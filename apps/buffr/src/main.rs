@@ -21,12 +21,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use buffr_config::{Config, ConfigSource};
+use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::{BuffrApp, init_cef_api, profile_paths};
 use buffr_modal::{Engine, PageMode, Step, key_event_to_chord};
 use cef::{ImplBrowser, Settings};
 use clap::Parser;
 use raw_window_handle::HasWindowHandle;
+use tempfile::TempDir;
 use tracing::{info, trace, warn};
 #[cfg(all(target_os = "linux", not(feature = "osr")))]
 use winit::platform::x11::EventLoopBuilderExtX11;
@@ -71,6 +72,22 @@ struct Cli {
     /// Prints the count removed.
     #[arg(long)]
     clear_completed_downloads: bool,
+    /// Print every persisted zoom override (`<domain>\t<level>`) and
+    /// exit. Debug aid until UI lands.
+    #[arg(long)]
+    list_zoom: bool,
+    /// Wipe the per-site zoom store. Prints the count of rows removed.
+    #[arg(long)]
+    clear_zoom: bool,
+    /// Run in private mode: every store is in-memory, the CEF cache
+    /// lives in a tempdir under `$TMPDIR/buffr-private-<pid>` that is
+    /// deleted on shutdown. Nothing persists across restarts.
+    ///
+    /// This is single-window incognito — there is no IPC isolation
+    /// from other buffr processes; full-process compartmentalisation
+    /// (Tor-Browser-grade) is out of scope for Phase 5.
+    #[arg(long)]
+    private: bool,
 }
 
 fn main() -> Result<()> {
@@ -143,6 +160,12 @@ fn main() -> Result<()> {
     if cli.clear_completed_downloads {
         return run_clear_completed_downloads();
     }
+    if cli.list_zoom {
+        return run_list_zoom();
+    }
+    if cli.clear_zoom {
+        return run_clear_zoom();
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -159,9 +182,22 @@ fn main() -> Result<()> {
     info!("buffr v{} starting", env!("CARGO_PKG_VERSION"));
     info!("buffr-core v{}", buffr_core::version());
 
-    // -------- profile paths --------
-    let paths = profile_paths().context("resolving profile dirs")?;
-    info!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
+    // -------- profile paths (persistent) or tempdir (--private) ------
+    //
+    // Private mode replaces both `cache` and `data` with a freshly-
+    // created `TempDir` under `$TMPDIR/buffr-private-<pid>`. The dir
+    // is deleted by `Drop` at process exit. Stores are opened
+    // in-memory, so no SQLite file ever appears on disk.
+    let (paths, _private_tmp) = resolve_paths(cli.private)?;
+    if cli.private {
+        info!(
+            cache = %paths.cache.display(),
+            data = %paths.data.display(),
+            "private mode active — no data persists across restart"
+        );
+    } else {
+        info!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
+    }
 
     // -------- history store --------
     //
@@ -169,11 +205,13 @@ fn main() -> Result<()> {
     // `<data>/history.sqlite`. `BrowserHost` keeps an `Arc<History>`
     // and CEF's `LoadHandler` / `DisplayHandler` (wired in
     // `buffr_core::handlers`) pump every main-frame visit + title
-    // into it.
-    let history = Arc::new(
+    // into it. Private mode opens an in-memory DB instead.
+    let history = Arc::new(if cli.private {
+        buffr_history::History::open_in_memory().context("opening in-memory history")?
+    } else {
         buffr_history::History::open(paths.data.join("history.sqlite"))
-            .context("opening history database")?,
-    );
+            .context("opening history database")?
+    });
     let initial_rows = history.count().unwrap_or(0);
     info!(rows = initial_rows, "history opened");
 
@@ -184,12 +222,26 @@ fn main() -> Result<()> {
     // bookmarks are user-action-driven (Phase 5 UI work). We hand the
     // `Arc<Bookmarks>` to `AppState` so the future omnibar / chrome
     // already has a handle to query.
-    let bookmarks = Arc::new(
+    let bookmarks = Arc::new(if cli.private {
+        buffr_bookmarks::Bookmarks::open_in_memory().context("opening in-memory bookmarks")?
+    } else {
         buffr_bookmarks::Bookmarks::open(paths.data.join("bookmarks.sqlite"))
-            .context("opening bookmarks database")?,
-    );
+            .context("opening bookmarks database")?
+    });
     let initial_bookmarks = bookmarks.count().unwrap_or(0);
     info!(rows = initial_bookmarks, "bookmarks opened");
+
+    // -------- zoom store --------
+    //
+    // Phase 5: SQLite-backed per-site zoom levels at
+    // `<data>/zoom.sqlite`. `BrowserHost` writes through on
+    // ZoomIn/Out/Reset; the CEF `LoadHandler` reads on each
+    // `on_load_end` to restore the level for the loaded domain.
+    let zoom = Arc::new(if cli.private {
+        buffr_zoom::ZoomStore::open_in_memory().context("opening in-memory zoom store")?
+    } else {
+        buffr_zoom::ZoomStore::open(paths.data.join("zoom.sqlite")).context("opening zoom store")?
+    });
 
     // -------- load config + build initial keymap ----------------------
     let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
@@ -210,10 +262,12 @@ fn main() -> Result<()> {
     // handler doesn't have to re-resolve on every event. We also
     // create the directory if it's missing so the very first download
     // doesn't fail with ENOENT before CEF gets a chance to fall back.
-    let downloads = Arc::new(
+    let downloads = Arc::new(if cli.private {
+        buffr_downloads::Downloads::open_in_memory().context("opening in-memory downloads")?
+    } else {
         buffr_downloads::Downloads::open(paths.data.join("downloads.sqlite"))
-            .context("opening downloads database")?,
-    );
+            .context("opening downloads database")?
+    });
     let initial_downloads = downloads.count().unwrap_or(0);
     info!(rows = initial_downloads, "downloads opened");
 
@@ -327,18 +381,39 @@ fn main() -> Result<()> {
     let mut app_state = AppState::new(
         homepage,
         engine,
-        history,
-        bookmarks,
-        downloads,
+        history.clone(),
+        bookmarks.clone(),
+        downloads.clone(),
         downloads_config,
+        zoom.clone(),
+        cli.private,
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
 
+    // -------- clear-on-exit --------
+    //
+    // Honour `[privacy] clear_on_exit` before tearing CEF down so
+    // cookie deletion routes through a still-live `CookieManager`.
+    // Private mode skips this entirely — the tempdir's `Drop` removes
+    // everything anyway.
+    if !cli.private {
+        run_clear_on_exit(
+            &config.privacy.clear_on_exit,
+            &paths,
+            &history,
+            &bookmarks,
+            &downloads,
+        );
+    }
+
     // -------- shutdown --------
     info!("cef shutting down");
     cef::shutdown();
+    // Tempdir drops here (after CEF is gone), removing the private
+    // profile root tree.
+    drop(_private_tmp);
     Ok(())
 }
 
@@ -449,6 +524,152 @@ fn run_clear_completed_downloads() -> Result<()> {
     Ok(())
 }
 
+/// Open the zoom store at the standard data path. Used by the CLI
+/// short-circuits — no CEF init.
+fn open_zoom_for_cli() -> Result<buffr_zoom::ZoomStore> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    let z = buffr_zoom::ZoomStore::open(paths.data.join("zoom.sqlite"))
+        .context("opening zoom database")?;
+    Ok(z)
+}
+
+fn run_list_zoom() -> Result<()> {
+    let z = open_zoom_for_cli()?;
+    for (domain, level) in z.all().context("loading zoom rows")? {
+        println!("{domain}\t{level}");
+    }
+    Ok(())
+}
+
+fn run_clear_zoom() -> Result<()> {
+    let z = open_zoom_for_cli()?;
+    let n = z.clear().context("clearing zoom rows")?;
+    println!("cleared {n} zoom rows");
+    Ok(())
+}
+
+/// Resolve the (cache, data) profile paths. Returns the resolved
+/// [`buffr_core::ProfilePaths`] plus an optional [`TempDir`] that owns
+/// the lifetime of the `--private` tree (so the caller can drop it
+/// after CEF shuts down).
+///
+/// Persistent layout: standard XDG via `directories::ProjectDirs`.
+///
+/// Private layout: `$TMPDIR/buffr-private-<pid>/{cache,data}`. The
+/// `<pid>` suffix means concurrent private launches each get their
+/// own root (no clobbering); the inner `cache` and `data` split
+/// matches the persistent shape so the rest of the codebase doesn't
+/// need conditionals.
+fn resolve_paths(private: bool) -> Result<(buffr_core::ProfilePaths, Option<TempDir>)> {
+    if private {
+        let pid = std::process::id();
+        let prefix = format!("buffr-private-{pid}-");
+        let tmp = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir()
+            .context("creating private-mode tempdir")?;
+        let cache = tmp.path().join("cache");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&cache).context("creating private cache subdir")?;
+        std::fs::create_dir_all(&data).context("creating private data subdir")?;
+        Ok((buffr_core::ProfilePaths { cache, data }, Some(tmp)))
+    } else {
+        let paths = profile_paths().context("resolving profile dirs")?;
+        Ok((paths, None))
+    }
+}
+
+/// Honour `[privacy] clear_on_exit` after the event loop returns and
+/// before `cef::shutdown()`. Each entry is processed independently —
+/// one failure doesn't skip the rest. Errors log at WARN; successes
+/// log at INFO so the user can see what was wiped.
+///
+/// Cookies + LocalStorage path: cookies route through CEF's
+/// global cookie manager (`cef::cookie_manager_get_global_manager`);
+/// localStorage is a tree under `<root_cache_path>/Local Storage` that
+/// we delete directly because CEF doesn't expose a programmatic flush
+/// for it. Cache is similarly a directory delete. History / Bookmarks
+/// / Downloads route through the corresponding store's `clear_all`.
+fn run_clear_on_exit(
+    items: &[ClearableData],
+    paths: &buffr_core::ProfilePaths,
+    history: &buffr_history::History,
+    bookmarks: &buffr_bookmarks::Bookmarks,
+    downloads: &buffr_downloads::Downloads,
+) {
+    if items.is_empty() {
+        return;
+    }
+    info!(count = items.len(), "clear_on_exit: running");
+    // Dedupe so repeats in config don't cause double work.
+    let mut seen = std::collections::HashSet::new();
+    for &item in items {
+        if !seen.insert(item) {
+            continue;
+        }
+        match item {
+            ClearableData::Cookies => clear_cookies(),
+            ClearableData::Cache => clear_dir(&paths.cache.join("Cache"), "cache"),
+            ClearableData::History => match history.clear_all() {
+                Ok(n) => info!(rows = n, "clear_on_exit: history cleared"),
+                Err(err) => warn!(error = %err, "clear_on_exit: history failed"),
+            },
+            ClearableData::Bookmarks => match bookmarks.clear_all() {
+                Ok(n) => info!(rows = n, "clear_on_exit: bookmarks cleared"),
+                Err(err) => warn!(error = %err, "clear_on_exit: bookmarks failed"),
+            },
+            ClearableData::Downloads => match downloads.clear_all() {
+                Ok(n) => info!(rows = n, "clear_on_exit: downloads cleared"),
+                Err(err) => warn!(error = %err, "clear_on_exit: downloads failed"),
+            },
+            ClearableData::LocalStorage => {
+                clear_dir(&paths.cache.join("Local Storage"), "local_storage")
+            }
+        }
+    }
+}
+
+/// Best-effort delete of a CEF-managed directory tree. CEF recreates
+/// the dir on next startup. ENOENT is silently swallowed.
+fn clear_dir(path: &std::path::Path, label: &str) {
+    if !path.exists() {
+        info!(path = %path.display(), label, "clear_on_exit: dir absent — skipping");
+        return;
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => info!(path = %path.display(), label, "clear_on_exit: dir wiped"),
+        Err(err) => {
+            warn!(path = %path.display(), label, error = %err, "clear_on_exit: dir wipe failed")
+        }
+    }
+}
+
+/// Wipe every cookie via CEF's global cookie manager. cef-147's
+/// `CookieManager::delete_cookies(None, None, None)` returns 1 on
+/// successful submission, 0 on synchronous failure, and dispatches
+/// the actual deletion asynchronously on the IO thread. We don't pass
+/// a `DeleteCookiesCallback` — the wipe runs to completion when CEF's
+/// IO thread is shut down by `cef::shutdown()` immediately after.
+///
+/// The flush_store hop afterward forces any in-memory cookie state
+/// to be persisted before we tear down — relevant for cookies that
+/// arrived just before the user closed the window.
+fn clear_cookies() {
+    let Some(manager) = cef::cookie_manager_get_global_manager(None) else {
+        warn!("clear_on_exit: cookie_manager_get_global_manager returned None");
+        return;
+    };
+    use cef::ImplCookieManager;
+    let submitted = manager.delete_cookies(None, None, None);
+    if submitted == 0 {
+        warn!("clear_on_exit: delete_cookies returned 0 (synchronous failure)");
+    } else {
+        info!("clear_on_exit: cookies — delete dispatched");
+    }
+    let _ = manager.flush_store(None);
+}
+
 /// Minimal winit `ApplicationHandler` that owns one window + one
 /// CEF browser, pumping CEF's message loop on `about_to_wait`.
 ///
@@ -475,12 +696,18 @@ struct AppState {
     bookmarks: Arc<buffr_bookmarks::Bookmarks>,
     downloads: Arc<buffr_downloads::Downloads>,
     downloads_config: Arc<buffr_config::DownloadsConfig>,
+    zoom: Arc<buffr_zoom::ZoomStore>,
+    /// Whether the runtime is in `--private` mode. Drives the title
+    /// stamp and is purely informational — the storage layer already
+    /// captured the choice at construction time.
+    private: bool,
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         homepage: String,
         engine: Arc<Mutex<Engine>>,
@@ -488,6 +715,8 @@ impl AppState {
         bookmarks: Arc<buffr_bookmarks::Bookmarks>,
         downloads: Arc<buffr_downloads::Downloads>,
         downloads_config: Arc<buffr_config::DownloadsConfig>,
+        zoom: Arc<buffr_zoom::ZoomStore>,
+        private: bool,
     ) -> Self {
         Self {
             homepage,
@@ -498,9 +727,23 @@ impl AppState {
             bookmarks,
             downloads,
             downloads_config,
+            zoom,
+            private,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
+        }
+    }
+
+    /// Window-title prefix. Persistent runs render `buffr — NORMAL`;
+    /// private mode inserts a marker between the brand and the mode
+    /// stamp so glancing at the taskbar makes the privacy state
+    /// obvious: `buffr — PRIVATE — NORMAL`.
+    fn title_for(&self, mode_label: &str) -> String {
+        if self.private {
+            format!("buffr — PRIVATE — {mode_label}")
+        } else {
+            format!("buffr — {mode_label}")
         }
     }
 
@@ -522,7 +765,7 @@ impl AppState {
         if label != self.current_mode_label {
             self.current_mode_label = label;
             if let Some(window) = self.window.as_ref() {
-                window.set_title(&format!("buffr — {label}"));
+                window.set_title(&self.title_for(label));
             }
         }
     }
@@ -548,7 +791,7 @@ impl ApplicationHandler for AppState {
             return;
         }
         let win_attrs = Window::default_attributes()
-            .with_title(format!("buffr — {}", self.current_mode_label))
+            .with_title(self.title_for(self.current_mode_label))
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
         let window = match event_loop.create_window(win_attrs) {
             Ok(w) => w,
@@ -574,6 +817,7 @@ impl ApplicationHandler for AppState {
             self.history.clone(),
             self.downloads.clone(),
             self.downloads_config.clone(),
+            self.zoom.clone(),
         ) {
             Ok(host) => {
                 info!(url = %self.homepage, "browser host created");
@@ -676,5 +920,27 @@ mod tests {
     #[test]
     fn cli_help_renders() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn resolve_paths_private_creates_subdirs_and_returns_tempdir() {
+        let (paths, tmp) = resolve_paths(true).expect("resolve_paths(true)");
+        let tmp = tmp.expect("private mode returns Some(TempDir)");
+        assert!(paths.cache.starts_with(tmp.path()));
+        assert!(paths.data.starts_with(tmp.path()));
+        assert!(paths.cache.exists());
+        assert!(paths.data.exists());
+        assert!(paths.cache.ends_with("cache"));
+        assert!(paths.data.ends_with("data"));
+        // Drop tempdir → tree gone.
+        let dir_path = tmp.path().to_path_buf();
+        drop(tmp);
+        assert!(!dir_path.exists());
+    }
+
+    #[test]
+    fn resolve_paths_persistent_returns_no_tempdir() {
+        let (_paths, tmp) = resolve_paths(false).expect("resolve_paths(false)");
+        assert!(tmp.is_none());
     }
 }

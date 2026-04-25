@@ -25,6 +25,7 @@ buffr-core.workspace = true
 buffr-history.workspace = true
 buffr-bookmarks.workspace = true
 buffr-downloads.workspace = true
+buffr-zoom.workspace = true
 # Enable the `winit` feature so we can pull in
 # `buffr_modal::key_event_to_chord` to translate winit key events into
 # our internal chord type without re-implementing the mapping.
@@ -38,3 +39,4 @@ cef.workspace = true
 winit.workspace = true
 raw-window-handle.workspace = true
 clap.workspace = true
+tempfile.workspace = true
