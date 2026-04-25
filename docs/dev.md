@@ -166,16 +166,18 @@ cargo test --workspace
 | `hjkl-engine` integration | `crates/buffr-modal/src/host.rs`    |
 | Config schema + loader    | `crates/buffr-config/src/lib.rs`    |
 | History store             | `crates/buffr-history/src/lib.rs`   |
+| Bookmarks store           | `crates/buffr-bookmarks/src/lib.rs` |
 
 ## Storage
 
 Per-user state buffr writes lives under `directories::ProjectDirs` resolution
 for `sh.kryptic.buffr`. On Linux that's:
 
-| Path                                  | Owner                                  |
-| ------------------------------------- | -------------------------------------- |
-| `~/.cache/buffr/`                     | CEF cache (cookies, GPU shader cache). |
-| `~/.local/share/buffr/history.sqlite` | History DB (Phase 5, `buffr-history`). |
+| Path                                    | Owner                                      |
+| --------------------------------------- | ------------------------------------------ |
+| `~/.cache/buffr/`                       | CEF cache (cookies, GPU shader cache).     |
+| `~/.local/share/buffr/history.sqlite`   | History DB (Phase 5, `buffr-history`).     |
+| `~/.local/share/buffr/bookmarks.sqlite` | Bookmarks DB (Phase 5, `buffr-bookmarks`). |
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
@@ -201,3 +203,26 @@ buffr --print-config            # dump the resolved (defaults + overrides) TOML
 buffr --config /tmp/foo.toml    # use a non-default path
 buffr --homepage about:blank    # override general.homepage for one run
 ```
+
+## Bookmarks
+
+`buffr-bookmarks` ships an SQLite-backed bookmark store with tag support and a
+Netscape HTML importer. Schema and Netscape parsing notes live in
+[`crates/buffr-bookmarks/README.md`](../crates/buffr-bookmarks/README.md).
+There's no UI yet (Phase 5b alongside the omnibar); the CLI flags exist for
+import + debugging:
+
+```sh
+# Import a Netscape HTML export (Chrome / Firefox / Edge "Export bookmarks…").
+buffr --import-bookmarks ~/Downloads/bookmarks.html
+# Stdout: `imported N bookmarks`
+
+# List every stored bookmark (id\turl\ttitle\t[tag,tag]).
+buffr --list-bookmarks
+
+# List every distinct tag, sorted alphabetically.
+buffr --list-bookmarks-tags
+```
+
+All three flags short-circuit before CEF init, so they work without a display
+server.

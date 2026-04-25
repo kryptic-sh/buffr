@@ -204,7 +204,10 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
   - [ ] Expose `buffr query history --limit N --search foo` CLI when chrome /
         omnibar lands so the data is reachable without UI.
   - [ ] Surface `SKIP_SCHEMES` as a `[privacy]` config knob.
-- [ ] Bookmarks: tagged, TOML or SQLite, CLI import (Netscape HTML).
+- [x] Bookmarks: tagged, SQLite-backed, CLI import (Netscape HTML). Pure data
+      layer in `crates/buffr-bookmarks`; CLI flags `--import-bookmarks`,
+      `--list-bookmarks`, `--list-bookmarks-tags` exposed on `apps/buffr`. UI
+      wiring is Phase 5b alongside the omnibar.
 - [ ] Downloads: progress, open-on-finish, default dir from config.
 - [ ] Cookies/site storage: per-profile, clear-on-exit option.
 - [ ] Permissions prompt UI: camera, mic, geolocation, notifications.
