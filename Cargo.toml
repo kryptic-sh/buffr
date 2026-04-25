@@ -13,3 +13,4 @@ description = "Browser chrome, command palette, and hint overlay for buffr."
 anyhow.workspace = true
 tracing.workspace = true
 buffr-modal.workspace = true
+softbuffer.workspace = true
