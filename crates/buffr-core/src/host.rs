@@ -170,6 +170,29 @@ impl BrowserHost {
         }
     }
 
+    /// Navigate the main frame to `url`. Used by the omnibar (Enter
+    /// on a typed URL or selected suggestion) and by `:open <url>` in
+    /// the command line.
+    ///
+    /// Empty / whitespace-only input is silently dropped — the caller
+    /// is expected to short-circuit before calling. URLs that don't
+    /// parse are still passed through to CEF, which will surface its
+    /// own error page (`net::ERR_INVALID_URL`).
+    pub fn navigate(&self, url: &str) -> Result<(), CoreError> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Err(CoreError::InvalidUrl(String::new()));
+        }
+        let Some(frame) = self.browser.main_frame() else {
+            warn!("navigate: main frame unavailable");
+            return Err(CoreError::CreateBrowserFailed);
+        };
+        let cef_url = CefString::from(trimmed);
+        frame.load_url(Some(&cef_url));
+        info!(target: "buffr_core::host", url = %trimmed, "navigate");
+        Ok(())
+    }
+
     /// Begin a fresh find session. Stores the query so subsequent
     /// `FindNext`/`FindPrev` reuse it; CEF's first call with
     /// `find_next = false` resets the match list, then we drive

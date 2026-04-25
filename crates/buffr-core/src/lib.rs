@@ -12,6 +12,7 @@ use directories::ProjectDirs;
 use thiserror::Error;
 
 pub mod app;
+pub mod cmdline;
 pub mod find;
 pub mod handlers;
 pub mod host;
