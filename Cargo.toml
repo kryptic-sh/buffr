@@ -41,11 +41,11 @@ buffr-modal = { path = "crates/buffr-modal" }
 buffr-ui = { path = "crates/buffr-ui" }
 buffr-config = { path = "crates/buffr-config" }
 
-# Vim engine + rope buffer extracted into a standalone repo. Local path
-# dep across the workspace boundary until hjkl 0.1.0 ships, then swap
-# to "=0.0.x" against crates.io.
-hjkl-engine = { path = "../hjkl/crates/hjkl-engine" }
-hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer", features = ["ratatui"] }
+# Vim engine + rope buffer extracted into a standalone repo. Pinned
+# exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
+# breaking changes can land on patch bumps.
+hjkl-engine = "=0.0.4"
+hjkl-buffer = "=0.0.4"
 
 [profile.release]
 lto = "thin"
