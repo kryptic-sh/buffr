@@ -1,9 +1,17 @@
 //! [`BrowserHost`] — owns a single CEF browser attached to a native
 //! window via the `cef` crate's windowed-rendering path.
 //!
-//! Phase 1: windowed mode (CEF child-window inside a winit window).
-//! Phase 3 will switch to off-screen rendering (OSR) so we can
-//! composite native chrome on top of the CEF surface.
+//! ## Linux backend matrix
+//!
+//! - **Default build (no `osr` feature)**: windowed embedding only.
+//!   CEF on Linux only supports embedding into an X11 window. We force
+//!   winit to its X11 backend in `apps/buffr/src/main.rs`, so on
+//!   Wayland sessions we transparently run via XWayland and CEF still
+//!   gets an X11 XID.
+//! - **`osr` feature (Phase 3)**: native Wayland via off-screen
+//!   rendering. CEF paints into a buffer, we composite it onto a
+//!   winit/wgpu Wayland surface ourselves. Scaffolded in
+//!   [`crate::osr`] but not yet implemented.
 
 use cef::{BrowserSettings, CefString, WindowInfo, browser_host_create_browser};
 use raw_window_handle::RawWindowHandle;
@@ -13,10 +21,11 @@ use crate::CoreError;
 
 /// Owns a CEF browser attached to a native window.
 ///
-/// The host is created **after** `cef::initialize` succeeds. On
-/// Linux/X11 we hand the X11 window XID to CEF via `WindowInfo`. On
-/// Wayland CEF currently expects an X11 window (XWayland fallback) —
-/// future phases will swap in OSR.
+/// The host is created **after** `cef::initialize` succeeds. On Linux
+/// (default build) we hand the X11 window XID to CEF via `WindowInfo` —
+/// this works for both native X11 sessions and Wayland sessions running
+/// XWayland, because we force winit to its X11 backend before creating
+/// the event loop.
 pub struct BrowserHost {
     /// CEF returns the [`Browser`](cef::Browser) handle asynchronously
     /// via the client callback; for Phase 1 we don't track it yet.
@@ -45,23 +54,22 @@ impl BrowserHost {
         };
 
         match window_handle {
+            // XWayland: winit gives us an Xlib handle even on Wayland
+            // sessions when the event loop is built with `with_x11()`,
+            // because the compositor proxies an X11 server (Xwayland)
+            // for legacy clients. CEF only supports windowed embedding
+            // into X11 on Linux, so this is the one supported arm in
+            // the default build.
             #[cfg(target_os = "linux")]
             RawWindowHandle::Xlib(handle) => {
                 window_info.parent_window = handle.window as _;
             }
-            // Wayland needs XWayland — winit returns Wayland by
-            // default, so on most Linux desktops users will hit this.
-            // TODO: switch to OSR in Phase 3 to support Wayland natively.
-            #[cfg(target_os = "linux")]
-            RawWindowHandle::Wayland(_) => {
-                tracing::warn!(
-                    "Wayland window handle received; CEF needs an X11 window. \
-                     Phase 1 only supports X11 (`WINIT_UNIX_BACKEND=x11`)."
-                );
-                return Err(CoreError::CreateBrowserFailed);
-            }
             other => {
-                tracing::warn!(?other, "unsupported window handle for Phase 1");
+                tracing::warn!(
+                    ?other,
+                    "unsupported window handle for windowed embedding; \
+                     native Wayland requires the `osr` feature (Phase 3)"
+                );
                 return Err(CoreError::CreateBrowserFailed);
             }
         }
@@ -83,5 +91,30 @@ impl BrowserHost {
         }
 
         Ok(Self { _placeholder: () })
+    }
+
+    /// Construct a browser in **off-screen rendering** mode for native
+    /// Wayland support.
+    ///
+    /// **Not yet implemented** — currently panics with
+    /// `unimplemented!()`. See [`crate::osr`] and `PLAN.md` (Phase 3)
+    /// for the planned architecture.
+    ///
+    /// The signature is intentionally plausible so future work has a
+    /// concrete target shape: callers will pass the host window handle
+    /// (so we can resize / track DPI), the initial URL, and a paint
+    /// callback that receives RGBA pixel buffers from CEF's `OnPaint`
+    /// every frame for compositing into a wgpu/softbuffer surface.
+    #[cfg(feature = "osr")]
+    pub fn new_osr(
+        _window_handle: RawWindowHandle,
+        url: &str,
+        _paint_callback: impl Fn(&[u8], u32, u32) + Send + 'static,
+    ) -> Result<Self, CoreError> {
+        tracing::error!(
+            %url,
+            "BrowserHost::new_osr called but OSR mode is not implemented yet"
+        );
+        unimplemented!("OSR mode coming in Phase 3 — see PLAN.md")
     }
 }
