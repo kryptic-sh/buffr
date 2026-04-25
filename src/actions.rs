@@ -29,7 +29,8 @@ pub enum Mode {
 
 /// Page-mode FSM states. Distinct from [`Mode`] (the status-line
 /// summary) — `PageMode` is what the keymap trie dispatches against.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PageMode {
     #[default]
     Normal,
@@ -47,7 +48,8 @@ pub enum PageMode {
 }
 
 /// Page-level actions emitted by the modal dispatcher.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PageAction {
     // -- scroll --------------------------------------------------------
     ScrollUp(u32),
@@ -115,4 +117,49 @@ pub enum PageAction {
     /// Defer to the embedded `hjkl_engine::Editor`. Keystroke
     /// unchanged; the modal dispatcher swallows nothing on this path.
     EnterEditMode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_mode_serde_round_trip() {
+        let s = toml::to_string(&Wrap {
+            m: PageMode::Visual,
+        })
+        .unwrap();
+        let back: Wrap = toml::from_str(&s).unwrap();
+        assert_eq!(back.m, PageMode::Visual);
+    }
+
+    #[test]
+    fn page_action_serde_round_trip_unit() {
+        let s = toml::to_string(&Wrap2 {
+            a: PageAction::Reload,
+        })
+        .unwrap();
+        let back: Wrap2 = toml::from_str(&s).unwrap();
+        assert_eq!(back.a, PageAction::Reload);
+    }
+
+    #[test]
+    fn page_action_serde_round_trip_count() {
+        let s = toml::to_string(&Wrap2 {
+            a: PageAction::ScrollDown(5),
+        })
+        .unwrap();
+        let back: Wrap2 = toml::from_str(&s).unwrap();
+        assert_eq!(back.a, PageAction::ScrollDown(5));
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Wrap {
+        m: PageMode,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Wrap2 {
+        a: PageAction,
+    }
 }

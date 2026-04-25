@@ -38,3 +38,6 @@ crossterm = "0.28.1"
 # `winit_adapter` module that converts `winit::event::KeyEvent` into
 # our internal `KeyChord`. The engine itself stays winit-agnostic.
 winit = { workspace = true, optional = true }
+
+[dev-dependencies]
+toml.workspace = true
