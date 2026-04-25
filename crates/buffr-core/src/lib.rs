@@ -12,6 +12,7 @@ use directories::ProjectDirs;
 use thiserror::Error;
 
 pub mod app;
+pub mod handlers;
 pub mod host;
 
 /// Off-screen rendering scaffold. Gated behind the `osr` feature

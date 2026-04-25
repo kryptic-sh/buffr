@@ -29,3 +29,8 @@ raw-window-handle.workspace = true
 # without its `winit` feature here — the adapter side is wired in
 # from `apps/buffr` instead.
 buffr-modal.workspace = true
+# Phase 5: CEF `LoadHandler` records every main-frame navigation into
+# `buffr-history`. `BrowserHost::new` accepts an `Arc<History>` and
+# wires it through the `Client` it hands to
+# `browser_host_create_browser_sync`.
+buffr-history.workspace = true

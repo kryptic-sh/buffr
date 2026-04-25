@@ -13,6 +13,9 @@
 //!   winit/wgpu Wayland surface ourselves. Scaffolded in
 //!   [`crate::osr`] but not yet implemented.
 
+use std::sync::Arc;
+
+use buffr_history::History;
 use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
     WindowInfo, browser_host_create_browser_sync,
@@ -20,7 +23,7 @@ use cef::{
 use raw_window_handle::RawWindowHandle;
 use tracing::{info, warn};
 
-use crate::CoreError;
+use crate::{CoreError, handlers};
 
 /// Owns a CEF browser attached to a native window.
 ///
@@ -46,7 +49,11 @@ impl BrowserHost {
     /// `window_handle` is the platform window the CEF browser will be
     /// parented to. On Linux this must be the X11 XID of a winit
     /// window.
-    pub fn new(window_handle: RawWindowHandle, url: &str) -> Result<Self, CoreError> {
+    pub fn new(
+        window_handle: RawWindowHandle,
+        url: &str,
+        history: Arc<History>,
+    ) -> Result<Self, CoreError> {
         info!(target: "buffr_core::host", %url, "creating CEF browser");
 
         let mut window_info = WindowInfo {
@@ -85,9 +92,14 @@ impl BrowserHost {
         let url = CefString::from(url);
         let settings = BrowserSettings::default();
 
+        // Phase 5: hand CEF a `Client` whose `get_load_handler` /
+        // `get_display_handler` plumb visits into `buffr-history`.
+        // Without a custom client, `on_load_end` never fires.
+        let mut client = handlers::make_client(history);
+
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
-            None, // no custom Client impl in Phase 1
+            Some(&mut client),
             Some(&url),
             Some(&settings),
             None,
