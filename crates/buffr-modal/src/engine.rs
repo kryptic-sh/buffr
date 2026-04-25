@@ -169,6 +169,23 @@ impl Engine {
         self.count
     }
 
+    /// Pending count buffer surfaced for the statusline. `None` when
+    /// no count has accumulated yet (the next count-bearing action
+    /// will get an implicit `1`); `Some(n)` once the user has typed
+    /// at least one digit.
+    ///
+    /// This is the chrome-friendly companion to [`Engine::count`] —
+    /// `count` returns the raw `u32` (0 for "none") which conflates
+    /// the absence of a count with the unrepresentable count of zero.
+    /// `count_buffer` does the obvious thing.
+    pub fn count_buffer(&self) -> Option<u32> {
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.count)
+        }
+    }
+
     /// Configured ambiguity timeout.
     pub fn timeout(&self) -> Duration {
         self.timeout
@@ -550,5 +567,18 @@ mod tests {
     fn tick_no_pending_returns_none() {
         let mut e = engine_with(&[]);
         assert_eq!(e.tick(t(5000)), None);
+    }
+
+    #[test]
+    fn count_buffer_none_until_digit() {
+        let mut e = engine_with(&[(PageMode::Normal, "j", PageAction::ScrollDown(1))]);
+        assert_eq!(e.count_buffer(), None);
+        let _ = e.feed(parse_key("1").unwrap(), t(0));
+        assert_eq!(e.count_buffer(), Some(1));
+        let _ = e.feed(parse_key("2").unwrap(), t(0));
+        assert_eq!(e.count_buffer(), Some(12));
+        let _ = e.feed(parse_key("j").unwrap(), t(0));
+        // Action resolved → buffer cleared.
+        assert_eq!(e.count_buffer(), None);
     }
 }

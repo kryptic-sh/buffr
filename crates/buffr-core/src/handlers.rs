@@ -29,6 +29,8 @@ use buffr_config::DownloadsConfig;
 use buffr_downloads::{DownloadStatus, Downloads};
 use buffr_history::{History, Transition};
 use buffr_zoom::ZoomStore;
+
+use crate::find::{FindResult, FindResultSink};
 // `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
 // `wrap_download_handler!` expand to references to bare `Client`,
 // `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
@@ -47,8 +49,9 @@ pub fn make_client(
     downloads: Arc<Downloads>,
     downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
+    find_sink: FindResultSink,
 ) -> Client {
-    BuffrClient::new(history, downloads, downloads_config, zoom)
+    BuffrClient::new(history, downloads, downloads_config, zoom, find_sink)
 }
 
 /// Standalone factory for the load handler — exposed so future
@@ -72,12 +75,20 @@ pub fn make_download_handler(
     BuffrDownloadHandler::new(downloads, downloads_config)
 }
 
+/// Standalone factory for the find handler. Takes the same
+/// [`FindResultSink`] [`BrowserHost`] uses so callbacks land in one
+/// place.
+pub fn make_find_handler(sink: FindResultSink) -> FindHandler {
+    BuffrFindHandler::new(sink)
+}
+
 wrap_client! {
     pub struct BuffrClient {
         history: Arc<History>,
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
+        find_sink: FindResultSink,
     }
 
     impl Client {
@@ -94,6 +105,45 @@ wrap_client! {
                 self.downloads.clone(),
                 self.downloads_config.clone(),
             ))
+        }
+
+        fn find_handler(&self) -> Option<FindHandler> {
+            Some(BuffrFindHandler::new(self.find_sink.clone()))
+        }
+    }
+}
+
+wrap_find_handler! {
+    pub struct BuffrFindHandler {
+        sink: FindResultSink,
+    }
+
+    impl FindHandler {
+        fn on_find_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            _identifier: ::std::os::raw::c_int,
+            count: ::std::os::raw::c_int,
+            _selection_rect: Option<&Rect>,
+            active_match_ordinal: ::std::os::raw::c_int,
+            final_update: ::std::os::raw::c_int,
+        ) {
+            // CEF emits a stream of partial results during a search;
+            // we always overwrite the previous tick's count so the
+            // statusline reflects the latest known state. `count` is
+            // the total match count for the page; `active_match_ordinal`
+            // is 1-based (CEF returns 0 before the first match is
+            // located).
+            let count = count.max(0) as u32;
+            let current = active_match_ordinal.max(0) as u32;
+            let result = FindResult {
+                count,
+                current,
+                final_update: final_update != 0,
+            };
+            if let Ok(mut guard) = self.sink.lock() {
+                *guard = Some(result);
+            }
         }
     }
 }

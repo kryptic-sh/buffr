@@ -12,6 +12,7 @@ use directories::ProjectDirs;
 use thiserror::Error;
 
 pub mod app;
+pub mod find;
 pub mod handlers;
 pub mod host;
 pub mod open_finder;
@@ -24,6 +25,9 @@ pub mod open_finder;
 pub mod osr;
 
 pub use app::{BuffrApp, ProfilePaths};
+pub use find::{
+    FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
+};
 pub use host::BrowserHost;
 
 #[derive(Debug, Error)]

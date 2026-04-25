@@ -13,7 +13,7 @@
 //!   winit/wgpu Wayland surface ourselves. Scaffolded in
 //!   [`crate::osr`] but not yet implemented.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use buffr_config::DownloadsConfig;
 use buffr_downloads::Downloads;
@@ -26,6 +26,7 @@ use cef::{
 use raw_window_handle::RawWindowHandle;
 use tracing::{info, warn};
 
+use crate::find::FindResultSink;
 use crate::{CoreError, handlers};
 
 /// Owns a CEF browser attached to a native window.
@@ -52,6 +53,9 @@ pub struct BrowserHost {
     /// Per-site zoom store. `ZoomIn` / `ZoomOut` / `ZoomReset` write
     /// through here; the CEF `LoadHandler` reads on load to restore.
     zoom: Arc<ZoomStore>,
+    /// Last successful find query. `FindNext` / `FindPrev` reuse this
+    /// — they are no-ops when no `start_find` has run yet.
+    last_find_query: Mutex<Option<String>>,
 }
 
 impl BrowserHost {
@@ -60,6 +64,7 @@ impl BrowserHost {
     /// `window_handle` is the platform window the CEF browser will be
     /// parented to. On Linux this must be the X11 XID of a winit
     /// window.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         window_handle: RawWindowHandle,
         url: &str,
@@ -67,19 +72,25 @@ impl BrowserHost {
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
+        find_sink: FindResultSink,
+        initial_size: (u32, u32),
     ) -> Result<Self, CoreError> {
         info!(target: "buffr_core::host", %url, "creating CEF browser");
 
+        // Phase 3 chrome: CEF's child window sits above a software-blit
+        // statusline strip the host window owns. Caller passes the
+        // already-trimmed width/height so the CEF child rect doesn't
+        // overlap the strip; on resize, `BrowserHost::resize` updates
+        // the rect and calls `was_resized()`.
+        let (init_w, init_h) = initial_size;
         let mut window_info = WindowInfo {
-            // Phase 1: 1280x800 client area; Phase 3 will resize from
-            // the parent winit window's inner size each frame.
+            bounds: cef::Rect {
+                x: 0,
+                y: 0,
+                width: init_w as i32,
+                height: init_h as i32,
+            },
             ..WindowInfo::default()
-        };
-        window_info.bounds = cef::Rect {
-            x: 0,
-            y: 0,
-            width: 1280,
-            height: 800,
         };
 
         match window_handle {
@@ -110,8 +121,13 @@ impl BrowserHost {
         // `get_display_handler` / `get_download_handler` plumb events
         // into `buffr-history` + `buffr-downloads`. Without a custom
         // client, `on_load_end` / `on_before_download` never fire.
-        let mut client =
-            handlers::make_client(history, downloads.clone(), downloads_config, zoom.clone());
+        let mut client = handlers::make_client(
+            history,
+            downloads.clone(),
+            downloads_config,
+            zoom.clone(),
+            find_sink,
+        );
 
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -127,7 +143,90 @@ impl BrowserHost {
             browser,
             downloads,
             zoom,
+            last_find_query: Mutex::new(None),
         })
+    }
+
+    /// Reflow the CEF child window to a new size after the host
+    /// `winit` window resized. Caller passes the *child* rect (i.e.
+    /// the page area, not including the statusline strip).
+    ///
+    /// Whether `was_resized()` alone is enough depends on CEF's host
+    /// platform: on Linux/X11 the embedded child is a real window
+    /// owned by CEF and does *not* automatically follow the parent's
+    /// new geometry — `was_resized` notifies the renderer of new
+    /// content dimensions but the X11 child still needs to be
+    /// repositioned/resized externally for some compositors. We don't
+    /// touch the X11 geometry directly here; that requires linking
+    /// `xlib` or going through `cef_window_handle_t`-typed APIs which
+    /// the cef-rs 147 wrapper doesn't expose. For now we rely on the
+    /// renderer-side `was_resized` and the X11 server's own size-hint
+    /// propagation (XWayland honours this; pure Mutter / KWin may
+    /// need `set_window_position` follow-up — punted to Phase 3b
+    /// since the smoke test path runs at fixed size).
+    pub fn resize(&self, _width: u32, _height: u32) {
+        if let Some(host) = self.browser.host() {
+            host.was_resized();
+        }
+    }
+
+    /// Begin a fresh find session. Stores the query so subsequent
+    /// `FindNext`/`FindPrev` reuse it; CEF's first call with
+    /// `find_next = false` resets the match list, then we drive
+    /// forward steps via `find_next = true`.
+    ///
+    /// `forward` selects search direction. `match_case` is hardcoded
+    /// to false for now — Phase 3b will surface it via the command
+    /// bar.
+    pub fn start_find(&self, query: &str, forward: bool) {
+        if query.is_empty() {
+            self.stop_find();
+            return;
+        }
+        let Some(host) = self.browser.host() else {
+            warn!("start_find: browser.host() returned None");
+            return;
+        };
+        let cef_query = CefString::from(query);
+        // `find_next = 0` for the initial call — CEF treats a fresh
+        // query as a new search.
+        host.find(Some(&cef_query), forward as i32, 0, 0);
+        if let Ok(mut slot) = self.last_find_query.lock() {
+            *slot = Some(query.to_string());
+        }
+    }
+
+    /// Cancel the active find. Clears CEF's selection and forgets the
+    /// last query so `FindNext` becomes a no-op.
+    pub fn stop_find(&self) {
+        if let Some(host) = self.browser.host() {
+            // `clear_selection = 1` — drop the highlight so the page
+            // doesn't keep pointing at a stale match.
+            host.stop_finding(1);
+        }
+        if let Ok(mut slot) = self.last_find_query.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Step to the next/previous match using the last successful
+    /// query. No-op when `start_find` has not been called.
+    fn find_step(&self, forward: bool) {
+        let query = match self.last_find_query.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => None,
+        };
+        let Some(query) = query else {
+            tracing::info!("find_step: no active query — call start_find first");
+            return;
+        };
+        let Some(host) = self.browser.host() else {
+            warn!("find_step: browser.host() returned None");
+            return;
+        };
+        let cef_query = CefString::from(query.as_str());
+        // `find_next = 1` continues the existing match list.
+        host.find(Some(&cef_query), forward as i32, 0, 1);
     }
 
     /// Construct a browser in **off-screen rendering** mode for native
@@ -229,16 +328,23 @@ impl BrowserHost {
                 }
             }
 
-            // -- find: stubbed (Phase 3 owns the command-line UI) ---
+            // -- find ------------------------------------------------
+            //
+            // `Find { forward }` opens a fresh find session, but the
+            // command bar that prompts the user for a query is Phase
+            // 3b. `start_find` / `stop_find` are exposed on the host
+            // so the future command bar wires straight in. For now,
+            // `Find` is a tracing breadcrumb. `FindNext` / `FindPrev`
+            // *do* work — they reuse the last query stashed by
+            // `start_find` (the smoke flag `--find` exercises this).
             A::Find { forward } => {
-                tracing::info!(
+                tracing::warn!(
                     forward = *forward,
-                    "find action — UI not yet implemented (Phase 3)"
+                    "Find requires command line — Phase 3b. Use BrowserHost::start_find() directly."
                 );
             }
-            A::FindNext | A::FindPrev => {
-                tracing::info!("find-next/prev — UI not yet implemented (Phase 3)");
-            }
+            A::FindNext => self.find_step(true),
+            A::FindPrev => self.find_step(false),
 
             // -- tabs: single-tab Phase 2 ---------------------------
             A::TabNext | A::TabPrev | A::TabClose | A::TabNew => {
