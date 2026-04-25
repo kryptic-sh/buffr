@@ -419,6 +419,22 @@ impl History {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM visits", [], |row| row.get(0))?;
         Ok(n as usize)
     }
+
+    /// Delete every visit row. Returns the number deleted. Used by the
+    /// `[privacy] clear_on_exit = ["history"]` shutdown hook in
+    /// `apps/buffr`. Runs `VACUUM` afterward to actually shrink the DB
+    /// file rather than just marking pages free.
+    pub fn clear_all(&self) -> Result<usize, HistoryError> {
+        let conn = self.conn.lock().map_err(|_| HistoryError::Poisoned)?;
+        let n = conn.execute("DELETE FROM visits", [])?;
+        // VACUUM cannot run inside a transaction. Failure is non-fatal —
+        // the DELETE already removed the data, VACUUM is just storage
+        // hygiene.
+        if let Err(err) = conn.execute("VACUUM", []) {
+            tracing::warn!(error = %err, "history: VACUUM after clear_all failed");
+        }
+        Ok(n)
+    }
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
@@ -604,6 +620,23 @@ mod tests {
         h.record_visit("not a url at all", None, Transition::Link)
             .unwrap();
         assert_eq!(h.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_all_wipes_table_and_reports_count() {
+        let h = History::open_in_memory().unwrap();
+        h.record_visit("https://a.example/", None, Transition::Link)
+            .unwrap();
+        h.record_visit("https://b.example/", None, Transition::Link)
+            .unwrap();
+        h.record_visit("https://c.example/", None, Transition::Link)
+            .unwrap();
+        assert_eq!(h.count().unwrap(), 3);
+        let removed = h.clear_all().unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(h.count().unwrap(), 0);
+        // Idempotent: second call returns 0, doesn't error.
+        assert_eq!(h.clear_all().unwrap(), 0);
     }
 
     #[test]
