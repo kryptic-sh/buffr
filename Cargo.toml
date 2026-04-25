@@ -5,6 +5,7 @@ members = [
     "crates/buffr-modal",
     "crates/buffr-ui",
     "crates/buffr-config",
+    "crates/buffr-history",
     "apps/buffr",
     "apps/buffr-helper",
     "xtask",
@@ -38,11 +39,18 @@ tar = "0.4"
 bzip2 = "0.4"
 clap = { version = "4", features = ["derive"] }
 notify = "6"
+# History store deps. `rusqlite`'s `bundled` feature is opted-in by
+# `buffr-history` — we expose the workspace base here without features
+# so other crates can later pick a different bundling mode if needed.
+rusqlite = "0.31"
+chrono = { version = "0.4", default-features = false }
+url = "2"
 
 buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
 buffr-ui = { path = "crates/buffr-ui" }
 buffr-config = { path = "crates/buffr-config" }
+buffr-history = { path = "crates/buffr-history" }
 
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
