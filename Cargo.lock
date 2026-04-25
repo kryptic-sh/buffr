@@ -223,6 +223,7 @@ name = "buffr-bookmarks"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "regex",
  "rusqlite",
  "serde",
  "thiserror 2.0.18",
