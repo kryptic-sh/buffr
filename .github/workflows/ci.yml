@@ -145,3 +145,71 @@ jobs:
 
       - name: cargo clippy (osr)
         run: cargo clippy --workspace --all-targets --features osr -- -D warnings
+
+  bundle-macos-cross:
+    # Cross-bundle the macOS .app on a Linux runner. Catches
+    # `xtask bundle-macos` regressions per-PR without paying for a real
+    # macOS runner. The resulting bundle is filesystem-correct only —
+    # the binaries inside are Linux ELFs and won't run on Darwin. Real
+    # macOS smoke testing is deferred to Phase 6.
+    name: macOS bundle (cross)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+      # Stub framework dir lets bundle-macos skip the macOS-only CEF
+      # tarball and finish assembly using whatever bytes happen to be
+      # in the directory we hand it. The contents don't matter — only
+      # the bundle script's directory layout does.
+      BUFFR_BUNDLE_FRAMEWORK_DIR: ${{ github.workspace }}/.ci/stub-framework
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install CEF runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
+            libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
+            libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
+            libgl1 libegl1 libgles2 \
+            libxml2-utils
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-build
+
+      - name: cache CEF binary distribution
+        uses: actions/cache@v4
+        with:
+          path: vendor/cef
+          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+
+      - name: fetch CEF
+        run: cargo xtask fetch-cef
+
+      - name: stage stub macOS framework
+        run: |
+          mkdir -p "$BUFFR_BUNDLE_FRAMEWORK_DIR/Versions/A/Resources"
+          echo stub > "$BUFFR_BUNDLE_FRAMEWORK_DIR/Versions/A/Chromium Embedded Framework"
+
+      - name: cargo xtask bundle-macos
+        run: cargo xtask bundle-macos
+
+      - name: validate bundle layout
+        run: |
+          set -e
+          test -f target/debug/buffr.app/Contents/Info.plist
+          test -f target/debug/buffr.app/Contents/PkgInfo
+          test -f target/debug/buffr.app/Contents/MacOS/buffr
+          test -d "target/debug/buffr.app/Contents/Frameworks/Chromium Embedded Framework.framework"
+          test -f "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/Info.plist"
+          test -f "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/MacOS/buffr Helper"
+          xmllint --noout target/debug/buffr.app/Contents/Info.plist
+          xmllint --noout "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/Info.plist"
