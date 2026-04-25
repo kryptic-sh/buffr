@@ -53,6 +53,16 @@ struct Cli {
     /// Override `general.homepage` for this run.
     #[arg(long, value_name = "URL")]
     homepage: Option<String>,
+    /// Import bookmarks from a Netscape Bookmark File (HTML). Runs
+    /// without launching CEF; prints the import count to stdout.
+    #[arg(long, value_name = "PATH")]
+    import_bookmarks: Option<PathBuf>,
+    /// Print every bookmark to stdout and exit. Debug aid until UI lands.
+    #[arg(long)]
+    list_bookmarks: bool,
+    /// Print every bookmark tag (sorted) to stdout and exit.
+    #[arg(long)]
+    list_bookmarks_tags: bool,
 }
 
 fn main() -> Result<()> {
@@ -110,6 +120,15 @@ fn main() -> Result<()> {
     if cli.print_config {
         return run_print_config(cli.config.as_deref());
     }
+    if let Some(path) = cli.import_bookmarks.as_deref() {
+        return run_import_bookmarks(path);
+    }
+    if cli.list_bookmarks {
+        return run_list_bookmarks();
+    }
+    if cli.list_bookmarks_tags {
+        return run_list_bookmarks_tags();
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -143,6 +162,20 @@ fn main() -> Result<()> {
     );
     let initial_rows = history.count().unwrap_or(0);
     info!(rows = initial_rows, "history opened");
+
+    // -------- bookmarks store --------
+    //
+    // Phase 5: SQLite-backed bookmarks at
+    // `<data>/bookmarks.sqlite`. Constructed but no auto-callback —
+    // bookmarks are user-action-driven (Phase 5 UI work). We hand the
+    // `Arc<Bookmarks>` to `AppState` so the future omnibar / chrome
+    // already has a handle to query.
+    let bookmarks = Arc::new(
+        buffr_bookmarks::Bookmarks::open(paths.data.join("bookmarks.sqlite"))
+            .context("opening bookmarks database")?,
+    );
+    let initial_bookmarks = bookmarks.count().unwrap_or(0);
+    info!(rows = initial_bookmarks, "bookmarks opened");
 
     // -------- load config + build initial keymap ----------------------
     let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
@@ -252,7 +285,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut app_state = AppState::new(homepage, engine, history);
+    let mut app_state = AppState::new(homepage, engine, history, bookmarks);
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
@@ -286,6 +319,48 @@ fn run_print_config(path: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// Open the bookmarks store at the standard data path. Used by the
+/// CLI short-circuits below (no CEF init needed).
+fn open_bookmarks_for_cli() -> Result<buffr_bookmarks::Bookmarks> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    let bm = buffr_bookmarks::Bookmarks::open(paths.data.join("bookmarks.sqlite"))
+        .context("opening bookmarks database")?;
+    Ok(bm)
+}
+
+fn run_import_bookmarks(path: &std::path::Path) -> Result<()> {
+    let html =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bm = open_bookmarks_for_cli()?;
+    let n = bm.import_netscape(&html).context("importing bookmarks")?;
+    println!("imported {n} bookmarks");
+    Ok(())
+}
+
+fn run_list_bookmarks() -> Result<()> {
+    let bm = open_bookmarks_for_cli()?;
+    let all = bm.all().context("loading bookmarks")?;
+    for b in &all {
+        let title = b.title.as_deref().unwrap_or("");
+        let tags = if b.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", b.tags.join(","))
+        };
+        println!("{}\t{}\t{}{}", b.id.0, b.url, title, tags);
+    }
+    Ok(())
+}
+
+fn run_list_bookmarks_tags() -> Result<()> {
+    let bm = open_bookmarks_for_cli()?;
+    for tag in bm.all_tags().context("loading tags")? {
+        println!("{tag}");
+    }
+    Ok(())
+}
+
 /// Minimal winit `ApplicationHandler` that owns one window + one
 /// CEF browser, pumping CEF's message loop on `about_to_wait`.
 ///
@@ -308,6 +383,8 @@ struct AppState {
     host: Option<buffr_core::BrowserHost>,
     engine: Arc<Mutex<Engine>>,
     history: Arc<buffr_history::History>,
+    #[allow(dead_code)]
+    bookmarks: Arc<buffr_bookmarks::Bookmarks>,
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
@@ -318,6 +395,7 @@ impl AppState {
         homepage: String,
         engine: Arc<Mutex<Engine>>,
         history: Arc<buffr_history::History>,
+        bookmarks: Arc<buffr_bookmarks::Bookmarks>,
     ) -> Self {
         Self {
             homepage,
@@ -325,6 +403,7 @@ impl AppState {
             host: None,
             engine,
             history,
+            bookmarks,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
