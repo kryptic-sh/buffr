@@ -18,6 +18,7 @@ use std::sync::Arc;
 use buffr_config::DownloadsConfig;
 use buffr_downloads::Downloads;
 use buffr_history::History;
+use buffr_zoom::ZoomStore;
 use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
     WindowInfo, browser_host_create_browser_sync,
@@ -48,6 +49,9 @@ pub struct BrowserHost {
     /// inside the `Client`; this is a separate `Arc` for direct
     /// mutations from the page-action dispatcher.
     downloads: Arc<Downloads>,
+    /// Per-site zoom store. `ZoomIn` / `ZoomOut` / `ZoomReset` write
+    /// through here; the CEF `LoadHandler` reads on load to restore.
+    zoom: Arc<ZoomStore>,
 }
 
 impl BrowserHost {
@@ -62,6 +66,7 @@ impl BrowserHost {
         history: Arc<History>,
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
+        zoom: Arc<ZoomStore>,
     ) -> Result<Self, CoreError> {
         info!(target: "buffr_core::host", %url, "creating CEF browser");
 
@@ -105,7 +110,8 @@ impl BrowserHost {
         // `get_display_handler` / `get_download_handler` plumb events
         // into `buffr-history` + `buffr-downloads`. Without a custom
         // client, `on_load_end` / `on_before_download` never fire.
-        let mut client = handlers::make_client(history, downloads.clone(), downloads_config);
+        let mut client =
+            handlers::make_client(history, downloads.clone(), downloads_config, zoom.clone());
 
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -117,7 +123,11 @@ impl BrowserHost {
         )
         .ok_or(CoreError::CreateBrowserFailed)?;
 
-        Ok(Self { browser, downloads })
+        Ok(Self {
+            browser,
+            downloads,
+            zoom,
+        })
     }
 
     /// Construct a browser in **off-screen rendering** mode for native
@@ -198,9 +208,15 @@ impl BrowserHost {
             A::StopLoading => self.browser.stop_load(),
 
             // -- zoom ------------------------------------------------
+            //
+            // Each variant writes through to `ZoomStore` so the next
+            // load on this domain restores the persisted level. The
+            // domain comes from the live main-frame URL via
+            // `buffr_zoom::domain_for_url` — `about:`/`data:`/`file:`
+            // collapse to the global key.
             A::ZoomIn => self.adjust_zoom(0.25),
             A::ZoomOut => self.adjust_zoom(-0.25),
-            A::ZoomReset => self.set_zoom(0.0),
+            A::ZoomReset => self.reset_zoom(),
 
             // -- devtools --------------------------------------------
             A::OpenDevTools => {
@@ -290,14 +306,37 @@ impl BrowserHost {
         };
         let new_level = host.zoom_level() + delta;
         host.set_zoom_level(new_level);
+        let domain = self.current_domain();
+        if let Err(err) = self.zoom.set(&domain, new_level) {
+            warn!(error = %err, %domain, "zoom: persist failed");
+        }
     }
 
-    fn set_zoom(&self, level: f64) {
+    /// `ZoomReset`: clear both the live zoom and the persisted row so
+    /// the domain reverts to CEF's default on next load.
+    fn reset_zoom(&self) {
         let Some(host) = self.browser.host() else {
-            warn!("set_zoom: browser.host() returned None");
+            warn!("reset_zoom: browser.host() returned None");
             return;
         };
-        host.set_zoom_level(level);
+        host.set_zoom_level(0.0);
+        let domain = self.current_domain();
+        if let Err(err) = self.zoom.remove(&domain) {
+            warn!(error = %err, %domain, "zoom: remove failed");
+        }
+    }
+
+    /// Extract the current main-frame URL's zoom-key. Returns the
+    /// global sentinel when the frame is unavailable so `set` /
+    /// `remove` still target a well-known row.
+    fn current_domain(&self) -> String {
+        match self.browser.main_frame() {
+            Some(frame) => {
+                let url = CefStringUtf16::from(&frame.url()).to_string();
+                buffr_zoom::domain_for_url(&url)
+            }
+            None => buffr_zoom::GLOBAL_KEY.to_string(),
+        }
     }
 }
 

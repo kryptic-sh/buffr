@@ -28,6 +28,7 @@ use std::sync::Arc;
 use buffr_config::DownloadsConfig;
 use buffr_downloads::{DownloadStatus, Downloads};
 use buffr_history::{History, Transition};
+use buffr_zoom::ZoomStore;
 // `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
 // `wrap_download_handler!` expand to references to bare `Client`,
 // `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
@@ -45,15 +46,16 @@ pub fn make_client(
     history: Arc<History>,
     downloads: Arc<Downloads>,
     downloads_config: Arc<DownloadsConfig>,
+    zoom: Arc<ZoomStore>,
 ) -> Client {
-    BuffrClient::new(history, downloads, downloads_config)
+    BuffrClient::new(history, downloads, downloads_config, zoom)
 }
 
 /// Standalone factory for the load handler — exposed so future
 /// `BrowserHost` flavors (OSR, multi-tab) can build their own client
 /// while still funnelling visits into the same history store.
-pub fn make_load_handler(history: Arc<History>) -> LoadHandler {
-    BuffrLoadHandler::new(history)
+pub fn make_load_handler(history: Arc<History>, zoom: Arc<ZoomStore>) -> LoadHandler {
+    BuffrLoadHandler::new(history, zoom)
 }
 
 /// Standalone factory for the display handler — same rationale as
@@ -75,11 +77,12 @@ wrap_client! {
         history: Arc<History>,
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
+        zoom: Arc<ZoomStore>,
     }
 
     impl Client {
         fn load_handler(&self) -> Option<LoadHandler> {
-            Some(BuffrLoadHandler::new(self.history.clone()))
+            Some(BuffrLoadHandler::new(self.history.clone(), self.zoom.clone()))
         }
 
         fn display_handler(&self) -> Option<DisplayHandler> {
@@ -98,12 +101,13 @@ wrap_client! {
 wrap_load_handler! {
     pub struct BuffrLoadHandler {
         history: Arc<History>,
+        zoom: Arc<ZoomStore>,
     }
 
     impl LoadHandler {
         fn on_load_end(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
             _http_status_code: ::std::os::raw::c_int,
         ) {
@@ -123,6 +127,28 @@ wrap_load_handler! {
                 self.history.record_visit(&url, None, Transition::Link)
             {
                 tracing::warn!(error = %err, %url, "history: record_visit failed");
+            }
+
+            // Restore persisted zoom level for this domain. Skip when
+            // the level is 0.0 (CEF default — no point round-tripping
+            // through `set_zoom_level`). On_load_end (rather than
+            // on_load_start) is the safe insertion point: the frame's
+            // committed URL is final, and CEF's renderer is ready to
+            // accept zoom changes.
+            let domain = buffr_zoom::domain_for_url(&url);
+            match self.zoom.get(&domain) {
+                Ok(level) if level != 0.0 => {
+                    if let Some(browser) = browser
+                        && let Some(host) = cef::ImplBrowser::host(browser)
+                    {
+                        host.set_zoom_level(level);
+                        tracing::trace!(%domain, level, "zoom: applied persisted");
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, %domain, "zoom: get failed");
+                }
             }
         }
     }

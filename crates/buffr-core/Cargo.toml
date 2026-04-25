@@ -40,3 +40,7 @@ buffr-history.workspace = true
 # whether to open on finish).
 buffr-downloads.workspace = true
 buffr-config.workspace = true
+# Phase 5: per-site zoom levels persisted across sessions.
+# `BrowserHost::dispatch` writes through; the CEF `LoadHandler` reads
+# the stored level on load to restore it.
+buffr-zoom.workspace = true
