@@ -186,10 +186,10 @@ pub fn resolve_default_dir(cfg: &DownloadsConfig) -> PathBuf {
     if let Some(p) = cfg.default_dir.as_ref() {
         return p.clone();
     }
-    if let Some(dirs) = UserDirs::new() {
-        if let Some(d) = dirs.download_dir() {
-            return d.to_path_buf();
-        }
+    if let Some(dirs) = UserDirs::new()
+        && let Some(d) = dirs.download_dir()
+    {
+        return d.to_path_buf();
     }
     // `$HOME/Downloads` fallback. `home_dir()` is deprecated on stable
     // for cross-platform reasons but we only need a best-effort
@@ -517,12 +517,11 @@ weird = "nope"
 
     #[test]
     fn resolve_default_dir_uses_explicit_value() {
-        let mut cfg = DownloadsConfig::default();
-        cfg.default_dir = Some(PathBuf::from("/tmp/explicit"));
-        assert_eq!(
-            resolve_default_dir(&cfg),
-            PathBuf::from("/tmp/explicit")
-        );
+        let cfg = DownloadsConfig {
+            default_dir: Some(PathBuf::from("/tmp/explicit")),
+            ..Default::default()
+        };
+        assert_eq!(resolve_default_dir(&cfg), PathBuf::from("/tmp/explicit"));
     }
 
     #[test]
