@@ -103,6 +103,7 @@ fn parse_unit(name: &str) -> Result<PageAction, KeyBindingError> {
         "zoom_out" => ZoomOut,
         "zoom_reset" => ZoomReset,
         "open_dev_tools" => OpenDevTools,
+        "clear_completed_downloads" => ClearCompletedDownloads,
         "enter_edit_mode" => EnterEditMode,
         other => return Err(KeyBindingError::UnknownAction(other.into())),
     })
@@ -220,6 +221,7 @@ fn action_to_string(action: &PageAction) -> String {
         ZoomOut => "zoom_out".into(),
         ZoomReset => "zoom_reset".into(),
         OpenDevTools => "open_dev_tools".into(),
+        ClearCompletedDownloads => "clear_completed_downloads".into(),
         EnterEditMode => "enter_edit_mode".into(),
     }
 }
