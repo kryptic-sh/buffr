@@ -20,3 +20,8 @@ serde = { workspace = true, features = ["derive"] }
 # means breaking changes can land on patch bumps.
 hjkl-engine = { workspace = true }
 hjkl-buffer = { workspace = true }
+
+# crossterm KeyEvent is the engine's input type today; the host
+# bridges from CEF browser keys into it. When trait extraction lands a
+# host-native Input enum, this dep moves out.
+crossterm = "0.28.1"

@@ -13,8 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod edit_mode;
 pub mod host;
 
+pub use edit_mode::EditSession;
 pub use host::BuffrHost;
 
 /// Coarse mode displayed in the status line. `Edit` is a single state
