@@ -1,0 +1,23 @@
+[package]
+name = "buffr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
+
+[[bin]]
+name = "buffr"
+path = "src/main.rs"
+
+[dependencies]
+buffr-core.workspace = true
+buffr-modal.workspace = true
+buffr-ui.workspace = true
+buffr-config.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/buffr-core",
+    "crates/buffr-modal",
+    "crates/buffr-ui",
+    "crates/buffr-config",
+    "apps/buffr",
+    "apps/buffr-helper",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr"
+homepage = "https://kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+
+[workspace.dependencies]
+cef = "147"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+
+buffr-core = { path = "crates/buffr-core" }
+buffr-modal = { path = "crates/buffr-modal" }
+buffr-ui = { path = "crates/buffr-ui" }
+buffr-config = { path = "crates/buffr-config" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

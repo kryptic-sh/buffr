@@ -1,0 +1,18 @@
+[package]
+name = "buffr-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "CEF subprocess helper binary (renderer/GPU/utility)."
+
+[[bin]]
+name = "buffr-helper"
+path = "src/main.rs"
+
+[dependencies]
+cef.workspace = true
+anyhow.workspace = true

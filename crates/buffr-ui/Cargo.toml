@@ -1,0 +1,15 @@
+[package]
+name = "buffr-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Browser chrome, command palette, and hint overlay for buffr."
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+buffr-modal.workspace = true
