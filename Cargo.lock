@@ -204,6 +204,7 @@ name = "buffr"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "buffr-bookmarks",
  "buffr-config",
  "buffr-core",
  "buffr-history",
@@ -215,6 +216,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winit",
+]
+
+[[package]]
+name = "buffr-bookmarks"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
 ]
 
 [[package]]
