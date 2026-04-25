@@ -114,6 +114,14 @@ pub enum PageAction {
     // -- devtools / misc ---------------------------------------------
     OpenDevTools,
 
+    // -- downloads ----------------------------------------------------
+    /// Delete every `Completed` download row. Does not have a default
+    /// keybinding — there's no obvious vim-flavored chord — so it's
+    /// reachable only via user config (`[keymap.normal] "..." =
+    /// "clear_completed_downloads"`) or the eventual `:downloads`
+    /// command line in Phase 3 chrome work.
+    ClearCompletedDownloads,
+
     /// Defer to the embedded `hjkl_engine::Editor`. Keystroke
     /// unchanged; the modal dispatcher swallows nothing on this path.
     EnterEditMode,
