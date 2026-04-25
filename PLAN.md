@@ -123,6 +123,10 @@ Goal: empty native window renders `https://example.com` via CEF.
 - [ ] CI: Linux build + smoke test (window opens, page loads, exits clean).
       Build job landed in `.github/workflows/ci.yml`; runtime smoke test still
       needs a display server in CI.
+- [x] macOS Helper bundle: `cargo xtask bundle-macos` assembles
+      `buffr.app/Contents/Frameworks/buffr Helper.app/` with embedded CEF
+      framework. Single helper flavor; multi-helper split (GPU / Renderer /
+      Plugin) deferred to Phase 6 alongside signing.
 
 ### Phase 2 — Modal engine
 
@@ -207,7 +211,12 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       managers.
 - [ ] Packaging:
   - [ ] Linux: AppImage, `.deb`, AUR PKGBUILD.
-  - [ ] macOS: signed/notarized `.app` + `.dmg`. Helper bundle inside.
+  - [ ] macOS: signed/notarized `.app` + `.dmg`. Helper bundle inside. Bundle
+        assembly already lives behind `cargo xtask bundle-macos` (Phase 1);
+        Phase 6 adds Developer-ID signing, the multi-helper split (`Helper`,
+        `Helper (GPU)`, `Helper (Renderer)`, `Helper (Plugin)`) with per-flavor
+        entitlements, and notarization. See
+        [`docs/macos-signing.md`](./docs/macos-signing.md) for the full plan.
   - [ ] Windows: signed MSI.
 - [ ] Telemetry: none by default; opt-in anonymous usage counters.
 - [ ] Accessibility pass: screen reader labels on chrome, focus order.

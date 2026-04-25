@@ -42,12 +42,12 @@ Override the CEF tree location with `CEF_PATH=...` (mirrors
 
 ## CEF binary distribution — size + platform matrix
 
-| Platform     | Archive (compressed) | Extracted | Notes                            |
-| ------------ | -------------------- | --------- | -------------------------------- |
-| `linux64`    | ~140 MB              | ~480 MB   | Tier 1 (primary dev target).     |
-| `macosarm64` | ~150 MB              | ~520 MB   | Tier 1 (Helper.app bundle TODO). |
-| `macosx64`   | ~150 MB              | ~520 MB   | Tier 1.                          |
-| `windows64`  | ~165 MB              | ~530 MB   | Tier 2.                          |
+| Platform     | Archive (compressed) | Extracted | Notes                                |
+| ------------ | -------------------- | --------- | ------------------------------------ |
+| `linux64`    | ~140 MB              | ~480 MB   | Tier 1 (primary dev target).         |
+| `macosarm64` | ~150 MB              | ~520 MB   | Tier 1 (`cargo xtask bundle-macos`). |
+| `macosx64`   | ~150 MB              | ~520 MB   | Tier 1.                              |
+| `windows64`  | ~165 MB              | ~530 MB   | Tier 2.                              |
 
 `vendor/cef/` is in `.gitignore`. Re-run `cargo xtask fetch-cef` after bumping
 the `cef` crate version.
@@ -98,6 +98,51 @@ cargo run -p buffr --features osr
 
 The OSR path will run CEF in windowless mode, blitting paint events onto a
 winit-owned Wayland surface via wgpu.
+
+## macOS bundling
+
+CEF on macOS requires a strict app-bundle layout: the libcef framework must live
+at `Contents/Frameworks/Chromium Embedded Framework.framework/`, and CEF's
+helper subprocesses must be launched out of a nested
+`Contents/Frameworks/buffr Helper.app/`. The main binary loads the framework at
+startup via `cef-rs`'s `LibraryLoader` (`helper=false`); the helper does the
+same with `helper=true` so the framework path resolves relative to its own
+deeper bundle position (`../../..` vs `../Frameworks`).
+
+The `xtask bundle-macos` subcommand assembles all of this:
+
+```sh
+# Vendor a macOS CEF distribution (cross-fetch from a Linux dev box is fine).
+cargo xtask fetch-cef --platform macosarm64
+
+# Build + assemble buffr.app under target/release/.
+cargo xtask bundle-macos --release
+
+# Optional ad-hoc signing (gatekeeper-bypassed local runs only).
+codesign --force --deep --sign - target/release/buffr.app
+
+# Run.
+open target/release/buffr.app
+```
+
+Notes:
+
+- The compiled helper binary is `buffr-helper` (with hyphen) but the bundle
+  convention renames it to `buffr Helper` (space-separated) during the copy. No
+  Cargo changes needed.
+- This round ships a single `buffr Helper.app` used for all subprocess types.
+  macOS's full sandbox model wants `Helper`, `Helper (GPU)`,
+  `Helper (Renderer)`, and `Helper (Plugin)` — that split is deferred to Phase 6
+  when proper signing + sandbox entitlements land.
+- No `buffr.icns` is bundled yet; the plist references the file so Finder picks
+  it up once we ship one. Until then macOS uses a generic app icon.
+- The bundle script runs on Linux too — useful for catching script regressions
+  in CI without booting a macOS runner. Real macOS CEF framework not on disk?
+  Set `BUFFR_BUNDLE_FRAMEWORK_DIR=<any-dir>` to short-circuit the
+  framework-existence check; bundle assembly still finishes, the resulting app
+  just won't run.
+- Distribution-grade signing + notarization is documented in
+  [`docs/macos-signing.md`](./macos-signing.md). Phase 6 work.
 
 ## Useful commands
 
