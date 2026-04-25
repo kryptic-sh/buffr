@@ -195,7 +195,15 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 ### Phase 5 — Browser features (1.0 cut)
 
 - [ ] Tabs: create/close/move/pin/duplicate, restore last session.
-- [ ] History: SQLite store, dedupe, fuzzy search for omnibar.
+- [x] History: SQLite store, dedupe, frecency search for omnibar. Pure data
+      layer in `crates/buffr-history`; wired live via the CEF `LoadHandler` in
+      `buffr-core::handlers`. Phase 5b/c follow-ups:
+  - [ ] FTS5 migration (replace `LIKE %q%` with `MATCH` + `bm25`).
+  - [ ] Detect `Reload` transitions via `LoadHandler::on_load_start`
+        (`transition_type` flag) — currently every visit is recorded as `Link`.
+  - [ ] Expose `buffr query history --limit N --search foo` CLI when chrome /
+        omnibar lands so the data is reachable without UI.
+  - [ ] Surface `SKIP_SCHEMES` as a `[privacy]` config knob.
 - [ ] Bookmarks: tagged, TOML or SQLite, CLI import (Netscape HTML).
 - [ ] Downloads: progress, open-on-finish, default dir from config.
 - [ ] Cookies/site storage: per-profile, clear-on-exit option.

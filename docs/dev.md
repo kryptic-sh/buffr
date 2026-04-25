@@ -154,16 +154,38 @@ cargo test --workspace
 
 ## Where things live
 
-| Concern                   | File                             |
-| ------------------------- | -------------------------------- |
-| Subprocess dispatch       | `apps/buffr/src/main.rs::main`   |
-| `cef::App` impl           | `crates/buffr-core/src/app.rs`   |
-| Browser creation          | `crates/buffr-core/src/host.rs`  |
-| CEF link + resource copy  | `crates/buffr-core/build.rs`     |
-| CEF download              | `xtask/src/main.rs::fetch_cef`   |
-| Page mode FSM             | `crates/buffr-modal/src/lib.rs`  |
-| `hjkl-engine` integration | `crates/buffr-modal/src/host.rs` |
-| Config schema + loader    | `crates/buffr-config/src/lib.rs` |
+| Concern                   | File                                |
+| ------------------------- | ----------------------------------- |
+| Subprocess dispatch       | `apps/buffr/src/main.rs::main`      |
+| `cef::App` impl           | `crates/buffr-core/src/app.rs`      |
+| Browser creation          | `crates/buffr-core/src/host.rs`     |
+| CEF callback handlers     | `crates/buffr-core/src/handlers.rs` |
+| CEF link + resource copy  | `crates/buffr-core/build.rs`        |
+| CEF download              | `xtask/src/main.rs::fetch_cef`      |
+| Page mode FSM             | `crates/buffr-modal/src/lib.rs`     |
+| `hjkl-engine` integration | `crates/buffr-modal/src/host.rs`    |
+| Config schema + loader    | `crates/buffr-config/src/lib.rs`    |
+| History store             | `crates/buffr-history/src/lib.rs`   |
+
+## Storage
+
+Per-user state buffr writes lives under `directories::ProjectDirs` resolution
+for `sh.kryptic.buffr`. On Linux that's:
+
+| Path                                  | Owner                                  |
+| ------------------------------------- | -------------------------------------- |
+| `~/.cache/buffr/`                     | CEF cache (cookies, GPU shader cache). |
+| `~/.local/share/buffr/history.sqlite` | History DB (Phase 5, `buffr-history`). |
+
+`history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
+`history.sqlite-shm` next to it during a live session — that's normal. Schema
+migrations are forward-only and recorded in a `schema_version` table; see
+[`crates/buffr-history/README.md`](../crates/buffr-history/README.md) for the
+schema and frecency formula.
+
+macOS uses `~/Library/Application Support/sh.kryptic.buffr/` and
+`~/Library/Caches/sh.kryptic.buffr/`; Windows uses
+`%APPDATA%\kryptic\buffr\data\` / `%LOCALAPPDATA%\kryptic\buffr\cache\`.
 
 ## Config
 
