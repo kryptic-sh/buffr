@@ -178,9 +178,15 @@ Goal: tab strip + statusline + command line + omnibar, all native.
 - [x] Statusline: mode indicator, URL, progress, cert state, count buffer.
       Bundled 6x10 bitmap font in `buffr-ui::font`; widget renders into a
       `softbuffer::Surface`. Phase 3b adds load-progress / cert hookup.
-- [ ] Command line (`:`): input, history, completion, async results. **Phase 3b
-      dependency** — find-in-page needs this for `Find { forward }`.
-- [ ] Omnibar (`o`/`O`): search-or-URL, suggestions from history.
+- [x] Command line (`:`): input strip, completion against a static command list,
+      dispatcher in `buffr-core::cmdline`. Supports `:q` / `:quit`, `:reload`,
+      `:back`, `:forward`, `:open <url>`, `:tabnew` (logs only),
+      `:set zoom in|out|reset`, `:bookmark <tags...>`, `:find <query>`,
+      `:devtools`. Find query routing now uses the live
+      `BrowserHost::start_find`.
+- [x] Omnibar (`o`/`O`): search-or-URL resolver in `buffr-config::search`,
+      suggestion source = history + bookmarks + search-engine fallback.
+      `BrowserHost::navigate` performs the load on Enter.
 - [ ] Hint mode (`f`/`F`): DOM query via CEF V8 binding → overlay labels →
       keystroke filter → click/focus dispatch. Triggers the migration to OSR +
       `wgpu` compositing — see `docs/ui-stack.md`.

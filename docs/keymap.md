@@ -131,6 +131,23 @@ The engine reads the resolved [`PageAction`] and auto-transitions:
 `<Esc>` is bound in Visual / Command / Hint to `EnterMode(Normal)` so every mode
 has a guaranteed escape hatch.
 
+## In-overlay shortcuts (command line / omnibar)
+
+When `:` opens the command line or `o`/`O` opens the omnibar, all keystrokes
+route to the input bar instead of the page-mode trie. The bindings below mirror
+readline / vim's command-line conventions.
+
+| Keys                 | Action                                                   |
+| -------------------- | -------------------------------------------------------- |
+| `<Esc>` / `<C-c>`    | Cancel — close overlay, return to Normal mode.           |
+| `<CR>`               | Confirm — dispatch the command or navigate to the URL.   |
+| `<Tab>` / `<Down>`   | Move suggestion selection one row down (cycles to last). |
+| `<S-Tab>` / `<Up>`   | Move suggestion selection one row up (clears at top).    |
+| `<Left>` / `<Right>` | Move cursor through the buffer.                          |
+| `<BS>`               | Delete the codepoint before the cursor.                  |
+| `<C-u>`              | Clear the entire buffer.                                 |
+| `<C-w>`              | Delete the word before the cursor.                       |
+
 ## Customising
 
 Bindings come from a static table in `crates/buffr-modal/src/keymap.rs`. User
