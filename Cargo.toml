@@ -16,6 +16,7 @@ serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 directories.workspace = true
 notify.workspace = true
+url.workspace = true
 buffr-modal.workspace = true
 
 [dev-dependencies]

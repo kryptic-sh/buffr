@@ -29,10 +29,12 @@ pub use buffr_modal::{PageAction, PageMode};
 
 mod keybinding;
 mod loader;
+pub mod search;
 mod watcher;
 
 pub use keybinding::{KeyBinding, KeyBindingError, parse_action};
 pub use loader::{ConfigSource, default_config_path, load, load_from_path};
+pub use search::resolve_input;
 pub use watcher::{ConfigWatcher, watch};
 
 /// Top-level config.
