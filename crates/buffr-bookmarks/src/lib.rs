@@ -414,6 +414,21 @@ impl Bookmarks {
         Ok(n as usize)
     }
 
+    /// Delete every bookmark + tag row. Returns the number of bookmark
+    /// rows deleted (not tag rows). Tag rows go via
+    /// `ON DELETE CASCADE`. Runs `VACUUM` afterward to shrink the file.
+    /// Used by the `[privacy] clear_on_exit = ["bookmarks"]` shutdown
+    /// hook in `apps/buffr` — bookmarks are user-explicit so this is
+    /// only honored when the user lists `bookmarks` in `clear_on_exit`.
+    pub fn clear_all(&self) -> Result<usize, BookmarkError> {
+        let conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
+        let n = conn.execute("DELETE FROM bookmarks", [])?;
+        if let Err(err) = conn.execute("VACUUM", []) {
+            tracing::warn!(error = %err, "bookmarks: VACUUM after clear_all failed");
+        }
+        Ok(n)
+    }
+
     /// Parse a Netscape Bookmark File Format HTML document and import
     /// every `<A HREF="...">` it finds. Returns the count of
     /// bookmarks successfully inserted (or upserted).
@@ -699,6 +714,22 @@ mod tests {
         assert!(b.remove(id).unwrap());
         assert!(!b.remove(id).unwrap());
         assert_eq!(b.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_all_wipes_bookmarks_and_tags() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://a.example/", Some("A"), &["t1", "t2"])
+            .unwrap();
+        b.add("https://b.example/", Some("B"), &["t3"]).unwrap();
+        assert_eq!(b.count().unwrap(), 2);
+        let removed = b.clear_all().unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(b.count().unwrap(), 0);
+        // Tags also gone via FK cascade.
+        assert!(b.all_tags().unwrap().is_empty());
+        // Idempotent.
+        assert_eq!(b.clear_all().unwrap(), 0);
     }
 
     #[test]

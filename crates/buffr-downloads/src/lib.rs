@@ -365,6 +365,20 @@ impl Downloads {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |row| row.get(0))?;
         Ok(n as usize)
     }
+
+    /// Delete every download row regardless of status. Returns the
+    /// number deleted. Used by the
+    /// `[privacy] clear_on_exit = ["downloads"]` shutdown hook in
+    /// `apps/buffr`. `clear_completed` is the narrower workflow knob
+    /// for the user; `clear_all` is the destructive shutdown flush.
+    pub fn clear_all(&self) -> Result<usize, DownloadError> {
+        let conn = self.conn.lock().map_err(|_| DownloadError::Poisoned)?;
+        let n = conn.execute("DELETE FROM downloads", [])?;
+        if let Err(err) = conn.execute("VACUUM", []) {
+            tracing::warn!(error = %err, "downloads: VACUUM after clear_all failed");
+        }
+        Ok(n)
+    }
 }
 
 fn row_to_download(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
@@ -569,6 +583,32 @@ mod tests {
         assert_eq!(all[0].id, id3);
         assert_eq!(all[1].id, id2);
         assert_eq!(all[2].id, id1);
+    }
+
+    #[test]
+    fn clear_all_wipes_every_status() {
+        let d = Downloads::open_in_memory().unwrap();
+        let in_flight = d
+            .record_started(1, "https://x.test/a", "a", None, None)
+            .unwrap();
+        let completed = d
+            .record_started(2, "https://x.test/b", "b", None, None)
+            .unwrap();
+        d.record_completed(completed, &PathBuf::from("/tmp/b"))
+            .unwrap();
+        let failed = d
+            .record_started(3, "https://x.test/c", "c", None, None)
+            .unwrap();
+        d.record_failed(failed, "ouch").unwrap();
+        assert_eq!(d.count().unwrap(), 3);
+        let removed = d.clear_all().unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(d.count().unwrap(), 0);
+        assert!(d.get(in_flight).unwrap().is_none());
+        assert!(d.get(completed).unwrap().is_none());
+        assert!(d.get(failed).unwrap().is_none());
+        // Idempotent.
+        assert_eq!(d.clear_all().unwrap(), 0);
     }
 
     #[test]
