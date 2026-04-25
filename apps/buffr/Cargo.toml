@@ -21,3 +21,6 @@ buffr-config.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+cef.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true
