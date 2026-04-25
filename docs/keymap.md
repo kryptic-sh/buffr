@@ -134,5 +134,6 @@ has a guaranteed escape hatch.
 ## Customising
 
 Bindings come from a static table in `crates/buffr-modal/src/keymap.rs`. User
-configuration lands in Phase 4 (`buffr-config`); the schema will mirror the
-table directly.
+overrides go in `~/.config/buffr/config.toml` under `[keymap.<mode>]` — see
+[`config.md`](./config.md) for the full schema and action notation. The watcher
+reloads the keymap on file changes (250ms debounced).

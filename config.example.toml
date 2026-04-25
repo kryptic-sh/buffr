@@ -1,0 +1,90 @@
+# buffr configuration — copy to ~/.config/buffr/config.toml on Linux,
+# ~/Library/Application Support/buffr/config.toml on macOS, or
+# %APPDATA%\buffr\config.toml on Windows. Every key has a default;
+# omitted entries fall back to the values shown below.
+
+[general]
+# Initial URL on first window when no session is restored.
+homepage = "https://example.com"
+# Single-character leader. Vim default is "\\". Engine validates this
+# is exactly one Unicode scalar value at startup; multi-char strings
+# are rejected with an error pointing at general.leader.
+leader = "\\"
+
+[startup]
+# Reopen the previous session's tabs on launch. Phase 5 work — the
+# field is parsed but the session-store glue lands later.
+restore_session = false
+# URL the `t` (tab_new) action navigates to on a fresh tab.
+new_tab_url = "about:blank"
+
+[search]
+# Must match a key under [search.engines.<name>].
+default_engine = "duckduckgo"
+
+[search.engines.duckduckgo]
+url = "https://duckduckgo.com/?q={query}"
+
+[search.engines.google]
+url = "https://www.google.com/search?q={query}"
+
+[theme]
+# Hex accent. Status line, omnibar caret, hint label background.
+accent = "#7aa2f7"
+# auto | dark | light. `auto` follows the desktop's appearance hint.
+mode = "auto"
+
+[privacy]
+# Reserved for future use; buffr never sends telemetry. Setting this
+# to `true` is a no-op until Phase 5 introduces opt-in usage counters.
+enable_telemetry = false
+# Categories cleared on exit. Valid entries (Phase 5+):
+# "cookies", "history", "cache".
+clear_on_exit = []
+
+# ----------------------------------------------------------------------
+# Keymap overrides
+# ----------------------------------------------------------------------
+#
+# Each `[keymap.<mode>]` table maps a vim-notation key sequence to a
+# PageAction. Values are strings using snake_case action names. Unit
+# variants are bare names ("scroll_down"); count-bearing scrolls take
+# a parenthesised count ("scroll_down(3)"); `find` takes a named
+# `forward` boolean ("find(forward = true)"). Mode transitions use
+# `enter_mode("normal" | "visual" | "command" | "hint")`.
+#
+# Bindings overlay on top of the built-in defaults — entries here
+# override individual rows; everything not listed keeps its default.
+#
+# Every binding is validated at load time. An invalid action name or
+# unparseable key sequence aborts startup with a line/column-tagged
+# error.
+
+[keymap.normal]
+"j" = "scroll_down"
+"k" = "scroll_up"
+"gg" = "scroll_top"
+"G" = "scroll_bottom"
+"<C-d>" = "scroll_half_page_down"
+"<C-u>" = "scroll_half_page_up"
+"H" = "history_back"
+"L" = "history_forward"
+"r" = "reload"
+"<C-r>" = "reload_hard"
+"o" = "open_omnibar"
+":" = "open_command_line"
+"f" = "enter_hint_mode"
+"/" = "find(forward = true)"
+"?" = "find(forward = false)"
+"n" = "find_next"
+"N" = "find_prev"
+"y" = "yank_url"
+
+[keymap.visual]
+"<Esc>" = "enter_mode(\"normal\")"
+
+[keymap.command]
+"<Esc>" = "enter_mode(\"normal\")"
+
+[keymap.hint]
+"<Esc>" = "enter_mode(\"normal\")"

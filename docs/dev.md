@@ -118,3 +118,19 @@ cargo test --workspace
 | CEF download              | `xtask/src/main.rs::fetch_cef`   |
 | Page mode FSM             | `crates/buffr-modal/src/lib.rs`  |
 | `hjkl-engine` integration | `crates/buffr-modal/src/host.rs` |
+| Config schema + loader    | `crates/buffr-config/src/lib.rs` |
+
+## Config
+
+`buffr-config` reads `~/.config/buffr/config.toml` (or the OS-specific XDG
+equivalent). Schema reference: [`docs/config.md`](./config.md). A copy-pasteable
+defaults file ships at [`config.example.toml`](../config.example.toml) at the
+repo root — drop it into `$XDG_CONFIG_HOME/buffr/config.toml` to start
+customising.
+
+```sh
+buffr --check-config            # validate ~/.config/buffr/config.toml
+buffr --print-config            # dump the resolved (defaults + overrides) TOML
+buffr --config /tmp/foo.toml    # use a non-default path
+buffr --homepage about:blank    # override general.homepage for one run
+```
