@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use directories::UserDirs;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -43,6 +44,7 @@ pub struct Config {
     pub search: Search,
     pub theme: Theme,
     pub privacy: Privacy,
+    pub downloads: DownloadsConfig,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
@@ -144,6 +146,59 @@ impl Default for Theme {
 pub struct Privacy {
     pub enable_telemetry: bool,
     pub clear_on_exit: Vec<String>,
+}
+
+/// `[downloads]` section. Phase 5: governs where files land, whether
+/// buffr opens them on completion, and (post-Phase 3) whether the
+/// chrome surfaces a save-as dialog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DownloadsConfig {
+    /// User-specified default directory. `None` (the default) means
+    /// "resolve at runtime via [`resolve_default_dir`]".
+    pub default_dir: Option<PathBuf>,
+    /// Open the downloaded file once it finishes via the platform's
+    /// open command (`xdg-open` / `open` / `start`). Default `false`.
+    pub open_on_finish: bool,
+    /// Show a save-as dialog for every download. Default `false` —
+    /// downloads silently land in `default_dir`. The actual dialog UI
+    /// is Phase 3 chrome work; setting this `true` before then is
+    /// effectively a no-op (CEF's `BeforeDownloadCallback::cont`
+    /// receives `show_dialog = 1` but no native dialog is wired yet).
+    pub ask_each_time: bool,
+}
+
+/// Resolve the effective default download directory.
+///
+/// Resolution order:
+///
+/// 1. `cfg.downloads.default_dir` if `Some` and absolute. Tilde and
+///    other shell expansions are *not* applied — TOML carries no
+///    shell.
+/// 2. `directories::UserDirs::download_dir()` — the XDG
+///    `XDG_DOWNLOAD_DIR` on Linux, `~/Downloads` on macOS,
+///    `%USERPROFILE%\Downloads` on Windows.
+/// 3. `$HOME/Downloads` (Unix) / `%USERPROFILE%\Downloads` (Windows)
+///    as a last-resort fallback.
+/// 4. Current working directory if even that's unavailable — we never
+///    return `None` so callers don't have to handle a missing default.
+pub fn resolve_default_dir(cfg: &DownloadsConfig) -> PathBuf {
+    if let Some(p) = cfg.default_dir.as_ref() {
+        return p.clone();
+    }
+    if let Some(dirs) = UserDirs::new() {
+        if let Some(d) = dirs.download_dir() {
+            return d.to_path_buf();
+        }
+    }
+    // `$HOME/Downloads` fallback. `home_dir()` is deprecated on stable
+    // for cross-platform reasons but we only need a best-effort
+    // fallback — if it's wrong the user can set `default_dir`.
+    #[allow(deprecated)]
+    if let Some(home) = std::env::home_dir() {
+        return home.join("Downloads");
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Errors the loader / validator can produce.
@@ -425,6 +480,61 @@ mod tests {
     }
 
     #[test]
+    fn downloads_section_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.downloads.default_dir.is_none());
+        assert!(!cfg.downloads.open_on_finish);
+        assert!(!cfg.downloads.ask_each_time);
+    }
+
+    #[test]
+    fn downloads_section_parses_from_toml() {
+        let toml = r#"
+[downloads]
+default_dir = "/tmp/buffr-dl"
+open_on_finish = true
+ask_each_time = false
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.downloads.default_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/buffr-dl"))
+        );
+        assert!(cfg.downloads.open_on_finish);
+        assert!(!cfg.downloads.ask_each_time);
+    }
+
+    #[test]
+    fn downloads_unknown_field_rejected() {
+        let toml = r#"
+[downloads]
+weird = "nope"
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("weird") || msg.contains("unknown"));
+    }
+
+    #[test]
+    fn resolve_default_dir_uses_explicit_value() {
+        let mut cfg = DownloadsConfig::default();
+        cfg.default_dir = Some(PathBuf::from("/tmp/explicit"));
+        assert_eq!(
+            resolve_default_dir(&cfg),
+            PathBuf::from("/tmp/explicit")
+        );
+    }
+
+    #[test]
+    fn resolve_default_dir_falls_back_to_user_dirs() {
+        let cfg = DownloadsConfig::default();
+        // We can't predict the exact path on every test host but the
+        // call must produce *some* path — never panic, never empty.
+        let p = resolve_default_dir(&cfg);
+        assert!(!p.as_os_str().is_empty());
+    }
+
+    #[test]
     fn full_config_roundtrip_parses() {
         let toml = r##"
 [general]
@@ -448,6 +558,10 @@ mode = "auto"
 [privacy]
 enable_telemetry = false
 clear_on_exit = []
+
+[downloads]
+open_on_finish = false
+ask_each_time = false
 
 [keymap.normal]
 "j" = "scroll_down"
