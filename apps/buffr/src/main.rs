@@ -56,6 +56,27 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    // -------- macOS framework loader ---------------------------------
+    //
+    // On macOS the libcef framework is bundled inside the .app and
+    // must be loaded explicitly through cef-rs's `LibraryLoader`
+    // before any CEF entry. This applies equally to the browser
+    // process and the subprocess case: both run from the same binary
+    // in single-binary mode, but in macOS bundles the helper is a
+    // separate executable that loads the framework with `helper=true`
+    // (path-resolved via `../../..` instead of `../Frameworks`).
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().context("resolving current_exe for LibraryLoader")?;
+        let loader = cef::library_loader::LibraryLoader::new(&exe, false);
+        if !loader.load() {
+            anyhow::bail!("failed to load CEF framework via LibraryLoader");
+        }
+        // Keep the loader alive for the lifetime of the process —
+        // `Drop` calls `unload_library`, which we only want at exit.
+        std::mem::forget(loader);
+    }
+
     // -------- subprocess dispatch (single-binary mode) ----------------
     //
     // CEF re-launches this binary with `--type=renderer` (and other
