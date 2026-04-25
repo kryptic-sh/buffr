@@ -63,6 +63,14 @@ struct Cli {
     /// Print every bookmark tag (sorted) to stdout and exit.
     #[arg(long)]
     list_bookmarks_tags: bool,
+    /// Print every download (most-recent first) to stdout and exit.
+    /// Debug aid until the downloads pane lands (Phase 5b chrome).
+    #[arg(long)]
+    list_downloads: bool,
+    /// Delete every `Completed` download row (keeps Failed/Canceled).
+    /// Prints the count removed.
+    #[arg(long)]
+    clear_completed_downloads: bool,
 }
 
 fn main() -> Result<()> {
@@ -129,6 +137,12 @@ fn main() -> Result<()> {
     if cli.list_bookmarks_tags {
         return run_list_bookmarks_tags();
     }
+    if cli.list_downloads {
+        return run_list_downloads();
+    }
+    if cli.clear_completed_downloads {
+        return run_clear_completed_downloads();
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -189,6 +203,31 @@ fn main() -> Result<()> {
         ConfigSource::File(p) => info!(path = %p.display(), "config loaded"),
         ConfigSource::Defaults => info!("config: built-in defaults"),
     }
+
+    // -------- downloads store + resolved config -----------------------
+    //
+    // Resolve `default_dir` once at startup so the CEF download
+    // handler doesn't have to re-resolve on every event. We also
+    // create the directory if it's missing so the very first download
+    // doesn't fail with ENOENT before CEF gets a chance to fall back.
+    let downloads = Arc::new(
+        buffr_downloads::Downloads::open(paths.data.join("downloads.sqlite"))
+            .context("opening downloads database")?,
+    );
+    let initial_downloads = downloads.count().unwrap_or(0);
+    info!(rows = initial_downloads, "downloads opened");
+
+    let mut downloads_config = config.downloads.clone();
+    if downloads_config.default_dir.is_none() {
+        downloads_config.default_dir = Some(buffr_config::resolve_default_dir(&downloads_config));
+    }
+    if let Some(dir) = downloads_config.default_dir.as_ref() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!(path = %dir.display(), error = %e, "downloads default_dir mkdir failed");
+        }
+        info!(path = %dir.display(), "downloads default_dir resolved");
+    }
+    let downloads_config = Arc::new(downloads_config);
 
     let keymap = buffr_config::build_keymap(&config).context("building keymap from config")?;
     let homepage = cli
@@ -285,7 +324,14 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut app_state = AppState::new(homepage, engine, history, bookmarks);
+    let mut app_state = AppState::new(
+        homepage,
+        engine,
+        history,
+        bookmarks,
+        downloads,
+        downloads_config,
+    );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
@@ -361,6 +407,48 @@ fn run_list_bookmarks_tags() -> Result<()> {
     Ok(())
 }
 
+/// Open the downloads store at the standard data path. Used by the
+/// CLI short-circuits — no CEF init.
+fn open_downloads_for_cli() -> Result<buffr_downloads::Downloads> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    let dl = buffr_downloads::Downloads::open(paths.data.join("downloads.sqlite"))
+        .context("opening downloads database")?;
+    Ok(dl)
+}
+
+fn run_list_downloads() -> Result<()> {
+    let dl = open_downloads_for_cli()?;
+    let all = dl.all(1024).context("loading downloads")?;
+    for d in &all {
+        let status = match d.status {
+            buffr_downloads::DownloadStatus::InFlight => "in_flight",
+            buffr_downloads::DownloadStatus::Completed => "completed",
+            buffr_downloads::DownloadStatus::Canceled => "canceled",
+            buffr_downloads::DownloadStatus::Failed => "failed",
+        };
+        let path = d.full_path.as_deref().unwrap_or("-");
+        let total = d
+            .total_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into());
+        println!(
+            "{}\t{}\t{}\t{}/{}\t{}\t{}",
+            d.id.0, status, d.url, d.received_bytes, total, d.suggested_name, path
+        );
+    }
+    Ok(())
+}
+
+fn run_clear_completed_downloads() -> Result<()> {
+    let dl = open_downloads_for_cli()?;
+    let n = dl
+        .clear_completed()
+        .context("clearing completed downloads")?;
+    println!("cleared {n} completed downloads");
+    Ok(())
+}
+
 /// Minimal winit `ApplicationHandler` that owns one window + one
 /// CEF browser, pumping CEF's message loop on `about_to_wait`.
 ///
@@ -385,6 +473,8 @@ struct AppState {
     history: Arc<buffr_history::History>,
     #[allow(dead_code)]
     bookmarks: Arc<buffr_bookmarks::Bookmarks>,
+    downloads: Arc<buffr_downloads::Downloads>,
+    downloads_config: Arc<buffr_config::DownloadsConfig>,
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
@@ -396,6 +486,8 @@ impl AppState {
         engine: Arc<Mutex<Engine>>,
         history: Arc<buffr_history::History>,
         bookmarks: Arc<buffr_bookmarks::Bookmarks>,
+        downloads: Arc<buffr_downloads::Downloads>,
+        downloads_config: Arc<buffr_config::DownloadsConfig>,
     ) -> Self {
         Self {
             homepage,
@@ -404,6 +496,8 @@ impl AppState {
             engine,
             history,
             bookmarks,
+            downloads,
+            downloads_config,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
@@ -474,7 +568,13 @@ impl ApplicationHandler for AppState {
             }
         };
 
-        match buffr_core::BrowserHost::new(raw, &self.homepage, self.history.clone()) {
+        match buffr_core::BrowserHost::new(
+            raw,
+            &self.homepage,
+            self.history.clone(),
+            self.downloads.clone(),
+            self.downloads_config.clone(),
+        ) {
             Ok(host) => {
                 info!(url = %self.homepage, "browser host created");
                 self.host = Some(host);

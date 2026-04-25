@@ -24,6 +24,7 @@ osr = ["buffr-core/osr"]
 buffr-core.workspace = true
 buffr-history.workspace = true
 buffr-bookmarks.workspace = true
+buffr-downloads.workspace = true
 # Enable the `winit` feature so we can pull in
 # `buffr_modal::key_event_to_chord` to translate winit key events into
 # our internal chord type without re-implementing the mapping.
