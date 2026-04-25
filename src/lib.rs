@@ -27,9 +27,17 @@ pub mod host;
 pub mod key;
 pub mod keymap;
 
+/// winit `KeyEvent` → [`KeyChord`] adapter. Gated behind the `winit`
+/// Cargo feature; the engine itself stays winit-agnostic.
+#[cfg(feature = "winit")]
+pub mod winit_adapter;
+
 pub use actions::{Mode, PageAction, PageMode};
 pub use edit_mode::EditSession;
 pub use engine::{DEFAULT_TIMEOUT, EditModeStep, Engine, Step};
 pub use host::{BuffrEditIntent, BuffrHost};
 pub use key::{Key, KeyChord, Modifiers, NamedKey, ParseError, parse_key, parse_keys};
 pub use keymap::{BindError, Keymap, Lookup};
+
+#[cfg(feature = "winit")]
+pub use winit_adapter::key_event_to_chord;
