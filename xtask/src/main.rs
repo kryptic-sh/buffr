@@ -6,6 +6,10 @@
 //!   downloads the CEF Spotify minimal binary distribution matching the `cef`
 //!   crate version (147 by default) and extracts it into
 //!   `vendor/cef/<platform>/`.
+//! - `bundle-macos [--release] [--target <triple>]` assembles a macOS `.app`
+//!   bundle (with a nested `buffr Helper.app`) under `target/<profile>/`. Runs
+//!   on Linux too; the actual runtime needs macOS, but bundle assembly is
+//!   purely filesystem work and is exercised by CI on a Linux runner.
 //!
 //! Run from the workspace root: `cargo xtask fetch-cef`.
 
@@ -14,7 +18,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +30,24 @@ const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
 /// Spotify CDN entries look like `cef_binary_147.0.10+gXXXXX+chromium-...`;
 /// we pick the newest entry whose version starts with this prefix.
 const CEF_VERSION_PREFIX: &str = "147.";
+
+/// Embedded `Info.plist` template for the main `buffr.app` bundle.
+const MAIN_PLIST_TEMPLATE: &str = include_str!("../templates/main.plist");
+/// Embedded `Info.plist` template for the nested `buffr Helper.app` bundle.
+const HELPER_PLIST_TEMPLATE: &str = include_str!("../templates/helper.plist");
+
+/// Bundle identifiers + display name used by the macOS bundle templates.
+const NAME: &str = "buffr";
+const BUNDLE_ID_MAIN: &str = "sh.kryptic.buffr";
+const BUNDLE_ID_HELPER: &str = "sh.kryptic.buffr.helper";
+const COPYRIGHT: &str = "MIT — kryptic.sh";
+
+/// Env var override for the macOS CEF framework directory.
+///
+/// Bundle scripts (and CI on Linux) may not have a real macOS CEF tarball
+/// available; pointing this at any directory lets `bundle-macos` finish the
+/// assembly step end-to-end so we can catch script regressions per-PR.
+const FRAMEWORK_OVERRIDE_ENV: &str = "BUFFR_BUNDLE_FRAMEWORK_DIR";
 
 #[derive(Debug, Deserialize)]
 struct CefIndex {
@@ -77,6 +99,7 @@ fn run() -> Result<()> {
         .context("missing subcommand (try `fetch-cef`)")?;
     match cmd.as_str() {
         "fetch-cef" => fetch_cef(args.collect()),
+        "bundle-macos" => bundle_macos(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -96,6 +119,10 @@ fn print_help() {
     println!("        Download + extract CEF minimal binary distribution.");
     println!("        PLATFORM: linux64 (default on Linux), macosarm64, macosx64, windows64.");
     println!("        PREFIX:   version prefix to match (default: {CEF_VERSION_PREFIX}).");
+    println!();
+    println!("    bundle-macos [--release] [--target TRIPLE]");
+    println!("        Assemble buffr.app (with nested buffr Helper.app) under");
+    println!("        target/<profile>/. Runs on Linux too (cross-bundle).");
 }
 
 fn fetch_cef(args: Vec<String>) -> Result<()> {
@@ -325,6 +352,265 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+// ----------------------------- bundle-macos ------------------------------
+
+/// Args for `cargo xtask bundle-macos`.
+#[derive(Debug, Default)]
+struct BundleArgs {
+    release: bool,
+    target: Option<String>,
+    /// Which `vendor/cef/<platform>/` to draw the framework from. If
+    /// unset we default to `macosarm64` (the most common Apple target).
+    platform: Option<String>,
+}
+
+fn bundle_macos(args: Vec<String>) -> Result<()> {
+    let mut parsed = BundleArgs::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--release" => parsed.release = true,
+            "--target" => {
+                parsed.target = Some(iter.next().context("--target requires a value")?);
+            }
+            "--platform" => {
+                parsed.platform = Some(iter.next().context("--platform requires a value")?);
+            }
+            other => bail!("unknown bundle-macos arg `{other}`"),
+        }
+    }
+
+    let workspace = workspace_root()?;
+    let profile = if parsed.release { "release" } else { "debug" };
+
+    // 1. Build the binaries.
+    eprintln!("xtask: building buffr + buffr-helper ({profile})");
+    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.current_dir(&workspace)
+        .arg("build")
+        .arg("-p")
+        .arg("buffr")
+        .arg("-p")
+        .arg("buffr-helper");
+    if parsed.release {
+        cmd.arg("--release");
+    }
+    if let Some(t) = parsed.target.as_deref() {
+        cmd.arg("--target").arg(t);
+    }
+    let status = cmd.status().context("spawning cargo build")?;
+    if !status.success() {
+        bail!("cargo build failed (status {status:?})");
+    }
+
+    // Resolve cargo's per-target output dir.
+    let target_dir = match parsed.target.as_deref() {
+        Some(t) => workspace.join("target").join(t).join(profile),
+        None => workspace.join("target").join(profile),
+    };
+
+    let buffr_bin = target_dir.join("buffr");
+    let helper_bin = target_dir.join("buffr-helper");
+    if !buffr_bin.exists() {
+        bail!("expected `{}` after build", buffr_bin.display());
+    }
+    if !helper_bin.exists() {
+        bail!("expected `{}` after build", helper_bin.display());
+    }
+
+    // 2. Resolve framework dir.
+    let framework_dir = resolve_framework_dir(&workspace, parsed.platform.as_deref())?;
+
+    // 3. Stage bundle (idempotent — wipe + rebuild).
+    let app_dir = target_dir.join("buffr.app");
+    if app_dir.exists() {
+        fs::remove_dir_all(&app_dir)
+            .with_context(|| format!("removing existing {}", app_dir.display()))?;
+    }
+
+    let version = workspace_version(&workspace)?;
+    stage_bundle(
+        &app_dir,
+        &buffr_bin,
+        &helper_bin,
+        &framework_dir,
+        version.as_str(),
+    )?;
+
+    eprintln!();
+    eprintln!("xtask: buffr.app staged at {}", app_dir.display());
+    eprintln!("xtask: For ad-hoc local signing:");
+    eprintln!(
+        "           codesign --force --deep --sign - {}",
+        app_dir.display()
+    );
+    eprintln!("xtask: For distribution: see docs/macos-signing.md (TODO)");
+    Ok(())
+}
+
+/// Pick the macOS CEF framework path:
+///
+/// 1. `BUFFR_BUNDLE_FRAMEWORK_DIR` env override (CI uses this with a
+///    stub directory so bundle-script regressions get caught on a
+///    Linux runner without a real macOS CEF tarball on disk).
+/// 2. `vendor/cef/<platform>/Release/Chromium Embedded Framework.framework`.
+fn resolve_framework_dir(workspace: &Path, platform_override: Option<&str>) -> Result<PathBuf> {
+    if let Ok(p) = env::var(FRAMEWORK_OVERRIDE_ENV) {
+        let path = PathBuf::from(p);
+        if !path.exists() {
+            bail!(
+                "{FRAMEWORK_OVERRIDE_ENV} = `{}` does not exist",
+                path.display()
+            );
+        }
+        eprintln!(
+            "xtask: using framework override {}={}",
+            FRAMEWORK_OVERRIDE_ENV,
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    let platform = platform_override.unwrap_or("macosarm64");
+    let candidate = workspace
+        .join("vendor/cef")
+        .join(platform)
+        .join("Release")
+        .join("Chromium Embedded Framework.framework");
+    if !candidate.exists() {
+        bail!(
+            "no macOS CEF framework at {}; \
+             run `cargo xtask fetch-cef --platform {platform}` (cross-fetch) \
+             or set {FRAMEWORK_OVERRIDE_ENV}=<dir> for assembly-only testing",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
+}
+
+/// Read the workspace package version from the root `Cargo.toml`.
+///
+/// We avoid pulling a TOML parser in just for this: the value lives at
+/// `[workspace.package] version = "..."`, and a tiny line scan is
+/// enough for our needs.
+fn workspace_version(workspace: &Path) -> Result<String> {
+    let manifest = workspace.join("Cargo.toml");
+    let text =
+        fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
+    let mut in_workspace_package = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace_package = trimmed == "[workspace.package]";
+            continue;
+        }
+        if in_workspace_package && let Some(rest) = trimmed.strip_prefix("version") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim();
+                let val = rest.trim_matches('"');
+                return Ok(val.to_string());
+            }
+        }
+    }
+    bail!(
+        "could not find workspace.package.version in {}",
+        manifest.display()
+    )
+}
+
+/// Build the bundle layout. See module docs for the tree.
+fn stage_bundle(
+    app_dir: &Path,
+    buffr_bin: &Path,
+    helper_bin: &Path,
+    framework_dir: &Path,
+    version: &str,
+) -> Result<()> {
+    let contents = app_dir.join("Contents");
+    let macos = contents.join("MacOS");
+    let frameworks = contents.join("Frameworks");
+    fs::create_dir_all(&macos).with_context(|| format!("creating {}", macos.display()))?;
+    fs::create_dir_all(&frameworks)
+        .with_context(|| format!("creating {}", frameworks.display()))?;
+
+    // Main Info.plist + PkgInfo.
+    let main_plist = render_main_plist(version);
+    fs::write(contents.join("Info.plist"), main_plist)
+        .with_context(|| format!("writing {}/Info.plist", contents.display()))?;
+    fs::write(contents.join("PkgInfo"), b"APPL????")
+        .with_context(|| format!("writing {}/PkgInfo", contents.display()))?;
+
+    // Main executable.
+    let main_exec = macos.join("buffr");
+    copy_file_executable(buffr_bin, &main_exec)?;
+
+    // Framework — always present in a real build, but we still copy via
+    // recursive walk so the bundle works on Linux runners pointing at a
+    // stub directory via BUFFR_BUNDLE_FRAMEWORK_DIR.
+    let dest_framework = frameworks.join("Chromium Embedded Framework.framework");
+    copy_dir_recursive(framework_dir, &dest_framework)
+        .with_context(|| format!("copying framework into {}", dest_framework.display()))?;
+
+    // Nested helper bundle.
+    let helper_app = frameworks.join("buffr Helper.app");
+    let helper_contents = helper_app.join("Contents");
+    let helper_macos = helper_contents.join("MacOS");
+    fs::create_dir_all(&helper_macos)
+        .with_context(|| format!("creating {}", helper_macos.display()))?;
+
+    let helper_plist = render_helper_plist(version);
+    fs::write(helper_contents.join("Info.plist"), helper_plist)
+        .with_context(|| format!("writing {}/Info.plist", helper_contents.display()))?;
+    fs::write(helper_contents.join("PkgInfo"), b"APPL????")
+        .with_context(|| format!("writing {}/PkgInfo", helper_contents.display()))?;
+
+    // Helper executable — buffr-helper renamed to "buffr Helper".
+    let helper_exec = helper_macos.join("buffr Helper");
+    copy_file_executable(helper_bin, &helper_exec)?;
+
+    Ok(())
+}
+
+fn render_main_plist(version: &str) -> String {
+    MAIN_PLIST_TEMPLATE
+        .replace("{NAME}", NAME)
+        .replace("{VERSION}", version)
+        .replace("{BUNDLE_ID_MAIN}", BUNDLE_ID_MAIN)
+        .replace("{EXECUTABLE}", "buffr")
+        .replace("{COPYRIGHT}", COPYRIGHT)
+}
+
+fn render_helper_plist(version: &str) -> String {
+    HELPER_PLIST_TEMPLATE
+        .replace("{NAME}", NAME)
+        .replace("{VERSION}", version)
+        .replace("{BUNDLE_ID_HELPER}", BUNDLE_ID_HELPER)
+        .replace("{EXECUTABLE}", "buffr Helper")
+        .replace("{COPYRIGHT}", COPYRIGHT)
+}
+
+/// Copy a single file and set executable mode on Unix hosts.
+///
+/// `fs::copy` already preserves permissions on Unix, but we set the
+/// bits explicitly so cross-bundling from a Linux box (where the
+/// source file already has +x) lands a +x file on the destination
+/// regardless of `umask`.
+fn copy_file_executable(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src, dest).with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(dest)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(dest, perms)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +645,105 @@ mod tests {
             url,
             "https://cef-builds.spotifycdn.com/cef_binary_147.0.10_linux64_minimal.tar.bz2"
         );
+    }
+
+    #[test]
+    fn render_main_plist_substitutes_placeholders() {
+        let s = render_main_plist("1.2.3");
+        assert!(s.contains("<string>1.2.3</string>"));
+        assert!(s.contains("<string>sh.kryptic.buffr</string>"));
+        assert!(s.contains("<string>buffr</string>"));
+        assert!(!s.contains("{VERSION}"));
+        assert!(!s.contains("{BUNDLE_ID_MAIN}"));
+        assert!(!s.contains("{EXECUTABLE}"));
+        assert!(!s.contains("{NAME}"));
+        assert!(!s.contains("{COPYRIGHT}"));
+    }
+
+    #[test]
+    fn render_helper_plist_substitutes_placeholders() {
+        let s = render_helper_plist("1.2.3");
+        assert!(s.contains("<string>sh.kryptic.buffr.helper</string>"));
+        assert!(s.contains("<string>buffr Helper</string>"));
+        // Helper plist drops the icon + category.
+        assert!(!s.contains("CFBundleIconFile"));
+        assert!(!s.contains("LSApplicationCategoryType"));
+        // Helper plist must mark itself as a UI element so it never
+        // shows up in the Dock alongside the main bundle.
+        assert!(s.contains("<key>LSUIElement</key>"));
+        assert!(!s.contains("{VERSION}"));
+        assert!(!s.contains("{BUNDLE_ID_HELPER}"));
+    }
+
+    #[test]
+    fn bundle_macos_stage_layout() {
+        // Build a fake framework + binaries on disk and run
+        // `stage_bundle` against them; assert the resulting tree.
+        let tmp = tempdir();
+        let fw = tmp.path().join("Chromium Embedded Framework.framework");
+        fs::create_dir_all(fw.join("Versions/A/Resources")).unwrap();
+        fs::write(fw.join("Versions/A/Chromium Embedded Framework"), b"stub").unwrap();
+
+        let buffr_bin = tmp.path().join("buffr");
+        let helper_bin = tmp.path().join("buffr-helper");
+        fs::write(&buffr_bin, b"#!/bin/sh\necho buffr\n").unwrap();
+        fs::write(&helper_bin, b"#!/bin/sh\necho helper\n").unwrap();
+
+        let app_dir = tmp.path().join("buffr.app");
+        stage_bundle(&app_dir, &buffr_bin, &helper_bin, &fw, "9.9.9").unwrap();
+
+        assert!(app_dir.join("Contents/Info.plist").exists());
+        assert!(app_dir.join("Contents/PkgInfo").exists());
+        assert!(app_dir.join("Contents/MacOS/buffr").exists());
+        assert!(
+            app_dir
+                .join("Contents/Frameworks/Chromium Embedded Framework.framework")
+                .exists()
+        );
+        let helper_app = app_dir.join("Contents/Frameworks/buffr Helper.app");
+        assert!(helper_app.join("Contents/Info.plist").exists());
+        assert!(helper_app.join("Contents/PkgInfo").exists());
+        assert!(helper_app.join("Contents/MacOS/buffr Helper").exists());
+
+        // PkgInfo content.
+        assert_eq!(
+            fs::read_to_string(app_dir.join("Contents/PkgInfo")).unwrap(),
+            "APPL????"
+        );
+
+        // Main plist contains substituted version.
+        let plist = fs::read_to_string(app_dir.join("Contents/Info.plist")).unwrap();
+        assert!(plist.contains("<string>9.9.9</string>"));
+    }
+
+    /// Minimal scratch dir helper. The xtask crate has no `tempfile`
+    /// dep and we want to avoid pulling one in for one test, so we
+    /// build a path under `target/tmp/` that's unique enough for
+    /// parallel `cargo test` runs.
+    fn tempdir() -> TempDir {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("buffr-xtask-{pid}-{nonce}"));
+        fs::create_dir_all(&path).unwrap();
+        TempDir { path }
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
