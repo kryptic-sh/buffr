@@ -14,3 +14,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
+
+# Edit-mode delegates to hjkl-engine against a mirrored Rope synced to
+# the DOM via CEF. Local path dep until hjkl 0.1.0 ships; lockstep churn
+# means breaking changes can land on patch bumps.
+hjkl-engine = { workspace = true }
+hjkl-buffer = { workspace = true }

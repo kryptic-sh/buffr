@@ -11,8 +11,8 @@ members = [
 
 [workspace.package]
 version = "0.0.1"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/kryptic-sh/buffr"
 homepage = "https://kryptic.sh"
@@ -32,6 +32,12 @@ buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
 buffr-ui = { path = "crates/buffr-ui" }
 buffr-config = { path = "crates/buffr-config" }
+
+# Vim engine + rope buffer extracted into a standalone repo. Local path
+# dep across the workspace boundary until hjkl 0.1.0 ships, then swap
+# to "=0.0.x" against crates.io.
+hjkl-engine = { path = "../hjkl/crates/hjkl-engine" }
+hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer", features = ["ratatui"] }
 
 [profile.release]
 lto = "thin"
