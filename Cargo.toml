@@ -60,8 +60,8 @@ buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
 # breaking changes can land on patch bumps.
-hjkl-engine = "=0.0.4"
-hjkl-buffer = "=0.0.4"
+hjkl-engine = "=0.0.16"
+hjkl-buffer = "=0.0.16"
 
 [profile.release]
 lto = "thin"
