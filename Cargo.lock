@@ -216,6 +216,7 @@ name = "buffr-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "buffr-modal",
  "cef",
  "directories",
  "raw-window-handle",
@@ -244,6 +245,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tracing",
+ "winit",
 ]
 
 [[package]]

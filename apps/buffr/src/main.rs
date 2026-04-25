@@ -13,17 +13,21 @@
 //!    the main loop — required for native chrome in Phase 3.)
 //! 6. On exit: shut CEF down cleanly.
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use buffr_core::{BuffrApp, init_cef_api, profile_paths};
+use buffr_modal::{Engine, Keymap, PageMode, Step, key_event_to_chord};
 use cef::{ImplBrowser, Settings};
 use raw_window_handle::HasWindowHandle;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 #[cfg(all(target_os = "linux", not(feature = "osr")))]
 use winit::platform::x11::EventLoopBuilderExtX11;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::ModifiersState,
     window::{Window, WindowId},
 };
 
@@ -140,19 +144,75 @@ fn main() -> Result<()> {
 
 /// Minimal winit `ApplicationHandler` that owns one window + one
 /// CEF browser, pumping CEF's message loop on `about_to_wait`.
+///
+/// Phase 2 additions:
+///
+/// - `engine` — the modal page-mode dispatcher. Default leader is `\`
+///   (vim's default).
+/// - `modifiers` — winit 0.30 splits modifier state out of `KeyEvent`
+///   so we track the latest `ModifiersChanged` payload here and feed
+///   it alongside each pressed key.
+/// - `startup` — wall-clock instant the event loop began. The engine
+///   is clock-agnostic: it just needs a monotonic `Duration`. We pass
+///   `startup.elapsed()` on every `feed`/`tick`.
+/// - `current_mode_label` — last mode rendered into the window title;
+///   only call `set_title` when this changes. winit's `set_title` is
+///   idempotent but cheap → cheaper still to skip.
 struct AppState {
     homepage: String,
     window: Option<Window>,
     host: Option<buffr_core::BrowserHost>,
+    engine: Engine,
+    modifiers: ModifiersState,
+    startup: Instant,
+    current_mode_label: &'static str,
 }
 
 impl AppState {
     fn new(homepage: String) -> Self {
+        let keymap = Keymap::default_bindings('\\');
+        let engine = Engine::new(keymap);
         Self {
             homepage,
             window: None,
             host: None,
+            engine,
+            modifiers: ModifiersState::empty(),
+            startup: Instant::now(),
+            current_mode_label: mode_label(PageMode::Normal),
         }
+    }
+
+    fn dispatch_action(&self, action: &buffr_modal::PageAction) {
+        if let Some(host) = self.host.as_ref() {
+            host.dispatch(action);
+        } else {
+            warn!(?action, "no browser host yet — dropping action");
+        }
+    }
+
+    fn refresh_title(&mut self) {
+        let label = mode_label(self.engine.mode());
+        if label != self.current_mode_label {
+            self.current_mode_label = label;
+            if let Some(window) = self.window.as_ref() {
+                window.set_title(&format!("buffr — {label}"));
+            }
+        }
+    }
+}
+
+/// Map a [`PageMode`] to the status-line label rendered into the
+/// window title. `Pending` collapses to `NORMAL` because the engine
+/// only enters `Pending` mid-multi-chord and we don't want the title
+/// to flicker on every key.
+fn mode_label(mode: PageMode) -> &'static str {
+    match mode {
+        PageMode::Normal | PageMode::Pending => "NORMAL",
+        PageMode::Visual => "VISUAL",
+        PageMode::Command => "COMMAND",
+        PageMode::Hint => "HINT",
+        PageMode::Edit => "EDIT",
     }
 }
 
@@ -162,7 +222,7 @@ impl ApplicationHandler for AppState {
             return;
         }
         let win_attrs = Window::default_attributes()
-            .with_title("buffr")
+            .with_title(format!("buffr — {}", self.current_mode_label))
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
         let window = match event_loop.create_window(win_attrs) {
             Ok(w) => w,
@@ -211,6 +271,35 @@ impl ApplicationHandler for AppState {
                     window.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let Some(chord) = key_event_to_chord(&event, self.modifiers) else {
+                    return;
+                };
+                let now = self.startup.elapsed();
+                match self.engine.feed(chord, now) {
+                    Step::Resolved(action) => {
+                        self.dispatch_action(&action);
+                    }
+                    Step::Pending | Step::Ambiguous { .. } => {
+                        // Phase 3 chrome will surface a count/pending
+                        // buffer indicator in the status line. For
+                        // now, silently accumulate.
+                    }
+                    Step::Reject => {
+                        trace!(?chord, "key not bound");
+                    }
+                    Step::EditModeActive => {
+                        // Edit-mode is the hjkl handoff; until that
+                        // lands the chord is dropped here. The engine
+                        // already updated state, so just trace.
+                        trace!(?chord, "chord dropped — edit-mode integration is Phase 2b");
+                    }
+                }
+                self.refresh_title();
+            }
             _ => {}
         }
     }
@@ -220,6 +309,15 @@ impl ApplicationHandler for AppState {
         // continuously, which is the simplest correct cadence for
         // Phase 1 — Phase 3 will switch to a tickless wakeup.
         cef::do_message_loop_work();
+
+        // Engine ambiguity timeout: if a single-chord prefix is
+        // sitting on the buffer past the timeout window, fire the
+        // shorter binding. This is the vim `&timeoutlen` behaviour.
+        let now = self.startup.elapsed();
+        if let Some(action) = self.engine.tick(now) {
+            self.dispatch_action(&action);
+            self.refresh_title();
+        }
     }
 }
 
