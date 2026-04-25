@@ -42,7 +42,7 @@
 //! when `hjkl_engine::Host` extraction ships upstream.
 
 use crate::actions::{PageAction, PageMode};
-use crate::key::{Key, KeyChord, Modifiers, NamedKey};
+use crate::key::{Key, KeyChord, NamedKey};
 use crate::keymap::{Keymap, Lookup};
 use std::time::Duration;
 
@@ -195,15 +195,14 @@ impl Engine {
             // convention: `0` alone is "go to col 0", which here
             // means it's bindable; `10j` works because `1` started
             // the count already).
-            if chord.modifiers.is_empty() {
-                if let Key::Char(c) = chord.key {
-                    if c.is_ascii_digit() {
-                        let d = (c as u32) - ('0' as u32);
-                        if self.count > 0 || d != 0 {
-                            self.count = self.count.saturating_mul(10).saturating_add(d);
-                            return Step::Pending;
-                        }
-                    }
+            if chord.modifiers.is_empty()
+                && let Key::Char(c) = chord.key
+                && c.is_ascii_digit()
+            {
+                let d = (c as u32) - ('0' as u32);
+                if self.count > 0 || d != 0 {
+                    self.count = self.count.saturating_mul(10).saturating_add(d);
+                    return Step::Pending;
                 }
             }
         }
