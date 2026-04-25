@@ -35,13 +35,23 @@ first. No Electron. No web UI for chrome. Snappy, low memory, good battery.
 |  | buffr-core (CEF host)  | |
 |  +------------------------+ |
 +-----------------------------+
+       |
+       | depends on
+       v
++----------------------------------------------+
+|   crates.io: hjkl-engine, hjkl-buffer,       |
+|              hjkl-editor                     |
+|   (vim FSM + rope + editor, no_std + alloc)  |
++----------------------------------------------+
 ```
 
 - **`buffr-core`** — CEF lifecycle, `CefApp`/`CefClient`, browser host,
   off-screen or windowed rendering, navigation, downloads, profile/cache dirs.
-- **`buffr-modal`** — mode FSM (normal/insert/visual/command/hint), keymap
-  parser (vim-notation: `<C-w>v`, `gT`, `<leader>...`), pending-key buffer,
-  count prefixes, motion grammar.
+- **`buffr-modal`** — **thin layer**: page-mode FSM (normal/visual/command/
+  hint) + dispatcher for browser actions (scroll, tab switch, omnibar, hint).
+  **Does not implement vim text editing** — delegates to `hjkl-editor` for
+  edit-mode (typing in text fields, `<textarea>`, `contenteditable`). Owns
+  page-mode keymap parser; edit-mode keymap comes from `hjkl-engine::Keymap`.
 - **`buffr-ui`** — native window, tab strip, statusline, command palette, hint
   overlay, omnibar. GPU-composited surface hosting CEF view.
 - **`buffr-config`** — TOML loader, schema, hot-reload, XDG/`directories`
@@ -50,6 +60,39 @@ first. No Electron. No web UI for chrome. Snappy, low memory, good battery.
   engine to UI, opens initial window.
 - **`apps/buffr-helper`** — subprocess entry for CEF child processes (renderer,
   GPU, utility). Must be tiny and fast.
+
+### Edit-mode integration with `hjkl-*`
+
+When the user enters a text field on a page (focus event from CEF) and presses
+`i` / `a` / `I` / `A` / etc., buffr enters **edit-mode**:
+
+1. CEF V8 binding reads the field's current value into a mirrored
+   `hjkl_buffer::Rope`.
+2. `hjkl_editor::Editor<Rope, BuffrHost>` is constructed; receives all
+   subsequent keystrokes.
+3. Per render frame, `Editor::take_changes()` returns `Vec<Edit>` which buffr
+   forwards to CEF as DOM updates (`element.value = ...` or
+   `Range.replaceWith`).
+4. On `<Esc>` → exit edit-mode → return to page-mode.
+
+`BuffrHost` impls `hjkl_engine::Host`:
+
+- `write_clipboard` → CEF clipboard API (fire-and-forget).
+- `read_clipboard` → cached value from CEF clipboard read on focus.
+- `Host::Intent` carries buffr-specific events (LSP-equivalents are absent; may
+  include `RequestAutocomplete` for form field hints).
+
+Crate features for hjkl: `default-features = false`, no `crossterm` or `ratatui`
+(browser context). `std` feature enabled (buffr is non-wasm; full std
+available).
+
+### Why hjkl, not in-tree
+
+- Avoids reimplementing vim FSM, motion grammar, registers, undo tree — all
+  already designed for sqeel + reusable.
+- Multicursor primitive (helix-style) lands for free in form fields.
+- Updates flow through one crates.io dependency.
+- See `kryptic-sh/hjkl` repo for full spec + stability contract.
 
 ## Phases
 
@@ -77,17 +120,38 @@ Goal: empty native window renders `https://example.com` via CEF.
 
 ### Phase 2 — Modal engine
 
-Goal: keystrokes routed through modal FSM; basic motions work.
+Goal: keystrokes routed through modal FSM; page actions work; edit-mode
+delegates to `hjkl-editor`.
 
-- [ ] `Mode` enum: `Normal | Insert | Visual | Command | Hint | Pending`.
+**Page-mode (buffr-modal, in-tree)**:
+
+- [ ] `PageMode` enum: `Normal | Visual | Command | Hint | Pending`. (Edit-mode
+      is a separate state that hands off to hjkl.)
 - [ ] Key parser: vim notation → `KeyChord`. Handle `<C-...>`, `<S-...>`,
       `<M-...>`, `<leader>`, `<Space>`, literals.
 - [ ] Keymap trie: prefix lookup, ambiguity timeout, count prefix, register
       prefix (`"a`).
-- [ ] Action dispatch: `Action` enum mapped to host calls (scroll, tab
+- [ ] Page-action dispatch: `PageAction` enum mapped to host calls (scroll, tab
       next/prev/close, back/forward, reload, find, yank URL).
 - [ ] Default bindings table (documented in `docs/keymap.md`).
 - [ ] Unit tests: parser, trie, ambiguity, count, mode transitions.
+
+**Edit-mode (delegates to hjkl)**:
+
+- [ ] Add `hjkl-engine`, `hjkl-buffer`, `hjkl-editor` to workspace deps, pinned
+      `=0.0.x`. No default features.
+- [ ] `BuffrHost` struct impls `hjkl_engine::Host`:
+      `write_clipboard`/`read_clipboard` via CEF clipboard API,
+      `Host::Intent = BuffrEditIntent { RequestAutocomplete, ... }`.
+- [ ] CEF V8 binding for focused text-field value get/set; `apps/buffr-helper`
+      exposes JS bridge.
+- [ ] On focus + `i`/`a`/`I`/`A` etc.: build `Rope` from field value, construct
+      `Editor<Rope, BuffrHost>`, route keys to it.
+- [ ] Per render frame: drain `Editor::take_changes()` → CEF DOM update via JS
+      bridge.
+- [ ] `<Esc>` → exit edit-mode → drop `Editor`, return to page-mode.
+- [ ] Smoke test: open a page with `<textarea>`, focus it, type `iHello<Esc>` →
+      field reads "Hello"; `dd` → field cleared.
 
 ### Phase 3 — UI chrome
 
@@ -153,10 +217,28 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 
 ### Build & toolchain
 
-- Pinned Rust via `rust-toolchain.toml` (TBD).
+- Pinned Rust via `rust-toolchain.toml`, tracking stable (matches `hjkl` MSRV
+  policy).
 - `cargo xtask` for: fetch-cef, package, sign, run-helper.
 - Workspace lints: `clippy::pedantic` opt-in per crate, deny `unwrap` in release
   paths.
+- Platform support matches `hjkl`: linux glibc 2.28+, macOS 12+ (universal),
+  Windows 10+. CEF availability is the harder constraint — only ship buffr where
+  CEF binaries exist.
+
+### Dependencies on hjkl-\*
+
+- `hjkl-engine = "=0.0.x"`, `hjkl-buffer = "=0.0.x"`, `hjkl-editor = "=0.0.x"`,
+  all `default-features = false`, `features = ["std"]` (no `crossterm`, no
+  `ratatui`).
+- Lockstep-pinned with exact `=` until hjkl reaches 0.1.0.
+- Local-dev override for working across both repos:
+  ```toml
+  [patch.crates-io]
+  hjkl-engine = { path = "../hjkl/crates/hjkl-engine" }
+  hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer" }
+  hjkl-editor = { path = "../hjkl/crates/hjkl-editor" }
+  ```
 
 ### Testing
 
@@ -184,14 +266,16 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 
 ## Risk Register
 
-| Risk                                         | Mitigation                                            |
-| -------------------------------------------- | ----------------------------------------------------- |
-| `cef` crate API churn at 147                 | Pin minor; vendor patches if needed.                  |
-| CEF binary size + distribution friction      | `xtask fetch-cef`; cache in CI; mirror tarballs.      |
-| Native chrome over CEF surface compositing   | Prototype early in Phase 3; fall back to OSR if hard. |
-| macOS code signing / notarization complexity | Set up Apple cert in CI before Phase 6.               |
-| Wayland vs X11 input handling differences    | Test both in CI from Phase 1.                         |
-| Modal engine ambiguity / timeout UX          | Vim-parity defaults; configurable via TOML.           |
+| Risk                                         | Mitigation                                                                                     |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `cef` crate API churn at 147                 | Pin minor; vendor patches if needed.                                                           |
+| CEF binary size + distribution friction      | `xtask fetch-cef`; cache in CI; mirror tarballs.                                               |
+| Native chrome over CEF surface compositing   | Prototype early in Phase 3; fall back to OSR if hard.                                          |
+| macOS code signing / notarization complexity | Set up Apple cert in CI before Phase 6.                                                        |
+| Wayland vs X11 input handling differences    | Test both in CI from Phase 1.                                                                  |
+| Modal engine ambiguity / timeout UX          | Vim-parity defaults; configurable via TOML.                                                    |
+| `hjkl-*` 0.0.x churn breaks edit-mode        | Pin `=0.0.x`; lockstep update PR per hjkl release.                                             |
+| DOM ↔ rope sync drift (concurrent edits)     | Pull model: `Editor::take_changes()` per frame; JS-side edits remap via `apply_external_edit`. |
 
 ## Milestones
 
