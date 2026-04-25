@@ -26,6 +26,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
+bitflags = "2"
 toml = "0.8"
 directories = "5"
 winit = "0.30"

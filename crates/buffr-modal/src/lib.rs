@@ -13,11 +13,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod defaults;
 pub mod edit_mode;
 pub mod host;
 pub mod keymap;
 pub mod trie;
 
+pub use defaults::vim_defaults;
 pub use edit_mode::EditSession;
 pub use host::BuffrHost;
 pub use keymap::{ChordMods, KeyAtom, KeyChord, KeyParseError, SpecialKey, parse};
