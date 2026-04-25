@@ -9,9 +9,14 @@
 //! In all cases the helper does the bare minimum: forwards argv to
 //! `cef::execute_process`, exits with whatever code CEF returns.
 
-use buffr_core::BuffrApp;
+use buffr_core::{BuffrApp, init_cef_api};
 
 fn main() {
+    // Pin the CEF API version before touching any CEF entry — see
+    // `buffr_core::init_cef_api` for the gory details. The helper
+    // hits `execute_process` directly, so the call must happen first.
+    init_cef_api();
+
     let args = cef::args::Args::new();
     let mut app = BuffrApp::new();
 

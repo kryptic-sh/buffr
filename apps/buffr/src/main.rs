@@ -14,7 +14,7 @@
 //! 6. On exit: shut CEF down cleanly.
 
 use anyhow::{Context, Result};
-use buffr_core::{BuffrApp, profile_paths};
+use buffr_core::{BuffrApp, init_cef_api, profile_paths};
 use cef::{ImplBrowser, Settings};
 use raw_window_handle::HasWindowHandle;
 use tracing::{info, warn};
@@ -40,6 +40,13 @@ fn main() -> Result<()> {
     // CEF re-launches the main binary with `--type=renderer` etc. for
     // its child processes. `execute_process` returns >= 0 in that
     // case and we must exit immediately afterwards.
+    //
+    // `init_cef_api` MUST run before any other CEF call: cef-rs 147
+    // wraps libcef's API-version negotiation, and skipping it triggers
+    // `CefApp_0_CToCpp called with invalid version -1` the moment a
+    // wrapped trait object (our `BuffrApp`) is handed to CEF.
+    init_cef_api();
+
     let args = cef::args::Args::new();
     let mut app = BuffrApp::new();
 

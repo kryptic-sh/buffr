@@ -34,6 +34,27 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Pin the CEF runtime API version before any CEF entry point.
+///
+/// `cef-rs` 147 wraps libcef 147, which in turn ships an API-version
+/// negotiation layer: every C-to-C++ wrapper checks an integer
+/// "API version" field on the wrapped struct (`App`, `Client`, …) and
+/// aborts with `CefXxx_0_CToCpp called with invalid version -1` if it
+/// hasn't been initialized.
+///
+/// `cef::api_hash(version, 0)` performs that negotiation; the `version`
+/// is sticky after the first call. We call it with `CEF_API_VERSION_LAST`
+/// (the highest version cef-dll-sys was generated against) so all
+/// wrapper entries route through versioned slots instead of the bogus
+/// slot-0 path.
+///
+/// MUST be invoked **before** `cef::execute_process` / `cef::initialize`
+/// in every process — both the browser binary and any helper that
+/// re-enters CEF for renderer/GPU/utility subprocess dispatch.
+pub fn init_cef_api() {
+    let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+}
+
 /// Resolve buffr's per-user profile + cache directories. Created on
 /// first call.
 pub fn profile_paths() -> Result<ProfilePaths, CoreError> {
