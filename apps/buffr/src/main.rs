@@ -12,13 +12,20 @@
 //!    each iteration. (We avoid `cef::run_message_loop` so winit owns
 //!    the main loop — required for native chrome in Phase 3.)
 //! 6. On exit: shut CEF down cleanly.
+//!
+//! Phase 4 additions: clap CLI, TOML config loader, hot-reload watcher
+//! that swaps the live keymap on file changes.
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use buffr_config::{Config, ConfigSource};
 use buffr_core::{BuffrApp, init_cef_api, profile_paths};
-use buffr_modal::{Engine, Keymap, PageMode, Step, key_event_to_chord};
+use buffr_modal::{Engine, PageMode, Step, key_event_to_chord};
 use cef::{ImplBrowser, Settings};
+use clap::Parser;
 use raw_window_handle::HasWindowHandle;
 use tracing::{info, trace, warn};
 #[cfg(all(target_os = "linux", not(feature = "osr")))]
@@ -31,9 +38,58 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const DEFAULT_HOMEPAGE: &str = "https://example.com";
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Print resolved config (TOML) to stdout and exit.
+    #[arg(long)]
+    print_config: bool,
+    /// Validate the config file and exit non-zero on failure.
+    #[arg(long)]
+    check_config: bool,
+    /// Override config file path (default: XDG location).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Override `general.homepage` for this run.
+    #[arg(long, value_name = "URL")]
+    homepage: Option<String>,
+}
 
 fn main() -> Result<()> {
+    // -------- subprocess dispatch (single-binary mode) ----------------
+    //
+    // CEF re-launches this binary with `--type=renderer` (and other
+    // worker args clap doesn't know about), so we must short-circuit
+    // before parsing the user-facing CLI. `cef::execute_process`
+    // returns >= 0 inside a child process and we exit with that code.
+    //
+    // `init_cef_api` MUST run before any other CEF call: cef-rs 147
+    // wraps libcef's API-version negotiation, and skipping it triggers
+    // `CefApp_0_CToCpp called with invalid version -1` the moment a
+    // wrapped trait object (our `BuffrApp`) is handed to CEF.
+    let is_subprocess = std::env::args().any(|a| a.starts_with("--type="));
+    if is_subprocess {
+        init_cef_api();
+        let args = cef::args::Args::new();
+        let mut app = BuffrApp::new();
+        let exit_code = cef::execute_process(
+            Some(args.as_main_args()),
+            Some(&mut app),
+            std::ptr::null_mut(),
+        );
+        std::process::exit(exit_code.max(0));
+    }
+
+    let cli = Cli::parse();
+
+    // -------- short-circuit modes (no CEF init) ----------------------
+    if cli.check_config {
+        return run_check_config(cli.config.as_deref());
+    }
+    if cli.print_config {
+        return run_print_config(cli.config.as_deref());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -41,33 +97,10 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // -------- subprocess dispatch (single-binary mode) --------
-    //
-    // CEF re-launches the main binary with `--type=renderer` etc. for
-    // its child processes. `execute_process` returns >= 0 in that
-    // case and we must exit immediately afterwards.
-    //
-    // `init_cef_api` MUST run before any other CEF call: cef-rs 147
-    // wraps libcef's API-version negotiation, and skipping it triggers
-    // `CefApp_0_CToCpp called with invalid version -1` the moment a
-    // wrapped trait object (our `BuffrApp`) is handed to CEF.
     init_cef_api();
 
     let args = cef::args::Args::new();
     let mut app = BuffrApp::new();
-
-    // SAFETY/SOUNDNESS: `execute_process` reads argv via the platform
-    // CEF shim. It's only safe to call before any GL / window-system
-    // initialization.
-    let exit_code = cef::execute_process(
-        Some(args.as_main_args()),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    );
-    if exit_code >= 0 {
-        // Child process — exit with the code CEF returned.
-        std::process::exit(exit_code);
-    }
 
     info!("buffr v{} starting", env!("CARGO_PKG_VERSION"));
     info!("buffr-core v{}", buffr_core::version());
@@ -76,15 +109,36 @@ fn main() -> Result<()> {
     let paths = profile_paths().context("resolving profile dirs")?;
     info!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
 
+    // -------- load config + build initial keymap ----------------------
+    let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "config load failed; falling back to defaults");
+            (Config::default(), ConfigSource::Defaults)
+        }
+    };
+    match &source {
+        ConfigSource::File(p) => info!(path = %p.display(), "config loaded"),
+        ConfigSource::Defaults => info!("config: built-in defaults"),
+    }
+
+    let keymap = buffr_config::build_keymap(&config).context("building keymap from config")?;
+    let homepage = cli
+        .homepage
+        .clone()
+        .unwrap_or_else(|| config.general.homepage.clone());
+
     // -------- CEF initialize --------
+    let cache_path = paths.cache.to_string_lossy().into_owned();
     let settings = Settings {
         no_sandbox: 1,
         // Drive the loop ourselves; don't let CEF spawn its own thread.
         multi_threaded_message_loop: 0,
-        // root_cache_path / cache_path are CefString fields; we
-        // intentionally leave them at default for Phase 1 to keep this
-        // file readable and let CEF use its defaults under the
-        // process working dir. Phase 4 (config) will plumb them.
+        // Plumb the per-user cache root so CEF doesn't fall back to its
+        // process working dir (and so cookies persist across runs).
+        // Field confirmed in cef-147's bindings:
+        // `Settings::root_cache_path: CefString`.
+        root_cache_path: cef::CefString::from(cache_path.as_str()),
         ..Default::default()
     };
 
@@ -131,7 +185,39 @@ fn main() -> Result<()> {
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app_state = AppState::new(DEFAULT_HOMEPAGE.to_string());
+    let engine = Arc::new(Mutex::new(Engine::new(keymap)));
+
+    // -------- spawn config watcher (keymap-only hot reload) ------------
+    //
+    // Phase 4 hot-apply scope: keymap changes only. Theme / homepage
+    // / startup require a restart for now — full hot-apply is Phase
+    // 5+ work and needs lifecycle hooks the chrome layer doesn't have
+    // yet.
+    let _watcher = if let ConfigSource::File(p) = &source {
+        let engine_for_watch = Arc::clone(&engine);
+        match buffr_config::watch(p.clone(), move |result| match result {
+            Ok(new_cfg) => match buffr_config::build_keymap(&new_cfg) {
+                Ok(km) => {
+                    if let Ok(mut e) = engine_for_watch.lock() {
+                        e.set_keymap(km);
+                        info!("config reloaded — keymap applied");
+                    }
+                }
+                Err(err) => warn!(error = %err, "config reload: keymap rebuild failed"),
+            },
+            Err(err) => warn!(error = %err, "config reload failed"),
+        }) {
+            Ok(w) => Some(w),
+            Err(err) => {
+                warn!(error = %err, "could not start config watcher");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut app_state = AppState::new(homepage, engine);
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
@@ -139,6 +225,29 @@ fn main() -> Result<()> {
     // -------- shutdown --------
     info!("cef shutting down");
     cef::shutdown();
+    Ok(())
+}
+
+fn run_check_config(path: Option<&std::path::Path>) -> Result<()> {
+    match buffr_config::load_and_validate(path) {
+        Ok((_, src)) => {
+            match src {
+                ConfigSource::File(p) => println!("ok: {}", p.display()),
+                ConfigSource::Defaults => println!("ok: (no user config; defaults)"),
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_print_config(path: Option<&std::path::Path>) -> Result<()> {
+    let (cfg, _) = buffr_config::load_and_validate(path).context("loading config")?;
+    let s = buffr_config::to_toml_string(&cfg).context("serializing config")?;
+    print!("{s}");
     Ok(())
 }
 
@@ -162,16 +271,14 @@ struct AppState {
     homepage: String,
     window: Option<Window>,
     host: Option<buffr_core::BrowserHost>,
-    engine: Engine,
+    engine: Arc<Mutex<Engine>>,
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
 }
 
 impl AppState {
-    fn new(homepage: String) -> Self {
-        let keymap = Keymap::default_bindings('\\');
-        let engine = Engine::new(keymap);
+    fn new(homepage: String, engine: Arc<Mutex<Engine>>) -> Self {
         Self {
             homepage,
             window: None,
@@ -192,7 +299,12 @@ impl AppState {
     }
 
     fn refresh_title(&mut self) {
-        let label = mode_label(self.engine.mode());
+        let mode = self
+            .engine
+            .lock()
+            .map(|e| e.mode())
+            .unwrap_or(PageMode::Normal);
+        let label = mode_label(mode);
         if label != self.current_mode_label {
             self.current_mode_label = label;
             if let Some(window) = self.window.as_ref() {
@@ -279,7 +391,11 @@ impl ApplicationHandler for AppState {
                     return;
                 };
                 let now = self.startup.elapsed();
-                match self.engine.feed(chord, now) {
+                let step = match self.engine.lock() {
+                    Ok(mut e) => e.feed(chord, now),
+                    Err(_) => return,
+                };
+                match step {
                     Step::Resolved(action) => {
                         self.dispatch_action(&action);
                     }
@@ -314,7 +430,11 @@ impl ApplicationHandler for AppState {
         // sitting on the buffer past the timeout window, fire the
         // shorter binding. This is the vim `&timeoutlen` behaviour.
         let now = self.startup.elapsed();
-        if let Some(action) = self.engine.tick(now) {
+        let action = match self.engine.lock() {
+            Ok(mut e) => e.tick(now),
+            Err(_) => None,
+        };
+        if let Some(action) = action {
             self.dispatch_action(&action);
             self.refresh_title();
         }
@@ -326,4 +446,15 @@ impl ApplicationHandler for AppState {
 #[allow(dead_code)]
 fn _impl_browser_used() {
     fn _f<T: ImplBrowser>(_: &T) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_help_renders() {
+        Cli::command().debug_assert();
+    }
 }
