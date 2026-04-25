@@ -13,6 +13,12 @@
 use buffr_modal::PageMode;
 
 pub mod font;
+pub mod input_bar;
+
+pub use input_bar::{
+    INPUT_HEIGHT, InputBar, MAX_SUGGESTIONS, Palette as InputPalette, SUGGESTION_ROW_HEIGHT,
+    Suggestion, SuggestionKind,
+};
 
 /// Statusline strip height in pixels. 24 px fits a 10-px glyph row
 /// with comfortable padding above + below; matches the recommendation
@@ -225,7 +231,7 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fill_rect(
+pub(crate) fn fill_rect(
     buffer: &mut [u32],
     width: usize,
     height: usize,
