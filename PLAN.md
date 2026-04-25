@@ -215,10 +215,22 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       `--clear-completed-downloads` exposed on `apps/buffr`.
   - [ ] `ask_each_time` UI is Phase 3 chrome work; for now downloads silently
         land in `default_dir`.
-- [ ] Cookies/site storage: per-profile, clear-on-exit option.
-- [ ] Permissions prompt UI: camera, mic, geolocation, notifications.
-- [ ] Private window: ephemeral profile.
-- [ ] Zoom per-site, persisted.
+- [x] Cookies/site storage: per-profile, clear-on-exit option. Wired via
+      `[privacy] clear_on_exit` listing `cookies` / `cache` / `history` /
+      `bookmarks` / `downloads` / `local_storage`. Cookies route through
+      `cef::cookie_manager_get_global_manager().delete_cookies(None, None, None)`;
+      cache + local-storage are directory-tree wipes under `root_cache_path`;
+      history/bookmarks/downloads call `clear_all` on their respective stores.
+- [ ] Permissions prompt UI: camera, mic, geolocation, notifications. Phase 3
+      chrome dependency — needs prompt-overlay rendering.
+- [x] Private window: ephemeral profile. `--private` CLI flag opens every store
+      in-memory and roots `Settings::root_cache_path` at a `tempfile::TempDir`
+      deleted on shutdown. Single-window incognito; multi-window-per-profile is
+      post-Phase-5 tabs work.
+- [x] Zoom per-site, persisted. `crates/buffr-zoom` SQLite store keyed by
+      `host[:port]` (or `_global_` for hostless URLs). Apply on
+      `LoadHandler::on_load_end`; persist on `ZoomIn` / `ZoomOut` / `ZoomReset`
+      page actions. CLI: `--list-zoom`, `--clear-zoom`.
 - [ ] DevTools toggle (`<C-S-i>`).
 
 ### Phase 6 — Polish & ship

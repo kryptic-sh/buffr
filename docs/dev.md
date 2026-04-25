@@ -174,12 +174,13 @@ cargo test --workspace
 Per-user state buffr writes lives under `directories::ProjectDirs` resolution
 for `sh.kryptic.buffr`. On Linux that's:
 
-| Path                                    | Owner                                      |
-| --------------------------------------- | ------------------------------------------ |
-| `~/.cache/buffr/`                       | CEF cache (cookies, GPU shader cache).     |
-| `~/.local/share/buffr/history.sqlite`   | History DB (Phase 5, `buffr-history`).     |
-| `~/.local/share/buffr/bookmarks.sqlite` | Bookmarks DB (Phase 5, `buffr-bookmarks`). |
-| `~/.local/share/buffr/downloads.sqlite` | Downloads DB (Phase 5, `buffr-downloads`). |
+| Path                                    | Owner                                         |
+| --------------------------------------- | --------------------------------------------- |
+| `~/.cache/buffr/`                       | CEF cache (cookies, GPU shader cache).        |
+| `~/.local/share/buffr/history.sqlite`   | History DB (Phase 5, `buffr-history`).        |
+| `~/.local/share/buffr/bookmarks.sqlite` | Bookmarks DB (Phase 5, `buffr-bookmarks`).    |
+| `~/.local/share/buffr/downloads.sqlite` | Downloads DB (Phase 5, `buffr-downloads`).    |
+| `~/.local/share/buffr/zoom.sqlite`      | Per-site zoom levels (Phase 5, `buffr-zoom`). |
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
@@ -228,3 +229,53 @@ buffr --list-bookmarks-tags
 
 All three flags short-circuit before CEF init, so they work without a display
 server.
+
+## Zoom
+
+`buffr-zoom` ships an SQLite-backed per-site zoom-level store. The CEF
+`LoadHandler::on_load_end` callback restores the persisted level for the domain
+on every load; the `ZoomIn` / `ZoomOut` / `ZoomReset` page actions write
+through. Schema lives in
+[`crates/buffr-zoom/README.md`](../crates/buffr-zoom/README.md).
+
+```sh
+# Print every override (`<domain>\t<level>`).
+buffr --list-zoom
+
+# Wipe every override.
+buffr --clear-zoom
+```
+
+Both flags short-circuit before CEF init.
+
+## Private mode
+
+```sh
+buffr --private
+```
+
+Private mode roots the entire profile under a `tempfile::TempDir`
+(`$TMPDIR/buffr-private-<pid>-<rand>/{cache,data}`) and opens every SQLite store
+in-memory. The tempdir is deleted on shutdown; nothing persists across restarts.
+The window title is stamped `buffr — PRIVATE — NORMAL` so the privacy state is
+obvious from the taskbar.
+
+Caveats:
+
+- This is single-window incognito, not Tor-Browser-grade compartmentalisation.
+  There is no IPC isolation from other buffr processes; running a persistent and
+  a private buffr concurrently shares the same renderer/GPU service-worker pool.
+- The clear-on-exit hook is a no-op in private mode — the tempdir's `Drop`
+  already removes everything.
+- Multi-profile / per-window incognito (one persistent window plus one private
+  window in the same process) is Phase 5 tabs work.
+
+## Clear-on-exit
+
+`[privacy] clear_on_exit` (in `config.toml`) lists data categories that buffr
+wipes after the event loop returns and before `cef::shutdown()`. Cookies route
+through CEF's global `CookieManager::delete_cookies`; cache and local-storage
+are directory-tree wipes under `Settings::root_cache_path`; history / bookmarks
+/ downloads call `clear_all` on their respective stores. See
+[`config.example.toml`](../config.example.toml) for the full list of valid
+entries.
