@@ -23,9 +23,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
+use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{BuffrApp, FindResultSink, init_cef_api, new_find_sink, profile_paths};
-use buffr_modal::{Engine, PageMode, Step, key_event_to_chord};
-use buffr_ui::{CertState, FindStatus, STATUSLINE_HEIGHT, Statusline};
+use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
+use buffr_ui::{
+    CertState, FindStatus, InputBar, STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind,
+};
 use cef::{ImplBrowser, Settings};
 use clap::Parser;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -389,6 +392,8 @@ fn main() -> Result<()> {
 
     let find_sink = new_find_sink();
 
+    let search_config = Arc::new(config.search.clone());
+
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -397,6 +402,7 @@ fn main() -> Result<()> {
         downloads.clone(),
         downloads_config,
         zoom.clone(),
+        search_config,
         cli.private,
         find_sink,
         cli.find.clone(),
@@ -705,11 +711,17 @@ struct AppState {
     host: Option<buffr_core::BrowserHost>,
     engine: Arc<Mutex<Engine>>,
     history: Arc<buffr_history::History>,
-    #[allow(dead_code)]
     bookmarks: Arc<buffr_bookmarks::Bookmarks>,
     downloads: Arc<buffr_downloads::Downloads>,
     downloads_config: Arc<buffr_config::DownloadsConfig>,
     zoom: Arc<buffr_zoom::ZoomStore>,
+    /// Resolved search config used by the omnibar's URL-or-search
+    /// resolver on Enter.
+    search_config: Arc<buffr_config::Search>,
+    /// Active overlay (top-of-window input bar). `None` when the
+    /// engine is in any non-overlay mode; the CEF child rect uses the
+    /// full vertical space minus the bottom statusline.
+    overlay: Option<OverlayState>,
     /// Whether the runtime is in `--private` mode. Drives the title
     /// stamp and is purely informational — the storage layer already
     /// captured the choice at construction time.
@@ -738,6 +750,36 @@ struct AppState {
     /// context can be reused across windows if we ever spawn more.
     softbuffer_ctx: Option<softbuffer::Context<Arc<Window>>>,
     softbuffer_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// Last cursor-blink toggle timestamp. We flip
+    /// `overlay.input.cursor_visible` every 500ms while an overlay is
+    /// open. Static frame (no widget redraw cost when the overlay is
+    /// closed).
+    cursor_blink_at: Instant,
+}
+
+/// Active overlay above the CEF child window.
+///
+/// Both variants wrap the same [`InputBar`]; the discriminant decides
+/// which suggestion source to query and how to handle Enter. The
+/// engine sits in [`PageMode::Command`] for both, so the discriminant
+/// is the only way to tell them apart at dispatch time.
+#[derive(Debug)]
+enum OverlayState {
+    Command(InputBar),
+    Omnibar(InputBar),
+}
+
+impl OverlayState {
+    fn input(&self) -> &InputBar {
+        match self {
+            OverlayState::Command(b) | OverlayState::Omnibar(b) => b,
+        }
+    }
+    fn input_mut(&mut self) -> &mut InputBar {
+        match self {
+            OverlayState::Command(b) | OverlayState::Omnibar(b) => b,
+        }
+    }
 }
 
 impl AppState {
@@ -750,6 +792,7 @@ impl AppState {
         downloads: Arc<buffr_downloads::Downloads>,
         downloads_config: Arc<buffr_config::DownloadsConfig>,
         zoom: Arc<buffr_zoom::ZoomStore>,
+        search_config: Arc<buffr_config::Search>,
         private: bool,
         find_sink: FindResultSink,
         pending_find: Option<String>,
@@ -771,6 +814,8 @@ impl AppState {
             downloads,
             downloads_config,
             zoom,
+            search_config,
+            overlay: None,
             private,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
@@ -781,6 +826,7 @@ impl AppState {
             statusline,
             softbuffer_ctx: None,
             softbuffer_surface: None,
+            cursor_blink_at: Instant::now(),
         }
     }
 
@@ -906,35 +952,413 @@ impl AppState {
                 return;
             }
         };
-        // Statusline writes only the bottom strip; the page region is
-        // owned by the CEF child window above and we never touch it.
-        // softbuffer's API requires `present()` to commit damage,
-        // which paints the whole surface — so the page area must
-        // contain "transparent" pixels. softbuffer 0.4 has no alpha;
-        // on X11, writing 0 produces black, which would clobber the
-        // CEF child window. We sidestep this by only blitting the
-        // strip rows: `present_with_damage` lets us tell the windowing
-        // system that only the bottom rows changed.
+        // Statusline writes only the bottom strip; the input bar (when
+        // active) writes only the top strip. Page region in between is
+        // owned by the CEF child window and we never touch it. We use
+        // `present_with_damage` to avoid blanking the page area —
+        // softbuffer 0.4 has no alpha, so writing zeros to the page
+        // region would clobber CEF's surface on X11.
         self.statusline
             .paint(buf.as_mut(), width as usize, height as usize);
+
+        let mut damage = Vec::with_capacity(2);
+
+        // Statusline damage rect (bottom).
         let strip_h_u = STATUSLINE_HEIGHT.min(height);
         let strip_y = height.saturating_sub(strip_h_u);
-        let Some(strip_h_nz) = NonZeroU32::new(strip_h_u) else {
+        if let Some(strip_h_nz) = NonZeroU32::new(strip_h_u) {
+            damage.push(softbuffer::Rect {
+                x: 0,
+                y: strip_y,
+                width: nz_w,
+                height: strip_h_nz,
+            });
+        }
+
+        // Overlay damage rect (top, if active).
+        if let Some(overlay) = self.overlay.as_ref() {
+            let bar = overlay.input();
+            bar.paint(buf.as_mut(), width as usize, height as usize);
+            let overlay_h = bar.total_height().min(height);
+            if let Some(h_nz) = NonZeroU32::new(overlay_h) {
+                damage.push(softbuffer::Rect {
+                    x: 0,
+                    y: 0,
+                    width: nz_w,
+                    height: h_nz,
+                });
+            }
+        }
+
+        if let Err(err) = buf.present_with_damage(&damage) {
+            warn!(error = %err, "softbuffer present_with_damage failed");
+        }
+    }
+
+    /// Compute the CEF child window rect for the current overlay
+    /// state. The page area sits between the input bar (top, when
+    /// open) and the statusline (bottom, always).
+    fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
+        let chrome_h = STATUSLINE_HEIGHT.min(full_h);
+        let overlay_h = self
+            .overlay
+            .as_ref()
+            .map(|o| o.input().total_height())
+            .unwrap_or(0)
+            .min(full_h.saturating_sub(chrome_h));
+        let cef_w = full_w.max(1);
+        let cef_h = full_h
+            .saturating_sub(chrome_h)
+            .saturating_sub(overlay_h)
+            .max(1);
+        (0, overlay_h, cef_w, cef_h)
+    }
+
+    /// Re-issue the CEF resize call for the current window dimensions.
+    /// Called whenever the overlay opens or closes so the page region
+    /// re-flows to fill the freed space.
+    fn resync_cef_rect(&self) {
+        let Some(window) = self.window.as_ref() else {
             return;
         };
-        // softbuffer 0.4 commits damage rectangles relative to the
-        // surface. Restricting damage to the strip means the X11
-        // server must already hold the page region in its backbuffer
-        // — which is fine, because the CEF child window paints the
-        // page on its own surface.
-        let damage = softbuffer::Rect {
-            x: 0,
-            y: strip_y,
-            width: nz_w,
-            height: strip_h_nz,
+        let size = window.inner_size();
+        let (_x, _y, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
+        if let Some(host) = self.host.as_ref() {
+            host.resize(w, h);
+        }
+    }
+
+    fn open_command_line(&mut self) {
+        self.overlay = Some(OverlayState::Command(InputBar::with_prefix(":")));
+        self.refresh_overlay_suggestions();
+        self.resync_cef_rect();
+        self.request_redraw();
+    }
+
+    fn open_omnibar(&mut self) {
+        let mut bar = InputBar::with_prefix("> ");
+        // Pre-populate with the current page URL so the user can edit
+        // it in place — Vimium / qutebrowser convention.
+        bar.buffer = self.statusline.url.clone();
+        bar.cursor = bar.buffer.len();
+        self.overlay = Some(OverlayState::Omnibar(bar));
+        self.refresh_overlay_suggestions();
+        self.resync_cef_rect();
+        self.request_redraw();
+    }
+
+    fn close_overlay(&mut self) {
+        if self.overlay.is_none() {
+            return;
+        }
+        self.overlay = None;
+        // Engine flips back to Normal so the modal trie resumes.
+        if let Ok(mut e) = self.engine.lock() {
+            e.set_mode(PageMode::Normal);
+        }
+        self.resync_cef_rect();
+        self.refresh_title();
+    }
+
+    /// Recompute the suggestion list for the current overlay buffer.
+    /// Called on every keystroke; SQLite searches at this depth (8
+    /// rows from each store) cost ~1ms on a warm cache, well below
+    /// human typing rates.
+    fn refresh_overlay_suggestions(&mut self) {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
         };
-        if let Err(err) = buf.present_with_damage(&[damage]) {
-            warn!(error = %err, "softbuffer present_with_damage failed");
+        let buffer = overlay.input().buffer.clone();
+        let suggestions = match overlay {
+            OverlayState::Command(_) => self.command_suggestions(&buffer),
+            OverlayState::Omnibar(_) => self.omnibar_suggestions(&buffer),
+        };
+        // Re-borrow the overlay since `self.command_suggestions` /
+        // `omnibar_suggestions` need `&self`.
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.input_mut().set_suggestions(suggestions);
+        }
+    }
+
+    fn command_suggestions(&self, buffer: &str) -> Vec<Suggestion> {
+        let needle = buffer.trim();
+        buffr_core::cmdline::COMMAND_NAMES
+            .iter()
+            .filter(|name| needle.is_empty() || name.starts_with(needle))
+            .take(buffr_ui::MAX_SUGGESTIONS)
+            .map(|name| Suggestion {
+                display: format!(":{name}"),
+                value: (*name).to_string(),
+                kind: SuggestionKind::Command,
+            })
+            .collect()
+    }
+
+    fn omnibar_suggestions(&self, buffer: &str) -> Vec<Suggestion> {
+        let needle = buffer.trim();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<Suggestion> = Vec::with_capacity(buffr_ui::MAX_SUGGESTIONS);
+        let mut seen_urls = std::collections::HashSet::<String>::new();
+
+        // History first.
+        if let Ok(rows) = self.history.search(needle, 8) {
+            for row in rows {
+                if seen_urls.insert(row.url.clone()) {
+                    let display = match row.title.as_deref() {
+                        Some(t) if !t.is_empty() => format!("{t} — {}", row.url),
+                        _ => row.url.clone(),
+                    };
+                    out.push(Suggestion {
+                        display,
+                        value: row.url,
+                        kind: SuggestionKind::History,
+                    });
+                    if out.len() >= buffr_ui::MAX_SUGGESTIONS {
+                        return out;
+                    }
+                }
+            }
+        }
+        // Bookmarks next.
+        if let Ok(rows) = self.bookmarks.search(needle) {
+            for bm in rows.into_iter().take(8) {
+                if seen_urls.insert(bm.url.clone()) {
+                    let display = match bm.title.as_deref() {
+                        Some(t) if !t.is_empty() => format!("{t} — {}", bm.url),
+                        _ => bm.url.clone(),
+                    };
+                    out.push(Suggestion {
+                        display,
+                        value: bm.url,
+                        kind: SuggestionKind::Bookmark,
+                    });
+                    if out.len() >= buffr_ui::MAX_SUGGESTIONS {
+                        return out;
+                    }
+                }
+            }
+        }
+        // Search fallback (always last when there's room).
+        if out.len() < buffr_ui::MAX_SUGGESTIONS {
+            let resolved = buffr_config::resolve_input(needle, &self.search_config);
+            if !resolved.is_empty() {
+                out.push(Suggestion {
+                    display: format!("Search: {needle}"),
+                    value: resolved,
+                    kind: SuggestionKind::SearchSuggestion,
+                });
+            }
+        }
+        out
+    }
+
+    /// Route a winit `KeyEvent` to the open overlay. Returns `true` if
+    /// the event was consumed (caller skips the engine path).
+    fn overlay_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.overlay.is_none() {
+            return false;
+        }
+        let chord = match key_event_to_chord(event, self.modifiers) {
+            Some(c) => c,
+            None => return true, // overlay swallows unmappable keys too
+        };
+        // Esc / <C-c> cancel. <CR> confirms. Everything else either
+        // edits the buffer or moves the selection.
+        let mods = chord.modifiers;
+        let key = chord.key;
+        let is_ctrl = mods.contains(buffr_modal::Modifiers::CTRL)
+            && !mods.contains(buffr_modal::Modifiers::SHIFT);
+
+        match (key, is_ctrl) {
+            (Key::Named(NamedKey::Esc), _) | (Key::Char('c'), true) => {
+                self.close_overlay();
+            }
+            (Key::Char('u'), true) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_clear_line();
+                }
+                self.refresh_overlay_suggestions();
+                self.request_redraw();
+            }
+            (Key::Char('w'), true) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_delete_word();
+                }
+                self.refresh_overlay_suggestions();
+                self.request_redraw();
+            }
+            (Key::Named(NamedKey::CR), _) => {
+                self.confirm_overlay();
+            }
+            (Key::Named(NamedKey::Tab), _) | (Key::Named(NamedKey::Down), _) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_down();
+                }
+                self.request_redraw();
+            }
+            (Key::Named(NamedKey::BackTab), _) | (Key::Named(NamedKey::Up), _) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_up();
+                }
+                self.request_redraw();
+            }
+            (Key::Named(NamedKey::Left), _) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_left();
+                }
+                self.request_redraw();
+            }
+            (Key::Named(NamedKey::Right), _) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_right();
+                }
+                self.request_redraw();
+            }
+            (Key::Named(NamedKey::BS), _) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_back();
+                }
+                self.refresh_overlay_suggestions();
+                self.request_redraw();
+            }
+            (Key::Char(c), false) => {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_text(c);
+                }
+                self.refresh_overlay_suggestions();
+                self.request_redraw();
+            }
+            _ => {
+                // Unhandled chord while overlay open — swallow so the
+                // engine doesn't see it. Phase 3b may surface a beep.
+            }
+        }
+        true
+    }
+
+    fn confirm_overlay(&mut self) {
+        let Some(overlay) = self.overlay.take() else {
+            return;
+        };
+        // Engine flips back regardless of dispatch outcome.
+        if let Ok(mut e) = self.engine.lock() {
+            e.set_mode(PageMode::Normal);
+        }
+        match overlay {
+            OverlayState::Command(bar) => self.dispatch_command(&bar),
+            OverlayState::Omnibar(bar) => self.dispatch_omnibar(&bar),
+        }
+        self.resync_cef_rect();
+        self.refresh_title();
+    }
+
+    fn dispatch_command(&mut self, bar: &InputBar) {
+        // If the user hit Enter on a selected suggestion, prefer that
+        // value (the bare command name) over the typed buffer.
+        let raw = bar.current_value();
+        let parsed = parse_cmdline(raw);
+        match parsed {
+            Command::Quit => {
+                tracing::info!("cmdline: quit requested — exit on next event-loop tick");
+                if let Some(window) = self.window.as_ref() {
+                    // Trigger a CloseRequested-equivalent path. winit
+                    // 0.30 doesn't have a public "exit now" API on the
+                    // app-handler half — push a close to the window.
+                    window.request_redraw();
+                }
+                // Set a flag the event loop can read. Simpler:
+                // request the OS to close the window, which winit
+                // surfaces as CloseRequested.
+                std::process::exit(0);
+            }
+            Command::Reload => {
+                self.dispatch_action(&buffr_modal::PageAction::Reload);
+            }
+            Command::Back => {
+                self.dispatch_action(&buffr_modal::PageAction::HistoryBack);
+            }
+            Command::Forward => {
+                self.dispatch_action(&buffr_modal::PageAction::HistoryForward);
+            }
+            Command::Open(url) => {
+                if let Some(host) = self.host.as_ref() {
+                    if let Err(err) = host.navigate(&url) {
+                        warn!(error = %err, %url, "open: navigate failed");
+                    }
+                } else {
+                    warn!(%url, "open: no host yet");
+                }
+            }
+            Command::TabNew => {
+                tracing::info!("cmdline: :tabnew — multi-tab is Phase 5");
+            }
+            Command::Set { key, value } => {
+                self.apply_set(&key, &value);
+            }
+            Command::Find(query) => {
+                if let Some(host) = self.host.as_ref() {
+                    self.statusline.find_query = Some(FindStatus {
+                        query: query.clone(),
+                        current: 0,
+                        total: 0,
+                    });
+                    host.start_find(&query, true);
+                }
+            }
+            Command::Bookmark { tags } => {
+                let url = self.statusline.url.clone();
+                if url.is_empty() {
+                    tracing::warn!(":bookmark — no current URL");
+                } else {
+                    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                    match self.bookmarks.add(&url, None, &tag_refs) {
+                        Ok(_) => tracing::info!(%url, ?tags, "bookmark added"),
+                        Err(err) => tracing::warn!(error = %err, %url, "bookmark failed"),
+                    }
+                }
+            }
+            Command::DevTools => {
+                self.dispatch_action(&buffr_modal::PageAction::OpenDevTools);
+            }
+            Command::Unknown(s) => {
+                tracing::warn!(input = %s, "cmdline: unknown command");
+            }
+        }
+    }
+
+    fn apply_set(&mut self, key: &str, value: &str) {
+        match key {
+            "zoom" => match value {
+                "in" => self.dispatch_action(&buffr_modal::PageAction::ZoomIn),
+                "out" => self.dispatch_action(&buffr_modal::PageAction::ZoomOut),
+                "reset" | "0" => self.dispatch_action(&buffr_modal::PageAction::ZoomReset),
+                other => tracing::warn!(value = %other, ":set zoom — expected in/out/reset"),
+            },
+            other => tracing::warn!(key = %other, value, ":set — unknown key"),
+        }
+    }
+
+    fn dispatch_omnibar(&mut self, bar: &InputBar) {
+        let raw = bar.current_value().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        // If a suggestion is selected its `value` is already a real
+        // URL; otherwise resolve the typed buffer.
+        let target = if bar.selected.is_some() {
+            raw
+        } else {
+            buffr_config::resolve_input(&raw, &self.search_config)
+        };
+        if target.is_empty() {
+            return;
+        }
+        if let Some(host) = self.host.as_ref()
+            && let Err(err) = host.navigate(&target)
+        {
+            warn!(error = %err, target = %target, "omnibar: navigate failed");
         }
     }
 }
@@ -1059,12 +1483,11 @@ impl ApplicationHandler for AppState {
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
-                // Trim the CEF child to leave room for the strip and
-                // tell CEF to re-lay-out. softbuffer's surface gets
-                // re-sized lazily inside `paint_chrome`.
-                let chrome_h = STATUSLINE_HEIGHT.min(new_size.height);
-                let cef_w = new_size.width.max(1);
-                let cef_h = new_size.height.saturating_sub(chrome_h).max(1);
+                // Trim the CEF child to leave room for the chrome
+                // strips. `cef_child_rect` accounts for the overlay
+                // when active.
+                let (_x, _y, cef_w, cef_h) =
+                    self.cef_child_rect(new_size.width.max(1), new_size.height.max(1));
                 if let Some(host) = self.host.as_ref() {
                     host.resize(cef_w, cef_h);
                 }
@@ -1074,6 +1497,10 @@ impl ApplicationHandler for AppState {
                 self.modifiers = mods.state();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Overlay open → all keys route to it.
+                if self.overlay_handle_key(&event) {
+                    return;
+                }
                 let Some(chord) = key_event_to_chord(&event, self.modifiers) else {
                     return;
                 };
@@ -1084,7 +1511,22 @@ impl ApplicationHandler for AppState {
                 };
                 match step {
                     Step::Resolved(action) => {
-                        self.dispatch_action(&action);
+                        // OpenOmnibar / OpenCommandLine flip the
+                        // engine into Mode::Command and ALSO open the
+                        // matching overlay UI. The host's `dispatch`
+                        // for these is a no-op log, so we handle the
+                        // UI side here.
+                        match &action {
+                            buffr_modal::PageAction::OpenOmnibar => {
+                                self.open_omnibar();
+                            }
+                            buffr_modal::PageAction::OpenCommandLine => {
+                                self.open_command_line();
+                            }
+                            _ => {
+                                self.dispatch_action(&action);
+                            }
+                        }
                     }
                     Step::Pending | Step::Ambiguous { .. } => {
                         // Phase 3 chrome will surface a count/pending
@@ -1131,6 +1573,21 @@ impl ApplicationHandler for AppState {
         // dispatch is due.
         self.pump_find_results();
         self.maybe_dispatch_find_smoke();
+
+        // Cursor blink for the open overlay. 500ms toggle; we only
+        // request a redraw when the bit actually flips so the page
+        // region isn't repainted needlessly.
+        if self.overlay.is_some() {
+            let now = Instant::now();
+            if now.duration_since(self.cursor_blink_at) >= Duration::from_millis(500) {
+                self.cursor_blink_at = now;
+                if let Some(overlay) = self.overlay.as_mut() {
+                    let bar = overlay.input_mut();
+                    bar.cursor_visible = !bar.cursor_visible;
+                }
+                self.request_redraw();
+            }
+        }
     }
 }
 
