@@ -1,0 +1,19 @@
+[package]
+name = "buffr-downloads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "SQLite-backed downloads store for buffr (Phase 5)."
+
+[dependencies]
+# `bundled` ships libsqlite3 inside the crate so we don't take a system
+# dep — buffr is shipped as a self-contained binary on every platform.
+rusqlite = { workspace = true, features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+chrono = { workspace = true, features = ["serde", "clock"] }

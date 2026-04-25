@@ -7,6 +7,7 @@ members = [
     "crates/buffr-config",
     "crates/buffr-history",
     "crates/buffr-bookmarks",
+    "crates/buffr-downloads",
     "apps/buffr",
     "apps/buffr-helper",
     "xtask",
@@ -56,6 +57,7 @@ buffr-ui = { path = "crates/buffr-ui" }
 buffr-config = { path = "crates/buffr-config" }
 buffr-history = { path = "crates/buffr-history" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
+buffr-downloads = { path = "crates/buffr-downloads" }
 
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
