@@ -21,15 +21,20 @@
 //! - [`Bookmarks::search`] does case-insensitive substring match over
 //!   url, title, and any tag, with ordering
 //!   `title-match > url-match > tag-match`, then `modified DESC`.
+//! - [`Bookmarks::import_netscape`] parses the Netscape Bookmark File
+//!   Format (Chrome/Firefox/Edge export shape) via a regex walker —
+//!   the format is loose enough that a real HTML parser is overkill.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, trace};
 
 pub mod schema;
 
@@ -395,8 +400,7 @@ impl Bookmarks {
     /// All distinct tags, sorted alphabetically.
     pub fn all_tags(&self) -> Result<Vec<String>, BookmarkError> {
         let conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT tag FROM bookmark_tags ORDER BY tag ASC")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT tag FROM bookmark_tags ORDER BY tag ASC")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -408,6 +412,123 @@ impl Bookmarks {
         let conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))?;
         Ok(n as usize)
+    }
+
+    /// Parse a Netscape Bookmark File Format HTML document and import
+    /// every `<A HREF="...">` it finds. Returns the count of
+    /// bookmarks successfully inserted (or upserted).
+    ///
+    /// Folder names from enclosing `<H3>` tags are added as tags on
+    /// every `<A>` inside that folder. The `TAGS=` attribute on each
+    /// `<A>` (Chrome / Pinboard convention) is split on comma and
+    /// merged.
+    ///
+    /// Implementation: regex-based walker. The Netscape format is
+    /// loose HTML — unbalanced tags, no DTD, no closing `</DT>` — so a
+    /// strict parser is overkill. We scan top-to-bottom, push folder
+    /// names from `<H3>` onto a stack (popping on `</DL>`), and emit
+    /// one `add()` per `<A>`.
+    pub fn import_netscape(&self, html: &str) -> Result<usize, BookmarkError> {
+        // Tokens we walk in document order. We can't reuse a single
+        // regex because `regex` doesn't support overlapping captures,
+        // and we genuinely need to know the relative ordering of
+        // `<H3>`, `</DL>`, and `<A>` to maintain the folder stack.
+        let h3_re = Regex::new(r"(?is)<H3[^>]*>(.*?)</H3>").expect("h3 regex");
+        let a_re = Regex::new(r#"(?is)<A\s+([^>]*)>(.*?)</A>"#).expect("a regex");
+        let dl_close_re = Regex::new(r"(?i)</DL>").expect("dl regex");
+        let attr_re = Regex::new(r#"(?i)(\w+)\s*=\s*"([^"]*)""#).expect("attr regex");
+
+        // Collect every match with its byte position so we can sort
+        // them into one ordered token stream.
+        enum Tok<'a> {
+            FolderOpen(&'a str),
+            FolderClose,
+            Anchor { attrs: &'a str, label: &'a str },
+        }
+        let mut toks: Vec<(usize, Tok<'_>)> = Vec::new();
+        for m in h3_re.captures_iter(html) {
+            let pos = m.get(0).map(|m| m.start()).unwrap_or(0);
+            let label = m.get(1).map(|m| m.as_str()).unwrap_or("");
+            toks.push((pos, Tok::FolderOpen(label)));
+        }
+        for m in dl_close_re.find_iter(html) {
+            toks.push((m.start(), Tok::FolderClose));
+        }
+        for m in a_re.captures_iter(html) {
+            let pos = m.get(0).map(|m| m.start()).unwrap_or(0);
+            let attrs = m.get(1).map(|m| m.as_str()).unwrap_or("");
+            let label = m.get(2).map(|m| m.as_str()).unwrap_or("");
+            toks.push((pos, Tok::Anchor { attrs, label }));
+        }
+        toks.sort_by_key(|(pos, _)| *pos);
+
+        // Walk: folder stack mirrors `<DL>` nesting via `<H3>` opens
+        // and `</DL>` closes. The Netscape format places one `<H3>`
+        // immediately before its `<DL>`, and we never see the `<DL>`
+        // open token here (we don't need it — the `<H3>` itself opens
+        // the folder for tag-purposes).
+        let mut folder_stack: Vec<String> = Vec::new();
+        let mut count = 0usize;
+        for (_, tok) in toks {
+            match tok {
+                Tok::FolderOpen(label) => {
+                    let cleaned = strip_html(label).trim().to_string();
+                    folder_stack.push(cleaned);
+                }
+                Tok::FolderClose => {
+                    folder_stack.pop();
+                }
+                Tok::Anchor { attrs, label } => {
+                    let mut href: Option<String> = None;
+                    let mut tags: Vec<String> = Vec::new();
+                    for m in attr_re.captures_iter(attrs) {
+                        let key = m
+                            .get(1)
+                            .map(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_ascii_uppercase();
+                        let val = m.get(2).map(|x| x.as_str()).unwrap_or("");
+                        match key.as_str() {
+                            "HREF" => href = Some(val.to_string()),
+                            "TAGS" => {
+                                for t in val.split(',') {
+                                    let trimmed = t.trim();
+                                    if !trimmed.is_empty() {
+                                        tags.push(trimmed.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(href) = href else {
+                        trace!("netscape import: <A> without HREF; skipping");
+                        continue;
+                    };
+                    // Folders → tags. Filter empties so `<H3></H3>`
+                    // doesn't poison the tag list.
+                    for folder in &folder_stack {
+                        if !folder.is_empty() {
+                            tags.push(folder.clone());
+                        }
+                    }
+                    let title = strip_html(label);
+                    let title_opt = if title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(title)
+                    };
+                    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                    match self.add(&href, title_opt.as_deref(), &tag_refs) {
+                        Ok(_) => count += 1,
+                        Err(e) => {
+                            debug!(error = %e, href = %href, "netscape import: skipping malformed entry");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -442,6 +563,16 @@ fn normalise_tags(tags: &[&str]) -> Vec<String> {
         }
     }
     set.into_iter().collect()
+}
+
+/// Strip a small set of HTML tags from a string. Netscape titles
+/// occasionally contain `<B>`, `<I>`, `<BR>`. We don't need a real
+/// HTML parser — just drop the angle-bracketed bits.
+fn strip_html(s: &str) -> String {
+    // SAFETY: regex is a constant; compile error only on programmer
+    // mistake, which would surface in tests.
+    let re = Regex::new(r"<[^>]+>").expect("strip_html regex");
+    re.replace_all(s, "").trim().to_string()
 }
 
 #[cfg(test)]
@@ -575,5 +706,55 @@ mod tests {
         let b = Bookmarks::open_in_memory().unwrap();
         let err = b.add("not a url", None, &[]);
         assert!(matches!(err, Err(BookmarkError::Url { .. })));
+    }
+
+    const NETSCAPE_FIXTURE: &str = r#"<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<TITLE>Bookmarks</TITLE>
+<H1>Bookmarks</H1>
+<DL><p>
+    <DT><H3>Rust</H3>
+    <DL><p>
+        <DT><A HREF="https://rust-lang.org/" ADD_DATE="1700000000">Rust language</A>
+        <DT><A HREF="https://crates.io/" ADD_DATE="1700000001" TAGS="package,registry">crates.io</A>
+    </DL><p>
+    <DT><H3>News</H3>
+    <DL><p>
+        <DT><A HREF="https://news.example.com/a" ADD_DATE="1700000002">A</A>
+        <DT><A HREF="https://news.example.com/b" ADD_DATE="1700000003">B</A>
+        <DT><A HREF="https://news.example.com/c" ADD_DATE="1700000004">C</A>
+    </DL><p>
+</DL><p>
+"#;
+
+    #[test]
+    fn import_netscape_5_bookmarks_2_folders() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let imported = b.import_netscape(NETSCAPE_FIXTURE).unwrap();
+        assert_eq!(imported, 5);
+        assert_eq!(b.count().unwrap(), 5);
+
+        let rust_hits = b.by_tag("rust").unwrap();
+        assert_eq!(rust_hits.len(), 2);
+        let news_hits = b.by_tag("news").unwrap();
+        assert_eq!(news_hits.len(), 3);
+
+        // TAGS= attribute also imported.
+        let pkg = b.by_tag("package").unwrap();
+        assert_eq!(pkg.len(), 1);
+        assert_eq!(pkg[0].url, "https://crates.io/");
+    }
+
+    #[test]
+    fn import_netscape_skips_malformed() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html = r#"<DL>
+            <DT><A HREF="https://ok.example/">Good</A>
+            <DT><A HREF="not a url">Bad</A>
+            <DT><A>NoHref</A>
+        </DL>"#;
+        let imported = b.import_netscape(html).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(b.count().unwrap(), 1);
     }
 }

@@ -18,3 +18,4 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono = { workspace = true, features = ["serde", "clock"] }
 url.workspace = true
+regex.workspace = true
