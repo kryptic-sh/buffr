@@ -412,7 +412,10 @@ mod tests {
             parse_keys("<F13>"),
             Err(ParseError::UnknownNamed(_))
         ));
-        assert!(matches!(parse_keys("<F0>"), Err(ParseError::UnknownNamed(_))));
+        assert!(matches!(
+            parse_keys("<F0>"),
+            Err(ParseError::UnknownNamed(_))
+        ));
     }
 
     #[test]

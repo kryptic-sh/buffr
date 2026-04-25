@@ -10,82 +10,26 @@
 //!
 //! See `PLAN.md` "Edit-mode integration with `hjkl-*`" for the full
 //! data flow.
+//!
+//! # Layout
+//!
+//! - [`actions`] — [`PageAction`] / [`PageMode`] / [`Mode`]
+//! - [`key`] — vim-notation parser → [`KeyChord`] / [`Modifiers`]
+//! - [`keymap`] — mode-scoped trie + ambiguity resolution
+//! - [`edit_mode`] — [`EditSession`] wrapping `hjkl_engine::Editor`
+//! - [`host`] — [`BuffrHost`] adapter implementing
+//!   `hjkl_engine::Host`
 
-use serde::{Deserialize, Serialize};
-
-pub mod defaults;
+pub mod actions;
 pub mod edit_mode;
+pub mod engine;
 pub mod host;
+pub mod key;
 pub mod keymap;
-pub mod trie;
 
-pub use defaults::vim_defaults;
+pub use actions::{Mode, PageAction, PageMode};
 pub use edit_mode::EditSession;
-pub use host::BuffrHost;
-pub use keymap::{ChordMods, KeyAtom, KeyChord, KeyParseError, SpecialKey, parse};
-pub use trie::{Keymap, Lookup};
-
-/// Coarse mode displayed in the status line. `Edit` is a single state
-/// here even though `hjkl_engine` may be in Normal/Insert/Visual
-/// internally — the page-mode FSM doesn't care which sub-mode the
-/// embedded editor is in, only that page-level keystrokes route to
-/// `BuffrHost` instead of the page action dispatcher.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Mode {
-    #[default]
-    Normal,
-    Visual,
-    Command,
-    Hint,
-    Edit,
-}
-
-/// Page-mode FSM states. Distinct from [`Mode`] (the status-line summary)
-/// — `PageMode` is what the keymap trie dispatches against.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PageMode {
-    #[default]
-    Normal,
-    Visual,
-    Command,
-    Hint,
-    /// A pending key sequence is being collected (e.g., `g…`, `<C-w>…`).
-    Pending,
-    /// Edit-mode is active; keystrokes route to the embedded
-    /// `hjkl_engine::Editor`.
-    Edit,
-}
-
-/// Page-level actions emitted by the modal dispatcher. The host (CEF
-/// shell) translates each into a CEF command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageAction {
-    ScrollUp(u32),
-    ScrollDown(u32),
-    ScrollLeft(u32),
-    ScrollRight(u32),
-    ScrollPageUp,
-    ScrollPageDown,
-    ScrollTop,
-    ScrollBottom,
-
-    TabNext,
-    TabPrev,
-    TabClose,
-    TabNew,
-
-    HistoryBack,
-    HistoryForward,
-    Reload,
-    StopLoading,
-
-    OpenOmnibar,
-    OpenCommandLine,
-    EnterHintMode,
-
-    YankUrl,
-
-    /// Defer to the embedded `hjkl_engine::Editor`. Keystroke unchanged;
-    /// the modal dispatcher swallows nothing on this path.
-    EnterEditMode,
-}
+pub use engine::{DEFAULT_TIMEOUT, EditModeStep, Engine, Step};
+pub use host::{BuffrEditIntent, BuffrHost};
+pub use key::{Key, KeyChord, Modifiers, NamedKey, ParseError, parse_key, parse_keys};
+pub use keymap::{BindError, Keymap, Lookup};
