@@ -42,6 +42,22 @@ enable_telemetry = false
 # "cookies", "history", "cache".
 clear_on_exit = []
 
+[downloads]
+# Directory downloads land in. If unset (the default), buffr resolves
+# at runtime in this order:
+#   1. directories::UserDirs::download_dir() (XDG_DOWNLOAD_DIR on
+#      Linux; ~/Downloads on macOS; %USERPROFILE%\Downloads on Windows)
+#   2. $HOME/Downloads as a last-resort fallback.
+# default_dir = "/home/me/Downloads"
+#
+# Open the file via the platform's launcher (xdg-open / open / start)
+# the moment a download finishes. Default false.
+open_on_finish = false
+# Show a save-as dialog for every download. The dialog UI is Phase 3
+# chrome work; for now downloads silently land in default_dir
+# regardless of this setting.
+ask_each_time = false
+
 # ----------------------------------------------------------------------
 # Keymap overrides
 # ----------------------------------------------------------------------
