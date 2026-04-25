@@ -130,6 +130,20 @@ fn main() -> Result<()> {
     let paths = profile_paths().context("resolving profile dirs")?;
     info!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
 
+    // -------- history store --------
+    //
+    // Phase 5: SQLite-backed history at
+    // `<data>/history.sqlite`. `BrowserHost` keeps an `Arc<History>`
+    // and CEF's `LoadHandler` / `DisplayHandler` (wired in
+    // `buffr_core::handlers`) pump every main-frame visit + title
+    // into it.
+    let history = Arc::new(
+        buffr_history::History::open(paths.data.join("history.sqlite"))
+            .context("opening history database")?,
+    );
+    let initial_rows = history.count().unwrap_or(0);
+    info!(rows = initial_rows, "history opened");
+
     // -------- load config + build initial keymap ----------------------
     let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
         Ok(v) => v,
@@ -238,7 +252,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut app_state = AppState::new(homepage, engine);
+    let mut app_state = AppState::new(homepage, engine, history);
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
@@ -293,18 +307,24 @@ struct AppState {
     window: Option<Window>,
     host: Option<buffr_core::BrowserHost>,
     engine: Arc<Mutex<Engine>>,
+    history: Arc<buffr_history::History>,
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
 }
 
 impl AppState {
-    fn new(homepage: String, engine: Arc<Mutex<Engine>>) -> Self {
+    fn new(
+        homepage: String,
+        engine: Arc<Mutex<Engine>>,
+        history: Arc<buffr_history::History>,
+    ) -> Self {
         Self {
             homepage,
             window: None,
             host: None,
             engine,
+            history,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
@@ -375,7 +395,7 @@ impl ApplicationHandler for AppState {
             }
         };
 
-        match buffr_core::BrowserHost::new(raw, &self.homepage) {
+        match buffr_core::BrowserHost::new(raw, &self.homepage, self.history.clone()) {
             Ok(host) => {
                 info!(url = %self.homepage, "browser host created");
                 self.host = Some(host);
