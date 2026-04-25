@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod edit_mode;
 pub mod host;
+pub mod keymap;
 
 pub use edit_mode::EditSession;
 pub use host::BuffrHost;
+pub use keymap::{ChordMods, KeyAtom, KeyChord, KeyParseError, SpecialKey, parse};
 
 /// Coarse mode displayed in the status line. `Edit` is a single state
 /// here even though `hjkl_engine` may be in Normal/Insert/Visual
