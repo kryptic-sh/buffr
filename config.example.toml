@@ -38,8 +38,26 @@ mode = "auto"
 # Reserved for future use; buffr never sends telemetry. Setting this
 # to `true` is a no-op until Phase 5 introduces opt-in usage counters.
 enable_telemetry = false
-# Categories cleared on exit. Valid entries (Phase 5+):
-# "cookies", "history", "cache".
+# Categories wiped on shutdown. Each entry is processed independently:
+# one failure doesn't skip the rest. Successes log at INFO; failures
+# at WARN. Order in the list does not matter.
+#
+# Valid entries:
+#   "cookies"        — flush every cookie via CEF's global cookie
+#                      manager.
+#   "cache"          — delete <root_cache_path>/Cache (recreated on
+#                      next startup).
+#   "history"        — wipe every row in history.sqlite.
+#   "bookmarks"      — wipe every row in bookmarks.sqlite. Destructive;
+#                      only honored when listed.
+#   "downloads"      — wipe every row in downloads.sqlite (regardless
+#                      of status).
+#   "local_storage"  — delete <root_cache_path>/Local Storage.
+#
+# Example: paranoid web-browsing — wipe cookies, cache, and local
+# storage on exit; keep history + bookmarks.
+#
+# clear_on_exit = ["cookies", "cache", "local_storage"]
 clear_on_exit = []
 
 [downloads]

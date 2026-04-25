@@ -141,11 +141,35 @@ impl Default for Theme {
     }
 }
 
+/// Categories of locally-stored data the shutdown hook can wipe when
+/// listed in `[privacy] clear_on_exit`. Variants map onto independent
+/// teardown paths in `apps/buffr/src/main.rs::run_clear_on_exit`. Adding
+/// a variant here is the only place a new clearable category needs to
+/// register — the shutdown hook matches exhaustively.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearableData {
+    /// Cookies, via the CEF global `CookieManager::delete_cookies`.
+    Cookies,
+    /// CEF cache directory (`<root_cache_path>/Cache`).
+    Cache,
+    /// `buffr-history` SQLite store — every visit row.
+    History,
+    /// `buffr-bookmarks` SQLite store — every bookmark + tag. Listed
+    /// here is destructive and only honored when explicit.
+    Bookmarks,
+    /// `buffr-downloads` SQLite store — every row regardless of status.
+    Downloads,
+    /// CEF localStorage / IndexedDB tree
+    /// (`<root_cache_path>/Local Storage`).
+    LocalStorage,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Privacy {
     pub enable_telemetry: bool,
-    pub clear_on_exit: Vec<String>,
+    pub clear_on_exit: Vec<ClearableData>,
 }
 
 /// `[downloads]` section. Phase 5: governs where files land, whether
@@ -531,6 +555,38 @@ weird = "nope"
         // call must produce *some* path — never panic, never empty.
         let p = resolve_default_dir(&cfg);
         assert!(!p.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn privacy_clear_on_exit_parses_known_variants() {
+        let toml = r#"
+[privacy]
+enable_telemetry = false
+clear_on_exit = ["cookies", "cache", "history", "bookmarks", "downloads", "local_storage"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.privacy.clear_on_exit,
+            vec![
+                ClearableData::Cookies,
+                ClearableData::Cache,
+                ClearableData::History,
+                ClearableData::Bookmarks,
+                ClearableData::Downloads,
+                ClearableData::LocalStorage,
+            ]
+        );
+    }
+
+    #[test]
+    fn privacy_clear_on_exit_unknown_variant_rejected() {
+        let toml = r#"
+[privacy]
+clear_on_exit = ["everything"]
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("everything") || msg.contains("unknown"));
     }
 
     #[test]
