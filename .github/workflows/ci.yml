@@ -29,6 +29,8 @@ jobs:
             libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
+            libgl1 libegl1 libgles2 \
             xvfb
 
       - name: install rust toolchain
