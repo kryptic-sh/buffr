@@ -164,10 +164,24 @@ cargo test --workspace
 | CEF download              | `xtask/src/main.rs::fetch_cef`      |
 | Page mode FSM             | `crates/buffr-modal/src/lib.rs`     |
 | `hjkl-engine` integration | `crates/buffr-modal/src/host.rs`    |
+| Statusline + bitmap font  | `crates/buffr-ui/src/lib.rs`        |
+| Find-in-page sink         | `crates/buffr-core/src/find.rs`     |
 | Config schema + loader    | `crates/buffr-config/src/lib.rs`    |
 | History store             | `crates/buffr-history/src/lib.rs`   |
 | Bookmarks store           | `crates/buffr-bookmarks/src/lib.rs` |
 | Downloads store           | `crates/buffr-downloads/src/lib.rs` |
+
+## UI
+
+Phase 3 chrome (statusline today; tab strip / command bar / hint mode later)
+lives in `crates/buffr-ui`. Rendering decisions are in
+[`docs/ui-stack.md`](./ui-stack.md): a `softbuffer` strip docked to the bottom
+of the buffr `winit` window, with the CEF child window sized to the remaining
+rect. The 24-pixel statusline draws via a hand-rolled 6x10 bitmap font in
+`crates/buffr-ui/src/font.rs`. Find-in-page is wired through
+`BrowserHost::start_find` / `stop_find`; a `--find <query>` CLI flag on
+`apps/buffr` exercises the round trip without a command bar (the Phase 3b
+dependency that blocks `Find { forward }` action UI).
 
 ## Storage
 

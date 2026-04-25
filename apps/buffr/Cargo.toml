@@ -40,3 +40,4 @@ winit.workspace = true
 raw-window-handle.workspace = true
 clap.workspace = true
 tempfile.workspace = true
+softbuffer.workspace = true

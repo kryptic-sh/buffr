@@ -16,17 +16,19 @@
 //! Phase 4 additions: clap CLI, TOML config loader, hot-reload watcher
 //! that swaps the live keymap on file changes.
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
-use buffr_core::{BuffrApp, init_cef_api, profile_paths};
+use buffr_core::{BuffrApp, FindResultSink, init_cef_api, new_find_sink, profile_paths};
 use buffr_modal::{Engine, PageMode, Step, key_event_to_chord};
+use buffr_ui::{CertState, FindStatus, STATUSLINE_HEIGHT, Statusline};
 use cef::{ImplBrowser, Settings};
 use clap::Parser;
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tempfile::TempDir;
 use tracing::{info, trace, warn};
 #[cfg(all(target_os = "linux", not(feature = "osr")))]
@@ -88,6 +90,13 @@ struct Cli {
     /// (Tor-Browser-grade) is out of scope for Phase 5.
     #[arg(long)]
     private: bool,
+    /// Smoke-test flag for Phase 3 find-in-page wiring. After the
+    /// browser is created and the homepage starts loading, kicks off
+    /// a single find for `<query>` (forward search). Match counts
+    /// are routed through the statusline; tracing also logs each
+    /// `OnFindResult` tick so the smoke job can scrape them.
+    #[arg(long, value_name = "QUERY")]
+    find: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -378,6 +387,8 @@ fn main() -> Result<()> {
         None
     };
 
+    let find_sink = new_find_sink();
+
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -387,6 +398,8 @@ fn main() -> Result<()> {
         downloads_config,
         zoom.clone(),
         cli.private,
+        find_sink,
+        cli.find.clone(),
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -688,7 +701,7 @@ fn clear_cookies() {
 ///   idempotent but cheap → cheaper still to skip.
 struct AppState {
     homepage: String,
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
     host: Option<buffr_core::BrowserHost>,
     engine: Arc<Mutex<Engine>>,
     history: Arc<buffr_history::History>,
@@ -704,6 +717,27 @@ struct AppState {
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
+    /// Find-in-page mailbox shared with the CEF `FindHandler`. The UI
+    /// thread polls this each frame and copies the latest result
+    /// into `statusline.find_query`.
+    find_sink: FindResultSink,
+    /// One-shot smoke query for `--find`. Drained once the browser
+    /// has loaded enough that `start_find` is meaningful (see the
+    /// `find_smoke_at` deadline below).
+    pending_find: Option<String>,
+    /// Wall-clock deadline at which `pending_find` is dispatched.
+    /// CEF refuses `find` until at least one frame has been laid out;
+    /// 1.5 s is a comfortable margin without a real load-finished
+    /// signal (Phase 3b will tie this to `OnLoadEnd`).
+    find_smoke_at: Option<Instant>,
+    /// Latest statusline render input. Mutated on mode change, find
+    /// tick, count buffer change; the `RedrawRequested` handler
+    /// repaints from this without re-deriving from the engine.
+    statusline: Statusline,
+    /// `softbuffer` graphics context. `Surface` is per-window; the
+    /// context can be reused across windows if we ever spawn more.
+    softbuffer_ctx: Option<softbuffer::Context<Arc<Window>>>,
+    softbuffer_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
 }
 
 impl AppState {
@@ -717,7 +751,16 @@ impl AppState {
         downloads_config: Arc<buffr_config::DownloadsConfig>,
         zoom: Arc<buffr_zoom::ZoomStore>,
         private: bool,
+        find_sink: FindResultSink,
+        pending_find: Option<String>,
     ) -> Self {
+        let mut statusline = Statusline {
+            url: homepage.clone(),
+            private,
+            cert_state: CertState::Unknown,
+            ..Statusline::default()
+        };
+        statusline.mode = PageMode::Normal;
         Self {
             homepage,
             window: None,
@@ -732,6 +775,12 @@ impl AppState {
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
+            find_sink,
+            pending_find,
+            find_smoke_at: None,
+            statusline,
+            softbuffer_ctx: None,
+            softbuffer_surface: None,
         }
     }
 
@@ -756,17 +805,136 @@ impl AppState {
     }
 
     fn refresh_title(&mut self) {
-        let mode = self
-            .engine
-            .lock()
-            .map(|e| e.mode())
-            .unwrap_or(PageMode::Normal);
+        let (mode, count) = match self.engine.lock() {
+            Ok(e) => (e.mode(), e.count_buffer()),
+            Err(_) => (PageMode::Normal, None),
+        };
         let label = mode_label(mode);
         if label != self.current_mode_label {
             self.current_mode_label = label;
             if let Some(window) = self.window.as_ref() {
                 window.set_title(&self.title_for(label));
             }
+        }
+        // Statusline reflects mode + count every refresh — both can
+        // change between tick callbacks.
+        self.statusline.mode = mode;
+        self.statusline.count_buffer = count;
+        self.request_redraw();
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Drain the find-result mailbox into the statusline. Called from
+    /// `about_to_wait` so the chrome reflects the latest CEF tick on
+    /// the next paint.
+    fn pump_find_results(&mut self) {
+        if let Some(result) = buffr_core::take_find_result(&self.find_sink) {
+            // Preserve the user's query string — `FindResult` only
+            // carries counts. If `find_query` is `None` the caller
+            // hasn't issued a `start_find` yet (legitimate during
+            // shutdown); silently drop the tick.
+            let query = self
+                .statusline
+                .find_query
+                .as_ref()
+                .map(|s| s.query.clone())
+                .or_else(|| self.pending_find.clone());
+            if let Some(query) = query {
+                self.statusline.find_query = Some(FindStatus {
+                    query,
+                    current: result.current,
+                    total: result.count,
+                });
+                self.request_redraw();
+            }
+            tracing::info!(
+                count = result.count,
+                current = result.current,
+                final_update = result.final_update,
+                "find: result tick"
+            );
+        }
+    }
+
+    /// If `--find` was passed and the smoke deadline elapsed, kick
+    /// the find off exactly once.
+    fn maybe_dispatch_find_smoke(&mut self) {
+        let Some(deadline) = self.find_smoke_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.find_smoke_at = None;
+        if let (Some(host), Some(query)) = (self.host.as_ref(), self.pending_find.take()) {
+            tracing::info!(%query, "find smoke: start_find");
+            self.statusline.find_query = Some(FindStatus {
+                query: query.clone(),
+                current: 0,
+                total: 0,
+            });
+            host.start_find(&query, true);
+        }
+    }
+
+    fn paint_chrome(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Some(surface) = self.softbuffer_surface.as_mut() else {
+            return;
+        };
+        let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        let (Some(nz_w), Some(nz_h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
+            return;
+        };
+        if let Err(err) = surface.resize(nz_w, nz_h) {
+            warn!(error = %err, "softbuffer resize failed");
+            return;
+        }
+        let mut buf = match surface.buffer_mut() {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(error = %err, "softbuffer buffer_mut failed");
+                return;
+            }
+        };
+        // Statusline writes only the bottom strip; the page region is
+        // owned by the CEF child window above and we never touch it.
+        // softbuffer's API requires `present()` to commit damage,
+        // which paints the whole surface — so the page area must
+        // contain "transparent" pixels. softbuffer 0.4 has no alpha;
+        // on X11, writing 0 produces black, which would clobber the
+        // CEF child window. We sidestep this by only blitting the
+        // strip rows: `present_with_damage` lets us tell the windowing
+        // system that only the bottom rows changed.
+        self.statusline
+            .paint(buf.as_mut(), width as usize, height as usize);
+        let strip_h_u = STATUSLINE_HEIGHT.min(height);
+        let strip_y = height.saturating_sub(strip_h_u);
+        let Some(strip_h_nz) = NonZeroU32::new(strip_h_u) else {
+            return;
+        };
+        // softbuffer 0.4 commits damage rectangles relative to the
+        // surface. Restricting damage to the strip means the X11
+        // server must already hold the page region in its backbuffer
+        // — which is fine, because the CEF child window paints the
+        // page on its own surface.
+        let damage = softbuffer::Rect {
+            x: 0,
+            y: strip_y,
+            width: nz_w,
+            height: strip_h_nz,
+        };
+        if let Err(err) = buf.present_with_damage(&[damage]) {
+            warn!(error = %err, "softbuffer present_with_damage failed");
         }
     }
 }
@@ -801,6 +969,7 @@ impl ApplicationHandler for AppState {
                 return;
             }
         };
+        let window = Arc::new(window);
 
         let raw = match window.window_handle() {
             Ok(h) => h.as_raw(),
@@ -811,6 +980,14 @@ impl ApplicationHandler for AppState {
             }
         };
 
+        // CEF child window leaves room at the bottom for the chrome
+        // strip. We pass the trimmed size so the X11 child rect is
+        // sized correctly from frame zero.
+        let inner = window.inner_size();
+        let chrome_h = STATUSLINE_HEIGHT.min(inner.height);
+        let cef_w = inner.width.max(1);
+        let cef_h = inner.height.saturating_sub(chrome_h).max(1);
+
         match buffr_core::BrowserHost::new(
             raw,
             &self.homepage,
@@ -818,6 +995,8 @@ impl ApplicationHandler for AppState {
             self.downloads.clone(),
             self.downloads_config.clone(),
             self.zoom.clone(),
+            self.find_sink.clone(),
+            (cef_w, cef_h),
         ) {
             Ok(host) => {
                 info!(url = %self.homepage, "browser host created");
@@ -826,6 +1005,40 @@ impl ApplicationHandler for AppState {
             Err(err) => {
                 warn!(error = %err, "failed to create browser host");
             }
+        }
+
+        // softbuffer context lives off the display handle; surface
+        // wraps the window. Both must outlive any `buffer_mut()` call.
+        match window.display_handle() {
+            Ok(_) => {
+                let context = match softbuffer::Context::new(window.clone()) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        warn!(error = %err, "softbuffer Context::new failed");
+                        self.window = Some(window);
+                        return;
+                    }
+                };
+                let surface = match softbuffer::Surface::new(&context, window.clone()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!(error = %err, "softbuffer Surface::new failed");
+                        self.softbuffer_ctx = Some(context);
+                        self.window = Some(window);
+                        return;
+                    }
+                };
+                self.softbuffer_ctx = Some(context);
+                self.softbuffer_surface = Some(surface);
+            }
+            Err(err) => warn!(error = %err, "no raw display handle for softbuffer"),
+        }
+
+        // Schedule the find smoke-test dispatch for 1.5s after window
+        // creation. This is a coarse "page is probably ready" timer
+        // because we don't yet hook `OnLoadEnd` into the host.
+        if self.pending_find.is_some() {
+            self.find_smoke_at = Some(Instant::now() + Duration::from_millis(1500));
         }
 
         self.window = Some(window);
@@ -843,9 +1056,19 @@ impl ApplicationHandler for AppState {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
+                self.paint_chrome();
+            }
+            WindowEvent::Resized(new_size) => {
+                // Trim the CEF child to leave room for the strip and
+                // tell CEF to re-lay-out. softbuffer's surface gets
+                // re-sized lazily inside `paint_chrome`.
+                let chrome_h = STATUSLINE_HEIGHT.min(new_size.height);
+                let cef_w = new_size.width.max(1);
+                let cef_h = new_size.height.saturating_sub(chrome_h).max(1);
+                if let Some(host) = self.host.as_ref() {
+                    host.resize(cef_w, cef_h);
                 }
+                self.request_redraw();
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -902,6 +1125,12 @@ impl ApplicationHandler for AppState {
             self.dispatch_action(&action);
             self.refresh_title();
         }
+
+        // Drain any find result the CEF browser thread posted since
+        // the last tick, then check whether the `--find` smoke
+        // dispatch is due.
+        self.pump_find_results();
+        self.maybe_dispatch_find_smoke();
     }
 }
 

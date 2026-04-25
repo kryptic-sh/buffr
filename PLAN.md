@@ -167,19 +167,28 @@ delegates to `hjkl-editor`.
 
 Goal: tab strip + statusline + command line + omnibar, all native.
 
-- [ ] Window backend choice: `winit` for window/event loop; `wgpu` or
-      platform-native compositor for chrome layer above CEF surface. Decision
-      doc in `docs/ui-stack.md`.
+- [x] Window backend choice: `winit` for window/event loop; chrome painted into
+      a `softbuffer = "0.4"` strip docked below the CEF child window. Decision
+      recorded in [`docs/ui-stack.md`](./docs/ui-stack.md). `wgpu`/OSR
+      compositor reserved for the hint-mode migration.
 - [ ] Implement `crates/buffr-core/src/osr.rs` (currently scaffolded). Wire
       `OsrHost::new` to real CEF windowless mode + wgpu compositor so Wayland
       sessions can run natively without XWayland.
 - [ ] Tab strip: render, drag-reorder, close-on-middle-click, overflow.
-- [ ] Statusline: mode indicator, URL, progress, cert state, count buffer.
-- [ ] Command line (`:`): input, history, completion, async results.
+- [x] Statusline: mode indicator, URL, progress, cert state, count buffer.
+      Bundled 6x10 bitmap font in `buffr-ui::font`; widget renders into a
+      `softbuffer::Surface`. Phase 3b adds load-progress / cert hookup.
+- [ ] Command line (`:`): input, history, completion, async results. **Phase 3b
+      dependency** — find-in-page needs this for `Find { forward }`.
 - [ ] Omnibar (`o`/`O`): search-or-URL, suggestions from history.
 - [ ] Hint mode (`f`/`F`): DOM query via CEF V8 binding → overlay labels →
-      keystroke filter → click/focus dispatch.
-- [ ] Find-in-page (`/`, `?`, `n`, `N`): wire to CEF find API.
+      keystroke filter → click/focus dispatch. Triggers the migration to OSR +
+      `wgpu` compositing — see `docs/ui-stack.md`.
+- [x] Find-in-page (`/`, `?`, `n`, `N`): wired to CEF `find` API via
+      `BrowserHost::start_find` / `stop_find` and a `BuffrFindHandler` that
+      pumps `OnFindResult` into the statusline. UI for entering the query
+      requires the command bar (Phase 3b); a `--find <query>` smoke flag on
+      `apps/buffr` exercises the wiring without UI.
 
 ### Phase 4 — Config
 
