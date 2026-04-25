@@ -8,6 +8,7 @@ members = [
     "crates/buffr-history",
     "crates/buffr-bookmarks",
     "crates/buffr-downloads",
+    "crates/buffr-zoom",
     "apps/buffr",
     "apps/buffr-helper",
     "xtask",
@@ -50,6 +51,9 @@ url = "2"
 # Used by `buffr-bookmarks` for Netscape HTML import. Format is loose
 # enough that pulling a real HTML parser would be overkill.
 regex = "1"
+# Ephemeral profile dir for `--private` mode. The TempDir's Drop
+# tears the tree down at process exit so no state persists.
+tempfile = "3"
 
 buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
@@ -58,6 +62,7 @@ buffr-config = { path = "crates/buffr-config" }
 buffr-history = { path = "crates/buffr-history" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 buffr-downloads = { path = "crates/buffr-downloads" }
+buffr-zoom = { path = "crates/buffr-zoom" }
 
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means

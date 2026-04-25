@@ -211,9 +211,11 @@ dependencies = [
  "buffr-history",
  "buffr-modal",
  "buffr-ui",
+ "buffr-zoom",
  "cef",
  "clap",
  "raw-window-handle",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "winit",
@@ -255,6 +257,7 @@ dependencies = [
  "buffr-downloads",
  "buffr-history",
  "buffr-modal",
+ "buffr-zoom",
  "cef",
  "directories",
  "raw-window-handle",
@@ -317,6 +320,17 @@ dependencies = [
  "anyhow",
  "buffr-modal",
  "tracing",
+]
+
+[[package]]
+name = "buffr-zoom"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
 ]
 
 [[package]]
