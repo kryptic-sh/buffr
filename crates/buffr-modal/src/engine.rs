@@ -132,6 +132,18 @@ impl Engine {
         &mut self.keymap
     }
 
+    /// Replace the live keymap and reset the pending chord buffer.
+    /// Used by hot-reload in `apps/buffr` so config edits swap bindings
+    /// without restarting CEF.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
+        self.pending.clear();
+        self.pending_started = None;
+        self.count = 0;
+        self.register = None;
+        self.awaiting_register_char = false;
+    }
+
     pub fn mode(&self) -> PageMode {
         self.mode
     }
