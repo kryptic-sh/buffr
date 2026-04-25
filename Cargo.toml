@@ -54,6 +54,10 @@ regex = "1"
 # Ephemeral profile dir for `--private` mode. The TempDir's Drop
 # tears the tree down at process exit so no state persists.
 tempfile = "3"
+# Phase 3 chrome — software-blit bitmap surface for the statusline strip
+# below the CEF child window. No GPU dependency; drawing is a per-pixel
+# `&mut [u32]` blit driven by the bitmap font in `buffr-ui::font`.
+softbuffer = "0.4"
 
 buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
