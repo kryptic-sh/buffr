@@ -76,8 +76,28 @@ buffr/
 RUST_LOG=buffr=debug,buffr_core=debug cargo run -p buffr
 ```
 
-On Wayland sessions you may need `WINIT_UNIX_BACKEND=x11` (Phase 1 parents the
-CEF browser into an X11 window; native Wayland support is a Phase 3 task).
+### Wayland
+
+The default build embeds CEF as a windowed child of an X11 window — that's the
+only mode CEF supports on Linux. On Wayland sessions buffr forces winit's X11
+backend at startup (`EventLoopBuilderExtX11::with_x11()`), so the compositor
+transparently proxies the X11 traffic through XWayland.
+
+This works on every major Wayland desktop that ships XWayland — GNOME, KDE,
+Sway, Hyprland — which is the default on essentially every distribution. Minimal
+compositors without XWayland (e.g. a stock `weston` build) won't work until
+native Wayland support lands.
+
+Native Wayland (no XWayland round-trip) is Phase 3 work, gated behind the `osr`
+feature:
+
+```sh
+# Currently panics at runtime — only compiles. Tracking issue: PLAN.md Phase 3.
+cargo run -p buffr --features osr
+```
+
+The OSR path will run CEF in windowless mode, blitting paint events onto a
+winit-owned Wayland surface via wgpu.
 
 ## Useful commands
 

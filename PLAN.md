@@ -116,6 +116,10 @@ Goal: empty native window renders `https://example.com` via CEF.
       profile/cache dir via `directories`.
 - [x] `buffr-core::Host`: create browser, attach to native window handle.
 - [x] `apps/buffr` main: init tracing, CEF init, open one tab, run loop.
+- [x] Wayland: XWayland default; native Wayland gated behind `--features osr`
+      (Phase 3 scope). `apps/buffr` forces the winit X11 backend via
+      `EventLoopBuilderExtX11::with_x11()` so Wayland sessions transparently run
+      via XWayland.
 - [ ] CI: Linux build + smoke test (window opens, page loads, exits clean).
       Build job landed in `.github/workflows/ci.yml`; runtime smoke test still
       needs a display server in CI.
@@ -162,6 +166,9 @@ Goal: tab strip + statusline + command line + omnibar, all native.
 - [ ] Window backend choice: `winit` for window/event loop; `wgpu` or
       platform-native compositor for chrome layer above CEF surface. Decision
       doc in `docs/ui-stack.md`.
+- [ ] Implement `crates/buffr-core/src/osr.rs` (currently scaffolded). Wire
+      `OsrHost::new` to real CEF windowless mode + wgpu compositor so Wayland
+      sessions can run natively without XWayland.
 - [ ] Tab strip: render, drag-reorder, close-on-middle-click, overflow.
 - [ ] Statusline: mode indicator, URL, progress, cert state, count buffer.
 - [ ] Command line (`:`): input, history, completion, async results.
