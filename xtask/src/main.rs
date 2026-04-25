@@ -192,6 +192,18 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Build the CDN URL for a `(platform, cef_version)` pair.
+///
+/// Spotify ships minimal builds at
+/// `<cdn>/cef_binary_<version>_<platform>_minimal.tar.bz2`. The full
+/// filename is normally read out of `index.json`; we expose the
+/// generator separately so unit tests can lock the URL pattern down
+/// without hitting the network.
+#[cfg_attr(not(test), allow(dead_code))]
+fn cef_minimal_url(cdn: &str, platform: &str, cef_version: &str) -> String {
+    format!("{cdn}/cef_binary_{cef_version}_{platform}_minimal.tar.bz2")
+}
+
 fn host_platform() -> &'static str {
     #[cfg(target_os = "linux")]
     {
@@ -311,4 +323,41 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
         io::copy(&mut File::open(from)?, &mut File::create(to)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cef_minimal_url_macosarm64() {
+        let url = cef_minimal_url(
+            DEFAULT_CDN,
+            "macosarm64",
+            "147.0.10+gabcdef0+chromium-147.0.0.0",
+        );
+        assert_eq!(
+            url,
+            "https://cef-builds.spotifycdn.com/\
+             cef_binary_147.0.10+gabcdef0+chromium-147.0.0.0_macosarm64_minimal.tar.bz2"
+        );
+    }
+
+    #[test]
+    fn cef_minimal_url_macosx64() {
+        let url = cef_minimal_url(DEFAULT_CDN, "macosx64", "147.0.10");
+        assert_eq!(
+            url,
+            "https://cef-builds.spotifycdn.com/cef_binary_147.0.10_macosx64_minimal.tar.bz2"
+        );
+    }
+
+    #[test]
+    fn cef_minimal_url_linux64() {
+        let url = cef_minimal_url(DEFAULT_CDN, "linux64", "147.0.10");
+        assert_eq!(
+            url,
+            "https://cef-builds.spotifycdn.com/cef_binary_147.0.10_linux64_minimal.tar.bz2"
+        );
+    }
 }
