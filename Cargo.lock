@@ -237,6 +237,7 @@ name = "buffr-modal"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "crossterm",
  "hjkl-buffer",
  "hjkl-engine",
  "serde",
