@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use buffr_config::DownloadsConfig;
+use buffr_downloads::Downloads;
 use buffr_history::History;
 use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
@@ -41,6 +43,11 @@ pub struct BrowserHost {
     /// `LifeSpanHandler::on_after_created` callback, which is harder
     /// to plumb through to the page-action dispatcher.
     browser: cef::Browser,
+    /// Downloads store retained for `PageAction::ClearCompletedDownloads`
+    /// dispatch. The CEF `DownloadHandler` already owns its own clone
+    /// inside the `Client`; this is a separate `Arc` for direct
+    /// mutations from the page-action dispatcher.
+    downloads: Arc<Downloads>,
 }
 
 impl BrowserHost {
@@ -53,6 +60,8 @@ impl BrowserHost {
         window_handle: RawWindowHandle,
         url: &str,
         history: Arc<History>,
+        downloads: Arc<Downloads>,
+        downloads_config: Arc<DownloadsConfig>,
     ) -> Result<Self, CoreError> {
         info!(target: "buffr_core::host", %url, "creating CEF browser");
 
@@ -93,9 +102,10 @@ impl BrowserHost {
         let settings = BrowserSettings::default();
 
         // Phase 5: hand CEF a `Client` whose `get_load_handler` /
-        // `get_display_handler` plumb visits into `buffr-history`.
-        // Without a custom client, `on_load_end` never fires.
-        let mut client = handlers::make_client(history);
+        // `get_display_handler` / `get_download_handler` plumb events
+        // into `buffr-history` + `buffr-downloads`. Without a custom
+        // client, `on_load_end` / `on_before_download` never fire.
+        let mut client = handlers::make_client(history, downloads.clone(), downloads_config);
 
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -107,7 +117,7 @@ impl BrowserHost {
         )
         .ok_or(CoreError::CreateBrowserFailed)?;
 
-        Ok(Self { browser })
+        Ok(Self { browser, downloads })
     }
 
     /// Construct a browser in **off-screen rendering** mode for native
@@ -234,6 +244,12 @@ impl BrowserHost {
                      (blocked on hjkl Host trait)"
                 );
             }
+
+            // -- downloads: Phase 5 ---------------------------------
+            A::ClearCompletedDownloads => match self.downloads.clear_completed() {
+                Ok(n) => tracing::info!(removed = n, "downloads: cleared completed"),
+                Err(err) => tracing::warn!(error = %err, "downloads: clear_completed failed"),
+            },
 
             // -- yank-url: clipboard is Phase 5 ---------------------
             A::YankUrl => {

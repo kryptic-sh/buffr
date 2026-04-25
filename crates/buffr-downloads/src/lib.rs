@@ -197,7 +197,10 @@ impl Downloads {
             )
             .optional()?;
         if let Some(id) = existing {
-            trace!(cef_id, id, "downloads: record_started no-op (already exists)");
+            trace!(
+                cef_id,
+                id, "downloads: record_started no-op (already exists)"
+            );
             return Ok(DownloadId(id));
         }
         let now = Utc::now().timestamp();
@@ -239,7 +242,10 @@ impl Downloads {
             params![received_bytes as i64, total_i64, id.0],
         )?;
         if n == 0 {
-            trace!(id = id.0, "downloads: update_progress no-op (terminal or missing)");
+            trace!(
+                id = id.0,
+                "downloads: update_progress no-op (terminal or missing)"
+            );
         }
         Ok(())
     }
@@ -349,10 +355,7 @@ impl Downloads {
     /// `Failed`/`Canceled` rows are kept so the user can see why.
     pub fn clear_completed(&self) -> Result<usize, DownloadError> {
         let conn = self.conn.lock().map_err(|_| DownloadError::Poisoned)?;
-        let n = conn.execute(
-            "DELETE FROM downloads WHERE status = 'completed'",
-            [],
-        )?;
+        let n = conn.execute("DELETE FROM downloads WHERE status = 'completed'", [])?;
         Ok(n)
     }
 

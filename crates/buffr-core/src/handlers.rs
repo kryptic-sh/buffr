@@ -1,7 +1,7 @@
 //! CEF callback handlers that bridge browser events into buffr's
 //! data layer.
 //!
-//! Phase 5 wires up two:
+//! Phase 5 wires up three:
 //!
 //! - [`make_load_handler`] — `LoadHandler::on_load_end` records every
 //!   main-frame navigation into [`buffr_history::History`].
@@ -10,28 +10,43 @@
 //!   [`buffr_history::History::update_latest_title`]. CEF emits
 //!   `on_title_change` slightly after `on_load_end`, so the visit row
 //!   already exists.
+//! - [`make_download_handler`] — `DownloadHandler::on_before_download`
+//!   resolves a target path under
+//!   [`buffr_config::DownloadsConfig::default_dir`] and routes
+//!   progress / lifecycle ticks into [`buffr_downloads::Downloads`].
 //!
-//! Both are exposed through [`make_client`], which spins a tiny
-//! `BuffrClient` whose only job is to hand the load + display handlers
-//! to CEF when it asks. `BrowserHost::new` passes the resulting
-//! `Client` to `browser_host_create_browser_sync` so CEF actually
-//! invokes our callbacks (without a custom `Client`, CEF defaults to
-//! a no-op client and our handlers never fire).
+//! All three are exposed through [`make_client`], which spins a tiny
+//! `BuffrClient` whose only job is to hand the load + display +
+//! download handlers to CEF when it asks. `BrowserHost::new` passes
+//! the resulting `Client` to `browser_host_create_browser_sync` so CEF
+//! actually invokes our callbacks (without a custom `Client`, CEF
+//! defaults to a no-op client and our handlers never fire).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use buffr_config::DownloadsConfig;
+use buffr_downloads::{DownloadStatus, Downloads};
 use buffr_history::{History, Transition};
-// `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!`
-// expand to references to bare `Client`, `WrapClient`, `ImplClient`,
-// `LoadHandler`, etc., so the upstream cef-rs examples (and our
-// `app.rs`) glob-import the whole crate. We do the same here.
+// `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
+// `wrap_download_handler!` expand to references to bare `Client`,
+// `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
+// so the upstream cef-rs examples (and our `app.rs`) glob-import the
+// whole crate. We do the same here.
 use cef::*;
 
-/// Build a CEF `Client` that returns our load + display handlers when
-/// CEF asks for them. This is the entry point `BrowserHost::new`
-/// uses; consumers don't construct `BuffrClient` directly.
-pub fn make_client(history: Arc<History>) -> Client {
-    BuffrClient::new(history)
+use crate::open_finder::{OsSpawn, open_path};
+
+/// Build a CEF `Client` that returns our load + display + download
+/// handlers when CEF asks for them. This is the entry point
+/// `BrowserHost::new` uses; consumers don't construct `BuffrClient`
+/// directly.
+pub fn make_client(
+    history: Arc<History>,
+    downloads: Arc<Downloads>,
+    downloads_config: Arc<DownloadsConfig>,
+) -> Client {
+    BuffrClient::new(history, downloads, downloads_config)
 }
 
 /// Standalone factory for the load handler — exposed so future
@@ -47,9 +62,19 @@ pub fn make_display_handler(history: Arc<History>) -> DisplayHandler {
     BuffrDisplayHandler::new(history)
 }
 
+/// Standalone factory for the download handler.
+pub fn make_download_handler(
+    downloads: Arc<Downloads>,
+    downloads_config: Arc<DownloadsConfig>,
+) -> DownloadHandler {
+    BuffrDownloadHandler::new(downloads, downloads_config)
+}
+
 wrap_client! {
     pub struct BuffrClient {
         history: Arc<History>,
+        downloads: Arc<Downloads>,
+        downloads_config: Arc<DownloadsConfig>,
     }
 
     impl Client {
@@ -59,6 +84,13 @@ wrap_client! {
 
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(BuffrDisplayHandler::new(self.history.clone()))
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(BuffrDownloadHandler::new(
+                self.downloads.clone(),
+                self.downloads_config.clone(),
+            ))
         }
     }
 }
@@ -121,5 +153,175 @@ wrap_display_handler! {
                 tracing::warn!(error = %err, %url, "history: update_latest_title failed");
             }
         }
+    }
+}
+
+wrap_download_handler! {
+    pub struct BuffrDownloadHandler {
+        downloads: Arc<Downloads>,
+        config: Arc<DownloadsConfig>,
+    }
+
+    impl DownloadHandler {
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            // Resolve a target path under the configured default_dir
+            // and continue the download. Without `cont`, CEF cancels
+            // the download silently.
+            let Some(callback) = callback else { return 0; };
+            let Some(item) = download_item else {
+                // No item → can't record. Tell CEF to use its
+                // built-in default path so the user still gets the
+                // file.
+                callback.cont(None, 1);
+                return 0;
+            };
+
+            let suggested = suggested_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    CefStringUtf16::from(&item.suggested_file_name()).to_string()
+                });
+            let url = CefStringUtf16::from(&item.url()).to_string();
+            let mime_str = CefStringUtf16::from(&item.mime_type()).to_string();
+            let mime = if mime_str.is_empty() { None } else { Some(mime_str) };
+            let total = item.total_bytes();
+            let total_opt = if total > 0 { Some(total as u64) } else { None };
+            let cef_id = item.id();
+
+            let target_dir = buffr_config::resolve_default_dir(&self.config);
+            // Best-effort directory creation. If this fails the user
+            // will see CEF's fallback path; that's acceptable.
+            let _ = std::fs::create_dir_all(&target_dir);
+            let safe_name = sanitise_filename(&suggested);
+            let target_path: PathBuf = target_dir.join(safe_name);
+
+            if let Err(err) = self.downloads.record_started(
+                cef_id,
+                &url,
+                &suggested,
+                mime.as_deref(),
+                total_opt,
+            ) {
+                tracing::warn!(error = %err, %url, "downloads: record_started failed");
+            }
+
+            let target_str = target_path.to_string_lossy();
+            let target_cef = CefString::from(target_str.as_ref());
+            let show_dialog = if self.config.ask_each_time { 1 } else { 0 };
+            callback.cont(Some(&target_cef), show_dialog);
+            0
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            _callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else { return };
+            let cef_id = item.id();
+            let row = match self.downloads.get_by_cef_id(cef_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    // No row for this cef_id (handler races?) — log
+                    // and bail. We can't fabricate a started_at.
+                    tracing::trace!(cef_id, "downloads: tick for unknown cef_id");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, cef_id, "downloads: get_by_cef_id failed");
+                    return;
+                }
+            };
+
+            // Already terminal — CEF can emit one trailing tick after
+            // `is_complete`. Skip writing.
+            if row.status != DownloadStatus::InFlight {
+                return;
+            }
+
+            let received = item.received_bytes();
+            let total = item.total_bytes();
+            let received_u = if received > 0 { received as u64 } else { 0 };
+            let total_u = if total > 0 { Some(total as u64) } else { None };
+
+            if item.is_complete() != 0 {
+                let path_str = CefStringUtf16::from(&item.full_path()).to_string();
+                let path = PathBuf::from(&path_str);
+                if let Err(err) = self.downloads.record_completed(row.id, &path) {
+                    tracing::warn!(error = %err, "downloads: record_completed failed");
+                    return;
+                }
+                if self.config.open_on_finish && !path_str.is_empty() {
+                    open_path(&OsSpawn, &path);
+                }
+                return;
+            }
+
+            if item.is_canceled() != 0 {
+                if let Err(err) = self.downloads.record_canceled(row.id) {
+                    tracing::warn!(error = %err, "downloads: record_canceled failed");
+                }
+                return;
+            }
+
+            if item.is_interrupted() != 0 {
+                let reason = format!("interrupted (code {:?})", item.interrupt_reason());
+                if let Err(err) = self.downloads.record_failed(row.id, &reason) {
+                    tracing::warn!(error = %err, "downloads: record_failed failed");
+                }
+                return;
+            }
+
+            if let Err(err) = self.downloads.update_progress(row.id, received_u, total_u) {
+                tracing::warn!(error = %err, "downloads: update_progress failed");
+            }
+        }
+    }
+}
+
+/// Strip path-traversal bits and OS-meaningful separators from a CEF
+/// suggested filename. We don't attempt full sanitisation — CEF
+/// already filters most malicious cases — but a `Path::file_name`
+/// pass guards against `../` prefixes leaking through.
+fn sanitise_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    let stripped = std::path::Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stripped.is_empty() {
+        // Last-resort fallback — a download with no filename and no
+        // way to derive one. CEF sometimes emits this for blob: URLs.
+        "download".to_string()
+    } else {
+        stripped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitise_filename_strips_path() {
+        assert_eq!(sanitise_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitise_filename("/tmp/foo.zip"), "foo.zip");
+        assert_eq!(sanitise_filename("clean.txt"), "clean.txt");
+    }
+
+    #[test]
+    fn sanitise_filename_empty_falls_back() {
+        assert_eq!(sanitise_filename(""), "download");
+        assert_eq!(sanitise_filename("   "), "download");
+        // Pure path-traversal with no real basename also resolves to
+        // the fallback after `Path::file_name` strips dot-segments.
+        assert_eq!(sanitise_filename("/"), "download");
     }
 }

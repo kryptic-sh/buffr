@@ -34,3 +34,9 @@ buffr-modal.workspace = true
 # wires it through the `Client` it hands to
 # `browser_host_create_browser_sync`.
 buffr-history.workspace = true
+# Phase 5: CEF `DownloadHandler` routes download progress + lifecycle
+# events into `buffr-downloads`. `BrowserHost::new` accepts an
+# `Arc<Downloads>` + the resolved `DownloadsConfig` (where files land,
+# whether to open on finish).
+buffr-downloads.workspace = true
+buffr-config.workspace = true

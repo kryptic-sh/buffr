@@ -207,6 +207,7 @@ dependencies = [
  "buffr-bookmarks",
  "buffr-config",
  "buffr-core",
+ "buffr-downloads",
  "buffr-history",
  "buffr-modal",
  "buffr-ui",
@@ -250,11 +251,24 @@ name = "buffr-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "buffr-config",
+ "buffr-downloads",
  "buffr-history",
  "buffr-modal",
  "cef",
  "directories",
  "raw-window-handle",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "buffr-downloads"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]

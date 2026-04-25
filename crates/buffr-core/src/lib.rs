@@ -14,6 +14,7 @@ use thiserror::Error;
 pub mod app;
 pub mod handlers;
 pub mod host;
+pub mod open_finder;
 
 /// Off-screen rendering scaffold. Gated behind the `osr` feature
 /// because it pulls in (eventually) `wgpu` and `softbuffer` deps.
