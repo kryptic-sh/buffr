@@ -14,6 +14,13 @@ use thiserror::Error;
 pub mod app;
 pub mod host;
 
+/// Off-screen rendering scaffold. Gated behind the `osr` feature
+/// because it pulls in (eventually) `wgpu` and `softbuffer` deps.
+/// Currently scaffolded only — runtime entries panic. See `PLAN.md`
+/// Phase 3.
+#[cfg(feature = "osr")]
+pub mod osr;
+
 pub use app::{BuffrApp, ProfilePaths};
 pub use host::BrowserHost;
 

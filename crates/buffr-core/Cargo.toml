@@ -10,6 +10,13 @@ authors.workspace = true
 description = "CEF integration and browser host for buffr."
 build = "build.rs"
 
+[features]
+default = []
+# Off-screen rendering for native Wayland (Phase 3). Currently
+# scaffolded (see `src/osr.rs`) but not implemented — runtime entry
+# points panic with `unimplemented!()`.
+osr = []
+
 [dependencies]
 cef.workspace = true
 anyhow.workspace = true
