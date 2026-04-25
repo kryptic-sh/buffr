@@ -106,17 +106,19 @@ available).
 
 Goal: empty native window renders `https://example.com` via CEF.
 
-- [ ] CEF binary distribution: download script (`xtask fetch-cef`) per platform,
+- [x] CEF binary distribution: download script (`xtask fetch-cef`) per platform,
       pinned to `cef` crate version (147).
-- [ ] `build.rs` resolves `CEF_PATH`, links `libcef`, copies resources/locales
+- [x] `build.rs` resolves `CEF_PATH`, links `libcef`, copies resources/locales
       next to target.
-- [ ] `apps/buffr-helper` minimal: forwards argv to `cef::execute_process`,
+- [x] `apps/buffr-helper` minimal: forwards argv to `cef::execute_process`,
       exits with returned code.
-- [ ] `buffr-core::App`: `CefApp` impl, `on_before_command_line_processing`,
+- [x] `buffr-core::App`: `CefApp` impl, `on_before_command_line_processing`,
       profile/cache dir via `directories`.
-- [ ] `buffr-core::Host`: create browser, attach to native window handle.
-- [ ] `apps/buffr` main: init tracing, CEF init, open one tab, run loop.
+- [x] `buffr-core::Host`: create browser, attach to native window handle.
+- [x] `apps/buffr` main: init tracing, CEF init, open one tab, run loop.
 - [ ] CI: Linux build + smoke test (window opens, page loads, exits clean).
+      Build job landed in `.github/workflows/ci.yml`; runtime smoke test still
+      needs a display server in CI.
 
 ### Phase 2 — Modal engine
 

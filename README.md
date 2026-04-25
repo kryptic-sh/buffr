@@ -33,11 +33,13 @@ buffr/
 ## Build
 
 ```bash
+cargo xtask fetch-cef   # vendor CEF (~500 MB extracted)
 cargo build
+cargo run -p buffr
 ```
 
-CEF binary distribution is not yet wired in — full build will require fetching
-`libcef` and resources matching the `cef` crate version.
+See [`docs/dev.md`](docs/dev.md) for full prerequisites, the platform matrix,
+and where things live.
 
 ## License
 
