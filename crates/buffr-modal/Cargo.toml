@@ -9,6 +9,13 @@ homepage.workspace = true
 authors.workspace = true
 description = "Vim-style modal keybinding engine for buffr."
 
+[features]
+default = []
+# Bring in the winit `KeyEvent` → `KeyChord` adapter so `apps/buffr` can
+# wire raw key events into the engine without re-implementing the
+# mapping. Optional because the engine itself is winit-agnostic.
+winit = ["dep:winit"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -26,3 +33,8 @@ hjkl-buffer = { workspace = true }
 # bridges from CEF browser keys into it. When trait extraction lands a
 # host-native Input enum, this dep moves out.
 crossterm = "0.28.1"
+
+# Optional: only enabled by the `winit` feature. Used by the
+# `winit_adapter` module that converts `winit::event::KeyEvent` into
+# our internal `KeyChord`. The engine itself stays winit-agnostic.
+winit = { workspace = true, optional = true }
