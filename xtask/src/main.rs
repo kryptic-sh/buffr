@@ -148,8 +148,7 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
         .versions
         .iter()
         .filter(|v| v.cef_version.starts_with(&version_prefix))
-        .filter(|v| v.channel.eq_ignore_ascii_case("stable"))
-        .next()
+        .find(|v| v.channel.eq_ignore_ascii_case("stable"))
         .or_else(|| {
             plat.versions
                 .iter()
