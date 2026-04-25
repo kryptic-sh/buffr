@@ -208,7 +208,13 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       layer in `crates/buffr-bookmarks`; CLI flags `--import-bookmarks`,
       `--list-bookmarks`, `--list-bookmarks-tags` exposed on `apps/buffr`. UI
       wiring is Phase 5b alongside the omnibar.
-- [ ] Downloads: progress, open-on-finish, default dir from config.
+- [x] Downloads: progress, open-on-finish, default dir from config. Pure data
+      layer in `crates/buffr-downloads`; CEF `DownloadHandler` (in
+      `buffr-core::handlers`) routes `OnBeforeDownload` / `OnDownloadUpdated`
+      into the store. CLI flags `--list-downloads` and
+      `--clear-completed-downloads` exposed on `apps/buffr`.
+  - [ ] `ask_each_time` UI is Phase 3 chrome work; for now downloads silently
+        land in `default_dir`.
 - [ ] Cookies/site storage: per-profile, clear-on-exit option.
 - [ ] Permissions prompt UI: camera, mic, geolocation, notifications.
 - [ ] Private window: ephemeral profile.

@@ -167,6 +167,7 @@ cargo test --workspace
 | Config schema + loader    | `crates/buffr-config/src/lib.rs`    |
 | History store             | `crates/buffr-history/src/lib.rs`   |
 | Bookmarks store           | `crates/buffr-bookmarks/src/lib.rs` |
+| Downloads store           | `crates/buffr-downloads/src/lib.rs` |
 
 ## Storage
 
@@ -178,6 +179,7 @@ for `sh.kryptic.buffr`. On Linux that's:
 | `~/.cache/buffr/`                       | CEF cache (cookies, GPU shader cache).     |
 | `~/.local/share/buffr/history.sqlite`   | History DB (Phase 5, `buffr-history`).     |
 | `~/.local/share/buffr/bookmarks.sqlite` | Bookmarks DB (Phase 5, `buffr-bookmarks`). |
+| `~/.local/share/buffr/downloads.sqlite` | Downloads DB (Phase 5, `buffr-downloads`). |
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
