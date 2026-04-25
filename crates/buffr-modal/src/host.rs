@@ -1,17 +1,13 @@
 //! `BuffrHost` — the host adapter that wires `hjkl_engine::Editor` to
 //! the buffr browser shell.
 //!
-//! Today this is a skeleton: clipboard reads/writes go through CEF, the
-//! intent stream carries autocomplete + form-event variants, and time
-//! comes from `std::time::Instant`. The actual hjkl `Host` trait isn't
-//! published yet (lives in `hjkl-engine`'s SPEC; trait extraction
-//! pending), so `BuffrHost` exists with the methods the engine will
-//! eventually call against — naming and signatures match SPEC so the
-//! refactor lands as a single rename.
-//!
-//! Once `hjkl_engine::Host` ships, `BuffrHost` will `impl Host` directly
-//! and the inherent methods drop or become forwarders.
+//! Implements [`hjkl_engine::Host`] with `type Intent = BuffrEditIntent`.
+//! Inherent helpers (`set_clipboard_cache`, `drain_clipboard_outbox`,
+//! `drain_intents`) sit alongside the trait methods so the host's tick
+//! loop can flush queued operations on its own cadence — the engine
+//! never blocks on either clipboard or intent fan-out.
 
+use hjkl_engine::{CursorShape, Host};
 use std::time::Instant;
 
 /// Buffer identifier in buffr's tab manager. Opaque — host owns the
@@ -39,6 +35,12 @@ pub enum BuffrEditIntent {
 /// active.
 #[derive(Debug)]
 pub struct BuffrHost {
+    /// Last cursor shape requested by the engine. Drained by the host
+    /// renderer per frame.
+    pub last_cursor_shape: CursorShape,
+    // Other fields intentionally below — keep `last_cursor_shape` first
+    // so debug-printing the host shows the most recently observed
+    // mode-derived state.
     /// Cached system clipboard value. Refreshed by the host on focus
     /// events / OSC52 reply / explicit poll. Reads from the engine
     /// return this slot directly — never block.
@@ -63,23 +65,12 @@ impl Default for BuffrHost {
 impl BuffrHost {
     pub fn new() -> Self {
         Self {
+            last_cursor_shape: CursorShape::Block,
             clipboard_cache: None,
             clipboard_outbox: Vec::new(),
             started: Instant::now(),
             intents: Vec::new(),
         }
-    }
-
-    /// Fire-and-forget clipboard write. Engine never blocks; the host
-    /// flushes the outbox on its own tick.
-    pub fn write_clipboard(&mut self, text: String) {
-        self.clipboard_outbox.push(text);
-    }
-
-    /// Returns the cached system clipboard value. May be stale —
-    /// matches the OSC52 / wl-paste model neovim and helix both ship.
-    pub fn read_clipboard(&mut self) -> Option<String> {
-        self.clipboard_cache.clone()
     }
 
     /// Update the cached clipboard. Host calls this on focus events or
@@ -94,27 +85,40 @@ impl BuffrHost {
         std::mem::take(&mut self.clipboard_outbox)
     }
 
-    /// Monotonic time since editor construction. Engine uses this for
-    /// multi-key timeout (`timeoutlen`) resolution.
-    pub fn now(&self) -> std::time::Duration {
-        self.started.elapsed()
-    }
-
-    /// Cooperative cancellation hook. Returns `false` until the host
-    /// implements `Ctrl-C` — engine polls in long search/regex loops.
-    pub fn should_cancel(&self) -> bool {
-        false
-    }
-
-    /// Emit an intent. Host drains via [`drain_intents`] per render
-    /// frame.
-    pub fn emit_intent(&mut self, intent: BuffrEditIntent) {
-        self.intents.push(intent);
-    }
-
     /// Drain queued intents. Host calls this once per render frame.
     pub fn drain_intents(&mut self) -> Vec<BuffrEditIntent> {
         std::mem::take(&mut self.intents)
+    }
+}
+
+impl Host for BuffrHost {
+    type Intent = BuffrEditIntent;
+
+    fn write_clipboard(&mut self, text: String) {
+        self.clipboard_outbox.push(text);
+    }
+
+    fn read_clipboard(&mut self) -> Option<String> {
+        self.clipboard_cache.clone()
+    }
+
+    fn now(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    fn prompt_search(&mut self) -> Option<String> {
+        // CEF prompt overlay is wired in phase 3 of buffr's roadmap.
+        // Until then, abort the search rather than block on a sync
+        // prompt the host can't service.
+        None
+    }
+
+    fn emit_cursor_shape(&mut self, shape: CursorShape) {
+        self.last_cursor_shape = shape;
+    }
+
+    fn emit_intent(&mut self, intent: Self::Intent) {
+        self.intents.push(intent);
     }
 }
 
@@ -157,5 +161,22 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let t1 = host.now();
         assert!(t1 > t0);
+    }
+
+    #[test]
+    fn cursor_shape_recorded() {
+        let mut host = BuffrHost::new();
+        assert_eq!(host.last_cursor_shape, CursorShape::Block);
+        host.emit_cursor_shape(CursorShape::Bar);
+        assert_eq!(host.last_cursor_shape, CursorShape::Bar);
+    }
+
+    /// Compile-time check that BuffrHost satisfies the Host trait
+    /// bound — confirms `type Intent = BuffrEditIntent` plus the full
+    /// method set.
+    #[test]
+    fn satisfies_host_trait() {
+        fn assert_host<H: Host>() {}
+        assert_host::<BuffrHost>();
     }
 }

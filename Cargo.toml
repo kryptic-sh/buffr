@@ -7,6 +7,7 @@ members = [
     "crates/buffr-config",
     "apps/buffr",
     "apps/buffr-helper",
+    "xtask",
 ]
 
 [workspace.package]
@@ -27,6 +28,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "5"
+winit = "0.30"
+raw-window-handle = "0.6"
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+flate2 = "1"
+tar = "0.4"
+bzip2 = "0.4"
 
 buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }

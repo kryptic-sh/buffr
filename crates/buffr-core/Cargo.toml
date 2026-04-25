@@ -8,9 +8,12 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "CEF integration and browser host for buffr."
+build = "build.rs"
 
 [dependencies]
 cef.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+directories.workspace = true
+raw-window-handle.workspace = true
