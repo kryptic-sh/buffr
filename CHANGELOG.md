@@ -25,3 +25,8 @@ and this project adheres to
   SPEC methods; the back-compat `Editor::new` shim wraps `DefaultHost`, so no
   Buffr source changes are required. Migration to
   `Editor::with_host(km, BuffrHost::new())` is left for a follow-up.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.29` to
+  `=0.0.30` — picks up Patch C-α, which relocates the motion vocabulary out of
+  `hjkl_buffer::Buffer` inherent methods into the `hjkl_engine::motions`
+  module. Buffr only consumes editor-level APIs, so the consumer-side change is
+  a pin bump only — no source changes required.
