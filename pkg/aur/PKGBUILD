@@ -1,0 +1,32 @@
+# Maintainer: kryptic.sh <hello@kryptic.sh>
+pkgname=buffr
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
+arch=('x86_64')
+url="https://buffr.kryptic.sh/"
+license=('MIT')
+depends=('gtk3' 'nss' 'libxss' 'alsa-lib' 'libgbm' 'libxshmfence' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd')
+makedepends=('rust' 'cargo' 'cmake')
+source=("https://github.com/kryptic-sh/buffr/archive/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo xtask fetch-cef
+    cargo build --release --workspace
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+    install -Dm755 target/release/buffr "$pkgdir/opt/buffr/buffr"
+    install -Dm755 target/release/buffr-helper "$pkgdir/opt/buffr/buffr-helper"
+    install -Dm644 target/release/libcef.so "$pkgdir/opt/buffr/libcef.so"
+    cp -r target/release/locales "$pkgdir/opt/buffr/locales"
+    install -Dm644 -t "$pkgdir/opt/buffr/" target/release/*.pak
+    install -Dm644 target/release/icudtl.dat "$pkgdir/opt/buffr/icudtl.dat"
+    install -Dm644 pkg/buffr.desktop "$pkgdir/usr/share/applications/buffr.desktop"
+    install -Dm644 pkg/buffr.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/buffr.png"
+    mkdir -p "$pkgdir/usr/local/bin"
+    ln -sf /opt/buffr/buffr "$pkgdir/usr/local/bin/buffr"
+}
