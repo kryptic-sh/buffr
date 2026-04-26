@@ -24,10 +24,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
-use buffr_core::{BuffrApp, FindResultSink, init_cef_api, new_find_sink, profile_paths};
+use buffr_core::{
+    BuffrApp, FindResultSink, HintAction, HintAlphabet, HintEventSink, init_cef_api, new_find_sink,
+    new_hint_event_sink, profile_paths,
+};
 use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
 use buffr_ui::{
-    CertState, FindStatus, InputBar, STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind,
+    CertState, FindStatus, HintStatus as UiHintStatus, InputBar, STATUSLINE_HEIGHT, Statusline,
+    Suggestion, SuggestionKind,
 };
 use cef::{ImplBrowser, Settings};
 use clap::Parser;
@@ -391,6 +395,16 @@ fn main() -> Result<()> {
     };
 
     let find_sink = new_find_sink();
+    let hint_sink = new_hint_event_sink();
+    // Build the hint alphabet up front so a misconfigured config
+    // surfaces an error before CEF has a chance to start. The
+    // validator already checked the same invariants but `from_str` is
+    // the type-safe constructor, so we run it again here.
+    let hint_alphabet = HintAlphabet::from_str(&config.hint.alphabet).unwrap_or_else(|err| {
+        warn!(error = %err, "hint alphabet rejected — falling back to default");
+        HintAlphabet::from_str(buffr_core::DEFAULT_HINT_ALPHABET)
+            .expect("default alphabet always valid")
+    });
 
     let search_config = Arc::new(config.search.clone());
 
@@ -405,6 +419,8 @@ fn main() -> Result<()> {
         search_config,
         cli.private,
         find_sink,
+        hint_sink,
+        hint_alphabet,
         cli.find.clone(),
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
@@ -733,6 +749,12 @@ struct AppState {
     /// thread polls this each frame and copies the latest result
     /// into `statusline.find_query`.
     find_sink: FindResultSink,
+    /// Hint-mode mailbox shared with the CEF display handler.
+    /// `BrowserHost::pump_hint_events` drains it each tick.
+    hint_sink: HintEventSink,
+    /// Configured hint alphabet, threaded through to the host on
+    /// browser creation.
+    hint_alphabet: HintAlphabet,
     /// One-shot smoke query for `--find`. Drained once the browser
     /// has loaded enough that `start_find` is meaningful (see the
     /// `find_smoke_at` deadline below).
@@ -795,6 +817,8 @@ impl AppState {
         search_config: Arc<buffr_config::Search>,
         private: bool,
         find_sink: FindResultSink,
+        hint_sink: HintEventSink,
+        hint_alphabet: HintAlphabet,
         pending_find: Option<String>,
     ) -> Self {
         let mut statusline = Statusline {
@@ -821,6 +845,8 @@ impl AppState {
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
             find_sink,
+            hint_sink,
+            hint_alphabet,
             pending_find,
             find_smoke_at: None,
             statusline,
@@ -1340,6 +1366,73 @@ impl AppState {
         }
     }
 
+    /// Route a keystroke to the active hint session, if any. Returns
+    /// `true` if the key was consumed.
+    ///
+    /// Esc cancels. Backspace pops the typed buffer. Printable ASCII
+    /// chars (no Ctrl / Alt / Meta) are fed to `feed_hint_key`. Every
+    /// other chord is silently swallowed so the modal trie can't fire
+    /// on `j` / `k` etc. while a session is live.
+    fn hint_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let Some(host) = self.host.as_ref() else {
+            return false;
+        };
+        if !host.is_hint_mode() {
+            return false;
+        }
+        let chord = match key_event_to_chord(event, self.modifiers) {
+            Some(c) => c,
+            None => return true,
+        };
+        let mods = chord.modifiers;
+        let plain = !mods.contains(buffr_modal::Modifiers::CTRL)
+            && !mods.contains(buffr_modal::Modifiers::ALT)
+            && !mods.contains(buffr_modal::Modifiers::SUPER);
+        match chord.key {
+            Key::Named(NamedKey::Esc) => {
+                host.cancel_hint();
+                self.exit_hint_mode();
+            }
+            Key::Named(NamedKey::BS) => {
+                if let Some(action) = host.backspace_hint() {
+                    self.handle_hint_action(action);
+                }
+            }
+            Key::Char(c) if plain => {
+                if let Some(action) = host.feed_hint_key(c) {
+                    self.handle_hint_action(action);
+                }
+            }
+            _ => {
+                // Unhandled chord while hint mode is active — swallow.
+            }
+        }
+        self.refresh_title();
+        self.request_redraw();
+        true
+    }
+
+    fn handle_hint_action(&mut self, action: HintAction) {
+        match action {
+            HintAction::Filter => {
+                // Session continues; statusline picks up new typed.
+            }
+            HintAction::Click(_) | HintAction::OpenInBackground(_) => {
+                self.exit_hint_mode();
+            }
+            HintAction::Cancel => {
+                self.exit_hint_mode();
+            }
+        }
+    }
+
+    fn exit_hint_mode(&mut self) {
+        if let Ok(mut e) = self.engine.lock() {
+            e.set_mode(PageMode::Normal);
+        }
+        self.statusline.hint_state = None;
+    }
+
     fn dispatch_omnibar(&mut self, bar: &InputBar) {
         let raw = bar.current_value().to_string();
         if raw.is_empty() {
@@ -1420,6 +1513,8 @@ impl ApplicationHandler for AppState {
             self.downloads_config.clone(),
             self.zoom.clone(),
             self.find_sink.clone(),
+            self.hint_sink.clone(),
+            self.hint_alphabet.clone(),
             (cef_w, cef_h),
         ) {
             Ok(host) => {
@@ -1501,6 +1596,14 @@ impl ApplicationHandler for AppState {
                 if self.overlay_handle_key(&event) {
                     return;
                 }
+                // Hint mode: route printable chars + Esc + BS straight
+                // to the host's hint-session API. The modal engine
+                // already sits in `Mode::Hint` (set by the action
+                // dispatch below), but the engine itself doesn't know
+                // about per-keystroke hint matching.
+                if self.hint_mode_handle_key(&event) {
+                    return;
+                }
                 let Some(chord) = key_event_to_chord(&event, self.modifiers) else {
                     return;
                 };
@@ -1573,6 +1676,23 @@ impl ApplicationHandler for AppState {
         // dispatch is due.
         self.pump_find_results();
         self.maybe_dispatch_find_smoke();
+
+        // Drain any hint event (Ready / Error from the renderer) and
+        // refresh the statusline indicator off the live session.
+        if let Some(host) = self.host.as_ref() {
+            if host.pump_hint_events() {
+                self.request_redraw();
+            }
+            let new_status = host.hint_status().map(|h| UiHintStatus {
+                typed: h.typed,
+                match_count: h.match_count as u32,
+                background: h.background,
+            });
+            if new_status != self.statusline.hint_state {
+                self.statusline.hint_state = new_status;
+                self.request_redraw();
+            }
+        }
 
         // Cursor blink for the open overlay. 500ms toggle; we only
         // request a redraw when the bit actually flips so the page
