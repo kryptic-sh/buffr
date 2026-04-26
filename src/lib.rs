@@ -14,11 +14,13 @@ use buffr_modal::PageMode;
 
 pub mod font;
 pub mod input_bar;
+pub mod tab_strip;
 
 pub use input_bar::{
     INPUT_HEIGHT, InputBar, MAX_SUGGESTIONS, Palette as InputPalette, SUGGESTION_ROW_HEIGHT,
     Suggestion, SuggestionKind,
 };
+pub use tab_strip::{MAX_TAB_WIDTH, MIN_TAB_WIDTH, TAB_STRIP_HEIGHT, TabStrip, TabView};
 
 /// Statusline strip height in pixels. 24 px fits a 10-px glyph row
 /// with comfortable padding above + below; matches the recommendation
