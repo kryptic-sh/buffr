@@ -144,6 +144,25 @@ Notes:
 - Distribution-grade signing + notarization is documented in
   [`docs/macos-signing.md`](./macos-signing.md). Phase 6 work.
 
+## Linux packaging
+
+Three Linux distribution paths, all producible from a single Linux dev box:
+
+```sh
+cargo xtask package-linux --release --variant all
+ls target/dist/linux/
+# buffr-0.0.1-x86_64.AppImage
+# buffr-0.0.1-amd64.deb
+```
+
+`appimagetool` and `dpkg-deb` are auto-detected; if either is missing the xtask
+leaves the staging directory in place and prints a warning rather than failing.
+The AUR PKGBUILD is regenerated at `pkg/aur/PKGBUILD` with the current workspace
+version on every run.
+
+Full guide (layout, depends, glibc, sandbox caveats, signing TODO):
+[`docs/packaging.md`](./packaging.md).
+
 ## Useful commands
 
 ```sh

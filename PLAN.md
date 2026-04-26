@@ -276,7 +276,11 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 - [ ] Update channel: stable + nightly tags. Tauri-style updater or OS package
       managers.
 - [ ] Packaging:
-  - [ ] Linux: AppImage, `.deb`, AUR PKGBUILD.
+  - [x] Linux: AppImage, `.deb`, AUR PKGBUILD.
+        `cargo xtask package-linux     [--variant {appimage,deb,aur,all}]`
+        produces all three under `target/dist/linux/`. Unsigned this round —
+        release-pipeline signing is the next step. See
+        [`docs/packaging.md`](./docs/packaging.md).
   - [ ] macOS: signed/notarized `.app` + `.dmg`. Helper bundle inside. Bundle
         assembly already lives behind `cargo xtask bundle-macos` (Phase 1);
         Phase 6 adds Developer-ID signing, the multi-helper split (`Helper`,
