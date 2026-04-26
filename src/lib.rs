@@ -48,6 +48,17 @@ pub struct FindStatus {
     pub total: u32,
 }
 
+/// Snapshot of hint mode state. Rendered next to the cert pip when a
+/// hint session is active. Mirrors `buffr_core::host::HintStatus` —
+/// the indirection exists so `buffr-ui` doesn't pull `buffr-core` as a
+/// dependency (would create a cycle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintStatus {
+    pub typed: String,
+    pub match_count: u32,
+    pub background: bool,
+}
+
 /// Rendering input for the statusline. Re-create per frame; the
 /// widget owns nothing.
 #[derive(Debug, Clone)]
@@ -65,6 +76,8 @@ pub struct Statusline {
     pub count_buffer: Option<u32>,
     pub private: bool,
     pub find_query: Option<FindStatus>,
+    /// Hint mode indicator. `Some(...)` while a hint session is live.
+    pub hint_state: Option<HintStatus>,
 }
 
 impl Default for Statusline {
@@ -77,6 +90,7 @@ impl Default for Statusline {
             count_buffer: None,
             private: false,
             find_query: None,
+            hint_state: None,
         }
     }
 }
@@ -143,6 +157,13 @@ impl Statusline {
             font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
             right_pen -= 8;
         }
+        if let Some(hint) = self.hint_state.as_ref() {
+            let s = format_hint(hint);
+            let w = font::text_width(&s) as i32;
+            right_pen -= w;
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
+            right_pen -= 8;
+        }
         if let Some(count) = self.count_buffer
             && count > 0
         {
@@ -194,6 +215,20 @@ impl Statusline {
                 COLOUR_PROGRESS,
             );
         }
+    }
+}
+
+fn format_hint(h: &HintStatus) -> String {
+    let prefix = if h.background { "F" } else { "f" };
+    if h.typed.is_empty() {
+        format!("{prefix}: {} hints", h.match_count)
+    } else {
+        format!(
+            "{prefix}: {} ({}/{})",
+            h.typed,
+            h.match_count,
+            h.match_count.max(1)
+        )
     }
 }
 
@@ -419,6 +454,27 @@ mod tests {
             total: 5,
         };
         assert_eq!(format_find(&f), "/foo 2/5");
+    }
+
+    #[test]
+    fn format_hint_no_typed() {
+        let h = HintStatus {
+            typed: String::new(),
+            match_count: 12,
+            background: false,
+        };
+        assert_eq!(format_hint(&h), "f: 12 hints");
+    }
+
+    #[test]
+    fn format_hint_with_typed_background() {
+        let h = HintStatus {
+            typed: "as".into(),
+            match_count: 3,
+            background: true,
+        };
+        assert!(format_hint(&h).starts_with("F:"));
+        assert!(format_hint(&h).contains("as"));
     }
 
     #[test]
