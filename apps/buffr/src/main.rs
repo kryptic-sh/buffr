@@ -150,6 +150,21 @@ struct Cli {
     /// Prints "purged N reports" and exits 0.
     #[arg(long)]
     purge_crashes: bool,
+    /// Phase 6 update channel: hit GitHub releases now, print the
+    /// resolved status, exit 0. No CEF init. Honors
+    /// `[updates] enabled = false` (prints `disabled` without any
+    /// network call).
+    #[arg(long)]
+    check_for_updates: bool,
+    /// Read the on-disk update cache and print the cached status. No
+    /// network. No CEF init. The statusline reads the same cache.
+    #[arg(long)]
+    update_status: bool,
+    /// Print every default-bound `PageAction` and the keys that bind
+    /// it. Exits 0 — used to verify keyboard-only paths for the a11y
+    /// audit. No CEF init.
+    #[arg(long)]
+    audit_keymap: bool,
 }
 
 fn main() -> Result<()> {
@@ -251,6 +266,15 @@ fn main() -> Result<()> {
     }
     if cli.purge_crashes {
         return run_purge_crashes(cli.config.as_deref());
+    }
+    if cli.check_for_updates {
+        return run_check_for_updates(cli.config.as_deref());
+    }
+    if cli.update_status {
+        return run_update_status(cli.config.as_deref());
+    }
+    if cli.audit_keymap {
+        return run_audit_keymap();
     }
 
     tracing_subscriber::fmt()
@@ -427,6 +451,35 @@ fn main() -> Result<()> {
         buffr_core::CrashReporter::install(crash_dir.clone(), true);
     }
 
+    // -------- accessibility flag --------
+    //
+    // Phase 6: when `[accessibility] force_renderer_accessibility = true`,
+    // CEF's `App::on_before_command_line_processing` injects the
+    // `--force-renderer-accessibility` switch so the renderer feeds an
+    // accessibility tree to platform screen readers. Default off
+    // because the tree adds non-trivial per-frame work.
+    //
+    // Toggling AFTER `BuffrApp::new()` is too late on the renderer
+    // side — the helper subprocess re-reads `force_renderer_accessibility_enabled`
+    // when it runs `BuffrApp::new()` itself, so we keep the toggle
+    // sticky across processes. (Helper doesn't share memory; it
+    // re-evaluates the env. We currently don't propagate this flag to
+    // helpers via env — TODO Phase 6b.)
+    buffr_core::set_force_renderer_accessibility(config.accessibility.force_renderer_accessibility);
+
+    // -------- update channel --------
+    //
+    // Phase 6 update channel: cache lives at `<data>/update-cache.json`.
+    // The statusline reads `check_cached()` once at startup so the
+    // indicator surfaces without a live network call. Users run
+    // `buffr --check-for-updates` to refresh.
+    let update_cache_path = paths.data.join("update-cache.json");
+    let update_checker = Arc::new(buffr_core::UpdateChecker::new(
+        config.updates.clone(),
+        update_cache_path,
+    ));
+    let initial_update_status = update_checker.check_cached();
+
     // -------- CEF initialize --------
     let cache_path = paths.cache.to_string_lossy().into_owned();
     let settings = Settings {
@@ -589,6 +642,9 @@ fn main() -> Result<()> {
         pending_session_tabs,
         session_path,
         counters.clone(),
+        update_checker.clone(),
+        initial_update_status,
+        config.theme.high_contrast,
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -888,6 +944,82 @@ fn run_purge_crashes(config_path: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the update-cache path. Stable across the live runtime and
+/// the `--check-for-updates` / `--update-status` short-circuits.
+fn update_cache_path() -> Result<PathBuf> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    Ok(paths.data.join("update-cache.json"))
+}
+
+fn print_update_status(status: &buffr_core::UpdateStatus) {
+    use buffr_core::UpdateStatus as U;
+    match status {
+        U::Disabled => println!("disabled"),
+        U::UpToDate { current } => println!("up-to-date\t{current}"),
+        U::Available { current, latest } => {
+            println!(
+                "available\t{}\t{}\t{}\t{}",
+                current, latest.version, latest.tag, latest.url
+            );
+        }
+        U::Stale {
+            last_checked,
+            latest,
+        } => {
+            println!(
+                "stale\t{}\t{}\t{}\t{}",
+                last_checked.to_rfc3339(),
+                latest.version,
+                latest.tag,
+                latest.url
+            );
+        }
+        U::NetworkError(msg) => println!("error\t{msg}"),
+    }
+}
+
+/// Project [`buffr_core::UpdateStatus`] onto the
+/// [`buffr_ui::UpdateIndicator`] surface. `Available` and `Stale`
+/// surface; everything else hides.
+fn update_indicator_from(status: &buffr_core::UpdateStatus) -> Option<buffr_ui::UpdateIndicator> {
+    match status {
+        buffr_core::UpdateStatus::Available { .. } => Some(buffr_ui::UpdateIndicator::Available),
+        buffr_core::UpdateStatus::Stale { .. } => Some(buffr_ui::UpdateIndicator::Stale),
+        _ => None,
+    }
+}
+
+fn run_check_for_updates(config_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = load_config_or_default(config_path);
+    let path = update_cache_path()?;
+    let checker = buffr_core::UpdateChecker::new(cfg.updates.clone(), path);
+    let status = checker.check_now();
+    print_update_status(&status);
+    Ok(())
+}
+
+fn run_update_status(config_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = load_config_or_default(config_path);
+    let path = update_cache_path()?;
+    let checker = buffr_core::UpdateChecker::new(cfg.updates.clone(), path);
+    let status = checker.check_cached();
+    print_update_status(&status);
+    Ok(())
+}
+
+/// `--audit-keymap` — print every default-bound `PageAction` plus the
+/// chord(s) that bind it. Format: `<mode>\t<keys>\t<action>`. Sorted by
+/// mode then keys for stable output. Used to verify keyboard-only
+/// reachability (Phase 6 a11y).
+fn run_audit_keymap() -> Result<()> {
+    let rows = buffr_modal::Keymap::audit_default_bindings('\\');
+    for (mode, keys, action) in &rows {
+        println!("{mode}\t{keys}\t{action:?}");
+    }
+    Ok(())
+}
+
 /// `--list-session` short-circuit. Prints one row per saved tab to
 /// stdout: `*\t<url>` when pinned, `\t<url>` otherwise. Schema
 /// version is printed on stderr for diagnostic clarity.
@@ -1131,6 +1263,13 @@ struct AppState {
     /// 60 s (telemetry is low-volume; the ~1 KB JSON write is cheap
     /// but pointless to do per-tick).
     counters_flush_at: Instant,
+    /// Phase 6 update channel: shared checker for the live runtime.
+    /// Currently the statusline reads `check_cached()` once at startup;
+    /// background re-checks would land here when scheduled. Held so
+    /// the cache lifetime tracks the AppState's even though the
+    /// runtime doesn't currently call `check_now` from the UI thread.
+    #[allow(dead_code)]
+    update_checker: Arc<buffr_core::UpdateChecker>,
 }
 
 /// Active overlay above the CEF child window.
@@ -1180,11 +1319,17 @@ impl AppState {
         pending_session_tabs: Vec<session::PersistedTab>,
         session_path: Option<PathBuf>,
         counters: Arc<buffr_core::UsageCounters>,
+        update_checker: Arc<buffr_core::UpdateChecker>,
+        initial_update_status: buffr_core::UpdateStatus,
+        high_contrast: bool,
     ) -> Self {
+        let update_indicator = update_indicator_from(&initial_update_status);
         let mut statusline = Statusline {
             url: homepage.clone(),
             private,
             cert_state: CertState::Unknown,
+            update_indicator,
+            high_contrast,
             ..Statusline::default()
         };
         statusline.mode = PageMode::Normal;
@@ -1222,6 +1367,7 @@ impl AppState {
             cursor_blink_at: Instant::now(),
             counters,
             counters_flush_at: Instant::now(),
+            update_checker,
         }
     }
 

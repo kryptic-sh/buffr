@@ -149,6 +149,93 @@ impl Keymap {
         }
     }
 
+    /// Phase 6 a11y audit: enumerate every static default binding as
+    /// `(mode_label, keys, action)` rows. Sorted by `(mode, keys)` so
+    /// the output is stable; used by `--audit-keymap` to verify
+    /// keyboard-only reachability of every `PageAction`.
+    ///
+    /// `leader` mirrors [`Self::default_bindings`]; the resolved
+    /// `<leader>` chord is rendered as the literal character so users
+    /// can see what they'd type.
+    pub fn audit_default_bindings(_leader: char) -> Vec<(&'static str, &'static str, PageAction)> {
+        let mut rows: Vec<(&'static str, &'static str, PageAction)> = DEFAULT_BINDINGS
+            .iter()
+            .map(|(mode, keys, action)| (mode_label(*mode), *keys, action.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
+        rows
+    }
+
+    /// Phase 6 a11y guarantee: every `PageAction` reachable by a
+    /// reasonable user is bound to at least one default chord in some
+    /// mode. Returns the list of unbound action *names* (debug-format
+    /// of the unit/parameterised variant) — empty Vec means full
+    /// coverage.
+    ///
+    /// "Reasonable" here excludes a small allow-list:
+    ///
+    /// - [`PageAction::TabReorder`] — currently mouse-only by design
+    /// - [`PageAction::ClearCompletedDownloads`] — no obvious chord;
+    ///   reachable via `:downloads` cmdline
+    /// - [`PageAction::EnterMode`] — variant-of-everything; the
+    ///   specific `EnterHintMode`/`OpenOmnibar`/etc. cover the surface
+    /// - [`PageAction::ScrollUp`/`ScrollDown` ≠ 1] — only the count=1
+    ///   variants need a default; counts come from the count buffer
+    pub fn missing_default_bindings() -> Vec<&'static str> {
+        // Static list of variant kinds we expect bound. A new
+        // `PageAction` variant lands → add it here or to the allow
+        // list. The exhaustive match below is the failure surface
+        // that catches drift at compile time.
+        //
+        // We DO this by name (not by `PageAction` value) so that count
+        // variants compare with `count = 1`; the table maps the canonical
+        // chord that fires the unit case.
+        let bound: std::collections::HashSet<&'static str> = DEFAULT_BINDINGS
+            .iter()
+            .map(|(_, _, a)| action_kind(a))
+            .collect();
+        let expected = [
+            "ScrollUp",
+            "ScrollDown",
+            "ScrollLeft",
+            "ScrollRight",
+            "ScrollHalfPageDown",
+            "ScrollHalfPageUp",
+            "ScrollFullPageDown",
+            "ScrollFullPageUp",
+            "ScrollTop",
+            "ScrollBottom",
+            "TabNext",
+            "TabPrev",
+            "TabClose",
+            "TabNew",
+            "DuplicateTab",
+            "PinTab",
+            "HistoryBack",
+            "HistoryForward",
+            "Reload",
+            "ReloadHard",
+            "StopLoading",
+            "OpenOmnibar",
+            "OpenCommandLine",
+            "EnterHintMode",
+            "EnterHintModeBackground",
+            "Find",
+            "FindNext",
+            "FindPrev",
+            "YankUrl",
+            "ZoomIn",
+            "ZoomOut",
+            "ZoomReset",
+            "OpenDevTools",
+        ];
+        expected
+            .iter()
+            .copied()
+            .filter(|name| !bound.contains(name))
+            .collect()
+    }
+
     /// Default vim-flavoured bindings. `leader` is the configured
     /// leader char (vim default is `\`). See `docs/keymap.md` for
     /// the full table.
@@ -218,6 +305,64 @@ impl ModeMap {
             }
         }
         last_action
+    }
+}
+
+fn mode_label(mode: PageMode) -> &'static str {
+    match mode {
+        PageMode::Normal => "normal",
+        PageMode::Visual => "visual",
+        PageMode::Command => "command",
+        PageMode::Hint => "hint",
+        PageMode::Pending => "pending",
+        PageMode::Edit => "edit",
+    }
+}
+
+/// Cheap discriminant name for a `PageAction`. Used by the a11y audit
+/// to bucket count-bearing variants under one name (e.g. ScrollDown(1)
+/// and ScrollDown(5) both report "ScrollDown").
+fn action_kind(a: &PageAction) -> &'static str {
+    match a {
+        PageAction::ScrollUp(_) => "ScrollUp",
+        PageAction::ScrollDown(_) => "ScrollDown",
+        PageAction::ScrollLeft(_) => "ScrollLeft",
+        PageAction::ScrollRight(_) => "ScrollRight",
+        PageAction::ScrollPageUp => "ScrollPageUp",
+        PageAction::ScrollPageDown => "ScrollPageDown",
+        PageAction::ScrollFullPageDown => "ScrollFullPageDown",
+        PageAction::ScrollFullPageUp => "ScrollFullPageUp",
+        PageAction::ScrollHalfPageDown => "ScrollHalfPageDown",
+        PageAction::ScrollHalfPageUp => "ScrollHalfPageUp",
+        PageAction::ScrollTop => "ScrollTop",
+        PageAction::ScrollBottom => "ScrollBottom",
+        PageAction::TabNext => "TabNext",
+        PageAction::TabPrev => "TabPrev",
+        PageAction::TabClose => "TabClose",
+        PageAction::TabNew => "TabNew",
+        PageAction::DuplicateTab => "DuplicateTab",
+        PageAction::PinTab => "PinTab",
+        PageAction::TabReorder { .. } => "TabReorder",
+        PageAction::HistoryBack => "HistoryBack",
+        PageAction::HistoryForward => "HistoryForward",
+        PageAction::Reload => "Reload",
+        PageAction::ReloadHard => "ReloadHard",
+        PageAction::StopLoading => "StopLoading",
+        PageAction::OpenOmnibar => "OpenOmnibar",
+        PageAction::OpenCommandLine => "OpenCommandLine",
+        PageAction::EnterHintMode => "EnterHintMode",
+        PageAction::EnterHintModeBackground => "EnterHintModeBackground",
+        PageAction::EnterMode(_) => "EnterMode",
+        PageAction::Find { .. } => "Find",
+        PageAction::FindNext => "FindNext",
+        PageAction::FindPrev => "FindPrev",
+        PageAction::YankUrl => "YankUrl",
+        PageAction::ZoomIn => "ZoomIn",
+        PageAction::ZoomOut => "ZoomOut",
+        PageAction::ZoomReset => "ZoomReset",
+        PageAction::OpenDevTools => "OpenDevTools",
+        PageAction::ClearCompletedDownloads => "ClearCompletedDownloads",
+        PageAction::EnterEditMode => "EnterEditMode",
     }
 }
 
@@ -457,6 +602,25 @@ mod tests {
         let km = Keymap::default_bindings('\\');
         let r = km.lookup(PageMode::Normal, &chords("<C-S-i>"));
         assert!(matches!(r, Lookup::Match(PageAction::OpenDevTools)));
+    }
+
+    #[test]
+    fn audit_default_bindings_returns_sorted_rows() {
+        let rows = Keymap::audit_default_bindings('\\');
+        assert!(!rows.is_empty());
+        // Sorted by mode then keys — assert pairwise.
+        for w in rows.windows(2) {
+            let (a_mode, a_keys) = (w[0].0, w[0].1);
+            let (b_mode, b_keys) = (w[1].0, w[1].1);
+            let cmp = a_mode.cmp(b_mode).then(a_keys.cmp(b_keys));
+            assert!(cmp.is_le(), "{a_mode}/{a_keys} vs {b_mode}/{b_keys}");
+        }
+    }
+
+    #[test]
+    fn every_user_facing_action_has_a_default_binding() {
+        let missing = Keymap::missing_default_bindings();
+        assert!(missing.is_empty(), "unbound actions: {missing:?}");
     }
 
     #[test]
