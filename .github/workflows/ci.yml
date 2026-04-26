@@ -43,7 +43,7 @@ jobs:
           shared-key: linux-build
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
@@ -128,7 +128,7 @@ jobs:
           shared-key: linux-build-osr
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
@@ -186,7 +186,7 @@ jobs:
           shared-key: linux-build
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
@@ -248,13 +248,13 @@ jobs:
           shared-key: linux-build
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
 
       - name: cache appimagetool
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/appimagetool
           key: appimagetool-x86_64-continuous
