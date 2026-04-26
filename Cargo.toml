@@ -74,10 +74,11 @@ buffr-zoom = { path = "crates/buffr-zoom" }
 buffr-permissions = { path = "crates/buffr-permissions" }
 
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
-# exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
-# breaking changes can land on patch bumps.
-hjkl-engine = "=0.0.42"
-hjkl-buffer = "=0.0.42"
+# exact via "=0.1.x" — hjkl 0.1.0 freezes the SPEC trait surface, but
+# patch bumps within 0.1.x may still land additive changes; lockstep
+# pin keeps the workspace deterministic.
+hjkl-engine = "=0.1.0"
+hjkl-buffer = "=0.1.0"
 
 # Local-dev override: point hjkl-* crates at the in-tree checkout so
 # we can iterate against unreleased changes without waiting on the
