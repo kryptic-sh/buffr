@@ -71,3 +71,7 @@ and this project adheres to
   `hjkl_engine`, threading fold operations through the editor host. Buffr does
   not implement a fold provider and consumes only editor-level APIs, so this is
   a transparent pin bump — no source changes required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.38` to
+  `=0.0.39` — adds `Query::dirty_gen` for cache invalidation on the syntax
+  query layer. Buffr consumes only editor-level APIs, so this is a transparent
+  pin bump — no source changes required.
