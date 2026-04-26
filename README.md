@@ -1,10 +1,14 @@
 # buffr
 
+[![CI](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Website](https://img.shields.io/badge/website-buffr.kryptic.sh-7ee787)](https://buffr.kryptic.sh)
+
 Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
 
 ## Status
 
-Early scaffold. Not usable yet.
+Early scaffold. Modal engine wired on hjkl 0.1.0; CEF integration in progress.
 
 ## Goals
 
