@@ -118,11 +118,9 @@ impl Capability {
             "midi" => Capability::Midi,
             other => {
                 if let Some(rest) = other.strip_prefix("other:") {
-                    let bit: u32 =
-                        rest.parse()
-                            .map_err(|_| PermError::UnknownCapability {
-                                capability: other.to_string(),
-                            })?;
+                    let bit: u32 = rest.parse().map_err(|_| PermError::UnknownCapability {
+                        capability: other.to_string(),
+                    })?;
                     Capability::Other(bit)
                 } else {
                     return Err(PermError::UnknownCapability {
@@ -231,11 +229,7 @@ impl Permissions {
 
     /// Look up the stored decision for `(origin, capability)`. `None`
     /// means "not yet decided — prompt the user".
-    pub fn get(
-        &self,
-        origin: &str,
-        capability: Capability,
-    ) -> Result<Option<Decision>, PermError> {
+    pub fn get(&self, origin: &str, capability: Capability) -> Result<Option<Decision>, PermError> {
         let conn = self.conn.lock().map_err(|_| PermError::Poisoned)?;
         let cap_key = capability.as_storage_key();
         let dec: Option<String> = conn
@@ -274,11 +268,7 @@ impl Permissions {
 
     /// Drop the stored decision for `(origin, capability)`. Returns
     /// `true` iff a row was deleted.
-    pub fn forget(
-        &self,
-        origin: &str,
-        capability: Capability,
-    ) -> Result<bool, PermError> {
+    pub fn forget(&self, origin: &str, capability: Capability) -> Result<bool, PermError> {
         let conn = self.conn.lock().map_err(|_| PermError::Poisoned)?;
         let cap_key = capability.as_storage_key();
         let n = conn.execute(
@@ -292,10 +282,7 @@ impl Permissions {
     /// rows deleted.
     pub fn forget_origin(&self, origin: &str) -> Result<usize, PermError> {
         let conn = self.conn.lock().map_err(|_| PermError::Poisoned)?;
-        let n = conn.execute(
-            "DELETE FROM permissions WHERE origin = ?1",
-            params![origin],
-        )?;
+        let n = conn.execute("DELETE FROM permissions WHERE origin = ?1", params![origin])?;
         Ok(n)
     }
 
@@ -394,14 +381,16 @@ mod tests {
     #[test]
     fn forget_existing_returns_true_missing_returns_false() {
         let p = Permissions::open_in_memory().unwrap();
-        p.set(
-            "https://a.example",
-            Capability::Microphone,
-            Decision::Allow,
-        )
-        .unwrap();
-        assert!(p.forget("https://a.example", Capability::Microphone).unwrap());
-        assert!(!p.forget("https://a.example", Capability::Microphone).unwrap());
+        p.set("https://a.example", Capability::Microphone, Decision::Allow)
+            .unwrap();
+        assert!(
+            p.forget("https://a.example", Capability::Microphone)
+                .unwrap()
+        );
+        assert!(
+            !p.forget("https://a.example", Capability::Microphone)
+                .unwrap()
+        );
         assert!(
             p.get("https://a.example", Capability::Microphone)
                 .unwrap()
@@ -414,12 +403,8 @@ mod tests {
         let p = Permissions::open_in_memory().unwrap();
         p.set("https://a.example", Capability::Camera, Decision::Allow)
             .unwrap();
-        p.set(
-            "https://a.example",
-            Capability::Microphone,
-            Decision::Allow,
-        )
-        .unwrap();
+        p.set("https://a.example", Capability::Microphone, Decision::Allow)
+            .unwrap();
         p.set(
             "https://b.example",
             Capability::Notifications,
@@ -499,15 +484,9 @@ mod tests {
     #[test]
     fn other_capability_round_trip_through_store() {
         let p = Permissions::open_in_memory().unwrap();
-        p.set(
-            "https://a.example",
-            Capability::Other(2048),
-            Decision::Deny,
-        )
-        .unwrap();
-        let row = p
-            .get("https://a.example", Capability::Other(2048))
+        p.set("https://a.example", Capability::Other(2048), Decision::Deny)
             .unwrap();
+        let row = p.get("https://a.example", Capability::Other(2048)).unwrap();
         assert_eq!(row, Some(Decision::Deny));
     }
 
