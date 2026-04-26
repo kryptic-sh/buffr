@@ -1,0 +1,23 @@
+[package]
+name = "buffr-permissions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "SQLite-backed per-origin permissions store for buffr (Phase 5)."
+
+[dependencies]
+# `bundled` ships libsqlite3 inside the crate so we don't take a system
+# dep — buffr is shipped as a self-contained binary on every platform.
+rusqlite = { workspace = true, features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Used by a unit test that confirms `Decision`'s snake_case rename
+# survives through serde_json. No runtime use.
+serde_json.workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/buffr-bookmarks",
     "crates/buffr-downloads",
     "crates/buffr-zoom",
+    "crates/buffr-permissions",
     "apps/buffr",
     "apps/buffr-helper",
     "xtask",
@@ -67,12 +68,21 @@ buffr-history = { path = "crates/buffr-history" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 buffr-downloads = { path = "crates/buffr-downloads" }
 buffr-zoom = { path = "crates/buffr-zoom" }
+buffr-permissions = { path = "crates/buffr-permissions" }
 
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
 # breaking changes can land on patch bumps.
-hjkl-engine = "=0.0.16"
-hjkl-buffer = "=0.0.16"
+hjkl-engine = "=0.0.22"
+hjkl-buffer = "=0.0.22"
+
+# Local-dev override: point hjkl-* crates at the in-tree checkout so
+# we can iterate against unreleased changes without waiting on the
+# crates.io publish rate limit. Comment out once the matching tag
+# publishes and the pin catches up.
+[patch.crates-io]
+hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer" }
+hjkl-engine = { path = "../hjkl/crates/hjkl-engine" }
 
 [profile.release]
 lto = "thin"
