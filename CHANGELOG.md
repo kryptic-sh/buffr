@@ -60,3 +60,9 @@ and this project adheres to
   and operations from `hjkl_buffer::Buffer` onto `hjkl_engine::Editor`. Buffr
   does not interact with the marks API directly, so this is a transparent pin
   bump — no source changes required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.36` to
+  `=0.0.37` — relocates `spans` and `search_pattern` out of
+  `hjkl_buffer::Buffer` onto `hjkl_engine::BufferView`, which now carries the
+  `spans` and `search_pattern` fields. Buffr does not consume these fields
+  directly per the consumer audit, so this is a transparent pin bump — no source
+  changes required.
