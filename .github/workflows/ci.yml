@@ -213,3 +213,92 @@ jobs:
           test -f "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/MacOS/buffr Helper"
           xmllint --noout target/debug/buffr.app/Contents/Info.plist
           xmllint --noout "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/Info.plist"
+
+  linux-package:
+    # Cross-build the AppImage / .deb / AUR PKGBUILD on a Linux runner.
+    # No signing in this round — Phase 6 release pipeline takes that
+    # over. The job verifies the bundle scripts produce installable
+    # artifacts and that `dpkg-deb -I` parses the resulting .deb metadata.
+    name: linux package (AppImage + deb + AUR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install CEF runtime + packaging deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
+            libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
+            libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
+            libgl1 libegl1 libgles2 \
+            libfuse2 dpkg dpkg-dev fakeroot file
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-build
+
+      - name: cache CEF binary distribution
+        uses: actions/cache@v4
+        with:
+          path: vendor/cef
+          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+
+      - name: cache appimagetool
+        uses: actions/cache@v4
+        with:
+          path: vendor/appimagetool
+          key: appimagetool-x86_64-continuous
+
+      - name: fetch CEF
+        run: cargo xtask fetch-cef
+
+      - name: cargo xtask package-linux (release)
+        run: cargo xtask package-linux --release --variant all
+
+      - name: list artifacts
+        run: ls -la target/dist/linux/
+
+      - name: validate AppImage exists + executable
+        run: |
+          set -e
+          shopt -s nullglob
+          appimages=(target/dist/linux/buffr-*-x86_64.AppImage)
+          if [ ${#appimages[@]} -eq 0 ]; then
+            echo "::error::no AppImage produced"
+            exit 1
+          fi
+          test -x "${appimages[0]}"
+          file "${appimages[0]}" | grep -q ELF
+          echo "AppImage OK: ${appimages[0]}"
+
+      - name: validate .deb metadata
+        run: |
+          set -e
+          shopt -s nullglob
+          debs=(target/dist/linux/buffr-*-amd64.deb)
+          if [ ${#debs[@]} -eq 0 ]; then
+            echo "::error::no .deb produced"
+            exit 1
+          fi
+          dpkg-deb -I "${debs[0]}"
+          dpkg-deb -c "${debs[0]}" | head -30
+          echo "deb OK: ${debs[0]}"
+
+      - name: validate PKGBUILD
+        run: |
+          set -e
+          test -f pkg/aur/PKGBUILD
+          grep -q '^pkgname=buffr$' pkg/aur/PKGBUILD
+          grep -q '^pkgver=' pkg/aur/PKGBUILD
+          grep -q "sha256sums=('SKIP')" pkg/aur/PKGBUILD
+          echo "PKGBUILD OK"
