@@ -49,6 +49,8 @@ pub struct Config {
     pub downloads: DownloadsConfig,
     pub hint: HintConfig,
     pub crash_reporter: CrashReporterConfig,
+    pub updates: UpdateConfig,
+    pub accessibility: AccessibilityConfig,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
@@ -134,6 +136,11 @@ pub enum ThemeMode {
 pub struct Theme {
     pub accent: String,
     pub mode: ThemeMode,
+    /// Phase 6 accessibility: when `true`, the chrome (statusline,
+    /// tab strip, input bar, prompt) renders with a high-contrast
+    /// palette instead of the accent-tinted default. See
+    /// `docs/accessibility.md` for the colour values.
+    pub high_contrast: bool,
 }
 
 impl Default for Theme {
@@ -141,8 +148,57 @@ impl Default for Theme {
         Self {
             accent: "#7aa2f7".into(),
             mode: ThemeMode::Auto,
+            high_contrast: false,
         }
     }
+}
+
+/// `[updates]` section — Phase 6 update channel.
+///
+/// Off-by-default would make us silently fall behind on security fixes,
+/// so the default is `enabled = true` with a 24 h interval. This
+/// performs **one** GET per `check_interval_hours` against the GitHub
+/// releases API; no PII is sent. To opt out fully set
+/// `enabled = false` — that path makes **zero** network calls. See
+/// `docs/privacy.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub enabled: bool,
+    /// Release channel. `"stable"` only today; `"nightly"` reserved.
+    pub channel: String,
+    pub check_interval_hours: u32,
+    /// `owner/repo` slug. Forks point this at their own repo.
+    pub github_repo: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel: "stable".into(),
+            check_interval_hours: 24,
+            github_repo: "kryptic-sh/buffr".into(),
+        }
+    }
+}
+
+/// `[accessibility]` section — Phase 6 a11y pass.
+///
+/// Web content goes through CEF's renderer accessibility tree (which
+/// platform screen readers read directly). Native chrome (statusline,
+/// tab strip, prompts) is keyboard-first; a screen-reader bridge is
+/// post-1.0 because it requires platform-specific bindings (AT-SPI on
+/// Linux, NSAccessibility on macOS, MSAA on Windows). See
+/// `docs/accessibility.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccessibilityConfig {
+    /// Enable CEF's renderer accessibility tree by passing the
+    /// `--force-renderer-accessibility` switch through
+    /// `App::on_before_command_line_processing`. Default `false` —
+    /// the tree is non-trivial overhead for users without an AT.
+    pub force_renderer_accessibility: bool,
 }
 
 /// Categories of locally-stored data the shutdown hook can wipe when
@@ -400,6 +456,40 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             return Err(ConfigError::Validate {
                 message: "hint.alphabet must contain at least 2 characters".into(),
                 location: Some("hint.alphabet".into()),
+            });
+        }
+    }
+
+    // -- updates ------------------------------------------------------
+    // Validate channel + repo shape so a typo doesn't surface as a 404
+    // GET burned each launch. Keep accepted channels permissive so
+    // `nightly` parses now even though the actual nightly tag stream
+    // isn't published yet.
+    {
+        let ch = cfg.updates.channel.as_str();
+        if ch != "stable" && ch != "nightly" {
+            return Err(ConfigError::Validate {
+                message: format!("updates.channel must be \"stable\" or \"nightly\" (got {ch:?})"),
+                location: Some("updates.channel".into()),
+            });
+        }
+        let repo = cfg.updates.github_repo.as_str();
+        // GitHub repos are `owner/repo` — exactly one slash, no empty
+        // segments. Anything else routes to a 404 we'd rather catch
+        // here than at HTTP time.
+        let slash_count = repo.matches('/').count();
+        if slash_count != 1 || repo.starts_with('/') || repo.ends_with('/') {
+            return Err(ConfigError::Validate {
+                message: format!(
+                    "updates.github_repo must be of the form \"owner/repo\" (got {repo:?})"
+                ),
+                location: Some("updates.github_repo".into()),
+            });
+        }
+        if cfg.updates.check_interval_hours == 0 {
+            return Err(ConfigError::Validate {
+                message: "updates.check_interval_hours must be > 0".into(),
+                location: Some("updates.check_interval_hours".into()),
             });
         }
     }
