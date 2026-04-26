@@ -120,9 +120,9 @@ Goal: empty native window renders `https://example.com` via CEF.
       (Phase 3 scope). `apps/buffr` forces the winit X11 backend via
       `EventLoopBuilderExtX11::with_x11()` so Wayland sessions transparently run
       via XWayland.
-- [ ] CI: Linux build + smoke test (window opens, page loads, exits clean).
-      Build job landed in `.github/workflows/ci.yml`; runtime smoke test still
-      needs a display server in CI.
+- [x] CI: Linux build + smoke test (window opens, page loads, exits clean).
+      `.github/workflows/ci.yml` runs the smoke job under `xvfb` after
+      installing `xkbcommon-x11` + GL libs (commits `51070da`, `9b75326`).
 - [x] macOS Helper bundle: `cargo xtask bundle-macos` assembles
       `buffr.app/Contents/Frameworks/buffr Helper.app/` with embedded CEF
       framework. Single helper flavor; multi-helper split (GPU / Renderer /
@@ -135,33 +135,52 @@ delegates to `hjkl-editor`.
 
 **Page-mode (buffr-modal, in-tree)**:
 
-- [ ] `PageMode` enum: `Normal | Visual | Command | Hint | Pending`. (Edit-mode
-      is a separate state that hands off to hjkl.)
-- [ ] Key parser: vim notation → `KeyChord`. Handle `<C-...>`, `<S-...>`,
-      `<M-...>`, `<leader>`, `<Space>`, literals.
-- [ ] Keymap trie: prefix lookup, ambiguity timeout, count prefix, register
-      prefix (`"a`).
-- [ ] Page-action dispatch: `PageAction` enum mapped to host calls (scroll, tab
-      next/prev/close, back/forward, reload, find, yank URL).
-- [ ] Default bindings table (documented in `docs/keymap.md`).
-- [ ] Unit tests: parser, trie, ambiguity, count, mode transitions.
+- [x] `PageMode` enum: `Normal | Visual | Command | Hint | Pending`. (Edit-mode
+      is a separate state that hands off to hjkl.) Landed in
+      `crates/buffr-modal/src/actions.rs`.
+- [x] Key parser: vim notation → `KeyChord`. Handle `<C-...>`, `<S-...>`,
+      `<M-...>`, `<leader>`, `<Space>`, literals. See
+      `crates/buffr-modal/src/key.rs` (commit `7440e9c`).
+- [x] Keymap trie: prefix lookup, ambiguity timeout, count prefix, register
+      prefix (`"a`). See `crates/buffr-modal/src/keymap.rs` (commit `bfce707`).
+- [x] Page-action dispatch: `PageAction` enum mapped to host calls (scroll, tab
+      next/prev/close, back/forward, reload, find, yank URL). See
+      `BrowserHost::dispatch` in `crates/buffr-core/src/host.rs` (commit
+      `d54dd92`).
+- [x] Default bindings table (documented in `docs/keymap.md`).
+      `Keymap::default_bindings` in `crates/buffr-modal/src/keymap.rs`;
+      reference at `docs/keymap.md` (commits `f3c739c`, `558c183`).
+- [x] Unit tests: parser, trie, ambiguity, count, mode transitions. 75+ tests
+      live under `crates/buffr-modal/`.
 
 **Edit-mode (delegates to hjkl)**:
 
-- [ ] Add `hjkl-engine`, `hjkl-buffer`, `hjkl-editor` to workspace deps, pinned
-      `=0.0.x`. No default features.
+**Status:** blocked on hjkl `>= 0.0.X` exposing the `Host` trait +
+`Editor<R, H>`. The `hjkl-watch` cron routine
+([trig_017EBdEhK2jzFunShjXPWYsT](https://claude.ai/code/routines/trig_017EBdEhK2jzFunShjXPWYsT))
+polls hjkl crates hourly and will land integration in a `hjkl-bump-*` PR when it
+ships.
+
+- [x] Add `hjkl-engine`, `hjkl-buffer`, `hjkl-editor` to workspace deps, pinned
+      `=0.0.x`. No default features. Pinned at `=0.0.25` in workspace
+      `Cargo.toml`; `hjkl-editor` not yet published — only `hjkl-engine` +
+      `hjkl-buffer` are wired today.
 - [ ] `BuffrHost` struct impls `hjkl_engine::Host`:
       `write_clipboard`/`read_clipboard` via CEF clipboard API,
-      `Host::Intent = BuffrEditIntent { RequestAutocomplete, ... }`.
+      `Host::Intent = BuffrEditIntent { RequestAutocomplete, ... }`. **Status:**
+      blocked on hjkl exposing the `Host` trait.
 - [ ] CEF V8 binding for focused text-field value get/set; `apps/buffr-helper`
-      exposes JS bridge.
+      exposes JS bridge. **Status:** blocked on hjkl `Host` trait extraction.
 - [ ] On focus + `i`/`a`/`I`/`A` etc.: build `Rope` from field value, construct
-      `Editor<Rope, BuffrHost>`, route keys to it.
+      `Editor<Rope, BuffrHost>`, route keys to it. **Status:** blocked on hjkl
+      `Editor<R, H>`.
 - [ ] Per render frame: drain `Editor::take_changes()` → CEF DOM update via JS
-      bridge.
-- [ ] `<Esc>` → exit edit-mode → drop `Editor`, return to page-mode.
+      bridge. **Status:** blocked on hjkl `Editor::take_changes`.
+- [ ] `<Esc>` → exit edit-mode → drop `Editor`, return to page-mode. **Status:**
+      blocked on hjkl `Editor<R, H>`.
 - [ ] Smoke test: open a page with `<textarea>`, focus it, type `iHello<Esc>` →
-      field reads "Hello"; `dd` → field cleared.
+      field reads "Hello"; `dd` → field cleared. **Status:** blocked on the
+      edit-mode wiring above.
 
 ### Phase 3 — UI chrome
 
@@ -173,7 +192,9 @@ Goal: tab strip + statusline + command line + omnibar, all native.
       compositor reserved for the hint-mode migration.
 - [ ] Implement `crates/buffr-core/src/osr.rs` (currently scaffolded). Wire
       `OsrHost::new` to real CEF windowless mode + wgpu compositor so Wayland
-      sessions can run natively without XWayland.
+      sessions can run natively without XWayland. **Status:** scaffolded;
+      deferred to post-1.0. XWayland covers Wayland sessions today. See
+      [`docs/ui-stack.md`](./docs/ui-stack.md).
 - [x] Tab strip: render via `buffr-ui::TabStrip` (softbuffer paint), wired to
       multi-tab `BrowserHost`. Active tab highlighted with accent stripe; pinned
       tabs marked with `*`; loading progress drawn at the bottom edge of each
@@ -207,12 +228,19 @@ Goal: tab strip + statusline + command line + omnibar, all native.
 
 Goal: user TOML config drives keymap, theme, startup, search engines.
 
-- [ ] Schema: `[keymap]`, `[theme]`, `[startup]`, `[search]`, `[privacy]`.
-- [ ] Loader: XDG (`$XDG_CONFIG_HOME/buffr/config.toml`), macOS app support dir,
-      Windows `%APPDATA%\buffr\config.toml`. Resolved via `directories`.
-- [ ] Validation: friendly errors with line/col via `toml` spans.
-- [ ] Hot reload: file watcher → re-parse → diff → apply.
-- [ ] `buffr --print-config` and `buffr --check-config`.
+- [x] Schema: `[keymap]`, `[theme]`, `[startup]`, `[search]`, `[privacy]`.
+      Defined in `crates/buffr-config/src/lib.rs` (commit `6fe5d21`); later grew
+      `[downloads]`, `[hint]`, `[updates]`, `[accessibility]`,
+      `[crash_reporter]`.
+- [x] Loader: XDG (`$XDG_CONFIG_HOME/buffr/config.toml`), macOS app support dir,
+      Windows `%APPDATA%\buffr\config.toml`. Resolved via `directories`. See
+      `crates/buffr-config/src/loader.rs`.
+- [x] Validation: friendly errors with line/col via `toml` spans. Uses
+      `toml::de::Error::span()` in `crates/buffr-config/src/lib.rs`.
+- [x] Hot reload: file watcher → re-parse → diff → apply. Implemented in
+      `crates/buffr-config/src/watcher.rs` (commit `dbe8fd8`).
+- [x] `buffr --print-config` and `buffr --check-config`. Wired via clap in
+      `apps/buffr/src/main.rs` (commit `ba6405b`).
 
 ### Phase 5 — Browser features (1.0 cut)
 
@@ -268,7 +296,10 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       `host[:port]` (or `_global_` for hostless URLs). Apply on
       `LoadHandler::on_load_end`; persist on `ZoomIn` / `ZoomOut` / `ZoomReset`
       page actions. CLI: `--list-zoom`, `--clear-zoom`.
-- [ ] DevTools toggle (`<C-S-i>`).
+- [x] DevTools toggle (`<C-S-i>`). `PageAction::OpenDevTools` is bound to
+      `<C-S-i>` in `Keymap::default_bindings`
+      (`crates/buffr-modal/src/keymap.rs`) and dispatched via
+      `browser.host().show_dev_tools(...)` in `crates/buffr-core/src/host.rs`.
 
 ### Phase 6 — Polish & ship
 
@@ -402,6 +433,30 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 | `v0.4.0` | Phase 4 done | TOML config, hot reload, custom keymaps.         |
 | `v0.9.0` | Phase 5 done | Feature-complete for daily driving.              |
 | `v1.0.0` | Phase 6 done | Signed packages on all tier-1 platforms.         |
+
+## Status snapshot — 2026-04-26
+
+All non-hjkl-blocked work is landed. Open items:
+
+- **Phase 2 edit-mode** — blocked on hjkl `Host` trait extraction. The
+  `hjkl-watch` cron routine
+  ([trig_017EBdEhK2jzFunShjXPWYsT](https://claude.ai/code/routines/trig_017EBdEhK2jzFunShjXPWYsT))
+  polls hjkl crates hourly; it will bump pins, integrate the trait, and open a
+  PR when 0.0.x exposes `Host` (or 0.1.0 lands).
+- **Phase 3 OSR** — scaffolded; full implementation reserved for native Wayland
+  (post-1.0). XWayland covers Wayland sessions today.
+- **Signing infrastructure** — macOS Developer ID / notarization and Windows
+  code signing are deferred until certs are provisioned. Unsigned packages are
+  produced by the existing `xtask package-{linux,macos-dmg,windows-msi}` flows
+  for development.
+
+Test count: 415 passing across the workspace as of this audit.
+
+Bug fixes, dependency bumps, and small features are tracked via:
+
+- `dependabot` (weekly cargo + GitHub Actions PRs)
+- `hjkl-watch` (hourly hjkl version checks)
+- Direct PRs / commits as work continues
 
 ## Open Questions
 
