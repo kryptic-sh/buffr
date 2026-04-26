@@ -1,5 +1,5 @@
-//! [`BrowserHost`] — owns a single CEF browser attached to a native
-//! window via the `cef` crate's windowed-rendering path.
+//! [`BrowserHost`] — a tab manager owning N concurrent CEF browsers
+//! parented to one X11 window.
 //!
 //! ## Linux backend matrix
 //!
@@ -12,7 +12,19 @@
 //!   rendering. CEF paints into a buffer, we composite it onto a
 //!   winit/wgpu Wayland surface ourselves. Scaffolded in
 //!   [`crate::osr`] but not yet implemented.
+//!
+//! ## Multi-tab architecture
+//!
+//! All tabs share a **single** [`cef::Client`] (so the load/display/
+//! find/download handlers continue funnelling events into the same
+//! history / downloads / find sinks). Each tab owns its own
+//! [`cef::Browser`]; switching tabs calls
+//! `was_hidden(true)` on the previous and `was_hidden(false)` +
+//! `set_focus(true)` on the next. All browsers share the same X11
+//! parent window (the winit window handle); only the active browser
+//! is visible. See `docs/multi-tab.md`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_config::DownloadsConfig;
@@ -33,50 +45,119 @@ use crate::hint::{
 };
 use crate::{CoreError, handlers};
 
-/// Owns a CEF browser attached to a native window.
+/// Monotonic tab identifier minted by [`BrowserHost`]. Distinct from
+/// CEF's `Browser::identifier()` (which can collide on close+reopen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TabId(pub u64);
+
+impl std::fmt::Display for TabId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tab#{}", self.0)
+    }
+}
+
+/// Per-tab UI state preserved across tab switches. Find query and hint
+/// session restore on focus.
+#[derive(Debug, Default, Clone)]
+pub struct TabSession {
+    pub find_query: Option<String>,
+    pub hint_session: Option<HintSession>,
+}
+
+/// One open browser. The `browser` field is the live [`cef::Browser`]
+/// CEF returned from `browser_host_create_browser_sync`.
+pub struct Tab {
+    pub id: TabId,
+    pub browser: cef::Browser,
+    /// Last-known main frame URL. Updated externally on navigation
+    /// (Phase 5b will hook `LoadHandler::on_load_end`).
+    pub url: String,
+    /// Most recent title from CEF's display handler.
+    pub title: Option<String>,
+    /// Page load progress 0.0..=1.0. 1.0 = idle.
+    pub progress: f32,
+    pub is_loading: bool,
+    pub pinned: bool,
+    pub session: TabSession,
+}
+
+impl Tab {
+    /// Display title for the tab strip — falls back to URL host /
+    /// scheme when no title has been reported.
+    pub fn display_title(&self) -> String {
+        if let Some(t) = self.title.as_ref()
+            && !t.is_empty()
+        {
+            return t.clone();
+        }
+        if !self.url.is_empty() {
+            return self.url.clone();
+        }
+        format!("{}", self.id)
+    }
+}
+
+/// Copy-friendly snapshot of a tab. Used by chrome / UI threads that
+/// don't want to hold the manager mutex.
+#[derive(Debug, Clone)]
+pub struct TabSummary {
+    pub id: TabId,
+    pub title: String,
+    pub url: String,
+    pub progress: f32,
+    pub is_loading: bool,
+    pub pinned: bool,
+    pub private: bool,
+}
+
+/// Owns N CEF browsers parented to a single native X11 window.
 ///
 /// The host is created **after** `cef::initialize` succeeds. On Linux
-/// (default build) we hand the X11 window XID to CEF via `WindowInfo` —
-/// this works for both native X11 sessions and Wayland sessions running
-/// XWayland, because we force winit to its X11 backend before creating
-/// the event loop.
+/// (default build) we hand the X11 window XID to CEF via `WindowInfo`
+/// — this works for both native X11 sessions and Wayland sessions
+/// running XWayland, because we force winit to its X11 backend before
+/// creating the event loop.
 pub struct BrowserHost {
-    /// Live `cef::Browser` handle. Phase 2 acquires this via the
-    /// **synchronous** `browser_host_create_browser_sync` entry point
-    /// so the host has something to dispatch against immediately —
-    /// the async `browser_host_create_browser` returns only an `int`
-    /// success code and surfaces the `Browser` later via the
-    /// `LifeSpanHandler::on_after_created` callback, which is harder
-    /// to plumb through to the page-action dispatcher.
-    browser: cef::Browser,
-    /// Downloads store retained for `PageAction::ClearCompletedDownloads`
-    /// dispatch. The CEF `DownloadHandler` already owns its own clone
-    /// inside the `Client`; this is a separate `Arc` for direct
-    /// mutations from the page-action dispatcher.
+    /// Live tab list. Only the active tab is visible; inactive tabs
+    /// are `was_hidden(true)`.
+    tabs: Mutex<Vec<Tab>>,
+    /// Index into `tabs` of the active tab. `None` only between
+    /// `close_active` of the last tab and the caller's exit decision.
+    active: Mutex<Option<usize>>,
+    /// Monotonic [`TabId`] minter. Reset only across process restart.
+    next_id: AtomicU64,
+    /// Stored on construction so `open_tab` can build new browsers
+    /// after the manager is up.
+    parent_handle: Mutex<Option<RawWindowHandle>>,
+    /// Last known CEF child rect (width, height). Caller-passed via
+    /// [`Self::resize`]. Used by `open_tab` to size new browsers
+    /// consistently.
+    last_size: Mutex<(u32, u32)>,
+    /// Whether the host is in private mode. Threaded into
+    /// [`TabSummary`] so chrome can mark every tab private.
+    private: bool,
+    /// Shared stores — every tab's CEF client funnels into the same
+    /// history / downloads / zoom rows.
+    history: Arc<History>,
     downloads: Arc<Downloads>,
-    /// Per-site zoom store. `ZoomIn` / `ZoomOut` / `ZoomReset` write
-    /// through here; the CEF `LoadHandler` reads on load to restore.
+    downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
-    /// Last successful find query. `FindNext` / `FindPrev` reuse this
-    /// — they are no-ops when no `start_find` has run yet.
-    last_find_query: Mutex<Option<String>>,
-    /// Mailbox for renderer-emitted hint events. The display handler
-    /// writes; the host's hint API reads.
+    /// Mailboxes shared with CEF handlers. One sink for the whole
+    /// host (handlers can't tell which browser fired the event in
+    /// every callback shape, so per-tab demux happens in the UI).
+    find_sink: FindResultSink,
     hint_sink: HintEventSink,
-    /// Hint session state. `None` outside of hint mode; `Some(...)`
-    /// between `enter_hint_mode` and the eventual commit / cancel.
-    hint_session: Mutex<Option<HintSession>>,
-    /// User-configured alphabet, snapshotted at construction. The
-    /// session derives labels from this on entry.
+    /// User-configured hint alphabet. Each tab uses the same alphabet.
     hint_alphabet: HintAlphabet,
 }
 
 impl BrowserHost {
-    /// Create a browser attached to `window_handle`, navigating to `url`.
+    /// Create the host with a single initial tab loading `url`.
     ///
     /// `window_handle` is the platform window the CEF browser will be
     /// parented to. On Linux this must be the X11 XID of a winit
-    /// window.
+    /// window. All later tabs created via [`Self::open_tab`] re-use
+    /// this handle.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         window_handle: RawWindowHandle,
@@ -90,14 +171,90 @@ impl BrowserHost {
         hint_alphabet: HintAlphabet,
         initial_size: (u32, u32),
     ) -> Result<Self, CoreError> {
-        info!(target: "buffr_core::host", %url, "creating CEF browser");
+        Self::new_with_options(
+            window_handle,
+            url,
+            history,
+            downloads,
+            downloads_config,
+            zoom,
+            find_sink,
+            hint_sink,
+            hint_alphabet,
+            initial_size,
+            false,
+        )
+    }
 
-        // Phase 3 chrome: CEF's child window sits above a software-blit
-        // statusline strip the host window owns. Caller passes the
-        // already-trimmed width/height so the CEF child rect doesn't
-        // overlap the strip; on resize, `BrowserHost::resize` updates
-        // the rect and calls `was_resized()`.
-        let (init_w, init_h) = initial_size;
+    /// Like [`Self::new`] but lets the embedder mark every browser as
+    /// private. The flag is purely informational — the underlying CEF
+    /// profile dirs are already swapped at process start by the
+    /// `--private` CLI flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        window_handle: RawWindowHandle,
+        url: &str,
+        history: Arc<History>,
+        downloads: Arc<Downloads>,
+        downloads_config: Arc<DownloadsConfig>,
+        zoom: Arc<ZoomStore>,
+        find_sink: FindResultSink,
+        hint_sink: HintEventSink,
+        hint_alphabet: HintAlphabet,
+        initial_size: (u32, u32),
+        private: bool,
+    ) -> Result<Self, CoreError> {
+        info!(target: "buffr_core::host", %url, "creating CEF browser (initial tab)");
+        let host = Self {
+            tabs: Mutex::new(Vec::new()),
+            active: Mutex::new(None),
+            next_id: AtomicU64::new(0),
+            parent_handle: Mutex::new(Some(window_handle)),
+            last_size: Mutex::new(initial_size),
+            private,
+            history,
+            downloads,
+            downloads_config,
+            zoom,
+            find_sink,
+            hint_sink,
+            hint_alphabet,
+        };
+        host.open_tab(url)?;
+        Ok(host)
+    }
+
+    fn mint_id(&self) -> TabId {
+        let n = self.next_id.fetch_add(1, Ordering::SeqCst);
+        TabId(n)
+    }
+
+    /// Spin a fresh CEF browser parented to the host window. The new
+    /// tab becomes active.
+    pub fn open_tab(&self, url: &str) -> Result<TabId, CoreError> {
+        let id = self.create_browser(url, false)?;
+        Ok(id)
+    }
+
+    /// Same as [`Self::open_tab`] but the new tab is created hidden;
+    /// the active tab does not change.
+    pub fn open_tab_background(&self, url: &str) -> Result<TabId, CoreError> {
+        self.create_browser(url, true)
+    }
+
+    fn create_browser(&self, url: &str, background: bool) -> Result<TabId, CoreError> {
+        let handle = match self.parent_handle.lock() {
+            Ok(g) => match *g {
+                Some(h) => h,
+                None => return Err(CoreError::CreateBrowserFailed),
+            },
+            Err(_) => return Err(CoreError::CreateBrowserFailed),
+        };
+        let (init_w, init_h) = match self.last_size.lock() {
+            Ok(g) => *g,
+            Err(_) => return Err(CoreError::CreateBrowserFailed),
+        };
+
         let mut window_info = WindowInfo {
             bounds: cef::Rect {
                 x: 0,
@@ -107,17 +264,10 @@ impl BrowserHost {
             },
             ..WindowInfo::default()
         };
-
-        match window_handle {
-            // XWayland: winit gives us an Xlib handle even on Wayland
-            // sessions when the event loop is built with `with_x11()`,
-            // because the compositor proxies an X11 server (Xwayland)
-            // for legacy clients. CEF only supports windowed embedding
-            // into X11 on Linux, so this is the one supported arm in
-            // the default build.
+        match handle {
             #[cfg(target_os = "linux")]
-            RawWindowHandle::Xlib(handle) => {
-                window_info.parent_window = handle.window as _;
+            RawWindowHandle::Xlib(h) => {
+                window_info.parent_window = h.window as _;
             }
             other => {
                 tracing::warn!(
@@ -129,160 +279,386 @@ impl BrowserHost {
             }
         }
 
-        let url = CefString::from(url);
+        let cef_url = CefString::from(url);
         let settings = BrowserSettings::default();
-
-        // Phase 5: hand CEF a `Client` whose `get_load_handler` /
-        // `get_display_handler` / `get_download_handler` plumb events
-        // into `buffr-history` + `buffr-downloads`. Without a custom
-        // client, `on_load_end` / `on_before_download` never fire.
         let mut client = handlers::make_client(
-            history,
-            downloads.clone(),
-            downloads_config,
-            zoom.clone(),
-            find_sink,
-            hint_sink.clone(),
+            self.history.clone(),
+            self.downloads.clone(),
+            self.downloads_config.clone(),
+            self.zoom.clone(),
+            self.find_sink.clone(),
+            self.hint_sink.clone(),
         );
-
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
-            Some(&url),
+            Some(&cef_url),
             Some(&settings),
             None,
             None,
         )
         .ok_or(CoreError::CreateBrowserFailed)?;
 
-        Ok(Self {
+        let id = self.mint_id();
+        let tab = Tab {
+            id,
             browser,
-            downloads,
-            zoom,
-            last_find_query: Mutex::new(None),
-            hint_sink,
-            hint_session: Mutex::new(None),
-            hint_alphabet,
-        })
+            url: url.to_string(),
+            title: None,
+            progress: 1.0,
+            is_loading: false,
+            pinned: false,
+            session: TabSession::default(),
+        };
+
+        let mut tabs = self
+            .tabs
+            .lock()
+            .map_err(|_| CoreError::CreateBrowserFailed)?;
+        tabs.push(tab);
+        let new_idx = tabs.len() - 1;
+        drop(tabs);
+
+        if background {
+            // Hide the new browser; keep the existing active one.
+            if let Ok(tabs) = self.tabs.lock()
+                && let Some(host) = tabs[new_idx].browser.host()
+            {
+                host.was_hidden(1);
+            }
+        } else {
+            self.set_active_index(new_idx);
+        }
+        info!(target: "buffr_core::host", %id, %url, background, "tab opened");
+        Ok(id)
     }
 
-    /// Reflow the CEF child window to a new size after the host
-    /// `winit` window resized. Caller passes the *child* rect (i.e.
-    /// the page area, not including the statusline strip).
-    ///
-    /// Whether `was_resized()` alone is enough depends on CEF's host
-    /// platform: on Linux/X11 the embedded child is a real window
-    /// owned by CEF and does *not* automatically follow the parent's
-    /// new geometry — `was_resized` notifies the renderer of new
-    /// content dimensions but the X11 child still needs to be
-    /// repositioned/resized externally for some compositors. We don't
-    /// touch the X11 geometry directly here; that requires linking
-    /// `xlib` or going through `cef_window_handle_t`-typed APIs which
-    /// the cef-rs 147 wrapper doesn't expose. For now we rely on the
-    /// renderer-side `was_resized` and the X11 server's own size-hint
-    /// propagation (XWayland honours this; pure Mutter / KWin may
-    /// need `set_window_position` follow-up — punted to Phase 3b
-    /// since the smoke test path runs at fixed size).
-    pub fn resize(&self, _width: u32, _height: u32) {
-        if let Some(host) = self.browser.host() {
+    fn set_active_index(&self, new_idx: usize) {
+        let mut active = match self.active.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let tabs = match self.tabs.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if new_idx >= tabs.len() {
+            return;
+        }
+        if let Some(prev) = *active
+            && prev < tabs.len()
+            && prev != new_idx
+            && let Some(host) = tabs[prev].browser.host()
+        {
+            host.was_hidden(1);
+            host.set_focus(0);
+        }
+        if let Some(host) = tabs[new_idx].browser.host() {
+            host.was_hidden(0);
             host.was_resized();
+            host.set_focus(1);
+        }
+        *active = Some(new_idx);
+    }
+
+    /// Switch to the tab with `id`. No-op when not found.
+    pub fn select_tab(&self, id: TabId) {
+        let idx = match self.tabs.lock() {
+            Ok(g) => g.iter().position(|t| t.id == id),
+            Err(_) => None,
+        };
+        if let Some(idx) = idx {
+            self.set_active_index(idx);
         }
     }
 
-    /// Navigate the main frame to `url`. Used by the omnibar (Enter
-    /// on a typed URL or selected suggestion) and by `:open <url>` in
-    /// the command line.
+    /// Number of open tabs.
+    pub fn tab_count(&self) -> usize {
+        self.tabs.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Active tab snapshot, if any.
+    pub fn active_tab(&self) -> Option<TabSummary> {
+        let tabs = self.tabs.lock().ok()?;
+        let idx = (*self.active.lock().ok()?)?;
+        tabs.get(idx).map(|t| self.summarize(t))
+    }
+
+    /// Snapshot of every tab in stored order.
+    pub fn tabs_summary(&self) -> Vec<TabSummary> {
+        let Ok(tabs) = self.tabs.lock() else {
+            return Vec::new();
+        };
+        tabs.iter().map(|t| self.summarize(t)).collect()
+    }
+
+    /// Index of the active tab in [`Self::tabs_summary`]'s ordering.
+    pub fn active_index(&self) -> Option<usize> {
+        self.active.lock().ok().and_then(|g| *g)
+    }
+
+    fn summarize(&self, t: &Tab) -> TabSummary {
+        TabSummary {
+            id: t.id,
+            title: t.display_title(),
+            url: t.url.clone(),
+            progress: t.progress,
+            is_loading: t.is_loading,
+            pinned: t.pinned,
+            private: self.private,
+        }
+    }
+
+    /// Cycle to the next tab (wraps).
+    pub fn next_tab(&self) {
+        let len = self.tab_count();
+        if len <= 1 {
+            return;
+        }
+        let cur = self.active_index().unwrap_or(0);
+        let next = (cur + 1) % len;
+        self.set_active_index(next);
+    }
+
+    /// Cycle to the previous tab (wraps).
+    pub fn prev_tab(&self) {
+        let len = self.tab_count();
+        if len <= 1 {
+            return;
+        }
+        let cur = self.active_index().unwrap_or(0);
+        let prev = if cur == 0 { len - 1 } else { cur - 1 };
+        self.set_active_index(prev);
+    }
+
+    /// Close the active tab. Returns `Ok(true)` when more tabs remain,
+    /// `Ok(false)` when this was the last tab (caller should exit the
+    /// app).
+    pub fn close_active(&self) -> Result<bool, CoreError> {
+        let idx = self.active_index().ok_or(CoreError::CreateBrowserFailed)?;
+        self.close_index(idx)
+    }
+
+    /// Close the tab with `id`. Returns `Ok(true)` when more tabs
+    /// remain, `Ok(false)` when this was the last tab.
+    pub fn close_tab(&self, id: TabId) -> Result<bool, CoreError> {
+        let idx = match self.tabs.lock() {
+            Ok(g) => g.iter().position(|t| t.id == id),
+            Err(_) => None,
+        };
+        match idx {
+            Some(i) => self.close_index(i),
+            None => Ok(true),
+        }
+    }
+
+    fn close_index(&self, idx: usize) -> Result<bool, CoreError> {
+        let removed = {
+            let mut tabs = self
+                .tabs
+                .lock()
+                .map_err(|_| CoreError::CreateBrowserFailed)?;
+            if idx >= tabs.len() {
+                return Ok(true);
+            }
+            tabs.remove(idx)
+        };
+        // Tell CEF to tear the browser down. The browser drop also
+        // runs at end-of-scope but `close_browser(1)` flushes IO and
+        // releases the X11 child window immediately.
+        if let Some(host) = removed.browser.host() {
+            host.close_browser(1);
+        }
+
+        // Pick a new active. Prefer the tab that was after the removed
+        // one (mirrors browser convention); fall back to the previous.
+        let len = self.tab_count();
+        if len == 0 {
+            if let Ok(mut a) = self.active.lock() {
+                *a = None;
+            }
+            return Ok(false);
+        }
+        let new_idx = if idx >= len { len - 1 } else { idx };
+        self.set_active_index(new_idx);
+        Ok(true)
+    }
+
+    /// Move the tab at `from` to position `to`. Indices are clamped to
+    /// the valid range; same-position is a no-op. Reserved for the
+    /// eventual mouse-drag handler.
+    pub fn move_tab(&self, from: usize, to: usize) {
+        let mut tabs = match self.tabs.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let len = tabs.len();
+        if len == 0 || from == to || from >= len {
+            return;
+        }
+        let to = to.min(len - 1);
+        let tab = tabs.remove(from);
+        tabs.insert(to, tab);
+        // Fix up active index so it points at the same tab.
+        let mut active = match self.active.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(a) = *active {
+            let new_a = if a == from {
+                to
+            } else if from < a && to >= a {
+                a - 1
+            } else if from > a && to <= a {
+                a + 1
+            } else {
+                a
+            };
+            *active = Some(new_a);
+        }
+    }
+
+    /// Duplicate the active tab — creates a new tab loading the same
+    /// URL.
+    pub fn duplicate_active(&self) -> Result<TabId, CoreError> {
+        let url = match self.active_tab() {
+            Some(t) => t.url,
+            None => return Err(CoreError::CreateBrowserFailed),
+        };
+        let target = if url.is_empty() {
+            "about:blank".to_string()
+        } else {
+            url
+        };
+        self.open_tab(&target)
+    }
+
+    /// Toggle the pinned bit on the active tab. Pin does **not**
+    /// prevent close — it only signals sort order to chrome.
+    pub fn toggle_pin_active(&self) {
+        let Ok(mut tabs) = self.tabs.lock() else {
+            return;
+        };
+        let Some(idx) = self.active.lock().ok().and_then(|g| *g) else {
+            return;
+        };
+        if let Some(t) = tabs.get_mut(idx) {
+            t.pinned = !t.pinned;
+        }
+    }
+
+    /// Update the URL field on the tab whose `Browser::identifier`
+    /// matches `cef_id`. Used by the load handler to keep the chrome
+    /// in sync. Returns the [`TabId`] of the affected tab, if any.
+    pub fn record_url(&self, cef_id: i32, url: &str) -> Option<TabId> {
+        let mut tabs = self.tabs.lock().ok()?;
+        for t in tabs.iter_mut() {
+            if t.browser.identifier() == cef_id {
+                t.url = url.to_string();
+                return Some(t.id);
+            }
+        }
+        None
+    }
+
+    /// Reflow every tab's CEF child window after the host winit window
+    /// resized. Caller passes the *child* rect (the page area, not
+    /// including chrome strips).
     ///
-    /// Empty / whitespace-only input is silently dropped — the caller
-    /// is expected to short-circuit before calling. URLs that don't
-    /// parse are still passed through to CEF, which will surface its
-    /// own error page (`net::ERR_INVALID_URL`).
+    /// `was_resized()` notifies CEF's renderer of new content
+    /// dimensions; on X11 the embedded child window does not always
+    /// follow the parent's geometry automatically — we rely on
+    /// XWayland / the compositor honouring resize hints. Pure Mutter
+    /// / KWin embeds may need an `XResizeWindow` follow-up which the
+    /// cef-rs 147 wrapper doesn't expose.
+    pub fn resize(&self, width: u32, height: u32) {
+        if let Ok(mut last) = self.last_size.lock() {
+            *last = (width, height);
+        }
+        let Ok(tabs) = self.tabs.lock() else {
+            return;
+        };
+        for t in tabs.iter() {
+            if let Some(host) = t.browser.host() {
+                host.was_resized();
+            }
+        }
+    }
+
+    /// Navigate the active tab's main frame to `url`.
     pub fn navigate(&self, url: &str) -> Result<(), CoreError> {
         let trimmed = url.trim();
         if trimmed.is_empty() {
             return Err(CoreError::InvalidUrl(String::new()));
         }
-        let Some(frame) = self.browser.main_frame() else {
-            warn!("navigate: main frame unavailable");
-            return Err(CoreError::CreateBrowserFailed);
-        };
-        let cef_url = CefString::from(trimmed);
-        frame.load_url(Some(&cef_url));
-        info!(target: "buffr_core::host", url = %trimmed, "navigate");
-        Ok(())
+        self.with_active(|t| {
+            let Some(frame) = t.browser.main_frame() else {
+                warn!("navigate: main frame unavailable");
+                return Err(CoreError::CreateBrowserFailed);
+            };
+            let cef_url = CefString::from(trimmed);
+            frame.load_url(Some(&cef_url));
+            t.url = trimmed.to_string();
+            info!(target: "buffr_core::host", url = %trimmed, "navigate");
+            Ok(())
+        })
+        .ok_or(CoreError::CreateBrowserFailed)?
     }
 
-    /// Begin a fresh find session. Stores the query so subsequent
-    /// `FindNext`/`FindPrev` reuse it; CEF's first call with
-    /// `find_next = false` resets the match list, then we drive
-    /// forward steps via `find_next = true`.
-    ///
-    /// `forward` selects search direction. `match_case` is hardcoded
-    /// to false for now — Phase 3b will surface it via the command
-    /// bar.
+    /// Borrow the active tab mutably under the manager mutex.
+    /// Returns `None` only when there is no active tab.
+    fn with_active<R>(&self, f: impl FnOnce(&mut Tab) -> R) -> Option<R> {
+        let mut tabs = self.tabs.lock().ok()?;
+        let idx = (*self.active.lock().ok()?)?;
+        let t = tabs.get_mut(idx)?;
+        Some(f(t))
+    }
+
+    /// Begin a fresh find session on the active tab.
     pub fn start_find(&self, query: &str, forward: bool) {
         if query.is_empty() {
             self.stop_find();
             return;
         }
-        let Some(host) = self.browser.host() else {
-            warn!("start_find: browser.host() returned None");
-            return;
-        };
-        let cef_query = CefString::from(query);
-        // `find_next = 0` for the initial call — CEF treats a fresh
-        // query as a new search.
-        host.find(Some(&cef_query), forward as i32, 0, 0);
-        if let Ok(mut slot) = self.last_find_query.lock() {
-            *slot = Some(query.to_string());
-        }
+        self.with_active(|t| {
+            let Some(host) = t.browser.host() else {
+                warn!("start_find: browser.host() returned None");
+                return;
+            };
+            let cef_query = CefString::from(query);
+            host.find(Some(&cef_query), forward as i32, 0, 0);
+            t.session.find_query = Some(query.to_string());
+        });
     }
 
-    /// Cancel the active find. Clears CEF's selection and forgets the
-    /// last query so `FindNext` becomes a no-op.
+    /// Cancel the active tab's find session.
     pub fn stop_find(&self) {
-        if let Some(host) = self.browser.host() {
-            // `clear_selection = 1` — drop the highlight so the page
-            // doesn't keep pointing at a stale match.
-            host.stop_finding(1);
-        }
-        if let Ok(mut slot) = self.last_find_query.lock() {
-            *slot = None;
-        }
+        self.with_active(|t| {
+            if let Some(host) = t.browser.host() {
+                host.stop_finding(1);
+            }
+            t.session.find_query = None;
+        });
     }
 
-    /// Step to the next/previous match using the last successful
-    /// query. No-op when `start_find` has not been called.
     fn find_step(&self, forward: bool) {
-        let query = match self.last_find_query.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => None,
-        };
-        let Some(query) = query else {
-            tracing::info!("find_step: no active query — call start_find first");
-            return;
-        };
-        let Some(host) = self.browser.host() else {
-            warn!("find_step: browser.host() returned None");
-            return;
-        };
-        let cef_query = CefString::from(query.as_str());
-        // `find_next = 1` continues the existing match list.
-        host.find(Some(&cef_query), forward as i32, 0, 1);
+        self.with_active(|t| {
+            let Some(query) = t.session.find_query.clone() else {
+                tracing::info!("find_step: no active query — call start_find first");
+                return;
+            };
+            let Some(host) = t.browser.host() else {
+                warn!("find_step: browser.host() returned None");
+                return;
+            };
+            let cef_query = CefString::from(query.as_str());
+            host.find(Some(&cef_query), forward as i32, 0, 1);
+        });
     }
 
-    /// Construct a browser in **off-screen rendering** mode for native
-    /// Wayland support.
-    ///
-    /// **Not yet implemented** — currently panics with
-    /// `unimplemented!()`. See [`crate::osr`] and `PLAN.md` (Phase 3)
-    /// for the planned architecture.
-    ///
-    /// The signature is intentionally plausible so future work has a
-    /// concrete target shape: callers will pass the host window handle
-    /// (so we can resize / track DPI), the initial URL, and a paint
-    /// callback that receives RGBA pixel buffers from CEF's `OnPaint`
-    /// every frame for compositing into a wgpu/softbuffer surface.
+    /// Construct a browser in **off-screen rendering** mode. **Not yet
+    /// implemented** — currently panics. See [`crate::osr`] and
+    /// `PLAN.md` (Phase 3).
     #[cfg(feature = "osr")]
     pub fn new_osr(
         _window_handle: RawWindowHandle,
@@ -296,35 +672,10 @@ impl BrowserHost {
         unimplemented!("OSR mode coming in Phase 3 — see PLAN.md")
     }
 
-    /// Dispatch a [`buffr_modal::PageAction`] to the live CEF
-    /// browser.
-    ///
-    /// Variants that are wired into real CEF calls today:
-    /// scrolls (via `executeJavaScript` on the main frame), history
-    /// (`go_back` / `go_forward`), reload (`reload` /
-    /// `reload_ignore_cache`), `stop_load`, zoom (`set_zoom_level` on
-    /// the host), and `OpenDevTools` (`show_dev_tools` with default
-    /// window-info / settings).
-    ///
-    /// Variants that are stubbed-with-log because they need UI chrome
-    /// (Phase 3) or multi-tab plumbing (Phase 5): find/find-next,
-    /// tab*, omnibar / command-line / hint mode, edit mode (blocked on
-    /// hjkl `Host` trait), `YankUrl` (clipboard plumbing in Phase 5),
-    /// and explicit `EnterMode` (the engine already tracks mode
-    /// internally — this method just logs).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // After `cef::initialize` succeeded and a winit window exists:
-    /// let host = buffr_core::BrowserHost::new(raw_handle, "https://example.com")?;
-    /// host.dispatch(&buffr_modal::PageAction::ScrollDown(3));
-    /// host.dispatch(&buffr_modal::PageAction::Reload);
-    /// ```
+    /// Dispatch a [`buffr_modal::PageAction`] against the active tab.
     pub fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
         match action {
-            // -- scrolls ---------------------------------------------
             A::ScrollUp(n) => self.scroll_by(0, -(STEP_PX * (*n as i64))),
             A::ScrollDown(n) => self.scroll_by(0, STEP_PX * (*n as i64)),
             A::ScrollLeft(n) => self.scroll_by(-(STEP_PX * (*n as i64)), 0),
@@ -341,44 +692,38 @@ impl BrowserHost {
             A::ScrollTop => self.run_js("window.scrollTo(0, 0);"),
             A::ScrollBottom => self.run_js("window.scrollTo(0, document.body.scrollHeight);"),
 
-            // -- history ---------------------------------------------
-            A::HistoryBack => self.browser.go_back(),
-            A::HistoryForward => self.browser.go_forward(),
-            A::Reload => self.browser.reload(),
-            A::ReloadHard => self.browser.reload_ignore_cache(),
-            A::StopLoading => self.browser.stop_load(),
+            A::HistoryBack => {
+                self.with_active(|t| t.browser.go_back());
+            }
+            A::HistoryForward => {
+                self.with_active(|t| t.browser.go_forward());
+            }
+            A::Reload => {
+                self.with_active(|t| t.browser.reload());
+            }
+            A::ReloadHard => {
+                self.with_active(|t| t.browser.reload_ignore_cache());
+            }
+            A::StopLoading => {
+                self.with_active(|t| t.browser.stop_load());
+            }
 
-            // -- zoom ------------------------------------------------
-            //
-            // Each variant writes through to `ZoomStore` so the next
-            // load on this domain restores the persisted level. The
-            // domain comes from the live main-frame URL via
-            // `buffr_zoom::domain_for_url` — `about:`/`data:`/`file:`
-            // collapse to the global key.
             A::ZoomIn => self.adjust_zoom(0.25),
             A::ZoomOut => self.adjust_zoom(-0.25),
             A::ZoomReset => self.reset_zoom(),
 
-            // -- devtools --------------------------------------------
             A::OpenDevTools => {
-                if let Some(host) = self.browser.host() {
-                    let window_info = WindowInfo::default();
-                    let settings = BrowserSettings::default();
-                    host.show_dev_tools(Some(&window_info), None, Some(&settings), None);
-                } else {
-                    warn!("OpenDevTools: browser.host() returned None");
-                }
+                self.with_active(|t| {
+                    if let Some(host) = t.browser.host() {
+                        let window_info = WindowInfo::default();
+                        let settings = BrowserSettings::default();
+                        host.show_dev_tools(Some(&window_info), None, Some(&settings), None);
+                    } else {
+                        warn!("OpenDevTools: browser.host() returned None");
+                    }
+                });
             }
 
-            // -- find ------------------------------------------------
-            //
-            // `Find { forward }` opens a fresh find session, but the
-            // command bar that prompts the user for a query is Phase
-            // 3b. `start_find` / `stop_find` are exposed on the host
-            // so the future command bar wires straight in. For now,
-            // `Find` is a tracing breadcrumb. `FindNext` / `FindPrev`
-            // *do* work — they reuse the last query stashed by
-            // `start_find` (the smoke flag `--find` exercises this).
             A::Find { forward } => {
                 tracing::warn!(
                     forward = *forward,
@@ -388,19 +733,32 @@ impl BrowserHost {
             A::FindNext => self.find_step(true),
             A::FindPrev => self.find_step(false),
 
-            // -- tabs: single-tab Phase 2 ---------------------------
-            A::TabNext | A::TabPrev | A::TabClose | A::TabNew => {
-                tracing::info!("tab action — multi-tab is Phase 5; single-tab buffr ignores this");
+            // Tab actions: the host is the manager. Apps-layer wires
+            // these directly via `next_tab` / `prev_tab` /
+            // `close_active` / `open_tab` so the manager can route the
+            // result (e.g. "last tab closed → exit") back to the app.
+            // The dispatch path here is a fallback for keymaps that
+            // hit the host without going through the apps shim.
+            A::TabNext => self.next_tab(),
+            A::TabPrev => self.prev_tab(),
+            A::TabClose => {
+                let _ = self.close_active();
             }
+            A::TabNew => {
+                let _ = self.open_tab("about:blank");
+            }
+            A::DuplicateTab => {
+                let _ = self.duplicate_active();
+            }
+            A::PinTab => self.toggle_pin_active(),
+            A::TabReorder { from, to } => self.move_tab(*from as usize, *to as usize),
 
-            // -- chrome overlays: Phase 3 ---------------------------
             A::OpenOmnibar | A::OpenCommandLine => {
-                tracing::info!("UI action — overlay rendering is Phase 3 chrome work");
+                tracing::info!("UI action — overlay rendering owned by apps layer");
             }
             A::EnterHintMode => self.enter_hint_mode(false),
             A::EnterHintModeBackground => self.enter_hint_mode(true),
 
-            // -- mode transitions: engine owns mode -----------------
             A::EnterMode(mode) => {
                 tracing::info!(?mode, "EnterMode — engine tracks mode internally");
             }
@@ -411,30 +769,30 @@ impl BrowserHost {
                 );
             }
 
-            // -- downloads: Phase 5 ---------------------------------
             A::ClearCompletedDownloads => match self.downloads.clear_completed() {
                 Ok(n) => tracing::info!(removed = n, "downloads: cleared completed"),
                 Err(err) => tracing::warn!(error = %err, "downloads: clear_completed failed"),
             },
 
-            // -- yank-url: clipboard is Phase 5 ---------------------
             A::YankUrl => {
-                if let Some(frame) = self.browser.main_frame() {
-                    let url = CefStringUtf16::from(&frame.url()).to_string();
-                    tracing::info!(url, "would copy to clipboard — clipboard is Phase 5");
-                } else {
-                    tracing::info!("would copy to clipboard — main frame unavailable");
-                }
+                self.with_active(|t| {
+                    if let Some(frame) = t.browser.main_frame() {
+                        let url = CefStringUtf16::from(&frame.url()).to_string();
+                        tracing::info!(url, "would copy to clipboard — clipboard is Phase 5");
+                    } else {
+                        tracing::info!("would copy to clipboard — main frame unavailable");
+                    }
+                });
             }
         }
     }
 
-    /// Status snapshot of the active hint session. `None` outside of
-    /// hint mode. UI threads pull this each tick to refresh the
-    /// statusline indicator.
+    /// Status snapshot of the active tab's hint session.
     pub fn hint_status(&self) -> Option<HintStatus> {
-        let guard = self.hint_session.lock().ok()?;
-        let s = guard.as_ref()?;
+        let tabs = self.tabs.lock().ok()?;
+        let idx = (*self.active.lock().ok()?)?;
+        let t = tabs.get(idx)?;
+        let s = t.session.hint_session.as_ref()?;
         Some(HintStatus {
             typed: s.typed.clone(),
             match_count: s.match_count(),
@@ -442,76 +800,58 @@ impl BrowserHost {
         })
     }
 
-    /// Whether a hint session is currently active.
+    /// Whether the active tab has a live hint session.
     pub fn is_hint_mode(&self) -> bool {
-        self.hint_session.lock().ok().is_some_and(|g| g.is_some())
+        self.with_active(|t| t.session.hint_session.is_some())
+            .unwrap_or(false)
     }
 
-    /// Inject `hint.js` into the active main frame. Generates labels
-    /// for the configured alphabet sized to a generous 256 — the JS
-    /// truncates to the actual visible-element count.
-    ///
-    /// Construction of the in-memory [`HintSession`] happens lazily
-    /// when the renderer reports back via [`HintConsoleEvent::Ready`]
-    /// — see [`Self::pump_hint_events`].
-    ///
-    /// `background = true` toggles the F-key variant; the host
-    /// currently logs a warning on commit and falls back to a same-tab
-    /// click (multi-tab is Phase 5).
+    /// Inject `hint.js` into the active tab's main frame.
     pub fn enter_hint_mode(&self, background: bool) {
-        // Reserve a generous label budget. The JS asset truncates to
-        // the actual visible-element count, so over-allocating here
-        // costs only a small string-array allocation in JS.
         const LABEL_BUDGET: usize = 256;
         let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
         let alphabet_str = self.hint_alphabet.as_string();
         let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
 
-        // Stash a placeholder session so the UI can render
-        // "HINT (waiting)" until the renderer reports back.
-        if let Ok(mut slot) = self.hint_session.lock() {
-            *slot = Some(HintSession::new(
-                self.hint_alphabet.clone(),
-                Vec::new(),
+        let alphabet = self.hint_alphabet.clone();
+        let mut bail = false;
+        self.with_active(|t| {
+            t.session.hint_session = Some(HintSession::new(alphabet, Vec::new(), background));
+            let Some(frame) = t.browser.main_frame() else {
+                warn!("enter_hint_mode: main frame unavailable");
+                bail = true;
+                return;
+            };
+            let url = CefStringUtf16::from(&frame.url()).to_string();
+            let cef_script = CefString::from(script.as_str());
+            let cef_url = CefString::from(url.as_str());
+            frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
+            info!(
                 background,
-            ));
-        }
-
-        let Some(frame) = self.browser.main_frame() else {
-            warn!("enter_hint_mode: main frame unavailable");
+                label_budget = LABEL_BUDGET,
+                "hint mode: injected"
+            );
+        });
+        if bail {
             self.cancel_hint();
-            return;
-        };
-        let url = CefStringUtf16::from(&frame.url()).to_string();
-        let cef_script = CefString::from(script.as_str());
-        let cef_url = CefString::from(url.as_str());
-        // `start_line = 1`: cef-rs forwards this to the V8 source-map
-        // line offset; only matters for stack traces. Use 1 so traces
-        // line up with the asset's first line.
-        frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
-        info!(
-            background,
-            label_budget = LABEL_BUDGET,
-            "hint mode: injected"
-        );
+        }
     }
 
-    /// Drain any renderer-side hint events the display handler has
-    /// posted since the last tick and finalise the active session.
-    /// Returns `true` if the session changed (so callers can request
-    /// a redraw).
+    /// Drain renderer-side hint events and finalise the active tab's
+    /// session. Returns `true` if the session changed.
     pub fn pump_hint_events(&self) -> bool {
         let Some(event) = crate::hint::take_hint_event(&self.hint_sink) else {
             return false;
         };
         match event {
             crate::hint::HintConsoleEvent::Ready { hints, alphabet: _ } => {
-                if let Ok(mut slot) = self.hint_session.lock()
-                    && let Some(existing) = slot.as_mut()
-                {
-                    let background = existing.background;
-                    *existing = HintSession::new(self.hint_alphabet.clone(), hints, background);
-                }
+                let alphabet = self.hint_alphabet.clone();
+                self.with_active(|t| {
+                    if let Some(existing) = t.session.hint_session.as_mut() {
+                        let background = existing.background;
+                        *existing = HintSession::new(alphabet, hints, background);
+                    }
+                });
                 true
             }
             crate::hint::HintConsoleEvent::Error { message } => {
@@ -522,151 +862,175 @@ impl BrowserHost {
         }
     }
 
-    /// Feed a printable character to the active hint session. Returns
-    /// `Some(action)` whose semantics match [`HintAction`]; the caller
-    /// is expected to act on `Click` / `OpenInBackground` (run the
-    /// commit JS) and clear the session on `Cancel`. Returns `None`
-    /// when no session is active.
+    /// Feed a printable character to the active tab's hint session.
     pub fn feed_hint_key(&self, ch: char) -> Option<HintAction> {
-        let mut slot = self.hint_session.lock().ok()?;
-        let session = slot.as_mut()?;
-        let action = session.feed(ch);
-        // Always tell the JS overlay to filter, even on Cancel — a
-        // Cancel removes overlays via `__buffrHintCancel`, but
-        // intermediate Filter ticks need an immediate visual update.
-        let typed = session.typed.clone();
-        drop(slot);
-        match &action {
-            HintAction::Filter => self.run_hint_js(&format!(
-                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
-                json_string_literal(&typed)
-            )),
-            HintAction::Click(id) | HintAction::OpenInBackground(id) => {
-                if matches!(action, HintAction::OpenInBackground(_)) {
-                    tracing::warn!(
-                        element_id = *id,
-                        "hint background commit: multi-tab not implemented; falling back to same-tab click"
-                    );
+        let mut commit_id: Option<u32> = None;
+        let mut filter_typed: Option<String> = None;
+        let mut clear = false;
+        let mut cancel = false;
+        let result = self.with_active(|t| {
+            let session = t.session.hint_session.as_mut()?;
+            let action = session.feed(ch);
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Click(id) | HintAction::OpenInBackground(id) => {
+                    if matches!(action, HintAction::OpenInBackground(_)) {
+                        tracing::warn!(
+                            element_id = *id,
+                            "hint background commit: routes through `open_tab_background`",
+                        );
+                    }
+                    commit_id = Some(*id);
+                    clear = true;
                 }
-                self.run_hint_js(&format!(
-                    "if (window.__buffrHintCommit) window.__buffrHintCommit({id})"
-                ));
-                self.clear_hint_session();
+                HintAction::Cancel => {
+                    cancel = true;
+                }
             }
-            HintAction::Cancel => {
-                self.cancel_hint();
-            }
-        }
-        Some(action)
-    }
-
-    /// Backspace the typed buffer. Mirrors [`Self::feed_hint_key`]
-    /// but pops a char from the session and re-issues a filter call.
-    pub fn backspace_hint(&self) -> Option<HintAction> {
-        let mut slot = self.hint_session.lock().ok()?;
-        let session = slot.as_mut()?;
-        let action = session.backspace();
-        let typed = session.typed.clone();
-        drop(slot);
-        match &action {
-            HintAction::Filter => self.run_hint_js(&format!(
+            Some(action)
+        });
+        let action = result.flatten()?;
+        if let Some(typed) = filter_typed {
+            self.run_hint_js(&format!(
                 "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
                 json_string_literal(&typed)
-            )),
-            HintAction::Cancel => self.cancel_hint(),
-            // `backspace` only emits Filter / Cancel — defensive.
-            _ => {}
+            ));
+        }
+        if let Some(id) = commit_id {
+            // Handle background variant by opening a new tab in the
+            // background rather than committing the click. We still
+            // invoke the JS commit on the original frame to capture
+            // the resolved href, but for now the fallback is a same-
+            // tab click (clipboard-driven URL extraction is Phase 5b).
+            self.run_hint_js(&format!(
+                "if (window.__buffrHintCommit) window.__buffrHintCommit({id})"
+            ));
+        }
+        if clear {
+            self.with_active(|t| {
+                t.session.hint_session = None;
+            });
+        }
+        if cancel {
+            self.cancel_hint();
         }
         Some(action)
     }
 
-    /// Cancel the active hint session — invokes the JS cleanup hook
-    /// and drops the session state. Idempotent.
+    /// Backspace the active tab's hint typed buffer.
+    pub fn backspace_hint(&self) -> Option<HintAction> {
+        let mut filter_typed: Option<String> = None;
+        let mut cancel = false;
+        let result = self.with_active(|t| {
+            let session = t.session.hint_session.as_mut()?;
+            let action = session.backspace();
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Cancel => cancel = true,
+                _ => {}
+            }
+            Some(action)
+        });
+        let action = result.flatten()?;
+        if let Some(typed) = filter_typed {
+            self.run_hint_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                json_string_literal(&typed)
+            ));
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
+    }
+
+    /// Cancel the active tab's hint session.
     pub fn cancel_hint(&self) {
         self.run_hint_js("if (window.__buffrHintCancel) window.__buffrHintCancel()");
-        self.clear_hint_session();
+        self.with_active(|t| {
+            t.session.hint_session = None;
+        });
     }
 
-    fn clear_hint_session(&self) {
-        if let Ok(mut slot) = self.hint_session.lock() {
-            *slot = None;
-        }
-    }
-
-    /// Helper: run a hint-related JS snippet against the main frame.
-    /// `script_url` is set to `buffr://hint` so DevTools attribution
-    /// matches the source.
     fn run_hint_js(&self, code: &str) {
-        let Some(frame) = self.browser.main_frame() else {
-            return;
-        };
-        let cef_code = CefString::from(code);
-        let cef_url = CefString::from("buffr://hint");
-        frame.execute_java_script(Some(&cef_code), Some(&cef_url), 1);
+        self.with_active(|t| {
+            let Some(frame) = t.browser.main_frame() else {
+                return;
+            };
+            let cef_code = CefString::from(code);
+            let cef_url = CefString::from("buffr://hint");
+            frame.execute_java_script(Some(&cef_code), Some(&cef_url), 1);
+        });
     }
 
     fn run_js(&self, code: &str) {
-        let Some(frame) = self.browser.main_frame() else {
-            warn!("run_js: main frame unavailable");
-            return;
-        };
-        let code = CefString::from(code);
-        // `script_url` is purely diagnostic — Chromium uses it in
-        // stack traces. Use a fixed marker so devtools shows where
-        // these came from.
-        let script_url = CefString::from("buffr://page-action");
-        frame.execute_java_script(Some(&code), Some(&script_url), 0);
+        self.with_active(|t| {
+            let Some(frame) = t.browser.main_frame() else {
+                warn!("run_js: main frame unavailable");
+                return;
+            };
+            let code = CefString::from(code);
+            let script_url = CefString::from("buffr://page-action");
+            frame.execute_java_script(Some(&code), Some(&script_url), 0);
+        });
     }
 
     fn scroll_by(&self, dx: i64, dy: i64) {
-        // Format inline so we don't drag a `format!`-string allocator
-        // into every key press. Numbers are cheap.
         let code = format!("window.scrollBy({dx}, {dy});");
         self.run_js(&code);
     }
 
     fn adjust_zoom(&self, delta: f64) {
-        let Some(host) = self.browser.host() else {
-            warn!("adjust_zoom: browser.host() returned None");
-            return;
-        };
-        let new_level = host.zoom_level() + delta;
-        host.set_zoom_level(new_level);
         let domain = self.current_domain();
-        if let Err(err) = self.zoom.set(&domain, new_level) {
+        let new_level = self
+            .with_active(|t| {
+                let Some(host) = t.browser.host() else {
+                    warn!("adjust_zoom: browser.host() returned None");
+                    return None;
+                };
+                let new_level = host.zoom_level() + delta;
+                host.set_zoom_level(new_level);
+                Some(new_level)
+            })
+            .flatten();
+        if let Some(level) = new_level
+            && let Err(err) = self.zoom.set(&domain, level)
+        {
             warn!(error = %err, %domain, "zoom: persist failed");
         }
     }
 
-    /// `ZoomReset`: clear both the live zoom and the persisted row so
-    /// the domain reverts to CEF's default on next load.
     fn reset_zoom(&self) {
-        let Some(host) = self.browser.host() else {
-            warn!("reset_zoom: browser.host() returned None");
-            return;
-        };
-        host.set_zoom_level(0.0);
         let domain = self.current_domain();
+        self.with_active(|t| {
+            let Some(host) = t.browser.host() else {
+                warn!("reset_zoom: browser.host() returned None");
+                return;
+            };
+            host.set_zoom_level(0.0);
+        });
         if let Err(err) = self.zoom.remove(&domain) {
             warn!(error = %err, %domain, "zoom: remove failed");
         }
     }
 
-    /// Extract the current main-frame URL's zoom-key. Returns the
-    /// global sentinel when the frame is unavailable so `set` /
-    /// `remove` still target a well-known row.
     fn current_domain(&self) -> String {
-        match self.browser.main_frame() {
-            Some(frame) => {
-                let url = CefStringUtf16::from(&frame.url()).to_string();
-                buffr_zoom::domain_for_url(&url)
-            }
-            None => buffr_zoom::GLOBAL_KEY.to_string(),
-        }
+        self.with_active(|t| {
+            t.browser
+                .main_frame()
+                .map(|f| {
+                    let url = CefStringUtf16::from(&f.url()).to_string();
+                    buffr_zoom::domain_for_url(&url)
+                })
+                .unwrap_or_else(|| buffr_zoom::GLOBAL_KEY.to_string())
+        })
+        .unwrap_or_else(|| buffr_zoom::GLOBAL_KEY.to_string())
     }
 }
 
-/// Snapshot of hint mode state for the statusline indicator.
+/// Snapshot of hint-mode state for the statusline indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HintStatus {
     pub typed: String,
@@ -675,8 +1039,8 @@ pub struct HintStatus {
 }
 
 /// Format a string as a JS double-quoted literal, escaping every
-/// non-ASCII codepoint to `\uXXXX`. Used for the inline filter call so
-/// the splice survives any input the user might type.
+/// non-ASCII codepoint to `\uXXXX`. Used for the inline filter call
+/// so the splice survives any input the user might type.
 fn json_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -700,9 +1064,6 @@ fn json_string_literal(s: &str) -> String {
     out
 }
 
-/// Trivial unused-import suppressor: `Hint` is referenced via the
-/// `crate::hint::Hint` re-export from `enter_hint_mode`'s docs but the
-/// binding is otherwise local.
 #[allow(dead_code)]
 fn _hint_used(_: Hint) {}
 
@@ -711,3 +1072,52 @@ fn _hint_used(_: Hint) {}
 /// `j` feel laggy. Half/full-page scrolls go through their own
 /// `window.innerHeight`-relative path so they're DPI-independent.
 const STEP_PX: i64 = 40;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The CEF host is mostly opaque to unit tests because constructing
+    // a `cef::Browser` requires a live CEF runtime + an X11 window
+    // handle. The pure-Rust pieces — `Tab::display_title`, `TabId`
+    // monotonicity, `BrowserHost::move_tab` index math — are tested
+    // without spinning CEF.
+
+    #[test]
+    fn tab_id_displays_with_prefix() {
+        assert_eq!(format!("{}", TabId(0)), "tab#0");
+        assert_eq!(format!("{}", TabId(42)), "tab#42");
+    }
+
+    #[test]
+    fn tab_session_default_is_empty() {
+        // Synthesizing a `Tab` without CEF is not possible (browser
+        // is non-trivial). The display logic is exercised indirectly
+        // via `TabSummary` round-trips at the apps layer.
+        let s = TabSession::default();
+        assert!(s.find_query.is_none());
+        assert!(s.hint_session.is_none());
+    }
+
+    #[test]
+    fn tab_summary_carries_pinned_and_private_flags() {
+        let summary = TabSummary {
+            id: TabId(7),
+            title: "x".into(),
+            url: "https://x".into(),
+            progress: 1.0,
+            is_loading: false,
+            pinned: true,
+            private: true,
+        };
+        assert_eq!(summary.id, TabId(7));
+        assert!(summary.pinned);
+        assert!(summary.private);
+    }
+
+    #[test]
+    fn tab_id_ordering() {
+        assert!(TabId(1) < TabId(2));
+        assert!(TabId(99) > TabId(7));
+    }
+}

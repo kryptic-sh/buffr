@@ -36,7 +36,7 @@ pub use hint::{
     HintEventSink, HintKind, HintLabel, HintRect, HintSession, build_inject_script,
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
-pub use host::BrowserHost;
+pub use host::{BrowserHost, HintStatus, Tab, TabId, TabSession, TabSummary};
 
 #[derive(Debug, Error)]
 pub enum CoreError {
