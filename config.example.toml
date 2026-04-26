@@ -35,8 +35,12 @@ accent = "#7aa2f7"
 mode = "auto"
 
 [privacy]
-# Reserved for future use; buffr never sends telemetry. Setting this
-# to `true` is a no-op until Phase 5 introduces opt-in usage counters.
+# Opt-in **local-only** usage counters. When `true`, buffr accumulates
+# anonymous integer counters (app_starts, tabs_opened, pages_loaded,
+# searches_run, bookmarks_added, downloads_completed) and writes them
+# to `<data>/usage-counters.json` for the user to inspect. No network
+# endpoint exists; buffr never sends telemetry anywhere. Even on opt-in
+# the counters stay local. See `docs/privacy.md`.
 enable_telemetry = false
 # Categories wiped on shutdown. Each entry is processed independently:
 # one failure doesn't skip the rest. Successes log at INFO; failures
@@ -87,6 +91,17 @@ ask_each_time = false
 # Vimium's home-row + upper-row alphabet. For full keyboard reach use
 # "abcdefghijklmnopqrstuvwxyz"; for strict home-row use "asdfjkl;".
 alphabet = "asdfghjkl;weruio"
+
+[crash_reporter]
+# Opt-in local panic reporter. When `true`, buffr installs a Rust
+# panic hook that writes JSON crash files under `<data>/crashes/`.
+# Reports stay on disk for the user to inspect or mail; nothing is
+# uploaded. CEF native-crash capture (crashpad/breakpad) is not yet
+# configured — see `docs/privacy.md`.
+enabled = false
+# Cutoff for `--purge-crashes`. Reports older than this many days are
+# removed. Default 30.
+purge_after_days = 30
 
 # ----------------------------------------------------------------------
 # Keymap overrides

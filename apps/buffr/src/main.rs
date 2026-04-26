@@ -133,6 +133,23 @@ struct Cli {
     /// the count of rows removed.
     #[arg(long, value_name = "ORIGIN")]
     forget_origin: Option<String>,
+    /// Print the telemetry on/off state, the on-disk counter file
+    /// path, and the current counter table; exit 0. No CEF init.
+    #[arg(long)]
+    telemetry_status: bool,
+    /// Reset every counter to zero (truncates the on-disk JSON to
+    /// `{}`). No-op when telemetry is disabled. Prints "telemetry
+    /// counters reset" and exits 0.
+    #[arg(long)]
+    reset_telemetry: bool,
+    /// Print every captured panic report (most recent first) and
+    /// exit 0. No CEF init.
+    #[arg(long)]
+    list_crashes: bool,
+    /// Delete crash reports older than `crash_reporter.purge_after_days`.
+    /// Prints "purged N reports" and exits 0.
+    #[arg(long)]
+    purge_crashes: bool,
 }
 
 fn main() -> Result<()> {
@@ -222,6 +239,18 @@ fn main() -> Result<()> {
     }
     if let Some(origin) = cli.forget_origin.as_deref() {
         return run_forget_origin(origin);
+    }
+    if cli.telemetry_status {
+        return run_telemetry_status(cli.config.as_deref());
+    }
+    if cli.reset_telemetry {
+        return run_reset_telemetry(cli.config.as_deref());
+    }
+    if cli.list_crashes {
+        return run_list_crashes();
+    }
+    if cli.purge_crashes {
+        return run_purge_crashes(cli.config.as_deref());
     }
 
     tracing_subscriber::fmt()
@@ -360,6 +389,44 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| config.general.homepage.clone());
 
+    // -------- telemetry counters --------
+    //
+    // Phase 6: opt-in usage counters. When `[privacy] enable_telemetry`
+    // is `false` (the default) every method is a no-op and no file is
+    // written. When `true`, increments accumulate in memory and flush
+    // on shutdown plus once a minute via the background task.
+    //
+    // Private mode disables telemetry unconditionally — the whole
+    // point of `--private` is "leave no traces". The counter store is
+    // still constructed (so call sites don't have to branch) but the
+    // `enabled` flag is forced off.
+    let telemetry_enabled = config.privacy.enable_telemetry && !cli.private;
+    let counters_path = if cli.private {
+        // Private mode tempdir; nothing persists past Drop.
+        paths.data.join("usage-counters.json")
+    } else {
+        paths.data.join("usage-counters.json")
+    };
+    let counters = Arc::new(buffr_core::UsageCounters::open(
+        &counters_path,
+        telemetry_enabled,
+    ));
+    if telemetry_enabled {
+        info!(path = %counters_path.display(), "telemetry counters enabled");
+    } else {
+        tracing::debug!("telemetry: disabled (no-op)");
+    }
+
+    // -------- crash reporter --------
+    //
+    // Phase 6: opt-in panic-hook reporter. Writes JSON crash files
+    // under `<data>/crashes/`. Disabled-default; the install call is
+    // a no-op when the config flag is false.
+    let crash_dir = paths.data.join("crashes");
+    if config.crash_reporter.enabled && !cli.private {
+        buffr_core::CrashReporter::install(crash_dir.clone(), true);
+    }
+
     // -------- CEF initialize --------
     let cache_path = paths.cache.to_string_lossy().into_owned();
     let settings = Settings {
@@ -384,6 +451,12 @@ fn main() -> Result<()> {
         anyhow::bail!("cef::initialize returned {init_ok} (expected 1)");
     }
     info!("cef initialized");
+
+    // Phase 6 telemetry: count the successful CEF init as one
+    // `app_starts` event. No-op when disabled. We tick *after*
+    // `cef::initialize` returns 1 so a launch that crashes during CEF
+    // boot doesn't get counted as a successful start.
+    counters.increment(buffr_core::KEY_APP_STARTS);
 
     // -------- winit event loop --------
     //
@@ -515,6 +588,7 @@ fn main() -> Result<()> {
         cli.new_tab.clone(),
         pending_session_tabs,
         session_path,
+        counters.clone(),
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -541,6 +615,13 @@ fn main() -> Result<()> {
             &downloads,
         );
     }
+
+    // -------- telemetry flush --------
+    //
+    // Final flush before CEF shutdown. No-op when telemetry is
+    // disabled. Errors log at WARN inside `flush()` and never
+    // propagate — telemetry must not block exit.
+    counters.flush();
 
     // -------- shutdown --------
     info!("cef shutting down");
@@ -724,6 +805,86 @@ fn run_forget_origin(origin: &str) -> Result<()> {
         .forget_origin(origin)
         .context("forgetting permissions for origin")?;
     println!("forgot {n} permission rows for {origin}");
+    Ok(())
+}
+
+/// Path the [`buffr_core::UsageCounters`] writes to. Stable across
+/// callers — `--telemetry-status` and the live runtime resolve here.
+fn telemetry_path() -> Result<PathBuf> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    Ok(paths.data.join("usage-counters.json"))
+}
+
+/// Crash report directory. Created lazily on first install.
+fn crash_dir() -> Result<PathBuf> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    Ok(paths.data.join("crashes"))
+}
+
+fn load_config_or_default(path: Option<&std::path::Path>) -> Config {
+    match buffr_config::load_and_validate(path) {
+        Ok((cfg, _)) => cfg,
+        Err(_) => Config::default(),
+    }
+}
+
+fn run_telemetry_status(config_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = load_config_or_default(config_path);
+    let path = telemetry_path()?;
+    let enabled = cfg.privacy.enable_telemetry;
+    let counters = buffr_core::UsageCounters::open(&path, enabled);
+    let label = if enabled { "enabled" } else { "disabled" };
+    println!("telemetry: {} (path: {})", label, path.display());
+    let snapshot = counters.read().context("reading telemetry counters")?;
+    if snapshot.is_empty() {
+        println!("(no counters recorded)");
+    } else {
+        // Sorted output so the line ordering is deterministic.
+        let mut keys: Vec<&String> = snapshot.keys().collect();
+        keys.sort();
+        for k in keys {
+            println!("{}\t{}", k, snapshot[k]);
+        }
+    }
+    Ok(())
+}
+
+fn run_reset_telemetry(config_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = load_config_or_default(config_path);
+    let path = telemetry_path()?;
+    let counters = buffr_core::UsageCounters::open(&path, cfg.privacy.enable_telemetry);
+    counters.reset().context("resetting telemetry counters")?;
+    println!("telemetry counters reset");
+    Ok(())
+}
+
+fn run_list_crashes() -> Result<()> {
+    let dir = crash_dir()?;
+    let crashes = buffr_core::CrashReporter::list_crashes(&dir);
+    if crashes.is_empty() {
+        println!("(no crash reports at {})", dir.display());
+        return Ok(());
+    }
+    for c in &crashes {
+        let location = c.location.as_deref().unwrap_or("-");
+        println!(
+            "{}\t{}\t{}\t{}",
+            c.timestamp.to_rfc3339(),
+            c.buffr_version,
+            location,
+            c.message
+        );
+    }
+    Ok(())
+}
+
+fn run_purge_crashes(config_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = load_config_or_default(config_path);
+    let dir = crash_dir()?;
+    let n = buffr_core::CrashReporter::purge_older_than(&dir, cfg.crash_reporter.purge_after_days)
+        .context("purging crash reports")?;
+    println!("purged {n} reports");
     Ok(())
 }
 
@@ -962,6 +1123,14 @@ struct AppState {
     /// open. Static frame (no widget redraw cost when the overlay is
     /// closed).
     cursor_blink_at: Instant,
+    /// Phase 6 usage counters. Threaded through to `BrowserHost` for
+    /// `tabs_opened` / `pages_loaded` / `downloads_completed`; used
+    /// directly here for `bookmarks_added` / `searches_run`.
+    counters: Arc<buffr_core::UsageCounters>,
+    /// Last counter-flush timestamp. Background flush runs every
+    /// 60 s (telemetry is low-volume; the ~1 KB JSON write is cheap
+    /// but pointless to do per-tick).
+    counters_flush_at: Instant,
 }
 
 /// Active overlay above the CEF child window.
@@ -1010,6 +1179,7 @@ impl AppState {
         pending_new_tabs: Vec<String>,
         pending_session_tabs: Vec<session::PersistedTab>,
         session_path: Option<PathBuf>,
+        counters: Arc<buffr_core::UsageCounters>,
     ) -> Self {
         let mut statusline = Statusline {
             url: homepage.clone(),
@@ -1050,6 +1220,8 @@ impl AppState {
             softbuffer_ctx: None,
             softbuffer_surface: None,
             cursor_blink_at: Instant::now(),
+            counters,
+            counters_flush_at: Instant::now(),
         }
     }
 
@@ -1739,7 +1911,16 @@ impl AppState {
                 } else {
                     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
                     match self.bookmarks.add(&url, None, &tag_refs) {
-                        Ok(_) => tracing::info!(%url, ?tags, "bookmark added"),
+                        Ok(_) => {
+                            tracing::info!(%url, ?tags, "bookmark added");
+                            // Phase 6 telemetry: count one bookmark
+                            // creation. `:bookmark` is the only path
+                            // that calls `Bookmarks::add` from a user
+                            // action; the Netscape importer fires its
+                            // own loop and is intentionally excluded
+                            // from this counter (importer is bulk).
+                            self.counters.increment(buffr_core::KEY_BOOKMARKS_ADDED);
+                        }
                         Err(err) => tracing::warn!(error = %err, %url, "bookmark failed"),
                     }
                 }
@@ -1932,8 +2113,15 @@ impl AppState {
         // If a suggestion is selected its `value` is already a real
         // URL; otherwise resolve the typed buffer.
         let target = if bar.selected.is_some() {
-            raw
+            raw.clone()
         } else {
+            // Phase 6 telemetry: count one search when the resolver
+            // would fall through to the search-engine template.
+            // Selecting a history/bookmark suggestion does NOT count
+            // as a search — those are direct navigations.
+            if buffr_config::classify_input(&raw) == buffr_config::InputKind::Search {
+                self.counters.increment(buffr_core::KEY_SEARCHES_RUN);
+            }
             buffr_config::resolve_input(&raw, &self.search_config)
         };
         if target.is_empty() {
@@ -1996,7 +2184,7 @@ impl ApplicationHandler for AppState {
         let cef_w = inner.width.max(1);
         let cef_h = inner.height.saturating_sub(chrome_h).max(1);
 
-        match buffr_core::BrowserHost::new(
+        match buffr_core::BrowserHost::new_with_options(
             raw,
             &self.homepage,
             self.history.clone(),
@@ -2009,6 +2197,8 @@ impl ApplicationHandler for AppState {
             self.hint_sink.clone(),
             self.hint_alphabet.clone(),
             (cef_w, cef_h),
+            self.private,
+            Some(self.counters.clone()),
         ) {
             Ok(host) => {
                 info!(url = %self.homepage, "browser host created");
@@ -2220,6 +2410,15 @@ impl ApplicationHandler for AppState {
         self.refresh_tab_strip();
         if prev_tabs != self.tab_strip.tabs || prev_active != self.tab_strip.active {
             self.request_redraw();
+        }
+
+        // Phase 6 telemetry: 60-second background flush so an abrupt
+        // exit (segfault from CEF, OOM kill, etc.) loses at most one
+        // minute of counter increments. No-op when disabled.
+        let wall_now = Instant::now();
+        if wall_now.duration_since(self.counters_flush_at) >= Duration::from_secs(60) {
+            self.counters_flush_at = wall_now;
+            self.counters.flush();
         }
 
         // Cursor blink for the open overlay. 500ms toggle; we only
