@@ -76,6 +76,13 @@ open_on_finish = false
 # regardless of this setting.
 ask_each_time = false
 
+[hint]
+# Ordered character list used to mint hint labels. Validated as
+# non-empty, ASCII-only, no duplicates, ≥ 2 chars. Default mirrors
+# Vimium's home-row + upper-row alphabet. For full keyboard reach use
+# "abcdefghijklmnopqrstuvwxyz"; for strict home-row use "asdfjkl;".
+alphabet = "asdfghjkl;weruio"
+
 # ----------------------------------------------------------------------
 # Keymap overrides
 # ----------------------------------------------------------------------

@@ -47,6 +47,7 @@ pub struct Config {
     pub theme: Theme,
     pub privacy: Privacy,
     pub downloads: DownloadsConfig,
+    pub hint: HintConfig,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
@@ -172,6 +173,38 @@ pub enum ClearableData {
 pub struct Privacy {
     pub enable_telemetry: bool,
     pub clear_on_exit: Vec<ClearableData>,
+}
+
+/// `[hint]` section — Phase 3 follow-by-letter labels.
+///
+/// `alphabet` is the ordered character list used to mint hint labels.
+/// Default mirrors Vimium's home-row plus upper-row; users can prefer
+/// `"abcdefghijklmnopqrstuvwxyz"` for full-keyboard reachability or
+/// trim to a smaller set if they only use the home row.
+///
+/// Validation:
+///
+/// - non-empty
+/// - no duplicates
+/// - ASCII only (the injected JS asserts ASCII so we keep the
+///   alphabet ASCII end-to-end)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HintConfig {
+    pub alphabet: String,
+}
+
+impl Default for HintConfig {
+    fn default() -> Self {
+        Self {
+            // Mirrors `buffr_core::DEFAULT_HINT_ALPHABET`. We can't
+            // import that as a const here (would create a config →
+            // core dep cycle); duplicate the literal and keep them in
+            // sync via the `default_hint_alphabet_matches_core` test in
+            // `buffr-core/src/hint.rs`.
+            alphabet: "asdfghjkl;weruio".into(),
+        }
+    }
 }
 
 /// `[downloads]` section. Phase 5: governs where files land, whether
@@ -308,6 +341,41 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             ),
             location: Some("general.leader".into()),
         });
+    }
+
+    // Hint alphabet validation. Surface any of the three failure modes
+    // (empty, duplicate, non-ASCII) as a [`ConfigError::Validate`] so
+    // the user gets a friendly toml-aware message instead of a panic
+    // deep inside `BrowserHost::new`.
+    {
+        let alpha = &cfg.hint.alphabet;
+        if alpha.is_empty() {
+            return Err(ConfigError::Validate {
+                message: "hint.alphabet must be non-empty".into(),
+                location: Some("hint.alphabet".into()),
+            });
+        }
+        if !alpha.is_ascii() {
+            return Err(ConfigError::Validate {
+                message: format!("hint.alphabet must be ASCII (got {alpha:?})"),
+                location: Some("hint.alphabet".into()),
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in alpha.chars() {
+            if !seen.insert(c) {
+                return Err(ConfigError::Validate {
+                    message: format!("hint.alphabet contains duplicate character {c:?}"),
+                    location: Some("hint.alphabet".into()),
+                });
+            }
+        }
+        if alpha.chars().count() < 2 {
+            return Err(ConfigError::Validate {
+                message: "hint.alphabet must contain at least 2 characters".into(),
+                location: Some("hint.alphabet".into()),
+            });
+        }
     }
 
     if !cfg.search.engines.contains_key(&cfg.search.default_engine) {
@@ -589,6 +657,71 @@ clear_on_exit = ["everything"]
         let err = toml::from_str::<Config>(toml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("everything") || msg.contains("unknown"));
+    }
+
+    #[test]
+    fn hint_section_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hint.alphabet, "asdfghjkl;weruio");
+    }
+
+    #[test]
+    fn hint_section_parses_custom_alphabet() {
+        let toml = r#"
+[hint]
+alphabet = "abcdef"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.hint.alphabet, "abcdef");
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn hint_alphabet_empty_rejected() {
+        let mut cfg = Config::default();
+        cfg.hint.alphabet = String::new();
+        let err = validate(&cfg).unwrap_err();
+        assert!(matches!(err, ConfigError::Validate { .. }));
+    }
+
+    #[test]
+    fn hint_alphabet_duplicate_rejected() {
+        let mut cfg = Config::default();
+        cfg.hint.alphabet = "abca".into();
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => assert!(message.contains("duplicate")),
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn hint_alphabet_non_ascii_rejected() {
+        let mut cfg = Config::default();
+        cfg.hint.alphabet = "αβγ".into();
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => assert!(message.contains("ASCII")),
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn hint_alphabet_single_char_rejected() {
+        let mut cfg = Config::default();
+        cfg.hint.alphabet = "a".into();
+        let err = validate(&cfg).unwrap_err();
+        assert!(matches!(err, ConfigError::Validate { .. }));
+    }
+
+    #[test]
+    fn hint_unknown_field_rejected() {
+        let toml = r#"
+[hint]
+weird = "x"
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("weird") || err.to_string().contains("unknown"));
     }
 
     #[test]
