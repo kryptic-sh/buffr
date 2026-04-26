@@ -15,6 +15,7 @@ pub mod app;
 pub mod cmdline;
 pub mod find;
 pub mod handlers;
+pub mod hint;
 pub mod host;
 pub mod open_finder;
 
@@ -28,6 +29,12 @@ pub mod osr;
 pub use app::{BuffrApp, ProfilePaths};
 pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
+};
+pub use hint::{
+    DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HINT_CONSOLE_SENTINEL, HINT_OVERLAY_CLASS,
+    HINT_OVERLAY_Z_INDEX, Hint, HintAction, HintAlphabet, HintConsoleEvent, HintError,
+    HintEventSink, HintKind, HintLabel, HintRect, HintSession, build_inject_script,
+    new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use host::BrowserHost;
 
