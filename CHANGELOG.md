@@ -15,3 +15,7 @@ and this project adheres to
   optional `ratatui` on `hjkl-engine`, new ratatui-free Editor methods). Buffr
   does not yet depend on `hjkl-editor` and uses no `Rect`-flavoured APIs, so
   this is a transparent pin bump — no source changes required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.26` to
+  `=0.0.28` — adopts canonical Buffer impl (0.0.27) plus sticky_col +
+  iskeyword hoist (0.0.28). Buffr only uses editor-level accessors, so the
+  `hjkl_buffer::Buffer` API breaking change in 0.0.28 is transparent here.
