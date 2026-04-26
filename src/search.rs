@@ -23,6 +23,41 @@
 
 use crate::Search;
 
+/// Classify what `resolve_input` would do with a given input, without
+/// actually resolving it. Useful for telemetry counter wiring — the
+/// caller can count "search-engine fallthrough" events without
+/// reimplementing the heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    /// Empty / whitespace-only input. Caller should short-circuit.
+    Empty,
+    /// Branch 1: parses as a real URL with a recognised scheme.
+    Url,
+    /// Branch 2: scheme-less but URL-shaped (`example.com`,
+    /// `localhost:3000`).
+    Host,
+    /// Branch 3: search-engine fallthrough.
+    Search,
+}
+
+/// Run `resolve_input`'s decision tree without producing the resolved
+/// string. Mirrors the branch order in `resolve_input` exactly.
+pub fn classify_input(input: &str) -> InputKind {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return InputKind::Empty;
+    }
+    if let Ok(parsed) = url::Url::parse(trimmed)
+        && is_real_scheme(parsed.scheme())
+    {
+        return InputKind::Url;
+    }
+    if looks_like_url(trimmed) {
+        return InputKind::Host;
+    }
+    InputKind::Search
+}
+
 /// Resolve a raw input string to a navigable URL.
 ///
 /// See module docs for the resolution rules. The returned string is
@@ -325,6 +360,18 @@ mod tests {
         assert!(!looks_like_url("foobar"));
         assert!(!looks_like_url("foo bar"));
         assert!(!looks_like_url(""));
+    }
+
+    #[test]
+    fn classify_input_branches() {
+        assert_eq!(classify_input(""), InputKind::Empty);
+        assert_eq!(classify_input("  "), InputKind::Empty);
+        assert_eq!(classify_input("https://example.com"), InputKind::Url);
+        assert_eq!(classify_input("file:///etc/hosts"), InputKind::Url);
+        assert_eq!(classify_input("example.com"), InputKind::Host);
+        assert_eq!(classify_input("localhost:3000"), InputKind::Host);
+        assert_eq!(classify_input("foobar"), InputKind::Search);
+        assert_eq!(classify_input("foo bar"), InputKind::Search);
     }
 
     #[test]
