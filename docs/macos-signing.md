@@ -53,27 +53,58 @@ files. At minimum:
 The Chromium upstream `cef/tests/cefclient/resources/mac/*.entitlements` files
 are the reference; we'll vendor adapted copies once Phase 6 lands.
 
-## Helper-flavor split (deferred)
+## Helper-flavor split (current layout)
 
-The single `buffr Helper.app` shipped today maps to all subprocess types.
-Apple's full sandboxing model wants four distinct helpers:
+`cargo xtask bundle-macos` ships **four** helper bundles inside
+`buffr.app/Contents/Frameworks/` — Apple's full sandboxing model wants one
+helper per subprocess type so per-flavor entitlements can differ:
 
-| Bundle id suffix   | Subprocess type          | Entitlements file (TODO)        |
-| ------------------ | ------------------------ | ------------------------------- |
-| `.helper`          | utility / generic worker | `helper.plist` (current single) |
-| `.helper.gpu`      | GPU process              | `helper-gpu.plist` (TODO)       |
-| `.helper.renderer` | renderer process         | `helper-renderer.plist` (TODO)  |
-| `.helper.plugin`   | plugin (PPAPI / WASM)    | `helper-plugin.plist` (TODO)    |
+| Bundle name                   | Bundle id                          | Plist template                          | Subprocess type          |
+| ----------------------------- | ---------------------------------- | --------------------------------------- | ------------------------ |
+| `buffr Helper.app`            | `sh.kryptic.buffr.helper`          | `xtask/templates/helper.plist`          | utility / generic worker |
+| `buffr Helper (GPU).app`      | `sh.kryptic.buffr.helper.gpu`      | `xtask/templates/helper-gpu.plist`      | GPU process              |
+| `buffr Helper (Renderer).app` | `sh.kryptic.buffr.helper.renderer` | `xtask/templates/helper-renderer.plist` | renderer process         |
+| `buffr Helper (Plugin).app`   | `sh.kryptic.buffr.helper.plugin`   | `xtask/templates/helper-plugin.plist`   | plugin (PPAPI / WASM)    |
 
-When this split lands we'll need:
+Apple requires every nested `.app`'s Mach-O have a **distinct** file name; each
+bundle's `Contents/MacOS/buffr Helper (Flavor)` is a `fs::copy` of the same
+`buffr-helper` binary (notarisation rejects symlinks for executables).
 
-- Three additional `xtask/templates/*.plist` files.
-- A `buffr-helper` per flavor (separate Cargo bins, or one bin with a symlink
-  tree under `Contents/Frameworks/`).
-- Per-helper entitlements + signing.
-- Updated `buffr-core::App::on_browser_process_handler_path` (or the equivalent
-  path-resolver hook in cef-rs 147) so each subprocess type is spawned out of
-  the right `.app`.
+cef-rs 147 only resolves a single `browser_subprocess_path`, so today every
+subprocess type is launched out of the unbranded `buffr Helper.app`. The other
+three bundles are still shipped (~80 MiB extra) so future signing only needs
+per-flavor entitlements + a path-resolver hook — when cef-rs grows
+`on_browser_process_handler_path` (or equivalent) we point each subprocess at
+its branded helper, no bundle layout migration required.
+
+## DMG production
+
+`cargo xtask package-macos-dmg [--release]` wraps the bundle into
+`target/dist/macos/buffr-<version>-<arch>.dmg` (`arm64` on Apple silicon hosts,
+`x86_64` on Intel). Implementation:
+
+1. The bundle from `bundle-macos` is copied into
+   `target/<profile>/dmg-staging/buffr.app/`.
+2. A relative `Applications -> /Applications` symlink is created next to it as
+   the drag-target.
+3. `hdiutil create -volname buffr -srcfolder dmg-staging -ov -format UDZO` runs
+   on macOS.
+4. On Linux dev hosts (no `hdiutil`) the script falls back to `genisoimage` —
+   the resulting image mounts on macOS but loses the Finder layout affordances;
+   only useful for smoke-testing the staging step. CI on a `macos-latest` runner
+   exercises the real `hdiutil` path.
+5. If neither tool is on `PATH` the staging tree is left in place and a clear
+   warning is printed; nothing fails.
+
+The DMG is **unsigned** in this round. After download, first-run users must
+clear the quarantine xattr that Gatekeeper attaches to web-downloaded files:
+
+```sh
+xattr -d com.apple.quarantine /Applications/buffr.app
+```
+
+Once Developer-ID signing + notarization land (next section), Gatekeeper will
+accept the bundle without manual intervention.
 
 ## Notarization tooling
 

@@ -284,33 +284,40 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       (live) and `--update-status` (cached). Disabled-able via
       `[updates] enabled = false` (zero network calls). See
       [`docs/updates.md`](./docs/updates.md).
-- [ ] Packaging:
+- [x] Packaging:
   - [x] Linux: AppImage, `.deb`, AUR PKGBUILD.
         `cargo xtask package-linux     [--variant {appimage,deb,aur,all}]`
         produces all three under `target/dist/linux/`. Unsigned this round —
         release-pipeline signing is the next step. See
         [`docs/packaging.md`](./docs/packaging.md).
-  - [ ] macOS: signed/notarized `.app` + `.dmg`. Helper bundle inside. Bundle
-        assembly already lives behind `cargo xtask bundle-macos` (Phase 1);
-        Phase 6 adds Developer-ID signing, the multi-helper split (`Helper`,
-        `Helper (GPU)`, `Helper (Renderer)`, `Helper (Plugin)`) with per-flavor
-        entitlements, and notarization. See
-        [`docs/macos-signing.md`](./docs/macos-signing.md) for the full plan.
-  - [ ] Windows: signed MSI.
+  - [x] macOS: `.app` + `.dmg`, **unsigned**. Bundle assembly via
+        `cargo xtask bundle-macos` (Phase 1) now ships the four-helper layout
+        (`Helper`, `Helper (GPU)`, `Helper (Renderer)`, `Helper (Plugin)`) so
+        future signing only needs per-flavor entitlements + a path-resolver
+        hook. `cargo xtask package-macos-dmg` wraps the bundle into
+        `target/dist/macos/buffr-<ver>-<arch>.dmg` via `hdiutil` (macOS) or
+        `genisoimage` (Linux fallback). Developer-ID signing + notarization are
+        post-Phase-6 release-pipeline work — see
+        [`docs/macos-signing.md`](./docs/macos-signing.md).
+  - [x] Windows: MSI, **unsigned**. `cargo xtask package-windows-msi` renders a
+        hand-rolled WiX 3 template (`xtask/templates/buffr.wxs`) and drives
+        `candle.exe` + `light.exe` to produce
+        `target/dist/windows/buffr-<ver>-x64.msi`. Authenticode signing is
+        post-Phase-6 release-pipeline work — see
+        [`docs/windows-packaging.md`](./docs/windows-packaging.md).
 - [x] Telemetry: none by default; opt-in anonymous usage counters. Local-only
       JSON file at `<data>/usage-counters.json`. No network endpoint exists —
       buffr never phones home, even on opt-in. See
       [`docs/privacy.md`](./docs/privacy.md).
-- [x] Accessibility pass: CEF renderer accessibility tree (off by default
-      via `[accessibility] force_renderer_accessibility`); high-contrast
-      theme palette (`[theme] high_contrast`); `--audit-keymap` CLI for
-      keyboard-only verification; documented gap (native chrome AT
-      bindings deferred post-1.0) in
-      [`docs/accessibility.md`](./docs/accessibility.md).
+- [x] Accessibility pass: CEF renderer accessibility tree (off by default via
+      `[accessibility] force_renderer_accessibility`); high-contrast theme
+      palette (`[theme] high_contrast`); `--audit-keymap` CLI for keyboard-only
+      verification; documented gap (native chrome AT bindings deferred post-1.0)
+      in [`docs/accessibility.md`](./docs/accessibility.md).
 - [x] Docs site: mdBook scaffold (`book.toml` + `docs/SUMMARY.md`).
-      `.github/workflows/docs.yml` builds + uploads to GitHub Pages on
-      push to main. DNS for `docs.buffr.kryptic.sh` is a TODO; until
-      then the github.io preview URL is the canonical surface.
+      `.github/workflows/docs.yml` builds + uploads to GitHub Pages on push to
+      main. DNS for `docs.buffr.kryptic.sh` is a TODO; until then the github.io
+      preview URL is the canonical surface.
 
 ### Post-1.0
 

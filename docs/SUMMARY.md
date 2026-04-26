@@ -12,4 +12,5 @@
 - [Accessibility](./accessibility.md)
 - [Packaging](./packaging.md)
 - [macOS signing](./macos-signing.md)
+- [Windows packaging](./windows-packaging.md)
 - [UI stack ADR](./ui-stack.md)

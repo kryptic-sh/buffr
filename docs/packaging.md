@@ -1,4 +1,20 @@
-# buffr — Linux packaging
+# buffr — Packaging
+
+Phase 6 lands distribution artifacts for all three tier-1 targets, all unsigned
+in this round (signing infrastructure is the next step):
+
+| Platform | Driver                            | Output                                     |
+| -------- | --------------------------------- | ------------------------------------------ |
+| Linux    | `cargo xtask package-linux`       | AppImage + `.deb` + AUR PKGBUILD           |
+| macOS    | `cargo xtask package-macos-dmg`   | `target/dist/macos/buffr-<ver>-<arch>.dmg` |
+| Windows  | `cargo xtask package-windows-msi` | `target/dist/windows/buffr-<ver>-x64.msi`  |
+
+The macOS bundle assembly (driving the DMG) lives in
+[`docs/macos-signing.md`](./macos-signing.md); the Windows MSI flow has its own
+[`docs/windows-packaging.md`](./windows-packaging.md). The rest of this document
+covers Linux end-to-end.
+
+## Linux
 
 Phase 6 ships three Linux distribution paths, all producible from a single Linux
 dev box:
@@ -217,3 +233,41 @@ The `linux-package` job in `.github/workflows/ci.yml` runs the full
 
 No artifacts are uploaded — the Phase 6 release pipeline replaces this with
 proper artifact retention.
+
+## macOS
+
+`cargo xtask bundle-macos --release` assembles `buffr.app` (with the four-helper
+layout — see [`macos-signing.md`](./macos-signing.md)).
+`cargo xtask package-macos-dmg --release` then wraps it into
+`target/dist/macos/buffr-<ver>-<arch>.dmg` via `hdiutil create … -format UDZO`
+(macOS hosts) or `genisoimage` (Linux fallback, smoke testing only).
+
+The DMG embeds:
+
+- `buffr.app/` (full bundle, including all four helpers + CEF framework)
+- `Applications -> /Applications` symlink (drag-target)
+
+Unsigned in this round. After download, first-run users must clear the
+quarantine xattr Gatekeeper attaches:
+
+```sh
+xattr -d com.apple.quarantine /Applications/buffr.app
+```
+
+The CI `macos-package` job runs the full pipeline on a `macos-latest` runner and
+uploads the DMG as a build artifact. Signing + notarization land in the eventual
+`release.yml` workflow.
+
+## Windows
+
+`cargo xtask package-windows-msi --release` produces
+`target/dist/windows/buffr-<ver>-x64.msi` from a hand-rolled WiX 3 source
+(`xtask/templates/buffr.wxs`). Full layout, registry directives, uninstall
+behaviour, and cross-build prerequisites are documented in
+[`windows-packaging.md`](./windows-packaging.md).
+
+Unsigned in this round. SmartScreen will warn the user on first run until
+Authenticode signing lands.
+
+The CI `windows-package` job runs the full pipeline on a `windows-latest` runner
+with the WiX 3 toolset installed and uploads the MSI as a build artifact.
