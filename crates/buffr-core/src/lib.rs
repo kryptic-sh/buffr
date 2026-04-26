@@ -13,12 +13,14 @@ use thiserror::Error;
 
 pub mod app;
 pub mod cmdline;
+pub mod crash;
 pub mod find;
 pub mod handlers;
 pub mod hint;
 pub mod host;
 pub mod open_finder;
 pub mod permissions;
+pub mod telemetry;
 
 /// Off-screen rendering scaffold. Gated behind the `osr` feature
 /// because it pulls in (eventually) `wgpu` and `softbuffer` deps.
@@ -28,6 +30,7 @@ pub mod permissions;
 pub mod osr;
 
 pub use app::{BuffrApp, ProfilePaths};
+pub use crash::{CrashError, CrashReport, CrashReporter};
 pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
 };
@@ -44,6 +47,10 @@ pub use permissions::{
     new_queue as new_permissions_queue, peek_front as peek_permission_front,
     pop_front as pop_permission_front, precheck as precheck_permission,
     queue_len as permissions_queue_len,
+};
+pub use telemetry::{
+    KEY_APP_STARTS, KEY_BOOKMARKS_ADDED, KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED,
+    KEY_SEARCHES_RUN, KEY_TABS_OPENED, TelemetryError, UsageCounters,
 };
 
 #[derive(Debug, Error)]

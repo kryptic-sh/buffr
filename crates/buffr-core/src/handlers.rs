@@ -38,6 +38,7 @@ use crate::permissions::{
     PendingPermission, PermissionsQueue, capabilities_for_media_mask,
     capabilities_for_request_mask, precheck,
 };
+use crate::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters};
 // `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
 // `wrap_download_handler!` expand to references to bare `Client`,
 // `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
@@ -61,6 +62,7 @@ pub fn make_client(
     permissions_queue: PermissionsQueue,
     find_sink: FindResultSink,
     hint_sink: HintEventSink,
+    counters: Option<Arc<UsageCounters>>,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -71,14 +73,19 @@ pub fn make_client(
         permissions_queue,
         find_sink,
         hint_sink,
+        counters,
     )
 }
 
 /// Standalone factory for the load handler — exposed so future
 /// `BrowserHost` flavors (OSR, multi-tab) can build their own client
 /// while still funnelling visits into the same history store.
-pub fn make_load_handler(history: Arc<History>, zoom: Arc<ZoomStore>) -> LoadHandler {
-    BuffrLoadHandler::new(history, zoom)
+pub fn make_load_handler(
+    history: Arc<History>,
+    zoom: Arc<ZoomStore>,
+    counters: Option<Arc<UsageCounters>>,
+) -> LoadHandler {
+    BuffrLoadHandler::new(history, zoom, counters)
 }
 
 /// Standalone factory for the display handler — same rationale as
@@ -91,8 +98,9 @@ pub fn make_display_handler(history: Arc<History>, hint_sink: HintEventSink) -> 
 pub fn make_download_handler(
     downloads: Arc<Downloads>,
     downloads_config: Arc<DownloadsConfig>,
+    counters: Option<Arc<UsageCounters>>,
 ) -> DownloadHandler {
-    BuffrDownloadHandler::new(downloads, downloads_config)
+    BuffrDownloadHandler::new(downloads, downloads_config, counters)
 }
 
 /// Standalone factory for the find handler. Takes the same
@@ -122,11 +130,16 @@ wrap_client! {
         permissions_queue: PermissionsQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
+        counters: Option<Arc<UsageCounters>>,
     }
 
     impl Client {
         fn load_handler(&self) -> Option<LoadHandler> {
-            Some(BuffrLoadHandler::new(self.history.clone(), self.zoom.clone()))
+            Some(BuffrLoadHandler::new(
+                self.history.clone(),
+                self.zoom.clone(),
+                self.counters.clone(),
+            ))
         }
 
         fn display_handler(&self) -> Option<DisplayHandler> {
@@ -140,6 +153,7 @@ wrap_client! {
             Some(BuffrDownloadHandler::new(
                 self.downloads.clone(),
                 self.downloads_config.clone(),
+                self.counters.clone(),
             ))
         }
 
@@ -195,6 +209,7 @@ wrap_load_handler! {
     pub struct BuffrLoadHandler {
         history: Arc<History>,
         zoom: Arc<ZoomStore>,
+        counters: Option<Arc<UsageCounters>>,
     }
 
     impl LoadHandler {
@@ -212,6 +227,12 @@ wrap_load_handler! {
                 return;
             }
             let url = CefStringUtf16::from(&frame.url()).to_string();
+            // Phase 6 telemetry: count one main-frame load. Gated on
+            // the same `is_main` check as the history recorder so
+            // counts and history rows stay in sync.
+            if let Some(c) = self.counters.as_ref() {
+                c.increment(KEY_PAGES_LOADED);
+            }
             // Phase 5 always records as `Link`. Differentiating
             // `Reload` requires hooking `on_load_start`'s
             // `transition_type` — punted to Phase 5 follow-up so we
@@ -309,6 +330,7 @@ wrap_download_handler! {
     pub struct BuffrDownloadHandler {
         downloads: Arc<Downloads>,
         config: Arc<DownloadsConfig>,
+        counters: Option<Arc<UsageCounters>>,
     }
 
     impl DownloadHandler {
@@ -406,6 +428,11 @@ wrap_download_handler! {
                 if let Err(err) = self.downloads.record_completed(row.id, &path) {
                     tracing::warn!(error = %err, "downloads: record_completed failed");
                     return;
+                }
+                // Phase 6 telemetry: count one completed download.
+                // Failed/canceled downloads do not increment.
+                if let Some(c) = self.counters.as_ref() {
+                    c.increment(KEY_DOWNLOADS_COMPLETED);
                 }
                 if self.config.open_on_finish && !path_str.is_empty() {
                     open_path(&OsSpawn, &path);

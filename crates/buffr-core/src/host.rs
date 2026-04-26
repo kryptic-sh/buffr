@@ -45,6 +45,7 @@ use crate::hint::{
     build_inject_script,
 };
 use crate::permissions::PermissionsQueue;
+use crate::telemetry::{KEY_TABS_OPENED, UsageCounters};
 use crate::{CoreError, handlers};
 
 /// Monotonic tab identifier minted by [`BrowserHost`]. Distinct from
@@ -153,6 +154,11 @@ pub struct BrowserHost {
     hint_sink: HintEventSink,
     /// User-configured hint alphabet. Each tab uses the same alphabet.
     hint_alphabet: HintAlphabet,
+    /// Phase 6 usage counters. `None` when the embedder didn't pass
+    /// one (e.g. older callers); when present every counter mutation
+    /// goes through this handle. The counters themselves no-op on
+    /// `enabled = false`, so the `Some(...)` arm is cheap when off.
+    counters: Option<Arc<UsageCounters>>,
 }
 
 impl BrowserHost {
@@ -191,6 +197,7 @@ impl BrowserHost {
             hint_alphabet,
             initial_size,
             false,
+            None,
         )
     }
 
@@ -213,6 +220,7 @@ impl BrowserHost {
         hint_alphabet: HintAlphabet,
         initial_size: (u32, u32),
         private: bool,
+        counters: Option<Arc<UsageCounters>>,
     ) -> Result<Self, CoreError> {
         info!(target: "buffr_core::host", %url, "creating CEF browser (initial tab)");
         let host = Self {
@@ -231,6 +239,7 @@ impl BrowserHost {
             find_sink,
             hint_sink,
             hint_alphabet,
+            counters,
         };
         host.open_tab(url)?;
         Ok(host)
@@ -315,6 +324,7 @@ impl BrowserHost {
             self.permissions_queue.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
+            self.counters.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -357,6 +367,11 @@ impl BrowserHost {
             self.set_active_index(new_idx);
         }
         info!(target: "buffr_core::host", %id, %url, background, "tab opened");
+        // Phase 6 telemetry: count every tab open (foreground +
+        // background) — they are equally "user opened a tab" events.
+        if let Some(c) = self.counters.as_ref() {
+            c.increment(KEY_TABS_OPENED);
+        }
         Ok(id)
     }
 

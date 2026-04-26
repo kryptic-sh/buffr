@@ -34,7 +34,7 @@ mod watcher;
 
 pub use keybinding::{KeyBinding, KeyBindingError, parse_action};
 pub use loader::{ConfigSource, default_config_path, load, load_from_path};
-pub use search::resolve_input;
+pub use search::{InputKind, classify_input, resolve_input};
 pub use watcher::{ConfigWatcher, watch};
 
 /// Top-level config.
@@ -48,6 +48,7 @@ pub struct Config {
     pub privacy: Privacy,
     pub downloads: DownloadsConfig,
     pub hint: HintConfig,
+    pub crash_reporter: CrashReporterConfig,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
@@ -173,6 +174,31 @@ pub enum ClearableData {
 pub struct Privacy {
     pub enable_telemetry: bool,
     pub clear_on_exit: Vec<ClearableData>,
+}
+
+/// `[crash_reporter]` section — Phase 6 opt-in panic reporter.
+///
+/// Off by default. Reports are written to
+/// `<data>/crashes/<timestamp>.json` for the user to inspect or submit
+/// by hand; nothing is uploaded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CrashReporterConfig {
+    /// Master switch. `false` (the default) leaves the default panic
+    /// hook in place; `true` installs the buffr panic hook on startup.
+    pub enabled: bool,
+    /// Auto-purge cutoff. Reports older than this many days are
+    /// removed by `--purge-crashes`. Default `30`.
+    pub purge_after_days: u32,
+}
+
+impl Default for CrashReporterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            purge_after_days: 30,
+        }
+    }
 }
 
 /// `[hint]` section — Phase 3 follow-by-letter labels.
@@ -722,6 +748,36 @@ weird = "x"
 "#;
         let err = toml::from_str::<Config>(toml).unwrap_err();
         assert!(err.to_string().contains("weird") || err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn crash_reporter_section_default() {
+        let cfg = Config::default();
+        assert!(!cfg.crash_reporter.enabled);
+        assert_eq!(cfg.crash_reporter.purge_after_days, 30);
+    }
+
+    #[test]
+    fn crash_reporter_section_parses_from_toml() {
+        let toml = r#"
+[crash_reporter]
+enabled = true
+purge_after_days = 7
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.crash_reporter.enabled);
+        assert_eq!(cfg.crash_reporter.purge_after_days, 7);
+    }
+
+    #[test]
+    fn crash_reporter_unknown_field_rejected() {
+        let toml = r#"
+[crash_reporter]
+weird = "x"
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("weird") || msg.contains("unknown"));
     }
 
     #[test]

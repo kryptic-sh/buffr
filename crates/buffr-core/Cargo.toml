@@ -26,6 +26,10 @@ directories.workspace = true
 raw-window-handle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Phase 6: crash reporter timestamps + telemetry counters reuse the
+# workspace `chrono`. `serde` enables `DateTime<Utc>` derive(Serialize)
+# in `CrashReport`; `clock` enables `Utc::now()`.
+chrono = { workspace = true, features = ["serde", "clock"] }
 # `BrowserHost::dispatch` matches on `buffr_modal::PageAction` to
 # translate page-mode actions into CEF calls. We pull `buffr-modal`
 # without its `winit` feature here — the adapter side is wired in
@@ -50,3 +54,7 @@ buffr-zoom.workspace = true
 # `PermissionHandler` (in `handlers.rs`) pre-checks remembered
 # decisions; the UI thread persists user choices marked "always".
 buffr-permissions.workspace = true
+
+[dev-dependencies]
+# Tests for `telemetry` and `crash` write to scratch directories.
+tempfile.workspace = true
