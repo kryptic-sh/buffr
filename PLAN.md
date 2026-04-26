@@ -272,7 +272,12 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 
 ### Phase 6 — Polish & ship
 
-- [ ] Crash reporter (opt-in).
+- [x] Crash reporter (opt-in). Local-only panic-hook reporter writing
+      `<data>/crashes/<timestamp>.json`. CEF native-crash capture via
+      crashpad/breakpad is deferred — `BrowserProcessHandler` does not expose
+      `on_uncaught_exception` in libcef-147; configuring crashpad requires
+      shipping a `crashpad_handler` binary + symbol server. See
+      [`docs/privacy.md`](./docs/privacy.md).
 - [ ] Update channel: stable + nightly tags. Tauri-style updater or OS package
       managers.
 - [ ] Packaging:
@@ -288,7 +293,10 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
         entitlements, and notarization. See
         [`docs/macos-signing.md`](./docs/macos-signing.md) for the full plan.
   - [ ] Windows: signed MSI.
-- [ ] Telemetry: none by default; opt-in anonymous usage counters.
+- [x] Telemetry: none by default; opt-in anonymous usage counters. Local-only
+      JSON file at `<data>/usage-counters.json`. No network endpoint exists —
+      buffr never phones home, even on opt-in. See
+      [`docs/privacy.md`](./docs/privacy.md).
 - [ ] Accessibility pass: screen reader labels on chrome, focus order.
 - [ ] Docs site: install, keymap reference, config reference, recipes.
 

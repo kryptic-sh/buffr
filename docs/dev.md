@@ -207,14 +207,16 @@ dependency that blocks `Find { forward }` action UI).
 Per-user state buffr writes lives under `directories::ProjectDirs` resolution
 for `sh.kryptic.buffr`. On Linux that's:
 
-| Path                                      | Owner                                                           |
-| ----------------------------------------- | --------------------------------------------------------------- |
-| `~/.cache/buffr/`                         | CEF cache (cookies, GPU shader cache).                          |
-| `~/.local/share/buffr/history.sqlite`     | History DB (Phase 5, `buffr-history`).                          |
-| `~/.local/share/buffr/bookmarks.sqlite`   | Bookmarks DB (Phase 5, `buffr-bookmarks`).                      |
-| `~/.local/share/buffr/downloads.sqlite`   | Downloads DB (Phase 5, `buffr-downloads`).                      |
-| `~/.local/share/buffr/zoom.sqlite`        | Per-site zoom levels (Phase 5, `buffr-zoom`).                   |
-| `~/.local/share/buffr/permissions.sqlite` | Per-origin permission decisions (Phase 5, `buffr-permissions`). |
+| Path                                       | Owner                                                           |
+| ------------------------------------------ | --------------------------------------------------------------- |
+| `~/.cache/buffr/`                          | CEF cache (cookies, GPU shader cache).                          |
+| `~/.local/share/buffr/history.sqlite`      | History DB (Phase 5, `buffr-history`).                          |
+| `~/.local/share/buffr/bookmarks.sqlite`    | Bookmarks DB (Phase 5, `buffr-bookmarks`).                      |
+| `~/.local/share/buffr/downloads.sqlite`    | Downloads DB (Phase 5, `buffr-downloads`).                      |
+| `~/.local/share/buffr/zoom.sqlite`         | Per-site zoom levels (Phase 5, `buffr-zoom`).                   |
+| `~/.local/share/buffr/permissions.sqlite`  | Per-origin permission decisions (Phase 5, `buffr-permissions`). |
+| `~/.local/share/buffr/usage-counters.json` | Opt-in local telemetry counters (Phase 6; off by default).      |
+| `~/.local/share/buffr/crashes/`            | Opt-in panic reports (Phase 6; off by default).                 |
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
