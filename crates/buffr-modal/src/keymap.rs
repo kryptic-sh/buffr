@@ -241,6 +241,8 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "gT", PageAction::TabPrev),
     (PageMode::Normal, "<C-w>c", PageAction::TabClose),
     (PageMode::Normal, "t", PageAction::TabNew),
+    (PageMode::Normal, "<C-w>n", PageAction::DuplicateTab),
+    (PageMode::Normal, "<C-w>p", PageAction::PinTab),
     // -- history --------------------------------------------------
     (PageMode::Normal, "H", PageAction::HistoryBack),
     (PageMode::Normal, "L", PageAction::HistoryForward),

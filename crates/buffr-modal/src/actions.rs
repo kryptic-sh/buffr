@@ -72,6 +72,18 @@ pub enum PageAction {
     TabPrev,
     TabClose,
     TabNew,
+    /// Duplicate the active tab — clones the URL into a fresh tab.
+    /// Default keybind `<C-w>n` (see `docs/keymap.md`).
+    DuplicateTab,
+    /// Pin / unpin the active tab. Pinned tabs sort first; pin does
+    /// **not** prevent close. Default keybind `<C-w>p`.
+    PinTab,
+    /// Reorder the tab list. Currently unbound; reserved for the
+    /// eventual mouse-drag handler.
+    TabReorder {
+        from: u32,
+        to: u32,
+    },
 
     // -- history ------------------------------------------------------
     HistoryBack,
