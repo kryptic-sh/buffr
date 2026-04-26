@@ -52,6 +52,18 @@ pub struct FindStatus {
     pub total: u32,
 }
 
+/// Update channel indicator surfaced in the right-hand statusline cell.
+/// Mirrors `buffr_core::UpdateStatus` projected onto two render modes
+/// (`* upd` for `Available`, `* upd?` for `Stale`). `None` hides the
+/// cell entirely; the chrome doesn't paint a placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateIndicator {
+    /// Newer release available — `* upd`.
+    Available,
+    /// Cache is older than `check_interval_hours` — `* upd?`.
+    Stale,
+}
+
 /// Snapshot of hint mode state. Rendered next to the cert pip when a
 /// hint session is active. Mirrors `buffr_core::host::HintStatus` —
 /// the indirection exists so `buffr-ui` doesn't pull `buffr-core` as a
@@ -82,6 +94,14 @@ pub struct Statusline {
     pub find_query: Option<FindStatus>,
     /// Hint mode indicator. `Some(...)` while a hint session is live.
     pub hint_state: Option<HintStatus>,
+    /// Phase 6 update channel indicator. `Some(...)` flags the user
+    /// that an update is available (`* upd`) or that the cache is
+    /// stale (`* upd?`). Click/tap doesn't go anywhere yet — the user
+    /// runs `buffr --check-for-updates` manually.
+    pub update_indicator: Option<UpdateIndicator>,
+    /// Phase 6 a11y: when `true`, the strip uses the high-contrast
+    /// palette (white on black) instead of the accent-tinted defaults.
+    pub high_contrast: bool,
 }
 
 impl Default for Statusline {
@@ -95,6 +115,8 @@ impl Default for Statusline {
             private: false,
             find_query: None,
             hint_state: None,
+            update_indicator: None,
+            high_contrast: false,
         }
     }
 }
@@ -118,8 +140,21 @@ impl Statusline {
 
         // Strip starts at this row.
         let strip_y = height - strip_h;
-        let bg = mode_bg(self.mode);
-        let fg = mode_fg(self.mode);
+        let bg = if self.high_contrast {
+            HC_BG
+        } else {
+            mode_bg(self.mode)
+        };
+        let fg = if self.high_contrast {
+            HC_FG
+        } else {
+            mode_fg(self.mode)
+        };
+        let accent = if self.high_contrast {
+            HC_ACCENT
+        } else {
+            mode_accent(self.mode)
+        };
 
         // Background fill — only the strip rows.
         fill_rect(buffer, width, height, 0, strip_y as i32, width, strip_h, bg);
@@ -137,21 +172,42 @@ impl Statusline {
             strip_y as i32,
             mode_w,
             strip_h,
-            mode_accent(self.mode),
+            accent,
         );
         // Vertically center: glyph height is 10, strip height is 24
         // → top padding (24 - 10) / 2 = 7.
         let text_y = strip_y as i32 + ((strip_h as i32 - font::GLYPH_H as i32) / 2);
         font::draw_text(buffer, width, height, 6, text_y, mode_text, fg);
 
-        // Right-side cell: count buffer, find status, and PRIVATE
-        // marker. Drawn right-to-left so each piece pads naturally.
+        // Right-side cell: count buffer, find status, update channel,
+        // and PRIVATE marker. Drawn right-to-left so each piece pads
+        // naturally.
         let mut right_pen = width as i32 - 6;
         if self.private {
             let s = "PRIVATE";
             let w = font::text_width(s) as i32;
             right_pen -= w;
-            font::draw_text(buffer, width, height, right_pen, text_y, s, COLOUR_PRIVATE);
+            let private_colour = if self.high_contrast {
+                HC_FG
+            } else {
+                COLOUR_PRIVATE
+            };
+            font::draw_text(buffer, width, height, right_pen, text_y, s, private_colour);
+            right_pen -= 8;
+        }
+        if let Some(ind) = self.update_indicator {
+            let s = match ind {
+                UpdateIndicator::Available => "* upd",
+                UpdateIndicator::Stale => "* upd?",
+            };
+            let w = font::text_width(s) as i32;
+            right_pen -= w;
+            let upd_colour = if self.high_contrast {
+                HC_FG
+            } else {
+                COLOUR_UPDATE
+            };
+            font::draw_text(buffer, width, height, right_pen, text_y, s, upd_colour);
             right_pen -= 8;
         }
         if let Some(find) = self.find_query.as_ref() {
@@ -324,6 +380,22 @@ const COLOUR_PROGRESS: u32 = 0x66_C2_FF;
 const COLOUR_PRIVATE: u32 = 0xFF_C8_C8;
 const COLOUR_CERT_SECURE: u32 = 0x66_E0_8A;
 const COLOUR_CERT_INSECURE: u32 = 0xE0_5A_5A;
+const COLOUR_UPDATE: u32 = 0xE0_C8_5A;
+
+// Phase 6 high-contrast palette. Documented in `docs/accessibility.md`.
+// Picked for WCAG-style contrast against the chrome's dark mode: pure
+// white-on-black for body, a saturated yellow accent that survives
+// black + white backgrounds, and a dimmed accent for secondary text.
+//
+// Colour values:
+// - HC_BG:        0x000000  (pure black)
+// - HC_FG:        0xFFFFFF  (pure white)
+// - HC_ACCENT:    0xFFFF00  (high-contrast yellow)
+// - HC_ACCENT_DIM:0xC0C0C0  (light grey, used for non-active accents)
+pub const HC_BG: u32 = 0x00_00_00;
+pub const HC_FG: u32 = 0xFF_FF_FF;
+pub const HC_ACCENT: u32 = 0xFF_FF_00;
+pub const HC_ACCENT_DIM: u32 = 0xC0_C0_C0;
 
 const fn mode_bg(mode: PageMode) -> u32 {
     match mode {
@@ -479,6 +551,69 @@ mod tests {
         };
         assert!(format_hint(&h).starts_with("F:"));
         assert!(format_hint(&h).contains("as"));
+    }
+
+    #[test]
+    fn high_contrast_uses_distinct_palette() {
+        let w = 400;
+        let h = 24;
+        let mut buf_default = make_buf(w, h);
+        let mut buf_hc = make_buf(w, h);
+        let default_s = Statusline {
+            url: "https://x".into(),
+            ..Statusline::default()
+        };
+        let hc_s = Statusline {
+            url: "https://x".into(),
+            high_contrast: true,
+            ..Statusline::default()
+        };
+        default_s.paint(&mut buf_default, w, h);
+        hc_s.paint(&mut buf_hc, w, h);
+        // Far-right pixel on the bottom row should differ — the
+        // strip background paint sits there.
+        let idx = (h - 1) * w + (w - 1);
+        assert_ne!(buf_default[idx], buf_hc[idx]);
+        // High-contrast strip background must be pure black.
+        assert_eq!(buf_hc[idx], HC_BG);
+    }
+
+    #[test]
+    fn high_contrast_palette_distinct_from_default_modes() {
+        // Guard: HC values are not accidentally equal to any per-mode
+        // default. (Catches a future palette refactor that picks the
+        // same accent.)
+        let modes = [
+            PageMode::Normal,
+            PageMode::Visual,
+            PageMode::Command,
+            PageMode::Hint,
+            PageMode::Edit,
+        ];
+        for m in modes {
+            assert_ne!(HC_ACCENT, mode_accent(m));
+            assert_ne!(HC_BG, mode_bg(m));
+        }
+    }
+
+    #[test]
+    fn update_indicator_renders_when_set() {
+        let w = 600;
+        let h = 24;
+        let mut buf_off = make_buf(w, h);
+        let mut buf_on = make_buf(w, h);
+        let off_s = Statusline {
+            url: "x".into(),
+            ..Statusline::default()
+        };
+        let on_s = Statusline {
+            url: "x".into(),
+            update_indicator: Some(UpdateIndicator::Available),
+            ..Statusline::default()
+        };
+        off_s.paint(&mut buf_off, w, h);
+        on_s.paint(&mut buf_on, w, h);
+        assert_ne!(buf_off, buf_on);
     }
 
     #[test]
