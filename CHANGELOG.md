@@ -27,6 +27,14 @@ and this project adheres to
   `Editor::with_host(km, BuffrHost::new())` is left for a follow-up.
 - Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.29` to
   `=0.0.30` — picks up Patch C-α, which relocates the motion vocabulary out of
-  `hjkl_buffer::Buffer` inherent methods into the `hjkl_engine::motions`
-  module. Buffr only consumes editor-level APIs, so the consumer-side change is
-  a pin bump only — no source changes required.
+  `hjkl_buffer::Buffer` inherent methods into the `hjkl_engine::motions` module.
+  Buffr only consumes editor-level APIs, so the consumer-side change is a pin
+  bump only — no source changes required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.31` to
+  `=0.0.32` — picks up Patch C-β (partial): deprecated aliases dropped,
+  `_xy`/`_xywh` asymmetries resolved (`mouse_click_in_rect`,
+  `mouse_extend_drag_in_rect`, `cursor_screen_pos_in_rect`,
+  `install_ratatui_syntax_spans`, `intern_ratatui_style`), and the additive
+  `FoldProvider` trait shipped. Buffr has no call sites against the renamed or
+  removed symbols, so this is a transparent pin bump — no source changes
+  required.
