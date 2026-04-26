@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# Remove the /usr/local/bin/buffr symlink we installed in postinst.
+# Only unlink if it actually points back at /opt/buffr/buffr — leave
+# unrelated files alone.
+if [ -L /usr/local/bin/buffr ]; then
+    target="$(readlink /usr/local/bin/buffr 2>/dev/null || true)"
+    if [ "$target" = "/opt/buffr/buffr" ]; then
+        rm -f /usr/local/bin/buffr
+    fi
+fi
+
+exit 0

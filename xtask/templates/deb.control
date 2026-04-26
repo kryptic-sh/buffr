@@ -1,0 +1,9 @@
+Package: buffr
+Version: {VERSION}
+Architecture: amd64
+Maintainer: kryptic.sh <hello@kryptic.sh>
+Depends: libgtk-3-0, libnss3, libxss1, libasound2, libgbm1, libxshmfence1, libxkbcommon0, libxkbcommon-x11-0, libgles2
+Description: Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
+Section: web
+Priority: optional
+Homepage: https://buffr.kryptic.sh/
