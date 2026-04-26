@@ -24,8 +24,9 @@ serde = { workspace = true, features = ["derive"] }
 bitflags = { workspace = true }
 
 # Edit-mode delegates to hjkl-engine against a mirrored Rope synced to
-# the DOM via CEF. Local path dep until hjkl 0.1.0 ships; lockstep churn
-# means breaking changes can land on patch bumps.
+# the DOM via CEF. hjkl 0.1.0 froze the SPEC trait surface; the
+# `Editor<B, H>` generic now binds `BuffrHost` directly without the
+# pre-0.1.0 dyn-host shim.
 hjkl-engine = { workspace = true }
 hjkl-buffer = { workspace = true }
 

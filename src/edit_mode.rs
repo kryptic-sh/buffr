@@ -10,29 +10,34 @@
 
 use crate::host::BuffrHost;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hjkl_engine::{Editor, KeybindingMode, VimMode};
+use hjkl_engine::{Editor, KeybindingMode, VimMode, types::Options};
 use std::sync::Arc;
 
 /// One active edit-mode session bound to a single text field.
 ///
-/// Owns the engine [`Editor`] plus a [`BuffrHost`] for clipboard /
-/// time / intent fan-out. Pull-model: per render frame the host calls
-/// [`EditSession::take_content_change`] and forwards any new content
-/// to the DOM.
+/// Owns the engine [`Editor`] generic over [`BuffrHost`]. The host
+/// (clipboard / time / intent fan-out) lives inside the editor as of
+/// hjkl 0.1.0 — `Editor<hjkl_buffer::Buffer, BuffrHost>`. Pull-model:
+/// per render frame the host calls [`EditSession::take_content_change`]
+/// and forwards any new content to the DOM.
 pub struct EditSession {
-    editor: Editor<'static>,
-    host: BuffrHost,
+    editor: Editor<hjkl_buffer::Buffer, BuffrHost>,
 }
 
 impl EditSession {
     /// Boot the session with the field's current value.
     pub fn new(initial: &str) -> Self {
-        let mut editor = Editor::new(KeybindingMode::Vim);
+        let mut editor = Editor::new(
+            hjkl_buffer::Buffer::new(),
+            BuffrHost::new(),
+            Options::default(),
+        );
+        // 0.1.0: keybinding mode is a post-construction public field on
+        // Editor. Vim is the default already, but set explicitly so the
+        // intent stays visible at the call site.
+        editor.keybinding_mode = KeybindingMode::Vim;
         editor.set_content(initial);
-        Self {
-            editor,
-            host: BuffrHost::new(),
-        }
+        Self { editor }
     }
 
     /// Feed one keystroke. Returns `true` when the keystroke was
@@ -85,19 +90,19 @@ impl EditSession {
     /// Drain queued clipboard writes the engine has accumulated.
     /// Host's tick loop dispatches each to CEF.
     pub fn drain_clipboard_outbox(&mut self) -> Vec<String> {
-        self.host.drain_clipboard_outbox()
+        self.editor.host_mut().drain_clipboard_outbox()
     }
 
     /// Drain queued intents (`RequestAutocomplete`, `SwitchBuffer`,
     /// etc.). Host fans each out to its CEF / browser-action layer.
     pub fn drain_intents(&mut self) -> Vec<crate::host::BuffrEditIntent> {
-        self.host.drain_intents()
+        self.editor.host_mut().drain_intents()
     }
 
     /// Mutable access to the host. Production callers reach for this
     /// to refresh the clipboard cache on focus events / OSC52 reply.
     pub fn host_mut(&mut self) -> &mut BuffrHost {
-        &mut self.host
+        self.editor.host_mut()
     }
 }
 
