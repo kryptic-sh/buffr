@@ -187,9 +187,13 @@ Goal: tab strip + statusline + command line + omnibar, all native.
 - [x] Omnibar (`o`/`O`): search-or-URL resolver in `buffr-config::search`,
       suggestion source = history + bookmarks + search-engine fallback.
       `BrowserHost::navigate` performs the load on Enter.
-- [ ] Hint mode (`f`/`F`): DOM query via CEF V8 binding → overlay labels →
-      keystroke filter → click/focus dispatch. Triggers the migration to OSR +
-      `wgpu` compositing — see `docs/ui-stack.md`.
+- [x] Hint mode (`f`/`F`): DOM-injected `<div class="buffr-hint-overlay">`
+      labels via `frame.execute_java_script`. CEF→Rust IPC uses the console-log
+      scraping fallback (`__buffr_hint__:` sentinel) since the
+      `cef_process_message_t` path needs a renderer-side `RenderProcessHandler`
+      we don't otherwise need. `F` (background-tab) currently logs a warning and
+      falls back to a same-tab click — multi-tab is post-Phase-3. See
+      [`docs/hint-mode.md`](./docs/hint-mode.md).
 - [x] Find-in-page (`/`, `?`, `n`, `N`): wired to CEF `find` API via
       `BrowserHost::start_find` / `stop_find` and a `BuffrFindHandler` that
       pumps `OnFindResult` into the statusline. UI for entering the query
