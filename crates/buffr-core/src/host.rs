@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use buffr_config::DownloadsConfig;
 use buffr_downloads::Downloads;
 use buffr_history::History;
+use buffr_permissions::Permissions;
 use buffr_zoom::ZoomStore;
 use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
@@ -43,6 +44,7 @@ use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
     build_inject_script,
 };
+use crate::permissions::PermissionsQueue;
 use crate::{CoreError, handlers};
 
 /// Monotonic tab identifier minted by [`BrowserHost`]. Distinct from
@@ -142,6 +144,8 @@ pub struct BrowserHost {
     downloads: Arc<Downloads>,
     downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
+    permissions: Arc<Permissions>,
+    permissions_queue: PermissionsQueue,
     /// Mailboxes shared with CEF handlers. One sink for the whole
     /// host (handlers can't tell which browser fired the event in
     /// every callback shape, so per-tab demux happens in the UI).
@@ -166,6 +170,8 @@ impl BrowserHost {
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
+        permissions: Arc<Permissions>,
+        permissions_queue: PermissionsQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         hint_alphabet: HintAlphabet,
@@ -178,6 +184,8 @@ impl BrowserHost {
             downloads,
             downloads_config,
             zoom,
+            permissions,
+            permissions_queue,
             find_sink,
             hint_sink,
             hint_alphabet,
@@ -198,6 +206,8 @@ impl BrowserHost {
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
+        permissions: Arc<Permissions>,
+        permissions_queue: PermissionsQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         hint_alphabet: HintAlphabet,
@@ -216,12 +226,27 @@ impl BrowserHost {
             downloads,
             downloads_config,
             zoom,
+            permissions,
+            permissions_queue,
             find_sink,
             hint_sink,
             hint_alphabet,
         };
         host.open_tab(url)?;
         Ok(host)
+    }
+
+    /// Borrow the shared permissions store. The UI thread uses this to
+    /// persist user-chosen "always" decisions when resolving a queued
+    /// prompt.
+    pub fn permissions(&self) -> &Arc<Permissions> {
+        &self.permissions
+    }
+
+    /// Borrow the shared permissions queue. The UI thread drains this
+    /// each tick.
+    pub fn permissions_queue(&self) -> &PermissionsQueue {
+        &self.permissions_queue
     }
 
     fn mint_id(&self) -> TabId {
@@ -286,6 +311,8 @@ impl BrowserHost {
             self.downloads.clone(),
             self.downloads_config.clone(),
             self.zoom.clone(),
+            self.permissions.clone(),
+            self.permissions_queue.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
         );

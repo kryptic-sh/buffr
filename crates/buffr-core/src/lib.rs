@@ -18,6 +18,7 @@ pub mod handlers;
 pub mod hint;
 pub mod host;
 pub mod open_finder;
+pub mod permissions;
 
 /// Off-screen rendering scaffold. Gated behind the `osr` feature
 /// because it pulls in (eventually) `wgpu` and `softbuffer` deps.
@@ -37,6 +38,13 @@ pub use hint::{
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use host::{BrowserHost, HintStatus, Tab, TabId, TabSession, TabSummary};
+pub use permissions::{
+    PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
+    capabilities_for_request_mask, drain_with_defer as drain_permissions_with_defer,
+    new_queue as new_permissions_queue, peek_front as peek_permission_front,
+    pop_front as pop_permission_front, precheck as precheck_permission,
+    queue_len as permissions_queue_len,
+};
 
 #[derive(Debug, Error)]
 pub enum CoreError {

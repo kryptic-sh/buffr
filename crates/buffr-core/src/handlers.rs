@@ -21,6 +21,7 @@
 //! the resulting `Client` to `browser_host_create_browser_sync` so CEF
 //! actually invokes our callbacks (without a custom `Client`, CEF
 //! defaults to a no-op client and our handlers never fire).
+#![allow(clippy::too_many_arguments)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,10 +29,15 @@ use std::sync::Arc;
 use buffr_config::DownloadsConfig;
 use buffr_downloads::{DownloadStatus, Downloads};
 use buffr_history::{History, Transition};
+use buffr_permissions::{Decision, Permissions};
 use buffr_zoom::ZoomStore;
 
 use crate::find::{FindResult, FindResultSink};
 use crate::hint::{HintEventSink, parse_console_event};
+use crate::permissions::{
+    PendingPermission, PermissionsQueue, capabilities_for_media_mask,
+    capabilities_for_request_mask, precheck,
+};
 // `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
 // `wrap_download_handler!` expand to references to bare `Client`,
 // `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
@@ -45,11 +51,14 @@ use crate::open_finder::{OsSpawn, open_path};
 /// handlers when CEF asks for them. This is the entry point
 /// `BrowserHost::new` uses; consumers don't construct `BuffrClient`
 /// directly.
+#[allow(clippy::too_many_arguments)]
 pub fn make_client(
     history: Arc<History>,
     downloads: Arc<Downloads>,
     downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
+    permissions: Arc<Permissions>,
+    permissions_queue: PermissionsQueue,
     find_sink: FindResultSink,
     hint_sink: HintEventSink,
 ) -> Client {
@@ -58,6 +67,8 @@ pub fn make_client(
         downloads,
         downloads_config,
         zoom,
+        permissions,
+        permissions_queue,
         find_sink,
         hint_sink,
     )
@@ -91,12 +102,24 @@ pub fn make_find_handler(sink: FindResultSink) -> FindHandler {
     BuffrFindHandler::new(sink)
 }
 
+/// Standalone factory for the permission handler. Pre-checks the
+/// store synchronously; otherwise enqueues the request for the UI
+/// thread.
+pub fn make_permission_handler(
+    permissions: Arc<Permissions>,
+    queue: PermissionsQueue,
+) -> PermissionHandler {
+    BuffrPermissionHandler::new(permissions, queue)
+}
+
 wrap_client! {
     pub struct BuffrClient {
         history: Arc<History>,
         downloads: Arc<Downloads>,
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
+        permissions: Arc<Permissions>,
+        permissions_queue: PermissionsQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
     }
@@ -122,6 +145,13 @@ wrap_client! {
 
         fn find_handler(&self) -> Option<FindHandler> {
             Some(BuffrFindHandler::new(self.find_sink.clone()))
+        }
+
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(BuffrPermissionHandler::new(
+                self.permissions.clone(),
+                self.permissions_queue.clone(),
+            ))
         }
     }
 }
@@ -401,6 +431,152 @@ wrap_download_handler! {
             if let Err(err) = self.downloads.update_progress(row.id, received_u, total_u) {
                 tracing::warn!(error = %err, "downloads: update_progress failed");
             }
+        }
+    }
+}
+
+wrap_permission_handler! {
+    pub struct BuffrPermissionHandler {
+        permissions: Arc<Permissions>,
+        queue: PermissionsQueue,
+    }
+
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> ::std::os::raw::c_int {
+            // CEF emits this for `getUserMedia` (camera/mic). Returning
+            // 0 hands the request back to CEF (which will deny by
+            // default in headless builds); returning 1 commits us to
+            // invoking the callback exactly once.
+            let Some(callback) = callback else {
+                tracing::warn!("permissions: media-access callback was None");
+                return 0;
+            };
+            let origin = requesting_origin
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let caps = capabilities_for_media_mask(requested_permissions);
+            if caps.is_empty() {
+                // Nothing buffr knows how to ask about — let CEF apply
+                // its default policy.
+                tracing::trace!(
+                    %origin,
+                    requested_permissions,
+                    "permissions: media request with no recognised bits — declining"
+                );
+                callback.cancel();
+                return 1;
+            }
+
+            // Pre-check the store. Sticky decisions short-circuit the
+            // prompt: every cap must agree (all-allow or any-deny).
+            match precheck(&self.permissions, &origin, &caps) {
+                Ok(Some(Decision::Allow)) => {
+                    callback.cont(requested_permissions);
+                    return 1;
+                }
+                Ok(Some(Decision::Deny)) => {
+                    callback.cancel();
+                    return 1;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, %origin, "permissions: precheck failed — falling through to prompt");
+                }
+            }
+
+            // Enqueue. We clone the callback (RefGuard::Clone bumps
+            // refcount) so it survives until the UI thread resolves
+            // the request.
+            let pending = PendingPermission::MediaAccess {
+                origin,
+                capabilities: caps,
+                callback: callback.clone(),
+                requested_mask: requested_permissions,
+            };
+            if let Ok(mut q) = self.queue.lock() {
+                q.push_back(pending);
+            } else {
+                tracing::warn!("permissions: queue mutex poisoned — denying");
+                callback.cancel();
+            }
+            1
+        }
+
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                tracing::warn!("permissions: prompt callback was None");
+                return 0;
+            };
+            let origin = requesting_origin
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let caps = capabilities_for_request_mask(requested_permissions);
+            if caps.is_empty() {
+                tracing::trace!(
+                    %origin,
+                    requested_permissions,
+                    "permissions: prompt request with no recognised bits — dismissing"
+                );
+                callback.cont(PermissionRequestResult::DISMISS);
+                return 1;
+            }
+
+            match precheck(&self.permissions, &origin, &caps) {
+                Ok(Some(Decision::Allow)) => {
+                    callback.cont(PermissionRequestResult::ACCEPT);
+                    return 1;
+                }
+                Ok(Some(Decision::Deny)) => {
+                    callback.cont(PermissionRequestResult::DENY);
+                    return 1;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, %origin, "permissions: precheck failed — falling through to prompt");
+                }
+            }
+
+            let pending = PendingPermission::Prompt {
+                origin,
+                capabilities: caps,
+                callback: callback.clone(),
+                prompt_id,
+            };
+            if let Ok(mut q) = self.queue.lock() {
+                q.push_back(pending);
+            } else {
+                tracing::warn!("permissions: queue mutex poisoned — dismissing");
+                callback.cont(PermissionRequestResult::DISMISS);
+            }
+            1
+        }
+
+        fn on_dismiss_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            _result: PermissionRequestResult,
+        ) {
+            // Fired when CEF cancels the prompt itself (e.g. tab
+            // navigated away). We don't have a stable identifier on
+            // the queue entry yet, so this is informational — the
+            // pending entry will eventually be resolved by the user or
+            // by `drain_with_defer` at shutdown.
+            tracing::trace!(prompt_id, "permissions: dismissed by CEF");
         }
     }
 }

@@ -46,3 +46,7 @@ buffr-config.workspace = true
 # `BrowserHost::dispatch` writes through; the CEF `LoadHandler` reads
 # the stored level on load to restore it.
 buffr-zoom.workspace = true
+# Phase 5: SQLite-backed per-origin permissions store. The CEF
+# `PermissionHandler` (in `handlers.rs`) pre-checks remembered
+# decisions; the UI thread persists user choices marked "always".
+buffr-permissions.workspace = true
