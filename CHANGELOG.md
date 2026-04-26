@@ -50,3 +50,8 @@ and this project adheres to
   CEF/winit page lifecycle in `apps/buffr`, the viewport stays at zero-size and
   the engine's scroll math no-ops. No `buffer().viewport*()` reaches in buffr,
   so the migration is contained to `BuffrHost`.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.34` to
+  `=0.0.35` — picks up the search FSM migration from `hjkl_buffer::Buffer` onto
+  `hjkl_engine::Editor`. Buffr does not drive search through the Buffer API per
+  the consumer audit, so this is a transparent pin bump — no source changes
+  required. First of a 5-patch path toward hjkl 0.1.0.
