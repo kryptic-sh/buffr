@@ -59,6 +59,9 @@ tempfile = "3"
 # below the CEF child window. No GPU dependency; drawing is a per-pixel
 # `&mut [u32]` blit driven by the bitmap font in `buffr-ui::font`.
 softbuffer = "0.4"
+# Phase 6 update channel: `UpdateChecker` compares the running version
+# against GitHub releases. SemVer parsing handles rc/beta suffixes.
+semver = { version = "1", features = ["serde"] }
 
 buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
@@ -73,8 +76,8 @@ buffr-permissions = { path = "crates/buffr-permissions" }
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.0.x" until hjkl 0.1.0 stabilises — lockstep churn means
 # breaking changes can land on patch bumps.
-hjkl-engine = "=0.0.23"
-hjkl-buffer = "=0.0.23"
+hjkl-engine = "=0.0.24"
+hjkl-buffer = "=0.0.24"
 
 # Local-dev override: point hjkl-* crates at the in-tree checkout so
 # we can iterate against unreleased changes without waiting on the
