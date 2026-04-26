@@ -59,6 +59,11 @@ enable_telemetry = false
 #
 # clear_on_exit = ["cookies", "cache", "local_storage"]
 clear_on_exit = []
+# Permissions store lives at <data>/permissions.sqlite. Use the
+# `--list-permissions` / `--clear-permissions` / `--forget-origin` CLI
+# flags to inspect or reset the table without launching CEF. Adding
+# `permissions` to `clear_on_exit` is reserved (Phase 5 follow-up); for
+# now use `--clear-permissions` to wipe the table.
 
 [downloads]
 # Directory downloads land in. If unset (the default), buffr resolves

@@ -155,6 +155,30 @@ readline / vim's command-line conventions.
 | `<C-u>`              | Clear the entire buffer.                                 |
 | `<C-w>`              | Delete the word before the cursor.                       |
 
+## In-prompt shortcuts (permissions)
+
+When a page asks for a permission (camera, microphone, geolocation,
+notifications, clipboard, MIDI sysex, …) buffr surfaces a prompt strip and
+routes keystrokes to it until the request is resolved. The page content does not
+see these keys.
+
+| Keys      | Action                                          |
+| --------- | ----------------------------------------------- |
+| `a` / `y` | Allow once (no row written).                    |
+| `A` / `Y` | Allow + remember for this origin.               |
+| `d` / `n` | Deny once (no row written).                     |
+| `D` / `N` | Deny + remember for this origin.                |
+| `s`       | Synonym for `D` — deny + remember.              |
+| `<Esc>`   | Defer — `Dismiss` / `cancel()`, no persistence. |
+
+If multiple requests pile up they queue; the statusline shows `(N more pending)`
+on the prompt strip. After resolving one the next prompt appears on the
+following frame.
+
+See
+[`crates/buffr-permissions/README.md`](../crates/buffr-permissions/README.md)
+for the decision-precedence rules.
+
 ## Customising
 
 Bindings come from a static table in `crates/buffr-modal/src/keymap.rs`. User

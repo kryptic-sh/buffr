@@ -250,8 +250,16 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       `cef::cookie_manager_get_global_manager().delete_cookies(None, None, None)`;
       cache + local-storage are directory-tree wipes under `root_cache_path`;
       history/bookmarks/downloads call `clear_all` on their respective stores.
-- [ ] Permissions prompt UI: camera, mic, geolocation, notifications. Phase 3
-      chrome dependency — needs prompt-overlay rendering.
+- [x] Permissions prompt UI: camera, mic, geolocation, notifications. CEF
+      `PermissionHandler` (`on_request_media_access_permission` +
+      `on_show_permission_prompt`) routes uncached requests onto a shared
+      `Mutex<VecDeque<PendingPermission>>`. The UI thread drains one per tick
+      and renders a 60 px [`PermissionsPrompt`] strip; `a`/`d` resolve once,
+      `A`/`D`/`s` persist into `crates/buffr-permissions` (SQLite,
+      `<data>/permissions.sqlite`). Decision precedence: stored Allow > stored
+      Deny > prompt. CLI flags `--list-permissions`, `--clear-permissions`,
+      `--forget-origin`. See
+      [`crates/buffr-permissions/README.md`](./crates/buffr-permissions/README.md).
 - [x] Private window: ephemeral profile. `--private` CLI flag opens every store
       in-memory and roots `Settings::root_cache_path` at a `tempfile::TempDir`
       deleted on shutdown. Single-window incognito; multi-window-per-profile is

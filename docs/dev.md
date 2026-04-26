@@ -188,13 +188,14 @@ dependency that blocks `Find { forward }` action UI).
 Per-user state buffr writes lives under `directories::ProjectDirs` resolution
 for `sh.kryptic.buffr`. On Linux that's:
 
-| Path                                    | Owner                                         |
-| --------------------------------------- | --------------------------------------------- |
-| `~/.cache/buffr/`                       | CEF cache (cookies, GPU shader cache).        |
-| `~/.local/share/buffr/history.sqlite`   | History DB (Phase 5, `buffr-history`).        |
-| `~/.local/share/buffr/bookmarks.sqlite` | Bookmarks DB (Phase 5, `buffr-bookmarks`).    |
-| `~/.local/share/buffr/downloads.sqlite` | Downloads DB (Phase 5, `buffr-downloads`).    |
-| `~/.local/share/buffr/zoom.sqlite`      | Per-site zoom levels (Phase 5, `buffr-zoom`). |
+| Path                                      | Owner                                                           |
+| ----------------------------------------- | --------------------------------------------------------------- |
+| `~/.cache/buffr/`                         | CEF cache (cookies, GPU shader cache).                          |
+| `~/.local/share/buffr/history.sqlite`     | History DB (Phase 5, `buffr-history`).                          |
+| `~/.local/share/buffr/bookmarks.sqlite`   | Bookmarks DB (Phase 5, `buffr-bookmarks`).                      |
+| `~/.local/share/buffr/downloads.sqlite`   | Downloads DB (Phase 5, `buffr-downloads`).                      |
+| `~/.local/share/buffr/zoom.sqlite`        | Per-site zoom levels (Phase 5, `buffr-zoom`).                   |
+| `~/.local/share/buffr/permissions.sqlite` | Per-origin permission decisions (Phase 5, `buffr-permissions`). |
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
