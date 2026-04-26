@@ -1217,7 +1217,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hjkl-buffer"
-version = "0.0.40"
+version = "0.0.41"
 dependencies = [
  "ratatui",
  "regex",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "hjkl-engine"
-version = "0.0.40"
+version = "0.0.41"
 dependencies = [
  "bitflags 2.11.1",
  "crossterm",
@@ -3541,7 +3541,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
