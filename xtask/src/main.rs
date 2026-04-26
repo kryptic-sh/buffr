@@ -14,6 +14,15 @@
 //!   Linux distribution artifacts under `target/dist/linux/`. Cross-builds
 //!   from any Linux dev box; `appimagetool` and `dpkg-deb` are auto-detected
 //!   and gracefully degraded if absent.
+//! - `package-macos-dmg [--release]` wraps the bundle from `bundle-macos`
+//!   into a `.dmg` under `target/dist/macos/`. Requires `hdiutil` (macOS) or
+//!   `genisoimage` (Linux fallback); falls through to a staging tree if
+//!   neither tool is available.
+//! - `package-windows-msi [--release]` produces a `.msi` installer (and / or
+//!   the staging payload + WiX source) under `target/dist/windows/`.
+//!   `candle.exe` + `light.exe` from the WiX 3 toolset are auto-detected;
+//!   absent tools leave the payload + `buffr.wxs` for a Windows runner to
+//!   pick up.
 //!
 //! Run from the workspace root: `cargo xtask fetch-cef`.
 
@@ -48,6 +57,10 @@ const HELPER_PLIST_TEMPLATE: &str = include_str!("../templates/helper.plist");
 const HELPER_GPU_PLIST_TEMPLATE: &str = include_str!("../templates/helper-gpu.plist");
 const HELPER_RENDERER_PLIST_TEMPLATE: &str = include_str!("../templates/helper-renderer.plist");
 const HELPER_PLUGIN_PLIST_TEMPLATE: &str = include_str!("../templates/helper-plugin.plist");
+
+/// Embedded WiX 3 source for the Windows MSI installer. Substituted at
+/// runtime via `str::replace`.
+const WIX_TEMPLATE: &str = include_str!("../templates/buffr.wxs");
 
 /// Bundle identifiers + display name used by the macOS bundle templates.
 const NAME: &str = "buffr";
@@ -114,6 +127,8 @@ fn run() -> Result<()> {
         "fetch-cef" => fetch_cef(args.collect()),
         "bundle-macos" => bundle_macos(args.collect()),
         "package-linux" => package_linux(args.collect()),
+        "package-macos-dmg" => package_macos_dmg(args.collect()),
+        "package-windows-msi" => package_windows_msi(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -129,7 +144,7 @@ fn print_help() {
     println!("    cargo xtask <COMMAND>");
     println!();
     println!("COMMANDS:");
-    println!("    fetch-cef [--platform PLATFORM] [--version PREFIX]");
+    println!("    fetch-cef [--platform|--target PLATFORM] [--version PREFIX]");
     println!("        Download + extract CEF minimal binary distribution.");
     println!("        PLATFORM: linux64 (default on Linux), macosarm64, macosx64, windows64.");
     println!("        PREFIX:   version prefix to match (default: {CEF_VERSION_PREFIX}).");
@@ -141,6 +156,16 @@ fn print_help() {
     println!("    package-linux [--release] [--variant VARIANT]");
     println!("        Produce Linux distribution artifacts under target/dist/linux/.");
     println!("        VARIANT: appimage | deb | aur | all (default: all).");
+    println!();
+    println!("    package-macos-dmg [--release]");
+    println!(
+        "        Wrap target/<profile>/buffr.app into target/dist/macos/buffr-<ver>-<arch>.dmg."
+    );
+    println!("        Requires hdiutil (macOS) or genisoimage (Linux fallback).");
+    println!();
+    println!("    package-windows-msi [--release]");
+    println!("        Stage Windows payload + WiX source under target/dist/windows/.");
+    println!("        Builds the .msi if candle/light from the WiX 3 toolset are on PATH.");
 }
 
 fn fetch_cef(args: Vec<String>) -> Result<()> {
@@ -150,8 +175,15 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--platform" => {
-                platform = Some(iter.next().context("--platform requires a value")?);
+            // `--target` is the same idea as `--platform` — kept as an
+            // alias so cross-host CI jobs (`--target windows64` /
+            // `--target macosarm64`) read naturally without conflicting
+            // with the historical `--platform` flag.
+            "--platform" | "--target" => {
+                platform = Some(
+                    iter.next()
+                        .context("--platform/--target requires a value")?,
+                );
             }
             "--version" => {
                 version_prefix = iter.next().context("--version requires a value")?;
@@ -1121,6 +1153,445 @@ fn write_pkgbuild(workspace: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
+// ----------------------------- package-macos-dmg ------------------------
+
+#[derive(Debug, Default)]
+struct PackageMacosDmgArgs {
+    release: bool,
+    /// Override the source `.app` (default: `target/<profile>/buffr.app`).
+    /// Mostly a hook for tests; CLI users go through `bundle-macos`.
+    app: Option<PathBuf>,
+}
+
+fn package_macos_dmg(args: Vec<String>) -> Result<()> {
+    let mut parsed = PackageMacosDmgArgs::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--release" => parsed.release = true,
+            "--app" => {
+                parsed.app = Some(PathBuf::from(
+                    iter.next().context("--app requires a value")?,
+                ))
+            }
+            other => bail!("unknown package-macos-dmg arg `{other}`"),
+        }
+    }
+
+    let workspace = workspace_root()?;
+    let profile = if parsed.release { "release" } else { "debug" };
+    let version = workspace_version(&workspace)?;
+    let target_dir = workspace.join("target").join(profile);
+
+    let app_dir = parsed.app.unwrap_or_else(|| target_dir.join("buffr.app"));
+    if !app_dir.exists() {
+        bail!(
+            "no buffr.app at {} — run `cargo xtask bundle-macos{}` first",
+            app_dir.display(),
+            if parsed.release { " --release" } else { "" }
+        );
+    }
+
+    let dist_dir = workspace.join("target/dist/macos");
+    fs::create_dir_all(&dist_dir).with_context(|| format!("creating {}", dist_dir.display()))?;
+
+    // Stage the DMG layout under target/<profile>/dmg-staging/.
+    let staging = target_dir.join("dmg-staging");
+    if staging.exists() {
+        fs::remove_dir_all(&staging).with_context(|| format!("wiping {}", staging.display()))?;
+    }
+    stage_dmg(&staging, &app_dir)?;
+
+    // Architecture suffix: macOS arm64 vs x86_64. Default is host arch
+    // since the bundle binary tracks the build target.
+    let arch = macos_arch_suffix();
+    let dmg_name = format!("buffr-{version}-{arch}.dmg");
+    let dmg_path = dist_dir.join(&dmg_name);
+
+    // Pick a tool: hdiutil (macOS) or genisoimage (Linux fallback). If
+    // neither is on PATH we leave the staging tree and warn — CI on a
+    // macos-latest runner exercises hdiutil for real.
+    let tool = resolve_dmg_tool();
+    match tool {
+        DmgTool::Hdiutil => {
+            eprintln!("xtask: hdiutil create -> {}", dmg_path.display());
+            let status = Command::new("hdiutil")
+                .arg("create")
+                .arg("-volname")
+                .arg("buffr")
+                .arg("-srcfolder")
+                .arg(&staging)
+                .arg("-ov")
+                .arg("-format")
+                .arg("UDZO")
+                .arg(&dmg_path)
+                .status()
+                .context("spawning hdiutil")?;
+            if !status.success() {
+                bail!("hdiutil exited {status:?}");
+            }
+            eprintln!("xtask: dmg written to {}", dmg_path.display());
+        }
+        DmgTool::Genisoimage => {
+            eprintln!("xtask: hdiutil unavailable; using genisoimage fallback (UDF, not UDZO)");
+            let status = Command::new("genisoimage")
+                .arg("-V")
+                .arg("buffr")
+                .arg("-D")
+                .arg("-R")
+                .arg("-apple")
+                .arg("-no-pad")
+                .arg("-o")
+                .arg(&dmg_path)
+                .arg(&staging)
+                .status()
+                .context("spawning genisoimage")?;
+            if !status.success() {
+                bail!("genisoimage exited {status:?}");
+            }
+            eprintln!("xtask: dmg-equivalent written to {}", dmg_path.display());
+            eprintln!(
+                "xtask: warning — genisoimage output is an ISO9660 image, not a real \
+                 hdiutil UDZO DMG; macOS will mount it but Finder layout / drag-target \
+                 affordances are not preserved. Re-run on a macOS host for distribution."
+            );
+        }
+        DmgTool::Missing => {
+            eprintln!(
+                "xtask: dmg tooling missing — staging tree at {}; install hdiutil (macOS) \
+                 or genisoimage (Linux) to package",
+                staging.display()
+            );
+            return Ok(());
+        }
+    }
+
+    eprintln!();
+    eprintln!("xtask: package-macos-dmg complete");
+    eprintln!("       artifact: {}", dmg_path.display());
+    eprintln!("       NOTE: unsigned. First-run users must clear the quarantine xattr:");
+    eprintln!("           xattr -d com.apple.quarantine /Applications/buffr.app");
+    eprintln!("       Signing + notarization land alongside docs/macos-signing.md.");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmgTool {
+    Hdiutil,
+    Genisoimage,
+    Missing,
+}
+
+fn resolve_dmg_tool() -> DmgTool {
+    if which("hdiutil") {
+        DmgTool::Hdiutil
+    } else if which("genisoimage") {
+        DmgTool::Genisoimage
+    } else {
+        DmgTool::Missing
+    }
+}
+
+/// Lay out the DMG-staging directory:
+///
+/// ```text
+/// dmg-staging/
+///   buffr.app/                  (copy of the bundle)
+///   Applications -> /Applications  (symlink, drag-target)
+/// ```
+///
+/// `.background.png` and `.DS_Store` are intentionally not generated —
+/// they only matter for visual layout when mounted, and producing them
+/// faithfully needs an `osascript` + a mounted volume on macOS. Once
+/// signing lands the post-Phase-6 release pipeline can layer those on.
+fn stage_dmg(staging: &Path, app_dir: &Path) -> Result<()> {
+    fs::create_dir_all(staging).with_context(|| format!("creating {}", staging.display()))?;
+
+    // Copy buffr.app into the staging tree. We copy rather than symlink
+    // so hdiutil sees a self-contained directory.
+    let dest_app = staging.join("buffr.app");
+    copy_dir_recursive(app_dir, &dest_app)
+        .with_context(|| format!("copying bundle into {}", dest_app.display()))?;
+
+    // Drag-target symlink to /Applications. On non-Unix hosts (Windows
+    // dev box that somehow runs this) `symlink` won't compile; but
+    // package-macos-dmg only ever runs on Unix anyway.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let link = staging.join("Applications");
+        if link.exists() {
+            fs::remove_file(&link).ok();
+        }
+        symlink("/Applications", &link)
+            .with_context(|| format!("creating symlink {}", link.display()))?;
+    }
+
+    Ok(())
+}
+
+fn macos_arch_suffix() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        "arm64"
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        "unknown"
+    }
+}
+
+fn which(tool: &str) -> bool {
+    Command::new("which")
+        .arg(tool)
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+// ----------------------------- package-windows-msi -----------------------
+
+#[derive(Debug, Default)]
+struct PackageWindowsMsiArgs {
+    release: bool,
+}
+
+/// Render the WiX 3 source for the workspace.
+///
+/// Pulled out so unit tests can lock the substitution behaviour down
+/// without spinning up the rest of the packaging pipeline.
+fn render_wix(version: &str, install_dir: &str, arch: &str) -> String {
+    WIX_TEMPLATE
+        .replace("{VERSION}", version)
+        .replace("{INSTALL_DIR}", install_dir)
+        .replace("{ARCH}", arch)
+}
+
+fn package_windows_msi(args: Vec<String>) -> Result<()> {
+    let mut parsed = PackageWindowsMsiArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "--release" => parsed.release = true,
+            other => bail!("unknown package-windows-msi arg `{other}`"),
+        }
+    }
+
+    let workspace = workspace_root()?;
+    let profile = if parsed.release { "release" } else { "debug" };
+    let version = workspace_version(&workspace)?;
+
+    let dist_dir = workspace.join("target/dist/windows");
+    fs::create_dir_all(&dist_dir).with_context(|| format!("creating {}", dist_dir.display()))?;
+
+    // 1. Always write the WiX source first so it's available for
+    //    inspection even on a Linux box without the Windows binaries.
+    let wxs = render_wix(&version, "buffr", "x64");
+    let wxs_path = dist_dir.join("buffr.wxs");
+    fs::write(&wxs_path, &wxs).with_context(|| format!("writing {}", wxs_path.display()))?;
+    eprintln!("xtask: wrote {}", wxs_path.display());
+
+    // 2. Locate buffr.exe + buffr-helper.exe. On a Windows host the
+    //    profile-default `target/<profile>/` already has them; on Linux
+    //    we look for an explicit cross-compile output under
+    //    `target/x86_64-pc-windows-{msvc,gnu}/<profile>/`. This
+    //    subcommand does not drive cross-compilation itself — the CI
+    //    Windows runner builds natively, and Linux dev boxes can opt
+    //    into the cross workflow manually.
+    let payload = match collect_windows_payload(&workspace, profile) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!(
+                "xtask: warning — Windows payload unavailable ({err}); \
+                 leaving .wxs at {} for a Windows runner to consume",
+                wxs_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let payload_dir = dist_dir.join("payload");
+    if payload_dir.exists() {
+        fs::remove_dir_all(&payload_dir)
+            .with_context(|| format!("wiping {}", payload_dir.display()))?;
+    }
+    fs::create_dir_all(&payload_dir)?;
+    stage_windows_payload(&payload_dir, &payload)?;
+
+    // 3. Resolve candle + light. Both must exist; partial WiX 3 install
+    //    is treated as missing.
+    let have_candle = which("candle") || which("candle.exe");
+    let have_light = which("light") || which("light.exe");
+    if !have_candle || !have_light {
+        eprintln!(
+            "xtask: candle/light from the WiX 3 toolset not on PATH; \
+             leaving payload + .wxs at {}",
+            dist_dir.display()
+        );
+        eprintln!(
+            "       To produce the .msi: install WiX 3 (or the v3 build of WiX 4) \
+             and re-run this command on a host with the toolset, or rely on the \
+             CI windows-package job."
+        );
+        return Ok(());
+    }
+
+    // 4. Drive candle + light. `.wixobj` lands next to the wxs source;
+    //    `light` produces the final `.msi` under `target/dist/windows/`.
+    let wixobj = dist_dir.join("buffr.wixobj");
+    eprintln!("xtask: candle -> {}", wixobj.display());
+    let status = Command::new(if which("candle") {
+        "candle"
+    } else {
+        "candle.exe"
+    })
+    .arg("-arch")
+    .arg("x64")
+    .arg("-o")
+    .arg(&wixobj)
+    .arg(&wxs_path)
+    .current_dir(&dist_dir)
+    .status()
+    .context("spawning candle")?;
+    if !status.success() {
+        bail!("candle exited {status:?}");
+    }
+
+    let msi_path = dist_dir.join(format!("buffr-{version}-x64.msi"));
+    eprintln!("xtask: light -> {}", msi_path.display());
+    let status = Command::new(if which("light") { "light" } else { "light.exe" })
+        .arg("-o")
+        .arg(&msi_path)
+        .arg(&wixobj)
+        .current_dir(&dist_dir)
+        .status()
+        .context("spawning light")?;
+    if !status.success() {
+        bail!("light exited {status:?}");
+    }
+    eprintln!("xtask: msi written to {}", msi_path.display());
+    eprintln!();
+    eprintln!("xtask: package-windows-msi complete");
+    eprintln!("       artifact: {}", msi_path.display());
+    eprintln!(
+        "       NOTE: unsigned. SmartScreen will warn until Authenticode signing lands \
+         (see docs/windows-packaging.md)."
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct WindowsPayload {
+    buffr_exe: PathBuf,
+    helper_exe: PathBuf,
+    libcef_dll: PathBuf,
+    icudtl: PathBuf,
+    paks: Vec<PathBuf>,
+    blobs: Vec<PathBuf>,
+    locales: PathBuf,
+}
+
+/// Search the typical native-Windows + cross-compile output paths for
+/// the MSI payload. Errors only when *no* candidate location has the
+/// minimum binaries; otherwise picks the first one that does.
+fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPayload> {
+    let candidates: Vec<PathBuf> = vec![
+        workspace.join("target").join(profile),
+        workspace
+            .join("target/x86_64-pc-windows-msvc")
+            .join(profile),
+        workspace.join("target/x86_64-pc-windows-gnu").join(profile),
+    ];
+
+    for dir in &candidates {
+        let buffr_exe = dir.join("buffr.exe");
+        let helper_exe = dir.join("buffr-helper.exe");
+        let libcef_dll = dir.join("libcef.dll");
+        if buffr_exe.exists() && helper_exe.exists() && libcef_dll.exists() {
+            return collect_windows_payload_from(dir);
+        }
+    }
+
+    bail!(
+        "no Windows payload found under any of {} \
+         — build via `cargo build --target x86_64-pc-windows-msvc --release` (Windows host) \
+         or `cargo build --target x86_64-pc-windows-gnu --release` (Linux cross) first.\n\
+         Cross-build prerequisites: see docs/windows-packaging.md",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
+    let buffr_exe = dir.join("buffr.exe");
+    let helper_exe = dir.join("buffr-helper.exe");
+    let libcef_dll = dir.join("libcef.dll");
+    let icudtl = dir.join("icudtl.dat");
+    let locales = dir.join("locales");
+
+    if !icudtl.exists() {
+        bail!(
+            "missing `{}` next to buffr.exe — buffr-core build.rs should have staged it",
+            icudtl.display()
+        );
+    }
+    if !locales.exists() {
+        bail!("missing `{}` next to buffr.exe", locales.display());
+    }
+
+    let mut paks = Vec::new();
+    let mut blobs = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+        if name.ends_with(".pak") {
+            paks.push(path);
+        } else if name.ends_with(".bin") {
+            blobs.push(path);
+        }
+    }
+    paks.sort();
+    blobs.sort();
+
+    Ok(WindowsPayload {
+        buffr_exe,
+        helper_exe,
+        libcef_dll,
+        icudtl,
+        paks,
+        blobs,
+        locales,
+    })
+}
+
+fn stage_windows_payload(dest: &Path, p: &WindowsPayload) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    copy_into_dir(&p.buffr_exe, dest)?;
+    copy_into_dir(&p.helper_exe, dest)?;
+    copy_into_dir(&p.libcef_dll, dest)?;
+    copy_into_dir(&p.icudtl, dest)?;
+    for pak in &p.paks {
+        copy_into_dir(pak, dest)?;
+    }
+    for blob in &p.blobs {
+        copy_into_dir(blob, dest)?;
+    }
+    let locales_dest = dest.join("locales");
+    let _ = fs::remove_dir_all(&locales_dest);
+    copy_dir_recursive(&p.locales, &locales_dest)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +1861,115 @@ mod tests {
         let err = collect_runtime_payload(&target).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("libcef.so"), "msg = {msg}");
+    }
+
+    #[test]
+    fn render_wix_substitutes_placeholders() {
+        let s = render_wix("0.1.2", "buffr", "x64");
+        assert!(s.contains("Version=\"0.1.2\""));
+        assert!(s.contains("Name=\"buffr\""));
+        assert!(!s.contains("{VERSION}"));
+        assert!(!s.contains("{INSTALL_DIR}"));
+        assert!(!s.contains("{ARCH}"));
+    }
+
+    #[test]
+    fn wix_template_targets_wix3_namespace() {
+        // We deliberately target the WiX 3.x namespace + element set
+        // (`<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">`,
+        // `<Product>`, `<Package>`). WiX 4 / 5 use a different
+        // namespace (`http://wixtoolset.org/schemas/v4/wxs`) and renamed
+        // `<Product>` to `<Package>` at the root. WiX 3 tooling is the
+        // most broadly available baseline today.
+        assert!(WIX_TEMPLATE.contains("xmlns=\"http://schemas.microsoft.com/wix/2006/wi\""));
+        assert!(WIX_TEMPLATE.contains("<Product"));
+        assert!(WIX_TEMPLATE.contains("<MajorUpgrade"));
+        assert!(WIX_TEMPLATE.contains("<MediaTemplate"));
+    }
+
+    #[test]
+    fn wix_template_records_install_metadata() {
+        // The HKLM\SOFTWARE\kryptic\buffr key + InstallPath/Version
+        // values are how an external uninstaller / updater discovers
+        // an existing install. Lock them down.
+        assert!(WIX_TEMPLATE.contains("SOFTWARE\\kryptic\\buffr"));
+        assert!(WIX_TEMPLATE.contains("InstallPath"));
+        assert!(WIX_TEMPLATE.contains("Version"));
+    }
+
+    #[test]
+    fn wix_template_uninstall_is_clean() {
+        // Uninstall must remove the registry hive AND the install
+        // folder. Without RemoveRegistryKey the HKLM entry would
+        // linger; without RemoveFolder C:\Program Files\buffr\ would
+        // remain as an empty directory.
+        assert!(WIX_TEMPLATE.contains("<RemoveRegistryKey"));
+        assert!(WIX_TEMPLATE.contains("<RemoveFolder"));
+        assert!(WIX_TEMPLATE.contains("removeOnUninstall"));
+    }
+
+    #[test]
+    fn wix_template_lists_msi_payload() {
+        // The .wxs lists every required runtime file. If something is
+        // dropped from this list the installed product won't run.
+        assert!(WIX_TEMPLATE.contains("buffr.exe"));
+        assert!(WIX_TEMPLATE.contains("buffr-helper.exe"));
+        assert!(WIX_TEMPLATE.contains("libcef.dll"));
+        assert!(WIX_TEMPLATE.contains("icudtl.dat"));
+    }
+
+    #[test]
+    fn stage_windows_payload_lays_out_msi_tree() {
+        let tmp = tempdir();
+        let target = tmp.path().join("target-release");
+        fs::create_dir_all(target.join("locales")).unwrap();
+        fs::write(target.join("buffr.exe"), b"MZ").unwrap();
+        fs::write(target.join("buffr-helper.exe"), b"MZ").unwrap();
+        fs::write(target.join("libcef.dll"), b"MZ").unwrap();
+        fs::write(target.join("icudtl.dat"), b"dat").unwrap();
+        fs::write(target.join("resources.pak"), b"pak").unwrap();
+        fs::write(target.join("v8_context_snapshot.bin"), b"bin").unwrap();
+        fs::write(target.join("locales/en-US.pak"), b"locale").unwrap();
+
+        let payload = collect_windows_payload_from(&target).unwrap();
+        assert_eq!(payload.paks.len(), 1);
+        assert_eq!(payload.blobs.len(), 1);
+
+        let dest = tmp.path().join("staged");
+        stage_windows_payload(&dest, &payload).unwrap();
+        assert!(dest.join("buffr.exe").exists());
+        assert!(dest.join("buffr-helper.exe").exists());
+        assert!(dest.join("libcef.dll").exists());
+        assert!(dest.join("icudtl.dat").exists());
+        assert!(dest.join("resources.pak").exists());
+        assert!(dest.join("v8_context_snapshot.bin").exists());
+        assert!(dest.join("locales/en-US.pak").exists());
+    }
+
+    #[test]
+    fn stage_dmg_creates_app_copy_and_applications_symlink() {
+        let tmp = tempdir();
+        let app = tmp.path().join("buffr.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/Info.plist"), "<plist/>").unwrap();
+        fs::write(app.join("Contents/MacOS/buffr"), b"\x7fELF").unwrap();
+
+        let staging = tmp.path().join("dmg-staging");
+        stage_dmg(&staging, &app).unwrap();
+
+        assert!(staging.join("buffr.app/Contents/Info.plist").exists());
+        assert!(staging.join("buffr.app/Contents/MacOS/buffr").exists());
+        #[cfg(unix)]
+        {
+            let link = staging.join("Applications");
+            let meta = std::fs::symlink_metadata(&link).unwrap();
+            assert!(
+                meta.file_type().is_symlink(),
+                "Applications must be a symlink"
+            );
+            let tgt = std::fs::read_link(&link).unwrap();
+            assert_eq!(tgt, std::path::PathBuf::from("/Applications"));
+        }
     }
 
     /// Minimal scratch dir helper. The xtask crate has no `tempfile`

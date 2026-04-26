@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX 3 source for the buffr Windows MSI installer.
+
+  This file is intentionally hand-rolled (rather than driven through
+  cargo-wix) so we own every directive and don't add a heavyweight
+  build dependency. WiX 3 syntax (xmlns wi/2006/wi) — the tooling is
+  shipped on every Windows runner via the WiX 3 toolset (`candle.exe`
+  + `light.exe`); WiX 4 / 5 changed the namespace + element names and
+  added a `wix.exe` driver, but the older 3.x tools remain the most
+  broadly-available baseline today and produce identical MSIs for our
+  needs (no per-user install, no MSIX, no bundle).
+
+  Placeholders (substituted at xtask runtime via str::replace):
+
+    {VERSION}       — workspace.package.version
+    {ARCH}          — "x64" (only one supported today)
+    {INSTALL_DIR}   — "buffr"; folder name under Program Files
+    {UPGRADE_GUID}  — fixed GUID baked in below; bumped on major rev only
+    {PRODUCT_GUID}  — fixed GUID; product code stays stable across patches
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="buffr"
+           Language="1033"
+           Version="{VERSION}"
+           Manufacturer="kryptic.sh"
+           UpgradeCode="9F4F8E1C-2B3D-4A5E-9C7B-8E1D2F3A4B5C">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="buffr — modal browser"
+             Manufacturer="kryptic.sh" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of buffr is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Filesystem layout. C:\Program Files\buffr\ -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="{INSTALL_DIR}">
+          <Directory Id="LocalesFolder" Name="locales" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="buffr" />
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop" />
+    </Directory>
+
+    <!-- Component group: payload binaries + CEF runtime files. -->
+    <ComponentGroup Id="MainPayload" Directory="INSTALLFOLDER">
+      <Component Id="cmpBuffrExe" Guid="*">
+        <File Id="filBuffrExe"
+              Source="payload\buffr.exe"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="cmpHelperExe" Guid="*">
+        <File Id="filHelperExe"
+              Source="payload\buffr-helper.exe"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="cmpLibcef" Guid="*">
+        <File Id="filLibcef"
+              Source="payload\libcef.dll"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="cmpIcudtl" Guid="*">
+        <File Id="filIcudtl"
+              Source="payload\icudtl.dat"
+              KeyPath="yes" />
+      </Component>
+      <!-- Registry component: install path + version under HKLM. -->
+      <Component Id="cmpRegistry" Guid="*">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\kryptic\buffr">
+          <RegistryValue Name="InstallPath"
+                         Type="string"
+                         Value="[INSTALLFOLDER]"
+                         KeyPath="yes" />
+          <RegistryValue Name="Version"
+                         Type="string"
+                         Value="{VERSION}" />
+        </RegistryKey>
+        <RemoveRegistryKey Action="removeOnUninstall"
+                           Root="HKLM"
+                           Key="SOFTWARE\kryptic\buffr" />
+        <RemoveFolder Id="rmInstallFolder"
+                      Directory="INSTALLFOLDER"
+                      On="uninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Start-menu shortcut + desktop shortcut. -->
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="cmpStartShortcut" Guid="*">
+        <Shortcut Id="ShortcutStartMenu"
+                  Name="buffr"
+                  Description="buffr — modal browser"
+                  Target="[#filBuffrExe]"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="rmStartMenu"
+                      Directory="ApplicationProgramsFolder"
+                      On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\kryptic\buffr"
+                       Name="ShortcutInstalled"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="cmpDesktopShortcut" Guid="*">
+        <Shortcut Id="ShortcutDesktop"
+                  Name="buffr"
+                  Description="buffr — modal browser"
+                  Target="[#filBuffrExe]"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\kryptic\buffr"
+                       Name="DesktopShortcutInstalled"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="ProductFeature"
+             Title="buffr"
+             Level="1">
+      <ComponentGroupRef Id="MainPayload" />
+      <ComponentRef Id="cmpStartShortcut" />
+      <ComponentRef Id="cmpDesktopShortcut" />
+    </Feature>
+  </Product>
+</Wix>
