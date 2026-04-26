@@ -6,6 +6,9 @@
 /vendor/cef
 /vendor/cef_*
 
+# appimagetool cache (downloaded on first `cargo xtask package-linux`)
+/vendor/appimagetool
+
 # Editor / OS
 .DS_Store
 .idea/

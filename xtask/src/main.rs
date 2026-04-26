@@ -10,6 +10,10 @@
 //!   bundle (with a nested `buffr Helper.app`) under `target/<profile>/`. Runs
 //!   on Linux too; the actual runtime needs macOS, but bundle assembly is
 //!   purely filesystem work and is exercised by CI on a Linux runner.
+//! - `package-linux [--release] [--variant {appimage,deb,aur,all}]` produces
+//!   Linux distribution artifacts under `target/dist/linux/`. Cross-builds
+//!   from any Linux dev box; `appimagetool` and `dpkg-deb` are auto-detected
+//!   and gracefully degraded if absent.
 //!
 //! Run from the workspace root: `cargo xtask fetch-cef`.
 
@@ -100,6 +104,7 @@ fn run() -> Result<()> {
     match cmd.as_str() {
         "fetch-cef" => fetch_cef(args.collect()),
         "bundle-macos" => bundle_macos(args.collect()),
+        "package-linux" => package_linux(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -123,6 +128,10 @@ fn print_help() {
     println!("    bundle-macos [--release] [--target TRIPLE]");
     println!("        Assemble buffr.app (with nested buffr Helper.app) under");
     println!("        target/<profile>/. Runs on Linux too (cross-bundle).");
+    println!();
+    println!("    package-linux [--release] [--variant VARIANT]");
+    println!("        Produce Linux distribution artifacts under target/dist/linux/.");
+    println!("        VARIANT: appimage | deb | aur | all (default: all).");
 }
 
 fn fetch_cef(args: Vec<String>) -> Result<()> {
@@ -333,6 +342,18 @@ fn flatten_top_level(dir: &Path) -> Result<()> {
         })?;
     }
     let _ = fs::remove_dir_all(&top);
+    Ok(())
+}
+
+/// Copy a single file into `dest_dir`, preserving the file name.
+fn copy_into_dir(src: &Path, dest_dir: &Path) -> Result<()> {
+    fs::create_dir_all(dest_dir).with_context(|| format!("creating {}", dest_dir.display()))?;
+    let name = src
+        .file_name()
+        .ok_or_else(|| anyhow!("copy_into_dir: src `{}` has no file name", src.display()))?;
+    let dest = dest_dir.join(name);
+    fs::copy(src, &dest)
+        .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
     Ok(())
 }
 
@@ -611,6 +632,444 @@ fn copy_file_executable(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+// ----------------------------- package-linux -----------------------------
+
+/// Embedded `AppRun` template for the AppImage AppDir.
+const APPRUN_TEMPLATE: &str = include_str!("../templates/AppRun");
+/// Embedded shared `.desktop` file (canonical source under `pkg/`).
+const DESKTOP_TEMPLATE: &str = include_str!("../../pkg/buffr.desktop");
+/// Embedded Debian control file template.
+const DEB_CONTROL_TEMPLATE: &str = include_str!("../templates/deb.control");
+/// Embedded Debian postinst hook.
+const DEB_POSTINST: &str = include_str!("../templates/deb.postinst");
+/// Embedded Debian prerm hook.
+const DEB_PRERM: &str = include_str!("../templates/deb.prerm");
+/// Embedded PKGBUILD template (`{VERSION}` substituted).
+const PKGBUILD_TEMPLATE: &str = include_str!("../templates/PKGBUILD.in");
+
+/// Pre-built `appimagetool` URL. We mirror this under
+/// `vendor/appimagetool/` so CI hits the cache after the first run.
+const APPIMAGETOOL_URL: &str = "https://github.com/AppImage/appimagetool/releases/download/continuous/\
+     appimagetool-x86_64.AppImage";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxVariant {
+    AppImage,
+    Deb,
+    Aur,
+    All,
+}
+
+impl LinuxVariant {
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "appimage" => Ok(Self::AppImage),
+            "deb" => Ok(Self::Deb),
+            "aur" => Ok(Self::Aur),
+            "all" => Ok(Self::All),
+            other => bail!("unknown --variant `{other}` (appimage|deb|aur|all)"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PackageLinuxArgs {
+    release: bool,
+    variant: LinuxVariant,
+}
+
+impl Default for PackageLinuxArgs {
+    fn default() -> Self {
+        Self {
+            release: false,
+            variant: LinuxVariant::All,
+        }
+    }
+}
+
+fn package_linux(args: Vec<String>) -> Result<()> {
+    let mut parsed = PackageLinuxArgs::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--release" => parsed.release = true,
+            "--variant" => {
+                let v = iter.next().context("--variant requires a value")?;
+                parsed.variant = LinuxVariant::parse(&v)?;
+            }
+            other => bail!("unknown package-linux arg `{other}`"),
+        }
+    }
+
+    let workspace = workspace_root()?;
+    let profile = if parsed.release { "release" } else { "debug" };
+    let version = workspace_version(&workspace)?;
+
+    eprintln!(
+        "xtask: package-linux variant={:?} profile={profile} version={version}",
+        parsed.variant
+    );
+
+    let dist_dir = workspace.join("target/dist/linux");
+    fs::create_dir_all(&dist_dir).with_context(|| format!("creating {}", dist_dir.display()))?;
+
+    // 1. Build the workspace binaries. The buffr-core build.rs will stage
+    //    libcef.so, *.pak, locales/, icudtl.dat next to the binaries.
+    eprintln!("xtask: building buffr + buffr-helper ({profile})");
+    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.current_dir(&workspace)
+        .arg("build")
+        .arg("-p")
+        .arg("buffr")
+        .arg("-p")
+        .arg("buffr-helper");
+    if parsed.release {
+        cmd.arg("--release");
+    }
+    let status = cmd.status().context("spawning cargo build")?;
+    if !status.success() {
+        bail!("cargo build failed (status {status:?})");
+    }
+
+    let target_dir = workspace.join("target").join(profile);
+    let payload = collect_runtime_payload(&target_dir)?;
+
+    // 2. Always (re)write the AUR PKGBUILD with the current version. It
+    //    is cheap and keeps `pkg/aur/PKGBUILD` in lockstep with the
+    //    workspace version even if the user only asked for AppImage.
+    if matches!(parsed.variant, LinuxVariant::Aur | LinuxVariant::All) {
+        write_pkgbuild(&workspace, &version)?;
+    }
+
+    if matches!(parsed.variant, LinuxVariant::AppImage | LinuxVariant::All) {
+        build_appimage(&workspace, &dist_dir, &target_dir, &payload, &version)?;
+    }
+
+    if matches!(parsed.variant, LinuxVariant::Deb | LinuxVariant::All) {
+        build_deb(&workspace, &dist_dir, &target_dir, &payload, &version)?;
+    }
+
+    eprintln!();
+    eprintln!("xtask: package-linux complete");
+    eprintln!("       artifacts: {}", dist_dir.display());
+    Ok(())
+}
+
+/// Filesystem locations of the runtime payload that all three variants
+/// embed. `target/<profile>/` is populated by the `buffr-core` build
+/// script; if `libcef.so` is missing we treat that as fatal — the
+/// resulting package would be unusable.
+#[derive(Debug)]
+struct RuntimePayload {
+    /// Absolute path to the `buffr` binary.
+    buffr: PathBuf,
+    /// Absolute path to the `buffr-helper` binary.
+    helper: PathBuf,
+    /// Absolute path to `libcef.so` (Linux dist).
+    libcef: PathBuf,
+    /// Absolute paths to `*.pak` files.
+    paks: Vec<PathBuf>,
+    /// Absolute paths to `*.dat` / `*.bin` blobs (icudtl, snapshot).
+    blobs: Vec<PathBuf>,
+    /// Absolute path to the `locales/` directory.
+    locales: PathBuf,
+}
+
+fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
+    let buffr = target_dir.join("buffr");
+    let helper = target_dir.join("buffr-helper");
+    let libcef = target_dir.join("libcef.so");
+    let locales = target_dir.join("locales");
+
+    if !buffr.exists() {
+        bail!("expected `{}` after build", buffr.display());
+    }
+    if !helper.exists() {
+        bail!("expected `{}` after build", helper.display());
+    }
+    if !libcef.exists() {
+        bail!(
+            "expected `{}` after build — buffr-core build.rs should have staged \
+             libcef.so. Did you `cargo xtask fetch-cef`?",
+            libcef.display()
+        );
+    }
+    if !locales.exists() {
+        bail!(
+            "expected `{}` after build — buffr-core build.rs should have staged \
+             the locales/ tree.",
+            locales.display()
+        );
+    }
+
+    let mut paks = Vec::new();
+    let mut blobs = Vec::new();
+    for entry in
+        fs::read_dir(target_dir).with_context(|| format!("reading {}", target_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+        if name.ends_with(".pak") {
+            paks.push(path);
+        } else if name.ends_with(".dat") || name.ends_with(".bin") {
+            blobs.push(path);
+        }
+    }
+    paks.sort();
+    blobs.sort();
+
+    Ok(RuntimePayload {
+        buffr,
+        helper,
+        libcef,
+        paks,
+        blobs,
+        locales,
+    })
+}
+
+/// Stage the shared `/opt/buffr/` payload inside `dest`. Used by both
+/// the AppImage (`<AppDir>/usr/lib/`-ish) and the Debian package
+/// (`/opt/buffr/`).
+fn stage_payload(dest: &Path, payload: &RuntimePayload) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    copy_file_executable(&payload.buffr, &dest.join("buffr"))?;
+    copy_file_executable(&payload.helper, &dest.join("buffr-helper"))?;
+    copy_into_dir(&payload.libcef, dest)?;
+    for pak in &payload.paks {
+        copy_into_dir(pak, dest)?;
+    }
+    for blob in &payload.blobs {
+        copy_into_dir(blob, dest)?;
+    }
+    let locales_dest = dest.join("locales");
+    let _ = fs::remove_dir_all(&locales_dest);
+    copy_dir_recursive(&payload.locales, &locales_dest)?;
+    Ok(())
+}
+
+// ---------------------------- AppImage ----------------------------------
+
+fn build_appimage(
+    workspace: &Path,
+    dist_dir: &Path,
+    target_dir: &Path,
+    payload: &RuntimePayload,
+    version: &str,
+) -> Result<()> {
+    let appdir = target_dir.join("buffr.AppDir");
+    if appdir.exists() {
+        fs::remove_dir_all(&appdir)
+            .with_context(|| format!("wiping existing {}", appdir.display()))?;
+    }
+    let usr_bin = appdir.join("usr/bin");
+    let usr_lib = appdir.join("usr/lib");
+    fs::create_dir_all(&usr_bin)?;
+    fs::create_dir_all(&usr_lib)?;
+
+    // Binaries land in usr/bin/, libcef + paks + locales in usr/lib/.
+    copy_file_executable(&payload.buffr, &usr_bin.join("buffr"))?;
+    copy_file_executable(&payload.helper, &usr_bin.join("buffr-helper"))?;
+    copy_into_dir(&payload.libcef, &usr_lib)?;
+    for pak in &payload.paks {
+        copy_into_dir(pak, &usr_lib)?;
+    }
+    for blob in &payload.blobs {
+        copy_into_dir(blob, &usr_lib)?;
+    }
+    let locales_dest = usr_lib.join("locales");
+    copy_dir_recursive(&payload.locales, &locales_dest)?;
+
+    // AppRun launcher script.
+    let apprun = appdir.join("AppRun");
+    fs::write(&apprun, APPRUN_TEMPLATE).with_context(|| format!("writing {}", apprun.display()))?;
+    set_executable(&apprun)?;
+
+    // .desktop + icon at AppDir root (appimagetool requirement).
+    fs::write(appdir.join("buffr.desktop"), DESKTOP_TEMPLATE)?;
+
+    let icon_src = workspace.join("pkg/buffr.png");
+    if icon_src.exists() {
+        fs::copy(&icon_src, appdir.join("buffr.png"))?;
+    } else {
+        eprintln!("xtask: warning — pkg/buffr.png missing; AppImage will lack an icon");
+    }
+
+    // Try to invoke appimagetool. Resolve in this order:
+    // 1. $PATH
+    // 2. vendor/appimagetool/appimagetool-x86_64.AppImage (cached)
+    // 3. download into vendor/appimagetool/
+    // If none of those work, leave the AppDir as the "artifact" — CI
+    // will exercise the full path on a runner with internet.
+    let tool = match resolve_appimagetool(workspace) {
+        Ok(p) => Some(p),
+        Err(err) => {
+            eprintln!(
+                "xtask: appimagetool unavailable ({err}); leaving AppDir at {}",
+                appdir.display()
+            );
+            None
+        }
+    };
+
+    let Some(tool) = tool else {
+        return Ok(());
+    };
+
+    let out = dist_dir.join(format!("buffr-{version}-x86_64.AppImage"));
+    eprintln!("xtask: running appimagetool -> {}", out.display());
+    let status = Command::new(&tool)
+        .env("ARCH", "x86_64")
+        .arg(&appdir)
+        .arg(&out)
+        .status()
+        .with_context(|| format!("spawning {}", tool.display()))?;
+    if !status.success() {
+        eprintln!("xtask: warning — appimagetool exited {status:?}");
+        return Ok(());
+    }
+    set_executable(&out)?;
+    eprintln!("xtask: AppImage written to {}", out.display());
+    Ok(())
+}
+
+fn resolve_appimagetool(workspace: &Path) -> Result<PathBuf> {
+    // 1. PATH lookup.
+    if let Ok(out) = Command::new("which").arg("appimagetool").output()
+        && out.status.success()
+    {
+        let line = String::from_utf8_lossy(&out.stdout);
+        let line = line.trim();
+        if !line.is_empty() {
+            return Ok(PathBuf::from(line));
+        }
+    }
+
+    // 2. vendor cache.
+    let cache_dir = workspace.join("vendor/appimagetool");
+    let cached = cache_dir.join("appimagetool-x86_64.AppImage");
+    if cached.exists() {
+        return Ok(cached);
+    }
+
+    // 3. Download. Strip whitespace from the URL constant (folded above
+    //    for readability) before handing it to ureq.
+    let url: String = APPIMAGETOOL_URL.split_whitespace().collect();
+    fs::create_dir_all(&cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
+    download(&url, &cached).context("downloading appimagetool")?;
+    set_executable(&cached)?;
+    Ok(cached)
+}
+
+fn set_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+// ---------------------------- .deb --------------------------------------
+
+fn build_deb(
+    workspace: &Path,
+    dist_dir: &Path,
+    target_dir: &Path,
+    payload: &RuntimePayload,
+    version: &str,
+) -> Result<()> {
+    let debroot = target_dir.join("buffr-deb");
+    if debroot.exists() {
+        fs::remove_dir_all(&debroot)
+            .with_context(|| format!("wiping existing {}", debroot.display()))?;
+    }
+
+    // /opt/buffr/<payload>
+    let opt = debroot.join("opt/buffr");
+    stage_payload(&opt, payload)?;
+
+    let icon_src = workspace.join("pkg/buffr.png");
+    if icon_src.exists() {
+        fs::copy(&icon_src, opt.join("icon.png"))?;
+        let icon_dest = debroot.join("usr/share/icons/hicolor/512x512/apps");
+        fs::create_dir_all(&icon_dest)?;
+        fs::copy(&icon_src, icon_dest.join("buffr.png"))?;
+    }
+
+    // .desktop in usr/share/applications.
+    let apps = debroot.join("usr/share/applications");
+    fs::create_dir_all(&apps)?;
+    fs::write(apps.join("buffr.desktop"), DESKTOP_TEMPLATE)?;
+
+    // DEBIAN/{control,postinst,prerm}.
+    let debian = debroot.join("DEBIAN");
+    fs::create_dir_all(&debian)?;
+    let control = DEB_CONTROL_TEMPLATE.replace("{VERSION}", version);
+    fs::write(debian.join("control"), control)?;
+    let postinst = debian.join("postinst");
+    fs::write(&postinst, DEB_POSTINST)?;
+    set_executable(&postinst)?;
+    let prerm = debian.join("prerm");
+    fs::write(&prerm, DEB_PRERM)?;
+    set_executable(&prerm)?;
+
+    // Invoke dpkg-deb if available. Otherwise leave the staging tree
+    // and let CI pick it up.
+    let out = dist_dir.join(format!("buffr-{version}-amd64.deb"));
+    let dpkg = Command::new("which").arg("dpkg-deb").output().ok();
+    let dpkg_ok = dpkg.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    if !dpkg_ok {
+        eprintln!(
+            "xtask: dpkg-deb not on PATH; leaving deb staging tree at {}",
+            debroot.display()
+        );
+        return Ok(());
+    }
+
+    eprintln!("xtask: running dpkg-deb --build -> {}", out.display());
+    let status = Command::new("dpkg-deb")
+        .arg("--build")
+        .arg("--root-owner-group")
+        .arg(&debroot)
+        .arg(&out)
+        .status()
+        .context("spawning dpkg-deb")?;
+    if !status.success() {
+        eprintln!("xtask: warning — dpkg-deb exited {status:?}");
+        return Ok(());
+    }
+    eprintln!("xtask: deb written to {}", out.display());
+    Ok(())
+}
+
+// ---------------------------- AUR PKGBUILD ------------------------------
+
+fn write_pkgbuild(workspace: &Path, version: &str) -> Result<()> {
+    let pkgbuild_dir = workspace.join("pkg/aur");
+    fs::create_dir_all(&pkgbuild_dir)
+        .with_context(|| format!("creating {}", pkgbuild_dir.display()))?;
+    let rendered = PKGBUILD_TEMPLATE.replace("{VERSION}", version);
+    let path = pkgbuild_dir.join("PKGBUILD");
+    fs::write(&path, rendered).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!(
+        "xtask: PKGBUILD updated at {} (pkgver={version})",
+        path.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +1173,117 @@ mod tests {
         // Main plist contains substituted version.
         let plist = fs::read_to_string(app_dir.join("Contents/Info.plist")).unwrap();
         assert!(plist.contains("<string>9.9.9</string>"));
+    }
+
+    #[test]
+    fn linux_variant_parse_known() {
+        assert_eq!(
+            LinuxVariant::parse("appimage").unwrap(),
+            LinuxVariant::AppImage
+        );
+        assert_eq!(LinuxVariant::parse("deb").unwrap(), LinuxVariant::Deb);
+        assert_eq!(LinuxVariant::parse("aur").unwrap(), LinuxVariant::Aur);
+        assert_eq!(LinuxVariant::parse("all").unwrap(), LinuxVariant::All);
+    }
+
+    #[test]
+    fn linux_variant_parse_unknown_errors() {
+        let err = LinuxVariant::parse("snap").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown --variant"));
+        assert!(msg.contains("snap"));
+    }
+
+    #[test]
+    fn deb_control_template_substitutes_version() {
+        let rendered = DEB_CONTROL_TEMPLATE.replace("{VERSION}", "1.2.3");
+        assert!(rendered.contains("Version: 1.2.3"));
+        assert!(rendered.contains("Package: buffr"));
+        assert!(rendered.contains("Architecture: amd64"));
+        assert!(!rendered.contains("{VERSION}"));
+        // The deb depends list is the contract with apt — surface the
+        // exact set so accidental edits show up in CI.
+        assert!(rendered.contains("libgtk-3-0"));
+        assert!(rendered.contains("libnss3"));
+        assert!(rendered.contains("libgbm1"));
+        assert!(rendered.contains("libgles2"));
+    }
+
+    #[test]
+    fn pkgbuild_template_substitutes_version() {
+        let rendered = PKGBUILD_TEMPLATE.replace("{VERSION}", "0.1.0");
+        assert!(rendered.contains("pkgver=0.1.0"));
+        assert!(rendered.contains("pkgname=buffr"));
+        assert!(rendered.contains("sha256sums=('SKIP')"));
+        assert!(!rendered.contains("{VERSION}"));
+        // makedepends should pin the toolchain as `rust` + `cargo`.
+        assert!(rendered.contains("makedepends=('rust' 'cargo' 'cmake')"));
+    }
+
+    #[test]
+    fn apprun_template_is_bash_launcher() {
+        assert!(APPRUN_TEMPLATE.starts_with("#!/usr/bin/env bash"));
+        assert!(APPRUN_TEMPLATE.contains("LD_LIBRARY_PATH"));
+        assert!(APPRUN_TEMPLATE.contains("usr/bin/buffr"));
+    }
+
+    #[test]
+    fn desktop_template_has_required_keys() {
+        // Keep the minimum keys that LXQt / GNOME / KDE all parse.
+        assert!(DESKTOP_TEMPLATE.contains("[Desktop Entry]"));
+        assert!(DESKTOP_TEMPLATE.contains("Name=buffr"));
+        assert!(DESKTOP_TEMPLATE.contains("Exec=buffr %U"));
+        assert!(DESKTOP_TEMPLATE.contains("Icon=buffr"));
+        assert!(DESKTOP_TEMPLATE.contains("Type=Application"));
+        assert!(DESKTOP_TEMPLATE.contains("Categories=Network;WebBrowser;"));
+    }
+
+    #[test]
+    fn stage_payload_lays_out_runtime_tree() {
+        // Build a fake `target/release/` tree, hand it to
+        // `collect_runtime_payload` + `stage_payload`, and assert the
+        // resulting destination directory matches what the deb / aur
+        // expectations encode.
+        let tmp = tempdir();
+        let target = tmp.path().join("target-release");
+        fs::create_dir_all(target.join("locales")).unwrap();
+        fs::write(target.join("buffr"), b"#!/bin/sh\n").unwrap();
+        fs::write(target.join("buffr-helper"), b"#!/bin/sh\n").unwrap();
+        fs::write(target.join("libcef.so"), b"\x7fELF").unwrap();
+        fs::write(target.join("chrome_100_percent.pak"), b"pak").unwrap();
+        fs::write(target.join("resources.pak"), b"pak").unwrap();
+        fs::write(target.join("icudtl.dat"), b"dat").unwrap();
+        fs::write(target.join("v8_context_snapshot.bin"), b"bin").unwrap();
+        fs::write(target.join("locales/en-US.pak"), b"locale").unwrap();
+
+        let payload = collect_runtime_payload(&target).unwrap();
+        assert_eq!(payload.paks.len(), 2);
+        assert_eq!(payload.blobs.len(), 2);
+
+        let dest = tmp.path().join("opt-buffr");
+        stage_payload(&dest, &payload).unwrap();
+        assert!(dest.join("buffr").exists());
+        assert!(dest.join("buffr-helper").exists());
+        assert!(dest.join("libcef.so").exists());
+        assert!(dest.join("chrome_100_percent.pak").exists());
+        assert!(dest.join("resources.pak").exists());
+        assert!(dest.join("icudtl.dat").exists());
+        assert!(dest.join("v8_context_snapshot.bin").exists());
+        assert!(dest.join("locales/en-US.pak").exists());
+    }
+
+    #[test]
+    fn collect_runtime_payload_missing_libcef_errors() {
+        let tmp = tempdir();
+        let target = tmp.path().join("target-release");
+        fs::create_dir_all(target.join("locales")).unwrap();
+        fs::write(target.join("buffr"), b"#!/bin/sh\n").unwrap();
+        fs::write(target.join("buffr-helper"), b"#!/bin/sh\n").unwrap();
+        // No libcef.so on purpose.
+
+        let err = collect_runtime_payload(&target).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("libcef.so"), "msg = {msg}");
     }
 
     /// Minimal scratch dir helper. The xtask crate has no `tempfile`
