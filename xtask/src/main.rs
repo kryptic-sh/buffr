@@ -37,8 +37,17 @@ const CEF_VERSION_PREFIX: &str = "147.";
 
 /// Embedded `Info.plist` template for the main `buffr.app` bundle.
 const MAIN_PLIST_TEMPLATE: &str = include_str!("../templates/main.plist");
-/// Embedded `Info.plist` template for the nested `buffr Helper.app` bundle.
+/// Embedded `Info.plist` template for the nested `buffr Helper.app` bundle
+/// (catch-all / unbranded helper used by cef-rs 147 today).
 const HELPER_PLIST_TEMPLATE: &str = include_str!("../templates/helper.plist");
+/// Per-flavor helper plists. Apple's signing model wants each subprocess
+/// type in its own `.app` bundle so entitlements can differ per flavor;
+/// cef-rs 147 only resolves a single `browser_subprocess_path` so we ship
+/// the four bundles but every executable points back at the same
+/// `buffr-helper` binary (renamed per Apple's distinct-executable rule).
+const HELPER_GPU_PLIST_TEMPLATE: &str = include_str!("../templates/helper-gpu.plist");
+const HELPER_RENDERER_PLIST_TEMPLATE: &str = include_str!("../templates/helper-renderer.plist");
+const HELPER_PLUGIN_PLIST_TEMPLATE: &str = include_str!("../templates/helper-plugin.plist");
 
 /// Bundle identifiers + display name used by the macOS bundle templates.
 const NAME: &str = "buffr";
@@ -573,25 +582,66 @@ fn stage_bundle(
     copy_dir_recursive(framework_dir, &dest_framework)
         .with_context(|| format!("copying framework into {}", dest_framework.display()))?;
 
-    // Nested helper bundle.
-    let helper_app = frameworks.join("buffr Helper.app");
-    let helper_contents = helper_app.join("Contents");
-    let helper_macos = helper_contents.join("MacOS");
-    fs::create_dir_all(&helper_macos)
-        .with_context(|| format!("creating {}", helper_macos.display()))?;
+    // Nested helper bundles. Apple's signing model wants four distinct
+    // helpers (catch-all, GPU, Renderer, Plugin); cef-rs 147 only
+    // resolves a single `browser_subprocess_path` so every flavor's
+    // executable is a `fs::copy` of the same `buffr-helper` binary
+    // (notarisation rejects symlinks for executables).
+    for flavor in HELPER_FLAVORS {
+        let bundle_name = format!("{} Helper{}.app", NAME, flavor.suffix);
+        let exec_name = format!("{} Helper{}", NAME, flavor.suffix);
+        let helper_app = frameworks.join(&bundle_name);
+        let helper_contents = helper_app.join("Contents");
+        let helper_macos = helper_contents.join("MacOS");
+        fs::create_dir_all(&helper_macos)
+            .with_context(|| format!("creating {}", helper_macos.display()))?;
 
-    let helper_plist = render_helper_plist(version);
-    fs::write(helper_contents.join("Info.plist"), helper_plist)
-        .with_context(|| format!("writing {}/Info.plist", helper_contents.display()))?;
-    fs::write(helper_contents.join("PkgInfo"), b"APPL????")
-        .with_context(|| format!("writing {}/PkgInfo", helper_contents.display()))?;
+        let helper_plist = render_helper_plist(flavor, version, &exec_name);
+        fs::write(helper_contents.join("Info.plist"), helper_plist)
+            .with_context(|| format!("writing {}/Info.plist", helper_contents.display()))?;
+        fs::write(helper_contents.join("PkgInfo"), b"APPL????")
+            .with_context(|| format!("writing {}/PkgInfo", helper_contents.display()))?;
 
-    // Helper executable — buffr-helper renamed to "buffr Helper".
-    let helper_exec = helper_macos.join("buffr Helper");
-    copy_file_executable(helper_bin, &helper_exec)?;
+        let helper_exec = helper_macos.join(&exec_name);
+        copy_file_executable(helper_bin, &helper_exec)?;
+    }
 
     Ok(())
 }
+
+/// Helper-bundle flavors shipped inside `buffr.app/Contents/Frameworks/`.
+///
+/// `suffix` is appended to `"buffr Helper"` for the bundle + executable
+/// names — `""` is the catch-all helper (`buffr Helper.app`), `" (GPU)"`
+/// becomes `buffr Helper (GPU).app`, etc. Apple requires every nested
+/// `.app`'s Mach-O have a *distinct* file name; `fs::copy` is used for
+/// each (notarisation rejects symlinks for executables).
+#[derive(Debug, Clone, Copy)]
+struct HelperFlavor {
+    /// Name suffix, e.g. `""`, `" (GPU)"`, `" (Renderer)"`, `" (Plugin)"`.
+    suffix: &'static str,
+    /// Embedded plist template body.
+    plist_template: &'static str,
+}
+
+const HELPER_FLAVORS: &[HelperFlavor] = &[
+    HelperFlavor {
+        suffix: "",
+        plist_template: HELPER_PLIST_TEMPLATE,
+    },
+    HelperFlavor {
+        suffix: " (GPU)",
+        plist_template: HELPER_GPU_PLIST_TEMPLATE,
+    },
+    HelperFlavor {
+        suffix: " (Renderer)",
+        plist_template: HELPER_RENDERER_PLIST_TEMPLATE,
+    },
+    HelperFlavor {
+        suffix: " (Plugin)",
+        plist_template: HELPER_PLUGIN_PLIST_TEMPLATE,
+    },
+];
 
 fn render_main_plist(version: &str) -> String {
     MAIN_PLIST_TEMPLATE
@@ -602,12 +652,13 @@ fn render_main_plist(version: &str) -> String {
         .replace("{COPYRIGHT}", COPYRIGHT)
 }
 
-fn render_helper_plist(version: &str) -> String {
-    HELPER_PLIST_TEMPLATE
-        .replace("{NAME}", NAME)
+fn render_helper_plist(flavor: &HelperFlavor, version: &str, executable: &str) -> String {
+    flavor
+        .plist_template
+        .replace("{NAME}", &format!("{NAME} Helper{}", flavor.suffix))
         .replace("{VERSION}", version)
         .replace("{BUNDLE_ID_HELPER}", BUNDLE_ID_HELPER)
-        .replace("{EXECUTABLE}", "buffr Helper")
+        .replace("{EXECUTABLE}", executable)
         .replace("{COPYRIGHT}", COPYRIGHT)
 }
 
@@ -1121,7 +1172,11 @@ mod tests {
 
     #[test]
     fn render_helper_plist_substitutes_placeholders() {
-        let s = render_helper_plist("1.2.3");
+        let base = HelperFlavor {
+            suffix: "",
+            plist_template: HELPER_PLIST_TEMPLATE,
+        };
+        let s = render_helper_plist(&base, "1.2.3", "buffr Helper");
         assert!(s.contains("<string>sh.kryptic.buffr.helper</string>"));
         assert!(s.contains("<string>buffr Helper</string>"));
         // Helper plist drops the icon + category.
@@ -1132,6 +1187,38 @@ mod tests {
         assert!(s.contains("<key>LSUIElement</key>"));
         assert!(!s.contains("{VERSION}"));
         assert!(!s.contains("{BUNDLE_ID_HELPER}"));
+    }
+
+    #[test]
+    fn render_helper_plist_per_flavor_bundle_ids() {
+        // Each flavor must produce its own CFBundleIdentifier suffix so
+        // future per-helper signing entitlements don't collide.
+        let cases = [
+            (" (GPU)", HELPER_GPU_PLIST_TEMPLATE, ".gpu"),
+            (" (Renderer)", HELPER_RENDERER_PLIST_TEMPLATE, ".renderer"),
+            (" (Plugin)", HELPER_PLUGIN_PLIST_TEMPLATE, ".plugin"),
+        ];
+        for (suffix, template, want) in cases {
+            let flavor = HelperFlavor {
+                suffix,
+                plist_template: template,
+            };
+            let exec = format!("buffr Helper{suffix}");
+            let s = render_helper_plist(&flavor, "1.2.3", &exec);
+            let expected_id = format!("sh.kryptic.buffr.helper{want}");
+            assert!(
+                s.contains(&format!("<string>{expected_id}</string>")),
+                "missing {expected_id} in {suffix} plist:\n{s}"
+            );
+            assert!(s.contains(&format!("<string>{exec}</string>")));
+        }
+    }
+
+    #[test]
+    fn helper_flavors_count_is_four() {
+        // GPU / Renderer / Plugin / catch-all. If this changes, the
+        // bundle-layout test below + macos-signing.md need to track.
+        assert_eq!(HELPER_FLAVORS.len(), 4);
     }
 
     #[test]
@@ -1159,10 +1246,29 @@ mod tests {
                 .join("Contents/Frameworks/Chromium Embedded Framework.framework")
                 .exists()
         );
-        let helper_app = app_dir.join("Contents/Frameworks/buffr Helper.app");
-        assert!(helper_app.join("Contents/Info.plist").exists());
-        assert!(helper_app.join("Contents/PkgInfo").exists());
-        assert!(helper_app.join("Contents/MacOS/buffr Helper").exists());
+        // All four helper flavors are present (catch-all + GPU + Renderer + Plugin).
+        for (suffix, exec_suffix) in [
+            ("", ""),
+            (" (GPU)", " (GPU)"),
+            (" (Renderer)", " (Renderer)"),
+            (" (Plugin)", " (Plugin)"),
+        ] {
+            let helper_app = app_dir.join(format!("Contents/Frameworks/buffr Helper{suffix}.app"));
+            assert!(
+                helper_app.join("Contents/Info.plist").exists(),
+                "missing Info.plist for buffr Helper{suffix}.app"
+            );
+            assert!(
+                helper_app.join("Contents/PkgInfo").exists(),
+                "missing PkgInfo for buffr Helper{suffix}.app"
+            );
+            assert!(
+                helper_app
+                    .join(format!("Contents/MacOS/buffr Helper{exec_suffix}"))
+                    .exists(),
+                "missing executable for buffr Helper{suffix}.app"
+            );
+        }
 
         // PkgInfo content.
         assert_eq!(
