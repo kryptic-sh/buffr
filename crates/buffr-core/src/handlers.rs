@@ -31,6 +31,7 @@ use buffr_history::{History, Transition};
 use buffr_zoom::ZoomStore;
 
 use crate::find::{FindResult, FindResultSink};
+use crate::hint::{HintEventSink, parse_console_event};
 // `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
 // `wrap_download_handler!` expand to references to bare `Client`,
 // `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
@@ -50,8 +51,16 @@ pub fn make_client(
     downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
     find_sink: FindResultSink,
+    hint_sink: HintEventSink,
 ) -> Client {
-    BuffrClient::new(history, downloads, downloads_config, zoom, find_sink)
+    BuffrClient::new(
+        history,
+        downloads,
+        downloads_config,
+        zoom,
+        find_sink,
+        hint_sink,
+    )
 }
 
 /// Standalone factory for the load handler — exposed so future
@@ -63,8 +72,8 @@ pub fn make_load_handler(history: Arc<History>, zoom: Arc<ZoomStore>) -> LoadHan
 
 /// Standalone factory for the display handler — same rationale as
 /// [`make_load_handler`].
-pub fn make_display_handler(history: Arc<History>) -> DisplayHandler {
-    BuffrDisplayHandler::new(history)
+pub fn make_display_handler(history: Arc<History>, hint_sink: HintEventSink) -> DisplayHandler {
+    BuffrDisplayHandler::new(history, hint_sink)
 }
 
 /// Standalone factory for the download handler.
@@ -89,6 +98,7 @@ wrap_client! {
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
         find_sink: FindResultSink,
+        hint_sink: HintEventSink,
     }
 
     impl Client {
@@ -97,7 +107,10 @@ wrap_client! {
         }
 
         fn display_handler(&self) -> Option<DisplayHandler> {
-            Some(BuffrDisplayHandler::new(self.history.clone()))
+            Some(BuffrDisplayHandler::new(
+                self.history.clone(),
+                self.hint_sink.clone(),
+            ))
         }
 
         fn download_handler(&self) -> Option<DownloadHandler> {
@@ -207,6 +220,7 @@ wrap_load_handler! {
 wrap_display_handler! {
     pub struct BuffrDisplayHandler {
         history: Arc<History>,
+        hint_sink: HintEventSink,
     }
 
     impl DisplayHandler {
@@ -228,6 +242,35 @@ wrap_display_handler! {
             if let Err(err) = self.history.update_latest_title(&url, &title) {
                 tracing::warn!(error = %err, %url, "history: update_latest_title failed");
             }
+        }
+
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // Hint mode IPC fallback: the injected hint.js writes
+            // `__buffr_hint__:{...}` lines via `console.log`. Parse
+            // them here and post into the hint event sink. Returning
+            // 0 lets CEF continue logging; returning 1 would suppress.
+            let Some(message) = message else { return 0; };
+            let text = message.to_string();
+            if let Some(parsed) = parse_console_event(&text) {
+                match parsed {
+                    Ok(event) => {
+                        if let Ok(mut guard) = self.hint_sink.lock() {
+                            *guard = Some(event);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %text, "hint: malformed console event");
+                    }
+                }
+            }
+            0
         }
     }
 }

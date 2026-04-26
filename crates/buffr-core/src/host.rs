@@ -27,6 +27,10 @@ use raw_window_handle::RawWindowHandle;
 use tracing::{info, warn};
 
 use crate::find::FindResultSink;
+use crate::hint::{
+    DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
+    build_inject_script,
+};
 use crate::{CoreError, handlers};
 
 /// Owns a CEF browser attached to a native window.
@@ -56,6 +60,15 @@ pub struct BrowserHost {
     /// Last successful find query. `FindNext` / `FindPrev` reuse this
     /// — they are no-ops when no `start_find` has run yet.
     last_find_query: Mutex<Option<String>>,
+    /// Mailbox for renderer-emitted hint events. The display handler
+    /// writes; the host's hint API reads.
+    hint_sink: HintEventSink,
+    /// Hint session state. `None` outside of hint mode; `Some(...)`
+    /// between `enter_hint_mode` and the eventual commit / cancel.
+    hint_session: Mutex<Option<HintSession>>,
+    /// User-configured alphabet, snapshotted at construction. The
+    /// session derives labels from this on entry.
+    hint_alphabet: HintAlphabet,
 }
 
 impl BrowserHost {
@@ -73,6 +86,8 @@ impl BrowserHost {
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
         find_sink: FindResultSink,
+        hint_sink: HintEventSink,
+        hint_alphabet: HintAlphabet,
         initial_size: (u32, u32),
     ) -> Result<Self, CoreError> {
         info!(target: "buffr_core::host", %url, "creating CEF browser");
@@ -127,6 +142,7 @@ impl BrowserHost {
             downloads_config,
             zoom.clone(),
             find_sink,
+            hint_sink.clone(),
         );
 
         let browser = browser_host_create_browser_sync(
@@ -144,6 +160,9 @@ impl BrowserHost {
             downloads,
             zoom,
             last_find_query: Mutex::new(None),
+            hint_sink,
+            hint_session: Mutex::new(None),
+            hint_alphabet,
         })
     }
 
@@ -375,9 +394,11 @@ impl BrowserHost {
             }
 
             // -- chrome overlays: Phase 3 ---------------------------
-            A::OpenOmnibar | A::OpenCommandLine | A::EnterHintMode | A::EnterHintModeBackground => {
+            A::OpenOmnibar | A::OpenCommandLine => {
                 tracing::info!("UI action — overlay rendering is Phase 3 chrome work");
             }
+            A::EnterHintMode => self.enter_hint_mode(false),
+            A::EnterHintModeBackground => self.enter_hint_mode(true),
 
             // -- mode transitions: engine owns mode -----------------
             A::EnterMode(mode) => {
@@ -406,6 +427,182 @@ impl BrowserHost {
                 }
             }
         }
+    }
+
+    /// Status snapshot of the active hint session. `None` outside of
+    /// hint mode. UI threads pull this each tick to refresh the
+    /// statusline indicator.
+    pub fn hint_status(&self) -> Option<HintStatus> {
+        let guard = self.hint_session.lock().ok()?;
+        let s = guard.as_ref()?;
+        Some(HintStatus {
+            typed: s.typed.clone(),
+            match_count: s.match_count(),
+            background: s.background,
+        })
+    }
+
+    /// Whether a hint session is currently active.
+    pub fn is_hint_mode(&self) -> bool {
+        self.hint_session.lock().ok().is_some_and(|g| g.is_some())
+    }
+
+    /// Inject `hint.js` into the active main frame. Generates labels
+    /// for the configured alphabet sized to a generous 256 — the JS
+    /// truncates to the actual visible-element count.
+    ///
+    /// Construction of the in-memory [`HintSession`] happens lazily
+    /// when the renderer reports back via [`HintConsoleEvent::Ready`]
+    /// — see [`Self::pump_hint_events`].
+    ///
+    /// `background = true` toggles the F-key variant; the host
+    /// currently logs a warning on commit and falls back to a same-tab
+    /// click (multi-tab is Phase 5).
+    pub fn enter_hint_mode(&self, background: bool) {
+        // Reserve a generous label budget. The JS asset truncates to
+        // the actual visible-element count, so over-allocating here
+        // costs only a small string-array allocation in JS.
+        const LABEL_BUDGET: usize = 256;
+        let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
+        let alphabet_str = self.hint_alphabet.as_string();
+        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
+
+        // Stash a placeholder session so the UI can render
+        // "HINT (waiting)" until the renderer reports back.
+        if let Ok(mut slot) = self.hint_session.lock() {
+            *slot = Some(HintSession::new(
+                self.hint_alphabet.clone(),
+                Vec::new(),
+                background,
+            ));
+        }
+
+        let Some(frame) = self.browser.main_frame() else {
+            warn!("enter_hint_mode: main frame unavailable");
+            self.cancel_hint();
+            return;
+        };
+        let url = CefStringUtf16::from(&frame.url()).to_string();
+        let cef_script = CefString::from(script.as_str());
+        let cef_url = CefString::from(url.as_str());
+        // `start_line = 1`: cef-rs forwards this to the V8 source-map
+        // line offset; only matters for stack traces. Use 1 so traces
+        // line up with the asset's first line.
+        frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
+        info!(
+            background,
+            label_budget = LABEL_BUDGET,
+            "hint mode: injected"
+        );
+    }
+
+    /// Drain any renderer-side hint events the display handler has
+    /// posted since the last tick and finalise the active session.
+    /// Returns `true` if the session changed (so callers can request
+    /// a redraw).
+    pub fn pump_hint_events(&self) -> bool {
+        let Some(event) = crate::hint::take_hint_event(&self.hint_sink) else {
+            return false;
+        };
+        match event {
+            crate::hint::HintConsoleEvent::Ready { hints, alphabet: _ } => {
+                if let Ok(mut slot) = self.hint_session.lock()
+                    && let Some(existing) = slot.as_mut()
+                {
+                    let background = existing.background;
+                    *existing = HintSession::new(self.hint_alphabet.clone(), hints, background);
+                }
+                true
+            }
+            crate::hint::HintConsoleEvent::Error { message } => {
+                warn!(message, "hint mode: renderer reported error");
+                self.cancel_hint();
+                true
+            }
+        }
+    }
+
+    /// Feed a printable character to the active hint session. Returns
+    /// `Some(action)` whose semantics match [`HintAction`]; the caller
+    /// is expected to act on `Click` / `OpenInBackground` (run the
+    /// commit JS) and clear the session on `Cancel`. Returns `None`
+    /// when no session is active.
+    pub fn feed_hint_key(&self, ch: char) -> Option<HintAction> {
+        let mut slot = self.hint_session.lock().ok()?;
+        let session = slot.as_mut()?;
+        let action = session.feed(ch);
+        // Always tell the JS overlay to filter, even on Cancel — a
+        // Cancel removes overlays via `__buffrHintCancel`, but
+        // intermediate Filter ticks need an immediate visual update.
+        let typed = session.typed.clone();
+        drop(slot);
+        match &action {
+            HintAction::Filter => self.run_hint_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                json_string_literal(&typed)
+            )),
+            HintAction::Click(id) | HintAction::OpenInBackground(id) => {
+                if matches!(action, HintAction::OpenInBackground(_)) {
+                    tracing::warn!(
+                        element_id = *id,
+                        "hint background commit: multi-tab not implemented; falling back to same-tab click"
+                    );
+                }
+                self.run_hint_js(&format!(
+                    "if (window.__buffrHintCommit) window.__buffrHintCommit({id})"
+                ));
+                self.clear_hint_session();
+            }
+            HintAction::Cancel => {
+                self.cancel_hint();
+            }
+        }
+        Some(action)
+    }
+
+    /// Backspace the typed buffer. Mirrors [`Self::feed_hint_key`]
+    /// but pops a char from the session and re-issues a filter call.
+    pub fn backspace_hint(&self) -> Option<HintAction> {
+        let mut slot = self.hint_session.lock().ok()?;
+        let session = slot.as_mut()?;
+        let action = session.backspace();
+        let typed = session.typed.clone();
+        drop(slot);
+        match &action {
+            HintAction::Filter => self.run_hint_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                json_string_literal(&typed)
+            )),
+            HintAction::Cancel => self.cancel_hint(),
+            // `backspace` only emits Filter / Cancel — defensive.
+            _ => {}
+        }
+        Some(action)
+    }
+
+    /// Cancel the active hint session — invokes the JS cleanup hook
+    /// and drops the session state. Idempotent.
+    pub fn cancel_hint(&self) {
+        self.run_hint_js("if (window.__buffrHintCancel) window.__buffrHintCancel()");
+        self.clear_hint_session();
+    }
+
+    fn clear_hint_session(&self) {
+        if let Ok(mut slot) = self.hint_session.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Helper: run a hint-related JS snippet against the main frame.
+    /// `script_url` is set to `buffr://hint` so DevTools attribution
+    /// matches the source.
+    fn run_hint_js(&self, code: &str) {
+        let Some(frame) = self.browser.main_frame() else {
+            return;
+        };
+        let cef_code = CefString::from(code);
+        let cef_url = CefString::from("buffr://hint");
+        frame.execute_java_script(Some(&cef_code), Some(&cef_url), 1);
     }
 
     fn run_js(&self, code: &str) {
@@ -468,6 +665,46 @@ impl BrowserHost {
         }
     }
 }
+
+/// Snapshot of hint mode state for the statusline indicator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintStatus {
+    pub typed: String,
+    pub match_count: usize,
+    pub background: bool,
+}
+
+/// Format a string as a JS double-quoted literal, escaping every
+/// non-ASCII codepoint to `\uXXXX`. Used for the inline filter call so
+/// the splice survives any input the user might type.
+fn json_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c => {
+                let mut buf = [0u16; 2];
+                for unit in c.encode_utf16(&mut buf).iter() {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Trivial unused-import suppressor: `Hint` is referenced via the
+/// `crate::hint::Hint` re-export from `enter_hint_mode`'s docs but the
+/// binding is otherwise local.
+#[allow(dead_code)]
+fn _hint_used(_: Hint) {}
 
 /// Pixels per scroll-unit. `ScrollDown(3)` therefore moves 120px,
 /// matching a typical "tap j three times" feel without making each
