@@ -16,6 +16,12 @@ and this project adheres to
   does not yet depend on `hjkl-editor` and uses no `Rect`-flavoured APIs, so
   this is a transparent pin bump — no source changes required.
 - Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.26` to
-  `=0.0.28` — adopts canonical Buffer impl (0.0.27) plus sticky_col +
-  iskeyword hoist (0.0.28). Buffr only uses editor-level accessors, so the
+  `=0.0.28` — adopts canonical Buffer impl (0.0.27) plus sticky_col + iskeyword
+  hoist (0.0.28). Buffr only uses editor-level accessors, so the
   `hjkl_buffer::Buffer` API breaking change in 0.0.28 is transparent here.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.28` to
+  `=0.0.29` — picks up Patch B, which wires the `Host` trait through `Editor`.
+  The Host surface itself is unchanged and `BuffrHost` already implements all 10
+  SPEC methods; the back-compat `Editor::new` shim wraps `DefaultHost`, so no
+  Buffr source changes are required. Migration to
+  `Editor::with_host(km, BuffrHost::new())` is left for a follow-up.
