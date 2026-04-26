@@ -31,8 +31,10 @@ use buffr_core::{
 use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
 use buffr_ui::{
     CertState, FindStatus, HintStatus as UiHintStatus, InputBar, STATUSLINE_HEIGHT, Statusline,
-    Suggestion, SuggestionKind,
+    Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
+
+mod session;
 use cef::{ImplBrowser, Settings};
 use clap::Parser;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -104,6 +106,18 @@ struct Cli {
     /// `OnFindResult` tick so the smoke job can scrape them.
     #[arg(long, value_name = "QUERY")]
     find: Option<String>,
+    /// Open this URL in an extra tab on launch. Repeatable; tabs are
+    /// added in order after any restored session and the homepage.
+    #[arg(long = "new-tab", value_name = "URL", action = clap::ArgAction::Append)]
+    new_tab: Vec<String>,
+    /// Skip session restore for this run. The homepage opens in a
+    /// single tab and a fresh session file is written on exit.
+    #[arg(long)]
+    no_restore: bool,
+    /// Print the saved session (one URL per line, `*` prefix for
+    /// pinned tabs) to stdout and exit. Does not launch CEF.
+    #[arg(long)]
+    list_session: bool,
 }
 
 fn main() -> Result<()> {
@@ -181,6 +195,9 @@ fn main() -> Result<()> {
     }
     if cli.clear_zoom {
         return run_clear_zoom();
+    }
+    if cli.list_session {
+        return run_list_session();
     }
 
     tracing_subscriber::fmt()
@@ -408,6 +425,39 @@ fn main() -> Result<()> {
 
     let search_config = Arc::new(config.search.clone());
 
+    // -------- session restore -----------------------------------------
+    //
+    // Read the saved tab list (skipped under `--private` / `--no-restore`).
+    // The first entry, if any, supersedes the homepage as the
+    // initial-tab URL; remaining entries open in the background once
+    // the window exists. CLI `--new-tab` URLs append after that.
+    let session_path = if cli.private {
+        None
+    } else {
+        Some(session::default_path(&paths.data))
+    };
+    let pending_session_tabs: Vec<session::PersistedTab> = if cli.private || cli.no_restore {
+        Vec::new()
+    } else if let Some(p) = session_path.as_ref() {
+        match session::read(p) {
+            Ok(Some(s)) => {
+                info!(
+                    path = %p.display(),
+                    tabs = s.tabs.len(),
+                    "session: restored",
+                );
+                s.tabs
+            }
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                warn!(error = %err, "session: read failed — starting fresh");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -422,6 +472,9 @@ fn main() -> Result<()> {
         hint_sink,
         hint_alphabet,
         cli.find.clone(),
+        cli.new_tab.clone(),
+        pending_session_tabs,
+        session_path,
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -581,6 +634,27 @@ fn run_clear_zoom() -> Result<()> {
     let z = open_zoom_for_cli()?;
     let n = z.clear().context("clearing zoom rows")?;
     println!("cleared {n} zoom rows");
+    Ok(())
+}
+
+/// `--list-session` short-circuit. Prints one row per saved tab to
+/// stdout: `*\t<url>` when pinned, `\t<url>` otherwise. Schema
+/// version is printed on stderr for diagnostic clarity.
+fn run_list_session() -> Result<()> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    let path = session::default_path(&paths.data);
+    match session::read(&path)? {
+        None => {
+            eprintln!("no saved session at {}", path.display());
+        }
+        Some(s) => {
+            eprintln!("schema version: {}", s.version);
+            for tab in &s.tabs {
+                let pin = if tab.pinned { "*" } else { " " };
+                println!("{pin}\t{}", tab.url);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -768,6 +842,21 @@ struct AppState {
     /// tick, count buffer change; the `RedrawRequested` handler
     /// repaints from this without re-deriving from the engine.
     statusline: Statusline,
+    /// Tab strip render input. Refreshed from the host's tab list on
+    /// every `about_to_wait` tick so the chrome reflects open / close
+    /// / switch transitions without a manual signal.
+    tab_strip: TabStrip,
+    /// Pre-built list of URLs to open as extra tabs after the
+    /// homepage / restored session has loaded. Drained by
+    /// [`AppState::open_pending_tabs`] once the window exists.
+    pending_new_tabs: Vec<String>,
+    /// Restored session snapshot (URL + pinned bit). The first tab in
+    /// the list becomes the active tab on startup; subsequent entries
+    /// open in the background.
+    pending_session_tabs: Vec<session::PersistedTab>,
+    /// Path the runtime persists the live tab list to on clean
+    /// shutdown. `None` in private mode (sessions never persist).
+    session_path: Option<PathBuf>,
     /// `softbuffer` graphics context. `Surface` is per-window; the
     /// context can be reused across windows if we ever spawn more.
     softbuffer_ctx: Option<softbuffer::Context<Arc<Window>>>,
@@ -820,6 +909,9 @@ impl AppState {
         hint_sink: HintEventSink,
         hint_alphabet: HintAlphabet,
         pending_find: Option<String>,
+        pending_new_tabs: Vec<String>,
+        pending_session_tabs: Vec<session::PersistedTab>,
+        session_path: Option<PathBuf>,
     ) -> Self {
         let mut statusline = Statusline {
             url: homepage.clone(),
@@ -850,6 +942,10 @@ impl AppState {
             pending_find,
             find_smoke_at: None,
             statusline,
+            tab_strip: TabStrip::default(),
+            pending_new_tabs,
+            pending_session_tabs,
+            session_path,
             softbuffer_ctx: None,
             softbuffer_surface: None,
             cursor_blink_at: Instant::now(),
@@ -868,12 +964,132 @@ impl AppState {
         }
     }
 
-    fn dispatch_action(&self, action: &buffr_modal::PageAction) {
-        if let Some(host) = self.host.as_ref() {
-            host.dispatch(action);
-        } else {
+    fn dispatch_action(&mut self, action: &buffr_modal::PageAction) {
+        let Some(host) = self.host.as_ref() else {
             warn!(?action, "no browser host yet — dropping action");
+            return;
+        };
+        // Tab actions need apps-layer policy decisions (e.g. last-tab
+        // close → exit) so they bypass the host dispatcher's fallback
+        // path.
+        use buffr_modal::PageAction as A;
+        match action {
+            A::TabNew => {
+                let url = self.homepage.clone();
+                if let Err(err) = host.open_tab(&url) {
+                    warn!(error = %err, %url, "tab_new: failed");
+                }
+            }
+            A::TabClose => {
+                self.close_active_tab_or_exit();
+            }
+            A::TabNext => host.next_tab(),
+            A::TabPrev => host.prev_tab(),
+            A::DuplicateTab => {
+                if let Err(err) = host.duplicate_active() {
+                    warn!(error = %err, "duplicate_tab: failed");
+                }
+            }
+            A::PinTab => host.toggle_pin_active(),
+            _ => host.dispatch(action),
         }
+    }
+
+    /// Close the active tab. If it was the last one, signal the
+    /// caller to exit. Returns `true` if more tabs remain.
+    fn close_active_tab_or_exit(&self) -> bool {
+        let Some(host) = self.host.as_ref() else {
+            return false;
+        };
+        match host.close_active() {
+            Ok(true) => true,
+            Ok(false) => {
+                info!("tab_close: last tab gone — saving session and exiting");
+                self.save_session_now();
+                std::process::exit(0);
+            }
+            Err(err) => {
+                warn!(error = %err, "tab_close: failed");
+                true
+            }
+        }
+    }
+
+    /// Persist the live tab list synchronously. Called on graceful
+    /// shutdown paths (last-tab-close, `:q`, `Ctrl-C`).
+    fn save_session_now(&self) {
+        let Some(path) = self.session_path.as_ref() else {
+            return;
+        };
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        let summaries = host.tabs_summary();
+        let s = session::Session::from_tabs(summaries.iter().map(|t| (t.url.as_str(), t.pinned)));
+        if let Err(err) = session::write(path, &s) {
+            warn!(error = %err, "session: write failed");
+        }
+    }
+
+    /// Open any extra `--new-tab` URLs after the homepage / session
+    /// has been initialised. Drained once per `resumed` tick.
+    fn open_pending_tabs(&mut self) {
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        // Restored session first — these were saved in the previous
+        // run's tab order. The first one is already loaded as the
+        // initial tab via `BrowserHost::new`; the rest open in the
+        // background so the user lands on tab 0.
+        let session = std::mem::take(&mut self.pending_session_tabs);
+        for (i, t) in session.iter().enumerate() {
+            if i == 0 {
+                // The initial `BrowserHost::new` already loaded tab 0
+                // with `homepage`. Navigate the active tab there
+                // instead of opening a new one so we don't end up
+                // with a stray homepage tab.
+                if let Err(err) = host.navigate(&t.url) {
+                    warn!(error = %err, url = %t.url, "session: navigate first tab failed");
+                }
+                continue;
+            }
+            match host.open_tab_background(&t.url) {
+                Ok(_id) => {
+                    if t.pinned {
+                        host.toggle_pin_active();
+                    }
+                }
+                Err(err) => warn!(error = %err, url = %t.url, "session: open_tab failed"),
+            }
+        }
+        // CLI `--new-tab` URLs append after the session.
+        let cli_tabs = std::mem::take(&mut self.pending_new_tabs);
+        for url in cli_tabs {
+            if let Err(err) = host.open_tab_background(&url) {
+                warn!(error = %err, %url, "new-tab: open_tab failed");
+            }
+        }
+    }
+
+    /// Refresh the tab-strip render input from the host's current
+    /// tab list. Cheap; runs every `about_to_wait` tick.
+    fn refresh_tab_strip(&mut self) {
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        let summaries = host.tabs_summary();
+        let active = host.active_index();
+        let tabs = summaries
+            .into_iter()
+            .map(|t| TabView {
+                title: t.title,
+                progress: t.progress,
+                pinned: t.pinned,
+                private: t.private,
+            })
+            .collect();
+        self.tab_strip.tabs = tabs;
+        self.tab_strip.active = active;
     }
 
     fn refresh_title(&mut self) {
@@ -958,12 +1174,16 @@ impl AppState {
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        let Some(surface) = self.softbuffer_surface.as_mut() else {
-            return;
-        };
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
+        // Precompute geometry-derived inputs before acquiring the
+        // softbuffer surface borrow — `tab_strip_y` needs `&self`
+        // and we only release once the buffer drops.
+        let tab_y = self.tab_strip_y(height);
+        let Some(surface) = self.softbuffer_surface.as_mut() else {
+            return;
+        };
         let (Some(nz_w), Some(nz_h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
         };
@@ -987,7 +1207,13 @@ impl AppState {
         self.statusline
             .paint(buf.as_mut(), width as usize, height as usize);
 
-        let mut damage = Vec::with_capacity(2);
+        // Tab strip — sits between input bar (when open) and CEF
+        // page area. Always painted; the buffer slot lives at
+        // `tab_y` (precomputed above so the softbuffer borrow holds).
+        self.tab_strip
+            .paint(buf.as_mut(), width as usize, height as usize, tab_y);
+
+        let mut damage = Vec::with_capacity(3);
 
         // Statusline damage rect (bottom).
         let strip_h_u = STATUSLINE_HEIGHT.min(height);
@@ -998,6 +1224,17 @@ impl AppState {
                 y: strip_y,
                 width: nz_w,
                 height: strip_h_nz,
+            });
+        }
+
+        // Tab strip damage rect.
+        let tab_h_u = TAB_STRIP_HEIGHT.min(height.saturating_sub(strip_h_u));
+        if let Some(tab_h_nz) = NonZeroU32::new(tab_h_u) {
+            damage.push(softbuffer::Rect {
+                x: 0,
+                y: tab_y,
+                width: nz_w,
+                height: tab_h_nz,
             });
         }
 
@@ -1022,22 +1259,40 @@ impl AppState {
     }
 
     /// Compute the CEF child window rect for the current overlay
-    /// state. The page area sits between the input bar (top, when
-    /// open) and the statusline (bottom, always).
+    /// state. Vertical layout (top → bottom):
+    ///
+    /// 1. Input bar (when overlay open)
+    /// 2. Tab strip (always, `TAB_STRIP_HEIGHT` px)
+    /// 3. CEF page area
+    /// 4. Statusline (always, `STATUSLINE_HEIGHT` px)
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
-        let chrome_h = STATUSLINE_HEIGHT.min(full_h);
+        let status_h = STATUSLINE_HEIGHT.min(full_h);
+        let remaining_after_status = full_h.saturating_sub(status_h);
+        let tab_h = TAB_STRIP_HEIGHT.min(remaining_after_status);
+        let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
         let overlay_h = self
             .overlay
             .as_ref()
             .map(|o| o.input().total_height())
             .unwrap_or(0)
-            .min(full_h.saturating_sub(chrome_h));
+            .min(remaining_after_tabs);
         let cef_w = full_w.max(1);
-        let cef_h = full_h
-            .saturating_sub(chrome_h)
-            .saturating_sub(overlay_h)
-            .max(1);
-        (0, overlay_h, cef_w, cef_h)
+        let cef_h = remaining_after_tabs.saturating_sub(overlay_h).max(1);
+        let cef_y = overlay_h + tab_h;
+        (0, cef_y, cef_w, cef_h)
+    }
+
+    /// The pixel row at which the tab strip begins (top of the
+    /// `TAB_STRIP_HEIGHT` band). Mirrors the math in
+    /// [`Self::cef_child_rect`] without depending on the CEF rect
+    /// itself.
+    fn tab_strip_y(&self, full_h: u32) -> u32 {
+        let overlay_h = self
+            .overlay
+            .as_ref()
+            .map(|o| o.input().total_height())
+            .unwrap_or(0);
+        overlay_h.min(full_h)
     }
 
     /// Re-issue the CEF resize call for the current window dimensions.
@@ -1287,17 +1542,13 @@ impl AppState {
         let parsed = parse_cmdline(raw);
         match parsed {
             Command::Quit => {
-                tracing::info!("cmdline: quit requested — exit on next event-loop tick");
-                if let Some(window) = self.window.as_ref() {
-                    // Trigger a CloseRequested-equivalent path. winit
-                    // 0.30 doesn't have a public "exit now" API on the
-                    // app-handler half — push a close to the window.
-                    window.request_redraw();
-                }
-                // Set a flag the event loop can read. Simpler:
-                // request the OS to close the window, which winit
-                // surfaces as CloseRequested.
-                std::process::exit(0);
+                // Vim-flavoured: `:q` closes the active tab; only the
+                // very last tab quits the app. Mirrors `<C-w>c`. To
+                // force-quit the whole app from the command line use
+                // `:q!` (not yet implemented) — for now `:q` on the
+                // last tab triggers the same exit path.
+                tracing::info!("cmdline: quit — closing active tab");
+                self.close_active_tab_or_exit();
             }
             Command::Reload => {
                 self.dispatch_action(&buffr_modal::PageAction::Reload);
@@ -1318,7 +1569,12 @@ impl AppState {
                 }
             }
             Command::TabNew => {
-                tracing::info!("cmdline: :tabnew — multi-tab is Phase 5");
+                let url = self.homepage.clone();
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab(&url)
+                {
+                    warn!(error = %err, %url, "cmdline :tabnew failed");
+                }
             }
             Command::Set { key, value } => {
                 self.apply_set(&key, &value);
@@ -1560,6 +1816,12 @@ impl ApplicationHandler for AppState {
             self.find_smoke_at = Some(Instant::now() + Duration::from_millis(1500));
         }
 
+        // Restore extra tabs from session + CLI now that the host
+        // exists. The first session tab (if any) replaces the
+        // homepage on tab 0; the rest open in the background.
+        self.open_pending_tabs();
+        self.refresh_tab_strip();
+
         self.window = Some(window);
     }
 
@@ -1572,6 +1834,7 @@ impl ApplicationHandler for AppState {
         match event {
             WindowEvent::CloseRequested => {
                 info!("close requested");
+                self.save_session_now();
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -1692,6 +1955,18 @@ impl ApplicationHandler for AppState {
                 self.statusline.hint_state = new_status;
                 self.request_redraw();
             }
+        }
+
+        // Refresh tab-strip render input. The host's tab list can
+        // change underneath us (LoadHandler updates URL/title;
+        // dispatched tab actions add/remove rows) so we resync every
+        // tick. The cost is a small alloc; the redraw is gated on
+        // diff via softbuffer's damage rect.
+        let prev_tabs = self.tab_strip.tabs.clone();
+        let prev_active = self.tab_strip.active;
+        self.refresh_tab_strip();
+        if prev_tabs != self.tab_strip.tabs || prev_active != self.tab_strip.active {
+            self.request_redraw();
         }
 
         // Cursor blink for the open overlay. 500ms toggle; we only

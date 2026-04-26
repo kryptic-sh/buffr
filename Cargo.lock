@@ -215,6 +215,8 @@ dependencies = [
  "cef",
  "clap",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "softbuffer",
  "tempfile",
  "tracing",
