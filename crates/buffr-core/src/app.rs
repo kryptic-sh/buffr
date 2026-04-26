@@ -15,11 +15,38 @@
 //!   plumbing.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // `wrap_app!` / `wrap_browser_process_handler!` expand to references
 // to bare `App`, `WrapApp`, `ImplApp`, `BrowserProcessHandler`, etc.
 // — the upstream cefsimple example uses `use cef::*;` for this reason.
 use cef::*;
+
+/// Process-wide flag toggling the `--force-renderer-accessibility`
+/// switch in `on_before_command_line_processing`. Set via
+/// [`set_force_renderer_accessibility`] before the first `BuffrApp` is
+/// constructed (i.e. before `cef::execute_process` / `cef::initialize`).
+///
+/// We use a static so the wrap_app! macro's struct doesn't need to
+/// carry state — the cef-rs trait surface for `App` doesn't accept
+/// per-instance fields cleanly.
+static FORCE_RENDERER_ACCESSIBILITY: AtomicBool = AtomicBool::new(false);
+
+/// Toggle the renderer accessibility tree for subsequent CEF launches.
+/// Call before `BuffrApp::new()` if you want the switch picked up.
+///
+/// Backed by `--force-renderer-accessibility` (Chromium switch). cef-147
+/// also exposes per-browser `SetAccessibilityState` on the host, but
+/// the command-line switch is the only path that fires before any
+/// browser exists — and it covers every renderer for the process.
+pub fn set_force_renderer_accessibility(on: bool) {
+    FORCE_RENDERER_ACCESSIBILITY.store(on, Ordering::SeqCst);
+}
+
+/// Read the current accessibility-flag toggle. Mostly useful for tests.
+pub fn force_renderer_accessibility_enabled() -> bool {
+    FORCE_RENDERER_ACCESSIBILITY.load(Ordering::SeqCst)
+}
 
 /// Resolved on-disk paths buffr uses for cache + profile data.
 ///
@@ -60,6 +87,14 @@ wrap_app! {
             // No-sandbox is set in `Settings`, but a redundant switch
             // keeps CEF from re-enabling on certain code paths.
             append_switch(command_line, "no-sandbox");
+            // Phase 6 accessibility: opt-in renderer accessibility tree.
+            // The renderer feeds this into Chromium's a11y subsystem,
+            // which platform screen readers consume. Off by default —
+            // some sites are noticeably slower with the tree forced on.
+            // Toggle via `[accessibility] force_renderer_accessibility`.
+            if force_renderer_accessibility_enabled() {
+                append_switch(command_line, "force-renderer-accessibility");
+            }
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {

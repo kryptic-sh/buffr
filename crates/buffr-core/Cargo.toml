@@ -54,7 +54,16 @@ buffr-zoom.workspace = true
 # `PermissionHandler` (in `handlers.rs`) pre-checks remembered
 # decisions; the UI thread persists user choices marked "always".
 buffr-permissions.workspace = true
+# Phase 6 update channel — `UpdateChecker` does one HTTP GET per
+# `check_interval_hours` against the GitHub releases API. The trait
+# `HttpClient` keeps the network shimmable for tests; the `ureq`
+# implementation is the production path.
+ureq.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 # Tests for `telemetry` and `crash` write to scratch directories.
 tempfile.workspace = true
+# Tests for `updates` round-trip the `[updates]` section through TOML
+# to verify `serde(deny_unknown_fields)` rejects typos.
+toml.workspace = true

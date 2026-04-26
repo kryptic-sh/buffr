@@ -21,6 +21,7 @@ pub mod host;
 pub mod open_finder;
 pub mod permissions;
 pub mod telemetry;
+pub mod updates;
 
 /// Off-screen rendering scaffold. Gated behind the `osr` feature
 /// because it pulls in (eventually) `wgpu` and `softbuffer` deps.
@@ -29,7 +30,9 @@ pub mod telemetry;
 #[cfg(feature = "osr")]
 pub mod osr;
 
-pub use app::{BuffrApp, ProfilePaths};
+pub use app::{
+    BuffrApp, ProfilePaths, force_renderer_accessibility_enabled, set_force_renderer_accessibility,
+};
 pub use crash::{CrashError, CrashReport, CrashReporter};
 pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
@@ -51,6 +54,10 @@ pub use permissions::{
 pub use telemetry::{
     KEY_APP_STARTS, KEY_BOOKMARKS_ADDED, KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED,
     KEY_SEARCHES_RUN, KEY_TABS_OPENED, TelemetryError, UsageCounters,
+};
+pub use updates::{
+    DEFAULT_CHANNEL, DEFAULT_CHECK_INTERVAL_HOURS, DEFAULT_GITHUB_REPO, HttpClient, ReleaseInfo,
+    UpdateChecker, UpdateConfig, UpdateError, UpdateStatus, UreqClient,
 };
 
 #[derive(Debug, Error)]
