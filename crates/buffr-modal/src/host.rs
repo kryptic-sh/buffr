@@ -7,6 +7,7 @@
 //! loop can flush queued operations on its own cadence — the engine
 //! never blocks on either clipboard or intent fan-out.
 
+use hjkl_buffer::Viewport;
 use hjkl_engine::{CursorShape, Host};
 use std::time::Instant;
 
@@ -54,6 +55,17 @@ pub struct BuffrHost {
     started: Instant,
     /// Intent queue drained by the host once per render frame.
     intents: Vec<BuffrEditIntent>,
+    /// Runtime viewport (rows/cols, scroll offsets) the engine reads
+    /// and writes via `Host::viewport` / `Host::viewport_mut` as of
+    /// hjkl 0.0.34 (Patch C-δ.1 — viewport relocated off `Buffer`).
+    ///
+    /// Sourced from the CEF/winit canvas: when buffr's main loop wires
+    /// edit-mode into the page lifecycle it should call
+    /// [`set_viewport_size`] from the existing `WindowEvent::Resized`
+    /// handler in `apps/buffr/src/main.rs`. Until then the viewport
+    /// stays at the zero-size default — engine scroll math falls back
+    /// to no-op (see `Viewport::new` docs), so this is a safe stub.
+    viewport: Viewport,
 }
 
 impl Default for BuffrHost {
@@ -70,7 +82,22 @@ impl BuffrHost {
             clipboard_outbox: Vec::new(),
             started: Instant::now(),
             intents: Vec::new(),
+            viewport: Viewport::new(),
         }
+    }
+
+    /// Publish the current canvas size into the viewport. Called from
+    /// the host's resize event handler (winit `WindowEvent::Resized`
+    /// in `apps/buffr`). `width` / `height` are in **cells**, not
+    /// pixels — buffr will divide pixel dimensions by font metrics
+    /// before calling this once edit-mode rendering lands.
+    ///
+    /// Currently unwired: buffr's main loop drives CEF + softbuffer
+    /// chrome and doesn't yet route resizes into edit-mode. When the
+    /// edit-mode overlay is plumbed, hook this in.
+    pub fn set_viewport_size(&mut self, width: u16, height: u16) {
+        self.viewport.width = width;
+        self.viewport.height = height;
     }
 
     /// Update the cached clipboard. Host calls this on focus events or
@@ -119,6 +146,14 @@ impl Host for BuffrHost {
 
     fn emit_intent(&mut self, intent: Self::Intent) {
         self.intents.push(intent);
+    }
+
+    fn viewport(&self) -> &Viewport {
+        &self.viewport
+    }
+
+    fn viewport_mut(&mut self) -> &mut Viewport {
+        &mut self.viewport
     }
 }
 
@@ -178,5 +213,22 @@ mod tests {
     fn satisfies_host_trait() {
         fn assert_host<H: Host>() {}
         assert_host::<BuffrHost>();
+    }
+
+    #[test]
+    fn viewport_defaults_zero_then_round_trips() {
+        let mut host = BuffrHost::new();
+        // Pre-resize: zero-size viewport, engine scroll math is a no-op.
+        assert_eq!(host.viewport().width, 0);
+        assert_eq!(host.viewport().height, 0);
+
+        // Resize event: host publishes new dimensions.
+        host.set_viewport_size(120, 40);
+        assert_eq!(host.viewport().width, 120);
+        assert_eq!(host.viewport().height, 40);
+
+        // Engine writes via viewport_mut (e.g. set_viewport_top in 0.0.34).
+        host.viewport_mut().top_row = 5;
+        assert_eq!(host.viewport().top_row, 5);
     }
 }

@@ -41,3 +41,12 @@ and this project adheres to
 - Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.32` to
   `=0.0.33` — picks up Patch C-γ (partial). Buffr has no source migration to
   perform, so this is a transparent pin bump — no source changes required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.33` to
+  `=0.0.34` — picks up Patch C-δ.1, which relocates `Viewport` ownership from
+  `hjkl_buffer::Buffer` onto `hjkl_engine::Host`. `BuffrHost` now carries a
+  `viewport: Viewport` field and implements the new `Host::viewport` /
+  `Host::viewport_mut` accessors. A `set_viewport_size(width, height)` helper is
+  exposed for the eventual resize wiring; until edit-mode is plumbed into the
+  CEF/winit page lifecycle in `apps/buffr`, the viewport stays at zero-size and
+  the engine's scroll math no-ops. No `buffer().viewport*()` reaches in buffr,
+  so the migration is contained to `BuffrHost`.
