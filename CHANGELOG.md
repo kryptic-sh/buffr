@@ -38,3 +38,6 @@ and this project adheres to
   `FoldProvider` trait shipped. Buffr has no call sites against the renamed or
   removed symbols, so this is a transparent pin bump — no source changes
   required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.32` to
+  `=0.0.33` — picks up Patch C-γ (partial). Buffr has no source migration to
+  perform, so this is a transparent pin bump — no source changes required.
