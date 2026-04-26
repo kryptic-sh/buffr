@@ -80,14 +80,6 @@ buffr-permissions = { path = "crates/buffr-permissions" }
 hjkl-engine = "=0.1.0"
 hjkl-buffer = "=0.1.0"
 
-# Local-dev override: point hjkl-* crates at the in-tree checkout so
-# we can iterate against unreleased changes without waiting on the
-# crates.io publish rate limit. Comment out once the matching tag
-# publishes and the pin catches up.
-[patch.crates-io]
-hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer" }
-hjkl-engine = { path = "../hjkl/crates/hjkl-engine" }
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
