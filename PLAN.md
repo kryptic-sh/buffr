@@ -174,7 +174,10 @@ Goal: tab strip + statusline + command line + omnibar, all native.
 - [ ] Implement `crates/buffr-core/src/osr.rs` (currently scaffolded). Wire
       `OsrHost::new` to real CEF windowless mode + wgpu compositor so Wayland
       sessions can run natively without XWayland.
-- [ ] Tab strip: render, drag-reorder, close-on-middle-click, overflow.
+- [x] Tab strip: render via `buffr-ui::TabStrip` (softbuffer paint), wired to
+      multi-tab `BrowserHost`. Active tab highlighted with accent stripe; pinned
+      tabs marked with `*`; loading progress drawn at the bottom edge of each
+      pill. Drag-reorder + middle-click-close are post-Phase-3.
 - [x] Statusline: mode indicator, URL, progress, cert state, count buffer.
       Bundled 6x10 bitmap font in `buffr-ui::font`; widget renders into a
       `softbuffer::Surface`. Phase 3b adds load-progress / cert hookup.
@@ -213,7 +216,14 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 
 ### Phase 5 — Browser features (1.0 cut)
 
-- [ ] Tabs: create/close/move/pin/duplicate, restore last session.
+- [x] Tabs: create/close/move/pin/duplicate, restore last session. Multi-tab
+      `BrowserHost` manages a `Vec<Tab>` with monotonic `TabId`s; default keymap
+      binds `gt` / `gT` / `<C-w>c` / `t` / `<C-w>n` (duplicate) / `<C-w>p`
+      (pin). `:tabnew` opens an extra tab; `:q` closes the active tab and only
+      quits when the last tab is gone. Session restored from
+      `~/.local/share/buffr/session.json` (`{ url, pinned }` per entry);
+      `--no-restore` and `--list-session` CLI flags drive testing. See
+      [`docs/multi-tab.md`](./docs/multi-tab.md).
 - [x] History: SQLite store, dedupe, frecency search for omnibar. Pure data
       layer in `crates/buffr-history`; wired live via the CEF `LoadHandler` in
       `buffr-core::handlers`. Phase 5b/c follow-ups:

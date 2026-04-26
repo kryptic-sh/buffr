@@ -54,12 +54,19 @@ the shorter action fires.
 
 ### Tabs
 
-| Keys     | Action     |
-| -------- | ---------- |
-| `gt`     | `TabNext`  |
-| `gT`     | `TabPrev`  |
-| `<C-w>c` | `TabClose` |
-| `t`      | `TabNew`   |
+| Keys     | Action         |
+| -------- | -------------- |
+| `gt`     | `TabNext`      |
+| `gT`     | `TabPrev`      |
+| `<C-w>c` | `TabClose`     |
+| `t`      | `TabNew`       |
+| `<C-w>n` | `DuplicateTab` |
+| `<C-w>p` | `PinTab`       |
+
+`TabClose` (and `:q`) close the active tab. The application only exits when the
+last tab is gone. `DuplicateTab` clones the active tab's URL into a fresh tab;
+`PinTab` toggles the pinned bit (sort hint only — pin does not prevent close).
+See [`multi-tab.md`](./multi-tab.md).
 
 ### History
 

@@ -50,19 +50,23 @@ less.
 ## Layout
 
 - `STATUSLINE_HEIGHT = 24` pixels, docked to the bottom of the buffr window.
+- `TAB_STRIP_HEIGHT = 30` pixels, sits above the CEF page area and below the
+  optional input bar. Always painted (zero tabs renders an empty bar in the
+  strip's bg colour).
 - `INPUT_HEIGHT = 28` pixels, docked to the **top** when the command line or
   omnibar is open. The input strip is hidden when the overlay is closed and the
   page region reclaims those rows.
 - Suggestion dropdown: each row is `STATUSLINE_HEIGHT` (24 px) tall, max 8 rows.
   Stacks below the input strip when populated; the dropdown rectangle also
   shrinks the CEF child rect so suggestions never overlap the page.
-- CEF child window rect: `(0, overlay_h, w, h - overlay_h - STATUSLINE_HEIGHT)`,
+- CEF child window rect:
+  `(0, overlay_h + TAB_STRIP_HEIGHT, w, h - overlay_h - TAB_STRIP_HEIGHT - STATUSLINE_HEIGHT)`,
   where `overlay_h` is `INPUT_HEIGHT + dropdown_rows * STATUSLINE_HEIGHT` when
   an overlay is open, `0` otherwise. The X11 XID is passed as
-  `WindowInfo::parent_window` at creation time; on resize the host calls
-  `cef::Browser::host().was_resized()` after winit reports the new size.
-  Whenever the overlay opens / closes we re-issue the resize so CEF re-flows the
-  page area.
+  `WindowInfo::parent_window` at creation time; on resize the host walks every
+  tab and calls `cef::Browser::host().was_resized()` after winit reports the new
+  size. Whenever the overlay opens / closes we re-issue the resize so CEF
+  re-flows the page area.
 - Statusline + input paint surface: a single `softbuffer::Surface` sized to the
   full window. Each frame we paint the bottom strip (statusline) and, when an
   overlay is active, the top strip (input bar + dropdown). The middle page
