@@ -278,8 +278,12 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       `on_uncaught_exception` in libcef-147; configuring crashpad requires
       shipping a `crashpad_handler` binary + symbol server. See
       [`docs/privacy.md`](./docs/privacy.md).
-- [ ] Update channel: stable + nightly tags. Tauri-style updater or OS package
-      managers.
+- [x] Update channel: GitHub releases API check + on-disk cache + statusline
+      indicator. **No automatic binary replacement** — that needs signing
+      infrastructure deferred to post-1.0. CLI flags `--check-for-updates`
+      (live) and `--update-status` (cached). Disabled-able via
+      `[updates] enabled = false` (zero network calls). See
+      [`docs/updates.md`](./docs/updates.md).
 - [ ] Packaging:
   - [x] Linux: AppImage, `.deb`, AUR PKGBUILD.
         `cargo xtask package-linux     [--variant {appimage,deb,aur,all}]`
@@ -297,8 +301,16 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       JSON file at `<data>/usage-counters.json`. No network endpoint exists —
       buffr never phones home, even on opt-in. See
       [`docs/privacy.md`](./docs/privacy.md).
-- [ ] Accessibility pass: screen reader labels on chrome, focus order.
-- [ ] Docs site: install, keymap reference, config reference, recipes.
+- [x] Accessibility pass: CEF renderer accessibility tree (off by default
+      via `[accessibility] force_renderer_accessibility`); high-contrast
+      theme palette (`[theme] high_contrast`); `--audit-keymap` CLI for
+      keyboard-only verification; documented gap (native chrome AT
+      bindings deferred post-1.0) in
+      [`docs/accessibility.md`](./docs/accessibility.md).
+- [x] Docs site: mdBook scaffold (`book.toml` + `docs/SUMMARY.md`).
+      `.github/workflows/docs.yml` builds + uploads to GitHub Pages on
+      push to main. DNS for `docs.buffr.kryptic.sh` is a TODO; until
+      then the github.io preview URL is the canonical surface.
 
 ### Post-1.0
 

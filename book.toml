@@ -1,0 +1,33 @@
+# mdBook configuration for buffr's docs site.
+#
+# Generates a static HTML site from `docs/*.md`. The rendered output
+# lives in `docs-site/` (gitignored target dir) and is uploaded to
+# `https://docs.buffr.kryptic.sh/` on push to main via
+# `.github/workflows/docs.yml`.
+#
+# DNS for `docs.buffr.kryptic.sh` is a TODO — until that lands the
+# site is only reachable through the GitHub Pages preview URL the
+# Actions workflow drops.
+#
+# Run locally:
+#   mdbook build       -> emits HTML into docs-site/
+#   mdbook serve       -> live-reload at http://localhost:3000
+
+[book]
+title = "buffr"
+description = "Vim-modal browser. Native shell, GPU-accelerated compositing via CEF."
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+language = "en"
+src = "docs"
+multilingual = false
+
+[build]
+build-dir = "docs-site"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/kryptic-sh/buffr"
+edit-url-template = "https://github.com/kryptic-sh/buffr/edit/main/{path}"
+site-url = "/"

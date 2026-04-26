@@ -1,10 +1,28 @@
 # buffr — privacy
 
-Two opt-in surfaces — telemetry counters and the crash reporter — both off by
-default and both **local-only**. buffr never sends data to a network endpoint.
-Not now, not ever, not even to a kryptic-owned server. The implementation is a
-deliberate no-op that documents the design rather than a stub waiting for an
-endpoint.
+Two opt-in surfaces — telemetry counters and the crash reporter — are both off
+by default and both **local-only**. buffr never sends usage or crash data to a
+network endpoint. Not now, not ever, not even to a kryptic-owned server. The
+implementation is a deliberate no-op that documents the design rather than a
+stub waiting for an endpoint.
+
+There is **one** network request buffr makes by default — see
+[Update channel](#update-channel) below. It can be disabled.
+
+## Update channel — one HTTP GET per day
+
+Default-on. `[updates] enabled = true` in the user config. buffr makes
+**one** HTTP GET per `check_interval_hours` (default 24 h) against
+`https://api.github.com/repos/kryptic-sh/buffr/releases/latest`. The request
+carries no PII: only a `User-Agent: buffr/<version>` header (which GitHub
+mandates) and an `Accept: application/vnd.github+json` header. No cookies, no
+auth token, no telemetry payload. GitHub logs the request like any public API
+request (IP + timestamp); buffr does not run its own collector.
+
+To disable entirely, set `[updates] enabled = false` in `config.toml`. That
+path makes **zero** network calls — the `--check-for-updates` CLI flag
+short-circuits without opening a socket. See
+[Updates](./updates.md) for the full surface.
 
 ## Telemetry — opt-in usage counters
 

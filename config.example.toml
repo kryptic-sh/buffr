@@ -33,6 +33,10 @@ url = "https://www.google.com/search?q={query}"
 accent = "#7aa2f7"
 # auto | dark | light. `auto` follows the desktop's appearance hint.
 mode = "auto"
+# Phase 6 a11y: switch chrome to a high-contrast palette
+# (white-on-black with a saturated yellow accent). See
+# `docs/accessibility.md` for the colour values.
+high_contrast = false
 
 [privacy]
 # Opt-in **local-only** usage counters. When `true`, buffr accumulates
@@ -102,6 +106,31 @@ enabled = false
 # Cutoff for `--purge-crashes`. Reports older than this many days are
 # removed. Default 30.
 purge_after_days = 30
+
+[updates]
+# Phase 6 update channel. The ONLY network request buffr makes by
+# default — one HTTP GET per `check_interval_hours` against the
+# GitHub releases API, no PII. Set `enabled = false` to disable
+# entirely; that path makes ZERO network calls. See
+# `docs/privacy.md` and `docs/updates.md`.
+enabled = true
+# `stable` (today) or `nightly` (reserved for the post-1.0 nightly
+# tag stream).
+channel = "stable"
+# Minimum hours between live `--check-for-updates` queries. Reads
+# inside the window come from the on-disk cache.
+check_interval_hours = 24
+# `owner/repo` slug. Forks override this.
+github_repo = "kryptic-sh/buffr"
+
+[accessibility]
+# Phase 6 a11y: enable CEF's renderer accessibility tree by passing
+# `--force-renderer-accessibility` through the App command-line hook.
+# Platform screen readers (Orca/AT-SPI on Linux, VoiceOver on macOS,
+# NVDA/JAWS on Windows) consume that tree. Default `false` because
+# building the tree adds a non-trivial per-frame cost; users with an
+# AT should turn it on. See `docs/accessibility.md`.
+force_renderer_accessibility = false
 
 # ----------------------------------------------------------------------
 # Keymap overrides

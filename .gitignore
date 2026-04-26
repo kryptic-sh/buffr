@@ -14,3 +14,8 @@
 .idea/
 .vscode/
 *.swp
+
+# mdBook output — regenerated from `docs/` on every CI run; not
+# committed because the source markdown is the canonical text.
+/docs-site
+
