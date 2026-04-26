@@ -18,7 +18,7 @@ jobs:
     env:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install CEF runtime deps
         run: |
@@ -104,7 +104,7 @@ jobs:
     env:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install CEF runtime deps
         run: |
@@ -163,7 +163,7 @@ jobs:
       # the bundle script's directory layout does.
       BUFFR_BUNDLE_FRAMEWORK_DIR: ${{ github.workspace }}/.ci/stub-framework
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install CEF runtime deps
         run: |
@@ -225,7 +225,7 @@ jobs:
     env:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install CEF runtime + packaging deps
         run: |
