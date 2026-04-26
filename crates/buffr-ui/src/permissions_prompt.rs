@@ -118,7 +118,7 @@ impl PermissionsPrompt {
             .unwrap_or(0);
         let right_pad: i32 = 8;
         // Truncate `line1` so it doesn't run into the queue indicator.
-        let line1_max_px = if let Some(_) = queue_text.as_ref() {
+        let line1_max_px = if queue_text.is_some() {
             (width as i32 - text_x - queue_w - right_pad - 12).max(0) as usize
         } else {
             (width as i32 - text_x - right_pad).max(0) as usize
