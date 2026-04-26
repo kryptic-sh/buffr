@@ -25,13 +25,17 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, FindResultSink, HintAction, HintAlphabet, HintEventSink, init_cef_api, new_find_sink,
-    new_hint_event_sink, profile_paths,
+    BuffrApp, FindResultSink, HintAction, HintAlphabet, HintEventSink, PermissionsQueue,
+    PromptOutcome, drain_permissions_with_defer, init_cef_api, new_find_sink, new_hint_event_sink,
+    new_permissions_queue, peek_permission_front, permissions_queue_len, pop_permission_front,
+    profile_paths,
 };
 use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
+use buffr_permissions::Permissions;
 use buffr_ui::{
-    CertState, FindStatus, HintStatus as UiHintStatus, InputBar, STATUSLINE_HEIGHT, Statusline,
-    Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
+    CertState, FindStatus, HintStatus as UiHintStatus, InputBar, PERMISSIONS_PROMPT_HEIGHT,
+    PermissionsPrompt, STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT,
+    TabStrip, TabView,
 };
 
 mod session;
@@ -118,6 +122,17 @@ struct Cli {
     /// pinned tabs) to stdout and exit. Does not launch CEF.
     #[arg(long)]
     list_session: bool,
+    /// Print every persisted permission decision and exit.
+    /// Output: `<origin>\t<capability>\t<decision>\t<set_at>`.
+    #[arg(long)]
+    list_permissions: bool,
+    /// Wipe the permissions table. Prints the count of rows removed.
+    #[arg(long)]
+    clear_permissions: bool,
+    /// Drop every stored permission decision for `<ORIGIN>`. Prints
+    /// the count of rows removed.
+    #[arg(long, value_name = "ORIGIN")]
+    forget_origin: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -199,6 +214,15 @@ fn main() -> Result<()> {
     if cli.list_session {
         return run_list_session();
     }
+    if cli.list_permissions {
+        return run_list_permissions();
+    }
+    if cli.clear_permissions {
+        return run_clear_permissions();
+    }
+    if let Some(origin) = cli.forget_origin.as_deref() {
+        return run_forget_origin(origin);
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -275,6 +299,20 @@ fn main() -> Result<()> {
     } else {
         buffr_zoom::ZoomStore::open(paths.data.join("zoom.sqlite")).context("opening zoom store")?
     });
+
+    // -------- permissions store --------
+    //
+    // Phase 5: SQLite-backed per-origin permission decisions at
+    // `<data>/permissions.sqlite`. The CEF `PermissionHandler`
+    // pre-checks remembered decisions; any uncached request enqueues
+    // onto the shared `PermissionsQueue` for the UI thread to prompt.
+    let permissions = Arc::new(if cli.private {
+        Permissions::open_in_memory().context("opening in-memory permissions")?
+    } else {
+        Permissions::open(paths.data.join("permissions.sqlite"))
+            .context("opening permissions database")?
+    });
+    let permissions_queue = new_permissions_queue();
 
     // -------- load config + build initial keymap ----------------------
     let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
@@ -466,6 +504,8 @@ fn main() -> Result<()> {
         downloads.clone(),
         downloads_config,
         zoom.clone(),
+        permissions.clone(),
+        permissions_queue.clone(),
         search_config,
         cli.private,
         find_sink,
@@ -479,6 +519,12 @@ fn main() -> Result<()> {
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
+
+    // Defer-dismiss any permission requests still queued at shutdown.
+    // Dropping a CEF callback without invoking it would wedge the
+    // renderer; resolving with `Defer` fires the right "DISMISS"
+    // outcome on each.
+    drain_permissions_with_defer(&permissions_queue, &permissions);
 
     // -------- clear-on-exit --------
     //
@@ -634,6 +680,50 @@ fn run_clear_zoom() -> Result<()> {
     let z = open_zoom_for_cli()?;
     let n = z.clear().context("clearing zoom rows")?;
     println!("cleared {n} zoom rows");
+    Ok(())
+}
+
+/// Open the permissions store at the standard data path. Used by the
+/// CLI short-circuits — no CEF init.
+fn open_permissions_for_cli() -> Result<Permissions> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    let p = Permissions::open(paths.data.join("permissions.sqlite"))
+        .context("opening permissions database")?;
+    Ok(p)
+}
+
+fn run_list_permissions() -> Result<()> {
+    let p = open_permissions_for_cli()?;
+    for row in p.all().context("loading permissions")? {
+        let dec = match row.decision {
+            buffr_permissions::Decision::Allow => "allow",
+            buffr_permissions::Decision::Deny => "deny",
+        };
+        println!(
+            "{}\t{}\t{}\t{}",
+            row.origin,
+            row.capability.as_storage_key(),
+            dec,
+            row.set_at
+        );
+    }
+    Ok(())
+}
+
+fn run_clear_permissions() -> Result<()> {
+    let p = open_permissions_for_cli()?;
+    let n = p.clear().context("clearing permissions")?;
+    println!("cleared {n} permission rows");
+    Ok(())
+}
+
+fn run_forget_origin(origin: &str) -> Result<()> {
+    let p = open_permissions_for_cli()?;
+    let n = p
+        .forget_origin(origin)
+        .context("forgetting permissions for origin")?;
+    println!("forgot {n} permission rows for {origin}");
     Ok(())
 }
 
@@ -805,6 +895,12 @@ struct AppState {
     downloads: Arc<buffr_downloads::Downloads>,
     downloads_config: Arc<buffr_config::DownloadsConfig>,
     zoom: Arc<buffr_zoom::ZoomStore>,
+    permissions: Arc<Permissions>,
+    permissions_queue: PermissionsQueue,
+    /// Active permission prompt (if any). `Some` while the front of
+    /// `permissions_queue` is being shown. Keystrokes route to the
+    /// prompt resolution path while this is set.
+    permissions_prompt: Option<PermissionsPrompt>,
     /// Resolved search config used by the omnibar's URL-or-search
     /// resolver on Enter.
     search_config: Arc<buffr_config::Search>,
@@ -903,6 +999,8 @@ impl AppState {
         downloads: Arc<buffr_downloads::Downloads>,
         downloads_config: Arc<buffr_config::DownloadsConfig>,
         zoom: Arc<buffr_zoom::ZoomStore>,
+        permissions: Arc<Permissions>,
+        permissions_queue: PermissionsQueue,
         search_config: Arc<buffr_config::Search>,
         private: bool,
         find_sink: FindResultSink,
@@ -930,6 +1028,9 @@ impl AppState {
             downloads,
             downloads_config,
             zoom,
+            permissions,
+            permissions_queue,
+            permissions_prompt: None,
             search_config,
             overlay: None,
             private,
@@ -1181,6 +1282,7 @@ impl AppState {
         // softbuffer surface borrow — `tab_strip_y` needs `&self`
         // and we only release once the buffer drops.
         let tab_y = self.tab_strip_y(height);
+        let prompt_y = self.permissions_prompt_y();
         let Some(surface) = self.softbuffer_surface.as_mut() else {
             return;
         };
@@ -1213,7 +1315,14 @@ impl AppState {
         self.tab_strip
             .paint(buf.as_mut(), width as usize, height as usize, tab_y);
 
-        let mut damage = Vec::with_capacity(3);
+        // Permissions prompt — sits between input bar and tab strip
+        // when active. Drawn after the tab strip so its accent border
+        // never overlaps a tab pill.
+        if let Some(prompt) = self.permissions_prompt.as_ref() {
+            prompt.paint(buf.as_mut(), width as usize, height as usize, prompt_y);
+        }
+
+        let mut damage = Vec::with_capacity(4);
 
         // Statusline damage rect (bottom).
         let strip_h_u = STATUSLINE_HEIGHT.min(height);
@@ -1236,6 +1345,19 @@ impl AppState {
                 width: nz_w,
                 height: tab_h_nz,
             });
+        }
+
+        // Permissions prompt damage rect.
+        if self.permissions_prompt.is_some() {
+            let prompt_h_u = PERMISSIONS_PROMPT_HEIGHT.min(height.saturating_sub(prompt_y));
+            if let Some(prompt_h_nz) = NonZeroU32::new(prompt_h_u) {
+                damage.push(softbuffer::Rect {
+                    x: 0,
+                    y: prompt_y,
+                    width: nz_w,
+                    height: prompt_h_nz,
+                });
+            }
         }
 
         // Overlay damage rect (top, if active).
@@ -1262,23 +1384,30 @@ impl AppState {
     /// state. Vertical layout (top → bottom):
     ///
     /// 1. Input bar (when overlay open)
-    /// 2. Tab strip (always, `TAB_STRIP_HEIGHT` px)
-    /// 3. CEF page area
-    /// 4. Statusline (always, `STATUSLINE_HEIGHT` px)
+    /// 2. Permissions prompt (when active, `PERMISSIONS_PROMPT_HEIGHT`)
+    /// 3. Tab strip (always, `TAB_STRIP_HEIGHT` px)
+    /// 4. CEF page area
+    /// 5. Statusline (always, `STATUSLINE_HEIGHT` px)
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
         let status_h = STATUSLINE_HEIGHT.min(full_h);
         let remaining_after_status = full_h.saturating_sub(status_h);
         let tab_h = TAB_STRIP_HEIGHT.min(remaining_after_status);
         let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
+        let prompt_h = if self.permissions_prompt.is_some() {
+            PERMISSIONS_PROMPT_HEIGHT.min(remaining_after_tabs)
+        } else {
+            0
+        };
+        let remaining_after_prompt = remaining_after_tabs.saturating_sub(prompt_h);
         let overlay_h = self
             .overlay
             .as_ref()
             .map(|o| o.input().total_height())
             .unwrap_or(0)
-            .min(remaining_after_tabs);
+            .min(remaining_after_prompt);
         let cef_w = full_w.max(1);
-        let cef_h = remaining_after_tabs.saturating_sub(overlay_h).max(1);
-        let cef_y = overlay_h + tab_h;
+        let cef_h = remaining_after_prompt.saturating_sub(overlay_h).max(1);
+        let cef_y = overlay_h + prompt_h + tab_h;
         (0, cef_y, cef_w, cef_h)
     }
 
@@ -1292,7 +1421,21 @@ impl AppState {
             .as_ref()
             .map(|o| o.input().total_height())
             .unwrap_or(0);
-        overlay_h.min(full_h)
+        let prompt_h = if self.permissions_prompt.is_some() {
+            PERMISSIONS_PROMPT_HEIGHT
+        } else {
+            0
+        };
+        (overlay_h + prompt_h).min(full_h)
+    }
+
+    /// Top-of-window y for the permissions prompt strip. Sits right
+    /// below the input bar (when open) and above the tab strip.
+    fn permissions_prompt_y(&self) -> u32 {
+        self.overlay
+            .as_ref()
+            .map(|o| o.input().total_height())
+            .unwrap_or(0)
     }
 
     /// Re-issue the CEF resize call for the current window dimensions.
@@ -1689,6 +1832,98 @@ impl AppState {
         self.statusline.hint_state = None;
     }
 
+    /// Pull the front of the permissions queue into a renderable
+    /// [`PermissionsPrompt`] if no prompt is currently shown. Returns
+    /// `true` when the prompt state changed (so the caller knows to
+    /// resync the CEF rect + redraw).
+    fn sync_permissions_prompt(&mut self) -> bool {
+        // Already showing a prompt — nothing to do until the user
+        // resolves it.
+        if self.permissions_prompt.is_some() {
+            return false;
+        }
+        let queue_total = permissions_queue_len(&self.permissions_queue);
+        if queue_total == 0 {
+            return false;
+        }
+        // queue_total includes the front entry; "more pending after
+        // this one" is queue_total - 1.
+        let queue_after = queue_total.saturating_sub(1) as u32;
+        let Some((origin, caps)) = peek_permission_front(&self.permissions_queue) else {
+            return false;
+        };
+        let labels: Vec<String> = caps.iter().map(|c| c.human_label()).collect();
+        self.permissions_prompt = Some(PermissionsPrompt {
+            origin,
+            capabilities: labels,
+            queue_len: queue_after,
+        });
+        true
+    }
+
+    /// Resolve the front-of-queue permission with `outcome`. The
+    /// callback fires exactly once; the next prompt (if any) is
+    /// drawn on the following tick via [`Self::sync_permissions_prompt`].
+    fn resolve_permission(&mut self, outcome: PromptOutcome) {
+        let Some(pending) = pop_permission_front(&self.permissions_queue) else {
+            warn!("permissions: resolve called with empty queue");
+            self.permissions_prompt = None;
+            return;
+        };
+        if let Err(err) = pending.resolve(outcome, &self.permissions) {
+            warn!(error = %err, "permissions: resolve failed");
+        }
+        self.permissions_prompt = None;
+        // Pull the next prompt immediately so the chrome shows it
+        // without waiting for the next tick.
+        self.sync_permissions_prompt();
+        self.resync_cef_rect();
+        self.request_redraw();
+    }
+
+    /// Route a keystroke to the active permission prompt. Returns
+    /// `true` when the key was consumed.
+    ///
+    /// Bindings:
+    ///
+    /// - `a` / `y` — allow once
+    /// - `A` / `Y` — allow + remember
+    /// - `d` / `n` — deny once
+    /// - `D` / `N` — deny + remember
+    /// - `s` — deny + remember (qutebrowser parity for "stop")
+    /// - `Esc` — defer (deny once, no persistence)
+    fn permissions_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.permissions_prompt.is_none() {
+            return false;
+        }
+        let chord = match key_event_to_chord(event, self.modifiers) {
+            Some(c) => c,
+            None => return true,
+        };
+        // Modifier-bearing chords (Ctrl-*, Alt-*) are swallowed so the
+        // modal trie can't fire on `<C-w>c` mid-prompt.
+        let mods = chord.modifiers;
+        let plain = !mods.contains(buffr_modal::Modifiers::CTRL)
+            && !mods.contains(buffr_modal::Modifiers::ALT)
+            && !mods.contains(buffr_modal::Modifiers::SUPER);
+        match chord.key {
+            Key::Named(NamedKey::Esc) => {
+                self.resolve_permission(PromptOutcome::Defer);
+            }
+            Key::Char(c) if plain => match c {
+                'a' | 'y' => self.resolve_permission(PromptOutcome::Allow { remember: false }),
+                'A' | 'Y' => self.resolve_permission(PromptOutcome::Allow { remember: true }),
+                'd' | 'n' => self.resolve_permission(PromptOutcome::Deny { remember: false }),
+                'D' | 'N' | 's' => self.resolve_permission(PromptOutcome::Deny { remember: true }),
+                _ => {
+                    // Unmapped — swallow so the modal engine doesn't see it.
+                }
+            },
+            _ => {}
+        }
+        true
+    }
+
     fn dispatch_omnibar(&mut self, bar: &InputBar) {
         let raw = bar.current_value().to_string();
         if raw.is_empty() {
@@ -1768,6 +2003,8 @@ impl ApplicationHandler for AppState {
             self.downloads.clone(),
             self.downloads_config.clone(),
             self.zoom.clone(),
+            self.permissions.clone(),
+            self.permissions_queue.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
             self.hint_alphabet.clone(),
@@ -1855,6 +2092,13 @@ impl ApplicationHandler for AppState {
                 self.modifiers = mods.state();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Permissions prompt takes precedence over every other
+                // key sink. Pressing `a`/`d`/`A`/`D`/Esc resolves the
+                // request; nothing else is allowed through until the
+                // queue drains.
+                if self.permissions_handle_key(&event) {
+                    return;
+                }
                 // Overlay open → all keys route to it.
                 if self.overlay_handle_key(&event) {
                     return;
@@ -1955,6 +2199,15 @@ impl ApplicationHandler for AppState {
                 self.statusline.hint_state = new_status;
                 self.request_redraw();
             }
+        }
+
+        // Permission prompt: pull the front of the queue into a
+        // visible widget. `sync_permissions_prompt` is a no-op when a
+        // prompt is already active, so the user always sees one
+        // request at a time.
+        if self.sync_permissions_prompt() {
+            self.resync_cef_rect();
+            self.request_redraw();
         }
 
         // Refresh tab-strip render input. The host's tab list can
