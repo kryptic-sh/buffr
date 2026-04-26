@@ -66,3 +66,8 @@ and this project adheres to
   `spans` and `search_pattern` fields. Buffr does not consume these fields
   directly per the consumer audit, so this is a transparent pin bump — no source
   changes required.
+- Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.37` to
+  `=0.0.38` — introduces the `FoldOp` / `FoldProvider::apply` pipeline on
+  `hjkl_engine`, threading fold operations through the editor host. Buffr does
+  not implement a fold provider and consumes only editor-level APIs, so this is
+  a transparent pin bump — no source changes required.
