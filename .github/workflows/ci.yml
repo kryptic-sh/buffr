@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: ./.github/actions/sync-hjkl
+
       - name: install CEF runtime deps
         run: |
           sudo apt-get update
@@ -106,6 +108,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: ./.github/actions/sync-hjkl
+
       - name: install CEF runtime deps
         run: |
           sudo apt-get update
@@ -164,6 +168,8 @@ jobs:
       BUFFR_BUNDLE_FRAMEWORK_DIR: ${{ github.workspace }}/.ci/stub-framework
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/sync-hjkl
 
       - name: install CEF runtime deps
         run: |
@@ -226,6 +232,8 @@ jobs:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/sync-hjkl
 
       - name: install CEF runtime + packaging deps
         run: |
