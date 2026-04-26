@@ -12,14 +12,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Extract the first =0.0.X version pin from any Cargo.toml in
-        # the workspace. We standardise on lockstep pinning across
-        # hjkl-buffer / hjkl-engine / hjkl-editor / hjkl-ratatui, so the
-        # first match is authoritative.
-        PIN=$(grep -rh -m1 -oE '"=[0-9]+\.[0-9]+\.[0-9]+"' \
-          Cargo.toml */Cargo.toml */*/Cargo.toml 2>/dev/null \
-          | head -1 | tr -d '"=')
-        if [ -z "$PIN" ]; then
+        # Extract the first =0.0.X hjkl version pin from any Cargo.toml
+        # in the workspace. We use `find` instead of shell globs so an
+        # empty `*/Cargo.toml` expansion doesn't trip `set -e`. We
+        # standardise on lockstep pinning across hjkl-buffer /
+        # hjkl-engine / hjkl-editor / hjkl-ratatui, so the first match
+        # is authoritative.
+        PIN=$(find . -maxdepth 4 -name Cargo.toml -not -path './target/*' \
+          -exec grep -h -m1 -oE 'hjkl-[a-z]+ ?= ?(\{[^}]*version ?= ?)?"=[0-9]+\.[0-9]+\.[0-9]+"' {} \; \
+          | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+        if [ -z "${PIN:-}" ]; then
           echo "could not extract hjkl pin from Cargo.toml" >&2
           exit 1
         fi
