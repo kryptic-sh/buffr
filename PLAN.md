@@ -467,7 +467,10 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
 - [x] **`LoadHandler::on_load_start` transition-type wiring** — `Reload`,
       `FormSubmit`, and `Generated` decoded from CEF `TransitionType` and stored
       in history; `Link` is the fallback.
-- [ ] **Bookmarks UI in omnibar** — Phase 5b small follow-up.
+- [x] **Bookmarks UI in omnibar** — already wired: `omnibar_suggestions` queries
+      `Bookmarks::search` at `apps/buffr/src/main.rs:2009`, with a distinct
+      `SuggestionKind::Bookmark` badge in the dropdown palette. Ordering:
+      history < bookmark < command < search-fallback.
 
 Signing (macOS Developer ID, Windows Authenticode) and native Wayland OSR are
 explicitly **not** gating 0.1.0. Unsigned packages ship at 0.1.0; signed
