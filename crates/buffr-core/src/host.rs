@@ -40,6 +40,7 @@ use raw_window_handle::RawWindowHandle;
 use tracing::{info, warn};
 
 use crate::download_notice::DownloadNoticeQueue;
+use crate::edit::EditEventSink;
 use crate::find::FindResultSink;
 use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
@@ -158,6 +159,17 @@ pub struct BrowserHost {
     /// every callback shape, so per-tab demux happens in the UI).
     find_sink: FindResultSink,
     hint_sink: HintEventSink,
+    /// Edit-mode event queue shared with the load handler (which injects
+    /// `edit.js`) and the display handler (which parses its console
+    /// output). Stage 2 will drain this from the UI render loop to drive
+    /// `EditSession` lifecycle — spawn on focus, keystroke-route while
+    /// attached, drop on blur/Esc.
+    ///
+    /// TODO(stage2): drain `edit_sink` each render tick; spawn/destroy
+    /// `EditSession` based on `Focus`/`Blur` events; route keystrokes
+    /// through `EditSession::feed_input`; push DOM updates back via
+    /// `window.__buffrEditApply`.
+    edit_sink: EditEventSink,
     /// User-configured hint alphabet. Each tab uses the same alphabet.
     hint_alphabet: HintAlphabet,
     /// Phase 6 usage counters. `None` when the embedder didn't pass
@@ -187,6 +199,7 @@ impl BrowserHost {
         notice_queue: DownloadNoticeQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
+        edit_sink: EditEventSink,
         hint_alphabet: HintAlphabet,
         initial_size: (u32, u32),
     ) -> Result<Self, CoreError> {
@@ -202,6 +215,7 @@ impl BrowserHost {
             notice_queue,
             find_sink,
             hint_sink,
+            edit_sink,
             hint_alphabet,
             initial_size,
             false,
@@ -226,6 +240,7 @@ impl BrowserHost {
         notice_queue: DownloadNoticeQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
+        edit_sink: EditEventSink,
         hint_alphabet: HintAlphabet,
         initial_size: (u32, u32),
         private: bool,
@@ -248,6 +263,7 @@ impl BrowserHost {
             notice_queue,
             find_sink,
             hint_sink,
+            edit_sink,
             hint_alphabet,
             counters,
         };
@@ -334,6 +350,7 @@ impl BrowserHost {
             self.permissions_queue.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
+            self.edit_sink.clone(),
             self.counters.clone(),
             self.notice_queue.clone(),
         );

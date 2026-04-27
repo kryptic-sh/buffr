@@ -172,6 +172,12 @@ gates the `v0.1.0` daily-driver cut.
       forwards keystrokes via `feed_input(PlannedInput)` (crossterm-free path),
       exposes `take_content_change()` pull-model drain. Unit-tested
       independently of CEF.
+- [x] JS-bridge focus-event IPC (Stage 1): `edit.js` injected once per
+      main-frame load; `focusin`/`focusout`/`input` sentinel events parsed in
+      `BuffrDisplayHandler::on_console_message` and queued in `EditEventSink`.
+      `parse_console_event` + `build_inject_script` in
+      `crates/buffr-core/src/edit.rs`. Inject + listen + parse + sink path
+      complete; `EditSession` plug-in and DOM write-back land in Stage 2.
 - [ ] CEF V8 binding for focused text-field value get/set; `apps/buffr-helper`
       exposes JS bridge. **Gates v0.1.0.**
 - [ ] CEF focus event → spawn `EditSession` from field value; route key events
@@ -478,6 +484,12 @@ packages cut 1.0.
 
 ## Status snapshot — 2026-04-28
 
+Stage 1 of edit-mode wiring is live: `crates/buffr-core/src/edit.rs` +
+`assets/edit.js` provide the inject → listen → parse → sink path. The
+`EditEventSink` queue is constructed in `main.rs` and threaded through
+`AppState` → `BrowserHost` → `make_client`. Stage 2 will drain the queue and
+wire it to `EditSession`.
+
 Phases 0–6 are all landed. Outstanding items are tracked above under "What gates
 `v0.1.0`". Other open work:
 
@@ -491,7 +503,7 @@ backend + host, the SPEC frozen, and a 14-method sealed Buffer trait. Buffr's
 edit-mode integration is no longer blocked on upstream — it is plain-old
 engineering work.
 
-Test count: 416 passing across the workspace.
+Test count: 453 passing across the workspace (+37 from edit-mode Stage 1).
 
 Bug fixes, dependency bumps, and small features are tracked via:
 

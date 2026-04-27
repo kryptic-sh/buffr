@@ -34,6 +34,7 @@ use buffr_permissions::{Decision, Permissions};
 use buffr_zoom::ZoomStore;
 
 use crate::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue, push};
+use crate::edit::{EditEventSink, build_inject_script as build_edit_inject_script};
 use crate::find::{FindResult, FindResultSink};
 use crate::hint::{HintEventSink, parse_console_event};
 use crate::permissions::{
@@ -64,6 +65,7 @@ pub fn make_client(
     permissions_queue: PermissionsQueue,
     find_sink: FindResultSink,
     hint_sink: HintEventSink,
+    edit_sink: EditEventSink,
     counters: Option<Arc<UsageCounters>>,
     notice_queue: DownloadNoticeQueue,
 ) -> Client {
@@ -76,6 +78,7 @@ pub fn make_client(
         permissions_queue,
         find_sink,
         hint_sink,
+        edit_sink,
         counters,
         notice_queue,
     )
@@ -88,19 +91,25 @@ pub fn make_load_handler(
     history: Arc<History>,
     zoom: Arc<ZoomStore>,
     counters: Option<Arc<UsageCounters>>,
+    edit_sink: EditEventSink,
 ) -> LoadHandler {
     BuffrLoadHandler::new(
         history,
         zoom,
         counters,
         Arc::new(Mutex::new(HashMap::new())),
+        edit_sink,
     )
 }
 
 /// Standalone factory for the display handler — same rationale as
 /// [`make_load_handler`].
-pub fn make_display_handler(history: Arc<History>, hint_sink: HintEventSink) -> DisplayHandler {
-    BuffrDisplayHandler::new(history, hint_sink)
+pub fn make_display_handler(
+    history: Arc<History>,
+    hint_sink: HintEventSink,
+    edit_sink: EditEventSink,
+) -> DisplayHandler {
+    BuffrDisplayHandler::new(history, hint_sink, edit_sink)
 }
 
 /// Standalone factory for the download handler.
@@ -140,6 +149,7 @@ wrap_client! {
         permissions_queue: PermissionsQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
+        edit_sink: EditEventSink,
         counters: Option<Arc<UsageCounters>>,
         notice_queue: DownloadNoticeQueue,
     }
@@ -151,6 +161,7 @@ wrap_client! {
                 self.zoom.clone(),
                 self.counters.clone(),
                 Arc::new(Mutex::new(HashMap::new())),
+                self.edit_sink.clone(),
             ))
         }
 
@@ -158,6 +169,7 @@ wrap_client! {
             Some(BuffrDisplayHandler::new(
                 self.history.clone(),
                 self.hint_sink.clone(),
+                self.edit_sink.clone(),
             ))
         }
 
@@ -224,6 +236,9 @@ wrap_load_handler! {
         zoom: Arc<ZoomStore>,
         counters: Option<Arc<UsageCounters>>,
         pending_transitions: Arc<Mutex<HashMap<i32, Transition>>>,
+        // Shared with BuffrDisplayHandler: write the injected edit.js
+        // script on load; display handler reads events from the queue.
+        edit_sink: EditEventSink,
     }
 
     impl LoadHandler {
@@ -304,6 +319,20 @@ wrap_load_handler! {
                     tracing::warn!(error = %err, %domain, "zoom: get failed");
                 }
             }
+
+            // Edit-mode Stage 1: inject edit.js once per main-frame load.
+            // The script is idempotent (`window.__buffrEditWired` guard)
+            // so SPA soft-navigations that re-trigger on_load_end are safe.
+            // We gate on `frame.is_main()` (already checked above) so
+            // iframes and subframes never get the listener installed.
+            let script = build_edit_inject_script();
+            let cef_script = CefString::from(script.as_str());
+            let cef_url = CefString::from("buffr://edit-inject");
+            frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
+            tracing::trace!(%url, "edit: injected edit.js");
+            // `self.edit_sink` is held for Stage 2 sink ownership; the
+            // display handler writes into it when console events arrive.
+            let _ = &self.edit_sink;
         }
     }
 }
@@ -350,6 +379,10 @@ wrap_display_handler! {
     pub struct BuffrDisplayHandler {
         history: Arc<History>,
         hint_sink: HintEventSink,
+        // Receives parsed EditConsoleEvents scraped from
+        // `__buffr_edit__:`-prefixed console lines. Stage 2 drains
+        // this from the UI render loop to drive EditSession lifecycle.
+        edit_sink: EditEventSink,
     }
 
     impl DisplayHandler {
@@ -381,12 +414,15 @@ wrap_display_handler! {
             _source: Option<&CefString>,
             _line: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
-            // Hint mode IPC fallback: the injected hint.js writes
-            // `__buffr_hint__:{...}` lines via `console.log`. Parse
-            // them here and post into the hint event sink. Returning
-            // 0 lets CEF continue logging; returning 1 would suppress.
+            // IPC fallback: injected JS writes sentinel-prefixed lines
+            // via `console.log`. We scrape them here and route to the
+            // appropriate sink. Returning 0 lets CEF continue logging;
+            // returning 1 would suppress the message from devtools.
             let Some(message) = message else { return 0; };
             let text = message.to_string();
+
+            // ---- hint mode IPC ------------------------------------------
+            // hint.js emits `__buffr_hint__:{...}` lines.
             if let Some(parsed) = parse_console_event(&text) {
                 match parsed {
                     Ok(event) => {
@@ -399,6 +435,22 @@ wrap_display_handler! {
                     }
                 }
             }
+
+            // ---- edit mode IPC ------------------------------------------
+            // edit.js emits `__buffr_edit__:{...}` lines on focus/blur/mutate.
+            if let Some(parsed) = crate::edit::parse_console_event(&text) {
+                match parsed {
+                    Ok(event) => {
+                        if let Ok(mut guard) = self.edit_sink.lock() {
+                            guard.push_back(event);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %text, "edit: malformed console event");
+                    }
+                }
+            }
+
             0
         }
     }

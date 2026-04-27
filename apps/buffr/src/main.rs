@@ -25,11 +25,11 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, DownloadNoticeQueue, FindResultSink, HintAction, HintAlphabet, HintEventSink,
-    PermissionsQueue, PromptOutcome, drain_permissions_with_defer, expire_stale_notices,
-    init_cef_api, new_download_notice_queue, new_find_sink, new_hint_event_sink,
-    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
-    pop_permission_front, profile_paths,
+    BuffrApp, DownloadNoticeQueue, EditEventSink, FindResultSink, HintAction, HintAlphabet,
+    HintEventSink, PermissionsQueue, PromptOutcome, drain_permissions_with_defer,
+    expire_stale_notices, init_cef_api, new_download_notice_queue, new_edit_event_sink,
+    new_find_sink, new_hint_event_sink, new_permissions_queue, peek_download_notice,
+    peek_permission_front, permissions_queue_len, pop_permission_front, profile_paths,
 };
 use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
 use buffr_permissions::Permissions;
@@ -600,6 +600,11 @@ fn main() -> Result<()> {
 
     let find_sink = new_find_sink();
     let hint_sink = new_hint_event_sink();
+    // Edit-mode Stage 1: construct the event queue now so it can be
+    // threaded through AppState → BrowserHost → handlers. Stage 2 will
+    // drain it from the render loop to drive EditSession lifecycle.
+    // TODO(stage2): drain edit_sink each tick; spawn/destroy EditSession.
+    let edit_sink = new_edit_event_sink();
     // Build the hint alphabet up front so a misconfigured config
     // surfaces an error before CEF has a chance to start. The
     // validator already checked the same invariants but `from_str` is
@@ -662,6 +667,7 @@ fn main() -> Result<()> {
         cli.private,
         find_sink,
         hint_sink,
+        edit_sink,
         hint_alphabet,
         cli.find.clone(),
         cli.new_tab.clone(),
@@ -1290,6 +1296,16 @@ struct AppState {
     /// Hint-mode mailbox shared with the CEF display handler.
     /// `BrowserHost::pump_hint_events` drains it each tick.
     hint_sink: HintEventSink,
+    /// Edit-mode event queue shared with the CEF load handler (which
+    /// injects `edit.js`) and display handler (which parses its console
+    /// output). Stage 2 drains this each tick to drive `EditSession`
+    /// lifecycle. Held here so the Arc stays alive for the process
+    /// lifetime even before the host is created.
+    ///
+    /// TODO(stage2): drain each render tick; route Focus → EditSession
+    /// spawn, keystrokes → feed_input, Blur/Esc → drop session.
+    #[allow(dead_code)]
+    edit_sink: EditEventSink,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1389,6 +1405,7 @@ impl AppState {
         private: bool,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
+        edit_sink: EditEventSink,
         hint_alphabet: HintAlphabet,
         pending_find: Option<String>,
         pending_new_tabs: Vec<String>,
@@ -1431,6 +1448,7 @@ impl AppState {
             current_mode_label: mode_label(PageMode::Normal),
             find_sink,
             hint_sink,
+            edit_sink,
             hint_alphabet,
             pending_find,
             find_smoke_at: None,
@@ -2484,6 +2502,7 @@ impl ApplicationHandler for AppState {
             self.download_notice_queue.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
+            self.edit_sink.clone(),
             self.hint_alphabet.clone(),
             (cef_w, cef_h),
             self.private,

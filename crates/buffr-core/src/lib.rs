@@ -15,6 +15,7 @@ pub mod app;
 pub mod cmdline;
 pub mod crash;
 pub mod download_notice;
+pub mod edit;
 pub mod find;
 pub mod handlers;
 pub mod hint;
@@ -40,6 +41,11 @@ pub use download_notice::{
     new_queue as new_download_notice_queue, peek_front as peek_download_notice,
     pop_front as pop_download_notice, push as push_download_notice,
     queue_len as download_notice_queue_len,
+};
+pub use edit::{
+    EDIT_CONSOLE_SENTINEL, EDIT_DOM_OVERLAY_CLASS, EditConsoleEvent, EditEventSink, EditFieldKind,
+    ParseError as EditParseError, build_inject_script as build_edit_inject_script,
+    drain_edit_events, new_edit_event_sink,
 };
 pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
