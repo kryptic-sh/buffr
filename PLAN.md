@@ -255,7 +255,8 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 - [x] History: SQLite store, dedupe, frecency search for omnibar. Pure data
       layer in `crates/buffr-history`; wired live via the CEF `LoadHandler` in
       `buffr-core::handlers`. Phase 5b/c follow-ups:
-  - [ ] FTS5 migration (replace `LIKE %q%` with `MATCH` + `bm25`).
+  - [x] FTS5 migration: replaced `LIKE %q%` with `visits_fts MATCH` (unicode61,
+        frecency ranks unchanged).
   - [x] `LoadHandler::on_load_start` transition-type wiring — `Reload`,
         `FormSubmit`, `Generated` decoded from CEF `TransitionType` and recorded
         in history; `Link` is the default.
@@ -447,8 +448,8 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
       `Editor<Rope, BuffrHost>` construction on `i`/`a`/`I`/`A`,
       `Editor::take_changes()` drain → DOM update each frame, `<Esc>` exit. hjkl
       0.3.0 is on crates.io so no upstream blocker remains.
-- [ ] **History FTS5 migration.** Replace `LIKE %q%` with `MATCH` + `bm25`
-      ranking in `crates/buffr-history`.
+- [x] **History FTS5 migration.** `visits_fts` (unicode61) in schema v2;
+      `search` uses `MATCH`; frecency ranking unchanged.
 - [ ] **Download `ask_each_time` UI.** Currently silent into `default_dir`;
       needs a chrome prompt strip (Phase 3 chrome surface is already in place —
       small wire-up).

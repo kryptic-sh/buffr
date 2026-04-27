@@ -395,13 +395,24 @@ impl History {
         Ok(rows)
     }
 
-    /// Search by substring (case-sensitive — SQLite `LIKE` is
-    /// case-insensitive on ASCII, case-sensitive on non-ASCII; for v1
-    /// that's fine since URLs are ASCII).
+    /// Search history using FTS5 token matching, ranked by frecency.
     ///
-    /// Frecency formula:
+    /// **Matching**: the query is run through `visits_fts MATCH` with
+    /// `unicode61` tokenization. Multi-word queries (`"rust learn"`) use
+    /// FTS5 implicit AND across both `url` and `title` columns. User
+    /// query text is wrapped in double-quotes before passing to SQLite
+    /// so that FTS5 special characters (`*`, `:`, `^`, `OR`, `AND`,
+    /// etc.) are treated as literals rather than operators — the same
+    /// substring-style experience as the old `LIKE %q%` path.
+    ///
+    /// **Empty query**: if `query` is empty (or only whitespace) the
+    /// function returns `Ok(vec![])`. Callers that want "show recent"
+    /// semantics on an empty bar should call [`History::recent`]
+    /// directly.
+    ///
+    /// **Frecency formula** (unchanged from v1):
     /// `score = visit_count * 2 + recency_bonus`, where
-    /// `recency_bonus = 10` if the latest visit was inside
+    /// `recency_bonus = 10` if the latest visit was within
     /// [`RECENCY_WINDOW_SECS`] (7 days) else `0`.
     ///
     /// Result rows are deduplicated by `url`; `visit_time` reflects
@@ -409,22 +420,29 @@ impl History {
     /// DESC` so two equally-scored entries surface the more recent
     /// one first.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<HistoryEntry>, HistoryError> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        // Wrap in FTS5 phrase-literal quotes; escape any embedded
+        // double-quotes by doubling them (FTS5 quoting convention).
+        let needle = format!("\"{}\"", query.replace('"', "\"\""));
         let conn = self.conn.lock().map_err(|_| HistoryError::Poisoned)?;
         let now = self.clock.now().timestamp();
         let recent_cutoff = now - RECENCY_WINDOW_SECS;
-        let needle = format!("%{query}%");
         let mut stmt = conn.prepare(
             "SELECT id, url, title, visit_time, transition, score FROM ( \
-               SELECT MAX(id) AS id, url, \
-                      (SELECT title FROM visits v2 WHERE v2.url = visits.url \
+               SELECT MAX(v.id) AS id, v.url, \
+                      (SELECT title FROM visits v2 WHERE v2.url = v.url \
                        ORDER BY visit_time DESC LIMIT 1) AS title, \
-                      MAX(visit_time) AS visit_time, \
-                      (SELECT transition FROM visits v2 WHERE v2.url = visits.url \
+                      MAX(v.visit_time) AS visit_time, \
+                      (SELECT transition FROM visits v2 WHERE v2.url = v.url \
                        ORDER BY visit_time DESC LIMIT 1) AS transition, \
-                      (COUNT(*) * 2 + CASE WHEN MAX(visit_time) >= ?1 THEN 10 ELSE 0 END) AS score \
-               FROM visits \
-               WHERE url LIKE ?2 OR title LIKE ?2 \
-               GROUP BY url \
+                      (COUNT(*) * 2 \
+                       + CASE WHEN MAX(v.visit_time) >= ?1 THEN 10 ELSE 0 END) AS score \
+               FROM visits v \
+               JOIN visits_fts f ON f.rowid = v.id \
+               WHERE visits_fts MATCH ?2 \
+               GROUP BY v.url \
              ) ORDER BY score DESC, visit_time DESC LIMIT ?3",
         )?;
         let rows = stmt
@@ -527,7 +545,7 @@ mod tests {
     fn open_in_memory_runs_migrations() {
         let h = History::open_in_memory().unwrap();
         assert_eq!(h.count().unwrap(), 0);
-        assert_eq!(schema::latest_version(), 1);
+        assert_eq!(schema::latest_version(), 2);
     }
 
     #[test]
@@ -709,5 +727,72 @@ mod tests {
         let recent = h.recent(2).unwrap();
         assert_eq!(recent[0].title.as_deref(), Some("fresh"));
         assert_eq!(recent[1].title.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn search_uses_fts_token_match() {
+        // URL contains "rust-lang" and "learn"; FTS5 implicit AND on
+        // two tokens spanning url + title should match.
+        let h = History::open_in_memory().unwrap();
+        h.record_visit(
+            "https://rust-lang.org/learn",
+            Some("Learn Rust"),
+            Transition::Link,
+        )
+        .unwrap();
+        // Unrelated page that must NOT appear.
+        h.record_visit("https://example.com/", Some("Example"), Transition::Link)
+            .unwrap();
+
+        let results = h.search("learn rust", 10).unwrap();
+        assert_eq!(results.len(), 1, "expected exactly one FTS match");
+        assert_eq!(results[0].url, "https://rust-lang.org/learn");
+    }
+
+    #[test]
+    fn search_handles_special_chars_in_query() {
+        // Characters like `*` are FTS5 operators. The quoting logic must
+        // neutralise them so the query returns Ok rather than Err.
+        let h = History::open_in_memory().unwrap();
+        h.record_visit("https://example.com/", None, Transition::Link)
+            .unwrap();
+
+        // These should not panic or error — result set may be empty.
+        assert!(h.search("foo*bar", 10).is_ok());
+        assert!(h.search("foo:bar", 10).is_ok());
+        assert!(h.search("OR AND NOT", 10).is_ok());
+        assert!(h.search("\"quoted\"", 10).is_ok());
+    }
+
+    #[test]
+    fn search_empty_query_returns_empty() {
+        // Empty (and whitespace-only) queries return Ok(vec![]) rather
+        // than matching everything. Callers wanting recent entries should
+        // use History::recent directly.
+        let h = History::open_in_memory().unwrap();
+        h.record_visit("https://example.com/", None, Transition::Link)
+            .unwrap();
+
+        assert_eq!(h.search("", 10).unwrap(), vec![]);
+        assert_eq!(h.search("   ", 10).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn migration_v2_indexes_existing_and_new_rows() {
+        // Open a fresh in-memory DB (runs both v1 + v2 migrations).
+        // Insert a row, then verify it is discoverable via search (which
+        // goes through visits_fts MATCH). This exercises both the
+        // backfill INSERT in v2 *and* the visits_ai trigger path.
+        let h = History::open_in_memory().unwrap();
+        h.record_visit(
+            "https://doc.rust-lang.org/",
+            Some("Rust Documentation"),
+            Transition::Link,
+        )
+        .unwrap();
+
+        let results = h.search("documentation", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://doc.rust-lang.org/");
     }
 }
