@@ -3,11 +3,9 @@
 # Generates a static HTML site from `docs/*.md`. The rendered output
 # lives in `docs-site/` (gitignored target dir) and is uploaded to
 # `https://docs.buffr.kryptic.sh/` on push to main via
-# `.github/workflows/docs.yml`.
-#
-# DNS for `docs.buffr.kryptic.sh` is a TODO — until that lands the
-# site is only reachable through the GitHub Pages preview URL the
-# Actions workflow drops.
+# `.github/workflows/docs.yml`. CNAME is injected into the artifact
+# at deploy time; DNS lives in DigitalOcean (CNAME docs.buffr →
+# kryptic-sh.github.io).
 #
 # Run locally:
 #   mdbook build       -> emits HTML into docs-site/
