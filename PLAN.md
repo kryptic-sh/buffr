@@ -155,32 +155,32 @@ delegates to `hjkl-editor`.
 
 **Edit-mode (delegates to hjkl)**:
 
-**Status:** blocked on hjkl `>= 0.0.X` exposing the `Host` trait +
-`Editor<R, H>`. The `hjkl-watch` cron routine
-([trig_017EBdEhK2jzFunShjXPWYsT](https://claude.ai/code/routines/trig_017EBdEhK2jzFunShjXPWYsT))
-polls hjkl crates hourly and will land integration in a `hjkl-bump-*` PR when it
-ships.
+**Status:** unblocked. hjkl is at 0.3.0 with `Editor<B, H>` generic + sealed
+`Host` trait on crates.io. The crossterm-0.29 bump landed
+`feed_input(PlannedInput)` as the engine entry in
+`crates/buffr-modal/src/edit_mode.rs`. Remaining wiring is plain engineering —
+gates the `v0.1.0` daily-driver cut.
 
-- [x] Add `hjkl-engine`, `hjkl-buffer`, `hjkl-editor` to workspace deps, pinned
-      `=0.0.x`. No default features. Pinned at `=0.0.25` in workspace
-      `Cargo.toml`; `hjkl-editor` not yet published — only `hjkl-engine` +
-      `hjkl-buffer` are wired today.
-- [ ] `BuffrHost` struct impls `hjkl_engine::Host`:
-      `write_clipboard`/`read_clipboard` via CEF clipboard API,
-      `Host::Intent = BuffrEditIntent { RequestAutocomplete, ... }`. **Status:**
-      blocked on hjkl exposing the `Host` trait.
+- [x] Add `hjkl-engine`, `hjkl-buffer` to workspace deps. Pinned at `=0.1.0`
+      (frozen SPEC). `default-features = false`; only `std` enabled (no
+      `crossterm`, no `ratatui`).
+- [x] `BuffrHost` impls `hjkl_engine::Host` — clipboard outbox, intent fan-out
+      (`BuffrEditIntent::RequestAutocomplete` etc.), viewport accessors. Lives
+      at `crates/buffr-modal/src/host.rs`.
+- [x] `EditSession` (`crates/buffr-modal/src/edit_mode.rs`) constructs
+      `Editor<hjkl_buffer::Buffer, BuffrHost>`, seeds from initial value,
+      forwards keystrokes via `feed_input(PlannedInput)` (crossterm-free path),
+      exposes `take_content_change()` pull-model drain. Unit-tested
+      independently of CEF.
 - [ ] CEF V8 binding for focused text-field value get/set; `apps/buffr-helper`
-      exposes JS bridge. **Status:** blocked on hjkl `Host` trait extraction.
-- [ ] On focus + `i`/`a`/`I`/`A` etc.: build `Rope` from field value, construct
-      `Editor<Rope, BuffrHost>`, route keys to it. **Status:** blocked on hjkl
-      `Editor<R, H>`.
-- [ ] Per render frame: drain `Editor::take_changes()` → CEF DOM update via JS
-      bridge. **Status:** blocked on hjkl `Editor::take_changes`.
-- [ ] `<Esc>` → exit edit-mode → drop `Editor`, return to page-mode. **Status:**
-      blocked on hjkl `Editor<R, H>`.
-- [ ] Smoke test: open a page with `<textarea>`, focus it, type `iHello<Esc>` →
-      field reads "Hello"; `dd` → field cleared. **Status:** blocked on the
-      edit-mode wiring above.
+      exposes JS bridge. **Gates v0.1.0.**
+- [ ] CEF focus event → spawn `EditSession` from field value; route key events
+      to it; on `<Esc>` (or focus-out) drop the session and return to page-mode.
+      **Gates v0.1.0.**
+- [ ] Per render frame: drain `EditSession::take_content_change()` → CEF DOM
+      update via the JS bridge. **Gates v0.1.0.**
+- [ ] Browser-side smoke test: open a page with `<textarea>`, focus it, type
+      `iHello<Esc>` → field reads "Hello"; `dd` → field cleared.
 
 ### Phase 3 — UI chrome
 
@@ -425,37 +425,61 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 
 ## Milestones
 
-| Tag      | Target       | Definition of done                               |
-| -------- | ------------ | ------------------------------------------------ |
-| `v0.1.0` | Phase 1 done | Linux: window opens, loads URL, exits clean.     |
-| `v0.2.0` | Phase 2 done | Modal engine drives navigation; default keymap.  |
-| `v0.3.0` | Phase 3 done | Native chrome: tabs, statusline, command, hints. |
-| `v0.4.0` | Phase 4 done | TOML config, hot reload, custom keymaps.         |
-| `v0.9.0` | Phase 5 done | Feature-complete for daily driving.              |
-| `v1.0.0` | Phase 6 done | Signed packages on all tier-1 platforms.         |
+The 0.0.x line is the churn phase — Phases 0–6 all landed under it without
+per-phase tag cuts. The first cut version is **`v0.1.0` — first daily-driver
+release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
 
-## Status snapshot — 2026-04-26
+| Tag      | Definition of done                                                                                                                                                                                  |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v0.1.0` | First daily-driver. Phases 1–6 functionally complete; edit-mode integrated with hjkl `Editor<B, H>`; FTS5 history + ask-each-time download UI landed; unsigned packages on Linux + macOS + Windows. |
+| `v0.2.0` | Edit-mode polish: external-edit reconciliation, autocomplete intent, `:registers` parity with hjkl. Native Wayland OSR if it lands.                                                                 |
+| `v1.0.0` | Signed packages on all tier-1 platforms (macOS Developer ID / notarization, Windows Authenticode). Sandbox + sync verified.                                                                         |
 
-All non-hjkl-blocked work is landed. Open items:
+### What gates `v0.1.0`
 
-- **Phase 2 edit-mode** — blocked on hjkl `Host` trait extraction. The
-  `hjkl-watch` cron routine
-  ([trig_017EBdEhK2jzFunShjXPWYsT](https://claude.ai/code/routines/trig_017EBdEhK2jzFunShjXPWYsT))
-  polls hjkl crates hourly; it will bump pins, integrate the trait, and open a
-  PR when 0.0.x exposes `Host` (or 0.1.0 lands).
-- **Phase 3 OSR** — scaffolded; full implementation reserved for native Wayland
-  (post-1.0). XWayland covers Wayland sessions today.
-- **Signing infrastructure** — macOS Developer ID / notarization and Windows
-  code signing are deferred until certs are provisioned. Unsigned packages are
-  produced by the existing `xtask package-{linux,macos-dmg,windows-msi}` flows
-  for development.
+- [ ] **Edit-mode lifecycle wired end-to-end.** Engine entry exists
+      (`feed_input(PlannedInput)` lands in `buffr-modal/src/edit_mode.rs` after
+      the crossterm 0.29 bump); remaining: CEF V8 binding for focused text-field
+      value get/set in `apps/buffr-helper`, Rope mirror +
+      `Editor<Rope, BuffrHost>` construction on `i`/`a`/`I`/`A`,
+      `Editor::take_changes()` drain → DOM update each frame, `<Esc>` exit. hjkl
+      0.3.0 is on crates.io so no upstream blocker remains.
+- [ ] **History FTS5 migration.** Replace `LIKE %q%` with `MATCH` + `bm25`
+      ranking in `crates/buffr-history`.
+- [ ] **Download `ask_each_time` UI.** Currently silent into `default_dir`;
+      needs a chrome prompt strip (Phase 3 chrome surface is already in place —
+      small wire-up).
+- [ ] **`buffr query history --limit N --search foo` CLI.** Surface the data
+      without UI for power users.
+- [ ] **`SKIP_SCHEMES` config knob** under `[privacy]`.
+- [ ] **`LoadHandler::on_load_start` transition-type wiring** — distinguish
+      `Reload` from `Link` in history records.
+- [ ] **Bookmarks UI in omnibar** — Phase 5b small follow-up.
 
-Test count: 415 passing across the workspace as of this audit.
+Signing (macOS Developer ID, Windows Authenticode) and native Wayland OSR are
+explicitly **not** gating 0.1.0. Unsigned packages ship at 0.1.0; signed
+packages cut 1.0.
+
+## Status snapshot — 2026-04-28
+
+Phases 0–6 are all landed. Outstanding items are tracked above under "What gates
+`v0.1.0`". Other open work:
+
+- **Phase 3 OSR** — scaffolded; full implementation reserved for native Wayland.
+  XWayland covers Wayland sessions today. Targeting 0.2.0+.
+- **Signing infrastructure** — deferred to 1.0. Unsigned packages from
+  `xtask package-{linux,macos-dmg,windows-msi}` are the 0.1.0 artifacts.
+
+hjkl unblocked: hjkl is at 0.3.0 on crates.io with `Editor<B, H>` generic over
+backend + host, the SPEC frozen, and a 14-method sealed Buffer trait. Buffr's
+edit-mode integration is no longer blocked on upstream — it is plain-old
+engineering work.
+
+Test count: 416 passing across the workspace.
 
 Bug fixes, dependency bumps, and small features are tracked via:
 
 - `dependabot` (weekly cargo + GitHub Actions PRs)
-- `hjkl-watch` (hourly hjkl version checks)
 - Direct PRs / commits as work continues
 
 ## Open Questions
