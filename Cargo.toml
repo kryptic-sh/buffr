@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 bitflags = "2"
 toml = "1.1"
-directories = "5"
+directories = "6"
 winit = "0.30"
 raw-window-handle = "0.6"
 ureq = { version = "3", features = ["json"] }
