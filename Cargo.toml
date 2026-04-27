@@ -46,7 +46,7 @@ notify = "8"
 # History store deps. `rusqlite`'s `bundled` feature is opted-in by
 # `buffr-history` — we expose the workspace base here without features
 # so other crates can later pick a different bundling mode if needed.
-rusqlite = "0.31"
+rusqlite = "0.39"
 chrono = { version = "0.4", default-features = false }
 url = "2"
 # Used by `buffr-bookmarks` for Netscape HTML import. Format is loose
