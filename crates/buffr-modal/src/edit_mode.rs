@@ -10,8 +10,45 @@
 
 use crate::host::BuffrHost;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hjkl_engine::{Editor, KeybindingMode, VimMode, types::Options};
+use hjkl_engine::{
+    Editor, KeybindingMode, Modifiers, PlannedInput, SpecialKey, VimMode, types::Options,
+};
 use std::sync::Arc;
+
+/// Convert a crossterm [`KeyEvent`] into the engine's [`PlannedInput`].
+///
+/// Uses the crossterm-free `feed_input` path so the engine and buffr
+/// can carry different crossterm major versions without a type mismatch.
+fn key_event_to_planned(key: KeyEvent) -> PlannedInput {
+    let mods = Modifiers {
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        super_: key.modifiers.contains(KeyModifiers::SUPER),
+    };
+    match key.code {
+        KeyCode::Char(c) => PlannedInput::Char(c, mods),
+        KeyCode::Esc => PlannedInput::Key(SpecialKey::Esc, mods),
+        KeyCode::Enter => PlannedInput::Key(SpecialKey::Enter, mods),
+        KeyCode::Backspace => PlannedInput::Key(SpecialKey::Backspace, mods),
+        KeyCode::Tab => PlannedInput::Key(SpecialKey::Tab, mods),
+        KeyCode::BackTab => PlannedInput::Key(SpecialKey::BackTab, mods),
+        KeyCode::Up => PlannedInput::Key(SpecialKey::Up, mods),
+        KeyCode::Down => PlannedInput::Key(SpecialKey::Down, mods),
+        KeyCode::Left => PlannedInput::Key(SpecialKey::Left, mods),
+        KeyCode::Right => PlannedInput::Key(SpecialKey::Right, mods),
+        KeyCode::Home => PlannedInput::Key(SpecialKey::Home, mods),
+        KeyCode::End => PlannedInput::Key(SpecialKey::End, mods),
+        KeyCode::PageUp => PlannedInput::Key(SpecialKey::PageUp, mods),
+        KeyCode::PageDown => PlannedInput::Key(SpecialKey::PageDown, mods),
+        KeyCode::Insert => PlannedInput::Key(SpecialKey::Insert, mods),
+        KeyCode::Delete => PlannedInput::Key(SpecialKey::Delete, mods),
+        KeyCode::F(n) => PlannedInput::Key(SpecialKey::F(n), mods),
+        // Anything else the engine can't model — treat as consumed no-op
+        // by wrapping a Null-equivalent char that the FSM ignores.
+        _ => PlannedInput::Key(SpecialKey::Insert, mods),
+    }
+}
 
 /// One active edit-mode session bound to a single text field.
 ///
@@ -44,7 +81,7 @@ impl EditSession {
     /// consumed by the engine; `false` means the caller should let
     /// the page see it (`<Esc>` in normal mode, etc.).
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        self.editor.handle_key(key)
+        self.editor.feed_input(key_event_to_planned(key))
     }
 
     /// Convenience: type a literal character with no modifiers. Used

@@ -33,7 +33,7 @@ hjkl-buffer = { workspace = true }
 # crossterm KeyEvent is the engine's input type today; the host
 # bridges from CEF browser keys into it. When trait extraction lands a
 # host-native Input enum, this dep moves out.
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 
 # Optional: only enabled by the `winit` feature. Used by the
 # `winit_adapter` module that converts `winit::event::KeyEvent` into
