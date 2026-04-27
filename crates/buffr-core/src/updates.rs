@@ -113,17 +113,20 @@ pub struct UreqClient;
 
 impl HttpClient for UreqClient {
     fn get(&self, url: &str) -> Result<String, String> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(5))
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_recv_response(Some(Duration::from_secs(5)))
             .user_agent(USER_AGENT)
             .build();
-        let resp = agent
+        let agent = ureq::Agent::new_with_config(config);
+        let mut resp = agent
             .get(url)
-            .set("Accept", "application/vnd.github+json")
+            .header("Accept", "application/vnd.github+json")
             .call()
             .map_err(|e| format!("ureq: {e}"))?;
-        resp.into_string().map_err(|e| format!("body read: {e}"))
+        resp.body_mut()
+            .read_to_string()
+            .map_err(|e| format!("body read: {e}"))
     }
 }
 
