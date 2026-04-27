@@ -39,5 +39,10 @@ pub use host::{BuffrEditIntent, BuffrHost};
 pub use key::{Key, KeyChord, Modifiers, NamedKey, ParseError, parse_key, parse_keys};
 pub use keymap::{BindError, Keymap, Lookup};
 
+// Re-export hjkl_engine types needed by the winit key-routing path in
+// `apps/buffr/src/main.rs`. `buffr-modal` owns the hjkl_engine dep so
+// the app binary doesn't need its own direct dependency.
+pub use hjkl_engine::{Modifiers as EngineModifiers, PlannedInput, SpecialKey, VimMode};
+
 #[cfg(feature = "winit")]
 pub use winit_adapter::key_event_to_chord;
