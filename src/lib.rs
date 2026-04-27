@@ -225,11 +225,31 @@ pub enum ClearableData {
     LocalStorage,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Default schemes suppressed by [`buffr_history`].
+pub const DEFAULT_SKIP_SCHEMES: &[&str] = &["about", "cef", "chrome", "data", "file"];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Privacy {
     pub enable_telemetry: bool,
     pub clear_on_exit: Vec<ClearableData>,
+    /// URL schemes whose visits are never recorded in history. Matching
+    /// is case-insensitive on the scheme component. The default list
+    /// (`about`, `cef`, `chrome`, `data`, `file`) covers internal
+    /// browser pages and privacy-sensitive local URLs. Add entries to
+    /// suppress additional schemes (e.g. `"javascript"`, `"blob"`);
+    /// remove entries to record them (unusual but supported).
+    pub skip_schemes: Vec<String>,
+}
+
+impl Default for Privacy {
+    fn default() -> Self {
+        Self {
+            enable_telemetry: false,
+            clear_on_exit: Vec::new(),
+            skip_schemes: DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 }
 
 /// `[crash_reporter]` section — Phase 6 opt-in panic reporter.
@@ -744,6 +764,28 @@ weird = "nope"
     }
 
     #[test]
+    fn privacy_default_skip_schemes_contains_canonical_list() {
+        let p = Privacy::default();
+        for scheme in DEFAULT_SKIP_SCHEMES {
+            assert!(
+                p.skip_schemes.iter().any(|s| s == scheme),
+                "default skip_schemes missing {scheme:?}"
+            );
+        }
+        assert_eq!(p.skip_schemes.len(), DEFAULT_SKIP_SCHEMES.len());
+    }
+
+    #[test]
+    fn privacy_skip_schemes_parses_from_toml() {
+        let toml = r#"
+[privacy]
+skip_schemes = ["javascript", "blob"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.privacy.skip_schemes, vec!["javascript", "blob"]);
+    }
+
+    #[test]
     fn privacy_clear_on_exit_parses_known_variants() {
         let toml = r#"
 [privacy]
@@ -894,6 +936,7 @@ mode = "auto"
 [privacy]
 enable_telemetry = false
 clear_on_exit = []
+skip_schemes = ["about", "cef", "chrome", "data", "file"]
 
 [downloads]
 open_on_finish = false
