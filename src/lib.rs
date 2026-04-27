@@ -12,11 +12,13 @@
 
 use buffr_modal::PageMode;
 
+pub mod download_notice;
 pub mod font;
 pub mod input_bar;
 pub mod permissions_prompt;
 pub mod tab_strip;
 
+pub use download_notice::{DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip};
 pub use input_bar::{
     INPUT_HEIGHT, InputBar, MAX_SUGGESTIONS, Palette as InputPalette, SUGGESTION_ROW_HEIGHT,
     Suggestion, SuggestionKind,
