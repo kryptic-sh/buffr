@@ -312,7 +312,7 @@ impl Default for HintConfig {
 /// `[downloads]` section. Phase 5: governs where files land, whether
 /// buffr opens them on completion, and (post-Phase 3) whether the
 /// chrome surfaces a save-as dialog.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DownloadsConfig {
     /// User-specified default directory. `None` (the default) means
@@ -322,11 +322,26 @@ pub struct DownloadsConfig {
     /// open command (`xdg-open` / `open` / `start`). Default `false`.
     pub open_on_finish: bool,
     /// Show a save-as dialog for every download. Default `false` —
-    /// downloads silently land in `default_dir`. The actual dialog UI
-    /// is Phase 3 chrome work; setting this `true` before then is
-    /// effectively a no-op (CEF's `BeforeDownloadCallback::cont`
-    /// receives `show_dialog = 1` but no native dialog is wired yet).
+    /// downloads silently land in `default_dir`. When `true`, CEF's
+    /// `BeforeDownloadCallback::cont` receives `show_dialog = 1` which
+    /// triggers the OS native Save-As dialog; the notification strip is
+    /// suppressed because the user already gets OS-level feedback.
     pub ask_each_time: bool,
+    /// Surface a chrome notification strip when a download starts or
+    /// finishes (only relevant when `ask_each_time = false`). Default
+    /// `true`. Set to `false` to opt out of the strip entirely.
+    pub show_notifications: bool,
+}
+
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        Self {
+            default_dir: None,
+            open_on_finish: false,
+            ask_each_time: false,
+            show_notifications: true,
+        }
+    }
 }
 
 /// Resolve the effective default download directory.
@@ -715,6 +730,7 @@ mod tests {
         assert!(cfg.downloads.default_dir.is_none());
         assert!(!cfg.downloads.open_on_finish);
         assert!(!cfg.downloads.ask_each_time);
+        assert!(cfg.downloads.show_notifications);
     }
 
     #[test]
@@ -732,6 +748,18 @@ ask_each_time = false
         );
         assert!(cfg.downloads.open_on_finish);
         assert!(!cfg.downloads.ask_each_time);
+        // show_notifications defaults to true when absent.
+        assert!(cfg.downloads.show_notifications);
+    }
+
+    #[test]
+    fn downloads_show_notifications_parses() {
+        let toml = r#"
+[downloads]
+show_notifications = false
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.downloads.show_notifications);
     }
 
     #[test]
