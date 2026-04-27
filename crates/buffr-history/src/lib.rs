@@ -41,11 +41,11 @@ use tracing::{debug, trace};
 
 pub mod schema;
 
-/// Schemes we never record. `about:` covers `about:blank` /
-/// `about:srcdoc`; `cef:` and `chrome:` cover internal browser UI;
-/// `data:` and `file:` are noisy and privacy-sensitive. Phase 4 will
-/// surface this list as a config knob.
-const SKIP_SCHEMES: &[&str] = &["about", "cef", "chrome", "data", "file"];
+/// Canonical default schemes never recorded. `about:` covers
+/// `about:blank` / `about:srcdoc`; `cef:` and `chrome:` cover internal
+/// browser UI; `data:` and `file:` are noisy and privacy-sensitive.
+/// Surfaced as `config.privacy.skip_schemes` (Phase 4).
+pub const DEFAULT_SKIP_SCHEMES: &[&str] = &["about", "cef", "chrome", "data", "file"];
 
 /// Dedupe window. If a row exists for the same canonical URL whose
 /// `visit_time` is within this many seconds of `now`, we update that
@@ -191,20 +191,43 @@ impl Clock for MockClock {
 pub struct History {
     conn: Mutex<Connection>,
     clock: Box<dyn Clock>,
+    skip_schemes: Vec<String>,
 }
 
 impl History {
     /// Open or create the SQLite database at `path` and run any
-    /// pending schema migrations. Uses [`SystemClock`] for time.
+    /// pending schema migrations. Uses [`SystemClock`] for time and
+    /// the canonical [`DEFAULT_SKIP_SCHEMES`] list.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HistoryError> {
         Self::open_with_clock(path, Box::new(SystemClock))
     }
 
+    /// Open with a caller-supplied skip-schemes list. Pass
+    /// `config.privacy.skip_schemes.clone()` here. Schemes are matched
+    /// case-insensitively on the URL scheme component.
+    pub fn open_with_skip_schemes(
+        path: impl AsRef<Path>,
+        skip_schemes: Vec<String>,
+    ) -> Result<Self, HistoryError> {
+        Self::open_with_clock_and_skip_schemes(path, Box::new(SystemClock), skip_schemes)
+    }
+
     /// Open or create the database with a custom [`Clock`] impl. Used
     /// by tests to drive the dedupe window deterministically.
+    /// Uses the canonical [`DEFAULT_SKIP_SCHEMES`] list.
     pub fn open_with_clock(
         path: impl AsRef<Path>,
         clock: Box<dyn Clock>,
+    ) -> Result<Self, HistoryError> {
+        let schemes = DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect();
+        Self::open_with_clock_and_skip_schemes(path, clock, schemes)
+    }
+
+    /// Full constructor: custom clock + custom skip-schemes list.
+    pub fn open_with_clock_and_skip_schemes(
+        path: impl AsRef<Path>,
+        clock: Box<dyn Clock>,
+        skip_schemes: Vec<String>,
     ) -> Result<Self, HistoryError> {
         let mut conn = Connection::open_with_flags(
             path.as_ref(),
@@ -216,17 +239,37 @@ impl History {
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
+            skip_schemes,
         })
     }
 
     /// In-memory database — for tests and short-lived ephemeral
     /// profiles (private windows, Phase 5 follow-up).
+    /// Uses the canonical [`DEFAULT_SKIP_SCHEMES`] list.
     pub fn open_in_memory() -> Result<Self, HistoryError> {
         Self::open_in_memory_with_clock(Box::new(SystemClock))
     }
 
+    /// In-memory database with a caller-supplied skip-schemes list.
+    /// Pass `config.privacy.skip_schemes.clone()` here.
+    pub fn open_in_memory_with_skip_schemes(
+        skip_schemes: Vec<String>,
+    ) -> Result<Self, HistoryError> {
+        Self::open_in_memory_with_clock_and_skip_schemes(Box::new(SystemClock), skip_schemes)
+    }
+
     /// In-memory database with a custom clock.
+    /// Uses the canonical [`DEFAULT_SKIP_SCHEMES`] list.
     pub fn open_in_memory_with_clock(clock: Box<dyn Clock>) -> Result<Self, HistoryError> {
+        let schemes = DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect();
+        Self::open_in_memory_with_clock_and_skip_schemes(clock, schemes)
+    }
+
+    /// Full in-memory constructor: custom clock + custom skip-schemes list.
+    pub fn open_in_memory_with_clock_and_skip_schemes(
+        clock: Box<dyn Clock>,
+        skip_schemes: Vec<String>,
+    ) -> Result<Self, HistoryError> {
         let mut conn =
             Connection::open_in_memory().map_err(|source| HistoryError::Open { source })?;
         Self::tune(&conn)?;
@@ -234,6 +277,7 @@ impl History {
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
+            skip_schemes,
         })
     }
 
@@ -276,7 +320,7 @@ impl History {
                 return Ok(());
             }
         };
-        if is_skip_scheme(&canon) {
+        if is_skip_scheme(&canon, &self.skip_schemes) {
             trace!(url = %canon, "history: skip-scheme; not recording");
             return Ok(());
         }
@@ -463,12 +507,12 @@ fn canonicalise(input: &str) -> Option<String> {
     url::Url::parse(trimmed).ok().map(|u| u.to_string())
 }
 
-fn is_skip_scheme(canonical_url: &str) -> bool {
+fn is_skip_scheme(canonical_url: &str, skip_schemes: &[String]) -> bool {
     let scheme = match canonical_url.split_once(':') {
         Some((s, _)) => s.to_ascii_lowercase(),
         None => return true,
     };
-    SKIP_SCHEMES.contains(&scheme.as_str())
+    skip_schemes.iter().any(|s| s.eq_ignore_ascii_case(&scheme))
 }
 
 #[cfg(test)]
@@ -612,6 +656,18 @@ mod tests {
         h.record_visit("data:text/plain,hi", None, Transition::Link)
             .unwrap();
         assert_eq!(h.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn custom_skip_schemes_honored() {
+        let h = History::open_in_memory_with_skip_schemes(vec!["javascript".to_string()]).unwrap();
+        h.record_visit("javascript:alert(1)", None, Transition::Link)
+            .unwrap();
+        assert_eq!(h.count().unwrap(), 0);
+        // A normal https URL must still be recorded.
+        h.record_visit("https://example.com/", None, Transition::Link)
+            .unwrap();
+        assert_eq!(h.count().unwrap(), 1);
     }
 
     #[test]

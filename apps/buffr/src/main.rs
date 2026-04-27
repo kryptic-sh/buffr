@@ -309,6 +309,19 @@ fn main() -> Result<()> {
         info!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
     }
 
+    // -------- load config + build initial keymap ----------------------
+    let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "config load failed; falling back to defaults");
+            (Config::default(), ConfigSource::Defaults)
+        }
+    };
+    match &source {
+        ConfigSource::File(p) => info!(path = %p.display(), "config loaded"),
+        ConfigSource::Defaults => info!("config: built-in defaults"),
+    }
+
     // -------- history store --------
     //
     // Phase 5: SQLite-backed history at
@@ -317,10 +330,16 @@ fn main() -> Result<()> {
     // `buffr_core::handlers`) pump every main-frame visit + title
     // into it. Private mode opens an in-memory DB instead.
     let history = Arc::new(if cli.private {
-        buffr_history::History::open_in_memory().context("opening in-memory history")?
+        buffr_history::History::open_in_memory_with_skip_schemes(
+            config.privacy.skip_schemes.clone(),
+        )
+        .context("opening in-memory history")?
     } else {
-        buffr_history::History::open(paths.data.join("history.sqlite"))
-            .context("opening history database")?
+        buffr_history::History::open_with_skip_schemes(
+            paths.data.join("history.sqlite"),
+            config.privacy.skip_schemes.clone(),
+        )
+        .context("opening history database")?
     });
     let initial_rows = history.count().unwrap_or(0);
     info!(rows = initial_rows, "history opened");
@@ -366,19 +385,6 @@ fn main() -> Result<()> {
             .context("opening permissions database")?
     });
     let permissions_queue = new_permissions_queue();
-
-    // -------- load config + build initial keymap ----------------------
-    let (config, source) = match buffr_config::load_and_validate(cli.config.as_deref()) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "config load failed; falling back to defaults");
-            (Config::default(), ConfigSource::Defaults)
-        }
-    };
-    match &source {
-        ConfigSource::File(p) => info!(path = %p.display(), "config loaded"),
-        ConfigSource::Defaults => info!("config: built-in defaults"),
-    }
 
     // -------- downloads store + resolved config -----------------------
     //

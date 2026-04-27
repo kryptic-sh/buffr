@@ -67,6 +67,13 @@ enable_telemetry = false
 #
 # clear_on_exit = ["cookies", "cache", "local_storage"]
 clear_on_exit = []
+# URL schemes whose visits are never recorded in browsing history.
+# The scheme component is matched case-insensitively. The default list
+# covers internal browser pages (about:, cef:, chrome:) and
+# privacy-sensitive local URLs (data:, file:). Extend to suppress
+# additional schemes (e.g. add "javascript", "blob"); remove entries to
+# record those schemes (unusual but supported).
+skip_schemes = ["about", "cef", "chrome", "data", "file"]
 # Permissions store lives at <data>/permissions.sqlite. Use the
 # `--list-permissions` / `--clear-permissions` / `--forget-origin` CLI
 # flags to inspect or reset the table without launching CEF. Adding

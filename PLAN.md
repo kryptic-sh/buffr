@@ -260,7 +260,9 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
         (`transition_type` flag) — currently every visit is recorded as `Link`.
   - [ ] Expose `buffr query history --limit N --search foo` CLI when chrome /
         omnibar lands so the data is reachable without UI.
-  - [ ] Surface `SKIP_SCHEMES` as a `[privacy]` config knob.
+  - [x] `SKIP_SCHEMES` shipped as `config.privacy.skip_schemes`; defaults to
+        canonical list; wired at `History::open_with_skip_schemes` /
+        `open_in_memory_with_skip_schemes`.
 - [x] Bookmarks: tagged, SQLite-backed, CLI import (Netscape HTML). Pure data
       layer in `crates/buffr-bookmarks`; CLI flags `--import-bookmarks`,
       `--list-bookmarks`, `--list-bookmarks-tags` exposed on `apps/buffr`. UI
@@ -451,7 +453,8 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
       small wire-up).
 - [ ] **`buffr query history --limit N --search foo` CLI.** Surface the data
       without UI for power users.
-- [ ] **`SKIP_SCHEMES` config knob** under `[privacy]`.
+- [x] **`SKIP_SCHEMES` config knob** under `[privacy]` — lives at
+      `config.privacy.skip_schemes`.
 - [ ] **`LoadHandler::on_load_start` transition-type wiring** — distinguish
       `Reload` from `Link` in history records.
 - [ ] **Bookmarks UI in omnibar** — Phase 5b small follow-up.
