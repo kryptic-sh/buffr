@@ -210,7 +210,8 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
     let index: CefIndex = ureq::get(&index_url)
         .call()
         .context("fetching CEF index.json")?
-        .into_json()
+        .body_mut()
+        .read_json()
         .context("parsing CEF index.json")?;
 
     let plat = match platform.as_str() {
@@ -315,7 +316,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     let resp = ureq::get(url)
         .call()
         .with_context(|| format!("GET {url}"))?;
-    let mut reader = resp.into_reader();
+    let mut reader = resp.into_body().into_reader();
     let mut file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
