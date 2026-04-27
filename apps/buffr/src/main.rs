@@ -133,6 +133,18 @@ struct Cli {
     /// the count of rows removed.
     #[arg(long, value_name = "ORIGIN")]
     forget_origin: Option<String>,
+    /// Print every history entry (most-recent first) and exit.
+    /// Debug aid until the history UI lands. See also `--history-limit`.
+    #[arg(long)]
+    list_history: bool,
+    /// Frecency-search history for `<QUERY>` and print matches, best
+    /// first. Mutually exclusive with `--list-history` (search wins).
+    #[arg(long, value_name = "QUERY")]
+    search_history: Option<String>,
+    /// Maximum rows returned by `--list-history` / `--search-history`.
+    /// Defaults to 100.
+    #[arg(long, value_name = "N")]
+    history_limit: Option<usize>,
     /// Print the telemetry on/off state, the on-disk counter file
     /// path, and the current counter table; exit 0. No CEF init.
     #[arg(long)]
@@ -275,6 +287,10 @@ fn main() -> Result<()> {
     }
     if cli.audit_keymap {
         return run_audit_keymap();
+    }
+    if cli.search_history.is_some() || cli.list_history {
+        let limit = cli.history_limit.unwrap_or(100);
+        return run_query_history(cli.search_history.as_deref(), limit);
     }
 
     tracing_subscriber::fmt()
@@ -823,6 +839,42 @@ fn run_clear_zoom() -> Result<()> {
     let z = open_zoom_for_cli()?;
     let n = z.clear().context("clearing zoom rows")?;
     println!("cleared {n} zoom rows");
+    Ok(())
+}
+
+/// Open the history store at the standard data path. Used by the CLI
+/// short-circuits — no CEF init. Skip-schemes only matter for recording,
+/// not for reading, so we pass the canonical defaults.
+fn open_history_for_cli() -> Result<buffr_history::History> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    let h = buffr_history::History::open(paths.data.join("history.sqlite"))
+        .context("opening history database")?;
+    Ok(h)
+}
+
+/// `--list-history` / `--search-history` short-circuit.
+///
+/// When `search` is `Some`, performs a frecency search; otherwise lists
+/// the `limit` most-recent visits. Output: one row per visit,
+/// tab-separated: `<id>\t<visit_time RFC3339>\t<transition>\t<url>\t<title-or-empty>`.
+fn run_query_history(search: Option<&str>, limit: usize) -> Result<()> {
+    let h = open_history_for_cli()?;
+    let entries = match search {
+        Some(q) => h.search(q, limit).context("searching history")?,
+        None => h.recent(limit).context("loading recent history")?,
+    };
+    for e in &entries {
+        let title = e.title.as_deref().unwrap_or("");
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            e.id,
+            e.visit_time.to_rfc3339(),
+            e.transition.as_str(),
+            e.url,
+            title
+        );
+    }
     Ok(())
 }
 

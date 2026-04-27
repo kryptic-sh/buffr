@@ -259,8 +259,8 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
   - [x] `LoadHandler::on_load_start` transition-type wiring — `Reload`,
         `FormSubmit`, `Generated` decoded from CEF `TransitionType` and recorded
         in history; `Link` is the default.
-  - [ ] Expose `buffr query history --limit N --search foo` CLI when chrome /
-        omnibar lands so the data is reachable without UI.
+  - [x] History CLI flags (`--list-history`, `--search-history`,
+        `--history-limit`) shipped — data reachable without UI.
   - [x] `SKIP_SCHEMES` shipped as `config.privacy.skip_schemes`; defaults to
         canonical list; wired at `History::open_with_skip_schemes` /
         `open_in_memory_with_skip_schemes`.
@@ -452,8 +452,10 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
 - [ ] **Download `ask_each_time` UI.** Currently silent into `default_dir`;
       needs a chrome prompt strip (Phase 3 chrome surface is already in place —
       small wire-up).
-- [ ] **`buffr query history --limit N --search foo` CLI.** Surface the data
-      without UI for power users.
+- [x] **History CLI flags** — `--list-history`, `--search-history <QUERY>`,
+      `--history-limit <N>` on the top-level `Cli` struct; short-circuit before
+      CEF init, output one tab-separated row per visit. Surface the data without
+      UI for power users.
 - [x] **`SKIP_SCHEMES` config knob** under `[privacy]` — lives at
       `config.privacy.skip_schemes`.
 - [x] **`LoadHandler::on_load_start` transition-type wiring** — `Reload`,
