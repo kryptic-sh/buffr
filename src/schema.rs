@@ -35,6 +35,39 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_visits_time ON visits(visit_time DESC);
     CREATE INDEX IF NOT EXISTS idx_visits_url_time ON visits(url, visit_time DESC);
     "#,
+    // v2 — FTS5 external-content index over (url, title) using the
+    // unicode61 tokenizer with diacritic folding. `content='visits'`
+    // + `content_rowid='id'` means the FTS shadow tables mirror real
+    // rows; MATCH joins land on rowid so the frecency query can JOIN
+    // visits_fts ON rowid = visits.id. Three triggers keep the index
+    // in sync with INSERT / DELETE / UPDATE on `visits`.
+    r#"
+    CREATE VIRTUAL TABLE visits_fts USING fts5(
+      url,
+      title,
+      content='visits',
+      content_rowid='id',
+      tokenize='unicode61 remove_diacritics 2'
+    );
+
+    INSERT INTO visits_fts(rowid, url, title)
+    SELECT id, url, COALESCE(title, '') FROM visits;
+
+    CREATE TRIGGER visits_ai AFTER INSERT ON visits BEGIN
+      INSERT INTO visits_fts(rowid, url, title)
+      VALUES (new.id, new.url, COALESCE(new.title, ''));
+    END;
+    CREATE TRIGGER visits_ad AFTER DELETE ON visits BEGIN
+      INSERT INTO visits_fts(visits_fts, rowid, url, title)
+      VALUES ('delete', old.id, old.url, COALESCE(old.title, ''));
+    END;
+    CREATE TRIGGER visits_au AFTER UPDATE ON visits BEGIN
+      INSERT INTO visits_fts(visits_fts, rowid, url, title)
+      VALUES ('delete', old.id, old.url, COALESCE(old.title, ''));
+      INSERT INTO visits_fts(rowid, url, title)
+      VALUES (new.id, new.url, COALESCE(new.title, ''));
+    END;
+    "#,
 ];
 
 /// Run all pending migrations, leaving `schema_version` reflecting the
