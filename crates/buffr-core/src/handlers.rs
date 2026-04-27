@@ -23,8 +23,9 @@
 //! defaults to a no-op client and our handlers never fire).
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use buffr_config::DownloadsConfig;
 use buffr_downloads::{DownloadStatus, Downloads};
@@ -85,7 +86,12 @@ pub fn make_load_handler(
     zoom: Arc<ZoomStore>,
     counters: Option<Arc<UsageCounters>>,
 ) -> LoadHandler {
-    BuffrLoadHandler::new(history, zoom, counters)
+    BuffrLoadHandler::new(
+        history,
+        zoom,
+        counters,
+        Arc::new(Mutex::new(HashMap::new())),
+    )
 }
 
 /// Standalone factory for the display handler — same rationale as
@@ -139,6 +145,7 @@ wrap_client! {
                 self.history.clone(),
                 self.zoom.clone(),
                 self.counters.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
             ))
         }
 
@@ -210,9 +217,30 @@ wrap_load_handler! {
         history: Arc<History>,
         zoom: Arc<ZoomStore>,
         counters: Option<Arc<UsageCounters>>,
+        pending_transitions: Arc<Mutex<HashMap<i32, Transition>>>,
     }
 
     impl LoadHandler {
+        fn on_load_start(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            transition_type: TransitionType,
+        ) {
+            // Only track main-frame navigations; subframes never reach
+            // `record_visit` in `on_load_end` anyway.
+            let Some(frame) = frame else { return };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let Some(browser) = browser else { return };
+            let id = cef::ImplBrowser::identifier(browser);
+            let transition = decode_transition(transition_type);
+            if let Ok(mut map) = self.pending_transitions.lock() {
+                map.insert(id, transition);
+            }
+        }
+
         fn on_load_end(
             &self,
             browser: Option<&mut Browser>,
@@ -233,12 +261,18 @@ wrap_load_handler! {
             if let Some(c) = self.counters.as_ref() {
                 c.increment(KEY_PAGES_LOADED);
             }
-            // Phase 5 always records as `Link`. Differentiating
-            // `Reload` requires hooking `on_load_start`'s
-            // `transition_type` — punted to Phase 5 follow-up so we
-            // don't conflate the dedupe + transition wiring.
+            // Retrieve the transition stashed by `on_load_start`. If
+            // none is present (e.g. the load started before this
+            // handler was wired), fall back to `Link`.
+            let transition = browser
+                .as_ref()
+                .and_then(|b| {
+                    let id = cef::ImplBrowser::identifier(*b);
+                    self.pending_transitions.lock().ok()?.remove(&id)
+                })
+                .unwrap_or(Transition::Link);
             if let Err(err) =
-                self.history.record_visit(&url, None, Transition::Link)
+                self.history.record_visit(&url, None, transition)
             {
                 tracing::warn!(error = %err, %url, "history: record_visit failed");
             }
@@ -265,6 +299,44 @@ wrap_load_handler! {
                 }
             }
         }
+    }
+}
+
+/// Map a CEF [`TransitionType`] to our [`Transition`] enum.
+///
+/// Source bits live in the low byte (mask `0xFF`). Flag bits above that
+/// are ignored — a reload navigated via forward/back is still a reload.
+fn decode_transition(tt: TransitionType) -> Transition {
+    // Cast via i32 (the C enum's underlying repr) then widen to u32 so
+    // negative-looking flag constants don't sign-extend strangely.
+    let raw = (*tt.as_ref() as i32) as u32;
+    decode_transition_raw(raw)
+}
+
+/// Inner decoder operating on the raw `u32` representation of a
+/// `cef_transition_type_t`. Separated so tests can pass arbitrary
+/// bitwise combinations without constructing invalid enum values.
+fn decode_transition_raw(raw: u32) -> Transition {
+    use cef::sys::cef_transition_type_t as T;
+    // Strip qualifier flags; keep only the source nibble.
+    let source = raw & 0xFF;
+    // Compare against known discriminants. Flag constants (TT_BLOCKED_FLAG
+    // etc.) live well above 0xFF, so masking is safe.
+    if source == T::TT_RELOAD as u32 {
+        Transition::Reload
+    } else if source == T::TT_FORM_SUBMIT as u32 {
+        Transition::FormSubmit
+    } else if source == T::TT_GENERATED as u32
+        || source == T::TT_KEYWORD as u32
+        || source == T::TT_KEYWORD_GENERATED as u32
+    {
+        Transition::Generated
+    } else if source == T::TT_LINK as u32 {
+        Transition::Link
+    } else {
+        // TT_EXPLICIT, TT_AUTO_BOOKMARK, TT_AUTO_TOPLEVEL,
+        // TT_AUTO_SUBFRAME, TT_MANUAL_SUBFRAME, TT_NUM_VALUES, …
+        Transition::Other
     }
 }
 
@@ -630,6 +702,90 @@ fn sanitise_filename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cef::sys::cef_transition_type_t as T;
+
+    // Test `decode_transition_raw` directly: pass arbitrary bitwise
+    // combinations without constructing invalid `cef_transition_type_t`
+    // enum discriminants.
+    fn raw(source: T) -> u32 {
+        source as u32
+    }
+
+    fn raw_flagged(source: T, flag: T) -> u32 {
+        source as u32 | flag as u32
+    }
+
+    #[test]
+    fn decode_transition_link() {
+        assert_eq!(decode_transition_raw(raw(T::TT_LINK)), Transition::Link);
+    }
+
+    #[test]
+    fn decode_transition_reload() {
+        assert_eq!(decode_transition_raw(raw(T::TT_RELOAD)), Transition::Reload);
+    }
+
+    #[test]
+    fn decode_transition_form_submit() {
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_FORM_SUBMIT)),
+            Transition::FormSubmit
+        );
+    }
+
+    #[test]
+    fn decode_transition_generated_variants() {
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_GENERATED)),
+            Transition::Generated
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_KEYWORD)),
+            Transition::Generated
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_KEYWORD_GENERATED)),
+            Transition::Generated
+        );
+    }
+
+    #[test]
+    fn decode_transition_other_variants() {
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_EXPLICIT)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_AUTO_TOPLEVEL)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_AUTO_BOOKMARK)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_AUTO_SUBFRAME)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_MANUAL_SUBFRAME)),
+            Transition::Other
+        );
+    }
+
+    #[test]
+    fn decode_transition_flag_bits_stripped() {
+        // TT_LINK | TT_FORWARD_BACK_FLAG — flag bits must not change the source.
+        assert_eq!(
+            decode_transition_raw(raw_flagged(T::TT_LINK, T::TT_FORWARD_BACK_FLAG)),
+            Transition::Link
+        );
+        // TT_RELOAD | TT_DIRECT_LOAD_FLAG — still a reload.
+        assert_eq!(
+            decode_transition_raw(raw_flagged(T::TT_RELOAD, T::TT_DIRECT_LOAD_FLAG)),
+            Transition::Reload
+        );
+    }
 
     #[test]
     fn sanitise_filename_strips_path() {

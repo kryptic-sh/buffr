@@ -256,8 +256,9 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
       layer in `crates/buffr-history`; wired live via the CEF `LoadHandler` in
       `buffr-core::handlers`. Phase 5b/c follow-ups:
   - [ ] FTS5 migration (replace `LIKE %q%` with `MATCH` + `bm25`).
-  - [ ] Detect `Reload` transitions via `LoadHandler::on_load_start`
-        (`transition_type` flag) — currently every visit is recorded as `Link`.
+  - [x] `LoadHandler::on_load_start` transition-type wiring — `Reload`,
+        `FormSubmit`, `Generated` decoded from CEF `TransitionType` and recorded
+        in history; `Link` is the default.
   - [ ] Expose `buffr query history --limit N --search foo` CLI when chrome /
         omnibar lands so the data is reachable without UI.
   - [x] `SKIP_SCHEMES` shipped as `config.privacy.skip_schemes`; defaults to
@@ -455,8 +456,9 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
       without UI for power users.
 - [x] **`SKIP_SCHEMES` config knob** under `[privacy]` — lives at
       `config.privacy.skip_schemes`.
-- [ ] **`LoadHandler::on_load_start` transition-type wiring** — distinguish
-      `Reload` from `Link` in history records.
+- [x] **`LoadHandler::on_load_start` transition-type wiring** — `Reload`,
+      `FormSubmit`, and `Generated` decoded from CEF `TransitionType` and stored
+      in history; `Link` is the fallback.
 - [ ] **Bookmarks UI in omnibar** — Phase 5b small follow-up.
 
 Signing (macOS Developer ID, Windows Authenticode) and native Wayland OSR are
