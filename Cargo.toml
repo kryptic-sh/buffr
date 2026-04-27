@@ -40,7 +40,7 @@ ureq = { version = "2", features = ["json"] }
 serde_json = "1"
 flate2 = "1"
 tar = "0.4"
-bzip2 = "0.4"
+bzip2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 notify = "6"
 # History store deps. `rusqlite`'s `bundled` feature is opted-in by
