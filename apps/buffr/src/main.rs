@@ -25,17 +25,18 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, FindResultSink, HintAction, HintAlphabet, HintEventSink, PermissionsQueue,
-    PromptOutcome, drain_permissions_with_defer, init_cef_api, new_find_sink, new_hint_event_sink,
-    new_permissions_queue, peek_permission_front, permissions_queue_len, pop_permission_front,
-    profile_paths,
+    BuffrApp, DownloadNoticeQueue, FindResultSink, HintAction, HintAlphabet, HintEventSink,
+    PermissionsQueue, PromptOutcome, drain_permissions_with_defer, expire_stale_notices,
+    init_cef_api, new_download_notice_queue, new_find_sink, new_hint_event_sink,
+    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
+    pop_permission_front, profile_paths,
 };
 use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
 use buffr_permissions::Permissions;
 use buffr_ui::{
-    CertState, FindStatus, HintStatus as UiHintStatus, InputBar, PERMISSIONS_PROMPT_HEIGHT,
-    PermissionsPrompt, STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT,
-    TabStrip, TabView,
+    CertState, DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip, FindStatus,
+    HintStatus as UiHintStatus, InputBar, PERMISSIONS_PROMPT_HEIGHT, PermissionsPrompt,
+    STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
 mod session;
@@ -644,6 +645,8 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
+    let download_notice_queue = new_download_notice_queue();
+
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -654,6 +657,7 @@ fn main() -> Result<()> {
         zoom.clone(),
         permissions.clone(),
         permissions_queue.clone(),
+        download_notice_queue,
         search_config,
         cli.private,
         find_sink,
@@ -1252,6 +1256,19 @@ struct AppState {
     /// `permissions_queue` is being shown. Keystrokes route to the
     /// prompt resolution path while this is set.
     permissions_prompt: Option<PermissionsPrompt>,
+    /// Passive download-notification queue. CEF's `DownloadHandler`
+    /// pushes notices onto this; the render loop composites the front
+    /// notice (if any) above the permissions strip. Notices self-expire
+    /// via [`expire_stale_notices`] on each `about_to_wait` tick.
+    ///
+    /// Layout (top → bottom when both are active):
+    ///   1. Input bar (overlay, when open)
+    ///   2. Download notice strip (28 px, when a notice is queued)
+    ///   3. Permissions prompt (60 px, when active)
+    ///   4. Tab strip (always)
+    ///   5. CEF page area
+    ///   6. Statusline (always)
+    download_notice_queue: DownloadNoticeQueue,
     /// Resolved search config used by the omnibar's URL-or-search
     /// resolver on Enter.
     search_config: Arc<buffr_config::Search>,
@@ -1367,6 +1384,7 @@ impl AppState {
         zoom: Arc<buffr_zoom::ZoomStore>,
         permissions: Arc<Permissions>,
         permissions_queue: PermissionsQueue,
+        download_notice_queue: DownloadNoticeQueue,
         search_config: Arc<buffr_config::Search>,
         private: bool,
         find_sink: FindResultSink,
@@ -1404,6 +1422,7 @@ impl AppState {
             permissions,
             permissions_queue,
             permissions_prompt: None,
+            download_notice_queue,
             search_config,
             overlay: None,
             private,
@@ -1655,10 +1674,15 @@ impl AppState {
         let width = size.width.max(1);
         let height = size.height.max(1);
         // Precompute geometry-derived inputs before acquiring the
-        // softbuffer surface borrow — `tab_strip_y` needs `&self`
-        // and we only release once the buffer drops.
+        // softbuffer surface borrow — geometry helpers and Arc-queue
+        // peeks all need `&self`; the borrow is released once `surface`
+        // and `buf` drop at end of scope.
         let tab_y = self.tab_strip_y(height);
         let prompt_y = self.permissions_prompt_y();
+        let notice_y = self.download_notice_y();
+        // Snapshot the front of the download notice queue now so we
+        // don't have to touch `self` again while `buf` is live.
+        let current_notice = peek_download_notice(&self.download_notice_queue);
         let Some(surface) = self.softbuffer_surface.as_mut() else {
             return;
         };
@@ -1691,14 +1715,32 @@ impl AppState {
         self.tab_strip
             .paint(buf.as_mut(), width as usize, height as usize, tab_y);
 
-        // Permissions prompt — sits between input bar and tab strip
+        // Permissions prompt — sits between download notice and tab strip
         // when active. Drawn after the tab strip so its accent border
         // never overlaps a tab pill.
         if let Some(prompt) = self.permissions_prompt.as_ref() {
             prompt.paint(buf.as_mut(), width as usize, height as usize, prompt_y);
         }
 
-        let mut damage = Vec::with_capacity(4);
+        // Download notice strip — sits above the permissions prompt (or
+        // above the tab strip when no prompt is active). Drawn last
+        // (highest priority visual layer) so its accent border is
+        // always visible. `current_notice` was snapshotted before this
+        // borrow scope; use it directly.
+        if let Some(ref notice) = current_notice {
+            let strip = DownloadNoticeStrip {
+                kind: match notice.kind {
+                    buffr_core::DownloadNoticeKind::Started => DownloadNoticeKind::Started,
+                    buffr_core::DownloadNoticeKind::Completed => DownloadNoticeKind::Completed,
+                    buffr_core::DownloadNoticeKind::Failed => DownloadNoticeKind::Failed,
+                },
+                filename: notice.filename.clone(),
+                path: notice.path.clone(),
+            };
+            strip.paint(buf.as_mut(), width as usize, height as usize, notice_y);
+        }
+
+        let mut damage = Vec::with_capacity(5);
 
         // Statusline damage rect (bottom).
         let strip_h_u = STATUSLINE_HEIGHT.min(height);
@@ -1736,6 +1778,19 @@ impl AppState {
             }
         }
 
+        // Download notice damage rect.
+        if current_notice.is_some() {
+            let notice_h_u = DOWNLOAD_NOTICE_HEIGHT.min(height.saturating_sub(notice_y));
+            if let Some(notice_h_nz) = NonZeroU32::new(notice_h_u) {
+                damage.push(softbuffer::Rect {
+                    x: 0,
+                    y: notice_y,
+                    width: nz_w,
+                    height: notice_h_nz,
+                });
+            }
+        }
+
         // Overlay damage rect (top, if active).
         if let Some(overlay) = self.overlay.as_ref() {
             let bar = overlay.input();
@@ -1756,14 +1811,16 @@ impl AppState {
         }
     }
 
-    /// Compute the CEF child window rect for the current overlay
-    /// state. Vertical layout (top → bottom):
+    /// Compute the CEF child window rect for the current overlay state.
+    ///
+    /// Vertical layout (top → bottom):
     ///
     /// 1. Input bar (when overlay open)
-    /// 2. Permissions prompt (when active, `PERMISSIONS_PROMPT_HEIGHT`)
-    /// 3. Tab strip (always, `TAB_STRIP_HEIGHT` px)
-    /// 4. CEF page area
-    /// 5. Statusline (always, `STATUSLINE_HEIGHT` px)
+    /// 2. Download notice strip (`DOWNLOAD_NOTICE_HEIGHT`, when queued)
+    /// 3. Permissions prompt (`PERMISSIONS_PROMPT_HEIGHT`, when active)
+    /// 4. Tab strip (always, `TAB_STRIP_HEIGHT` px)
+    /// 5. CEF page area
+    /// 6. Statusline (always, `STATUSLINE_HEIGHT` px)
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
         let status_h = STATUSLINE_HEIGHT.min(full_h);
         let remaining_after_status = full_h.saturating_sub(status_h);
@@ -1775,15 +1832,21 @@ impl AppState {
             0
         };
         let remaining_after_prompt = remaining_after_tabs.saturating_sub(prompt_h);
+        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
+            DOWNLOAD_NOTICE_HEIGHT.min(remaining_after_prompt)
+        } else {
+            0
+        };
+        let remaining_after_notice = remaining_after_prompt.saturating_sub(notice_h);
         let overlay_h = self
             .overlay
             .as_ref()
             .map(|o| o.input().total_height())
             .unwrap_or(0)
-            .min(remaining_after_prompt);
+            .min(remaining_after_notice);
         let cef_w = full_w.max(1);
-        let cef_h = remaining_after_prompt.saturating_sub(overlay_h).max(1);
-        let cef_y = overlay_h + prompt_h + tab_h;
+        let cef_h = remaining_after_notice.saturating_sub(overlay_h).max(1);
+        let cef_y = overlay_h + notice_h + prompt_h + tab_h;
         (0, cef_y, cef_w, cef_h)
     }
 
@@ -1797,21 +1860,42 @@ impl AppState {
             .as_ref()
             .map(|o| o.input().total_height())
             .unwrap_or(0);
+        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
+            DOWNLOAD_NOTICE_HEIGHT
+        } else {
+            0
+        };
         let prompt_h = if self.permissions_prompt.is_some() {
             PERMISSIONS_PROMPT_HEIGHT
         } else {
             0
         };
-        (overlay_h + prompt_h).min(full_h)
+        (overlay_h + notice_h + prompt_h).min(full_h)
     }
 
-    /// Top-of-window y for the permissions prompt strip. Sits right
-    /// below the input bar (when open) and above the tab strip.
-    fn permissions_prompt_y(&self) -> u32 {
+    /// Top-of-window y for the download notice strip. Sits right below
+    /// the input bar (when open) and above the permissions prompt.
+    fn download_notice_y(&self) -> u32 {
         self.overlay
             .as_ref()
             .map(|o| o.input().total_height())
             .unwrap_or(0)
+    }
+
+    /// Top-of-window y for the permissions prompt strip. Sits right
+    /// below the download notice (when active) and above the tab strip.
+    fn permissions_prompt_y(&self) -> u32 {
+        let overlay_h = self
+            .overlay
+            .as_ref()
+            .map(|o| o.input().total_height())
+            .unwrap_or(0);
+        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
+            DOWNLOAD_NOTICE_HEIGHT
+        } else {
+            0
+        };
+        overlay_h + notice_h
     }
 
     /// Re-issue the CEF resize call for the current window dimensions.
@@ -2397,6 +2481,7 @@ impl ApplicationHandler for AppState {
             self.zoom.clone(),
             self.permissions.clone(),
             self.permissions_queue.clone(),
+            self.download_notice_queue.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
             self.hint_alphabet.clone(),
@@ -2602,6 +2687,17 @@ impl ApplicationHandler for AppState {
         if self.sync_permissions_prompt() {
             self.resync_cef_rect();
             self.request_redraw();
+        }
+
+        // Download notices: drop any that have lived past their expiry
+        // window. Trigger a redraw + resync when the queue changes so
+        // the chrome immediately reclaims the strip height.
+        {
+            let dropped = expire_stale_notices(&self.download_notice_queue);
+            if dropped > 0 {
+                self.resync_cef_rect();
+                self.request_redraw();
+            }
         }
 
         // Refresh tab-strip render input. The host's tab list can

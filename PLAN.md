@@ -450,9 +450,14 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
       0.3.0 is on crates.io so no upstream blocker remains.
 - [x] **History FTS5 migration.** `visits_fts` (unicode61) in schema v2;
       `search` uses `MATCH`; frecency ranking unchanged.
-- [ ] **Download `ask_each_time` UI.** Currently silent into `default_dir`;
-      needs a chrome prompt strip (Phase 3 chrome surface is already in place —
-      small wire-up).
+- [x] **Download notification strip landed.** `ask_each_time = false` (the
+      default) now surfaces a passive 28 px chrome strip:
+      `v filename ->     path` on start (auto-expires 2 s),
+      `OK filename -> path` on completion (4 s), `X filename` on failure (4 s).
+      `ask_each_time = true` continues to use CEF's native OS Save-As dialog
+      (already wired at `crates/buffr-core/src/handlers.rs`) — the strip is
+      suppressed on that path. Gated by `[downloads] show_notifications = true`
+      (default).
 - [x] **History CLI flags** — `--list-history`, `--search-history <QUERY>`,
       `--history-limit <N>` on the top-level `Cli` struct; short-circuit before
       CEF init, output one tab-separated row per visit. Surface the data without

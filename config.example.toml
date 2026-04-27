@@ -91,10 +91,15 @@ skip_schemes = ["about", "cef", "chrome", "data", "file"]
 # Open the file via the platform's launcher (xdg-open / open / start)
 # the moment a download finishes. Default false.
 open_on_finish = false
-# Show a save-as dialog for every download. The dialog UI is Phase 3
-# chrome work; for now downloads silently land in default_dir
-# regardless of this setting.
+# Show a save-as dialog for every download. When true, CEF's native OS
+# Save-As dialog fires (BeforeDownloadCallback::cont show_dialog=1) and
+# the notification strip is suppressed — the OS dialog is the feedback.
+# Default false: files land in default_dir and the strip appears.
 ask_each_time = false
+# Show a chrome notification strip when a silent download (ask_each_time
+# = false) starts or finishes. Strip auto-expires: 2 s for Started, 4 s
+# for Completed/Failed. Set false to opt out entirely.
+show_notifications = true
 
 [hint]
 # Ordered character list used to mint hint labels. Validated as

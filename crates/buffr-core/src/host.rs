@@ -39,6 +39,7 @@ use cef::{
 use raw_window_handle::RawWindowHandle;
 use tracing::{info, warn};
 
+use crate::download_notice::DownloadNoticeQueue;
 use crate::find::FindResultSink;
 use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
@@ -147,6 +148,11 @@ pub struct BrowserHost {
     zoom: Arc<ZoomStore>,
     permissions: Arc<Permissions>,
     permissions_queue: PermissionsQueue,
+    /// Download notification queue — shared between the CEF IO thread
+    /// (which pushes notices) and the UI render loop (which drains and
+    /// paints them). `DownloadHandler` pushes into this; `AppState`
+    /// expires stale entries each tick.
+    notice_queue: DownloadNoticeQueue,
     /// Mailboxes shared with CEF handlers. One sink for the whole
     /// host (handlers can't tell which browser fired the event in
     /// every callback shape, so per-tab demux happens in the UI).
@@ -178,6 +184,7 @@ impl BrowserHost {
         zoom: Arc<ZoomStore>,
         permissions: Arc<Permissions>,
         permissions_queue: PermissionsQueue,
+        notice_queue: DownloadNoticeQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         hint_alphabet: HintAlphabet,
@@ -192,6 +199,7 @@ impl BrowserHost {
             zoom,
             permissions,
             permissions_queue,
+            notice_queue,
             find_sink,
             hint_sink,
             hint_alphabet,
@@ -215,6 +223,7 @@ impl BrowserHost {
         zoom: Arc<ZoomStore>,
         permissions: Arc<Permissions>,
         permissions_queue: PermissionsQueue,
+        notice_queue: DownloadNoticeQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         hint_alphabet: HintAlphabet,
@@ -236,6 +245,7 @@ impl BrowserHost {
             zoom,
             permissions,
             permissions_queue,
+            notice_queue,
             find_sink,
             hint_sink,
             hint_alphabet,
@@ -325,6 +335,7 @@ impl BrowserHost {
             self.find_sink.clone(),
             self.hint_sink.clone(),
             self.counters.clone(),
+            self.notice_queue.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),

@@ -33,6 +33,7 @@ use buffr_history::{History, Transition};
 use buffr_permissions::{Decision, Permissions};
 use buffr_zoom::ZoomStore;
 
+use crate::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue, push};
 use crate::find::{FindResult, FindResultSink};
 use crate::hint::{HintEventSink, parse_console_event};
 use crate::permissions::{
@@ -64,6 +65,7 @@ pub fn make_client(
     find_sink: FindResultSink,
     hint_sink: HintEventSink,
     counters: Option<Arc<UsageCounters>>,
+    notice_queue: DownloadNoticeQueue,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -75,6 +77,7 @@ pub fn make_client(
         find_sink,
         hint_sink,
         counters,
+        notice_queue,
     )
 }
 
@@ -105,8 +108,9 @@ pub fn make_download_handler(
     downloads: Arc<Downloads>,
     downloads_config: Arc<DownloadsConfig>,
     counters: Option<Arc<UsageCounters>>,
+    notice_queue: DownloadNoticeQueue,
 ) -> DownloadHandler {
-    BuffrDownloadHandler::new(downloads, downloads_config, counters)
+    BuffrDownloadHandler::new(downloads, downloads_config, counters, notice_queue)
 }
 
 /// Standalone factory for the find handler. Takes the same
@@ -137,6 +141,7 @@ wrap_client! {
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         counters: Option<Arc<UsageCounters>>,
+        notice_queue: DownloadNoticeQueue,
     }
 
     impl Client {
@@ -161,6 +166,7 @@ wrap_client! {
                 self.downloads.clone(),
                 self.downloads_config.clone(),
                 self.counters.clone(),
+                self.notice_queue.clone(),
             ))
         }
 
@@ -403,6 +409,7 @@ wrap_download_handler! {
         downloads: Arc<Downloads>,
         config: Arc<DownloadsConfig>,
         counters: Option<Arc<UsageCounters>>,
+        notice_queue: DownloadNoticeQueue,
     }
 
     impl DownloadHandler {
@@ -457,6 +464,22 @@ wrap_download_handler! {
             let target_str = target_path.to_string_lossy();
             let target_cef = CefString::from(target_str.as_ref());
             let show_dialog = if self.config.ask_each_time { 1 } else { 0 };
+
+            // Push a Started notice only for the silent (default_dir)
+            // path. When ask_each_time=true the OS native Save-As dialog
+            // already provides feedback to the user.
+            if !self.config.ask_each_time && self.config.show_notifications {
+                push(
+                    &self.notice_queue,
+                    DownloadNotice {
+                        kind: DownloadNoticeKind::Started,
+                        filename: suggested.clone(),
+                        path: target_path.to_string_lossy().into_owned(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+
             callback.cont(Some(&target_cef), show_dialog);
             0
         }
@@ -506,6 +529,18 @@ wrap_download_handler! {
                 if let Some(c) = self.counters.as_ref() {
                     c.increment(KEY_DOWNLOADS_COMPLETED);
                 }
+                // Completed notice — only for the silent path.
+                if !self.config.ask_each_time && self.config.show_notifications {
+                    push(
+                        &self.notice_queue,
+                        DownloadNotice {
+                            kind: DownloadNoticeKind::Completed,
+                            filename: row.suggested_name.clone(),
+                            path: path_str.clone(),
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                }
                 if self.config.open_on_finish && !path_str.is_empty() {
                     open_path(&OsSpawn, &path);
                 }
@@ -516,6 +551,7 @@ wrap_download_handler! {
                 if let Err(err) = self.downloads.record_canceled(row.id) {
                     tracing::warn!(error = %err, "downloads: record_canceled failed");
                 }
+                // Canceled = user-initiated; skip notification noise.
                 return;
             }
 
@@ -523,6 +559,18 @@ wrap_download_handler! {
                 let reason = format!("interrupted (code {:?})", item.interrupt_reason());
                 if let Err(err) = self.downloads.record_failed(row.id, &reason) {
                     tracing::warn!(error = %err, "downloads: record_failed failed");
+                }
+                // Failed notice.
+                if !self.config.ask_each_time && self.config.show_notifications {
+                    push(
+                        &self.notice_queue,
+                        DownloadNotice {
+                            kind: DownloadNoticeKind::Failed,
+                            filename: row.suggested_name.clone(),
+                            path: String::new(),
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
                 }
                 return;
             }
