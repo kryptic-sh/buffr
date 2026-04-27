@@ -352,7 +352,7 @@ jobs:
           echo "DMG OK: ${dmgs[0]}"
 
       - name: upload dmg
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: buffr-macos-dmg
           path: target/dist/macos/buffr-*.dmg
@@ -419,7 +419,7 @@ jobs:
         shell: powershell
 
       - name: upload msi
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: buffr-windows-msi
           path: target/dist/windows/buffr-*.msi
