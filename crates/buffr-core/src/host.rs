@@ -1025,14 +1025,47 @@ impl BrowserHost {
     }
 
     fn run_hint_js(&self, code: &str) {
+        self.run_main_frame_js(code, "buffr://hint");
+    }
+
+    /// Execute arbitrary JS on the active tab's main frame.
+    fn run_main_frame_js(&self, code: &str, url: &str) {
         self.with_active(|t| {
             let Some(frame) = t.browser.main_frame() else {
                 return;
             };
             let cef_code = CefString::from(code);
-            let cef_url = CefString::from("buffr://hint");
+            let cef_url = CefString::from(url);
             frame.execute_java_script(Some(&cef_code), Some(&cef_url), 1);
         });
+    }
+
+    /// Push a new value into the focused field via `__buffrEditApply`.
+    pub fn run_edit_apply(&self, field_id: &str, value: &str) {
+        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        let escaped_value = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+        self.run_main_frame_js(
+            &format!("if (window.__buffrEditApply) window.__buffrEditApply({escaped_id}, {escaped_value})"),
+            "buffr://edit",
+        );
+    }
+
+    /// Add the edit-active CSS class to the field via `__buffrEditAttach`.
+    pub fn run_edit_attach(&self, field_id: &str) {
+        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        self.run_main_frame_js(
+            &format!("if (window.__buffrEditAttach) window.__buffrEditAttach({escaped_id})"),
+            "buffr://edit",
+        );
+    }
+
+    /// Remove the edit-active CSS class from the field via `__buffrEditDetach`.
+    pub fn run_edit_detach(&self, field_id: &str) {
+        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        self.run_main_frame_js(
+            &format!("if (window.__buffrEditDetach) window.__buffrEditDetach({escaped_id})"),
+            "buffr://edit",
+        );
     }
 
     fn run_js(&self, code: &str) {

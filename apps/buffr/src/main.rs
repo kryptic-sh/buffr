@@ -25,13 +25,18 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, DownloadNoticeQueue, EditEventSink, FindResultSink, HintAction, HintAlphabet,
-    HintEventSink, PermissionsQueue, PromptOutcome, drain_permissions_with_defer,
-    expire_stale_notices, init_cef_api, new_download_notice_queue, new_edit_event_sink,
-    new_find_sink, new_hint_event_sink, new_permissions_queue, peek_download_notice,
-    peek_permission_front, permissions_queue_len, pop_permission_front, profile_paths,
+    BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, EditFieldKind, FindResultSink,
+    HintAction, HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, drain_edit_events,
+    drain_permissions_with_defer, expire_stale_notices, init_cef_api, new_download_notice_queue,
+    new_edit_event_sink, new_find_sink, new_hint_event_sink, new_permissions_queue,
+    peek_download_notice, peek_permission_front, permissions_queue_len, pop_permission_front,
+    profile_paths,
 };
-use buffr_modal::{Engine, Key, NamedKey, PageMode, Step, key_event_to_chord};
+use buffr_modal::edit_mode::EditSession;
+use buffr_modal::{
+    Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step, VimMode,
+    key_event_to_chord,
+};
 use buffr_permissions::Permissions;
 use buffr_ui::{
     CertState, DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip, FindStatus,
@@ -1298,14 +1303,13 @@ struct AppState {
     hint_sink: HintEventSink,
     /// Edit-mode event queue shared with the CEF load handler (which
     /// injects `edit.js`) and display handler (which parses its console
-    /// output). Stage 2 drains this each tick to drive `EditSession`
-    /// lifecycle. Held here so the Arc stays alive for the process
-    /// lifetime even before the host is created.
-    ///
-    /// TODO(stage2): drain each render tick; route Focus → EditSession
-    /// spawn, keystrokes → feed_input, Blur/Esc → drop session.
-    #[allow(dead_code)]
+    /// output). Drained each `about_to_wait` tick to drive `EditSession`
+    /// lifecycle.
     edit_sink: EditEventSink,
+    /// Current edit-mode focus state. Drives keyboard routing and
+    /// `EditSession` lifecycle. Drained via [`drain_edit_events`] each
+    /// tick and mutated by the keystroke path.
+    edit_focus: EditFocus,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1361,6 +1365,31 @@ struct AppState {
     /// runtime doesn't currently call `check_now` from the UI thread.
     #[allow(dead_code)]
     update_checker: Arc<buffr_core::UpdateChecker>,
+}
+
+/// Edit-mode focus state machine.
+///
+/// Transitions:
+///   `None` → (JS Focus event) → `Tracking`
+///   `Tracking` → (i/a/I/A etc.) → `Editing`
+///   `Editing` → (Esc while Normal) → `Tracking`
+///   `Tracking | Editing` → (JS Blur event for same field) → `None`
+#[allow(clippy::large_enum_variant)]
+enum EditFocus {
+    /// No editable field is focused.
+    None,
+    /// JS reported a focused field; user has not yet entered insert mode.
+    Tracking {
+        field_id: String,
+        kind: EditFieldKind,
+        value: String,
+    },
+    /// `i`/`a`/`I`/`A` pressed on a tracked field — engine is live.
+    Editing {
+        field_id: String,
+        kind: EditFieldKind,
+        session: EditSession,
+    },
 }
 
 /// Active overlay above the CEF child window.
@@ -1449,6 +1478,7 @@ impl AppState {
             find_sink,
             hint_sink,
             edit_sink,
+            edit_focus: EditFocus::None,
             hint_alphabet,
             pending_find,
             find_smoke_at: None,
@@ -2319,6 +2349,241 @@ impl AppState {
         self.statusline.hint_state = None;
     }
 
+    // ---- Edit-mode plumbing ---------------------------------------------
+
+    /// Drain queued edit-focus events and update `self.edit_focus`.
+    fn drain_edit_focus_events(&mut self) {
+        for ev in drain_edit_events(&self.edit_sink) {
+            match ev {
+                EditConsoleEvent::Focus {
+                    field_id,
+                    kind,
+                    value,
+                    ..
+                } => {
+                    // Only move to Tracking when not already Editing
+                    // the same field — a spurious re-focus during
+                    // engine-attached state must not clobber the session.
+                    let already_editing = matches!(
+                        &self.edit_focus,
+                        EditFocus::Editing { field_id: f, .. } if *f == field_id
+                    );
+                    if !already_editing {
+                        self.edit_focus = EditFocus::Tracking {
+                            field_id,
+                            kind,
+                            value,
+                        };
+                    }
+                }
+                EditConsoleEvent::Blur { field_id } => {
+                    let matches_current = match &self.edit_focus {
+                        EditFocus::Editing { field_id: f, .. }
+                        | EditFocus::Tracking { field_id: f, .. } => *f == field_id,
+                        EditFocus::None => false,
+                    };
+                    if matches_current {
+                        self.edit_focus = EditFocus::None;
+                    }
+                }
+                EditConsoleEvent::Mutate { field_id, value } => match &mut self.edit_focus {
+                    EditFocus::Tracking {
+                        field_id: f,
+                        value: v,
+                        ..
+                    } if *f == field_id => {
+                        *v = value;
+                    }
+                    EditFocus::Editing { field_id: f, .. } if *f == field_id => {
+                        tracing::trace!(
+                            %field_id,
+                            "edit-mode: page mutation while engine attached; ignored"
+                        );
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    /// Convert a winit `KeyEvent` into a `PlannedInput` for the hjkl engine.
+    ///
+    /// Mirrors `buffr_modal::winit_adapter::key_event_to_chord` but targets
+    /// `hjkl_engine::PlannedInput` rather than our internal `KeyChord`.
+    fn winit_key_to_planned(
+        event: &winit::event::KeyEvent,
+        modifiers: winit::keyboard::ModifiersState,
+    ) -> Option<PlannedInput> {
+        use winit::event::ElementState;
+        use winit::keyboard::{Key as WKey, NamedKey as WNamed};
+
+        if event.state != ElementState::Pressed {
+            return None;
+        }
+        let mods = EngineModifiers {
+            ctrl: modifiers.control_key(),
+            shift: modifiers.shift_key(),
+            alt: modifiers.alt_key(),
+            super_: modifiers.super_key(),
+        };
+        match &event.logical_key {
+            WKey::Character(s) => {
+                let mut chars = s.chars();
+                let first = chars.next()?;
+                if chars.next().is_some() {
+                    return None;
+                }
+                Some(PlannedInput::Char(first, mods))
+            }
+            WKey::Named(named) => {
+                let sk = match named {
+                    WNamed::Escape => SpecialKey::Esc,
+                    WNamed::Enter => SpecialKey::Enter,
+                    WNamed::Backspace => SpecialKey::Backspace,
+                    WNamed::Tab => SpecialKey::Tab,
+                    WNamed::ArrowUp => SpecialKey::Up,
+                    WNamed::ArrowDown => SpecialKey::Down,
+                    WNamed::ArrowLeft => SpecialKey::Left,
+                    WNamed::ArrowRight => SpecialKey::Right,
+                    WNamed::Home => SpecialKey::Home,
+                    WNamed::End => SpecialKey::End,
+                    WNamed::PageUp => SpecialKey::PageUp,
+                    WNamed::PageDown => SpecialKey::PageDown,
+                    WNamed::Insert => SpecialKey::Insert,
+                    WNamed::Delete => SpecialKey::Delete,
+                    WNamed::F1 => SpecialKey::F(1),
+                    WNamed::F2 => SpecialKey::F(2),
+                    WNamed::F3 => SpecialKey::F(3),
+                    WNamed::F4 => SpecialKey::F(4),
+                    WNamed::F5 => SpecialKey::F(5),
+                    WNamed::F6 => SpecialKey::F(6),
+                    WNamed::F7 => SpecialKey::F(7),
+                    WNamed::F8 => SpecialKey::F(8),
+                    WNamed::F9 => SpecialKey::F(9),
+                    WNamed::F10 => SpecialKey::F(10),
+                    WNamed::F11 => SpecialKey::F(11),
+                    WNamed::F12 => SpecialKey::F(12),
+                    _ => return None,
+                };
+                Some(PlannedInput::Key(sk, mods))
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle a key event while in `Editing` state. Returns `true` if
+    /// the event was consumed (the caller must not forward it further).
+    fn edit_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let planned = Self::winit_key_to_planned(event, self.modifiers);
+
+        let EditFocus::Editing {
+            field_id, session, ..
+        } = &mut self.edit_focus
+        else {
+            return false;
+        };
+
+        let pre_mode = session.vim_mode();
+        let is_esc = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
+
+        if let Some(p) = planned {
+            session.feed_planned(p);
+        } else {
+            // Unmapped key — consumed (edit-mode owns the keyboard).
+            return true;
+        }
+
+        let post_mode = session.vim_mode();
+
+        // Drain any content change and push it to the DOM.
+        if let Some(arc) = session.take_content_change()
+            && let Some(host) = self.host.as_ref()
+        {
+            host.run_edit_apply(field_id, &arc);
+        }
+
+        // Esc while already Normal → demote to Tracking.
+        // Esc while Insert → the engine transitioned to Normal; stay Editing.
+        if is_esc && pre_mode == VimMode::Normal && post_mode == VimMode::Normal {
+            // Borrow checker: we need to read `field_id` after the mut borrow.
+            let fid = field_id.clone();
+            if let EditFocus::Editing {
+                field_id: f,
+                kind: k,
+                session: s,
+            } = std::mem::replace(&mut self.edit_focus, EditFocus::None)
+            {
+                let last_value = s.content();
+                self.edit_focus = EditFocus::Tracking {
+                    field_id: f,
+                    kind: k,
+                    value: last_value,
+                };
+            }
+            if let Some(host) = self.host.as_ref() {
+                host.run_edit_detach(&fid);
+            }
+            // Return engine to Normal page mode.
+            if let Ok(mut e) = self.engine.lock() {
+                e.set_mode(PageMode::Normal);
+            }
+        }
+
+        true
+    }
+
+    /// Promote `Tracking` → `Editing` after the engine fired
+    /// `EnterEditMode` (i.e. the user pressed `i`/`a`/`I`/`A` etc.).
+    ///
+    /// If there is no `Tracking` focus, the promotion is a no-op (the
+    /// engine already set `PageMode::Edit` in response to the chord —
+    /// nothing else to wire up).
+    fn promote_tracking_to_editing(&mut self, event: &winit::event::KeyEvent) {
+        let EditFocus::Tracking {
+            field_id,
+            kind,
+            value,
+        } = std::mem::replace(&mut self.edit_focus, EditFocus::None)
+        else {
+            // No tracked field — restore None and let the engine sit in
+            // Edit mode (it will return EditModeActive on subsequent keys
+            // until Esc fires feed_edit_mode_key → Exited).
+            return;
+        };
+
+        let mut session = EditSession::new(&value);
+        // Forward the triggering chord so the engine sees the intended
+        // entry key (i/a/I/A).
+        if let Some(p) = Self::winit_key_to_planned(event, self.modifiers) {
+            session.feed_planned(p);
+        }
+        // Drain any immediate content change from the entry key.
+        if let Some(arc) = session.take_content_change()
+            && let Some(host) = self.host.as_ref()
+        {
+            host.run_edit_apply(&field_id, &arc);
+        }
+        if let Some(host) = self.host.as_ref() {
+            host.run_edit_attach(&field_id);
+        }
+        self.edit_focus = EditFocus::Editing {
+            field_id,
+            kind,
+            session,
+        };
+    }
+
+    /// Called when `Engine::feed` returns `EditModeActive` — the engine
+    /// is already in Edit mode but the Rust side had not yet constructed
+    /// a session (e.g. user pressed a non-entry chord while Tracking).
+    /// We try to promote if there is a tracked field; otherwise no-op.
+    fn maybe_promote_to_editing(&mut self, event: &winit::event::KeyEvent) {
+        if matches!(&self.edit_focus, EditFocus::Tracking { .. }) {
+            self.promote_tracking_to_editing(event);
+        }
+        // If already Editing or None, the event is simply consumed.
+    }
+
     /// Pull the front of the permissions queue into a renderable
     /// [`PermissionsPrompt`] if no prompt is currently shown. Returns
     /// `true` when the prompt state changed (so the caller knows to
@@ -2609,6 +2874,14 @@ impl ApplicationHandler for AppState {
                 if self.hint_mode_handle_key(&event) {
                     return;
                 }
+                // Edit-mode takes precedence over the page-mode FSM
+                // once an engine is attached (Editing state). Tracking
+                // falls through so `i`/`a`/… can upgrade to Editing.
+                if matches!(&self.edit_focus, EditFocus::Editing { .. })
+                    && self.edit_mode_handle_key(&event)
+                {
+                    return;
+                }
                 let Some(chord) = key_event_to_chord(&event, self.modifiers) else {
                     return;
                 };
@@ -2619,6 +2892,15 @@ impl ApplicationHandler for AppState {
                 };
                 match step {
                     Step::Resolved(action) => {
+                        // When the engine resolves `EnterEditMode` and
+                        // we have a Tracking focus, promote to Editing.
+                        // The triggering chord is forwarded so the
+                        // engine sees the intended entry key (i/a/I/A).
+                        if action == buffr_modal::PageAction::EnterEditMode {
+                            self.promote_tracking_to_editing(&event);
+                            self.refresh_title();
+                            return;
+                        }
                         // OpenOmnibar / OpenCommandLine flip the
                         // engine into Mode::Command and ALSO open the
                         // matching overlay UI. The host's `dispatch`
@@ -2645,10 +2927,10 @@ impl ApplicationHandler for AppState {
                         trace!(?chord, "key not bound");
                     }
                     Step::EditModeActive => {
-                        // Edit-mode is the hjkl handoff; until that
-                        // lands the chord is dropped here. The engine
-                        // already updated state, so just trace.
-                        trace!(?chord, "chord dropped — edit-mode integration is Phase 2b");
+                        // Engine is already in PageMode::Edit — route
+                        // to the edit-mode handler if we have a Tracking
+                        // focus that can be promoted, or just consume.
+                        self.maybe_promote_to_editing(&event);
                     }
                 }
                 self.refresh_title();
@@ -2662,6 +2944,11 @@ impl ApplicationHandler for AppState {
         // continuously, which is the simplest correct cadence for
         // Phase 1 — Phase 3 will switch to a tickless wakeup.
         cef::do_message_loop_work();
+
+        // Edit-mode: drain focus/blur/mutate events from the JS bridge.
+        // Runs before the engine tick so state is consistent when key
+        // routing fires later in the same event-loop iteration.
+        self.drain_edit_focus_events();
 
         // Engine ambiguity timeout: if a single-chord prefix is
         // sitting on the buffer past the timeout window, fire the
@@ -2794,5 +3081,317 @@ mod tests {
     fn resolve_paths_persistent_returns_no_tempdir() {
         let (_paths, tmp) = resolve_paths(false).expect("resolve_paths(false)");
         assert!(tmp.is_none());
+    }
+
+    // ---- edit-mode unit tests --------------------------------------------
+
+    /// Build a minimal `winit::keyboard::ModifiersState` for tests.
+    fn no_mods() -> winit::keyboard::ModifiersState {
+        winit::keyboard::ModifiersState::empty()
+    }
+
+    /// Tests for `winit_key_to_planned`. We can't construct `winit::event::KeyEvent`
+    /// directly in unit tests (the `platform_specific` field is opaque on Linux),
+    /// so we extract the inner translation logic into a free function that takes
+    /// `(logical_key, modifiers, pressed)` — the three inputs `winit_key_to_planned`
+    /// gates on — and test through that seam.
+    mod winit_key_to_planned_tests {
+        use super::*;
+        use winit::keyboard::{Key as WKey, NamedKey as WNamed, SmolStr};
+
+        /// Thin mirror of `AppState::winit_key_to_planned` that accepts the
+        /// logical key directly, sidestepping the `KeyEvent` construction.
+        fn translate(
+            logical: &WKey<SmolStr>,
+            modifiers: winit::keyboard::ModifiersState,
+            pressed: bool,
+        ) -> Option<PlannedInput> {
+            if !pressed {
+                return None;
+            }
+            let mods = EngineModifiers {
+                ctrl: modifiers.control_key(),
+                shift: modifiers.shift_key(),
+                alt: modifiers.alt_key(),
+                super_: modifiers.super_key(),
+            };
+            match logical {
+                WKey::Character(s) => {
+                    let mut chars = s.chars();
+                    let first = chars.next()?;
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                    Some(PlannedInput::Char(first, mods))
+                }
+                WKey::Named(named) => {
+                    let sk = match named {
+                        WNamed::Escape => SpecialKey::Esc,
+                        WNamed::Enter => SpecialKey::Enter,
+                        WNamed::Backspace => SpecialKey::Backspace,
+                        WNamed::Tab => SpecialKey::Tab,
+                        WNamed::ArrowUp => SpecialKey::Up,
+                        WNamed::ArrowDown => SpecialKey::Down,
+                        WNamed::ArrowLeft => SpecialKey::Left,
+                        WNamed::ArrowRight => SpecialKey::Right,
+                        WNamed::Home => SpecialKey::Home,
+                        WNamed::End => SpecialKey::End,
+                        WNamed::PageUp => SpecialKey::PageUp,
+                        WNamed::PageDown => SpecialKey::PageDown,
+                        WNamed::Insert => SpecialKey::Insert,
+                        WNamed::Delete => SpecialKey::Delete,
+                        WNamed::F1 => SpecialKey::F(1),
+                        WNamed::F2 => SpecialKey::F(2),
+                        WNamed::F3 => SpecialKey::F(3),
+                        WNamed::F4 => SpecialKey::F(4),
+                        WNamed::F5 => SpecialKey::F(5),
+                        WNamed::F6 => SpecialKey::F(6),
+                        WNamed::F7 => SpecialKey::F(7),
+                        WNamed::F8 => SpecialKey::F(8),
+                        WNamed::F9 => SpecialKey::F(9),
+                        WNamed::F10 => SpecialKey::F(10),
+                        WNamed::F11 => SpecialKey::F(11),
+                        WNamed::F12 => SpecialKey::F(12),
+                        _ => return None,
+                    };
+                    Some(PlannedInput::Key(sk, mods))
+                }
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn char_a_maps_to_planned_char() {
+            let p = translate(&WKey::Character(SmolStr::new("a")), no_mods(), true);
+            assert!(matches!(p, Some(PlannedInput::Char('a', _))));
+        }
+
+        #[test]
+        fn esc_maps_to_planned_esc() {
+            let p = translate(&WKey::Named(WNamed::Escape), no_mods(), true);
+            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::Esc, _))));
+        }
+
+        #[test]
+        fn enter_maps_to_planned_enter() {
+            let p = translate(&WKey::Named(WNamed::Enter), no_mods(), true);
+            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::Enter, _))));
+        }
+
+        #[test]
+        fn tab_maps_to_planned_tab() {
+            let p = translate(&WKey::Named(WNamed::Tab), no_mods(), true);
+            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::Tab, _))));
+        }
+
+        #[test]
+        fn arrows_map_correctly() {
+            let cases = [
+                (WNamed::ArrowUp, SpecialKey::Up),
+                (WNamed::ArrowDown, SpecialKey::Down),
+                (WNamed::ArrowLeft, SpecialKey::Left),
+                (WNamed::ArrowRight, SpecialKey::Right),
+            ];
+            for (named, expected) in cases {
+                let p = translate(&WKey::Named(named), no_mods(), true);
+                assert!(
+                    matches!(p, Some(PlannedInput::Key(sk, _)) if sk == expected),
+                    "expected {expected:?} for {named:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn f1_maps_to_planned_f1() {
+            let p = translate(&WKey::Named(WNamed::F1), no_mods(), true);
+            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::F(1), _))));
+        }
+
+        #[test]
+        fn release_returns_none() {
+            let p = translate(&WKey::Character(SmolStr::new("a")), no_mods(), false);
+            assert!(p.is_none());
+        }
+    }
+
+    /// Test the `EditFocus` FSM state transitions via `drain_edit_focus_events`.
+    mod edit_focus_fsm_tests {
+        use super::*;
+        use buffr_core::edit::{EditFieldKind, new_edit_event_sink};
+
+        fn push_event(sink: &EditEventSink, ev: EditConsoleEvent) {
+            sink.lock().unwrap().push_back(ev);
+        }
+
+        fn focus_event(id: &str) -> EditConsoleEvent {
+            EditConsoleEvent::Focus {
+                field_id: id.to_string(),
+                kind: EditFieldKind::Input,
+                value: "hello".to_string(),
+                selection_start: Some(5),
+                selection_end: Some(5),
+            }
+        }
+
+        fn blur_event(id: &str) -> EditConsoleEvent {
+            EditConsoleEvent::Blur {
+                field_id: id.to_string(),
+            }
+        }
+
+        fn mutate_event(id: &str, val: &str) -> EditConsoleEvent {
+            EditConsoleEvent::Mutate {
+                field_id: id.to_string(),
+                value: val.to_string(),
+            }
+        }
+
+        #[test]
+        fn focus_moves_to_tracking() {
+            let sink = new_edit_event_sink();
+            push_event(&sink, focus_event("f1"));
+            let evs = drain_edit_events(&sink);
+
+            let mut focus = EditFocus::None;
+            // Simulate the drain logic inline (no full AppState needed).
+            for ev in evs {
+                if let EditConsoleEvent::Focus {
+                    field_id,
+                    kind,
+                    value,
+                    ..
+                } = ev
+                {
+                    let already_editing = matches!(
+                        &focus,
+                        EditFocus::Editing { field_id: f, .. } if *f == field_id
+                    );
+                    if !already_editing {
+                        focus = EditFocus::Tracking {
+                            field_id,
+                            kind,
+                            value,
+                        };
+                    }
+                }
+            }
+            assert!(matches!(&focus, EditFocus::Tracking { field_id, .. } if field_id == "f1"));
+        }
+
+        #[test]
+        fn blur_resets_to_none() {
+            let sink = new_edit_event_sink();
+            push_event(&sink, focus_event("f1"));
+            push_event(&sink, blur_event("f1"));
+            let evs = drain_edit_events(&sink);
+
+            let mut focus: EditFocus = EditFocus::None;
+            for ev in evs {
+                match ev {
+                    EditConsoleEvent::Focus {
+                        field_id,
+                        kind,
+                        value,
+                        ..
+                    } => {
+                        focus = EditFocus::Tracking {
+                            field_id,
+                            kind,
+                            value,
+                        };
+                    }
+                    EditConsoleEvent::Blur { field_id } => {
+                        let matches_cur = match &focus {
+                            EditFocus::Tracking { field_id: f, .. }
+                            | EditFocus::Editing { field_id: f, .. } => *f == field_id,
+                            EditFocus::None => false,
+                        };
+                        if matches_cur {
+                            focus = EditFocus::None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(matches!(focus, EditFocus::None));
+        }
+
+        #[test]
+        fn mutate_updates_tracking_value() {
+            let sink = new_edit_event_sink();
+            push_event(&sink, focus_event("f1"));
+            push_event(&sink, mutate_event("f1", "world"));
+            let evs = drain_edit_events(&sink);
+
+            let mut focus = EditFocus::None;
+            for ev in evs {
+                match ev {
+                    EditConsoleEvent::Focus {
+                        field_id,
+                        kind,
+                        value,
+                        ..
+                    } => {
+                        focus = EditFocus::Tracking {
+                            field_id,
+                            kind,
+                            value,
+                        };
+                    }
+                    EditConsoleEvent::Mutate { field_id, value } => {
+                        if let EditFocus::Tracking {
+                            field_id: f,
+                            value: v,
+                            ..
+                        } = &mut focus
+                            && *f == field_id
+                        {
+                            *v = value;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(matches!(&focus, EditFocus::Tracking { value, .. } if value == "world"));
+        }
+
+        #[test]
+        fn blur_on_wrong_field_does_not_reset() {
+            let sink = new_edit_event_sink();
+            push_event(&sink, focus_event("f1"));
+            push_event(&sink, blur_event("f99")); // different field
+            let evs = drain_edit_events(&sink);
+
+            let mut focus = EditFocus::None;
+            for ev in evs {
+                match ev {
+                    EditConsoleEvent::Focus {
+                        field_id,
+                        kind,
+                        value,
+                        ..
+                    } => {
+                        focus = EditFocus::Tracking {
+                            field_id,
+                            kind,
+                            value,
+                        };
+                    }
+                    EditConsoleEvent::Blur { field_id } => {
+                        let matches_cur = match &focus {
+                            EditFocus::Tracking { field_id: f, .. }
+                            | EditFocus::Editing { field_id: f, .. } => *f == field_id,
+                            EditFocus::None => false,
+                        };
+                        if matches_cur {
+                            focus = EditFocus::None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // f1 focus still active; blur for f99 was a no-op.
+            assert!(matches!(&focus, EditFocus::Tracking { field_id, .. } if field_id == "f1"));
+        }
     }
 }

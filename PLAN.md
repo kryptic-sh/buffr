@@ -180,13 +180,20 @@ gates the `v0.1.0` daily-driver cut.
       complete; `EditSession` plug-in and DOM write-back land in Stage 2.
 - [ ] CEF V8 binding for focused text-field value get/set; `apps/buffr-helper`
       exposes JS bridge. **Gates v0.1.0.**
-- [ ] CEF focus event → spawn `EditSession` from field value; route key events
-      to it; on `<Esc>` (or focus-out) drop the session and return to page-mode.
-      **Gates v0.1.0.**
-- [ ] Per render frame: drain `EditSession::take_content_change()` → CEF DOM
-      update via the JS bridge. **Gates v0.1.0.**
+- [x] On focus + `i`/`a`/`I`/`A` etc.: build `Rope` from field value, construct
+      `Editor`, route keys via `feed_input`. `EditFocus` FSM in
+      `apps/buffr/src/main.rs` drives `None → Tracking → Editing` transitions;
+      `promote_tracking_to_editing` and `edit_mode_handle_key` wire the
+      keystroke path. (Stage 2)
+- [x] Per render frame: drain `EditSession::take_content_change()` → CEF DOM
+      update via the JS bridge. `BrowserHost::run_edit_apply` executes
+      `__buffrEditApply` on the active tab's main frame. (Stage 2)
+- [x] `<Esc>` → exit edit-mode → drop the session and return to page-mode.
+      Pre/post `VimMode::Normal` + Esc heuristic demotes `Editing → Tracking`
+      and calls `run_edit_detach`. (Stage 2)
 - [ ] Browser-side smoke test: open a page with `<textarea>`, focus it, type
-      `iHello<Esc>` → field reads "Hello"; `dd` → field cleared.
+      `iHello<Esc>` → field reads "Hello"; `dd` → field cleared. (Requires
+      manual or harness-driven CEF run — follow-up.)
 
 ### Phase 3 — UI chrome
 
@@ -447,13 +454,13 @@ release**, mirroring hjkl's freeze cadence (0.1.0 = stability marker, not 1.0).
 
 ### What gates `v0.1.0`
 
-- [ ] **Edit-mode lifecycle wired end-to-end.** Engine entry exists
-      (`feed_input(PlannedInput)` lands in `buffr-modal/src/edit_mode.rs` after
-      the crossterm 0.29 bump); remaining: CEF V8 binding for focused text-field
-      value get/set in `apps/buffr-helper`, Rope mirror +
-      `Editor<Rope, BuffrHost>` construction on `i`/`a`/`I`/`A`,
-      `Editor::take_changes()` drain → DOM update each frame, `<Esc>` exit. hjkl
-      0.3.0 is on crates.io so no upstream blocker remains.
+- [x] **Edit-mode lifecycle wired end-to-end (Stage 2 landed 2026-04-28).**
+      `EditFocus` FSM (`None → Tracking → Editing`) driven by JS
+      focus/blur/mutate events. `EditSession` constructed on `i`/`a`/`I`/`A`;
+      keystrokes routed via `feed_planned`; `take_content_change()` drain pushed
+      to DOM each frame via `__buffrEditApply`; `<Esc>` while Normal demotes to
+      Tracking + calls `__buffrEditDetach`. CEF browser-side smoke verification
+      is a follow-up (requires a live CEF run outside the unit-test harness).
 - [x] **History FTS5 migration.** `visits_fts` (unicode61) in schema v2;
       `search` uses `MATCH`; frecency ranking unchanged.
 - [x] **Download notification strip landed.** `ask_each_time = false` (the

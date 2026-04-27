@@ -84,6 +84,14 @@ impl EditSession {
         self.editor.feed_input(key_event_to_planned(key))
     }
 
+    /// Feed a [`hjkl_engine::PlannedInput`] directly. Bypasses the
+    /// crossterm conversion layer — used by the winit event path which
+    /// constructs `PlannedInput` from winit's `KeyEvent` directly so
+    /// the two crates never need a shared `crossterm` version.
+    pub fn feed_planned(&mut self, input: hjkl_engine::PlannedInput) -> bool {
+        self.editor.feed_input(input)
+    }
+
     /// Convenience: type a literal character with no modifiers. Used
     /// by tests and by the JS bridge when forwarding plain printable
     /// keys.
@@ -207,6 +215,27 @@ mod tests {
         s.press(KeyCode::Esc);
         s.press(KeyCode::Esc);
         assert_eq!(s.vim_mode(), VimMode::Normal);
+    }
+
+    #[test]
+    fn feed_planned_round_trip() {
+        // Stage 2: feed_planned bypasses crossterm; same FSM result.
+        // Type `i`, `H`, `i`, Esc → content starts with "Hi".
+        use hjkl_engine::{Modifiers, PlannedInput, SpecialKey};
+        let empty_mods = Modifiers::default();
+        let mut s = EditSession::new("");
+        // `i` → enter insert mode
+        s.feed_planned(PlannedInput::Char('i', empty_mods));
+        assert_eq!(s.vim_mode(), VimMode::Insert);
+        s.feed_planned(PlannedInput::Char('H', empty_mods));
+        s.feed_planned(PlannedInput::Char('i', empty_mods));
+        s.feed_planned(PlannedInput::Key(SpecialKey::Esc, empty_mods));
+        assert_eq!(s.vim_mode(), VimMode::Normal);
+        assert!(
+            s.content().starts_with("Hi"),
+            "expected content to start with 'Hi', got {:?}",
+            s.content()
+        );
     }
 
     #[test]

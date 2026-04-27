@@ -12,11 +12,12 @@
 // This is the same console-log scraping pattern as hint.js — see
 // `crates/buffr-core/src/hint.rs` for the rationale.
 //
-// IPC (browser → renderer) will be added in Stage 2:
-//   `window.__buffrEditApply(field_id, value, [start, end])` — push a
-//       new value + caret position from Rust back into the focused field.
-//   `window.__buffrEditDetach(field_id)` — remove the active-class and
-//       stop forwarding input events for this field.
+// IPC (browser → renderer) — Stage 2 additions:
+//   `window.__buffrEditApply(field_id, value)` — push a new value from
+//       Rust back into the focused field, firing a synthetic `input`
+//       event so the page's bound handlers stay in sync.
+//   `window.__buffrEditAttach(field_id)` — add the active CSS class.
+//   `window.__buffrEditDetach(field_id)` — remove the active CSS class.
 //
 // The `%%OVERLAY_CLASS%%` class is added to focused fields now so that
 // Stage 2 can style them without a follow-up edit to this asset.
@@ -40,7 +41,8 @@
     // means the element can still be garbage-collected when the page
     // removes it; we never hold a strong reference.
 
-    var idMap = new WeakMap();
+    var idMap = new WeakMap();   // Element → id string (forward)
+    var elById = new Map();      // id string → WeakRef<Element> (reverse)
     var nextId = 1;
 
     function idFor(el) {
@@ -48,8 +50,18 @@
         if (id == null) {
             id = 'f' + (nextId++);
             idMap.set(el, id);
+            elById.set(id, new WeakRef(el));
         }
         return id;
+    }
+
+    // Re-resolve an element by id; cleans the map if the element was GC'd.
+    function elFor(id) {
+        var ref = elById.get(id);
+        if (!ref) { return null; }
+        var el = ref.deref();
+        if (!el) { elById.delete(id); return null; }
+        return el;
     }
 
     // ---- element classification -----------------------------------------
@@ -146,10 +158,9 @@
     // are already in `idMap` (i.e. were previously focused by the user)
     // so random off-screen autofill doesn't produce noise.
     //
-    // Stage 2 will gate on `window.__buffrEditAttached === id` to avoid
-    // rebroadcasting our own DOM mutations (when Rust writes back into
-    // the field the `input` event fires again; the gate prevents a
-    // Rust-emits → JS-emits → Rust-processes loop).
+    // Gate: if `el.__buffrApplying` is set, the mutation originated from
+    // our own `__buffrEditApply` call — skip re-emitting to break the
+    // Rust-writes → JS-emits → Rust-processes loop.
 
     document.addEventListener('input', function (ev) {
         var el = ev.target;
@@ -160,8 +171,48 @@
         // `idMap.has` is a WeakMap lookup — O(1), no allocation.
         if (!idMap.has(el)) { return; }
 
+        // Skip echoes of our own DOM writes.
+        if (el.__buffrApplying) { return; }
+
         var id = idMap.get(el);
         emit({ type: 'mutate', field_id: id, value: valueOf(el, kind) });
     }, true);
+
+    // ---- browser → renderer IPC (Stage 2) ------------------------------
+
+    window.__buffrEditApply = function (fieldId, newValue) {
+        var el = elFor(fieldId);
+        if (!el) { return false; }
+        var kind = kindOf(el);
+        if (!kind) { return false; }
+        // Mark our own write so the input listener ignores it.
+        el.__buffrApplying = true;
+        try {
+            if (kind === 'input' || kind === 'textarea') {
+                if (el.value !== newValue) { el.value = newValue; }
+            } else if (kind === 'contentEditable') {
+                if (el.innerText !== newValue) { el.innerText = newValue; }
+            }
+            // Fire input event so site JS bound to the field stays in sync.
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        } finally {
+            el.__buffrApplying = false;
+        }
+        return true;
+    };
+
+    window.__buffrEditAttach = function (fieldId) {
+        var el = elFor(fieldId);
+        if (!el) { return false; }
+        el.classList.add(OVERLAY_CLASS);
+        return true;
+    };
+
+    window.__buffrEditDetach = function (fieldId) {
+        var el = elFor(fieldId);
+        if (!el) { return false; }
+        el.classList.remove(OVERLAY_CLASS);
+        return true;
+    };
 
 })();
