@@ -2120,17 +2120,26 @@ impl AppState {
         self.current_mode_label = label;
         let url = self.statusline.url.clone();
         let title = self.title_for(label, &url);
-        if title != self.current_title {
+        let title_changed = title != self.current_title;
+        if title_changed {
             self.current_title = title.clone();
             if let Some(window) = self.window.as_ref() {
                 window.set_title(&title);
             }
         }
-        // Statusline reflects mode + count every refresh — both can
-        // change between tick callbacks.
+        // Only request a redraw when the visible chrome state actually
+        // changed. Previously this fired on every call, including pass-
+        // through key events in Insert mode where mode/count/url stay
+        // identical — CEF emits its own on_paint after processing the
+        // key which already triggers a redraw, so the pre-CEF redraw
+        // here just painted stale OSR pixels and doubled GPU work.
+        let chrome_changed =
+            self.statusline.mode != mode || self.statusline.count_buffer != count || title_changed;
         self.statusline.mode = mode;
         self.statusline.count_buffer = count;
-        self.request_redraw();
+        if chrome_changed {
+            self.request_redraw();
+        }
     }
 
     fn request_redraw(&self) {
