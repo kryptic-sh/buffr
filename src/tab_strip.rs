@@ -45,6 +45,11 @@ pub const MIN_TAB_WIDTH: u32 = 80;
 /// titles get long enough to be hard to glance at.
 pub const MAX_TAB_WIDTH: u32 = 220;
 
+/// Compact width for pinned tabs. Pinned tabs render as a square
+/// icon-only pill — no title text, just the favicon (or a fallback
+/// initial) — so the user can fit many anchors in a small strip.
+pub const PINNED_TAB_WIDTH: u32 = 32;
+
 /// Per-tab render input. `progress >= 1.0` hides the loading bar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabView {
@@ -109,12 +114,18 @@ impl TabStrip {
             return;
         }
 
-        // Compute each tab's pixel rect. Strategy: distribute the
-        // available width equally among tabs, clamp to [MIN, MAX], let
-        // the rightmost overflow truncate.
-        let n = self.tabs.len() as u32;
-        let available = (width as u32).saturating_sub((n + 1) * GUTTER);
-        let raw_w = available / n.max(1);
+        // Compute each tab's pixel rect. Pinned tabs are fixed-width
+        // (PINNED_TAB_WIDTH) icon-only pills; unpinned tabs share the
+        // remaining width equally, clamped to [MIN, MAX], with the
+        // rightmost overflow truncating.
+        let pinned_count = self.tabs.iter().filter(|t| t.pinned).count() as u32;
+        let unpinned_count = self.tabs.len() as u32 - pinned_count;
+        let pinned_total_w = pinned_count * PINNED_TAB_WIDTH;
+        let gutter_total = ((self.tabs.len() as u32) + 1) * GUTTER;
+        let avail_for_unpinned = (width as u32)
+            .saturating_sub(pinned_total_w)
+            .saturating_sub(gutter_total);
+        let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
         let tab_w = raw_w.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
 
         let text_y = start_y as i32 + ((strip_h as i32 - font::GLYPH_H as i32) / 2);
@@ -127,8 +138,18 @@ impl TabStrip {
             if x >= max_right {
                 break;
             }
-            let pill_w = (tab_w as i32).min(max_right - x);
-            if pill_w < MIN_TAB_WIDTH as i32 / 2 {
+            let target_w = if tab.pinned {
+                PINNED_TAB_WIDTH as i32
+            } else {
+                tab_w as i32
+            };
+            let pill_w = target_w.min(max_right - x);
+            let min_pill = if tab.pinned {
+                PINNED_TAB_WIDTH as i32 / 2
+            } else {
+                MIN_TAB_WIDTH as i32 / 2
+            };
+            if pill_w < min_pill {
                 break;
             }
             let is_active = self.active == Some(i);
@@ -172,13 +193,23 @@ impl TabStrip {
                 );
             }
 
-            // Title with optional pin glyph prefix. We pre-truncate so
-            // the text never bleeds onto the next pill.
-            let prefix = if tab.pinned { "*" } else { " " };
-            let raw_label = format!("{prefix} {}", tab.title);
-            let max_text_px = (pill_w as usize).saturating_sub(12);
-            let label = truncate_to_width(&raw_label, max_text_px);
-            font::draw_text(buffer, width, height, x + 6, text_y, label, fg);
+            if tab.pinned {
+                // Default-favicon stand-in: a single capitalized letter
+                // pulled from the title (or `*` if the title is empty)
+                // centered in the pill. Real favicon image rendering
+                // is a follow-up — this gives users an at-a-glance
+                // anchor today without any network IO.
+                let glyph: String = pinned_glyph(&tab.title);
+                let glyph_px = font::text_width(&glyph) as i32;
+                let glyph_x = x + (pill_w - glyph_px) / 2;
+                font::draw_text(buffer, width, height, glyph_x, text_y, &glyph, fg);
+            } else {
+                // Title for unpinned tabs. Pre-truncate so the text
+                // never bleeds onto the next pill.
+                let max_text_px = (pill_w as usize).saturating_sub(12);
+                let label = truncate_to_width(&tab.title, max_text_px);
+                font::draw_text(buffer, width, height, x + 6, text_y, label, fg);
+            }
 
             // Progress bar across the bottom edge of the pill — hidden
             // when idle (progress >= 1.0).
@@ -200,6 +231,18 @@ impl TabStrip {
             x += pill_w + GUTTER as i32;
         }
     }
+}
+
+/// First printable letter of a tab's title, uppercased — a default
+/// "favicon" stand-in for pinned tabs. Falls back to `*` when the
+/// title has no usable codepoint.
+fn pinned_glyph(title: &str) -> String {
+    for c in title.chars() {
+        if c.is_alphanumeric() {
+            return c.to_uppercase().to_string();
+        }
+    }
+    "*".to_string()
 }
 
 /// Truncate `s` to fit in `max_px` pixels, appending `..` when it
