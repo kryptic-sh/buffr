@@ -154,21 +154,21 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
     ""
 }
 
-// Palette ---------------------------------------------------------------
+// Palette (opaque BGRA: 0xFF_RR_GG_BB) ---------------------------------
 
-const COLOUR_FG: u32 = 0xF0_E8_D8;
+const COLOUR_FG: u32 = 0xFF_F0_E8_D8;
 
 // Started: dark blue-grey background, blue accent.
-const COLOUR_BG_STARTED: u32 = 0x0E_12_18;
-const COLOUR_ACCENT_STARTED: u32 = 0x55_88_FF;
+const COLOUR_BG_STARTED: u32 = 0xFF_0E_12_18;
+const COLOUR_ACCENT_STARTED: u32 = 0xFF_55_88_FF;
 
 // Completed: dark green background, green accent.
-const COLOUR_BG_COMPLETED: u32 = 0x0A_14_0E;
-const COLOUR_ACCENT_COMPLETED: u32 = 0x4A_C9_5C;
+const COLOUR_BG_COMPLETED: u32 = 0xFF_0A_14_0E;
+const COLOUR_ACCENT_COMPLETED: u32 = 0xFF_4A_C9_5C;
 
 // Failed: dark red background, red accent.
-const COLOUR_BG_FAILED: u32 = 0x16_0E_0E;
-const COLOUR_ACCENT_FAILED: u32 = 0xE0_5A_5A;
+const COLOUR_BG_FAILED: u32 = 0xFF_16_0E_0E;
+const COLOUR_ACCENT_FAILED: u32 = 0xFF_E0_5A_5A;
 
 // -----------------------------------------------------------------------
 

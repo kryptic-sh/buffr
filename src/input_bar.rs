@@ -86,16 +86,16 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            bg: 0x1A_1F_2E,
-            fg: 0xEE_EE_EE,
-            accent: 0x55_88_FF,
-            border: 0x33_3D_55,
-            dropdown_bg: 0x14_18_24,
-            dropdown_selected_bg: 0x22_2D_45,
-            dropdown_kind_history: 0x88_AA_FF,
-            dropdown_kind_bookmark: 0xE0_C8_5A,
-            dropdown_kind_command: 0x4A_C9_5C,
-            dropdown_kind_search: 0xC8_5A_E0,
+            bg: 0xFF_1A_1F_2E,
+            fg: 0xFF_EE_EE_EE,
+            accent: 0xFF_55_88_FF,
+            border: 0xFF_33_3D_55,
+            dropdown_bg: 0xFF_14_18_24,
+            dropdown_selected_bg: 0xFF_22_2D_45,
+            dropdown_kind_history: 0xFF_88_AA_FF,
+            dropdown_kind_bookmark: 0xFF_E0_C8_5A,
+            dropdown_kind_command: 0xFF_4A_C9_5C,
+            dropdown_kind_search: 0xFF_C8_5A_E0,
         }
     }
 }
