@@ -3672,7 +3672,10 @@ fn mode_label(mode: PageMode) -> &'static str {
 impl ApplicationHandler<BuffrUserEvent> for AppState {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
         match event {
-            BuffrUserEvent::OsrFrame => self.request_redraw(),
+            BuffrUserEvent::OsrFrame => {
+                tracing::trace!("user_event: OsrFrame -> request_redraw");
+                self.request_redraw();
+            }
         }
     }
 
@@ -3804,6 +3807,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                tracing::trace!("redraw: RedrawRequested");
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
@@ -3885,6 +3889,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 use winit::event::{ElementState::Pressed, MouseButton};
+                tracing::trace!(?state, ?button, cursor = ?self.osr_cursor, "input: mouse_button");
                 // Pinned-close confirmation hit-test: a left click on
                 // the Yes / No button resolves the prompt. Anywhere else
                 // is swallowed so the click can't reach the page or
@@ -4072,6 +4077,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     };
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
+                    tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
                     host.osr_mouse_wheel(bx, by, dx, dy, mods);
                 }
             }

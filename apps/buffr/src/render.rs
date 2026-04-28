@@ -253,8 +253,12 @@ impl Renderer {
         let w = self.width as usize;
         let h = self.height as usize;
 
+        let t0 = std::time::Instant::now();
+
         // Invoke the paint closure with the CPU buffer.
         paint(&mut self.cpu_buf, w, h);
+
+        let t_paint = t0.elapsed();
 
         // Upload CPU buffer to GPU texture as raw bytes.
         let bytes: &[u8] = bytemuck::cast_slice(&self.cpu_buf);
@@ -278,10 +282,14 @@ impl Renderer {
             },
         );
 
+        let t_upload = t0.elapsed();
+
         let frame = self
             .surface
             .get_current_texture()
             .context("wgpu: get_current_texture")?;
+
+        let t_acquire = t0.elapsed();
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -314,7 +322,19 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        let t_submit = t0.elapsed();
         frame.present();
+        let t_present = t0.elapsed();
+
+        tracing::trace!(
+            paint_us = t_paint.as_micros() as u64,
+            upload_us = (t_upload - t_paint).as_micros() as u64,
+            acquire_us = (t_acquire - t_upload).as_micros() as u64,
+            submit_us = (t_submit - t_acquire).as_micros() as u64,
+            present_us = (t_present - t_submit).as_micros() as u64,
+            total_us = t_present.as_micros() as u64,
+            "renderer.frame",
+        );
 
         Ok(())
     }
