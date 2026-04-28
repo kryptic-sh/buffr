@@ -767,6 +767,12 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
+    // same EGL / GL / Vulkan driver state on Linux; tearing down
+    // wgpu after CEF has dismantled the GPU process segfaults.
+    info!("shutdown: dropping renderer");
+    drop(app_state.renderer.take());
+
     // Defer-dismiss any permission requests still queued at shutdown.
     // Dropping a CEF callback without invoking it would wedge the
     // renderer; resolving with `Defer` fires the right "DISMISS"
