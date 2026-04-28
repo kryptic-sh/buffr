@@ -3771,24 +3771,34 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
-                // Trim the CEF child to leave room for the chrome
-                // strips. `cef_child_rect` accounts for the overlay
-                // when active.
                 let (_x, _y, cef_w, cef_h) =
                     self.cef_child_rect(new_size.width.max(1), new_size.height.max(1));
+                debug!(
+                    win_w = new_size.width,
+                    win_h = new_size.height,
+                    cef_w,
+                    cef_h,
+                    has_host = self.host.is_some(),
+                    "winit: Resized",
+                );
                 if let Some(host) = self.host.as_ref() {
                     match host.mode() {
                         buffr_core::HostMode::Windowed => {
                             host.resize(cef_w, cef_h);
                         }
                         buffr_core::HostMode::Osr => {
-                            // OSR: update viewport atomics + trigger was_resized()
-                            // so CEF re-paints at the new dimensions.
                             host.osr_resize(cef_w, cef_h);
+                            debug!(cef_w, cef_h, "winit: Resized -> osr_resize");
                         }
                     }
                 }
                 self.request_redraw();
+            }
+            WindowEvent::Moved(pos) => {
+                debug!(x = pos.x, y = pos.y, "winit: Moved");
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                debug!(scale_factor, "winit: ScaleFactorChanged");
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
