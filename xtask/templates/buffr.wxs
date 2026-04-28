@@ -30,7 +30,7 @@
     <Package InstallerVersion="500"
              Compressed="yes"
              InstallScope="perMachine"
-             Description="buffr — modal browser"
+             Description="buffr - modal browser"
              Manufacturer="kryptic.sh" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of buffr is already installed." />
@@ -96,7 +96,7 @@
       <Component Id="cmpStartShortcut" Guid="*">
         <Shortcut Id="ShortcutStartMenu"
                   Name="buffr"
-                  Description="buffr — modal browser"
+                  Description="buffr - modal browser"
                   Target="[#filBuffrExe]"
                   WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="rmStartMenu"
@@ -115,7 +115,7 @@
       <Component Id="cmpDesktopShortcut" Guid="*">
         <Shortcut Id="ShortcutDesktop"
                   Name="buffr"
-                  Description="buffr — modal browser"
+                  Description="buffr - modal browser"
                   Target="[#filBuffrExe]"
                   WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue Root="HKCU"

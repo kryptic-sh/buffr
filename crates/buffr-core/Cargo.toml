@@ -10,6 +10,11 @@ authors.workspace = true
 description = "CEF integration and browser host for buffr."
 build = "build.rs"
 
+[features]
+# Off-screen rendering path (Linux default; always compiled in).
+# The feature flag exists so `--features osr` is accepted workspace-wide
+# by CI without cargo rejecting it as unknown.
+osr = []
 
 [dependencies]
 cef.workspace = true
