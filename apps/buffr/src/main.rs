@@ -1314,6 +1314,20 @@ struct AppState {
     /// strip. Set on press, cleared on release; if the release lands on
     /// a different tab slot, the drag triggers a `move_tab`.
     tab_drag_src: Option<usize>,
+    /// Set whenever something the session-restore cares about changes
+    /// (tab open / close / reorder / active switch / URL navigation).
+    /// `about_to_wait` flushes the session JSON to disk while this is
+    /// true, then clears it. On shutdown we only re-save when dirty.
+    session_dirty: bool,
+    /// Snapshot of the active tab's URL at the last session save.
+    /// Compared against `host.active_tab_live_url()` each tick to
+    /// detect navigation.
+    last_session_url: String,
+    /// Snapshot of `host.active_index()` at the last session save.
+    last_session_active: Option<usize>,
+    /// Snapshot of the tab count + ID list at the last session save —
+    /// detects open / close / reorder events the moment they happen.
+    last_session_tab_ids: Vec<buffr_core::TabId>,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1532,6 +1546,10 @@ impl AppState {
             osr_click_count: 1,
             shutdown_flag,
             tab_ids: Vec::new(),
+            session_dirty: false,
+            last_session_url: String::new(),
+            last_session_active: None,
+            last_session_tab_ids: Vec::new(),
         }
     }
 
@@ -1597,7 +1615,7 @@ impl AppState {
 
     /// Close the active tab. If it was the last one, signal the
     /// caller to exit. Returns `true` if more tabs remain.
-    fn close_active_tab_or_exit(&self) -> bool {
+    fn close_active_tab_or_exit(&mut self) -> bool {
         let Some(host) = self.host.as_ref() else {
             return false;
         };
@@ -1616,8 +1634,10 @@ impl AppState {
     }
 
     /// Persist the live tab list synchronously. Called on graceful
-    /// shutdown paths (last-tab-close, `:q`, `Ctrl-C`).
-    fn save_session_now(&self) {
+    /// shutdown paths (last-tab-close, `:q`, `Ctrl-C`) and from
+    /// `about_to_wait` when `session_dirty` is set. No-op when the
+    /// in-memory snapshot already matches and `session_dirty` is false.
+    fn save_session_now(&mut self) {
         let Some(path) = self.session_path.as_ref() else {
             return;
         };
@@ -1626,13 +1646,38 @@ impl AppState {
         };
         let summaries = host.tabs_summary();
         let active = host.active_index();
+        let ids: Vec<buffr_core::TabId> = summaries.iter().map(|t| t.id).collect();
+        let url = host.active_tab_live_url();
+
+        // Skip if nothing changed and no external dirty signal.
+        if !self.session_dirty
+            && active == self.last_session_active
+            && ids == self.last_session_tab_ids
+            && url == self.last_session_url
+        {
+            return;
+        }
+
         let s = session::Session::from_tabs_with_active(
             summaries.iter().map(|t| (t.url.as_str(), t.pinned)),
             active,
         );
         if let Err(err) = session::write(path, &s) {
             warn!(error = %err, "session: write failed");
+            return;
         }
+
+        // Update snapshots and clear dirty flag.
+        self.last_session_url = url;
+        self.last_session_active = active;
+        self.last_session_tab_ids = ids;
+        self.session_dirty = false;
+    }
+
+    /// Mark the session as needing a flush. Call this at any site that
+    /// mutates tab state outside the `about_to_wait` URL-poll path.
+    fn mark_session_dirty(&mut self) {
+        self.session_dirty = true;
     }
 
     /// Open any extra `--new-tab` URLs after the homepage / session
@@ -3371,18 +3416,18 @@ impl ApplicationHandler for AppState {
                     self.tab_drag_src = Some(idx);
                     return;
                 }
-                if state != Pressed && button == MouseButton::Left {
-                    if let Some(src) = self.tab_drag_src.take() {
-                        if let Some(dst) = tab_strip_idx
-                            && dst != src
-                            && let Some(host) = self.host.as_ref()
-                        {
-                            host.move_tab(src, dst);
-                            self.refresh_tab_strip();
-                            self.request_redraw();
-                            return;
-                        }
-                    }
+                if state != Pressed
+                    && button == MouseButton::Left
+                    && let Some(src) = self.tab_drag_src.take()
+                    && let Some(dst) = tab_strip_idx
+                    && dst != src
+                    && let Some(host) = self.host.as_ref()
+                {
+                    host.move_tab(src, dst);
+                    self.mark_session_dirty();
+                    self.refresh_tab_strip();
+                    self.request_redraw();
+                    return;
                 }
                 if state == Pressed
                     && button == MouseButton::Middle
@@ -3646,13 +3691,34 @@ impl ApplicationHandler for AppState {
 
         // Live URL sync: poll the active tab's main-frame URL each tick
         // and push it into the statusline. Cheap (one CEF call + string
-        // compare); redraw only on change.
+        // compare); redraw only on change. Also detects navigation,
+        // active-index, and tab-list changes for the session dirty flag.
         if let Some(host) = self.host.as_ref() {
             let live = host.active_tab_live_url();
             if !live.is_empty() && live != self.statusline.url {
-                self.statusline.url = live;
+                self.statusline.url = live.clone();
                 self.request_redraw();
             }
+            // Session dirty detection: URL changed since last save.
+            if !live.is_empty() && live != self.last_session_url {
+                self.session_dirty = true;
+            }
+            // Active-index changed.
+            let active_idx = host.active_index();
+            if active_idx != self.last_session_active {
+                self.session_dirty = true;
+            }
+            // Tab-list (open / close / reorder) changed.
+            let current_ids: Vec<buffr_core::TabId> =
+                host.tabs_summary().iter().map(|t| t.id).collect();
+            if current_ids != self.last_session_tab_ids {
+                self.session_dirty = true;
+            }
+        }
+
+        // Flush session when dirty.
+        if self.session_dirty {
+            self.save_session_now();
         }
 
         // Download notices: drop any that have lived past their expiry
