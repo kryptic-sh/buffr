@@ -1603,6 +1603,13 @@ struct AppState {
     /// selection. CEF natively renders the on-screen text selection
     /// during the drag.
     osr_drag_start: Option<(i32, i32)>,
+    /// CEF event-flag bitmask of mouse buttons currently held. OR'd
+    /// into the `modifiers` field of `MouseEvent` on every `CursorMoved`
+    /// so Chromium knows the left button is down during a drag and
+    /// extends the text selection. Bits: 16 = left, 32 = middle,
+    /// 64 = right (CEF `EVENTFLAG_*_MOUSE_BUTTON`). Set on press,
+    /// cleared on release.
+    osr_mouse_buttons: u32,
     /// Wheel-momentum state. Native Chrome decelerates after a touchpad
     /// flick via the gesture-recognizer / smooth-scroll path; CEF's
     /// `send_mouse_wheel_event` API is event-driven only, so we synthesize
@@ -1762,6 +1769,7 @@ impl AppState {
             osr_last_click_button: None,
             osr_click_count: 1,
             osr_drag_start: None,
+            osr_mouse_buttons: 0,
             osr_wheel_velocity: (0.0, 0.0),
             osr_wheel_last_at: None,
             shutdown_flag,
@@ -3957,7 +3965,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let bx = position.x as i32;
                     let by = (position.y as i32).saturating_sub(cef_y as i32);
                     self.osr_cursor = (bx, by);
-                    let mods = winit_mods_to_cef(&self.modifiers);
+                    let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     host.osr_mouse_move(bx, by, mods);
                 }
             }
@@ -4085,6 +4093,24 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && let Some(cef_button) = winit_button_to_cef(&button)
                 {
                     let mouse_up = state == winit::event::ElementState::Released;
+                    // Track held mouse buttons so subsequent CursorMoved
+                    // events carry the *_MOUSE_BUTTON event flag — without
+                    // it, Chromium's hit-test treats drag-motion as plain
+                    // hover and won't extend the text selection.
+                    let btn_flag: u32 = if cef_button == MouseButtonType::LEFT {
+                        16
+                    } else if cef_button == MouseButtonType::MIDDLE {
+                        32
+                    } else if cef_button == MouseButtonType::RIGHT {
+                        64
+                    } else {
+                        0
+                    };
+                    if mouse_up {
+                        self.osr_mouse_buttons &= !btn_flag;
+                    } else {
+                        self.osr_mouse_buttons |= btn_flag;
+                    }
                     // Double-click detection.
                     let now = Instant::now();
                     let same_button = self
@@ -4131,7 +4157,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             tracing::debug!(dx, dy, "osr drag → Visual mode");
                         }
                     }
-                    let mods = winit_mods_to_cef(&self.modifiers);
+                    let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     let (bx, by) = self.osr_cursor;
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
                 }
