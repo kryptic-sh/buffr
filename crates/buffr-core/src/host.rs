@@ -295,7 +295,8 @@ impl BrowserHost {
             RawWindowHandle::Win32(_) => HostMode::Windowed,
             _ => HostMode::Osr,
         };
-        info!(target: "buffr_core::host", %url, ?mode, "creating CEF browser (initial tab)");
+        info!(target: "buffr_core::host", ?mode, "creating CEF browser (initial tab)");
+        tracing::debug!(target: "buffr_core::host", %url, "creating CEF browser (initial tab) — url");
         let (osr_w, osr_h) = initial_size;
         let osr_view = Arc::new(OsrViewState::new());
         osr_view
@@ -479,7 +480,7 @@ impl BrowserHost {
         if self.mode != HostMode::Osr {
             return;
         }
-        info!(
+        tracing::debug!(
             target: "buffr_core::host",
             x, y, ?button, mouse_up, click_count, modifiers,
             "osr_mouse_click"
@@ -804,7 +805,8 @@ impl BrowserHost {
         } else {
             self.set_active_index(new_idx);
         }
-        info!(target: "buffr_core::host", %id, %url, background, "tab opened");
+        info!(target: "buffr_core::host", %id, background, "tab opened");
+        tracing::debug!(target: "buffr_core::host", %url, "tab opened — url");
         // Phase 6 telemetry: count every tab open (foreground +
         // background) — they are equally "user opened a tab" events.
         if let Some(c) = self.counters.as_ref() {
@@ -1077,7 +1079,7 @@ impl BrowserHost {
             let cef_url = CefString::from(trimmed);
             frame.load_url(Some(&cef_url));
             t.url = trimmed.to_string();
-            info!(target: "buffr_core::host", url = %trimmed, "navigate");
+            tracing::debug!(target: "buffr_core::host", url = %trimmed, "navigate");
             Ok(())
         })
         .ok_or(CoreError::CreateBrowserFailed)?
@@ -1260,7 +1262,7 @@ impl BrowserHost {
                         let url = CefStringUtf16::from(&frame.url()).to_string();
                         if let Ok(mut cb) = self.clipboard.lock() {
                             if cb.set_text(&url) {
-                                tracing::info!(url, "yanked URL to clipboard");
+                                tracing::debug!(url, "yanked URL to clipboard");
                             } else {
                                 tracing::warn!(
                                     url,

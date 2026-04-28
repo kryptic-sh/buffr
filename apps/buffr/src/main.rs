@@ -49,7 +49,7 @@ use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tempfile::TempDir;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -320,13 +320,15 @@ fn main() -> Result<()> {
     // in-memory, so no SQLite file ever appears on disk.
     let (paths, _private_tmp) = resolve_paths(cli.private)?;
     if cli.private {
-        info!(
+        info!("private mode active — no data persists across restart");
+        debug!(
             cache = %paths.cache.display(),
             data = %paths.data.display(),
-            "private mode active — no data persists across restart"
+            "private mode paths"
         );
     } else {
-        info!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
+        info!("profile paths resolved");
+        debug!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
     }
 
     // -------- load config + build initial keymap ----------------------
@@ -429,7 +431,7 @@ fn main() -> Result<()> {
         if let Err(e) = std::fs::create_dir_all(dir) {
             warn!(path = %dir.display(), error = %e, "downloads default_dir mkdir failed");
         }
-        info!(path = %dir.display(), "downloads default_dir resolved");
+        debug!(path = %dir.display(), "downloads default_dir resolved");
     }
     let downloads_config = Arc::new(downloads_config);
 
@@ -1849,7 +1851,7 @@ impl AppState {
         }
         self.find_smoke_at = None;
         if let (Some(host), Some(query)) = (self.host.as_ref(), self.pending_find.take()) {
-            tracing::info!(%query, "find smoke: start_find");
+            tracing::debug!(%query, "find smoke: start_find");
             self.statusline.find_query = Some(FindStatus {
                 query: query.clone(),
                 current: 0,
@@ -2555,7 +2557,7 @@ impl AppState {
                     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
                     match self.bookmarks.add(&url, None, &tag_refs) {
                         Ok(_) => {
-                            tracing::info!(%url, ?tags, "bookmark added");
+                            tracing::debug!(%url, ?tags, "bookmark added");
                             // Phase 6 telemetry: count one bookmark
                             // creation. `:bookmark` is the only path
                             // that calls `Bookmarks::add` from a user
@@ -2673,7 +2675,7 @@ impl AppState {
                         &self.edit_focus,
                         EditFocus::Editing { field_id: f } if *f == field_id
                     );
-                    tracing::info!(
+                    tracing::debug!(
                         %field_id,
                         ?kind,
                         already_editing,
@@ -2698,11 +2700,11 @@ impl AppState {
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Insert);
                         }
-                        tracing::info!(%field_id, "edit-mode entered");
+                        tracing::debug!(%field_id, "edit-mode entered");
                         self.edit_focus = EditFocus::Editing { field_id };
                         mode_changed = true;
                     } else if !already_editing {
-                        tracing::info!(%field_id, "focus ignored — no recent user gesture");
+                        tracing::debug!(%field_id, "focus ignored — no recent user gesture");
                     }
                 }
                 EditConsoleEvent::Blur { field_id } => {
@@ -2811,7 +2813,7 @@ impl AppState {
     fn edit_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         let planned = Self::winit_key_to_planned(event, self.modifiers);
         let is_esc_pressed = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
-        tracing::info!(
+        tracing::debug!(
             state = ?event.state,
             logical = ?event.logical_key,
             is_esc_pressed,
@@ -3273,11 +3275,8 @@ impl ApplicationHandler for AppState {
             Some(self.counters.clone()),
         ) {
             Ok(host) => {
-                info!(
-                    url = %self.homepage,
-                    mode = ?host.mode(),
-                    "browser host created"
-                );
+                info!(mode = ?host.mode(), "browser host created");
+                debug!(url = %self.homepage, "browser host created — initial url");
                 // CEF stays focused for the lifetime of the browser
                 // so DOM clicks deliver focus to inputs. We do NOT
                 // forward OS-level Focused(false) (alt-tab) so pages
