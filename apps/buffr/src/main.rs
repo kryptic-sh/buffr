@@ -2292,6 +2292,15 @@ impl AppState {
                 self.refresh_overlay_suggestions();
                 self.request_redraw();
             }
+            (Key::Named(NamedKey::Space), _) => {
+                // winit reports space as a Named key, not Char(' ').
+                // The omnibar is text input — space is just a literal.
+                if let Some(o) = self.overlay.as_mut() {
+                    o.input_mut().handle_text(' ');
+                }
+                self.refresh_overlay_suggestions();
+                self.request_redraw();
+            }
             (Key::Char(c), false) => {
                 if let Some(o) = self.overlay.as_mut() {
                     o.input_mut().handle_text(c);
