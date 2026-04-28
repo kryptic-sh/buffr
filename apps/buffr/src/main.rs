@@ -3142,10 +3142,10 @@ impl ApplicationHandler for AppState {
                     }
                 }
 
-                // Tab-strip click: Left button press within the tab strip
-                // y-range → focus the clicked tab. Intercept before OSR.
+                // Tab-strip click: Left = focus, Middle = close. Both
+                // on press. Intercept before OSR.
                 if state == Pressed
-                    && button == MouseButton::Left
+                    && (button == MouseButton::Left || button == MouseButton::Middle)
                     && let Some(window) = self.window.as_ref()
                 {
                     let size = window.inner_size();
@@ -3172,7 +3172,18 @@ impl ApplicationHandler for AppState {
                             let idx = (rel_x / (tab_w + GUTTER)) as usize;
                             if idx < self.tab_ids.len() {
                                 let id = self.tab_ids[idx];
-                                if let Some(host) = self.host.as_ref() {
+                                if button == MouseButton::Middle {
+                                    let remaining = if let Some(host) = self.host.as_ref() {
+                                        let _ = host.close_tab(id);
+                                        host.tab_count()
+                                    } else {
+                                        0
+                                    };
+                                    self.refresh_tab_strip();
+                                    if remaining == 0 {
+                                        event_loop.exit();
+                                    }
+                                } else if let Some(host) = self.host.as_ref() {
                                     host.select_tab(id);
                                 }
                                 return;
