@@ -369,35 +369,69 @@ fn action_kind(a: &PageAction) -> &'static str {
 /// Default keymap table. Static so test can validate every entry
 /// parses cleanly. See `docs/keymap.md` for the human-readable
 /// version.
+///
+/// Bindings mirror Vieb defaults; see docs/keymap.md for intentional
+/// divergences (`=` as ZoomReset, `<C-c>` as StopLoading, `o` kept).
 const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // -- scroll ---------------------------------------------------
     (PageMode::Normal, "j", PageAction::ScrollDown(1)),
     (PageMode::Normal, "k", PageAction::ScrollUp(1)),
     (PageMode::Normal, "h", PageAction::ScrollLeft(1)),
     (PageMode::Normal, "l", PageAction::ScrollRight(1)),
+    (PageMode::Normal, "<Down>", PageAction::ScrollDown(1)),
+    (PageMode::Normal, "<Up>", PageAction::ScrollUp(1)),
+    (PageMode::Normal, "<Left>", PageAction::ScrollLeft(1)),
+    (PageMode::Normal, "<Right>", PageAction::ScrollRight(1)),
+    (PageMode::Normal, "<C-e>", PageAction::ScrollDown(1)),
+    (PageMode::Normal, "<C-y>", PageAction::ScrollUp(1)),
     (PageMode::Normal, "<C-d>", PageAction::ScrollHalfPageDown),
     (PageMode::Normal, "<C-u>", PageAction::ScrollHalfPageUp),
     (PageMode::Normal, "<C-f>", PageAction::ScrollFullPageDown),
     (PageMode::Normal, "<C-b>", PageAction::ScrollFullPageUp),
+    (
+        PageMode::Normal,
+        "<PageDown>",
+        PageAction::ScrollFullPageDown,
+    ),
+    (PageMode::Normal, "<PageUp>", PageAction::ScrollFullPageUp),
     (PageMode::Normal, "gg", PageAction::ScrollTop),
     (PageMode::Normal, "G", PageAction::ScrollBottom),
+    (PageMode::Normal, "<Home>", PageAction::ScrollTop),
+    (PageMode::Normal, "<End>", PageAction::ScrollBottom),
     // -- tabs -----------------------------------------------------
+    (PageMode::Normal, "J", PageAction::TabNext),
+    (PageMode::Normal, "K", PageAction::TabPrev),
+    (PageMode::Normal, "w", PageAction::TabNext),
+    (PageMode::Normal, "b", PageAction::TabPrev),
     (PageMode::Normal, "gt", PageAction::TabNext),
     (PageMode::Normal, "gT", PageAction::TabPrev),
-    (PageMode::Normal, "<C-w>c", PageAction::TabClose),
     (PageMode::Normal, "t", PageAction::TabNew),
+    (PageMode::Normal, "d", PageAction::TabClose),
+    (PageMode::Normal, "<C-w>c", PageAction::TabClose),
     (PageMode::Normal, "<C-w>n", PageAction::DuplicateTab),
+    // buffr extension: <C-w>p for PinTab (no direct Vieb equivalent)
     (PageMode::Normal, "<C-w>p", PageAction::PinTab),
     // -- history --------------------------------------------------
     (PageMode::Normal, "H", PageAction::HistoryBack),
     (PageMode::Normal, "L", PageAction::HistoryForward),
+    (PageMode::Normal, "<C-o>", PageAction::HistoryBack),
+    (PageMode::Normal, "<C-i>", PageAction::HistoryForward),
     // -- reload / stop --------------------------------------------
     (PageMode::Normal, "r", PageAction::Reload),
+    (PageMode::Normal, "R", PageAction::ReloadHard),
     (PageMode::Normal, "<C-r>", PageAction::ReloadHard),
+    // buffr keeps <Esc> as StopLoading (Vieb: stopLoadingPage)
+    (PageMode::Normal, "<Esc>", PageAction::StopLoading),
+    // buffr extension: <C-c> as StopLoading (Vieb: copyText)
     (PageMode::Normal, "<C-c>", PageAction::StopLoading),
     // -- omnibar / command ----------------------------------------
+    (PageMode::Normal, "e", PageAction::OpenOmnibar),
+    (PageMode::Normal, "<C-l>", PageAction::OpenOmnibar),
+    // buffr extension: `o` kept as omnibar alias
     (PageMode::Normal, "o", PageAction::OpenOmnibar),
     (PageMode::Normal, ":", PageAction::OpenCommandLine),
+    // buffr extension: `;` as command line alias
+    (PageMode::Normal, ";", PageAction::OpenCommandLine),
     // -- hints ----------------------------------------------------
     (PageMode::Normal, "f", PageAction::EnterHintMode),
     (PageMode::Normal, "F", PageAction::EnterHintModeBackground),
@@ -411,8 +445,14 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // -- zoom -----------------------------------------------------
     (PageMode::Normal, "+", PageAction::ZoomIn),
     (PageMode::Normal, "-", PageAction::ZoomOut),
+    (PageMode::Normal, "_", PageAction::ZoomOut),
+    // buffr divergence: `=` stays as ZoomReset (Vieb uses `=` for
+    // zoomIn, but ZoomReset is more useful as a default chord).
+    // <C-0> added as Vieb-style zoom-reset alias.
     (PageMode::Normal, "=", PageAction::ZoomReset),
+    (PageMode::Normal, "<C-0>", PageAction::ZoomReset),
     // -- devtools -------------------------------------------------
+    (PageMode::Normal, "<F12>", PageAction::OpenDevTools),
     (PageMode::Normal, "<C-S-i>", PageAction::OpenDevTools),
     // -- visual-mode minimal ---------------------------------------
     // Esc returns to normal — the engine handles this via the mode
