@@ -118,21 +118,31 @@ impl Renderer {
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or_else(|| caps.formats[0]);
 
+        // Prefer Mailbox over Fifo. Both are vsync-aligned, but Mailbox
+        // is non-blocking: get_current_texture never waits on compositor
+        // image release, since a newer frame replaces the queued one.
+        // Under Fifo (any frame_latency) we observed get_current_texture
+        // blocking 100ms-1s during typing bursts on Wayland because the
+        // compositor stalls briefly on input events. Mailbox sidesteps
+        // that entirely — we may drop intermediate frames if we render
+        // faster than vsync, which is fine for UI: the latest one wins.
+        // Falls back to Fifo when Mailbox is unsupported.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        tracing::debug!(?present_mode, "wgpu surface present mode selected");
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width,
             height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
-            // Single in-flight frame: with latency=2 we observed
-            // `get_current_texture` blocking for 100+ ms during typing
-            // bursts when CEF on_paint fired faster than the Wayland
-            // compositor released swapchain images. latency=1 keeps the
-            // queue from filling, trading a tiny bit of GPU/CPU overlap
-            // for predictable acquire times.
-            desired_maximum_frame_latency: 1,
+            desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
 
