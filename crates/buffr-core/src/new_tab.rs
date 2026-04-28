@@ -16,6 +16,8 @@
 // `ImplSchemeHandlerFactory`, `WrapSchemeHandlerFactory`, `ResourceHandler`,
 // etc. — mirroring how `app.rs` uses `use cef::*`.
 use cef::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The URL opened when the user presses `t` (TabNew).
 pub const NEW_TAB_URL: &str = "buffr://new";
@@ -63,7 +65,7 @@ wrap_scheme_handler_factory! {
             _scheme_name: Option<&CefString>,
             _request: Option<&mut cef::Request>,
         ) -> Option<cef::ResourceHandler> {
-            Some(BuffrResourceHandler::new())
+            Some(BuffrResourceHandler::new(Arc::new(AtomicUsize::new(0))))
         }
     }
 }
@@ -73,7 +75,9 @@ wrap_scheme_handler_factory! {
 // ---------------------------------------------------------------------------
 
 wrap_resource_handler! {
-    pub struct BuffrResourceHandler;
+    pub struct BuffrResourceHandler {
+        cursor: Arc<AtomicUsize>,
+    }
 
     impl ResourceHandler {
         fn open(
@@ -82,8 +86,6 @@ wrap_resource_handler! {
             handle_request: Option<&mut ::std::os::raw::c_int>,
             _callback: Option<&mut cef::Callback>,
         ) -> ::std::os::raw::c_int {
-            // Signal that the request is handled synchronously (handle_request = 1)
-            // and the handler can proceed immediately (return 1).
             if let Some(hr) = handle_request {
                 *hr = 1;
             }
@@ -114,24 +116,27 @@ wrap_resource_handler! {
             bytes_read: Option<&mut ::std::os::raw::c_int>,
             _callback: Option<&mut cef::ResourceReadCallback>,
         ) -> ::std::os::raw::c_int {
-            // The trait takes `&self` so we cannot maintain a cursor across
-            // calls. Instead we copy as much as fits in one shot. CEF passes
-            // a buffer sized to `response_length` (set above), so for our
-            // small static page this is always a single call.
             let len = NEW_TAB_HTML.len();
-            if len == 0 || bytes_to_read <= 0 {
+            let pos = self.cursor.load(Ordering::SeqCst);
+            if pos >= len || bytes_to_read <= 0 {
                 if let Some(br) = bytes_read {
                     *br = 0;
                 }
+                // Return 0 to signal EOF — CEF stops calling read.
                 return 0;
             }
-            let to_copy = len.min(bytes_to_read as usize);
+            let remaining = len - pos;
+            let to_copy = remaining.min(bytes_to_read as usize);
             // Safety: CEF guarantees `data_out` is a valid writable buffer
-            // of at least `bytes_to_read` bytes. The pointer is not held
-            // beyond this call.
+            // of at least `bytes_to_read` bytes.
             unsafe {
-                std::ptr::copy_nonoverlapping(NEW_TAB_HTML.as_ptr(), data_out, to_copy);
+                std::ptr::copy_nonoverlapping(
+                    NEW_TAB_HTML.as_ptr().add(pos),
+                    data_out,
+                    to_copy,
+                );
             }
+            self.cursor.store(pos + to_copy, Ordering::SeqCst);
             if let Some(br) = bytes_read {
                 *br = to_copy as i32;
             }
