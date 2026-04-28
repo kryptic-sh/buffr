@@ -202,6 +202,11 @@ struct Cli {
     /// audit. No CEF init.
     #[arg(long)]
     audit_keymap: bool,
+    /// Force the X11 backend on Linux. No effect on macOS / Windows.
+    /// Useful for testing the X11 path on a Wayland session.
+    #[cfg(target_os = "linux")]
+    #[arg(long)]
+    x11: bool,
 }
 
 fn main() -> Result<()> {
@@ -573,12 +578,25 @@ fn main() -> Result<()> {
     // -------- winit event loop --------
     //
     // Allow winit to pick the best Wayland backend. Linux always uses
-    // HostMode::Osr (softbuffer composite over Wayland) — X11/XWayland
+    // HostMode::Osr (wgpu composite over Wayland) — X11/XWayland
     // windowed embedding is not supported. macOS and Windows use native
     // child-window embedding (HostMode::Windowed).
-    let event_loop = EventLoop::<BuffrUserEvent>::with_user_event()
-        .build()
-        .context("creating winit event loop")?;
+    //
+    // On Linux, `--x11` forces the X11 backend even on a Wayland session
+    // (useful for regression testing the X11 path).
+    let event_loop = {
+        let mut builder = EventLoop::<BuffrUserEvent>::with_user_event();
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            if cli.x11 {
+                builder.with_x11();
+            }
+            // Default: winit auto-picks Wayland when WAYLAND_DISPLAY is
+            // set, otherwise X11. No explicit call needed.
+        }
+        builder.build().context("creating winit event loop")?
+    };
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
