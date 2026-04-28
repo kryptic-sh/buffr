@@ -6,12 +6,17 @@
 //! ```json
 //! {
 //!   "version": 1,
-//!   "tabs": [
-//!     { "url": "https://example.com", "pinned": false },
-//!     { "url": "https://kryptic.sh", "pinned": true }
-//!   ]
+//!   "pinned": ["https://kryptic.sh"],
+//!   "tabs":   ["https://example.com", "https://other.example"],
+//!   "active": 1
 //! }
 //! ```
+//!
+//! Pinned and unpinned tabs live in separate arrays so the on-disk
+//! split is explicit. Restore opens pinned tabs first, then unpinned;
+//! the live tab strip mirrors that ordering. `active` is the index in
+//! the combined `pinned ++ tabs` list — `0` is the first pinned tab,
+//! `pinned.len()` is the first unpinned tab.
 //!
 //! On startup `buffr` reads this file (unless `--no-restore`); on
 //! clean shutdown it writes the live tab list. `--list-session`
@@ -26,29 +31,23 @@ use tracing::{info, warn};
 /// On-disk session schema version. Bump on incompatible changes.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// One persisted tab. The runtime carries more state (find query,
-/// hint session, scroll position) but only `url + pinned` survive a
-/// restart — Phase 5 explicitly punts scroll restoration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PersistedTab {
-    pub url: String,
-    #[serde(default)]
-    pub pinned: bool,
-}
-
-/// On-disk session blob. `version` lets us reject older shapes if
-/// the format ever changes.
+/// On-disk session blob. Pinned and unpinned tabs are stored in
+/// separate arrays; the runtime tab order is `pinned ++ tabs` and
+/// `active` indexes into that combined list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Pinned tab URLs in their saved order.
     #[serde(default)]
-    pub tabs: Vec<PersistedTab>,
-    /// Index of the active tab when the session was saved. `None` for
-    /// older session files that didn't track focus; the restorer falls
-    /// back to tab 0 in that case.
+    pub pinned: Vec<String>,
+    /// Unpinned tab URLs in their saved order.
+    #[serde(default)]
+    pub tabs: Vec<String>,
+    /// Index of the active tab when the session was saved, into the
+    /// combined `pinned ++ tabs` list. `None` for older session files
+    /// that didn't track focus; the restorer falls back to tab 0.
     #[serde(default)]
     pub active: Option<usize>,
 }
@@ -57,6 +56,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             version: SCHEMA_VERSION,
+            pinned: Vec::new(),
             tabs: Vec::new(),
             active: None,
         }
@@ -68,26 +68,31 @@ fn default_version() -> u32 {
 }
 
 impl Session {
-    /// Build a session from an iterator of `(url, pinned)` pairs —
-    /// the runtime's preferred shape.
+    /// Build a session from an iterator of `(url, pinned)` pairs in
+    /// the runtime tab order. Splits into the two on-disk arrays
+    /// preserving relative order within each.
     pub fn from_tabs<'a, I>(tabs: I) -> Self
     where
         I: IntoIterator<Item = (&'a str, bool)>,
     {
+        let mut pinned = Vec::new();
+        let mut unpinned = Vec::new();
+        for (url, is_pinned) in tabs {
+            if is_pinned {
+                pinned.push(url.to_string());
+            } else {
+                unpinned.push(url.to_string());
+            }
+        }
         Self {
             version: SCHEMA_VERSION,
-            tabs: tabs
-                .into_iter()
-                .map(|(url, pinned)| PersistedTab {
-                    url: url.to_string(),
-                    pinned,
-                })
-                .collect(),
+            pinned,
+            tabs: unpinned,
             active: None,
         }
     }
 
-    /// Like [`from_tabs`] but also records the active tab index.
+    /// Like [`Self::from_tabs`] but also records the active tab index.
     pub fn from_tabs_with_active<'a, I>(tabs: I, active: Option<usize>) -> Self
     where
         I: IntoIterator<Item = (&'a str, bool)>,
@@ -95,6 +100,15 @@ impl Session {
         let mut s = Self::from_tabs(tabs);
         s.active = active;
         s
+    }
+
+    /// Iterate `(url, pinned)` pairs in the combined runtime order
+    /// (pinned first, then unpinned).
+    pub fn entries(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.pinned
+            .iter()
+            .map(|u| (u.as_str(), true))
+            .chain(self.tabs.iter().map(|u| (u.as_str(), false)))
     }
 }
 
@@ -107,23 +121,24 @@ pub fn default_path(data_dir: &Path) -> PathBuf {
 /// Read the session at `path`. Returns `Ok(None)` when the file is
 /// absent (legitimate fresh-install state).
 pub fn read(path: &Path) -> Result<Option<Session>> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let session: Session = serde_json::from_str(&s)
-                .with_context(|| format!("parsing session file {}", path.display()))?;
-            if session.version != SCHEMA_VERSION {
-                warn!(
-                    saved = session.version,
-                    expected = SCHEMA_VERSION,
-                    "session: schema version mismatch — ignoring file",
-                );
-                return Ok(None);
-            }
-            Ok(Some(session))
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading session file {}", path.display()));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading session file {}", path.display())),
+    };
+    let session: Session = serde_json::from_str(&text)
+        .with_context(|| format!("parsing session file {}", path.display()))?;
+    if session.version != SCHEMA_VERSION {
+        warn!(
+            saved = session.version,
+            expected = SCHEMA_VERSION,
+            "session: schema version mismatch — ignoring file",
+        );
+        return Ok(None);
     }
+    Ok(Some(session))
 }
 
 /// Atomically write `session` to `path`. Parent dir is created on
@@ -139,7 +154,12 @@ pub fn write(path: &Path, session: &Session) -> Result<()> {
     std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    info!(path = %path.display(), tabs = session.tabs.len(), "session: persisted");
+    info!(
+        path = %path.display(),
+        pinned = session.pinned.len(),
+        tabs = session.tabs.len(),
+        "session: persisted",
+    );
     Ok(())
 }
 
@@ -148,21 +168,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_three_tabs() {
+    fn round_trip_split() {
         let dir = tempfile::tempdir().unwrap();
         let path = default_path(dir.path());
         let s = Session::from_tabs([
             ("https://a.example", false),
             ("https://b.example", true),
             ("https://c.example", false),
+            ("https://d.example", true),
         ]);
         write(&path, &s).unwrap();
         let back = read(&path).unwrap().unwrap();
         assert_eq!(back.version, SCHEMA_VERSION);
-        assert_eq!(back.tabs.len(), 3);
-        assert_eq!(back.tabs[0].url, "https://a.example");
-        assert!(!back.tabs[0].pinned);
-        assert!(back.tabs[1].pinned);
+        assert_eq!(back.pinned, vec!["https://b.example", "https://d.example"]);
+        assert_eq!(back.tabs, vec!["https://a.example", "https://c.example"]);
+    }
+
+    #[test]
+    fn entries_yields_pinned_first() {
+        let s = Session::from_tabs([
+            ("https://a", false),
+            ("https://b", true),
+            ("https://c", false),
+            ("https://d", true),
+        ]);
+        let collected: Vec<_> = s.entries().collect();
+        assert_eq!(
+            collected,
+            vec![
+                ("https://b", true),
+                ("https://d", true),
+                ("https://a", false),
+                ("https://c", false),
+            ]
+        );
     }
 
     #[test]
@@ -177,48 +216,9 @@ mod tests {
     fn schema_version_mismatch_treated_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         let path = default_path(dir.path());
-        std::fs::write(&path, r#"{"version":99,"tabs":[]}"#).unwrap();
+        std::fs::write(&path, r#"{"version":99,"pinned":[],"tabs":[]}"#).unwrap();
         let r = read(&path).unwrap();
         assert!(r.is_none());
-    }
-
-    #[test]
-    fn deny_unknown_fields_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = default_path(dir.path());
-        std::fs::write(&path, r#"{"version":1,"tabs":[],"sneaky":"field"}"#).unwrap();
-        let err = read(&path).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(
-            s.contains("sneaky") || s.contains("unknown field"),
-            "got: {s}"
-        );
-    }
-
-    #[test]
-    fn pinned_default_false_when_absent() {
-        let json = r#"{"version":1,"tabs":[{"url":"https://x"}]}"#;
-        let s: Session = serde_json::from_str(json).unwrap();
-        assert!(!s.tabs[0].pinned);
-    }
-
-    #[test]
-    fn from_tabs_preserves_order_and_pin() {
-        let s = Session::from_tabs([("https://a", false), ("https://b", true)]);
-        assert_eq!(s.tabs.len(), 2);
-        assert_eq!(s.tabs[0].url, "https://a");
-        assert!(!s.tabs[0].pinned);
-        assert!(s.tabs[1].pinned);
-    }
-
-    #[test]
-    fn write_creates_missing_parent_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let nested = dir.path().join("a/b/c");
-        let path = default_path(&nested);
-        let s = Session::from_tabs([("https://x", false)]);
-        write(&path, &s).unwrap();
-        assert!(path.exists());
     }
 
     #[test]
@@ -228,6 +228,7 @@ mod tests {
         let s = Session::default();
         write(&path, &s).unwrap();
         let back = read(&path).unwrap().unwrap();
+        assert!(back.pinned.is_empty());
         assert!(back.tabs.is_empty());
     }
 

@@ -643,31 +643,32 @@ fn main() -> Result<()> {
     } else {
         Some(session::default_path(&paths.data))
     };
-    let (pending_session_tabs, pending_session_active): (
-        Vec<session::PersistedTab>,
-        Option<usize>,
-    ) = if cli.private || cli.no_restore {
-        (Vec::new(), None)
-    } else if let Some(p) = session_path.as_ref() {
-        match session::read(p) {
-            Ok(Some(s)) => {
-                info!(
-                    path = %p.display(),
-                    tabs = s.tabs.len(),
-                    active = ?s.active,
-                    "session: restored",
-                );
-                (s.tabs, s.active)
+    let (pending_session_tabs, pending_session_active): (Vec<(String, bool)>, Option<usize>) =
+        if cli.private || cli.no_restore {
+            (Vec::new(), None)
+        } else if let Some(p) = session_path.as_ref() {
+            match session::read(p) {
+                Ok(Some(s)) => {
+                    info!(
+                        path = %p.display(),
+                        pinned = s.pinned.len(),
+                        tabs = s.tabs.len(),
+                        active = ?s.active,
+                        "session: restored",
+                    );
+                    let entries: Vec<(String, bool)> =
+                        s.entries().map(|(u, p)| (u.to_string(), p)).collect();
+                    (entries, s.active)
+                }
+                Ok(None) => (Vec::new(), None),
+                Err(err) => {
+                    warn!(error = %err, "session: read failed — starting fresh");
+                    (Vec::new(), None)
+                }
             }
-            Ok(None) => (Vec::new(), None),
-            Err(err) => {
-                warn!(error = %err, "session: read failed — starting fresh");
-                (Vec::new(), None)
-            }
-        }
-    } else {
-        (Vec::new(), None)
-    };
+        } else {
+            (Vec::new(), None)
+        };
 
     let download_notice_queue = new_download_notice_queue();
 
@@ -1180,9 +1181,9 @@ fn run_list_session() -> Result<()> {
         }
         Some(s) => {
             eprintln!("schema version: {}", s.version);
-            for tab in &s.tabs {
-                let pin = if tab.pinned { "*" } else { " " };
-                println!("{pin}\t{}", tab.url);
+            for (url, pinned) in s.entries() {
+                let pin = if pinned { "*" } else { " " };
+                println!("{pin}\t{url}");
             }
         }
     }
@@ -1465,7 +1466,7 @@ struct AppState {
     /// Restored session snapshot (URL + pinned bit). The first tab in
     /// the list becomes the active tab on startup; subsequent entries
     /// open in the background.
-    pending_session_tabs: Vec<session::PersistedTab>,
+    pending_session_tabs: Vec<(String, bool)>,
     /// Path the runtime persists the live tab list to on clean
     /// shutdown. `None` in private mode (sessions never persist).
     session_path: Option<PathBuf>,
@@ -1593,7 +1594,7 @@ impl AppState {
         hint_alphabet: HintAlphabet,
         pending_find: Option<String>,
         pending_new_tabs: Vec<String>,
-        pending_session_tabs: Vec<session::PersistedTab>,
+        pending_session_tabs: Vec<(String, bool)>,
         pending_session_active: Option<usize>,
         session_path: Option<PathBuf>,
         counters: Arc<buffr_core::UsageCounters>,
@@ -1736,7 +1737,11 @@ impl AppState {
             }
             A::TabNext => host.next_tab(),
             A::TabPrev => host.prev_tab(),
-            A::PinTab => host.toggle_pin_active(),
+            A::PinTab => {
+                host.toggle_pin_active();
+                self.refresh_tab_strip();
+                self.mark_session_dirty();
+            }
             A::PasteUrl { after } => {
                 let active_idx = host.active_index().unwrap_or(0);
                 let insert_idx = if *after {
@@ -1916,32 +1921,30 @@ impl AppState {
         // initial tab via `BrowserHost::new`; the rest open in the
         // background so the user lands on tab 0.
         let session = std::mem::take(&mut self.pending_session_tabs);
-        for (i, t) in session.iter().enumerate() {
+        for (i, (url, pinned)) in session.iter().enumerate() {
             if i == 0 {
                 // The initial `BrowserHost::new` already loaded tab 0
                 // with `homepage`. Navigate the active tab there
                 // instead of opening a new one so we don't end up
                 // with a stray homepage tab.
-                if let Err(err) = host.navigate(&t.url) {
-                    warn!(error = %err, url = %t.url, "session: navigate first tab failed");
+                if let Err(err) = host.navigate(url) {
+                    warn!(error = %err, %url, "session: navigate first tab failed");
                 }
-                if t.pinned
-                    && let Some(active) = host.active_tab()
-                {
+                if *pinned && let Some(active) = host.active_tab() {
                     host.set_pinned(active.id, true);
                 }
                 continue;
             }
-            match host.open_tab_background(&t.url) {
+            match host.open_tab_background(url) {
                 Ok(id) => {
-                    if t.pinned {
+                    if *pinned {
                         // The new tab is in the background, so the
                         // pin must target it by id rather than the
                         // currently-active tab.
                         host.set_pinned(id, true);
                     }
                 }
-                Err(err) => warn!(error = %err, url = %t.url, "session: open_tab failed"),
+                Err(err) => warn!(error = %err, %url, "session: open_tab failed"),
             }
         }
         // Restore the active tab from the session, if any.

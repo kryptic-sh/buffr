@@ -1117,27 +1117,63 @@ impl BrowserHost {
 
     /// Toggle the pinned bit on the active tab. Pin does **not**
     /// prevent close — it only signals sort order to chrome.
+    /// Repositions the tab so pinned tabs always occupy the leading
+    /// slots in the strip.
     pub fn toggle_pin_active(&self) {
-        let Ok(mut tabs) = self.tabs.lock() else {
-            return;
+        let id = match self.active.lock().ok().and_then(|g| *g) {
+            Some(idx) => match self.tabs.lock() {
+                Ok(mut tabs) => match tabs.get_mut(idx) {
+                    Some(t) => {
+                        t.pinned = !t.pinned;
+                        t.id
+                    }
+                    None => return,
+                },
+                Err(_) => return,
+            },
+            None => return,
         };
-        let Some(idx) = self.active.lock().ok().and_then(|g| *g) else {
-            return;
-        };
-        if let Some(t) = tabs.get_mut(idx) {
-            t.pinned = !t.pinned;
-        }
+        let _ = id;
+        self.enforce_pinned_ordering();
     }
 
     /// Set the pinned bit on the tab with `id`. Used by session
     /// restore to apply the saved pin state without depending on
     /// which tab is currently active.
     pub fn set_pinned(&self, id: TabId, pinned: bool) {
+        if let Ok(mut tabs) = self.tabs.lock()
+            && let Some(t) = tabs.iter_mut().find(|t| t.id == id)
+        {
+            t.pinned = pinned;
+        }
+        self.enforce_pinned_ordering();
+    }
+
+    /// Stable partition: pinned tabs first, unpinned next, relative
+    /// order within each group preserved. The active index is
+    /// re-resolved against the same `TabId` so the user's focus
+    /// follows its tab through the rearrangement.
+    fn enforce_pinned_ordering(&self) {
+        let active_id = {
+            let Ok(active) = self.active.lock() else {
+                return;
+            };
+            let Ok(tabs) = self.tabs.lock() else {
+                return;
+            };
+            (*active).and_then(|i| tabs.get(i).map(|t| t.id))
+        };
         let Ok(mut tabs) = self.tabs.lock() else {
             return;
         };
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == id) {
-            t.pinned = pinned;
+        let drained: Vec<Tab> = tabs.drain(..).collect();
+        let (pinned, unpinned): (Vec<Tab>, Vec<Tab>) = drained.into_iter().partition(|t| t.pinned);
+        tabs.extend(pinned);
+        tabs.extend(unpinned);
+        let new_idx = active_id.and_then(|id| tabs.iter().position(|t| t.id == id));
+        drop(tabs);
+        if let Ok(mut a) = self.active.lock() {
+            *a = new_idx;
         }
     }
 
