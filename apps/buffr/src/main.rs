@@ -740,6 +740,19 @@ fn main() -> Result<()> {
         warn!(error = %err, "winit event loop exited with error");
     }
 
+    // Force-close every live browser BEFORE dropping AppState. CEF
+    // requires `close_browser(true)` + a message-pump round-trip per
+    // browser before `cef::shutdown()` — otherwise its internal
+    // teardown segfaults when it finds active browsers. The pump
+    // loop below gives OnBeforeClose a chance to fire on each tab.
+    if let Some(host) = app_state.host.as_ref() {
+        host.close_all_browsers();
+    }
+    for _ in 0..30 {
+        cef::do_message_loop_work();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     // Drop AppState BEFORE cef::shutdown(). AppState owns the
     // BrowserHost (which holds CEF browser refs) and the wgpu
     // Renderer (which holds the surface + Arc<Window>). Letting it
@@ -3667,6 +3680,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 host.set_osr_wake(Arc::new(move || {
                     let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
                 }));
+                // Match CEF's OSR frame rate to the display refresh
+                // rate so scrolling / video / animations don't stutter
+                // at CEF's 30 fps default. CEF clamps internally
+                // (147.x caps at 60). Falls back to 60 when the
+                // monitor doesn't report a rate.
+                let display_hz = window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|mhz| (mhz / 1000).max(1))
+                    .unwrap_or(60);
+                host.set_frame_rate(display_hz);
+                tracing::debug!(display_hz, "OSR frame rate set");
                 self.host = Some(host);
             }
             Err(err) => {

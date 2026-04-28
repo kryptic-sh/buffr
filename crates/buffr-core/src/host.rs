@@ -566,6 +566,55 @@ impl BrowserHost {
         }
     }
 
+    /// Update the OSR frame rate target for ALL live browsers and
+    /// any browsers created later. CEF clamps internally (current
+    /// builds cap at 60 fps for windowless rendering); we accept
+    /// any positive integer and let CEF decide. No-op in Windowed
+    /// mode.
+    pub fn set_frame_rate(&self, hz: u32) {
+        let hz = hz.max(1);
+        self.osr_view.frame_rate_hz.store(hz, Ordering::Relaxed);
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        if let Ok(tabs) = self.tabs.lock() {
+            for t in tabs.iter() {
+                if let Some(host) = t.browser.host() {
+                    host.set_windowless_frame_rate(hz as i32);
+                }
+            }
+        }
+        tracing::debug!(hz, "set_frame_rate: applied to live browsers");
+    }
+
+    /// Force-close every live browser. Called once at app shutdown
+    /// before `cef::shutdown()` so CEF's internal teardown doesn't
+    /// trip over still-active browsers (segfaults on recent builds
+    /// with hardware compositing on). Caller must pump
+    /// `cef::do_message_loop_work()` afterwards until OnBeforeClose
+    /// fires for each browser.
+    pub fn close_all_browsers(&self) {
+        let tabs = match self.tabs.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for t in tabs.iter() {
+            if let Some(host) = t.browser.host() {
+                host.close_browser(1);
+            }
+        }
+        // Closed-tab undo stack also holds live browsers (see
+        // close_tab — stashable tabs are kept alive for reopen).
+        if let Ok(stack) = self.closed_stack.lock() {
+            for c in stack.iter() {
+                if let Some(host) = c.tab.browser.host() {
+                    host.close_browser(1);
+                }
+            }
+        }
+        tracing::info!("close_all_browsers: dispatched");
+    }
+
     /// Forward a mouse-wheel event to the active tab's browser host.
     ///
     /// No-op when the host is in `Windowed` mode.
@@ -874,7 +923,17 @@ impl BrowserHost {
         );
 
         let cef_url = CefString::from(url);
-        let settings = BrowserSettings::default();
+        let mut settings = BrowserSettings::default();
+        // CEF's OSR default is 30 fps — that's the lag floor for mouse
+        // wheel scrolling, smooth animations, and video playback. We
+        // pass through whatever rate the embedder requested via
+        // `set_frame_rate` (defaults to 60; embedder typically sets
+        // it to the display refresh rate). CEF clamps internally —
+        // current builds cap at 60. Has no effect in Windowed mode.
+        if self.mode == HostMode::Osr {
+            let hz = self.osr_view.frame_rate_hz.load(Ordering::Relaxed);
+            settings.windowless_frame_rate = hz.max(1) as i32;
+        }
 
         // Build the render handler for OSR mode; None for windowed.
         let render_handler = if self.mode == HostMode::Osr {

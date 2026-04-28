@@ -75,6 +75,11 @@ pub struct OsrViewState {
     pub height: AtomicU32,
     /// Device scale factor stored as thousandths (e.g. 1000 = 1.0×, 1500 = 1.5×).
     pub scale: AtomicU32,
+    /// CEF `windowless_frame_rate` to use when creating new browsers
+    /// and (via `BrowserHost::set_frame_rate`) when retargeting live
+    /// ones. Default 60. CEF clamps to its own max (typically 60 in
+    /// CEF 147; future builds may go higher).
+    pub frame_rate_hz: AtomicU32,
     /// Optional callback invoked from `on_paint` after a frame lands. The
     /// embedder uses this to wake the winit event loop (via
     /// `EventLoopProxy`) so the UI can pump a redraw without polling.
@@ -89,6 +94,7 @@ impl OsrViewState {
             width: AtomicU32::new(1280),
             height: AtomicU32::new(800),
             scale: AtomicU32::new(1000),
+            frame_rate_hz: AtomicU32::new(60),
             wake: OnceLock::new(),
         }
     }
