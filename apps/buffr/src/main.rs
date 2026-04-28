@@ -793,7 +793,7 @@ fn main() -> Result<()> {
     counters.flush();
 
     // -------- shutdown --------
-    info!("cef shutting down");
+    info!("shutdown: cef shutting down");
     cef::shutdown();
     info!("shutdown: cef::shutdown returned");
     // Drop the rest of AppState now (renderer/wgpu, window, engine,
