@@ -2334,7 +2334,9 @@ impl AppState {
             //
             // HostMode::Windowed: CEF owns an X11 child window that sits over
             // the top region — we must NOT write there or we would clobber it.
-            if let Some((osr_frame, _)) = &osr_data {
+            // FIXME(test): OSR composite disabled to isolate chrome-only
+            // resize behavior. Restore by removing the `false &&`.
+            if false && let Some((osr_frame, _)) = &osr_data {
                 let lock_start = Instant::now();
                 if let Ok(frame) = osr_frame.lock() {
                     osr_lock_us = lock_start.elapsed().as_micros() as u64;
