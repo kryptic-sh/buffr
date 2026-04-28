@@ -2143,8 +2143,19 @@ impl AppState {
         // here just painted stale OSR pixels and doubled GPU work.
         let chrome_changed =
             self.statusline.mode != mode || self.statusline.count_buffer != count || title_changed;
+        let leaving_visual = self.statusline.mode == PageMode::Visual && mode != PageMode::Visual;
         self.statusline.mode = mode;
         self.statusline.count_buffer = count;
+        if leaving_visual && let Some(host) = self.host.as_ref() {
+            // Drop the page's DOM selection so the highlight goes with
+            // Visual mode. Any prior YankSelection JS has already been
+            // queued in the renderer and runs first; this just collapses
+            // what's left.
+            host.run_main_frame_js(
+                "try { var s = window.getSelection && window.getSelection(); if (s) s.removeAllRanges(); } catch (_) {}",
+                "buffr://visual-clear-selection",
+            );
+        }
         if chrome_changed {
             self.request_redraw();
         }
@@ -3967,6 +3978,35 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     self.osr_cursor = (bx, by);
                     let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     host.osr_mouse_move(bx, by, mods);
+
+                    // Promote to Visual the moment a left-button drag
+                    // crosses the threshold — Chromium has already begun
+                    // extending the page selection (see osr_mouse_buttons
+                    // wiring), so the engine should reflect that without
+                    // waiting for button-up.
+                    if (self.osr_mouse_buttons & 16) != 0
+                        && let Some((sx, sy)) = self.osr_drag_start
+                    {
+                        const DRAG_THRESHOLD_PX: i32 = 4;
+                        let dx = (bx - sx).abs();
+                        let dy = (by - sy).abs();
+                        if dx > DRAG_THRESHOLD_PX || dy > DRAG_THRESHOLD_PX {
+                            let already_visual = self
+                                .engine
+                                .lock()
+                                .map(|e| e.mode() == PageMode::Visual)
+                                .unwrap_or(true);
+                            if !already_visual {
+                                if let Ok(mut e) = self.engine.lock() {
+                                    e.set_mode(PageMode::Visual);
+                                }
+                                self.refresh_title();
+                            }
+                            // Clear so MouseInput release path doesn't
+                            // double-fire the Visual transition.
+                            self.osr_drag_start = None;
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {

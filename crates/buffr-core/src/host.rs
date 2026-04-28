@@ -1803,7 +1803,7 @@ impl BrowserHost {
     }
 
     /// Execute arbitrary JS on the active tab's main frame.
-    fn run_main_frame_js(&self, code: &str, url: &str) {
+    pub fn run_main_frame_js(&self, code: &str, url: &str) {
         self.with_active(|t| {
             let Some(frame) = t.browser.main_frame() else {
                 return;
