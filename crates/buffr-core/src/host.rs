@@ -1054,9 +1054,9 @@ impl BrowserHost {
             }
 
             A::Find { forward } => {
-                tracing::warn!(
+                tracing::trace!(
                     forward = *forward,
-                    "Find requires command line — Phase 3b. Use BrowserHost::start_find() directly."
+                    "Find: intercepted at apps layer; host dispatch is a no-op."
                 );
             }
             A::FindNext => self.find_step(true),

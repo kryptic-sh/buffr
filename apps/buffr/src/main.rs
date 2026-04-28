@@ -1398,25 +1398,28 @@ enum EditFocus {
 
 /// Active overlay above the CEF child window.
 ///
-/// Both variants wrap the same [`InputBar`]; the discriminant decides
+/// All variants wrap the same [`InputBar`]; the discriminant decides
 /// which suggestion source to query and how to handle Enter. The
-/// engine sits in [`PageMode::Command`] for both, so the discriminant
+/// engine sits in [`PageMode::Command`] for all, so the discriminant
 /// is the only way to tell them apart at dispatch time.
 #[derive(Debug)]
 enum OverlayState {
     Command(InputBar),
     Omnibar(InputBar),
+    Find { forward: bool, bar: InputBar },
 }
 
 impl OverlayState {
     fn input(&self) -> &InputBar {
         match self {
             OverlayState::Command(b) | OverlayState::Omnibar(b) => b,
+            OverlayState::Find { bar, .. } => bar,
         }
     }
     fn input_mut(&mut self) -> &mut InputBar {
         match self {
             OverlayState::Command(b) | OverlayState::Omnibar(b) => b,
+            OverlayState::Find { bar, .. } => bar,
         }
     }
 }
@@ -2118,6 +2121,17 @@ impl AppState {
         self.request_redraw();
     }
 
+    fn open_find(&mut self, forward: bool) {
+        let prefix = if forward { "/ " } else { "? " };
+        let bar = InputBar::with_prefix(prefix);
+        self.overlay = Some(OverlayState::Find { forward, bar });
+        if let Ok(mut e) = self.engine.lock() {
+            e.set_mode(PageMode::Command);
+        }
+        self.refresh_overlay_suggestions();
+        self.request_redraw();
+    }
+
     fn close_overlay(&mut self) {
         if self.overlay.is_none() {
             return;
@@ -2143,6 +2157,7 @@ impl AppState {
         let suggestions = match overlay {
             OverlayState::Command(_) => self.command_suggestions(&buffer),
             OverlayState::Omnibar(_) => self.omnibar_suggestions(&buffer),
+            OverlayState::Find { .. } => Vec::new(),
         };
         // Re-borrow the overlay since `self.command_suggestions` /
         // `omnibar_suggestions` need `&self`.
@@ -2331,6 +2346,7 @@ impl AppState {
         match overlay {
             OverlayState::Command(bar) => self.dispatch_command(&bar),
             OverlayState::Omnibar(bar) => self.dispatch_omnibar(&bar),
+            OverlayState::Find { forward, bar } => self.dispatch_find(&bar, forward),
         }
         self.resync_cef_rect();
         self.refresh_title();
@@ -2797,6 +2813,21 @@ impl AppState {
             && let Err(err) = host.navigate(&target)
         {
             warn!(error = %err, target = %target, "omnibar: navigate failed");
+        }
+    }
+
+    fn dispatch_find(&mut self, bar: &InputBar, forward: bool) {
+        let query = bar.current_value().trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.statusline.find_query = Some(FindStatus {
+            query: query.clone(),
+            current: 0,
+            total: 0,
+        });
+        if let Some(host) = self.host.as_ref() {
+            host.start_find(&query, forward);
         }
     }
 }
@@ -3398,6 +3429,9 @@ impl ApplicationHandler for AppState {
                             }
                             buffr_modal::PageAction::OpenCommandLine => {
                                 self.open_command_line();
+                            }
+                            buffr_modal::PageAction::Find { forward } => {
+                                self.open_find(*forward);
                             }
                             _ => {
                                 self.dispatch_action(&action);
