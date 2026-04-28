@@ -4067,13 +4067,26 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && host.mode() == buffr_core::HostMode::Osr
                 {
                     use winit::event::MouseScrollDelta;
+                    // CEF's send_mouse_wheel_event expects wheel-tick units
+                    // (120 ≈ 1 line). winit's PixelDelta is raw px per event
+                    // (touchpad / high-res wheel emits ~4-6 px each), so a
+                    // direct pass-through scrolls ~1/30th of a line and feels
+                    // dead. Native Chrome compensates with precise-pixel +
+                    // momentum scrolling, which the CEF C API doesn't expose
+                    // (no phase / precision flag on send_mouse_wheel_event),
+                    // so we approximate by amplifying pixel deltas. 5× is the
+                    // empirical sweet spot for touchpad feel on Wayland.
+                    const PIXEL_DELTA_SCALE: f32 = 5.0;
                     let (dx, dy) = match delta {
                         // Line delta: 120 per tick matches Chromium's wheel
                         // tick magnitude expectation.
                         MouseScrollDelta::LineDelta(x, y) => {
                             ((x * 120.0) as i32, (y * 120.0) as i32)
                         }
-                        MouseScrollDelta::PixelDelta(p) => (p.x as i32, p.y as i32),
+                        MouseScrollDelta::PixelDelta(p) => (
+                            (p.x as f32 * PIXEL_DELTA_SCALE) as i32,
+                            (p.y as f32 * PIXEL_DELTA_SCALE) as i32,
+                        ),
                     };
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
