@@ -1752,7 +1752,13 @@ impl AppState {
     /// mutates tab state outside the `about_to_wait` URL-poll path.
     fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
-        self.session_dirty_since = Some(Instant::now());
+        // Start the debounce clock only on the transition into dirty.
+        // Re-arming on every call would let high-frequency callers
+        // (e.g. the 250 ms URL/active-index poll) push the deadline
+        // forward indefinitely so the flush would never fire.
+        if self.session_dirty_since.is_none() {
+            self.session_dirty_since = Some(Instant::now());
+        }
     }
 
     /// Open any extra `--new-tab` URLs after the homepage / session
@@ -3827,6 +3833,11 @@ impl ApplicationHandler for AppState {
             }
             // Active-index changed.
             if active_idx != self.last_session_active {
+                tracing::debug!(
+                    new_idx = ?active_idx,
+                    last_idx = ?self.last_session_active,
+                    "session: active-index changed -> mark_session_dirty"
+                );
                 self.mark_session_dirty();
             }
             // Tab-list (open / close / reorder) changed.
@@ -3845,11 +3856,16 @@ impl ApplicationHandler for AppState {
         // `save_session_now` directly, bypassing this check.
         if self.session_dirty {
             let debounce = Duration::from_millis(SESSION_SAVE_DEBOUNCE_MS);
-            let elapsed_enough = self
+            let elapsed = self
                 .session_dirty_since
-                .map(|t| t.elapsed() >= debounce)
-                .unwrap_or(true);
-            if elapsed_enough {
+                .map(|t| t.elapsed())
+                .unwrap_or(debounce);
+            tracing::debug!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                debounce_ms = SESSION_SAVE_DEBOUNCE_MS,
+                "session: dirty flush check"
+            );
+            if elapsed >= debounce {
                 self.save_session_now();
             }
         }
