@@ -1345,6 +1345,16 @@ struct AppState {
     /// runtime doesn't currently call `check_now` from the UI thread.
     #[allow(dead_code)]
     update_checker: Arc<buffr_core::UpdateChecker>,
+    /// OSR composite: generation token of the last frame we blitted.
+    /// When the CEF paint handler bumps `OsrFrame::generation` past this
+    /// we know there is new content to show; when they match we can skip
+    /// the BGRA→RGB copy and re-present the existing buffer.
+    last_osr_generation: u64,
+    /// Timestamp of the last OSR redraw request.  Used by `about_to_wait`
+    /// to throttle to ≈60 Hz while paint→redraw signalling is still polled.
+    /// TODO: replace with a direct signal from `OsrPaintHandler::on_paint`
+    ///       once a cross-thread wakeup channel (e.g. EventLoopProxy) lands.
+    last_osr_redraw: Instant,
 }
 
 /// Edit-mode focus state machine.
@@ -1473,6 +1483,8 @@ impl AppState {
             counters,
             counters_flush_at: Instant::now(),
             update_checker,
+            last_osr_generation: 0,
+            last_osr_redraw: Instant::now(),
         }
     }
 
@@ -1711,6 +1723,9 @@ impl AppState {
         // Snapshot the front of the download notice queue now so we
         // don't have to touch `self` again while `buf` is live.
         let current_notice = peek_download_notice(&self.download_notice_queue);
+        // Precompute browser region for the OSR composite so we don't need
+        // a `&self` borrow while the surface buffer is live.
+        let (_, browser_y, browser_w, browser_h) = self.cef_child_rect(width, height);
         let Some(surface) = self.softbuffer_surface.as_mut() else {
             return;
         };
@@ -1728,6 +1743,74 @@ impl AppState {
                 return;
             }
         };
+
+        // ── OSR composite (Wayland / off-screen mode only) ────────────────
+        // For HostMode::Osr CEF paints BGRA into SharedOsrFrame instead of
+        // into a native child window.  We blit those pixels into the top
+        // region of the softbuffer surface (everything above the chrome strip)
+        // then let the chrome painting below overdraw its own region.
+        //
+        // HostMode::Windowed: CEF owns an X11 child window that sits over the
+        // top region — we must NOT write there or we would clobber it.
+        let osr_damage: Option<softbuffer::Rect> = if let Some(host) = self.host.as_ref()
+            && host.mode() == buffr_core::HostMode::Osr
+        {
+            // browser_y / browser_w / browser_h precomputed before the
+            // surface borrow above to avoid conflicting &self borrows.
+            let osr_frame = host.osr_frame();
+            let new_gen = osr_frame
+                .lock()
+                .map(|f| f.generation)
+                .unwrap_or(self.last_osr_generation);
+
+            // Blit regardless of generation change — softbuffer may have
+            // discarded our previous write on resize, so we always fill the
+            // browser region to avoid showing garbage.  The generation check
+            // is kept as a future optimisation hook (skip when surfaced buffer
+            // is already fresh) but is not applied for correctness here.
+            let _ = new_gen; // used below
+
+            if let Ok(frame) = osr_frame.lock() {
+                let osr_w = frame.width as usize;
+                let osr_h = frame.height as usize;
+                let pixels = &frame.pixels;
+                let bw = browser_w as usize;
+                let bh = browser_h as usize;
+                let by = browser_y as usize;
+
+                for row in 0..bh {
+                    let dst_row_base = (by + row) * (width as usize);
+                    for col in 0..bw {
+                        let dst_idx = dst_row_base + col;
+                        if row < osr_h && col < osr_w {
+                            // BGRA → 0x00RRGGBB
+                            let src = row * osr_w * 4 + col * 4;
+                            let b = pixels[src] as u32;
+                            let g = pixels[src + 1] as u32;
+                            let r = pixels[src + 2] as u32;
+                            buf[dst_idx] = (r << 16) | (g << 8) | b;
+                        } else {
+                            // OSR frame smaller than browser region — fill white.
+                            buf[dst_idx] = 0x00FF_FFFF;
+                        }
+                    }
+                }
+                self.last_osr_generation = frame.generation;
+            }
+
+            // Damage the whole browser region so softbuffer presents it.
+            NonZeroU32::new(browser_w)
+                .zip(NonZeroU32::new(browser_h))
+                .map(|(nz_bw, nz_bh)| softbuffer::Rect {
+                    x: 0,
+                    y: browser_y,
+                    width: nz_bw,
+                    height: nz_bh,
+                })
+        } else {
+            None
+        };
+
         // Statusline writes only the bottom strip; the input bar (when
         // active) writes only the top strip. Page region in between is
         // owned by the CEF child window and we never touch it. We use
@@ -1768,7 +1851,13 @@ impl AppState {
             strip.paint(buf.as_mut(), width as usize, height as usize, notice_y);
         }
 
-        let mut damage = Vec::with_capacity(5);
+        let mut damage = Vec::with_capacity(6);
+
+        // OSR browser-region damage rect (must be added before chrome rects
+        // so that chrome always renders on top in the damage list order).
+        if let Some(osr_rect) = osr_damage {
+            damage.push(osr_rect);
+        }
 
         // Statusline damage rect (bottom).
         let strip_h_u = STATUSLINE_HEIGHT.min(height);
@@ -2834,7 +2923,16 @@ impl ApplicationHandler for AppState {
                 let (_x, _y, cef_w, cef_h) =
                     self.cef_child_rect(new_size.width.max(1), new_size.height.max(1));
                 if let Some(host) = self.host.as_ref() {
-                    host.resize(cef_w, cef_h);
+                    match host.mode() {
+                        buffr_core::HostMode::Windowed => {
+                            host.resize(cef_w, cef_h);
+                        }
+                        buffr_core::HostMode::Osr => {
+                            // OSR: update viewport atomics + trigger was_resized()
+                            // so CEF re-paints at the new dimensions.
+                            host.osr_resize(cef_w, cef_h);
+                        }
+                    }
                 }
                 self.request_redraw();
             }
@@ -3025,6 +3123,26 @@ impl ApplicationHandler for AppState {
                     let bar = overlay.input_mut();
                     bar.cursor_visible = !bar.cursor_visible;
                 }
+                self.request_redraw();
+            }
+        }
+
+        // OSR poll-redraw throttle — ~60 Hz.
+        //
+        // In a complete pipeline, `OsrPaintHandler::on_paint` would post a
+        // wakeup through an `EventLoopProxy` and we'd only redraw when CEF
+        // delivers a new frame.  That signal channel is not yet wired up
+        // (deferred to step 5 / a follow-up).  Until then we request a redraw
+        // at ≈60 Hz whenever the host is in OSR mode so the page stays live.
+        // This only fires for Wayland sessions; X11 windowed mode is unaffected.
+        //
+        // TODO: replace with EventLoopProxy-based wakeup from on_paint.
+        if let Some(host) = self.host.as_ref()
+            && host.mode() == buffr_core::HostMode::Osr
+        {
+            let now = Instant::now();
+            if now.duration_since(self.last_osr_redraw) >= Duration::from_millis(16) {
+                self.last_osr_redraw = now;
                 self.request_redraw();
             }
         }
