@@ -168,7 +168,7 @@ wrap_render_handler! {
             let w = width as u32;
             let h = height as u32;
             let len = (w as usize) * (h as usize) * 4;
-            tracing::debug!(w, h, "osr: on_paint fired");
+            tracing::trace!(w, h, "osr: on_paint fired");
 
             // SAFETY: CEF guarantees `buffer` points to `width * height * 4`
             // valid bytes for the duration of this call.
