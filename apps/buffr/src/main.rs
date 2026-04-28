@@ -740,30 +740,32 @@ fn main() -> Result<()> {
         warn!(error = %err, "winit event loop exited with error");
     }
 
-    // Force-close every live browser BEFORE dropping AppState. CEF
-    // requires `close_browser(true)` + a message-pump round-trip per
-    // browser before `cef::shutdown()` — otherwise its internal
-    // teardown segfaults when it finds active browsers. The pump
-    // loop below gives OnBeforeClose a chance to fire on each tab.
+    // Shutdown sequence — order is critical. CEF browsers must close
+    // and fully release before `cef::shutdown()`, and all CEF refs we
+    // hold must drop while CEF's threads are still alive. Mishandling
+    // any step segfaults during the GPU process teardown on builds
+    // with hardware compositing.
     info!("shutdown: closing browsers");
     if let Some(host) = app_state.host.as_ref() {
         host.close_all_browsers();
     }
-    info!("shutdown: pumping CEF message loop (1s)");
-    for _ in 0..100 {
+    info!("shutdown: pumping CEF message loop (2s)");
+    for _ in 0..200 {
         cef::do_message_loop_work();
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Drop AppState BEFORE cef::shutdown(). Field declaration order
-    // ensures host drops first (releasing CEF browser refs while CEF
-    // is still alive), then renderer (wgpu surface), then window.
-    // Letting it live past cef::shutdown() tears those resources down
-    // after CEF has already torn down the GPU process, which
-    // segfaults on recent CEF builds with hardware compositing on.
-    info!("shutdown: dropping app_state");
-    drop(app_state);
-    info!("shutdown: app_state dropped");
+    // Drop ONLY the host first. This releases every Browser ref while
+    // CEF's threads are still running, so CEF can finish the close
+    // callbacks instead of segfaulting on dangling refs during its
+    // own shutdown.
+    info!("shutdown: dropping host");
+    drop(app_state.host.take());
+    info!("shutdown: pumping CEF after host drop (300ms)");
+    for _ in 0..30 {
+        cef::do_message_loop_work();
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Defer-dismiss any permission requests still queued at shutdown.
     // Dropping a CEF callback without invoking it would wedge the
@@ -798,6 +800,12 @@ fn main() -> Result<()> {
     info!("cef shutting down");
     cef::shutdown();
     info!("shutdown: cef::shutdown returned");
+    // Drop the rest of AppState now (renderer/wgpu, window, engine,
+    // sinks). CEF is fully gone, so wgpu can release the GPU surface
+    // without racing CEF's GPU process teardown.
+    info!("shutdown: dropping app_state remainder");
+    drop(app_state);
+    info!("shutdown: app_state dropped");
     // Tempdir drops here (after CEF is gone), removing the private
     // profile root tree.
     drop(_private_tmp);

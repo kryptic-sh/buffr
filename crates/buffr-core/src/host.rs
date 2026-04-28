@@ -1602,18 +1602,45 @@ impl BrowserHost {
             }
 
             A::YankSelection => {
-                // CEF natively copies the active selection in the
-                // focused frame to the system clipboard via
-                // `Frame::copy()`. We try the focused frame first
-                // (selection lives there if the user clicked into an
-                // iframe); fall back to main frame.
+                // Synthesise a Ctrl+C key event into the active
+                // browser. CEF/Chromium's native key handler routes
+                // this through the editor's Copy command, which
+                // handles non-editable selections (regular page text)
+                // correctly and writes to the system clipboard via
+                // ui::Clipboard. `Frame::copy()` only works on
+                // editable frames, hence the synthetic-key path.
+                use cef::{KeyEvent, KeyEventType};
+                const VK_C: i32 = 0x43;
+                const EVENTFLAG_CONTROL_DOWN: u32 = 4;
+                let key_down = KeyEvent {
+                    size: std::mem::size_of::<cef::sys::_cef_key_event_t>(),
+                    type_: KeyEventType::RAWKEYDOWN,
+                    modifiers: EVENTFLAG_CONTROL_DOWN,
+                    windows_key_code: VK_C,
+                    native_key_code: 0,
+                    is_system_key: 0,
+                    character: 0,
+                    unmodified_character: 0,
+                    focus_on_editable_field: 0,
+                };
+                let key_char = KeyEvent {
+                    type_: KeyEventType::CHAR,
+                    character: 'c' as u16,
+                    unmodified_character: 'c' as u16,
+                    ..key_down.clone()
+                };
+                let key_up = KeyEvent {
+                    type_: KeyEventType::KEYUP,
+                    ..key_down.clone()
+                };
                 self.with_active(|t| {
-                    let frame = t.browser.focused_frame().or_else(|| t.browser.main_frame());
-                    if let Some(frame) = frame {
-                        frame.copy();
-                        tracing::debug!("yanked selection via frame.copy()");
+                    if let Some(host) = t.browser.host() {
+                        host.send_key_event(Some(&key_down));
+                        host.send_key_event(Some(&key_char));
+                        host.send_key_event(Some(&key_up));
+                        tracing::debug!("yanked selection via synthetic Ctrl+C");
                     } else {
-                        tracing::warn!("YankSelection: no frame available");
+                        tracing::warn!("YankSelection: no browser host");
                     }
                 });
             }
