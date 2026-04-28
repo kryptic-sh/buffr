@@ -95,6 +95,15 @@ fn chord_from_logical(logical: &WKey, modifiers: ModifiersState) -> Option<KeyCh
             })
         }
         WKey::Named(named) => {
+            // Space lands as Char(' ') so a leader=' ' binding (the
+            // default) matches the canonical form the keymap parser
+            // emits for both `<Space>` and `<leader>` after resolution.
+            if matches!(named, WNamed::Space) {
+                return Some(KeyChord {
+                    modifiers: mods,
+                    key: Key::Char(' '),
+                });
+            }
             let mapped = map_named(*named)?;
             Some(KeyChord {
                 modifiers: mods,
@@ -179,6 +188,15 @@ fn translate_key_test_only(logical_key: &WKey, modifiers: ModifiersState) -> Opt
             })
         }
         WKey::Named(named) => {
+            // Space lands as Char(' ') so a leader=' ' binding (the
+            // default) matches the canonical form the keymap parser
+            // emits for both `<Space>` and `<leader>` after resolution.
+            if matches!(named, WNamed::Space) {
+                return Some(KeyChord {
+                    modifiers: mods,
+                    key: Key::Char(' '),
+                });
+            }
             let mapped = map_named(*named)?;
             Some(KeyChord {
                 modifiers: mods,
