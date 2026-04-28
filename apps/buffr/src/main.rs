@@ -1603,14 +1603,6 @@ struct AppState {
     /// selection. CEF natively renders the on-screen text selection
     /// during the drag.
     osr_drag_start: Option<(i32, i32)>,
-    /// Pixel-delta accumulator for high-res wheel / touchpad input.
-    /// CEF's `send_mouse_wheel_event` API takes int delta in wheel-tick
-    /// units (120 = 1 line ≈ 50px) and exposes no precision-pixel /
-    /// phase / momentum flag, so sub-tick pixel deltas (~4-6px per
-    /// touchpad event) are effectively dropped. We accumulate here and
-    /// emit a CEF wheel event each time the accumulator crosses one
-    /// tick worth of motion in either axis.
-    osr_wheel_accum: (f32, f32),
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
@@ -1761,7 +1753,6 @@ impl AppState {
             osr_last_click_button: None,
             osr_click_count: 1,
             osr_drag_start: None,
-            osr_wheel_accum: (0.0, 0.0),
             shutdown_flag,
             tab_ids: Vec::new(),
             session_dirty: false,
@@ -4078,35 +4069,25 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && host.mode() == buffr_core::HostMode::Osr
                 {
                     use winit::event::MouseScrollDelta;
-                    let mods = winit_mods_to_cef(&self.modifiers);
-                    let (bx, by) = self.osr_cursor;
+                    // CEF's send_mouse_wheel_event takes int delta in
+                    // wheel-tick units (120 ≈ 1 line). winit's PixelDelta
+                    // is raw px per event (~4-6 px from touchpad / high-res
+                    // wheel), which CEF rounds to near-zero on its own,
+                    // and the C API exposes no precision / phase / momentum
+                    // flag. 10× multiplier on PixelDelta is the empirical
+                    // sweet spot for touchpad feel after testing.
+                    const PIXEL_DELTA_SCALE: f32 = 10.0;
                     let (dx, dy) = match delta {
-                        // Discrete wheel tick: 120 per line is Chromium's
-                        // expected magnitude. Pass through directly.
                         MouseScrollDelta::LineDelta(x, y) => {
                             ((x * 120.0) as i32, (y * 120.0) as i32)
                         }
-                        // High-res / touchpad input: accumulate raw pixel
-                        // deltas and emit one CEF wheel event each time
-                        // the accumulator crosses one tick (~50px) of
-                        // physical motion. Keeps scroll directly
-                        // proportional to motion distance and avoids
-                        // dropping sub-tick deltas that the CEF int API
-                        // would otherwise round to zero.
-                        MouseScrollDelta::PixelDelta(p) => {
-                            const PX_PER_TICK: f32 = 50.0;
-                            self.osr_wheel_accum.0 += p.x as f32;
-                            self.osr_wheel_accum.1 += p.y as f32;
-                            let ticks_x = (self.osr_wheel_accum.0 / PX_PER_TICK).trunc();
-                            let ticks_y = (self.osr_wheel_accum.1 / PX_PER_TICK).trunc();
-                            if ticks_x == 0.0 && ticks_y == 0.0 {
-                                return;
-                            }
-                            self.osr_wheel_accum.0 -= ticks_x * PX_PER_TICK;
-                            self.osr_wheel_accum.1 -= ticks_y * PX_PER_TICK;
-                            ((ticks_x * 120.0) as i32, (ticks_y * 120.0) as i32)
-                        }
+                        MouseScrollDelta::PixelDelta(p) => (
+                            (p.x as f32 * PIXEL_DELTA_SCALE) as i32,
+                            (p.y as f32 * PIXEL_DELTA_SCALE) as i32,
+                        ),
                     };
+                    let mods = winit_mods_to_cef(&self.modifiers);
+                    let (bx, by) = self.osr_cursor;
                     tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
                     host.osr_mouse_wheel(bx, by, dx, dy, mods);
                 }
