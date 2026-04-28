@@ -6,14 +6,13 @@
 //! two button labels.
 //!
 //! Both buttons are clickable — the apps layer queries
-//! [`ConfirmPrompt::button_rects`] to hit-test mouse events. Pressing
+//! [`ConfirmPrompt::button_rects_at`] to hit-test mouse events. Pressing
 //! `y` / `n` (or `<Esc>` for No) is the keyboard equivalent and is
 //! handled at the apps layer too.
 
 use crate::{fill_rect, font};
 
-/// Strip height in pixels — same as PERMISSIONS_PROMPT_HEIGHT so the
-/// chrome layout doesn't reflow when the prompt opens.
+/// Content height in pixels. The caller wraps this in a popup frame.
 pub const CONFIRM_PROMPT_HEIGHT: u32 = 60;
 
 /// Render input. Apps construct one of these when a confirmation is
@@ -30,57 +29,54 @@ pub struct ConfirmPrompt {
 pub type ConfirmRect = (i32, i32, i32, i32);
 
 impl ConfirmPrompt {
-    /// Pixel rects for the Yes and No buttons given the strip's
-    /// `top_y` and the full window `width`. Deterministic in the
-    /// inputs so the apps layer can hit-test without consulting any
-    /// paint-time state.
-    pub fn button_rects(&self, width: u32, top_y: u32) -> (ConfirmRect, ConfirmRect) {
-        let w = width as i32;
+    /// Pixel rects for the Yes and No buttons in window coordinates.
+    /// `content_x/y` are the top-left of the inner popup rect;
+    /// `content_w` is its width. Deterministic so the apps layer can
+    /// hit-test without consulting paint-time state.
+    pub fn button_rects_at(
+        &self,
+        content_x: u32,
+        content_y: u32,
+        content_w: u32,
+    ) -> (ConfirmRect, ConfirmRect) {
+        let right = (content_x + content_w) as i32;
         let btn_h = BUTTON_H;
-        let btn_y = top_y as i32 + (CONFIRM_PROMPT_HEIGHT as i32 - btn_h) / 2;
+        let btn_y = content_y as i32 + (CONFIRM_PROMPT_HEIGHT as i32 - btn_h) / 2;
         let yes_w = (font::text_width(&self.yes_label) as i32 + BUTTON_PAD_X * 2).max(40);
         let no_w = (font::text_width(&self.no_label) as i32 + BUTTON_PAD_X * 2).max(40);
         let gap = 12;
-        let total = yes_w + gap + no_w;
         let right_pad = 16;
-        let no_x = w - right_pad - no_w;
+        let no_x = right - right_pad - no_w;
         let yes_x = no_x - gap - yes_w;
-        let _ = total;
         ((yes_x, btn_y, yes_w, btn_h), (no_x, btn_y, no_w, btn_h))
     }
 
-    /// Paint the prompt into `buffer`. `width` and `height` are the
-    /// full window dimensions; `top_y` is the row where the strip
-    /// starts. Out-of-bounds writes are clipped at the bottom.
-    pub fn paint(&self, buffer: &mut [u32], width: usize, height: usize, top_y: u32) {
-        let strip_h = CONFIRM_PROMPT_HEIGHT as usize;
-        if width == 0 || height == 0 || strip_h == 0 {
-            return;
+    /// Paint the prompt content into the inner popup rect
+    /// `(content_x, content_y, content_w, CONFIRM_PROMPT_HEIGHT)`.
+    /// The caller is responsible for drawing the popup border and
+    /// background before calling this. Returns `CONFIRM_PROMPT_HEIGHT`.
+    pub fn paint_at(
+        &self,
+        buffer: &mut [u32],
+        width: usize,
+        height: usize,
+        content_x: u32,
+        content_y: u32,
+        content_w: u32,
+    ) -> u32 {
+        if width == 0 || height == 0 || content_w == 0 {
+            return CONFIRM_PROMPT_HEIGHT;
         }
         if buffer.len() < width * height {
-            return;
+            return CONFIRM_PROMPT_HEIGHT;
         }
-        let top = top_y as i32;
+        let top = content_y as i32;
         if top >= height as i32 {
-            return;
+            return CONFIRM_PROMPT_HEIGHT;
         }
 
-        // Background + accent border.
-        fill_rect(buffer, width, height, 0, top, width, strip_h, COLOUR_BG);
-        fill_rect(
-            buffer,
-            width,
-            height,
-            0,
-            top,
-            width,
-            ACCENT_BAR_PX,
-            COLOUR_ACCENT,
-        );
-
-        // Message text on the left, buttons on the right.
-        let text_x = 8_i32;
-        let text_y = top + 8 + (CONFIRM_PROMPT_HEIGHT as i32 - 8 - font::GLYPH_H as i32) / 2;
+        let text_x = content_x as i32 + 8;
+        let text_y = top + (CONFIRM_PROMPT_HEIGHT as i32 - font::GLYPH_H as i32) / 2;
         font::draw_text(
             buffer,
             width,
@@ -91,9 +87,11 @@ impl ConfirmPrompt {
             COLOUR_FG,
         );
 
-        let (yes, no) = self.button_rects(width as u32, top_y);
+        let (yes, no) = self.button_rects_at(content_x, content_y, content_w);
         paint_button(buffer, width, height, yes, &self.yes_label, COLOUR_BTN_YES);
         paint_button(buffer, width, height, no, &self.no_label, COLOUR_BTN_NO);
+
+        CONFIRM_PROMPT_HEIGHT
     }
 }
 
@@ -124,10 +122,7 @@ pub fn rect_contains(rect: ConfirmRect, px: i32, py: i32) -> bool {
 
 const BUTTON_H: i32 = 28;
 const BUTTON_PAD_X: i32 = 14;
-const ACCENT_BAR_PX: usize = 2;
 
-const COLOUR_BG: u32 = 0x16_0E_0E;
-const COLOUR_ACCENT: u32 = 0xE0_5A_5A;
 const COLOUR_FG: u32 = 0xF0_E8_D8;
 const COLOUR_BTN_YES: u32 = 0x40_28_28;
 const COLOUR_BTN_NO: u32 = 0x28_28_28;
@@ -143,9 +138,14 @@ mod tests {
             yes_label: "Yes".into(),
             no_label: "No".into(),
         };
-        let (yes, no) = p.button_rects(800, 100);
+        let content_x = 100u32;
+        let content_w = 600u32;
+        let (yes, no) = p.button_rects_at(content_x, 100, content_w);
         assert!(yes.0 < no.0, "Yes should sit left of No");
-        assert!(no.0 + no.2 <= 800, "No must fit inside the window width");
+        assert!(
+            no.0 + no.2 <= (content_x + content_w) as i32,
+            "No must fit inside content width"
+        );
     }
 
     #[test]

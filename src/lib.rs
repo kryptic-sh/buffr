@@ -331,11 +331,11 @@ pub(crate) fn truncate_to_width(s: &str, max_px: usize) -> &str {
     // Walk backwards by char until the prefix + ".." fits.
     let mut end = s.len();
     while end > 0 {
-        let prefix = &s[..end];
         if !s.is_char_boundary(end) {
             end -= 1;
             continue;
         }
+        let prefix = &s[..end];
         if font::text_width(prefix) + font::text_width("..") <= max_px {
             return prefix;
         }
