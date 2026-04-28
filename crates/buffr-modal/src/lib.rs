@@ -45,4 +45,4 @@ pub use keymap::{BindError, Keymap, Lookup};
 pub use hjkl_engine::{Modifiers as EngineModifiers, PlannedInput, SpecialKey, VimMode};
 
 #[cfg(feature = "winit")]
-pub use winit_adapter::key_event_to_chord;
+pub use winit_adapter::{key_event_to_chord, key_event_to_chord_with_repeat};

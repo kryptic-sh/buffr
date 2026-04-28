@@ -35,7 +35,7 @@ use buffr_core::{
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
-    key_event_to_chord,
+    key_event_to_chord, key_event_to_chord_with_repeat,
 };
 use buffr_permissions::Permissions;
 use buffr_ui::{
@@ -2199,7 +2199,9 @@ impl AppState {
         if self.overlay.is_none() {
             return false;
         }
-        let chord = match key_event_to_chord(event, self.modifiers) {
+        // Allow auto-repeat so holding Backspace / arrows / chars in
+        // the omnibar fires continuously.
+        let chord = match key_event_to_chord_with_repeat(event, self.modifiers) {
             Some(c) => c,
             None => return true, // overlay swallows unmappable keys too
         };
