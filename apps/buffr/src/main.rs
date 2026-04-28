@@ -1560,7 +1560,6 @@ impl AppState {
                 if let Ok(mut e) = self.engine.lock() {
                     e.set_mode(PageMode::Normal);
                 }
-                host.osr_focus(false);
                 self.refresh_title();
                 self.request_redraw();
             }
@@ -2542,9 +2541,6 @@ impl AppState {
                     if !already_editing {
                         if let Some(host) = self.host.as_ref() {
                             host.run_edit_attach(&field_id);
-                            // Tell CEF the browser is focused now that
-                            // we're entering Insert mode.
-                            host.osr_focus(true);
                         }
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Insert);
@@ -2563,9 +2559,6 @@ impl AppState {
                         self.edit_focus = EditFocus::None;
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Normal);
-                        }
-                        if let Some(host) = self.host.as_ref() {
-                            host.osr_focus(false);
                         }
                         mode_changed = true;
                     }
@@ -2687,7 +2680,6 @@ impl AppState {
         el.dispatchEvent(new KeyboardEvent('keyup',k));\
         el.blur();})();",
                 );
-                host.osr_focus(false);
             }
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(PageMode::Normal);
@@ -3137,10 +3129,12 @@ impl ApplicationHandler for AppState {
                     mode = ?host.mode(),
                     "browser host created"
                 );
-                // CEF focus is bound to Insert mode (see
-                // drain_edit_focus_events). Browser starts unfocused —
-                // pages may use document.hasFocus() to throttle work
-                // while the user is just navigating in Normal mode.
+                // CEF stays focused for the lifetime of the browser
+                // so DOM clicks deliver focus to inputs. We do NOT
+                // forward OS-level Focused(false) (alt-tab) so pages
+                // retain state. Insert mode transitions are tracked
+                // independently via the modal engine.
+                host.osr_focus(true);
                 self.host = Some(host);
             }
             Err(err) => {
