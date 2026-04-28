@@ -25,6 +25,7 @@ pub mod host;
 pub mod new_tab;
 pub mod open_finder;
 pub mod permissions;
+pub mod scripts;
 pub mod telemetry;
 pub mod updates;
 

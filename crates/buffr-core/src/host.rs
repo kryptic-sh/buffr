@@ -1237,35 +1237,7 @@ impl BrowserHost {
             }
 
             A::FocusFirstInput => {
-                // Focus the first VISIBLE interactive text field. If
-                // the page already has one focused, refire focusin so
-                // edit.js notifies buffr regardless.
-                let js = "(function(){\
-                    var sel='input:not([type=hidden]):not([disabled]):not([readonly]),\
-textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
-                    function editable(el){if(!el)return false;\
-                        var t=(el.tagName||'').toUpperCase();\
-                        return t==='INPUT'||t==='TEXTAREA'||el.isContentEditable;}\
-                    function visible(el){\
-                        if(!el)return false;\
-                        var r=el.getBoundingClientRect();\
-                        if(r.width<=0||r.height<=0)return false;\
-                        var s=getComputedStyle(el);\
-                        if(s.visibility==='hidden'||s.display==='none')return false;\
-                        return true;}\
-                    var cur=document.activeElement;\
-                    if(editable(cur)&&visible(cur)){\
-                        cur.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));\
-                        return;}\
-                    var nodes=document.querySelectorAll(sel);\
-                    for(var i=0;i<nodes.length;i++){\
-                        if(visible(nodes[i])){\
-                            nodes[i].focus();\
-                            nodes[i].scrollIntoView({block:'center'});\
-                            nodes[i].dispatchEvent(new FocusEvent('focusin',{bubbles:true}));\
-                            return;}}\
-                })();";
-                self.run_js(js);
+                self.run_js(crate::scripts::FOCUS_FIRST_INPUT);
             }
 
             A::ExitInsertMode => {
@@ -1274,13 +1246,7 @@ textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
                 // the main loop drains it and resets EditFocus. As a defensive
                 // measure, the caller (apps/buffr/src/main.rs's dispatch_action
                 // path) should ALSO clear local state synchronously.
-                self.run_js(
-                    "(function(){var el=document.activeElement;if(!el)return;\
-        var k={key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true};\
-        el.dispatchEvent(new KeyboardEvent('keydown',k));\
-        el.dispatchEvent(new KeyboardEvent('keyup',k));\
-        el.blur();})();",
-                );
+                self.run_js(crate::scripts::EXIT_INSERT);
             }
 
             A::ClearCompletedDownloads => match self.downloads.clear_completed() {

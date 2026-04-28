@@ -2828,13 +2828,7 @@ impl AppState {
             if let Some(host) = self.host.as_ref() {
                 host.run_edit_detach(&fid);
                 // Blur the field so further typing doesn't go to it.
-                host.run_js(
-                    "(function(){var el=document.activeElement;if(!el)return;\
-        var k={key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true};\
-        el.dispatchEvent(new KeyboardEvent('keydown',k));\
-        el.dispatchEvent(new KeyboardEvent('keyup',k));\
-        el.blur();})();",
-                );
+                host.run_js(buffr_core::scripts::EXIT_INSERT);
             }
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(PageMode::Normal);
