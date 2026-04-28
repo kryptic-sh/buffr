@@ -306,4 +306,16 @@
         el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
     };
 
+    // Snapshot the current document selection and ship it to Rust via
+    // the console-log sentinel. Called from the YankSelection arm so
+    // the Rust side can write the text into the system clipboard
+    // through hjkl-clipboard, sidestepping Chromium's editor copy
+    // command (which on some Wayland builds writes only to its own
+    // internal clipboard rather than wl_data_device).
+    window.__buffrEmitSelection = function () {
+        var s = '';
+        try { s = window.getSelection ? String(window.getSelection() || '') : ''; } catch (_) {}
+        emit({ type: 'selection', value: s });
+    };
+
 })();

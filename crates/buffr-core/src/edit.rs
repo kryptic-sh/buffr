@@ -110,6 +110,11 @@ pub enum EditConsoleEvent {
     /// and re-derives the diff so undo history stays correct. Stage 1
     /// just queues it.
     Mutate { field_id: String, value: String },
+    /// On-demand snapshot of `window.getSelection().toString()` emitted
+    /// by `__buffrEmitSelection`. Used by the apps layer to land a
+    /// Visual-mode yank into the system clipboard via hjkl-clipboard
+    /// instead of routing through Chromium's internal copy command.
+    Selection { value: String },
 }
 
 // ---- wire types for serde ----------------------------------------------
@@ -142,6 +147,11 @@ struct RawBlur {
 #[derive(Deserialize)]
 struct RawMutate {
     field_id: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct RawSelection {
     value: String,
 }
 
@@ -206,6 +216,13 @@ pub fn parse_console_event(line: &str) -> Option<Result<EditConsoleEvent, ParseE
                 field_id: r.field_id,
                 value: r.value,
             }
+        }
+        "selection" => {
+            let r: RawSelection = match serde_json::from_str(suffix) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(ParseError::Json(e))),
+            };
+            EditConsoleEvent::Selection { value: r.value }
         }
         other => {
             return Some(Err(ParseError::UnknownType(other.to_owned())));

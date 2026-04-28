@@ -1606,47 +1606,15 @@ impl BrowserHost {
             }
 
             A::YankSelection => {
-                // Synthesise a Ctrl+C key event into the active
-                // browser. CEF/Chromium's native key handler routes
-                // this through the editor's Copy command, which
-                // handles non-editable selections (regular page text)
-                // correctly and writes to the system clipboard via
-                // ui::Clipboard. `Frame::copy()` only works on
-                // editable frames, hence the synthetic-key path.
-                use cef::{KeyEvent, KeyEventType};
-                const VK_C: i32 = 0x43;
-                const EVENTFLAG_CONTROL_DOWN: u32 = 4;
-                let key_down = KeyEvent {
-                    size: std::mem::size_of::<cef::sys::_cef_key_event_t>(),
-                    type_: KeyEventType::RAWKEYDOWN,
-                    modifiers: EVENTFLAG_CONTROL_DOWN,
-                    windows_key_code: VK_C,
-                    native_key_code: 0,
-                    is_system_key: 0,
-                    character: 0,
-                    unmodified_character: 0,
-                    focus_on_editable_field: 0,
-                };
-                let key_char = KeyEvent {
-                    type_: KeyEventType::CHAR,
-                    character: 'c' as u16,
-                    unmodified_character: 'c' as u16,
-                    ..key_down.clone()
-                };
-                let key_up = KeyEvent {
-                    type_: KeyEventType::KEYUP,
-                    ..key_down.clone()
-                };
-                self.with_active(|t| {
-                    if let Some(host) = t.browser.host() {
-                        host.send_key_event(Some(&key_down));
-                        host.send_key_event(Some(&key_char));
-                        host.send_key_event(Some(&key_up));
-                        tracing::debug!("yanked selection via synthetic Ctrl+C");
-                    } else {
-                        tracing::warn!("YankSelection: no browser host");
-                    }
-                });
+                // Ask the page for its current selection. edit.js emits a
+                // `selection` console-log sentinel which the apps layer
+                // drains and writes through `hjkl-clipboard` so the
+                // payload lands on the system clipboard, not Chromium's
+                // internal one.
+                self.run_main_frame_js(
+                    "if (window.__buffrEmitSelection) window.__buffrEmitSelection()",
+                    "buffr://yank-selection",
+                );
             }
         }
     }
@@ -1877,6 +1845,17 @@ impl BrowserHost {
     /// -tab dispatch before classifying the contents as a URL.
     pub fn clipboard_text(&self) -> Option<String> {
         self.clipboard.lock().ok().and_then(|mut cb| cb.get_text())
+    }
+
+    /// Write `text` to the system clipboard via `hjkl-clipboard`.
+    /// Returns the underlying `set_text` result (`true` on success).
+    /// Used by both YankUrl and YankSelection so both yanks land on
+    /// the same `+` register rather than Chromium's internal one.
+    pub fn clipboard_set_text(&self, text: &str) -> bool {
+        match self.clipboard.lock() {
+            Ok(mut cb) => cb.set_text(text),
+            Err(_) => false,
+        }
     }
 
     pub fn run_edit_cycle(&self, forward: bool) {

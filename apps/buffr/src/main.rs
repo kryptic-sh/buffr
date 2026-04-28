@@ -3150,6 +3150,18 @@ impl AppState {
                         );
                     }
                 }
+                EditConsoleEvent::Selection { value } => {
+                    if value.is_empty() {
+                        tracing::debug!("yank: selection event with empty value — nothing copied");
+                    } else if let Some(host) = self.host.as_ref() {
+                        let ok = host.clipboard_set_text(&value);
+                        tracing::debug!(
+                            len = value.len(),
+                            ok,
+                            "yank: selection -> system clipboard"
+                        );
+                    }
+                }
             }
         }
         if mode_changed {
@@ -4777,6 +4789,7 @@ mod tests {
                         }
                     }
                     EditConsoleEvent::Mutate { .. } => {}
+                    EditConsoleEvent::Selection { .. } => {}
                 }
             }
         }
