@@ -313,9 +313,21 @@ impl Renderer {
                 return Ok(());
             }
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                tracing::warn!("wgpu surface: outdated/lost, reconfiguring");
+                // Common right after a Wayland configure: swapchain was
+                // recreated but the wl_surface hasn't been committed at
+                // the new size yet, so the Vulkan/EGL acquire reports
+                // Outdated. Reconfigure and retry once before giving up.
+                // Skipping the frame outright leaves the compositor with
+                // the previous-size buffer, which it then stretches /
+                // letterboxes onto the new surface — visible as the
+                // bottom chrome trailing the new window edge during a
+                // live drag.
+                tracing::warn!("wgpu surface: outdated/lost, reconfigure + retry");
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                match self.surface.get_current_texture() {
+                    Ok(f) => f,
+                    Err(_) => return Ok(()),
+                }
             }
             Err(e @ wgpu::SurfaceError::OutOfMemory) => {
                 return Err(anyhow::anyhow!("wgpu surface OOM: {e:?}"));
