@@ -27,11 +27,11 @@ use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, EditFieldKind, FindResultSink,
-    HintAction, HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, drain_edit_events,
-    drain_permissions_with_defer, expire_stale_notices, init_cef_api, new_download_notice_queue,
-    new_edit_event_sink, new_find_sink, new_hint_event_sink, new_permissions_queue,
-    peek_download_notice, peek_permission_front, permissions_queue_len, pop_permission_front,
-    profile_paths,
+    HintAction, HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId,
+    drain_edit_events, drain_permissions_with_defer, expire_stale_notices, init_cef_api,
+    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
+    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
+    pop_permission_front, profile_paths,
 };
 use buffr_modal::edit_mode::EditSession;
 use buffr_modal::{
@@ -1376,6 +1376,10 @@ struct AppState {
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
+    /// Ordered list of `TabId`s mirroring `tab_strip.tabs`. Refreshed
+    /// every `about_to_wait` tick alongside the strip; used for
+    /// tab-strip click hit-testing.
+    tab_ids: Vec<TabId>,
 }
 
 /// Edit-mode focus state machine.
@@ -1512,6 +1516,7 @@ impl AppState {
             osr_last_click_button: None,
             osr_click_count: 1,
             shutdown_flag,
+            tab_ids: Vec::new(),
         }
     }
 
@@ -1642,15 +1647,20 @@ impl AppState {
         };
         let summaries = host.tabs_summary();
         let active = host.active_index();
+        let mut ids = Vec::with_capacity(summaries.len());
         let tabs = summaries
             .into_iter()
-            .map(|t| TabView {
-                title: t.title,
-                progress: t.progress,
-                pinned: t.pinned,
-                private: t.private,
+            .map(|t| {
+                ids.push(t.id);
+                TabView {
+                    title: t.title,
+                    progress: t.progress,
+                    pinned: t.pinned,
+                    private: t.private,
+                }
             })
             .collect();
+        self.tab_ids = ids;
         self.tab_strip.tabs = tabs;
         self.tab_strip.active = active;
     }
@@ -3197,6 +3207,45 @@ impl ApplicationHandler for AppState {
                             return;
                         }
                         _ => {}
+                    }
+                }
+
+                // Tab-strip click: Left button press within the tab strip
+                // y-range → focus the clicked tab. Intercept before OSR.
+                if state == Pressed
+                    && button == MouseButton::Left
+                    && let Some(window) = self.window.as_ref()
+                {
+                    let size = window.inner_size();
+                    let full_w = size.width.max(1);
+                    let full_h = size.height.max(1);
+                    let tab_y = self.tab_strip_y(full_h);
+                    let tab_y_end = tab_y + TAB_STRIP_HEIGHT;
+                    // osr_cursor is in browser-region coords:
+                    //   bx = position.x, by = position.y - cef_y
+                    // So window_y = osr_cursor.1 + cef_y.
+                    let (_, cef_y, _, _) = self.cef_child_rect(full_w, full_h);
+                    let wx = self.osr_cursor.0 as u32;
+                    let wy = (self.osr_cursor.1 + cef_y as i32).max(0) as u32;
+                    if wy >= tab_y && wy < tab_y_end && !self.tab_ids.is_empty() {
+                        // Compute tab width using same algorithm as TabStrip::paint.
+                        let n = self.tab_ids.len() as u32;
+                        const GUTTER: u32 = 4;
+                        let available = full_w.saturating_sub((n + 1) * GUTTER);
+                        let raw_w = available / n.max(1);
+                        let tab_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
+                        // Tabs start at x = GUTTER, each occupies tab_w + GUTTER.
+                        if wx >= GUTTER {
+                            let rel_x = wx - GUTTER;
+                            let idx = (rel_x / (tab_w + GUTTER)) as usize;
+                            if idx < self.tab_ids.len() {
+                                let id = self.tab_ids[idx];
+                                if let Some(host) = self.host.as_ref() {
+                                    host.select_tab(id);
+                                }
+                                return;
+                            }
+                        }
                     }
                 }
 
