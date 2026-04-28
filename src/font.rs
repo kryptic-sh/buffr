@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use fontdue::{Font as FdFont, FontSettings, Metrics};
 
-const TARGET_PX: f32 = 14.0;
+const TARGET_PX: f32 = 15.0;
 
 struct TtfFace {
     font: FdFont,
