@@ -236,13 +236,14 @@ impl TabStrip {
 /// First printable letter of a tab's title, uppercased — a default
 /// "favicon" stand-in for pinned tabs. Falls back to `*` when the
 /// title has no usable codepoint. When the title looks like a URL
-/// (`scheme://…`) the scheme is skipped so the glyph reflects the
-/// host, not the protocol.
+/// (`scheme://…`) the scheme and a leading `www.` are skipped so the
+/// glyph reflects the meaningful host segment.
 fn pinned_glyph(title: &str) -> String {
     let body = title
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(title);
+    let body = body.strip_prefix("www.").unwrap_or(body);
     for c in body.chars() {
         if c.is_alphanumeric() {
             return c.to_uppercase().to_string();
@@ -506,6 +507,12 @@ mod tests {
         assert_eq!(pinned_glyph("https://example.com"), "E");
         assert_eq!(pinned_glyph("http://kryptic.sh"), "K");
         assert_eq!(pinned_glyph("buffr://new"), "N");
+    }
+
+    #[test]
+    fn pinned_glyph_skips_www() {
+        assert_eq!(pinned_glyph("https://www.google.com"), "G");
+        assert_eq!(pinned_glyph("www.example.com"), "E");
     }
 
     #[test]
