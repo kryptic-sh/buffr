@@ -137,6 +137,10 @@ pub enum PageAction {
     /// Defer to the embedded `hjkl_engine::Editor`. Keystroke
     /// unchanged; the modal dispatcher swallows nothing on this path.
     EnterEditMode,
+
+    /// Focus the first text input on the page and enter edit mode.
+    /// Vieb's `gi` / `insertAtFirstInput`.
+    FocusFirstInput,
 }
 
 #[cfg(test)]

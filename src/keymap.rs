@@ -228,6 +228,8 @@ impl Keymap {
             "ZoomOut",
             "ZoomReset",
             "OpenDevTools",
+            "EnterEditMode",
+            "FocusFirstInput",
         ];
         expected
             .iter()
@@ -363,6 +365,7 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::OpenDevTools => "OpenDevTools",
         PageAction::ClearCompletedDownloads => "ClearCompletedDownloads",
         PageAction::EnterEditMode => "EnterEditMode",
+        PageAction::FocusFirstInput => "FocusFirstInput",
     }
 }
 
@@ -451,6 +454,9 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // <C-0> added as Vieb-style zoom-reset alias.
     (PageMode::Normal, "=", PageAction::ZoomReset),
     (PageMode::Normal, "<C-0>", PageAction::ZoomReset),
+    // -- edit mode ------------------------------------------------
+    (PageMode::Normal, "i", PageAction::EnterEditMode),
+    (PageMode::Normal, "gi", PageAction::FocusFirstInput),
     // -- devtools -------------------------------------------------
     (PageMode::Normal, "<F12>", PageAction::OpenDevTools),
     (PageMode::Normal, "<C-S-i>", PageAction::OpenDevTools),
