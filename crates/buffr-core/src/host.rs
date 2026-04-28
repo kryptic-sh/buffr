@@ -367,7 +367,19 @@ impl BrowserHost {
             counters,
             osr_frame,
             osr_view,
-            clipboard: Mutex::new(hjkl_clipboard::Clipboard::new()),
+            clipboard: {
+                let mut cb = hjkl_clipboard::Clipboard::new();
+                // Probe: arboard's init failure is silently swallowed
+                // by hjkl-clipboard (falls back to OSC52, useless for
+                // a GUI app). A benign empty `set_text` distinguishes
+                // arboard-backed from OSC52-only at startup.
+                let probe = cb.set_text("");
+                tracing::info!(
+                    set_text_ok = probe,
+                    "clipboard probe: hjkl-clipboard set_text(\"\") result"
+                );
+                Mutex::new(cb)
+            },
             popup_queue,
             address_sink,
             closed_stack: Mutex::new(Vec::new()),
