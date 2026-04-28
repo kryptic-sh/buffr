@@ -1346,6 +1346,12 @@ struct AppState {
     /// `permissions_queue` is being shown. Keystrokes route to the
     /// prompt resolution path while this is set.
     permissions_prompt: Option<PermissionsPrompt>,
+    /// Pending close-pinned-tab confirmation. When `Some(id)`, a
+    /// yes/no banner is shown and the close is gated on the user's
+    /// answer (`y` / yes-button → close; `n` / no-button / `<Esc>`
+    /// → dismiss). Mutually exclusive with `permissions_prompt` for
+    /// rendering — the confirmation wins the slot.
+    confirm_close_pinned: Option<buffr_core::TabId>,
     /// Passive download-notification queue. CEF's `DownloadHandler`
     /// pushes notices onto this; the render loop composites the front
     /// notice (if any) above the permissions strip. Notices self-expire
@@ -1619,6 +1625,7 @@ impl AppState {
             permissions,
             permissions_queue,
             permissions_prompt: None,
+            confirm_close_pinned: None,
             download_notice_queue,
             search_config,
             overlay: None,
@@ -1787,10 +1794,24 @@ impl AppState {
 
     /// Close the active tab. If it was the last one, signal the
     /// caller to exit. Returns `true` if more tabs remain.
+    ///
+    /// Closing a *pinned* active tab is gated through the
+    /// confirmation overlay: if no confirmation is currently pending,
+    /// arm one and return without closing. The user's response (y or
+    /// the Yes button) reaches `confirm_close_now` which calls this
+    /// path again with the confirmation already cleared.
     fn close_active_tab_or_exit(&mut self) -> bool {
         let Some(host) = self.host.as_ref() else {
             return false;
         };
+        if self.confirm_close_pinned.is_none()
+            && let Some(t) = host.active_tab()
+            && t.pinned
+        {
+            self.confirm_close_pinned = Some(t.id);
+            self.request_redraw();
+            return true;
+        }
         match host.close_active() {
             Ok(true) => true,
             Ok(false) => {
@@ -1802,6 +1823,30 @@ impl AppState {
                 warn!(error = %err, "tab_close: failed");
                 true
             }
+        }
+    }
+
+    /// Resolve the close-pinned confirmation. `confirm = true` clears
+    /// the prompt and finishes the close; `false` just dismisses.
+    fn resolve_pinned_close(&mut self, confirm: bool) {
+        let Some(target) = self.confirm_close_pinned.take() else {
+            return;
+        };
+        self.request_redraw();
+        if !confirm {
+            return;
+        }
+        // Close the recorded tab even if focus shifted in between.
+        if let Some(host) = self.host.as_ref() {
+            let only = host.tab_count() <= 1;
+            let _ = host.close_tab(target);
+            if only {
+                info!("tab_close: last tab gone — saving session and exiting");
+                self.save_session_now();
+                std::process::exit(0);
+            }
+            self.refresh_tab_strip();
+            self.mark_session_dirty();
         }
     }
 
@@ -2131,10 +2176,17 @@ impl AppState {
         self.tab_strip
             .paint(buf.as_mut(), width as usize, height as usize, tab_y);
 
-        // Permissions prompt — sits between download notice and tab strip
-        // when active. Drawn after the tab strip so its accent border
-        // never overlaps a tab pill.
-        if let Some(prompt) = self.permissions_prompt.as_ref() {
+        // Permissions prompt OR pinned-close confirmation — share the
+        // slot between download notice and tab strip. Confirmation
+        // wins when both are pending (it's modal).
+        if self.confirm_close_pinned.is_some() {
+            let confirm = buffr_ui::ConfirmPrompt {
+                message: "Close pinned tab?".to_string(),
+                yes_label: "Yes (y)".to_string(),
+                no_label: "No (n)".to_string(),
+            };
+            confirm.paint(buf.as_mut(), width as usize, height as usize, prompt_y);
+        } else if let Some(prompt) = self.permissions_prompt.as_ref() {
             prompt.paint(buf.as_mut(), width as usize, height as usize, prompt_y);
         }
 
@@ -2187,8 +2239,18 @@ impl AppState {
             });
         }
 
-        // Permissions prompt damage rect.
-        if self.permissions_prompt.is_some() {
+        // Permissions prompt / confirm-close-pinned damage rect.
+        if self.confirm_close_pinned.is_some() {
+            let prompt_h_u = buffr_ui::CONFIRM_PROMPT_HEIGHT.min(height.saturating_sub(prompt_y));
+            if let Some(prompt_h_nz) = NonZeroU32::new(prompt_h_u) {
+                damage.push(softbuffer::Rect {
+                    x: 0,
+                    y: prompt_y,
+                    width: nz_w,
+                    height: prompt_h_nz,
+                });
+            }
+        } else if self.permissions_prompt.is_some() {
             let prompt_h_u = PERMISSIONS_PROMPT_HEIGHT.min(height.saturating_sub(prompt_y));
             if let Some(prompt_h_nz) = NonZeroU32::new(prompt_h_u) {
                 damage.push(softbuffer::Rect {
@@ -2292,7 +2354,9 @@ impl AppState {
         let remaining_after_status = full_h.saturating_sub(status_h);
         let tab_h = TAB_STRIP_HEIGHT.min(remaining_after_status);
         let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
-        let prompt_h = if self.permissions_prompt.is_some() {
+        let prompt_h = if self.confirm_close_pinned.is_some() {
+            buffr_ui::CONFIRM_PROMPT_HEIGHT.min(remaining_after_tabs)
+        } else if self.permissions_prompt.is_some() {
             PERMISSIONS_PROMPT_HEIGHT.min(remaining_after_tabs)
         } else {
             0
@@ -2350,7 +2414,9 @@ impl AppState {
         } else {
             0
         };
-        let prompt_h = if self.permissions_prompt.is_some() {
+        let prompt_h = if self.confirm_close_pinned.is_some() {
+            buffr_ui::CONFIRM_PROMPT_HEIGHT
+        } else if self.permissions_prompt.is_some() {
             PERMISSIONS_PROMPT_HEIGHT
         } else {
             0
@@ -3148,17 +3214,41 @@ impl AppState {
         self.request_redraw();
     }
 
+    /// Resolve the close-pinned confirmation from a keypress. Returns
+    /// `true` when the keypress is consumed (any key, since the prompt
+    /// is modal). `y` / `<Enter>` confirms, `n` / `<Esc>` dismisses,
+    /// everything else is swallowed without changing state so a stray
+    /// keypress can't accidentally close the tab.
+    fn confirm_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.confirm_close_pinned.is_none() {
+            return false;
+        }
+        if event.state != winit::event::ElementState::Pressed {
+            return true;
+        }
+        use winit::keyboard::{Key as WKey, NamedKey as WNamed};
+        match &event.logical_key {
+            WKey::Character(s) => {
+                let c = s.chars().next().unwrap_or('\0').to_ascii_lowercase();
+                match c {
+                    'y' => self.resolve_pinned_close(true),
+                    'n' => self.resolve_pinned_close(false),
+                    _ => {}
+                }
+            }
+            WKey::Named(WNamed::Enter) => self.resolve_pinned_close(true),
+            WKey::Named(WNamed::Escape) => self.resolve_pinned_close(false),
+            _ => {}
+        }
+        true
+    }
+
     /// Route a keystroke to the active permission prompt. Returns
     /// `true` when the key was consumed.
     ///
-    /// Bindings:
-    ///
-    /// - `a` / `y` — allow once
-    /// - `A` / `Y` — allow + remember
-    /// - `d` / `n` — deny once
-    /// - `D` / `N` — deny + remember
-    /// - `s` — deny + remember (qutebrowser parity for "stop")
-    /// - `Esc` — defer (deny once, no persistence)
+    /// Bindings: `a`/`y` allow once, `A`/`Y` allow + remember, `d`/`n`
+    /// deny once, `D`/`N` deny + remember, `s` deny + remember
+    /// (qutebrowser parity for "stop"), `Esc` defer.
     fn permissions_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         if self.permissions_prompt.is_none() {
             return false;
@@ -3653,6 +3743,46 @@ impl ApplicationHandler for AppState {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 use winit::event::{ElementState::Pressed, MouseButton};
+                // Pinned-close confirmation hit-test: a left click on
+                // the Yes / No button resolves the prompt. Anywhere else
+                // is swallowed so the click can't reach the page or
+                // the tab strip while a modal banner is up.
+                if state == Pressed
+                    && button == MouseButton::Left
+                    && self.confirm_close_pinned.is_some()
+                {
+                    let (px, py) = self.osr_cursor;
+                    // osr_cursor is in browser-region coords; convert
+                    // back to absolute window coords so the rects from
+                    // ConfirmPrompt match.
+                    let size = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.inner_size())
+                        .unwrap_or_default();
+                    let prompt_y = self.permissions_prompt_y();
+                    let confirm = buffr_ui::ConfirmPrompt {
+                        message: String::new(),
+                        yes_label: "Yes (y)".to_string(),
+                        no_label: "No (n)".to_string(),
+                    };
+                    let abs_x = px;
+                    let abs_y =
+                        py + self.cef_child_rect(size.width.max(1), size.height.max(1)).1 as i32;
+                    let (yes_rect, no_rect) = confirm.button_rects(size.width.max(1), prompt_y);
+                    if buffr_ui::rect_contains(yes_rect, abs_x, abs_y) {
+                        self.resolve_pinned_close(true);
+                        return;
+                    }
+                    if buffr_ui::rect_contains(no_rect, abs_x, abs_y) {
+                        self.resolve_pinned_close(false);
+                        return;
+                    }
+                    // Click missed the buttons — swallow the event so
+                    // it doesn't fall through to tab-strip / page hit
+                    // testing while the modal is open.
+                    return;
+                }
                 // Back/Forward side buttons → history navigation regardless
                 // of host mode. Intercept before OSR dispatch.
                 if state == Pressed {
@@ -3702,6 +3832,19 @@ impl ApplicationHandler for AppState {
                     && let Some(idx) = tab_strip_idx
                 {
                     let id = self.tab_ids[idx];
+                    // Middle-click on a pinned tab also gates through
+                    // the confirmation overlay so the user can't lose
+                    // a pinned tab by misaiming.
+                    let pinned = self
+                        .host
+                        .as_ref()
+                        .and_then(|h| h.tabs_summary().get(idx).map(|t| t.pinned))
+                        .unwrap_or(false);
+                    if pinned && self.confirm_close_pinned.is_none() {
+                        self.confirm_close_pinned = Some(id);
+                        self.request_redraw();
+                        return;
+                    }
                     let remaining = if let Some(host) = self.host.as_ref() {
                         let _ = host.close_tab(id);
                         host.tab_count()
@@ -3767,6 +3910,14 @@ impl ApplicationHandler for AppState {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Pinned-close confirmation takes precedence over
+                // everything else: `y` or `<Enter>` confirms, `n` /
+                // `<Esc>` dismisses. Other keys are swallowed so the
+                // page underneath can't receive stray input while a
+                // modal banner is up.
+                if self.confirm_close_pinned.is_some() && self.confirm_handle_key(&event) {
+                    return;
+                }
                 // Permissions prompt takes precedence over every other
                 // key sink. Pressing `a`/`d`/`A`/`D`/Esc resolves the
                 // request; nothing else is allowed through until the
