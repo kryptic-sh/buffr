@@ -1316,15 +1316,19 @@ impl BrowserHost {
                 // also opens the omnibar). The host fallback just appends.
                 let _ = self.open_tab("about:blank");
             }
-            A::DuplicateTab => {
-                let _ = self.duplicate_active();
-            }
             A::PinTab => self.toggle_pin_active(),
             A::ReopenClosedTab => match self.reopen_closed_tab() {
                 Ok(Some(_)) => {}
                 Ok(None) => tracing::debug!("reopen_closed_tab: stack empty"),
                 Err(err) => tracing::warn!(error = %err, "reopen_closed_tab: failed"),
             },
+            A::PasteUrl { .. } => {
+                // Paste-as-tab needs both clipboard read and search-config
+                // URL classification, which the apps layer owns. The host
+                // dispatch fallback is a no-op so a stray dispatch on a
+                // private host (no apps wiring) doesn't open a junk tab.
+                tracing::debug!("PasteUrl reached host dispatch — apps layer should handle it");
+            }
             A::TabReorder { from, to } => self.move_tab(*from as usize, *to as usize),
 
             A::OpenOmnibar | A::OpenCommandLine => {
@@ -1597,6 +1601,14 @@ impl BrowserHost {
     /// Move focus to the next (or previous) visible input via
     /// `__buffrCycleInput`. Used to override Tab/Shift+Tab in Insert
     /// mode so cycling skips links/buttons.
+    /// Read text off the system clipboard. Returns `None` when the
+    /// clipboard is empty, holds non-text content (image, files, …),
+    /// or the platform read fails. Used by the apps layer's paste-as
+    /// -tab dispatch before classifying the contents as a URL.
+    pub fn clipboard_text(&self) -> Option<String> {
+        self.clipboard.lock().ok().and_then(|mut cb| cb.get_text())
+    }
+
     pub fn run_edit_cycle(&self, forward: bool) {
         let arg = if forward { "true" } else { "false" };
         self.run_main_frame_js(

@@ -222,9 +222,9 @@ impl Keymap {
             "TabClose",
             "TabNewRight",
             "TabNewLeft",
-            "DuplicateTab",
             "PinTab",
             "ReopenClosedTab",
+            "PasteUrl",
             "HistoryBack",
             "HistoryForward",
             "Reload",
@@ -374,9 +374,9 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::TabNew => "TabNew",
         PageAction::TabNewRight => "TabNewRight",
         PageAction::TabNewLeft => "TabNewLeft",
-        PageAction::DuplicateTab => "DuplicateTab",
         PageAction::PinTab => "PinTab",
         PageAction::ReopenClosedTab => "ReopenClosedTab",
+        PageAction::PasteUrl { .. } => "PasteUrl",
         PageAction::TabReorder { .. } => "TabReorder",
         PageAction::HistoryBack => "HistoryBack",
         PageAction::HistoryForward => "HistoryForward",
@@ -443,9 +443,15 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "gT", PageAction::TabPrev),
     (PageMode::Normal, "d", PageAction::TabClose),
     (PageMode::Normal, "<C-w>c", PageAction::TabClose),
-    (PageMode::Normal, "<C-w>n", PageAction::DuplicateTab),
-    // buffr extension: <C-w>p for PinTab (no direct Vieb equivalent)
-    (PageMode::Normal, "<C-w>p", PageAction::PinTab),
+    // PinTab toggles the active tab's pin state. `<leader>p` keeps the
+    // chord off the `<C-w>` prefix space so the leaf <C-w> = TabClose
+    // bind doesn't have to wait for an ambiguity timeout.
+    (PageMode::Normal, "<leader>p", PageAction::PinTab),
+    // Paste-as-tab: open a new tab using the clipboard contents as
+    // its URL. Apps layer validates the clipboard classifies as Url
+    // or Host before opening; non-URL clipboard contents are no-ops.
+    (PageMode::Normal, "p", PageAction::PasteUrl { after: true }),
+    (PageMode::Normal, "P", PageAction::PasteUrl { after: false }),
     // Re-open the most recently closed tab (vim-flavored undo). Stack-based
     // so repeated `u` undoes successive closes in reverse order.
     (PageMode::Normal, "u", PageAction::ReopenClosedTab),

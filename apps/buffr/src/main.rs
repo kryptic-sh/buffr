@@ -1729,12 +1729,34 @@ impl AppState {
             }
             A::TabNext => host.next_tab(),
             A::TabPrev => host.prev_tab(),
-            A::DuplicateTab => {
-                if let Err(err) = host.duplicate_active() {
-                    warn!(error = %err, "duplicate_tab: failed");
+            A::PinTab => host.toggle_pin_active(),
+            A::PasteUrl { after } => {
+                let active_idx = host.active_index().unwrap_or(0);
+                let insert_idx = if *after {
+                    active_idx.saturating_add(1)
+                } else {
+                    active_idx
+                };
+                let url = match host.clipboard_text() {
+                    Some(t) => t,
+                    None => return,
+                };
+                let trimmed = url.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                if !matches!(
+                    buffr_config::search::classify_input(trimmed),
+                    buffr_config::search::InputKind::Url | buffr_config::search::InputKind::Host
+                ) {
+                    debug!(text = trimmed, "paste_url: clipboard isn't a URL — no-op");
+                    return;
+                }
+                let resolved = buffr_config::search::resolve_input(trimmed, &self.search_config);
+                if let Err(err) = host.open_tab_at(&resolved, insert_idx) {
+                    warn!(error = %err, url = %resolved, "paste_url: open_tab_at failed");
                 }
             }
-            A::PinTab => host.toggle_pin_active(),
             A::FocusFirstInput => {
                 // User gesture — allow the next focusin to enter Insert.
                 self.insert_intent_at = Some(Instant::now());
