@@ -16,7 +16,6 @@
 //! Phase 4 additions: clap CLI, TOML config loader, hot-reload watcher
 //! that swaps the live keymap on file changes.
 
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,10 +56,11 @@ use buffr_ui::{
     STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
+mod render;
 mod session;
 use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::HasWindowHandle;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
 use winit::{
@@ -1503,10 +1503,9 @@ struct AppState {
     /// Path the runtime persists the live tab list to on clean
     /// shutdown. `None` in private mode (sessions never persist).
     session_path: Option<PathBuf>,
-    /// `softbuffer` graphics context. `Surface` is per-window; the
-    /// context can be reused across windows if we ever spawn more.
-    softbuffer_ctx: Option<softbuffer::Context<Arc<Window>>>,
-    softbuffer_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// wgpu-based present layer. Initialised in `resumed`; replaces the
+    /// former softbuffer context + surface pair.
+    renderer: Option<crate::render::Renderer>,
     /// Last cursor-blink toggle timestamp. We flip
     /// `overlay.input.cursor_visible` every 500ms while an overlay is
     /// open. Static frame (no widget redraw cost when the overlay is
@@ -1681,8 +1680,7 @@ impl AppState {
             pending_session_tabs,
             pending_session_active,
             session_path,
-            softbuffer_ctx: None,
-            softbuffer_surface: None,
+            renderer: None,
             cursor_blink_at: Instant::now(),
             counters,
             counters_flush_at: Instant::now(),
@@ -2132,284 +2130,183 @@ impl AppState {
                 (size.width.max(1), size.height.max(1))
             }
         };
-        // Precompute geometry-derived inputs before acquiring the
-        // softbuffer surface borrow — geometry helpers and Arc-queue
-        // peeks all need `&self`; the borrow is released once `surface`
-        // and `buf` drop at end of scope.
+        // Precompute geometry-derived inputs before the renderer frame
+        // closure — geometry helpers and Arc-queue peeks all need `&self`.
         let tab_y = self.tab_strip_y(height);
         let prompt_y = self.permissions_prompt_y();
         let notice_y = self.download_notice_y();
-        // Snapshot the front of the download notice queue now so we
-        // don't have to touch `self` again while `buf` is live.
+        // Snapshot the front of the download notice queue before the
+        // renderer frame closure so we don't borrow self inside it.
         let current_notice = peek_download_notice(&self.download_notice_queue);
-        // Precompute browser region for the OSR composite so we don't need
-        // a `&self` borrow while the surface buffer is live.
+        // Precompute browser region for the OSR composite.
         let (_, browser_y, browser_w, browser_h) = self.cef_child_rect(width, height);
-        let Some(surface) = self.softbuffer_surface.as_mut() else {
-            return;
-        };
-        let (Some(nz_w), Some(nz_h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
-            return;
-        };
-        if let Err(err) = surface.resize(nz_w, nz_h) {
-            warn!(error = %err, "softbuffer resize failed");
-            return;
-        }
-        let mut buf = match surface.buffer_mut() {
-            Ok(b) => b,
-            Err(err) => {
-                warn!(error = %err, "softbuffer buffer_mut failed");
-                return;
-            }
-        };
 
-        // ── OSR composite (Wayland / off-screen mode only) ────────────────
-        // For HostMode::Osr CEF paints BGRA into SharedOsrFrame instead of
-        // into a native child window.  We blit those pixels into the top
-        // region of the softbuffer surface (everything above the chrome strip)
-        // then let the chrome painting below overdraw its own region.
-        //
-        // HostMode::Windowed: CEF owns an X11 child window that sits over the
-        // top region — we must NOT write there or we would clobber it.
-        let osr_damage: Option<softbuffer::Rect> = if let Some(host) = self.host.as_ref()
+        // Snapshot OSR state we need inside the closure.
+        // SharedOsrFrame = Arc<Mutex<OsrFrame>>; clone is cheap (Arc clone).
+        let osr_data: Option<(buffr_core::SharedOsrFrame, u64)> =
+            if let Some(host) = self.host.as_ref()
             && host.mode() == buffr_core::HostMode::Osr
         {
-            // browser_y / browser_w / browser_h precomputed before the
-            // surface borrow above to avoid conflicting &self borrows.
-            let osr_frame = host.osr_frame();
-            let new_gen = osr_frame
-                .lock()
-                .map(|f| f.generation)
-                .unwrap_or(self.last_osr_generation);
-
-            // Blit regardless of generation change — softbuffer may have
-            // discarded our previous write on resize, so we always fill the
-            // browser region to avoid showing garbage.  The generation check
-            // is kept as a future optimisation hook (skip when surfaced buffer
-            // is already fresh) but is not applied for correctness here.
-            let _ = new_gen; // used below
-
-            if let Ok(frame) = osr_frame.lock() {
-                let osr_w = frame.width as usize;
-                let osr_h = frame.height as usize;
-                let pixels = &frame.pixels;
-                let bw = browser_w as usize;
-                let bh = browser_h as usize;
-                let by = browser_y as usize;
-
-                // OSR-to-chrome blit. While CEF catches up to a live
-                // resize the OSR frame can be a different size than
-                // the chrome's browser region; we nearest-neighbour
-                // stretch so the gap reads as a slightly scaled page
-                // (better than any gap-fill heuristic). At rest the
-                // dimensions match and this is a 1:1 copy.
-                if osr_w > 0 && osr_h > 0 {
-                    for row in 0..bh {
-                        let src_row = row * osr_h / bh;
-                        let dst_row_base = (by + row) * (width as usize);
-                        let src_row_base = src_row * osr_w * 4;
-                        for col in 0..bw {
-                            let src_col = col * osr_w / bw;
-                            let src = src_row_base + src_col * 4;
-                            let b = pixels[src] as u32;
-                            let g = pixels[src + 1] as u32;
-                            let r = pixels[src + 2] as u32;
-                            buf[dst_row_base + col] = (r << 16) | (g << 8) | b;
-                        }
-                    }
-                }
-                self.last_osr_generation = frame.generation;
-            }
-
-            // Damage the whole browser region so softbuffer presents it.
-            NonZeroU32::new(browser_w)
-                .zip(NonZeroU32::new(browser_h))
-                .map(|(nz_bw, nz_bh)| softbuffer::Rect {
-                    x: 0,
-                    y: browser_y,
-                    width: nz_bw,
-                    height: nz_bh,
-                })
+            Some((host.osr_frame(), self.last_osr_generation))
         } else {
             None
         };
 
-        // Statusline writes only the bottom strip; the input bar (when
-        // active) writes only the top strip. Page region in between is
-        // owned by the CEF child window and we never touch it. We use
-        // `present_with_damage` to avoid blanking the page area —
-        // softbuffer 0.4 has no alpha, so writing zeros to the page
-        // region would clobber CEF's surface on X11.
-        self.statusline
-            .paint(buf.as_mut(), width as usize, height as usize);
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        renderer.resize(width, height);
 
-        // Tab strip — sits between input bar (when open) and CEF
-        // page area. Always painted; the buffer slot lives at
-        // `tab_y` (precomputed above so the softbuffer borrow holds).
-        self.tab_strip
-            .paint(buf.as_mut(), width as usize, height as usize, tab_y);
+        // Clone/snapshot values needed in the closure (can't borrow self).
+        let statusline = self.statusline.clone();
+        let tab_strip = self.tab_strip.clone();
+        let confirm_close_pinned = self.confirm_close_pinned.clone();
+        let permissions_prompt = self.permissions_prompt.clone();
+        let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
 
-        // Permissions prompt OR pinned-close confirmation — share the
-        // slot between download notice and tab strip. Confirmation
-        // wins when both are pending (it's modal).
-        if self.confirm_close_pinned.is_some() {
-            let confirm = buffr_ui::ConfirmPrompt {
-                message: "Close pinned tab?".to_string(),
-                yes_label: "Yes (y)".to_string(),
-                no_label: "No (n)".to_string(),
-            };
-            confirm.paint(buf.as_mut(), width as usize, height as usize, prompt_y);
-        } else if let Some(prompt) = self.permissions_prompt.as_ref() {
-            prompt.paint(buf.as_mut(), width as usize, height as usize, prompt_y);
-        }
+        let mut new_osr_generation = self.last_osr_generation;
 
-        // Download notice strip — sits above the permissions prompt (or
-        // above the tab strip when no prompt is active). Drawn last
-        // (highest priority visual layer) so its accent border is
-        // always visible. `current_notice` was snapshotted before this
-        // borrow scope; use it directly.
-        if let Some(ref notice) = current_notice {
-            let strip = DownloadNoticeStrip {
-                kind: match notice.kind {
-                    buffr_core::DownloadNoticeKind::Started => DownloadNoticeKind::Started,
-                    buffr_core::DownloadNoticeKind::Completed => DownloadNoticeKind::Completed,
-                    buffr_core::DownloadNoticeKind::Failed => DownloadNoticeKind::Failed,
-                },
-                filename: notice.filename.clone(),
-                path: notice.path.clone(),
-            };
-            strip.paint(buf.as_mut(), width as usize, height as usize, notice_y);
-        }
+        let res = renderer.frame(|buf, w, _h| {
+            // ── OSR composite (Wayland / off-screen mode only) ────────────────
+            // For HostMode::Osr CEF paints BGRA into SharedOsrFrame instead of
+            // into a native child window. We blit those pixels into the top
+            // region of the wgpu CPU buffer (everything above the chrome strip)
+            // then let the chrome painting below overdraw its own region.
+            //
+            // HostMode::Windowed: CEF owns an X11 child window that sits over
+            // the top region — we must NOT write there or we would clobber it.
+            if let Some((osr_frame, last_gen)) = &osr_data {
+                let new_gen = osr_frame
+                    .lock()
+                    .map(|f| f.generation)
+                    .unwrap_or(*last_gen);
+                // Blit regardless of generation change — the wgpu CPU buffer
+                // is freshly allocated on each resize, so we always fill the
+                // browser region to avoid showing garbage. The generation check
+                // is kept as a future optimisation hook but not applied.
+                let _ = new_gen;
 
-        let mut damage = Vec::with_capacity(6);
+                if let Ok(frame) = osr_frame.lock() {
+                    let osr_w = frame.width as usize;
+                    let osr_h = frame.height as usize;
+                    let pixels = &frame.pixels;
+                    let bw = browser_w as usize;
+                    let bh = browser_h as usize;
+                    let by = browser_y as usize;
 
-        // OSR browser-region damage rect (must be added before chrome rects
-        // so that chrome always renders on top in the damage list order).
-        if let Some(osr_rect) = osr_damage {
-            damage.push(osr_rect);
-        }
-
-        // Statusline damage rect (bottom).
-        let strip_h_u = STATUSLINE_HEIGHT.min(height);
-        let strip_y = height.saturating_sub(strip_h_u);
-        if let Some(strip_h_nz) = NonZeroU32::new(strip_h_u) {
-            damage.push(softbuffer::Rect {
-                x: 0,
-                y: strip_y,
-                width: nz_w,
-                height: strip_h_nz,
-            });
-        }
-
-        // Tab strip damage rect.
-        let tab_h_u = TAB_STRIP_HEIGHT.min(height.saturating_sub(strip_h_u));
-        if let Some(tab_h_nz) = NonZeroU32::new(tab_h_u) {
-            damage.push(softbuffer::Rect {
-                x: 0,
-                y: tab_y,
-                width: nz_w,
-                height: tab_h_nz,
-            });
-        }
-
-        // Permissions prompt / confirm-close-pinned damage rect.
-        if self.confirm_close_pinned.is_some() {
-            let prompt_h_u = buffr_ui::CONFIRM_PROMPT_HEIGHT.min(height.saturating_sub(prompt_y));
-            if let Some(prompt_h_nz) = NonZeroU32::new(prompt_h_u) {
-                damage.push(softbuffer::Rect {
-                    x: 0,
-                    y: prompt_y,
-                    width: nz_w,
-                    height: prompt_h_nz,
-                });
+                    // OSR-to-chrome blit. While CEF catches up to a live
+                    // resize the OSR frame can be a different size than
+                    // the chrome's browser region; we nearest-neighbour
+                    // stretch so the gap reads as a slightly scaled page
+                    // (better than any gap-fill heuristic). At rest the
+                    // dimensions match and this is a 1:1 copy.
+                    if osr_w > 0 && osr_h > 0 {
+                        for row in 0..bh {
+                            let src_row = row * osr_h / bh;
+                            let dst_row_base = (by + row) * w;
+                            let src_row_base = src_row * osr_w * 4;
+                            for col in 0..bw {
+                                let src_col = col * osr_w / bw;
+                                let src = src_row_base + src_col * 4;
+                                let b = pixels[src] as u32;
+                                let g = pixels[src + 1] as u32;
+                                let r = pixels[src + 2] as u32;
+                                buf[dst_row_base + col] = (r << 16) | (g << 8) | b;
+                            }
+                        }
+                    }
+                    new_osr_generation = frame.generation;
+                }
             }
-        } else if self.permissions_prompt.is_some() {
-            let prompt_h_u = PERMISSIONS_PROMPT_HEIGHT.min(height.saturating_sub(prompt_y));
-            if let Some(prompt_h_nz) = NonZeroU32::new(prompt_h_u) {
-                damage.push(softbuffer::Rect {
-                    x: 0,
-                    y: prompt_y,
-                    width: nz_w,
-                    height: prompt_h_nz,
-                });
+
+            // Statusline — bottom strip.
+            statusline.paint(buf, w, height as usize);
+
+            // Tab strip — sits between chrome strip and CEF page area.
+            tab_strip.paint(buf, w, height as usize, tab_y);
+
+            // Permissions prompt OR pinned-close confirmation.
+            if let Some(ref confirm) = confirm_close_pinned {
+                let _ = confirm; // type is present; paint the generic confirm widget
+                let confirm_widget = buffr_ui::ConfirmPrompt {
+                    message: "Close pinned tab?".to_string(),
+                    yes_label: "Yes (y)".to_string(),
+                    no_label: "No (n)".to_string(),
+                };
+                confirm_widget.paint(buf, w, height as usize, prompt_y);
+            } else if let Some(ref prompt) = permissions_prompt {
+                prompt.paint(buf, w, height as usize, prompt_y);
             }
-        }
 
-        // Download notice damage rect.
-        if current_notice.is_some() {
-            let notice_h_u = DOWNLOAD_NOTICE_HEIGHT.min(height.saturating_sub(notice_y));
-            if let Some(notice_h_nz) = NonZeroU32::new(notice_h_u) {
-                damage.push(softbuffer::Rect {
-                    x: 0,
-                    y: notice_y,
-                    width: nz_w,
-                    height: notice_h_nz,
-                });
+            // Download notice strip — drawn last (highest priority layer).
+            if let Some(ref notice) = current_notice {
+                let strip = DownloadNoticeStrip {
+                    kind: match notice.kind {
+                        buffr_core::DownloadNoticeKind::Started => DownloadNoticeKind::Started,
+                        buffr_core::DownloadNoticeKind::Completed => DownloadNoticeKind::Completed,
+                        buffr_core::DownloadNoticeKind::Failed => DownloadNoticeKind::Failed,
+                    },
+                    filename: notice.filename.clone(),
+                    path: notice.path.clone(),
+                };
+                strip.paint(buf, w, height as usize, notice_y);
             }
-        }
 
-        // Overlay popup — floats over the CEF region at top 1/3 of the window.
-        // CEF is never resized when the overlay opens or closes.
-        if let Some(overlay) = self.overlay.as_ref() {
-            let bar = overlay.input();
-            let popup_w = ((width * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
-            let popup_x = (width - popup_w) / 2;
-            let popup_y = height / 3;
-            // Add border so the inner rect always has room for the
-            // input row (paint_at bails when inner_h < INPUT_HEIGHT,
-            // which previously hid the input on empty omnibar).
-            let popup_h =
-                (bar.total_height() + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
+            // Overlay popup — floats over the CEF region at top 1/3 of the window.
+            // CEF is never resized when the overlay opens or closes.
+            if let Some(ref bar) = overlay_data {
+                let popup_w = ((width * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
+                let popup_x = (width - popup_w) / 2;
+                let popup_y = height / 3;
+                // Add border so the inner rect always has room for the
+                // input row (paint_at bails when inner_h < INPUT_HEIGHT,
+                // which previously hid the input on empty omnibar).
+                let popup_h = (bar.total_height() + 2 * OMNIBAR_POPUP_BORDER)
+                    .min(height.saturating_sub(popup_y));
 
-            // Border fill.
-            fill_rect_u32(
-                buf.as_mut(),
-                width as usize,
-                height as usize,
-                popup_x as usize,
-                popup_y as usize,
-                popup_w as usize,
-                popup_h as usize,
-                OMNIBAR_POPUP_BORDER_COLOR,
-            );
-            // Inner background.
-            let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
-            let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
-            let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-            let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-            fill_rect_u32(
-                buf.as_mut(),
-                width as usize,
-                height as usize,
-                inner_x as usize,
-                inner_y as usize,
-                inner_w as usize,
-                inner_h as usize,
-                OMNIBAR_POPUP_BG,
-            );
-            // Input bar + suggestions inside the popup.
-            bar.paint_at(
-                buf.as_mut(),
-                width as usize,
-                height as usize,
-                inner_x as usize,
-                inner_y as usize,
-                inner_w as usize,
-                inner_h as usize,
-            );
-            // Damage only the popup region.
-            if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(popup_w), NonZeroU32::new(popup_h)) {
-                damage.push(softbuffer::Rect {
-                    x: popup_x,
-                    y: popup_y,
-                    width: w_nz,
-                    height: h_nz,
-                });
+                // Border fill.
+                fill_rect_u32(
+                    buf,
+                    w,
+                    height as usize,
+                    popup_x as usize,
+                    popup_y as usize,
+                    popup_w as usize,
+                    popup_h as usize,
+                    OMNIBAR_POPUP_BORDER_COLOR,
+                );
+                // Inner background.
+                let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
+                let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
+                let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+                let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+                fill_rect_u32(
+                    buf,
+                    w,
+                    height as usize,
+                    inner_x as usize,
+                    inner_y as usize,
+                    inner_w as usize,
+                    inner_h as usize,
+                    OMNIBAR_POPUP_BG,
+                );
+                // Input bar + suggestions inside the popup.
+                bar.paint_at(
+                    buf,
+                    w,
+                    height as usize,
+                    inner_x as usize,
+                    inner_y as usize,
+                    inner_w as usize,
+                    inner_h as usize,
+                );
             }
-        }
+        });
 
-        if let Err(err) = buf.present_with_damage(&damage) {
-            warn!(error = %err, "softbuffer present_with_damage failed");
+        self.last_osr_generation = new_osr_generation;
+
+        if let Err(err) = res {
+            warn!(error = %err, "wgpu frame failed");
         }
     }
 
@@ -3736,31 +3633,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
         }
 
-        // softbuffer context lives off the display handle; surface
-        // wraps the window. Both must outlive any `buffer_mut()` call.
-        match window.display_handle() {
-            Ok(_) => {
-                let context = match softbuffer::Context::new(window.clone()) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        warn!(error = %err, "softbuffer Context::new failed");
-                        self.window = Some(window);
-                        return;
-                    }
-                };
-                let surface = match softbuffer::Surface::new(&context, window.clone()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        warn!(error = %err, "softbuffer Surface::new failed");
-                        self.softbuffer_ctx = Some(context);
-                        self.window = Some(window);
-                        return;
-                    }
-                };
-                self.softbuffer_ctx = Some(context);
-                self.softbuffer_surface = Some(surface);
+        // Initialise wgpu renderer. On failure, log and exit — there is
+        // no CPU-only fallback in this code path.
+        match crate::render::Renderer::new(window.clone()) {
+            Ok(r) => self.renderer = Some(r),
+            Err(err) => {
+                warn!(error = %err, "wgpu renderer init failed");
+                event_loop.exit();
+                return;
             }
-            Err(err) => warn!(error = %err, "no raw display handle for softbuffer"),
         }
 
         // Schedule the find smoke-test dispatch for 1.5s after window
