@@ -1527,8 +1527,8 @@ impl AppState {
         use buffr_modal::PageAction as A;
         match action {
             A::TabNew => {
-                let url = self.homepage.clone();
-                if let Err(err) = host.open_tab(&url) {
+                let url = "chrome://new-tab-page/";
+                if let Err(err) = host.open_tab(url) {
                     warn!(error = %err, %url, "tab_new: failed");
                 }
             }
