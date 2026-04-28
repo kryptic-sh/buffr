@@ -222,16 +222,21 @@ pub struct BrowserHost {
     closed_stack: Mutex<Vec<ClosedTab>>,
 }
 
-/// Snapshot retained for a closed tab so `reopen_closed_tab` can put
-/// it back at the same slot in the strip.
-#[derive(Debug, Clone)]
+/// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
+/// alive (just hidden via `was_hidden(1)`) so re-opening preserves
+/// the back/forward history, scroll position, form state, and any
+/// in-flight JS — closing-and-recreating a fresh browser would lose
+/// all of it. Stack overflow drops the oldest entry, which Drops the
+/// `Tab` and tears down its browser.
 struct ClosedTab {
-    url: String,
+    tab: Tab,
     index: usize,
-    pinned: bool,
 }
 
-const CLOSED_STACK_CAP: usize = 32;
+// Each stashed entry keeps a live CEF browser hidden in memory so
+// reopen preserves history. Cap kept tight to bound the resident-set
+// cost — Chromium browsers are expensive even hidden.
+const CLOSED_STACK_CAP: usize = 8;
 
 impl BrowserHost {
     /// Create the host with a single initial tab loading `url`.
@@ -628,10 +633,11 @@ impl BrowserHost {
         self.create_browser(url, true)
     }
 
-    /// Pop the most recently closed tab off the undo stack and open
-    /// it back at its original position. Re-pins the tab if it was
-    /// pinned at close time. Returns `Ok(None)` when the stack is
-    /// empty so the caller can no-op without logging a warning.
+    /// Pop the most recently closed tab off the undo stack and put
+    /// it back at its original position. The CEF browser was kept
+    /// alive while stashed, so back/forward history, scroll position,
+    /// and any in-flight JS state are preserved. Returns `Ok(None)`
+    /// when the stack is empty so the caller can no-op silently.
     pub fn reopen_closed_tab(&self) -> Result<Option<TabId>, CoreError> {
         let entry = match self.closed_stack.lock() {
             Ok(mut s) => s.pop(),
@@ -640,12 +646,28 @@ impl BrowserHost {
         let Some(entry) = entry else {
             return Ok(None);
         };
-        let id = self.open_tab_at(&entry.url, entry.index)?;
-        if entry.pinned {
-            // toggle_pin_active flips the active tab's pin; the just-
-            // opened tab is active after open_tab_at.
-            self.toggle_pin_active();
+        let id = entry.tab.id;
+        // Insert the live Tab back into the strip at its original
+        // index (clamped). Doing the insert before un-hiding ensures
+        // tab_count / set_active_index see the right slot.
+        let final_idx = {
+            let mut tabs = self
+                .tabs
+                .lock()
+                .map_err(|_| CoreError::CreateBrowserFailed)?;
+            let clamped = entry.index.min(tabs.len());
+            tabs.insert(clamped, entry.tab);
+            clamped
+        };
+        // Un-hide and focus the restored browser.
+        if let Ok(tabs) = self.tabs.lock()
+            && let Some(t) = tabs.get(final_idx)
+            && let Some(host) = t.browser.host()
+        {
+            host.was_hidden(0);
+            host.was_resized();
         }
+        self.set_active_index(final_idx);
         Ok(Some(id))
     }
 
@@ -988,28 +1010,46 @@ impl BrowserHost {
             }
             tabs.remove(idx)
         };
-        // Push onto the closed-tabs undo stack before tearing the
-        // browser down. Skip blank entries — re-opening a true blank
-        // page is the same as `:tabnew`, so the stack stays signal.
-        if !removed.url.is_empty()
-            && removed.url != "about:blank"
-            && let Ok(mut stack) = self.closed_stack.lock()
-        {
-            stack.push(ClosedTab {
-                url: removed.url.clone(),
-                index: idx,
-                pinned: removed.pinned,
-            });
-            let extra = stack.len().saturating_sub(CLOSED_STACK_CAP);
-            if extra > 0 {
-                stack.drain(0..extra);
+
+        // Decide whether this tab is worth stashing on the closed-tabs
+        // undo stack: blank pages aren't (re-opening them is the same
+        // as `:tabnew`).
+        let stashable = !removed.url.is_empty() && removed.url != "about:blank";
+
+        if stashable {
+            // Hide the browser but keep it alive so a future
+            // `reopen_closed_tab` preserves history, scroll, and form
+            // state. `close_browser` is only called when the entry
+            // ages out of the stack (see eviction below).
+            if let Some(host) = removed.browser.host() {
+                host.was_hidden(1);
+                host.set_focus(0);
             }
-        }
-        // Tell CEF to tear the browser down. The browser drop also
-        // runs at end-of-scope but `close_browser(1)` flushes IO and
-        // releases the child window immediately.
-        if let Some(host) = removed.browser.host() {
-            host.close_browser(1);
+            let evicted: Vec<Tab> = if let Ok(mut stack) = self.closed_stack.lock() {
+                stack.push(ClosedTab {
+                    tab: removed,
+                    index: idx,
+                });
+                let extra = stack.len().saturating_sub(CLOSED_STACK_CAP);
+                if extra > 0 {
+                    stack.drain(0..extra).map(|c| c.tab).collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            // Tear down any stack-evicted browsers outside the lock.
+            for t in evicted {
+                if let Some(host) = t.browser.host() {
+                    host.close_browser(1);
+                }
+            }
+        } else {
+            // Not stashable — close immediately.
+            if let Some(host) = removed.browser.host() {
+                host.close_browser(1);
+            }
         }
 
         // Pick a new active. Prefer the tab that was after the removed
