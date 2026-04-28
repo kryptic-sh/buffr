@@ -2467,18 +2467,26 @@ impl AppState {
                     value,
                     ..
                 } => {
-                    // Only move to Tracking when not already Editing
-                    // the same field — a spurious re-focus during
-                    // engine-attached state must not clobber the session.
+                    // Browser UX: clicking an input enters Edit mode
+                    // immediately (no `i` step). A spurious re-focus
+                    // during engine-attached state must not clobber
+                    // an existing session for the same field.
                     let already_editing = matches!(
                         &self.edit_focus,
                         EditFocus::Editing { field_id: f, .. } if *f == field_id
                     );
                     if !already_editing {
-                        self.edit_focus = EditFocus::Tracking {
+                        let session = buffr_modal::EditSession::new(&value);
+                        if let Some(host) = self.host.as_ref() {
+                            host.run_edit_attach(&field_id);
+                        }
+                        if let Ok(mut e) = self.engine.lock() {
+                            e.set_mode(buffr_modal::PageMode::Edit);
+                        }
+                        self.edit_focus = EditFocus::Editing {
                             field_id,
                             kind,
-                            value,
+                            session,
                         };
                     }
                 }
