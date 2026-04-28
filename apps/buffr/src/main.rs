@@ -1136,54 +1136,6 @@ fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
 /// Minimal HTML escaper for the new-tab page renderer. Covers the
 /// five characters that matter when injecting keybinding labels into
 /// table cells.
-/// Mode of the BGRA pixels in row `row` of an OSR frame `osr_w` pixels
-/// wide. Used to pick a sensible fill colour for the bottom gap during
-/// a live resize — the page bg dominates this row even if a sliver of
-/// text crosses it.
-fn mode_color_row(pixels: &[u8], osr_w: usize, row: usize) -> u32 {
-    use std::collections::HashMap;
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    let row_base = row * osr_w * 4;
-    for col in 0..osr_w {
-        let src = row_base + col * 4;
-        if src + 3 >= pixels.len() {
-            break;
-        }
-        let b = pixels[src] as u32;
-        let g = pixels[src + 1] as u32;
-        let r = pixels[src + 2] as u32;
-        *counts.entry((r << 16) | (g << 8) | b).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(c, _)| c)
-        .unwrap_or(0x0000_0000)
-}
-
-/// Mode of the BGRA pixels in column `col` (rows `0..osr_h`) of an OSR
-/// frame `osr_w` pixels wide. Caller passes a `col` offset inside the
-/// scrollbar so the body bg dominates instead of the scrollbar grey.
-fn mode_color_col(pixels: &[u8], osr_w: usize, osr_h: usize, col: usize) -> u32 {
-    use std::collections::HashMap;
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    for row in 0..osr_h {
-        let src = row * osr_w * 4 + col * 4;
-        if src + 3 >= pixels.len() {
-            break;
-        }
-        let b = pixels[src] as u32;
-        let g = pixels[src + 1] as u32;
-        let r = pixels[src + 2] as u32;
-        *counts.entry((r << 16) | (g << 8) | b).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(c, _)| c)
-        .unwrap_or(0x0000_0000)
-}
-
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -2232,40 +2184,24 @@ impl AppState {
                 let bh = browser_h as usize;
                 let by = browser_y as usize;
 
-                // Compute fill colours for the gap when CEF hasn't
-                // caught up to a live resize:
-                //   - bottom gap (rows >= osr_h): mode of the bottom
-                //     row's pixels — captures the page bg even if the
-                //     last row has a sliver of text.
-                //   - right gap (cols >= osr_w): mode of the rightmost
-                //     column's pixels, offset inward by the scrollbar
-                //     width so the body bg dominates instead of the
-                //     scrollbar grey.
-                const SCROLLBAR_OFFSET: usize = 16;
-                let bottom_fill = if osr_w > 0 && osr_h > 0 {
-                    mode_color_row(pixels, osr_w, osr_h - 1)
-                } else {
-                    0x0000_0000
-                };
-                let right_fill = if osr_w > SCROLLBAR_OFFSET && osr_h > 0 {
-                    mode_color_col(pixels, osr_w, osr_h, osr_w - 1 - SCROLLBAR_OFFSET)
-                } else {
-                    bottom_fill
-                };
-                for row in 0..bh {
-                    let dst_row_base = (by + row) * (width as usize);
-                    for col in 0..bw {
-                        let dst_idx = dst_row_base + col;
-                        if row < osr_h && col < osr_w {
-                            let src = row * osr_w * 4 + col * 4;
+                // OSR-to-chrome blit. While CEF catches up to a live
+                // resize the OSR frame can be a different size than
+                // the chrome's browser region; we nearest-neighbour
+                // stretch so the gap reads as a slightly scaled page
+                // (better than any gap-fill heuristic). At rest the
+                // dimensions match and this is a 1:1 copy.
+                if osr_w > 0 && osr_h > 0 {
+                    for row in 0..bh {
+                        let src_row = row * osr_h / bh;
+                        let dst_row_base = (by + row) * (width as usize);
+                        let src_row_base = src_row * osr_w * 4;
+                        for col in 0..bw {
+                            let src_col = col * osr_w / bw;
+                            let src = src_row_base + src_col * 4;
                             let b = pixels[src] as u32;
                             let g = pixels[src + 1] as u32;
                             let r = pixels[src + 2] as u32;
-                            buf[dst_idx] = (r << 16) | (g << 8) | b;
-                        } else if row >= osr_h {
-                            buf[dst_idx] = bottom_fill;
-                        } else {
-                            buf[dst_idx] = right_fill;
+                            buf[dst_row_base + col] = (r << 16) | (g << 8) | b;
                         }
                     }
                 }
