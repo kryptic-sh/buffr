@@ -4089,6 +4089,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                         self.osr_last_click_at = now;
                         self.osr_last_click_button = Some(cef_button);
+                        // Promote CEF widget focus on the first real
+                        // click into the OSR region. We deliberately
+                        // skip set_focus(1) on load so page-autofocus
+                        // doesn't drive a caret-blink paint loop; this
+                        // is the place the user finally tells CEF the
+                        // page is theirs to interact with.
+                        host.osr_focus(true);
                         // Left-click is a user gesture that may focus
                         // an input — allow the next focusin to enter
                         // Insert mode.
