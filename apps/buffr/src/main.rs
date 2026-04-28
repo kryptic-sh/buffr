@@ -2359,14 +2359,16 @@ impl AppState {
         let new_osr_generation;
         let res = if let Some((ref pixels, osr_w, osr_h, osr_gen)) = osr_pixels_and_meta {
             new_osr_generation = osr_gen;
-            let copy_w = osr_w.min(browser_w);
-            let copy_h = osr_h.min(browser_h);
+            // dst_rect always uses the live browser rect (not min'd against
+            // the stale OSR dims). The renderer stretches the OSR texture
+            // to fill it, so when CEF's buffer lags the window resize the
+            // stale frame visually scales up instead of letterboxing.
             let osr_upload = crate::render::OsrUpload {
                 pixels,
                 width: osr_w,
                 height: osr_h,
                 generation: osr_gen,
-                dst_rect: (0, browser_y, copy_w, copy_h),
+                dst_rect: (0, browser_y, browser_w, browser_h),
             };
             renderer.frame(
                 chrome_dirty,

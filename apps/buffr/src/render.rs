@@ -563,24 +563,26 @@ impl Renderer {
                     upload,
                 );
                 // Update the OSR quad uniform to match dst_rect.
+                // The quad always covers the full dst_rect and samples the
+                // entire OSR texture (UV 0..1). When CEF's buffer lags the
+                // window dims (during a live-resize the new buffer hasn't
+                // arrived yet), the GPU sampler stretches the stale frame
+                // to fill the whole CEF region — no letterbox at the edge.
+                // Once CEF catches up (was_resized → new on_paint), the
+                // upload dims match dst and the stretch becomes 1:1.
                 let (dx, dy, dw, dh) = upload.dst_rect;
-                let copy_w = upload.width.min(dw) as f32;
-                let copy_h = upload.height.min(dh) as f32;
                 let win_w = self.width as f32;
                 let win_h = self.height as f32;
                 // NDC: x left→right = -1→+1, y bottom→top = -1→+1.
                 // Window pixels: row 0 = top, col 0 = left.
                 let ndc_x0 = (dx as f32 / win_w) * 2.0 - 1.0;
-                let ndc_x1 = ((dx as f32 + copy_w) / win_w) * 2.0 - 1.0;
+                let ndc_x1 = ((dx as f32 + dw as f32) / win_w) * 2.0 - 1.0;
                 // y=top in NDC is +1, pixel row dy=0 means top of window.
                 let ndc_y1 = 1.0 - (dy as f32 / win_h) * 2.0;
-                let ndc_y0 = 1.0 - ((dy as f32 + copy_h) / win_h) * 2.0;
-                // UV: (0,0)=top-left of OSR texture, (1,1)=bottom-right.
-                let uv_u1 = copy_w / upload.width as f32;
-                let uv_v1 = copy_h / upload.height as f32;
+                let ndc_y0 = 1.0 - ((dy as f32 + dh as f32) / win_h) * 2.0;
                 let uni = QuadUniforms {
                     ndc: [ndc_x0, ndc_y1, ndc_x1, ndc_y0],
-                    uv: [0.0, 0.0, uv_u1, uv_v1],
+                    uv: [0.0, 0.0, 1.0, 1.0],
                 };
                 self.queue
                     .write_buffer(&self.osr_uniform_buf, 0, bytemuck::bytes_of(&uni));
