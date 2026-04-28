@@ -108,6 +108,7 @@ fn parse_unit(name: &str) -> Result<PageAction, KeyBindingError> {
         "clear_completed_downloads" => ClearCompletedDownloads,
         "enter_edit_mode" => EnterEditMode,
         "focus_first_input" => FocusFirstInput,
+        "exit_insert_mode" => ExitInsertMode,
         other => return Err(KeyBindingError::UnknownAction(other.into())),
     })
 }
@@ -230,6 +231,7 @@ fn action_to_string(action: &PageAction) -> String {
         ClearCompletedDownloads => "clear_completed_downloads".into(),
         EnterEditMode => "enter_edit_mode".into(),
         FocusFirstInput => "focus_first_input".into(),
+        ExitInsertMode => "exit_insert_mode".into(),
     }
 }
 
