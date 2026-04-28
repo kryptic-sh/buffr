@@ -581,24 +581,33 @@ impl BrowserHost {
             ..WindowInfo::default()
         };
         match self.mode {
-            HostMode::Windowed => match handle {
-                #[cfg(target_os = "macos")]
-                RawWindowHandle::AppKit(h) => {
-                    window_info.parent_window = h.ns_view.as_ptr() as _;
+            HostMode::Windowed => {
+                // Capture bounds before moving window_info into set_as_child.
+                // Named with underscore so Linux (OSR-only) doesn't warn on
+                // the dead binding; macOS/Windows arms below reference it.
+                #[allow(unused_variables)]
+                let bounds = window_info.bounds.clone();
+                match handle {
+                    #[cfg(target_os = "macos")]
+                    RawWindowHandle::AppKit(h) => {
+                        window_info = window_info.set_as_child(h.ns_view.as_ptr() as _, &bounds);
+                    }
+                    #[cfg(target_os = "windows")]
+                    RawWindowHandle::Win32(h) => {
+                        // raw_window_handle gives us `isize`; CEF's HWND is `*mut HWND__`.
+                        window_info = window_info
+                            .set_as_child(cef::sys::HWND(h.hwnd.get() as *mut _), &bounds);
+                    }
+                    other => {
+                        tracing::warn!(
+                            ?other,
+                            "windowed mode but unrecognised handle variant — \
+                                 cannot embed CEF child window"
+                        );
+                        return Err(CoreError::CreateBrowserFailed);
+                    }
                 }
-                #[cfg(target_os = "windows")]
-                RawWindowHandle::Win32(h) => {
-                    window_info.parent_window = h.hwnd.get() as _;
-                }
-                other => {
-                    tracing::warn!(
-                        ?other,
-                        "windowed mode but unrecognised handle variant — \
-                             cannot embed CEF child window"
-                    );
-                    return Err(CoreError::CreateBrowserFailed);
-                }
-            },
+            }
             HostMode::Osr => {
                 // Off-screen rendering: no parent_window; CEF will call the
                 // RenderHandler instead of creating a child window.
@@ -609,7 +618,6 @@ impl BrowserHost {
             }
         }
         tracing::info!(
-            parent_window = window_info.parent_window,
             bounds_w = window_info.bounds.width,
             bounds_h = window_info.bounds.height,
             windowless_rendering_enabled = window_info.windowless_rendering_enabled,
