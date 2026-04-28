@@ -2267,37 +2267,35 @@ impl AppState {
                     let by = browser_y as usize;
                     osr_dims = Some((osr_w as u32, osr_h as u32, bw as u32, bh as u32));
 
-                    // Clip + memcpy. While CEF catches up to a live resize
-                    // the OSR frame can be smaller or larger than the
-                    // chrome's browser region; copy the overlap and fill
-                    // any leftover strip with a solid grey so the gap
-                    // reads cleanly instead of as undefined memory. No
-                    // scaling — at rest dims match and this is a straight
-                    // per-row memcpy. CEF emits BGRA bytes which already
-                    // match the wgpu Bgra8Unorm texture, so we copy as u32
+                    // Two paths. CEF emits BGRA bytes which already match
+                    // the wgpu Bgra8Unorm texture, so both copy as u32
                     // without any swizzle.
+                    //
+                    // Fast: dims match → per-row memcpy. The common case
+                    // at rest, ~210µs at 944×505.
+                    //
+                    // Slow: dims mismatch (transient catch-up after a
+                    // Resized event, ~70ms while CEF re-rasterizes) →
+                    // nearest-neighbour stretch to fill the whole browser
+                    // region. Slightly fuzzy during the transition, but
+                    // way better than a grey strip on half the window.
                     if osr_w > 0 && osr_h > 0 {
-                        let copy_w = bw.min(osr_w);
-                        let copy_h = bh.min(osr_h);
                         let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
-
-                        for row in 0..copy_h {
-                            let dst = (by + row) * w;
-                            let src = row * osr_w;
-                            buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
-                        }
-
-                        const GAP: u32 = 0x202020;
-                        if copy_w < bw {
-                            for row in 0..copy_h {
-                                let dst = (by + row) * w + copy_w;
-                                buf[dst..dst + (bw - copy_w)].fill(GAP);
-                            }
-                        }
-                        if copy_h < bh {
-                            for row in copy_h..bh {
+                        if osr_w == bw && osr_h == bh {
+                            for row in 0..bh {
                                 let dst = (by + row) * w;
-                                buf[dst..dst + bw].fill(GAP);
+                                let src = row * osr_w;
+                                buf[dst..dst + bw].copy_from_slice(&src_u32[src..src + bw]);
+                            }
+                        } else {
+                            for row in 0..bh {
+                                let src_row = row * osr_h / bh;
+                                let dst_base = (by + row) * w;
+                                let src_base = src_row * osr_w;
+                                for col in 0..bw {
+                                    let src_col = col * osr_w / bw;
+                                    buf[dst_base + col] = src_u32[src_base + src_col];
+                                }
                             }
                         }
                     }
