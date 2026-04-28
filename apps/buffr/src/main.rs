@@ -1571,6 +1571,29 @@ impl AppState {
     }
 
     fn dispatch_action(&mut self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+        // Adjacent-tab opens require both a host call and a &mut self call
+        // (open_omnibar). Handle them before the shared host borrow so the
+        // borrow checker sees two disjoint borrows.
+        if matches!(action, A::TabNewRight | A::TabNewLeft) {
+            let Some(host) = self.host.as_ref() else {
+                warn!(?action, "no browser host yet — dropping action");
+                return;
+            };
+            let insert_idx = if matches!(action, A::TabNewRight) {
+                host.active_index().unwrap_or(0).saturating_add(1)
+            } else {
+                host.active_index().unwrap_or(0)
+            };
+            // Last use of `host` — NLL releases the shared borrow here.
+            let result = host.open_tab_at(NEW_TAB_URL, insert_idx);
+            match result {
+                Ok(_) => self.open_omnibar(),
+                Err(ref err) => warn!(error = %err, "tab_new adjacent: failed"),
+            }
+            return;
+        }
+
         let Some(host) = self.host.as_ref() else {
             warn!(?action, "no browser host yet — dropping action");
             return;
@@ -1578,8 +1601,8 @@ impl AppState {
         // Tab actions need apps-layer policy decisions (e.g. last-tab
         // close → exit) so they bypass the host dispatcher's fallback
         // path.
-        use buffr_modal::PageAction as A;
         match action {
+            A::TabNewRight | A::TabNewLeft => unreachable!("handled above"),
             A::TabNew => {
                 let url = NEW_TAB_URL;
                 if let Err(err) = host.open_tab(url) {

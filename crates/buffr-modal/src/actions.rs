@@ -72,6 +72,14 @@ pub enum PageAction {
     TabPrev,
     TabClose,
     TabNew,
+    /// Open a fresh tab adjacent to the active tab. The apps layer also
+    /// auto-opens the omnibar after creation so the user can type a URL.
+    /// Inserts the new tab immediately to the right of the active tab.
+    TabNewRight,
+    /// Open a fresh tab adjacent to the active tab. The apps layer also
+    /// auto-opens the omnibar after creation so the user can type a URL.
+    /// Inserts the new tab immediately to the left of the active tab.
+    TabNewLeft,
     /// Duplicate the active tab — clones the URL into a fresh tab.
     /// Default keybind `<C-w>n` (see `docs/keymap.md`).
     DuplicateTab,

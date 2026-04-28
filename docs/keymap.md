@@ -67,17 +67,18 @@ the shorter action fires.
 
 ### Tabs
 
-| Keys     | Action         | Notes                                           |
-| -------- | -------------- | ----------------------------------------------- |
-| `H`      | `TabPrev`      | **[buffr]** Vieb uses `H` for history-back.     |
-| `L`      | `TabNext`      | **[buffr]** Vieb uses `L` for history-forward.  |
-| `gt`     | `TabNext`      |                                                 |
-| `gT`     | `TabPrev`      |                                                 |
-| `t`      | `TabNew`       |                                                 |
-| `d`      | `TabClose`     |                                                 |
-| `<C-w>c` | `TabClose`     |                                                 |
-| `<C-w>n` | `DuplicateTab` |                                                 |
-| `<C-w>p` | `PinTab`       | **[buffr]** Vieb uses `<C-w>p` for prev-buffer. |
+| Keys     | Action         | Notes                                                                         |
+| -------- | -------------- | ----------------------------------------------------------------------------- |
+| `H`      | `TabPrev`      | **[buffr]** Vieb uses `H` for history-back.                                   |
+| `L`      | `TabNext`      | **[buffr]** Vieb uses `L` for history-forward.                                |
+| `gt`     | `TabNext`      |                                                                               |
+| `gT`     | `TabPrev`      |                                                                               |
+| `o`      | `TabNewRight`  | **[buffr]** Open tab to the right of active; omnibar opens so you type a URL. |
+| `O`      | `TabNewLeft`   | **[buffr]** Open tab to the left of active; omnibar opens so you type a URL.  |
+| `d`      | `TabClose`     |                                                                               |
+| `<C-w>c` | `TabClose`     |                                                                               |
+| `<C-w>n` | `DuplicateTab` |                                                                               |
+| `<C-w>p` | `PinTab`       | **[buffr]** Vieb uses `<C-w>p` for prev-buffer.                               |
 
 `TabClose` (and `:q`) close the active tab. The application only exits when the
 last tab is gone. `DuplicateTab` clones the active tab's URL into a fresh tab;
@@ -108,13 +109,12 @@ See [`multi-tab.md`](./multi-tab.md).
 
 ### Omnibar / command line
 
-| Keys    | Action            | Notes                                        |
-| ------- | ----------------- | -------------------------------------------- |
-| `e`     | `OpenOmnibar`     |                                              |
-| `<C-l>` | `OpenOmnibar`     |                                              |
-| `o`     | `OpenOmnibar`     | **[buffr]** kept as alias (no Vieb default). |
-| `:`     | `OpenCommandLine` |                                              |
-| `;`     | `OpenCommandLine` | **[buffr]** alias; Vieb uses `;` for hints.  |
+| Keys    | Action            | Notes                                       |
+| ------- | ----------------- | ------------------------------------------- |
+| `e`     | `OpenOmnibar`     |                                             |
+| `<C-l>` | `OpenOmnibar`     |                                             |
+| `:`     | `OpenCommandLine` |                                             |
+| `;`     | `OpenCommandLine` | **[buffr]** alias; Vieb uses `;` for hints. |
 
 ### Hints
 
@@ -181,7 +181,7 @@ The engine reads the resolved [`PageAction`] and auto-transitions:
 
 ## In-overlay shortcuts (command line / omnibar)
 
-When `:` opens the command line or `e`/`o` opens the omnibar, all keystrokes
+When `:` opens the command line or `e`/`<C-l>` opens the omnibar, all keystrokes
 route to the input bar instead of the page-mode trie. The bindings below mirror
 readline / vim's command-line conventions.
 
@@ -238,7 +238,7 @@ are skipped until those features land:
 | `s` / `S`               | toSearchMode (special)   | Covered by `/` / `?`                                                 |
 | `<C-a>` / `<C-x>`       | incrementUrl / decrement | No URL increment action                                              |
 | `<kPlus>` / `<kMinus>`  | zoomIn / zoomOut         | `kPlus`/`kMinus` not a named key in buffr parser; covered by `+`/`-` |
-| `<C-t>`                 | openNewTab               | Covered by `t`                                                       |
+| `<C-t>`                 | openNewTab               | No default binding; use `o`/`O` for adjacent-tab open.               |
 | `u`                     | reopenTab                | No `ReopenTab` action                                                |
 | `<C-Tab>` / `<C-S-Tab>` | nextTab / prevTab        | Covered by `J`/`K`                                                   |
 

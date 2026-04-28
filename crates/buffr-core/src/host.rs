@@ -611,6 +611,56 @@ impl BrowserHost {
         self.create_browser(url, true)
     }
 
+    /// Open a new tab and place it at `insert_idx` in the tab list.
+    /// Out-of-bounds indices clamp to the end. Returns the new tab's
+    /// [`TabId`]. The new tab becomes active and the active index is
+    /// adjusted if the insertion pushed the previous active tab down.
+    pub fn open_tab_at(&self, url: &str, insert_idx: usize) -> Result<TabId, CoreError> {
+        // Create the browser appended (background=true so focus stays
+        // on the current tab while we reorder).
+        let id = self.create_browser(url, true)?;
+
+        // Move the freshly-appended tab to the requested position.
+        {
+            let mut tabs = self
+                .tabs
+                .lock()
+                .map_err(|_| CoreError::CreateBrowserFailed)?;
+            let appended_idx = tabs.len() - 1;
+            let clamped = insert_idx.min(appended_idx);
+            if clamped != appended_idx {
+                let tab = tabs.remove(appended_idx);
+                tabs.insert(clamped, tab);
+                // Fix up active index: the removal + re-insert shifts
+                // any active tab that was at or after `clamped`.
+                let mut active = self
+                    .active
+                    .lock()
+                    .map_err(|_| CoreError::CreateBrowserFailed)?;
+                if let Some(a) = *active {
+                    // After removing from appended_idx and inserting at
+                    // clamped, indices in [clamped, appended_idx) shift +1.
+                    if a >= clamped && a < appended_idx {
+                        *active = Some(a + 1);
+                    }
+                }
+            }
+        }
+
+        // Now make the new tab active at the clamped position.
+        let final_idx = {
+            let tabs = self
+                .tabs
+                .lock()
+                .map_err(|_| CoreError::CreateBrowserFailed)?;
+            tabs.iter().position(|t| t.id == id)
+        };
+        if let Some(idx) = final_idx {
+            self.set_active_index(idx);
+        }
+        Ok(id)
+    }
+
     fn create_browser(&self, url: &str, background: bool) -> Result<TabId, CoreError> {
         let handle = match self.parent_handle.lock() {
             Ok(g) => match *g {
@@ -1157,6 +1207,11 @@ impl BrowserHost {
                 let _ = self.close_active();
             }
             A::TabNew => {
+                let _ = self.open_tab("about:blank");
+            }
+            A::TabNewRight | A::TabNewLeft => {
+                // Adjacent-tab opens are handled at the apps layer (which
+                // also opens the omnibar). The host fallback just appends.
                 let _ = self.open_tab("about:blank");
             }
             A::DuplicateTab => {
