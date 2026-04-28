@@ -2571,6 +2571,12 @@ impl AppState {
     fn edit_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         let planned = Self::winit_key_to_planned(event, self.modifiers);
         let is_esc_pressed = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
+        tracing::info!(
+            state = ?event.state,
+            logical = ?event.logical_key,
+            is_esc_pressed,
+            "edit_mode_handle_key"
+        );
 
         let EditFocus::Editing { field_id, .. } = &self.edit_focus else {
             return false;
