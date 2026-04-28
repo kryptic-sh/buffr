@@ -749,11 +749,6 @@ fn main() -> Result<()> {
     if let Some(host) = app_state.host.as_ref() {
         host.close_all_browsers();
     }
-    info!("shutdown: pumping CEF message loop (500ms)");
-    for _ in 0..50 {
-        cef::do_message_loop_work();
-        std::thread::sleep(Duration::from_millis(10));
-    }
 
     // Drop ONLY the host first. This releases every Browser ref while
     // CEF's threads are still running, so CEF can finish the close
@@ -761,11 +756,6 @@ fn main() -> Result<()> {
     // own shutdown.
     info!("shutdown: dropping host");
     drop(app_state.host.take());
-    info!("shutdown: pumping CEF after host drop (100ms)");
-    for _ in 0..10 {
-        cef::do_message_loop_work();
-        std::thread::sleep(Duration::from_millis(10));
-    }
 
     // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
     // same EGL / GL / Vulkan driver state on Linux; tearing down
