@@ -2237,6 +2237,15 @@ impl AppState {
 
         let mut new_osr_generation = self.last_osr_generation;
 
+        // Hot-path timings. Logged at trace level — enable with
+        // `RUST_LOG=buffr=trace` to inspect per-frame budget. The
+        // closure captures these via Cell-free locals; final values
+        // read after `renderer.frame` returns.
+        let frame_start = Instant::now();
+        let mut osr_lock_us: u64 = 0;
+        let mut osr_blit_us: u64 = 0;
+        let mut osr_dims: Option<(u32, u32, u32, u32)> = None;
+
         let res = renderer.frame(|buf, w, _h| {
             // ── OSR composite (Wayland / off-screen mode only) ────────────────
             // For HostMode::Osr CEF paints BGRA into SharedOsrFrame instead of
@@ -2246,50 +2255,55 @@ impl AppState {
             //
             // HostMode::Windowed: CEF owns an X11 child window that sits over
             // the top region — we must NOT write there or we would clobber it.
-            if let Some((osr_frame, _)) = &osr_data
-                && let Ok(frame) = osr_frame.lock()
-            {
-                let osr_w = frame.width as usize;
-                let osr_h = frame.height as usize;
-                let bw = browser_w as usize;
-                let bh = browser_h as usize;
-                let by = browser_y as usize;
+            if let Some((osr_frame, _)) = &osr_data {
+                let lock_start = Instant::now();
+                if let Ok(frame) = osr_frame.lock() {
+                    osr_lock_us = lock_start.elapsed().as_micros() as u64;
+                    let blit_start = Instant::now();
+                    let osr_w = frame.width as usize;
+                    let osr_h = frame.height as usize;
+                    let bw = browser_w as usize;
+                    let bh = browser_h as usize;
+                    let by = browser_y as usize;
+                    osr_dims = Some((osr_w as u32, osr_h as u32, bw as u32, bh as u32));
 
-                // Clip + memcpy. While CEF catches up to a live resize
-                // the OSR frame can be smaller or larger than the
-                // chrome's browser region; copy the overlap and fill
-                // any leftover strip with a solid grey so the gap
-                // reads cleanly instead of as undefined memory. No
-                // scaling — at rest dims match and this is a straight
-                // per-row memcpy. CEF emits BGRA bytes which already
-                // match the wgpu Bgra8Unorm texture, so we copy as u32
-                // without any swizzle.
-                if osr_w > 0 && osr_h > 0 {
-                    let copy_w = bw.min(osr_w);
-                    let copy_h = bh.min(osr_h);
-                    let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
+                    // Clip + memcpy. While CEF catches up to a live resize
+                    // the OSR frame can be smaller or larger than the
+                    // chrome's browser region; copy the overlap and fill
+                    // any leftover strip with a solid grey so the gap
+                    // reads cleanly instead of as undefined memory. No
+                    // scaling — at rest dims match and this is a straight
+                    // per-row memcpy. CEF emits BGRA bytes which already
+                    // match the wgpu Bgra8Unorm texture, so we copy as u32
+                    // without any swizzle.
+                    if osr_w > 0 && osr_h > 0 {
+                        let copy_w = bw.min(osr_w);
+                        let copy_h = bh.min(osr_h);
+                        let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
 
-                    for row in 0..copy_h {
-                        let dst = (by + row) * w;
-                        let src = row * osr_w;
-                        buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
-                    }
-
-                    const GAP: u32 = 0x202020;
-                    if copy_w < bw {
                         for row in 0..copy_h {
-                            let dst = (by + row) * w + copy_w;
-                            buf[dst..dst + (bw - copy_w)].fill(GAP);
-                        }
-                    }
-                    if copy_h < bh {
-                        for row in copy_h..bh {
                             let dst = (by + row) * w;
-                            buf[dst..dst + bw].fill(GAP);
+                            let src = row * osr_w;
+                            buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
+                        }
+
+                        const GAP: u32 = 0x202020;
+                        if copy_w < bw {
+                            for row in 0..copy_h {
+                                let dst = (by + row) * w + copy_w;
+                                buf[dst..dst + (bw - copy_w)].fill(GAP);
+                            }
+                        }
+                        if copy_h < bh {
+                            for row in copy_h..bh {
+                                let dst = (by + row) * w;
+                                buf[dst..dst + bw].fill(GAP);
+                            }
                         }
                     }
+                    new_osr_generation = frame.generation;
+                    osr_blit_us = blit_start.elapsed().as_micros() as u64;
                 }
-                new_osr_generation = frame.generation;
             }
 
             // Statusline — bottom strip.
@@ -2377,6 +2391,38 @@ impl AppState {
         });
 
         self.last_osr_generation = new_osr_generation;
+
+        let total_us = frame_start.elapsed().as_micros() as u64;
+        if let Some((osr_w, osr_h, bw, bh)) = osr_dims {
+            tracing::trace!(
+                win_w = width,
+                win_h = height,
+                osr_w,
+                osr_h,
+                bw,
+                bh,
+                gen = new_osr_generation,
+                lock_us = osr_lock_us,
+                blit_us = osr_blit_us,
+                total_us,
+                "paint_chrome",
+            );
+            // Surface slow frames at debug level (>16ms = miss vsync at 60Hz).
+            if total_us > 16_000 {
+                tracing::debug!(
+                    total_us,
+                    blit_us = osr_blit_us,
+                    lock_us = osr_lock_us,
+                    osr_w,
+                    osr_h,
+                    bw,
+                    bh,
+                    "paint_chrome: slow frame",
+                );
+            }
+        } else {
+            tracing::trace!(win_w = width, win_h = height, total_us, "paint_chrome");
+        }
 
         if let Err(err) = res {
             warn!(error = %err, "wgpu frame failed");
