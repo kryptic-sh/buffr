@@ -1560,6 +1560,7 @@ impl AppState {
                 if let Ok(mut e) = self.engine.lock() {
                     e.set_mode(PageMode::Normal);
                 }
+                host.osr_focus(false);
                 self.refresh_title();
                 self.request_redraw();
             }
@@ -2541,6 +2542,9 @@ impl AppState {
                     if !already_editing {
                         if let Some(host) = self.host.as_ref() {
                             host.run_edit_attach(&field_id);
+                            // Tell CEF the browser is focused now that
+                            // we're entering Insert mode.
+                            host.osr_focus(true);
                         }
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Insert);
@@ -2559,6 +2563,9 @@ impl AppState {
                         self.edit_focus = EditFocus::None;
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Normal);
+                        }
+                        if let Some(host) = self.host.as_ref() {
+                            host.osr_focus(false);
                         }
                         mode_changed = true;
                     }
@@ -2680,6 +2687,7 @@ impl AppState {
         el.dispatchEvent(new KeyboardEvent('keyup',k));\
         el.blur();})();",
                 );
+                host.osr_focus(false);
             }
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(PageMode::Normal);
@@ -3129,11 +3137,10 @@ impl ApplicationHandler for AppState {
                     mode = ?host.mode(),
                     "browser host created"
                 );
-                // Wayland may not fire Focused(true) on initial map.
-                // Tell CEF the browser is focused so Google's
-                // document.hasFocus() checks pass and inputs accept
-                // focus on first click.
-                host.osr_focus(true);
+                // CEF focus is bound to Insert mode (see
+                // drain_edit_focus_events). Browser starts unfocused —
+                // pages may use document.hasFocus() to throttle work
+                // while the user is just navigating in Normal mode.
                 self.host = Some(host);
             }
             Err(err) => {
@@ -3222,10 +3229,12 @@ impl ApplicationHandler for AppState {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
-            WindowEvent::Focused(focused) => {
-                if let Some(host) = self.host.as_ref() {
-                    host.osr_focus(focused);
-                }
+            WindowEvent::Focused(_focused) => {
+                // OS-level window focus is intentionally NOT forwarded
+                // to CEF. CEF focus tracks buffr's modal state instead
+                // (Insert = focused, Normal = unfocused). This stops
+                // pages losing input state when the user alt-tabs or
+                // brings up another window.
             }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(host) = self.host.as_ref() {
@@ -3345,12 +3354,6 @@ impl ApplicationHandler for AppState {
                     }
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
-                    // Force CEF focus on every click — Wayland's
-                    // Focused event is unreliable; without this Google
-                    // and other pages reject input on first click.
-                    if !mouse_up {
-                        host.osr_focus(true);
-                    }
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
                 }
             }
