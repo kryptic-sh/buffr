@@ -79,6 +79,7 @@ buffr-permissions = { path = "crates/buffr-permissions" }
 # pin keeps the workspace deterministic.
 hjkl-engine = "=0.1.0"
 hjkl-buffer = "=0.1.0"
+hjkl-clipboard = "=0.3.0"
 
 [profile.release]
 lto = "thin"

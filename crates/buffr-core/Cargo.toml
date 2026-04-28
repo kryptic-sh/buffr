@@ -54,6 +54,7 @@ buffr-permissions.workspace = true
 # implementation is the production path.
 ureq.workspace = true
 semver.workspace = true
+hjkl-clipboard.workspace = true
 
 [dev-dependencies]
 # Tests for `telemetry` and `crash` write to scratch directories.

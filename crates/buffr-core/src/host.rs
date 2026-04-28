@@ -197,6 +197,11 @@ pub struct BrowserHost {
     /// the UI thread via [`Self::osr_resize`]; read by the CEF IO
     /// thread inside `OsrPaintHandler::view_rect`.
     osr_view: SharedOsrViewState,
+    /// Clipboard sink. Lazily constructed once; guarded by `Mutex` so
+    /// `dispatch` (called from the UI thread) can reach it without
+    /// requiring `&mut self`. `hjkl_clipboard::Clipboard::new` is
+    /// infallible, so this is always `Some` after construction.
+    clipboard: Mutex<hjkl_clipboard::Clipboard>,
 }
 
 impl BrowserHost {
@@ -309,6 +314,7 @@ impl BrowserHost {
             counters,
             osr_frame,
             osr_view,
+            clipboard: Mutex::new(hjkl_clipboard::Clipboard::new()),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -1124,9 +1130,18 @@ textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
                 self.with_active(|t| {
                     if let Some(frame) = t.browser.main_frame() {
                         let url = CefStringUtf16::from(&frame.url()).to_string();
-                        tracing::info!(url, "would copy to clipboard — clipboard is Phase 5");
+                        if let Ok(mut cb) = self.clipboard.lock() {
+                            if cb.set_text(&url) {
+                                tracing::info!(url, "yanked URL to clipboard");
+                            } else {
+                                tracing::warn!(
+                                    url,
+                                    "yank failed: clipboard set_text returned false"
+                                );
+                            }
+                        }
                     } else {
-                        tracing::info!("would copy to clipboard — main frame unavailable");
+                        tracing::warn!("YankUrl: main frame unavailable");
                     }
                 });
             }
