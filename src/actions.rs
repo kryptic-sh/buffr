@@ -6,13 +6,13 @@
 //! scrolls (`ScrollDown(u32)`).
 //!
 //! Mode-transition actions (`OpenOmnibar`, `EnterHintMode`,
-//! `EnterEditMode`, `EnterMode`) are emitted to the host *and* drive
+//! `EnterInsertMode`, `EnterMode`) are emitted to the host *and* drive
 //! [`crate::engine::Engine::set_mode`] at the same point — see the
 //! design note at the top of `engine.rs`.
 
 use serde::{Deserialize, Serialize};
 
-/// Coarse mode displayed in the status line. `Edit` is a single state
+/// Coarse mode displayed in the status line. `Insert` is a single state
 /// here even though `hjkl_engine` may be in Normal/Insert/Visual
 /// internally — the page-mode FSM doesn't care which sub-mode the
 /// embedded editor is in, only that page-level keystrokes route to
@@ -24,7 +24,7 @@ pub enum Mode {
     Visual,
     Command,
     Hint,
-    Edit,
+    Insert,
 }
 
 /// Page-mode FSM states. Distinct from [`Mode`] (the status-line
@@ -41,10 +41,10 @@ pub enum PageMode {
     /// `<C-w>…`). Internal — surfaces from `Engine::mode()` only while
     /// a multi-chord prefix is mid-flight.
     Pending,
-    /// Edit-mode is active; keystrokes route through
+    /// Insert-mode is active; keystrokes route through
     /// [`crate::engine::Engine::feed_edit_mode_key`] which (post-Phase
     /// 2) hands off to `hjkl_editor::Editor`.
-    Edit,
+    Insert,
 }
 
 /// Page-level actions emitted by the modal dispatcher.
@@ -101,7 +101,7 @@ pub enum PageAction {
     EnterHintModeBackground,
     /// Generic mode-transition variant. Equivalent to the more
     /// specific `OpenOmnibar`/`OpenCommandLine`/`EnterHintMode`/
-    /// `EnterEditMode` actions but parameterised — useful for user
+    /// `EnterInsertMode` actions but parameterised — useful for user
     /// config that wants `<F2>` → command mode.
     EnterMode(PageMode),
 
@@ -136,13 +136,13 @@ pub enum PageAction {
 
     /// Defer to the embedded `hjkl_engine::Editor`. Keystroke
     /// unchanged; the modal dispatcher swallows nothing on this path.
-    EnterEditMode,
+    EnterInsertMode,
 
-    /// Focus the first text input on the page and enter edit mode.
+    /// Focus the first text input on the page and enter insert mode.
     /// Vieb's `gi` / `insertAtFirstInput`.
     FocusFirstInput,
 
-    /// Exit insert/edit mode unconditionally — blurs the focused DOM element
+    /// Exit insert mode unconditionally — blurs the focused DOM element
     /// and returns the engine to PageMode::Normal.
     ExitInsertMode,
 }

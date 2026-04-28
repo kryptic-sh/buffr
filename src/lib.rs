@@ -4,7 +4,7 @@
 //!
 //! - **Page mode** ([`PageMode`]) — scroll, tab switch, omnibar, hint mode,
 //!   command line. Owned by this crate.
-//! - **Edit mode** — typing in `<textarea>` / `contenteditable` / form
+//! - **Insert mode** — typing in `<textarea>` / `contenteditable` / form
 //!   fields. Delegates to [`hjkl_engine::Editor`] against a mirrored
 //!   [`hjkl_buffer::Buffer`] synced to the DOM via CEF.
 //!

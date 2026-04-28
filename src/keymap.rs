@@ -133,7 +133,7 @@ impl Keymap {
 
     fn mode_map(&self, mode: PageMode) -> &ModeMap {
         match mode {
-            PageMode::Normal | PageMode::Pending | PageMode::Edit => &self.normal,
+            PageMode::Normal | PageMode::Pending | PageMode::Insert => &self.normal,
             PageMode::Visual => &self.visual,
             PageMode::Command => &self.command,
             PageMode::Hint => &self.hint,
@@ -142,7 +142,7 @@ impl Keymap {
 
     fn mode_map_mut(&mut self, mode: PageMode) -> &mut ModeMap {
         match mode {
-            PageMode::Normal | PageMode::Pending | PageMode::Edit => &mut self.normal,
+            PageMode::Normal | PageMode::Pending | PageMode::Insert => &mut self.normal,
             PageMode::Visual => &mut self.visual,
             PageMode::Command => &mut self.command,
             PageMode::Hint => &mut self.hint,
@@ -317,7 +317,7 @@ fn mode_label(mode: PageMode) -> &'static str {
         PageMode::Command => "command",
         PageMode::Hint => "hint",
         PageMode::Pending => "pending",
-        PageMode::Edit => "edit",
+        PageMode::Insert => "insert",
     }
 }
 
@@ -364,7 +364,7 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::ZoomReset => "ZoomReset",
         PageAction::OpenDevTools => "OpenDevTools",
         PageAction::ClearCompletedDownloads => "ClearCompletedDownloads",
-        PageAction::EnterEditMode => "EnterEditMode",
+        PageAction::EnterInsertMode => "EnterInsertMode",
         PageAction::FocusFirstInput => "FocusFirstInput",
         PageAction::ExitInsertMode => "ExitInsertMode",
     }
@@ -424,7 +424,7 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "r", PageAction::Reload),
     (PageMode::Normal, "R", PageAction::ReloadHard),
     (PageMode::Normal, "<C-r>", PageAction::ReloadHard),
-    // <Esc> now exits insert/edit mode unconditionally.
+    // <Esc> now exits insert mode unconditionally.
     (PageMode::Normal, "<Esc>", PageAction::ExitInsertMode),
     // buffr extension: <C-c> as StopLoading (Vieb: copyText)
     (PageMode::Normal, "<C-c>", PageAction::StopLoading),
@@ -455,9 +455,9 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // <C-0> added as Vieb-style zoom-reset alias.
     (PageMode::Normal, "=", PageAction::ZoomReset),
     (PageMode::Normal, "<C-0>", PageAction::ZoomReset),
-    // -- edit mode ------------------------------------------------
+    // -- insert mode -----------------------------------------------
     // `i` and `gi` both focus the first form input (same as Vieb's
-    // insertAtFirstInput / gi). EnterEditMode stays in the enum for
+    // insertAtFirstInput / gi). EnterInsertMode stays in the enum for
     // advanced user config but is unbound by default.
     (PageMode::Normal, "i", PageAction::FocusFirstInput),
     (PageMode::Normal, "gi", PageAction::FocusFirstInput),
