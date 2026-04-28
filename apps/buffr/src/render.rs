@@ -126,7 +126,13 @@ impl Renderer {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // Single in-flight frame: with latency=2 we observed
+            // `get_current_texture` blocking for 100+ ms during typing
+            // bursts when CEF on_paint fired faster than the Wayland
+            // compositor released swapchain images. latency=1 keeps the
+            // queue from filling, trading a tiny bit of GPU/CPU overlap
+            // for predictable acquire times.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 
