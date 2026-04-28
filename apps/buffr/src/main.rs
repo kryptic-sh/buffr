@@ -3246,8 +3246,12 @@ impl ApplicationHandler for AppState {
                     return;
                 };
                 let now = self.startup.elapsed();
-                let step = match self.engine.lock() {
-                    Ok(mut e) => e.feed(chord, now),
+                let (step, post_mode) = match self.engine.lock() {
+                    Ok(mut e) => {
+                        let s = e.feed(chord, now);
+                        let m = e.mode();
+                        (s, m)
+                    }
                     Err(_) => return,
                 };
                 match step {
@@ -3284,16 +3288,27 @@ impl ApplicationHandler for AppState {
                         // now, silently accumulate.
                     }
                     Step::Reject => {
-                        trace!(?chord, "key not bound");
-                        // OSR: forward unhandled keys to CEF (the page
-                        // may handle them — e.g. arrow keys in a form,
-                        // Ctrl-A, etc.). In windowed mode the X11 child
-                        // window receives them natively.
-                        if let Some(host) = self.host.as_ref() {
-                            let mods = winit_mods_to_cef(&self.modifiers);
-                            for ev in winit_key_to_cef_events(&event, mods) {
-                                host.osr_key_event(ev);
+                        // Vim-style: only pass unbound keys to the page
+                        // in modes where the page owns input (Edit /
+                        // Command). In Normal, Visual, Hint, and Pending
+                        // the modal layer owns the keyboard — silently
+                        // swallow so typing `a`, `s`, etc. doesn't
+                        // type into a focused field or trigger browser
+                        // shortcuts.
+                        let pass_through = matches!(post_mode, PageMode::Edit | PageMode::Command);
+                        if pass_through {
+                            if let Some(host) = self.host.as_ref() {
+                                let mods = winit_mods_to_cef(&self.modifiers);
+                                for ev in winit_key_to_cef_events(&event, mods) {
+                                    host.osr_key_event(ev);
+                                }
                             }
+                        } else {
+                            trace!(
+                                ?chord,
+                                ?post_mode,
+                                "key not bound — swallowed in modal mode"
+                            );
                         }
                     }
                     Step::EditModeActive => {
