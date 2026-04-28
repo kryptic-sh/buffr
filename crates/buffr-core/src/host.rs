@@ -767,10 +767,20 @@ impl BrowserHost {
     }
 
     fn summarize(&self, t: &Tab) -> TabSummary {
+        // Prefer the live main-frame URL — the stored `t.url` is set
+        // on creation and isn't mutated as the user navigates within
+        // the tab. Fall back to the stored URL when the frame is
+        // unavailable (between create and first commit).
+        let live_url = t
+            .browser
+            .main_frame()
+            .map(|f| CefStringUtf16::from(&f.url()).to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| t.url.clone());
         TabSummary {
             id: t.id,
             title: t.display_title(),
-            url: t.url.clone(),
+            url: live_url,
             progress: t.progress,
             is_loading: t.is_loading,
             pinned: t.pinned,
