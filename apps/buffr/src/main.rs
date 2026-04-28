@@ -2327,6 +2327,19 @@ impl AppState {
             }
         };
 
+        // Sync subsurface position to whatever dims this paint will use.
+        // winit fires both Resized and RedrawRequested per configure on
+        // Wayland, so paint_chrome can run from either event — and the
+        // RedrawRequested handler doesn't have its own set_size call.
+        // If we only updated set_position in the Resized handler the
+        // RedrawRequested commit would carry the previous frame's
+        // subsurface position with this frame's parent buffer, leaving
+        // the statusline offset above the window bottom for that frame.
+        // Doing it here covers every paint path with one call.
+        if let Some(sub) = self.wayland_sub.as_mut() {
+            sub.set_size(width, height);
+        }
+
         // Precompute geometry before the renderer call — helpers need `&self`.
         let tab_y = self.tab_strip_y(height);
         let notice_y = self.download_notice_y();
@@ -4075,12 +4088,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // queue the new position into the parent's pending state
                 // first — otherwise the position update is one frame
                 // behind and the subsurface tracks the previous resize.
+                // paint_chrome_with calls sub.set_size internally before
+                // the wgpu present, keeping the subsurface position synced
+                // with the parent commit's buffer dims. Don't duplicate the
+                // call here — both paths would do the same work.
                 let w = new_size.width.max(1);
                 let h = new_size.height.max(1);
-                if let Some(sub) = self.wayland_sub.as_mut() {
-                    sub.set_size(w, h);
-                    debug!(w, h, "wayland_sub: set_size pre-paint");
-                }
                 self.mark_chrome_dirty();
                 self.paint_chrome_with(Some((w, h)));
                 // Force wgpu's parent commit to reach the compositor in
