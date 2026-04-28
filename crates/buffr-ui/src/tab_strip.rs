@@ -278,15 +278,15 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
 
 const GUTTER: u32 = 4;
 
-// vim-flavoured palette consistent with the Statusline accents.
-const TAB_STRIP_BG: u32 = 0x10_18_20;
-const TAB_BG_ACTIVE: u32 = 0x22_2E_22;
-const TAB_BG_INACTIVE: u32 = 0x18_1E_22;
-const TAB_BG_PRIVATE: u32 = 0x2A_18_2A;
-const TAB_FG_ACTIVE: u32 = 0xEE_EE_EE;
-const TAB_FG_INACTIVE: u32 = 0xA0_A8_AC;
-const TAB_ACCENT_ACTIVE: u32 = 0x4A_C9_5C;
-const TAB_PROGRESS: u32 = 0x66_C2_FF;
+// vim-flavoured palette consistent with the Statusline accents (opaque BGRA).
+const TAB_STRIP_BG: u32 = 0xFF_10_18_20;
+const TAB_BG_ACTIVE: u32 = 0xFF_22_2E_22;
+const TAB_BG_INACTIVE: u32 = 0xFF_18_1E_22;
+const TAB_BG_PRIVATE: u32 = 0xFF_2A_18_2A;
+const TAB_FG_ACTIVE: u32 = 0xFF_EE_EE_EE;
+const TAB_FG_INACTIVE: u32 = 0xFF_A0_A8_AC;
+const TAB_ACCENT_ACTIVE: u32 = 0xFF_4A_C9_5C;
+const TAB_PROGRESS: u32 = 0xFF_66_C2_FF;
 
 #[cfg(test)]
 mod tests {

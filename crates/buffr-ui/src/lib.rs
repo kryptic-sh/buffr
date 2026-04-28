@@ -387,55 +387,56 @@ fn mode_label(mode: PageMode) -> &'static str {
     }
 }
 
-// ---- colour table (RGB packed; alpha byte ignored) ------------------
+// ---- colour table (BGRA packed, alpha = 0xFF) -----------------------
 //
-// `softbuffer` 0.4 expects pixels as `0x00RRGGBB`; the high byte must
-// be zero on Linux/X11. Picking saturated, vim-flavoured palette
-// here — tweakable later via Phase 4 theme config.
+// Pixels are u32 with layout `0xFF_RR_GG_BB` on little-endian: the byte
+// sequence in memory is [B, G, R, A], matching `wgpu::TextureFormat::Bgra8Unorm`.
+// The alpha byte is 0xFF (fully opaque) so the GPU alpha-blend pass
+// composites chrome strips correctly over the OSR texture.
 
-const COLOUR_PROGRESS: u32 = 0x66_C2_FF;
-const COLOUR_PRIVATE: u32 = 0xFF_C8_C8;
-const COLOUR_CERT_SECURE: u32 = 0x66_E0_8A;
-const COLOUR_CERT_INSECURE: u32 = 0xE0_5A_5A;
-const COLOUR_UPDATE: u32 = 0xE0_C8_5A;
+const COLOUR_PROGRESS: u32 = 0xFF_66_C2_FF;
+const COLOUR_PRIVATE: u32 = 0xFF_FF_C8_C8;
+const COLOUR_CERT_SECURE: u32 = 0xFF_66_E0_8A;
+const COLOUR_CERT_INSECURE: u32 = 0xFF_E0_5A_5A;
+const COLOUR_UPDATE: u32 = 0xFF_E0_C8_5A;
 
 // Phase 6 high-contrast palette. Documented in `docs/accessibility.md`.
 // Picked for WCAG-style contrast against the chrome's dark mode: pure
 // white-on-black for body, a saturated yellow accent that survives
 // black + white backgrounds, and a dimmed accent for secondary text.
 //
-// Colour values:
-// - HC_BG:        0x000000  (pure black)
-// - HC_FG:        0xFFFFFF  (pure white)
-// - HC_ACCENT:    0xFFFF00  (high-contrast yellow)
-// - HC_ACCENT_DIM:0xC0C0C0  (light grey, used for non-active accents)
-pub const HC_BG: u32 = 0x00_00_00;
-pub const HC_FG: u32 = 0xFF_FF_FF;
-pub const HC_ACCENT: u32 = 0xFF_FF_00;
-pub const HC_ACCENT_DIM: u32 = 0xC0_C0_C0;
+// Colour values (opaque BGRA):
+// - HC_BG:        0xFF000000  (pure black, fully opaque)
+// - HC_FG:        0xFFFFFFFF  (pure white, fully opaque)
+// - HC_ACCENT:    0xFFFFFF00  (high-contrast yellow, fully opaque)
+// - HC_ACCENT_DIM:0xFFC0C0C0  (light grey, fully opaque)
+pub const HC_BG: u32 = 0xFF_00_00_00;
+pub const HC_FG: u32 = 0xFF_FF_FF_FF;
+pub const HC_ACCENT: u32 = 0xFF_FF_FF_00;
+pub const HC_ACCENT_DIM: u32 = 0xFF_C0_C0_C0;
 
 const fn mode_bg(mode: PageMode) -> u32 {
     match mode {
-        PageMode::Normal | PageMode::Pending => 0x16_30_18,
-        PageMode::Visual => 0x33_22_06,
-        PageMode::Command => 0x1A_1F_2E,
-        PageMode::Hint => 0x2A_1A_2E,
-        PageMode::Insert => 0x10_1F_30,
+        PageMode::Normal | PageMode::Pending => 0xFF_16_30_18,
+        PageMode::Visual => 0xFF_33_22_06,
+        PageMode::Command => 0xFF_1A_1F_2E,
+        PageMode::Hint => 0xFF_2A_1A_2E,
+        PageMode::Insert => 0xFF_10_1F_30,
     }
 }
 
 const fn mode_accent(mode: PageMode) -> u32 {
     match mode {
-        PageMode::Normal | PageMode::Pending => 0x4A_C9_5C,
-        PageMode::Visual => 0xE0_8B_2A,
-        PageMode::Command => 0x55_88_FF,
-        PageMode::Hint => 0xC8_5A_E0,
-        PageMode::Insert => 0x5A_AA_E0,
+        PageMode::Normal | PageMode::Pending => 0xFF_4A_C9_5C,
+        PageMode::Visual => 0xFF_E0_8B_2A,
+        PageMode::Command => 0xFF_55_88_FF,
+        PageMode::Hint => 0xFF_C8_5A_E0,
+        PageMode::Insert => 0xFF_5A_AA_E0,
     }
 }
 
 const fn mode_fg(_mode: PageMode) -> u32 {
-    0xEE_EE_EE
+    0xFF_EE_EE_EE
 }
 
 #[cfg(test)]
@@ -457,7 +458,7 @@ mod tests {
         };
         s.paint(&mut buf, w, h);
         // The leftmost column of the strip is owned by the mode-accent
-        // cell — pixel (0,0) sits on the strip top row.
+        // cell — pixel (0,0) sits on the strip top row. Alpha is 0xFF (opaque).
         assert_eq!(buf[0], mode_accent(PageMode::Normal));
     }
 

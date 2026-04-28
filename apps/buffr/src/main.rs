@@ -1635,6 +1635,15 @@ struct AppState {
     /// focus to the last-touched field rather than always jumping to the
     /// first one. Reset to `None` on navigation (IDs are per-load).
     last_focused_field: Option<String>,
+    /// Monotonic counter bumped on every chrome state change (mode, URL,
+    /// tabs, overlay, popups, download notices, window resize). The chrome
+    /// texture is only re-uploaded when this differs from
+    /// `last_painted_chrome_gen`.
+    chrome_generation: u64,
+    /// Value of `chrome_generation` at the last chrome texture upload.
+    /// When equal to `chrome_generation`, the texture is valid and no
+    /// repaint is needed.
+    last_painted_chrome_gen: u64,
 }
 
 /// Edit-mode focus state machine.
@@ -1783,6 +1792,8 @@ impl AppState {
             last_url_poll: Instant::now(),
             pending_resize_finalize: None,
             event_proxy,
+            chrome_generation: 1,
+            last_painted_chrome_gen: 0,
         }
     }
 
@@ -1802,6 +1813,11 @@ impl AppState {
         } else {
             format!("{head} — {url}")
         }
+    }
+
+    /// Mark the chrome texture as needing a repaint.
+    fn mark_chrome_dirty(&mut self) {
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
     }
 
     fn dispatch_action(&mut self, action: &buffr_modal::PageAction) {
@@ -1945,6 +1961,7 @@ impl AppState {
             && t.pinned
         {
             self.confirm_close_pinned = Some(t.id);
+            self.mark_chrome_dirty();
             self.request_redraw();
             return true;
         }
@@ -1968,6 +1985,7 @@ impl AppState {
         let Some(target) = self.confirm_close_pinned.take() else {
             return;
         };
+        self.mark_chrome_dirty();
         self.request_redraw();
         if !confirm {
             return;
@@ -2116,8 +2134,12 @@ impl AppState {
             })
             .collect();
         self.tab_ids = ids;
+        let tabs_changed = tabs != self.tab_strip.tabs || active != self.tab_strip.active;
         self.tab_strip.tabs = tabs;
         self.tab_strip.active = active;
+        if tabs_changed {
+            self.mark_chrome_dirty();
+        }
     }
 
     fn refresh_title(&mut self) {
@@ -2158,6 +2180,7 @@ impl AppState {
             );
         }
         if chrome_changed {
+            self.mark_chrome_dirty();
             self.request_redraw();
         }
     }
@@ -2189,6 +2212,7 @@ impl AppState {
                     current: result.current,
                     total: result.count,
                 });
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
             tracing::info!(
@@ -2281,23 +2305,33 @@ impl AppState {
                 (size.width.max(1), size.height.max(1))
             }
         };
-        // Precompute geometry-derived inputs before the renderer frame
-        // closure — geometry helpers and Arc-queue peeks all need `&self`.
+
+        // Precompute geometry before the renderer call — helpers need `&self`.
         let tab_y = self.tab_strip_y(height);
         let notice_y = self.download_notice_y();
-        // Snapshot the front of the download notice queue before the
-        // renderer frame closure so we don't borrow self inside it.
         let current_notice = peek_download_notice(&self.download_notice_queue);
-        // Precompute browser region for the OSR composite.
         let (_, browser_y, browser_w, browser_h) = self.cef_child_rect(width, height);
 
-        // Snapshot OSR state we need inside the closure.
-        // SharedOsrFrame = Arc<Mutex<OsrFrame>>; clone is cheap (Arc clone).
-        let osr_data: Option<(buffr_core::SharedOsrFrame, u64)> = if let Some(host) =
+        // Build the OSR upload if in OSR mode. Lock the frame here so
+        // we hold it for as short a time as possible.
+        let osr_pixels_and_meta: Option<(Vec<u8>, u32, u32, u64)> = if let Some(host) =
             self.host.as_ref()
             && host.mode() == buffr_core::HostMode::Osr
         {
-            Some((host.osr_frame(), self.last_osr_generation))
+            if let Ok(frame) = host.osr_frame().lock() {
+                if frame.width > 0 && frame.height > 0 {
+                    Some((
+                        frame.pixels.clone(),
+                        frame.width,
+                        frame.height,
+                        frame.generation,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -2305,235 +2339,99 @@ impl AppState {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+
+        // Resize bumps chrome_generation via the caller's resize event;
+        // the renderer itself tracks whether it needs to reallocate.
         renderer.resize(width, height);
 
-        // Clone/snapshot values needed in the closure (can't borrow self).
+        let chrome_dirty = self.chrome_generation != self.last_painted_chrome_gen;
+
+        // Clone/snapshot values needed in the chrome paint closure.
         let statusline = self.statusline.clone();
         let tab_strip = self.tab_strip.clone();
         let confirm_close_pinned = self.confirm_close_pinned;
         let permissions_prompt = self.permissions_prompt.clone();
         let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
 
-        let mut new_osr_generation = self.last_osr_generation;
-
-        // Hot-path timings. Logged at trace level — enable with
-        // `RUST_LOG=buffr=trace` to inspect per-frame budget. The
-        // closure captures these via Cell-free locals; final values
-        // read after `renderer.frame` returns.
         let frame_start = Instant::now();
-        let mut osr_lock_us: u64 = 0;
-        let mut osr_blit_us: u64 = 0;
-        let mut osr_dims: Option<(u32, u32, u32, u32)> = None;
 
-        let res = renderer.frame(|buf, w, _h| {
-            // ── OSR composite (Wayland / off-screen mode only) ────────────────
-            // For HostMode::Osr CEF paints BGRA into SharedOsrFrame instead of
-            // into a native child window. We blit those pixels into the top
-            // region of the wgpu CPU buffer (everything above the chrome strip)
-            // then let the chrome painting below overdraw its own region.
-            //
-            // HostMode::Windowed: CEF owns an X11 child window that sits over
-            // the top region — we must NOT write there or we would clobber it.
-            if let Some((osr_frame, _)) = &osr_data {
-                let lock_start = Instant::now();
-                if let Ok(frame) = osr_frame.lock() {
-                    osr_lock_us = lock_start.elapsed().as_micros() as u64;
-                    let blit_start = Instant::now();
-                    let osr_w = frame.width as usize;
-                    let osr_h = frame.height as usize;
-                    let bw = browser_w as usize;
-                    let bh = browser_h as usize;
-                    let by = browser_y as usize;
-                    osr_dims = Some((osr_w as u32, osr_h as u32, bw as u32, bh as u32));
-
-                    // CEF emits BGRA matching the wgpu Bgra8Unorm
-                    // texture, so we copy as u32 without swizzle.
-                    //
-                    // Letterbox: blit the OSR frame at its native size,
-                    // top-left aligned within the CEF rect, and fill
-                    // the leftover with a solid colour. The previous
-                    // NN-scale path took ~15 ms per frame on its
-                    // per-pixel integer-divide scaler, which couldn't
-                    // keep up with Wayland's ~30 ms Resized cadence;
-                    // the buffer fell behind the surface and the
-                    // compositor letterboxed the right/bottom gap.
-                    // Per-row memcpy here is ~1 ms.
-                    if osr_w > 0 && osr_h > 0 {
-                        let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
-                        let copy_h = osr_h.min(bh);
-                        let copy_w = osr_w.min(bw);
-                        if osr_w != bw || osr_h != bh {
-                            fill_rect_u32(
-                                buf,
-                                w,
-                                height as usize,
-                                0,
-                                by,
-                                bw,
-                                bh,
-                                OSR_LETTERBOX_BG,
-                            );
-                        }
-                        for row in 0..copy_h {
-                            let dst = (by + row) * w;
-                            let src = row * osr_w;
-                            buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
-                        }
-                    }
-                    new_osr_generation = frame.generation;
-                    osr_blit_us = blit_start.elapsed().as_micros() as u64;
-                }
-            }
-
-            // Statusline — bottom strip.
-            statusline.paint(buf, w, height as usize);
-
-            // Tab strip — sits between chrome strip and CEF page area.
-            tab_strip.paint(buf, w, height as usize, tab_y);
-
-            // Permissions prompt OR pinned-close confirmation — centered
-            // floating popup, top 1/3 of the window. CEF is never resized.
-            let has_prompt = confirm_close_pinned.is_some() || permissions_prompt.is_some();
-            if has_prompt {
-                let popup_w = ((width * 60) / 100).clamp(300, OMNIBAR_POPUP_MAX_WIDTH);
-                let popup_x = (width - popup_w) / 2;
-                let popup_y = height / 3;
-                let content_h = buffr_ui::CONFIRM_PROMPT_HEIGHT;
-                let popup_h =
-                    (content_h + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
-                fill_rect_u32(
-                    buf,
-                    w,
-                    height as usize,
-                    popup_x as usize,
-                    popup_y as usize,
-                    popup_w as usize,
-                    popup_h as usize,
-                    OMNIBAR_POPUP_BORDER_COLOR,
-                );
-                let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
-                let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
-                let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-                let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-                fill_rect_u32(
-                    buf,
-                    w,
-                    height as usize,
-                    inner_x as usize,
-                    inner_y as usize,
-                    inner_w as usize,
-                    inner_h as usize,
-                    OMNIBAR_POPUP_BG,
-                );
-                if let Some(ref _confirm) = confirm_close_pinned {
-                    let confirm_widget = buffr_ui::ConfirmPrompt {
-                        message: "Close pinned tab?".to_string(),
-                        yes_label: "Yes (y)".to_string(),
-                        no_label: "No (n)".to_string(),
-                    };
-                    confirm_widget.paint_at(buf, w, height as usize, inner_x, inner_y, inner_w);
-                } else if let Some(ref prompt) = permissions_prompt {
-                    prompt.paint_at(buf, w, height as usize, inner_x, inner_y, inner_w);
-                }
-            }
-
-            // Download notice strip — drawn last (highest priority layer).
-            if let Some(ref notice) = current_notice {
-                let strip = DownloadNoticeStrip {
-                    kind: match notice.kind {
-                        buffr_core::DownloadNoticeKind::Started => DownloadNoticeKind::Started,
-                        buffr_core::DownloadNoticeKind::Completed => DownloadNoticeKind::Completed,
-                        buffr_core::DownloadNoticeKind::Failed => DownloadNoticeKind::Failed,
-                    },
-                    filename: notice.filename.clone(),
-                    path: notice.path.clone(),
-                };
-                strip.paint(buf, w, height as usize, notice_y);
-            }
-
-            // Overlay popup — floats over the CEF region at top 1/3 of the window.
-            // CEF is never resized when the overlay opens or closes.
-            if let Some(ref bar) = overlay_data {
-                let popup_w = ((width * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
-                let popup_x = (width - popup_w) / 2;
-                let popup_y = height / 3;
-                // Add border so the inner rect always has room for the
-                // input row (paint_at bails when inner_h < INPUT_HEIGHT,
-                // which previously hid the input on empty omnibar).
-                let popup_h = (bar.total_height() + 2 * OMNIBAR_POPUP_BORDER)
-                    .min(height.saturating_sub(popup_y));
-
-                // Border fill.
-                fill_rect_u32(
-                    buf,
-                    w,
-                    height as usize,
-                    popup_x as usize,
-                    popup_y as usize,
-                    popup_w as usize,
-                    popup_h as usize,
-                    OMNIBAR_POPUP_BORDER_COLOR,
-                );
-                // Inner background.
-                let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
-                let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
-                let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-                let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-                fill_rect_u32(
-                    buf,
-                    w,
-                    height as usize,
-                    inner_x as usize,
-                    inner_y as usize,
-                    inner_w as usize,
-                    inner_h as usize,
-                    OMNIBAR_POPUP_BG,
-                );
-                // Input bar + suggestions inside the popup.
-                bar.paint_at(
-                    buf,
-                    w,
-                    height as usize,
-                    inner_x as usize,
-                    inner_y as usize,
-                    inner_w as usize,
-                    inner_h as usize,
-                );
-            }
-        });
+        // Build the OsrUpload, passing a reference to the cloned pixels.
+        let new_osr_generation;
+        let res = if let Some((ref pixels, osr_w, osr_h, osr_gen)) = osr_pixels_and_meta {
+            new_osr_generation = osr_gen;
+            let copy_w = osr_w.min(browser_w);
+            let copy_h = osr_h.min(browser_h);
+            let osr_upload = crate::render::OsrUpload {
+                pixels,
+                width: osr_w,
+                height: osr_h,
+                generation: osr_gen,
+                dst_rect: (0, browser_y, copy_w, copy_h),
+            };
+            renderer.frame(
+                chrome_dirty,
+                |buf, w, _h| {
+                    paint_chrome_strips(
+                        buf,
+                        w,
+                        height,
+                        &statusline,
+                        &tab_strip,
+                        tab_y,
+                        notice_y,
+                        current_notice.as_ref(),
+                        confirm_close_pinned,
+                        permissions_prompt.as_ref(),
+                        overlay_data.as_ref(),
+                    );
+                },
+                Some(osr_upload),
+            )
+        } else {
+            new_osr_generation = self.last_osr_generation;
+            renderer.frame(
+                chrome_dirty,
+                |buf, w, _h| {
+                    paint_chrome_strips(
+                        buf,
+                        w,
+                        height,
+                        &statusline,
+                        &tab_strip,
+                        tab_y,
+                        notice_y,
+                        current_notice.as_ref(),
+                        confirm_close_pinned,
+                        permissions_prompt.as_ref(),
+                        overlay_data.as_ref(),
+                    );
+                },
+                None,
+            )
+        };
 
         self.last_osr_generation = new_osr_generation;
+        if chrome_dirty {
+            self.last_painted_chrome_gen = self.chrome_generation;
+        }
 
         let total_us = frame_start.elapsed().as_micros() as u64;
-        if let Some((osr_w, osr_h, bw, bh)) = osr_dims {
-            tracing::trace!(
+        tracing::trace!(
+            win_w = width,
+            win_h = height,
+            chrome_dirty,
+            gen = new_osr_generation,
+            total_us,
+            "paint_chrome",
+        );
+        if total_us > 16_000 {
+            tracing::debug!(
                 win_w = width,
                 win_h = height,
-                osr_w,
-                osr_h,
-                bw,
-                bh,
-                gen = new_osr_generation,
-                lock_us = osr_lock_us,
-                blit_us = osr_blit_us,
+                chrome_dirty,
                 total_us,
-                "paint_chrome",
+                "paint_chrome: slow frame",
             );
-            // Surface slow frames at debug level (>16ms = miss vsync at 60Hz).
-            if total_us > 16_000 {
-                tracing::debug!(
-                    total_us,
-                    blit_us = osr_blit_us,
-                    lock_us = osr_lock_us,
-                    osr_w,
-                    osr_h,
-                    bw,
-                    bh,
-                    "paint_chrome: slow frame",
-                );
-            }
-        } else {
-            tracing::trace!(win_w = width, win_h = height, total_us, "paint_chrome");
         }
 
         if let Err(err) = res {
@@ -2655,7 +2553,7 @@ impl AppState {
     fn open_command_line(&mut self) {
         self.overlay = Some(OverlayState::Command(InputBar::with_prefix(":")));
         self.refresh_overlay_suggestions();
-        // Overlay is a floating popup — no CEF resize on toggle.
+        self.mark_chrome_dirty();
         self.request_redraw();
     }
 
@@ -2680,7 +2578,7 @@ impl AppState {
         }
         self.overlay = Some(OverlayState::Omnibar(bar));
         self.refresh_overlay_suggestions();
-        // Overlay is a floating popup — no CEF resize on toggle.
+        self.mark_chrome_dirty();
         self.request_redraw();
     }
 
@@ -2692,6 +2590,7 @@ impl AppState {
             e.set_mode(PageMode::Command);
         }
         self.refresh_overlay_suggestions();
+        self.mark_chrome_dirty();
         self.request_redraw();
     }
 
@@ -2700,6 +2599,7 @@ impl AppState {
             return;
         }
         self.overlay = None;
+        self.mark_chrome_dirty();
         // Engine flips back to Normal so the modal trie resumes.
         if let Ok(mut e) = self.engine.lock() {
             e.set_mode(PageMode::Normal);
@@ -2906,6 +2806,7 @@ impl AppState {
                 // engine doesn't see it. Phase 3b may surface a beep.
             }
         }
+        self.mark_chrome_dirty();
         true
     }
 
@@ -3089,6 +2990,7 @@ impl AppState {
             e.set_mode(PageMode::Normal);
         }
         self.statusline.hint_state = None;
+        self.mark_chrome_dirty();
     }
 
     // ---- Edit-mode plumbing ---------------------------------------------
@@ -3399,6 +3301,7 @@ impl AppState {
             capabilities: labels,
             queue_len: queue_after,
         });
+        self.mark_chrome_dirty();
         true
     }
 
@@ -3409,6 +3312,7 @@ impl AppState {
         let Some(pending) = pop_permission_front(&self.permissions_queue) else {
             warn!("permissions: resolve called with empty queue");
             self.permissions_prompt = None;
+            self.mark_chrome_dirty();
             return;
         };
         if let Err(err) = pending.resolve(outcome, &self.permissions) {
@@ -3418,6 +3322,7 @@ impl AppState {
         // Pull the next prompt immediately so the chrome shows it
         // without waiting for the next tick.
         self.sync_permissions_prompt();
+        self.mark_chrome_dirty();
         self.request_redraw();
     }
 
@@ -3709,12 +3614,8 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
 /// Omnibar / command-line popup geometry.
 const OMNIBAR_POPUP_MAX_WIDTH: u32 = 800;
 const OMNIBAR_POPUP_BORDER: u32 = 2;
-const OMNIBAR_POPUP_BG: u32 = 0x1a1b26;
-const OMNIBAR_POPUP_BORDER_COLOR: u32 = 0x7aa2f7;
-
-/// Fill colour for the gap between the OSR frame and the CEF rect when
-/// dimensions disagree (transient state during a deferred resize).
-const OSR_LETTERBOX_BG: u32 = 0x1a1b26;
+const OMNIBAR_POPUP_BG: u32 = 0xFF_1A_1B_26;
+const OMNIBAR_POPUP_BORDER_COLOR: u32 = 0xFF_7A_A2_F7;
 
 /// Fill a rectangle in a u32 pixel buffer with stride `buf_w`.
 #[allow(clippy::too_many_arguments)]
@@ -3740,6 +3641,137 @@ fn fill_rect_u32(
             break;
         }
         buf[base + x..base + x1].fill(color);
+    }
+}
+
+/// Paint only the chrome strips (statusline, tab strip, popups, download
+/// notice, overlay) into `buf`. The CEF region rows are never touched —
+/// they must remain at `0x00_00_00_00` (transparent) so the OSR texture
+/// shows through the alpha-blended chrome layer.
+///
+/// All colours written here use `0xFF_RR_GG_BB` (fully-opaque BGRA) so
+/// the GPU alpha-blend composite produces crisp chrome-over-OSR output.
+#[allow(clippy::too_many_arguments)]
+fn paint_chrome_strips(
+    buf: &mut [u32],
+    w: usize,
+    height: u32,
+    statusline: &Statusline,
+    tab_strip: &TabStrip,
+    tab_y: u32,
+    notice_y: u32,
+    current_notice: Option<&buffr_core::DownloadNotice>,
+    confirm_close_pinned: Option<buffr_core::TabId>,
+    permissions_prompt: Option<&PermissionsPrompt>,
+    overlay_data: Option<&InputBar>,
+) {
+    let h = height as usize;
+
+    // Statusline — bottom strip.
+    statusline.paint(buf, w, h);
+
+    // Tab strip — between download notice and CEF region.
+    tab_strip.paint(buf, w, h, tab_y);
+
+    // Permissions prompt OR pinned-close confirmation.
+    let win_w = w as u32;
+    let has_prompt = confirm_close_pinned.is_some() || permissions_prompt.is_some();
+    if has_prompt {
+        let popup_w = ((win_w * 60) / 100).clamp(300, OMNIBAR_POPUP_MAX_WIDTH);
+        let popup_x = (win_w - popup_w) / 2;
+        let popup_y = height / 3;
+        let content_h = buffr_ui::CONFIRM_PROMPT_HEIGHT;
+        let popup_h = (content_h + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
+        fill_rect_u32(
+            buf,
+            w,
+            h,
+            popup_x as usize,
+            popup_y as usize,
+            popup_w as usize,
+            popup_h as usize,
+            OMNIBAR_POPUP_BORDER_COLOR,
+        );
+        let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
+        let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
+        let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+        let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+        fill_rect_u32(
+            buf,
+            w,
+            h,
+            inner_x as usize,
+            inner_y as usize,
+            inner_w as usize,
+            inner_h as usize,
+            OMNIBAR_POPUP_BG,
+        );
+        if confirm_close_pinned.is_some() {
+            let confirm_widget = buffr_ui::ConfirmPrompt {
+                message: "Close pinned tab?".to_string(),
+                yes_label: "Yes (y)".to_string(),
+                no_label: "No (n)".to_string(),
+            };
+            confirm_widget.paint_at(buf, w, h, inner_x, inner_y, inner_w);
+        } else if let Some(prompt) = permissions_prompt {
+            prompt.paint_at(buf, w, h, inner_x, inner_y, inner_w);
+        }
+    }
+
+    // Download notice strip.
+    if let Some(notice) = current_notice {
+        let strip = DownloadNoticeStrip {
+            kind: match notice.kind {
+                buffr_core::DownloadNoticeKind::Started => DownloadNoticeKind::Started,
+                buffr_core::DownloadNoticeKind::Completed => DownloadNoticeKind::Completed,
+                buffr_core::DownloadNoticeKind::Failed => DownloadNoticeKind::Failed,
+            },
+            filename: notice.filename.clone(),
+            path: notice.path.clone(),
+        };
+        strip.paint(buf, w, h, notice_y);
+    }
+
+    // Overlay popup (omnibar / command / find).
+    if let Some(bar) = overlay_data {
+        let popup_w = ((win_w * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
+        let popup_x = (win_w - popup_w) / 2;
+        let popup_y = height / 3;
+        let popup_h =
+            (bar.total_height() + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
+        fill_rect_u32(
+            buf,
+            w,
+            h,
+            popup_x as usize,
+            popup_y as usize,
+            popup_w as usize,
+            popup_h as usize,
+            OMNIBAR_POPUP_BORDER_COLOR,
+        );
+        let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
+        let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
+        let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+        let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+        fill_rect_u32(
+            buf,
+            w,
+            h,
+            inner_x as usize,
+            inner_y as usize,
+            inner_w as usize,
+            inner_h as usize,
+            OMNIBAR_POPUP_BG,
+        );
+        bar.paint_at(
+            buf,
+            w,
+            h,
+            inner_x as usize,
+            inner_y as usize,
+            inner_w as usize,
+            inner_h as usize,
+        );
     }
 }
 
@@ -3966,6 +3998,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // compositor letterboxes the right/bottom gap.
                 // winit collapses multiple request_redraw into one
                 // delivery, so we paint exactly once per drag step.
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
             WindowEvent::Moved(pos) => {
@@ -4515,6 +4548,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             });
             if new_status != self.statusline.hint_state {
                 self.statusline.hint_state = new_status;
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
         }
@@ -4535,6 +4569,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // prompt is already active, so the user always sees one
         // request at a time.
         if self.sync_permissions_prompt() {
+            self.mark_chrome_dirty();
             self.request_redraw();
         }
 
@@ -4566,6 +4601,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             if !live.is_empty() && live != self.statusline.url {
                 self.statusline.url = live.clone();
                 self.refresh_title();
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
             // Session dirty detection: URL changed since last save.
@@ -4588,6 +4624,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             // Zoom level: poll active tab and update statusline.
             if (zoom - self.statusline.zoom_level).abs() > f64::EPSILON {
                 self.statusline.zoom_level = zoom;
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
         }
@@ -4627,6 +4664,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             let dropped = expire_stale_notices(&self.download_notice_queue);
             if dropped > 0 {
                 self.resync_cef_rect();
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
         }
@@ -4663,6 +4701,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let bar = overlay.input_mut();
                     bar.cursor_visible = !bar.cursor_visible;
                 }
+                self.mark_chrome_dirty();
                 self.request_redraw();
             }
         }
