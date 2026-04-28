@@ -3834,12 +3834,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             host.resize(cef_w, cef_h);
                         }
                         buffr_core::HostMode::Osr => {
-                            host.osr_resize(cef_w, cef_h);
-                            // Track final pending dims so about_to_wait
-                            // can fire a trailing osr_resize_finalize
-                            // once the drag stops firing Resized.
+                            // Defer the CEF resize until the drag settles.
+                            // Calling was_resized on every Resized event makes
+                            // CEF re-rasterize many times during a live-drag
+                            // and stutters the visible page; the trailing
+                            // finalize in about_to_wait fires one was_resized
+                            // at the final dims once Resized stops arriving.
+                            // The OSR composite NN-scales the stale frame
+                            // to fill the new region in the meantime.
                             self.pending_resize_finalize = Some((cef_w, cef_h, Instant::now()));
-                            debug!(cef_w, cef_h, "winit: Resized -> osr_resize");
+                            debug!(cef_w, cef_h, "winit: Resized -> defer osr_resize");
                         }
                     }
                 }
