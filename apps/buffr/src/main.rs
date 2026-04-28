@@ -3990,18 +3990,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                     }
                 }
-                // Coalesce: request a redraw and let the event-loop's
-                // RedrawRequested handler paint once at the LATEST
-                // inner_size. Painting synchronously per Resized was
-                // committing a buffer matching the *event*'s size, but
-                // on Wayland the compositor can have a newer configure
-                // pending — wgpu's commit then ack's the later configure
-                // while attaching the older-size buffer, and the
-                // compositor letterboxes the right/bottom gap.
-                // winit collapses multiple request_redraw into one
-                // delivery, so we paint exactly once per drag step.
+                // Paint synchronously so the configure ack carries a
+                // buffer matching this event's size. Hyprland (and other
+                // wlroots compositors) anchor top-edge resize at the
+                // cursor — the window bounds grow immediately and any
+                // client-paint latency shows up as a letterbox at the
+                // bottom of the window while the stale buffer is still
+                // attached. With the GPU compositor a paint is ~1-2 ms
+                // so doing it inline here is cheaper than the visible
+                // lag coalescing produces.
                 self.mark_chrome_dirty();
-                self.request_redraw();
+                self.paint_chrome();
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
