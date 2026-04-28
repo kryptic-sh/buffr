@@ -302,10 +302,17 @@ fn main() -> Result<()> {
         return run_query_history(cli.search_history.as_deref(), limit);
     }
 
+    // Debug builds default to DEBUG, release builds to INFO. Both
+    // honor RUST_LOG when set explicitly.
+    let default_filter = if cfg!(debug_assertions) {
+        "buffr=debug,buffr_core=debug"
+    } else {
+        "buffr=info,buffr_core=info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "buffr=info,buffr_core=info".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 
