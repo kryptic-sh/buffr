@@ -10,6 +10,10 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     name: linux build + lint + smoke
