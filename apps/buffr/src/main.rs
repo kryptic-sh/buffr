@@ -3483,6 +3483,27 @@ impl ApplicationHandler for AppState {
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
+                    // After a left-release, refire focusin on the
+                    // currently-focused element if it's editable. Pages
+                    // that autofocus on load (google.com) have an input
+                    // already focused; the click hits the same element
+                    // and the DOM does NOT fire a fresh focusin, so
+                    // buffr's edit.js never sees it. Synthesizing a
+                    // focusin here flips us into Insert mode reliably.
+                    if mouse_up
+                        && cef_button
+                            == cef::MouseButtonType::from(
+                                cef::sys::cef_mouse_button_type_t::MBT_LEFT,
+                            )
+                    {
+                        host.run_js(
+                            "(function(){var el=document.activeElement;\
+                            if(!el)return;\
+                            var t=(el.tagName||'').toUpperCase();\
+                            if(t==='INPUT'||t==='TEXTAREA'||el.isContentEditable)\
+                                el.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));})();",
+                        );
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
