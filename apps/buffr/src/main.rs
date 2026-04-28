@@ -2184,21 +2184,27 @@ impl AppState {
                 let bh = browser_h as usize;
                 let by = browser_y as usize;
 
+                // When the OSR frame is smaller than the chrome's
+                // browser region (CEF hasn't caught up to a live resize
+                // yet) we edge-extend the rightmost column / bottom
+                // row so the gap blends with the page background
+                // instead of flashing white. Looks correct on both
+                // light and dark pages.
                 for row in 0..bh {
                     let dst_row_base = (by + row) * (width as usize);
+                    let src_row = row.min(osr_h.saturating_sub(1));
                     for col in 0..bw {
                         let dst_idx = dst_row_base + col;
-                        if row < osr_h && col < osr_w {
-                            // BGRA → 0x00RRGGBB
-                            let src = row * osr_w * 4 + col * 4;
-                            let b = pixels[src] as u32;
-                            let g = pixels[src + 1] as u32;
-                            let r = pixels[src + 2] as u32;
-                            buf[dst_idx] = (r << 16) | (g << 8) | b;
-                        } else {
-                            // OSR frame smaller than browser region — fill white.
-                            buf[dst_idx] = 0x00FF_FFFF;
+                        if osr_w == 0 || osr_h == 0 {
+                            buf[dst_idx] = 0x0000_0000;
+                            continue;
                         }
+                        let src_col = col.min(osr_w - 1);
+                        let src = src_row * osr_w * 4 + src_col * 4;
+                        let b = pixels[src] as u32;
+                        let g = pixels[src + 1] as u32;
+                        let r = pixels[src + 2] as u32;
+                        buf[dst_idx] = (r << 16) | (g << 8) | b;
                     }
                 }
                 self.last_osr_generation = frame.generation;
