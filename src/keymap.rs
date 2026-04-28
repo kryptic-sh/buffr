@@ -492,13 +492,15 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // -- yank -----------------------------------------------------
     (PageMode::Normal, "y", PageAction::YankUrl),
     // -- zoom -----------------------------------------------------
+    // `+` / `=` zoom in (matches Chromium's Ctrl++ and Ctrl+= aliases),
+    // `-` / `_` zoom out, `0` / `)` reset. `<C-0>` kept as a Vieb-style
+    // alias for users who still reach for the conventional chord.
     (PageMode::Normal, "+", PageAction::ZoomIn),
+    (PageMode::Normal, "=", PageAction::ZoomIn),
     (PageMode::Normal, "-", PageAction::ZoomOut),
     (PageMode::Normal, "_", PageAction::ZoomOut),
-    // buffr divergence: `=` stays as ZoomReset (Vieb uses `=` for
-    // zoomIn, but ZoomReset is more useful as a default chord).
-    // <C-0> added as Vieb-style zoom-reset alias.
-    (PageMode::Normal, "=", PageAction::ZoomReset),
+    (PageMode::Normal, "0", PageAction::ZoomReset),
+    (PageMode::Normal, ")", PageAction::ZoomReset),
     (PageMode::Normal, "<C-0>", PageAction::ZoomReset),
     // -- insert mode -----------------------------------------------
     // `i` and `gi` both focus the first form input (same as Vieb's
