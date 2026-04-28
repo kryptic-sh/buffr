@@ -504,6 +504,7 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "N", PageAction::FindPrev),
     // -- yank -----------------------------------------------------
     (PageMode::Normal, "y", PageAction::YankUrl),
+    (PageMode::Normal, "<C-c>", PageAction::YankUrl),
     // -- zoom -----------------------------------------------------
     // `+` / `=` zoom in (matches Chromium's Ctrl++ and Ctrl+= aliases),
     // `-` / `_` zoom out, `0` / `)` reset. `<C-0>` kept as a Vieb-style
@@ -532,6 +533,7 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // native frame.copy()) and returns to Normal. `<Esc>` cancels
     // without yanking.
     (PageMode::Visual, "y", PageAction::YankSelection),
+    (PageMode::Visual, "<C-c>", PageAction::YankSelection),
     (
         PageMode::Visual,
         "<Esc>",
