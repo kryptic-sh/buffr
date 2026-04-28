@@ -69,10 +69,8 @@ the shorter action fires.
 
 | Keys     | Action         | Notes                                           |
 | -------- | -------------- | ----------------------------------------------- |
-| `J`      | `TabNext`      |                                                 |
-| `K`      | `TabPrev`      |                                                 |
-| `w`      | `TabNext`      |                                                 |
-| `b`      | `TabPrev`      |                                                 |
+| `H`      | `TabPrev`      | **[buffr]** Vieb uses `H` for history-back.     |
+| `L`      | `TabNext`      | **[buffr]** Vieb uses `L` for history-forward.  |
 | `gt`     | `TabNext`      |                                                 |
 | `gT`     | `TabPrev`      |                                                 |
 | `t`      | `TabNew`       |                                                 |
@@ -88,12 +86,12 @@ See [`multi-tab.md`](./multi-tab.md).
 
 ### History
 
-| Keys    | Action           |
-| ------- | ---------------- |
-| `H`     | `HistoryBack`    |
-| `L`     | `HistoryForward` |
-| `<C-o>` | `HistoryBack`    |
-| `<C-i>` | `HistoryForward` |
+| Keys    | Action           | Notes                                       |
+| ------- | ---------------- | ------------------------------------------- |
+| `J`     | `HistoryBack`    | **[buffr]** Vieb uses `J` for next-tab.     |
+| `K`     | `HistoryForward` | **[buffr]** Vieb uses `K` for previous-tab. |
+| `<C-o>` | `HistoryBack`    |                                             |
+| `<C-i>` | `HistoryForward` |                                             |
 
 ### Reload / stop
 
