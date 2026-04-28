@@ -513,6 +513,19 @@ impl Renderer {
             // into rows that are now transparent (e.g. after CEF rect shrinks).
             self.chrome_cpu.fill(0);
             paint_chrome(&mut self.chrome_cpu, w, h);
+            // Safety row: force the very last buffer row to alpha=0 so it
+            // alpha-blends to nothing and the surface clear colour shows
+            // through. Hyprland (and other wlroots compositors) edge-clamp
+            // the buffer's bottom row when the xdg configure size exceeds
+            // the attached buffer's height during a fast top-edge resize —
+            // the gap between buffer-bottom and window-bottom would
+            // otherwise be filled with statusline pixels stretched as a
+            // band. Reading the clear colour there makes the replicated
+            // band match the window background.
+            if h > 0 {
+                let last_row = (h - 1) * w;
+                self.chrome_cpu[last_row..last_row + w].fill(0);
+            }
             let bytes: &[u8] = bytemuck::cast_slice(&self.chrome_cpu);
             self.queue.write_texture(
                 wgpu::ImageCopyTexture {
