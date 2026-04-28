@@ -2445,13 +2445,21 @@ impl AppState {
     fn drain_edit_focus_events(&mut self) {
         for ev in drain_edit_events(&self.edit_sink) {
             match ev {
-                EditConsoleEvent::Focus { field_id, .. } => {
+                EditConsoleEvent::Focus {
+                    field_id, ref kind, ..
+                } => {
                     // Browser UX: clicking/tabbing to an input auto-enters
                     // Edit mode. A spurious re-focus for the already-active
                     // field must not clobber the existing state.
                     let already_editing = matches!(
                         &self.edit_focus,
                         EditFocus::Editing { field_id: f } if *f == field_id
+                    );
+                    tracing::info!(
+                        %field_id,
+                        ?kind,
+                        already_editing,
+                        "drain_edit_focus_events: Focus received"
                     );
                     if !already_editing {
                         if let Some(host) = self.host.as_ref() {
@@ -2460,6 +2468,7 @@ impl AppState {
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Edit);
                         }
+                        tracing::info!(%field_id, "edit-mode entered");
                         self.edit_focus = EditFocus::Editing { field_id };
                     }
                 }

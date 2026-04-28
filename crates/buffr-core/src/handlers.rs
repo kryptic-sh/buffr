@@ -339,7 +339,7 @@ wrap_load_handler! {
             let cef_script = CefString::from(script.as_str());
             let cef_url = CefString::from("buffr://edit-inject");
             frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
-            tracing::trace!(%url, "edit: injected edit.js");
+            tracing::info!(target: "buffr_core::handlers", %url, "edit: injected edit.js into main frame");
             // `self.edit_sink` is held for Stage 2 sink ownership; the
             // display handler writes into it when console events arrive.
             let _ = &self.edit_sink;
@@ -430,6 +430,10 @@ wrap_display_handler! {
             // returning 1 would suppress the message from devtools.
             let Some(message) = message else { return 0; };
             let text = message.to_string();
+
+            // Diagnostic: log every console message so we can see whether
+            // edit.js focus events reach on_console_message at all.
+            tracing::info!(target: "buffr_core::console", %text, "on_console_message");
 
             // ---- hint mode IPC ------------------------------------------
             // hint.js emits `__buffr_hint__:{...}` lines.

@@ -383,6 +383,11 @@ impl BrowserHost {
         if self.mode != HostMode::Osr {
             return;
         }
+        info!(
+            target: "buffr_core::host",
+            x, y, ?button, mouse_up, click_count, modifiers,
+            "osr_mouse_click"
+        );
         let Ok(tabs) = self.tabs.lock() else { return };
         let active_idx = self.active.lock().ok().and_then(|g| *g);
         if let Some(idx) = active_idx
@@ -391,6 +396,8 @@ impl BrowserHost {
         {
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_click_event(Some(&event), button, mouse_up as i32, click_count);
+        } else {
+            warn!(target: "buffr_core::host", "osr_mouse_click: no active browser host — click dropped");
         }
     }
 
