@@ -20,6 +20,7 @@ pub mod find;
 pub mod handlers;
 pub mod hint;
 pub mod host;
+pub mod new_tab;
 pub mod open_finder;
 pub mod permissions;
 pub mod telemetry;
@@ -55,6 +56,7 @@ pub use hint::{
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use host::{BrowserHost, HintStatus, HostMode, Tab, TabId, TabSession, TabSummary};
+pub use new_tab::{NEW_TAB_URL, register_buffr_handler_factory, register_buffr_scheme};
 pub use permissions::{
     PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
     capabilities_for_request_mask, drain_with_defer as drain_permissions_with_defer,

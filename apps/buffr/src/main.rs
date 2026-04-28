@@ -27,11 +27,11 @@ use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
-    HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId, drain_edit_events,
-    drain_permissions_with_defer, expire_stale_notices, init_cef_api, new_download_notice_queue,
-    new_edit_event_sink, new_find_sink, new_hint_event_sink, new_permissions_queue,
-    peek_download_notice, peek_permission_front, permissions_queue_len, pop_permission_front,
-    profile_paths,
+    HintAlphabet, HintEventSink, NEW_TAB_URL, PermissionsQueue, PromptOutcome, TabId,
+    drain_edit_events, drain_permissions_with_defer, expire_stale_notices, init_cef_api,
+    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
+    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
+    pop_permission_front, profile_paths, register_buffr_handler_factory,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -533,6 +533,11 @@ fn main() -> Result<()> {
         anyhow::bail!("cef::initialize returned {init_ok} (expected 1)");
     }
     info!("cef initialized");
+
+    // Register the `buffr://` scheme handler factory so that internal URLs
+    // such as `buffr://new` (the new-tab page) are served by Rust code
+    // rather than delegated to the network stack.
+    register_buffr_handler_factory();
 
     // Phase 6 telemetry: count the successful CEF init as one
     // `app_starts` event. No-op when disabled. We tick *after*
@@ -1527,7 +1532,7 @@ impl AppState {
         use buffr_modal::PageAction as A;
         match action {
             A::TabNew => {
-                let url = "chrome://new-tab-page/";
+                let url = NEW_TAB_URL;
                 if let Err(err) = host.open_tab(url) {
                     warn!(error = %err, %url, "tab_new: failed");
                 }

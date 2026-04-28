@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // — the upstream cefsimple example uses `use cef::*;` for this reason.
 use cef::*;
 
+use crate::new_tab::register_buffr_scheme;
+
 /// Process-wide flag toggling the `--force-renderer-accessibility`
 /// switch in `on_before_command_line_processing`. Set via
 /// [`set_force_renderer_accessibility`] before the first `BuffrApp` is
@@ -66,6 +68,12 @@ wrap_app! {
     pub struct BuffrApp;
 
     impl App {
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            if let Some(r) = registrar {
+                register_buffr_scheme(r);
+            }
+        }
+
         fn on_before_command_line_processing(
             &self,
             _process_type: Option<&CefString>,
