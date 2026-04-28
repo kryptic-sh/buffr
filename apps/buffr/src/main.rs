@@ -3856,16 +3856,11 @@ impl ApplicationHandler for AppState {
         // `save_session_now` directly, bypassing this check.
         if self.session_dirty {
             let debounce = Duration::from_millis(SESSION_SAVE_DEBOUNCE_MS);
-            let elapsed = self
+            let elapsed_enough = self
                 .session_dirty_since
-                .map(|t| t.elapsed())
-                .unwrap_or(debounce);
-            tracing::debug!(
-                elapsed_ms = elapsed.as_millis() as u64,
-                debounce_ms = SESSION_SAVE_DEBOUNCE_MS,
-                "session: dirty flush check"
-            );
-            if elapsed >= debounce {
+                .map(|t| t.elapsed() >= debounce)
+                .unwrap_or(true);
+            if elapsed_enough {
                 self.save_session_now();
             }
         }
