@@ -1118,7 +1118,13 @@ textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
                 // the main loop drains it and resets EditFocus. As a defensive
                 // measure, the caller (apps/buffr/src/main.rs's dispatch_action
                 // path) should ALSO clear local state synchronously.
-                self.run_js("if(document.activeElement)document.activeElement.blur();");
+                self.run_js(
+                    "(function(){var el=document.activeElement;if(!el)return;\
+        var k={key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true};\
+        el.dispatchEvent(new KeyboardEvent('keydown',k));\
+        el.dispatchEvent(new KeyboardEvent('keyup',k));\
+        el.blur();})();",
+                );
             }
 
             A::ClearCompletedDownloads => match self.downloads.clear_completed() {
