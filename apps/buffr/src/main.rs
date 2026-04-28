@@ -1946,16 +1946,57 @@ impl AppState {
             }
         }
 
-        // Overlay damage rect (top, if active).
+        // Overlay popup — floats over the CEF region at top 1/3 of the window.
+        // CEF is never resized when the overlay opens or closes.
         if let Some(overlay) = self.overlay.as_ref() {
             let bar = overlay.input();
-            bar.paint(buf.as_mut(), width as usize, height as usize);
-            let overlay_h = bar.total_height().min(height);
-            if let Some(h_nz) = NonZeroU32::new(overlay_h) {
+            let popup_w = ((width * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
+            let popup_x = (width - popup_w) / 2;
+            let popup_y = height / 3;
+            let popup_h = bar.total_height().min(height.saturating_sub(popup_y));
+
+            // Border fill.
+            fill_rect_u32(
+                buf.as_mut(),
+                width as usize,
+                height as usize,
+                popup_x as usize,
+                popup_y as usize,
+                popup_w as usize,
+                popup_h as usize,
+                OMNIBAR_POPUP_BORDER_COLOR,
+            );
+            // Inner background.
+            let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
+            let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
+            let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+            let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+            fill_rect_u32(
+                buf.as_mut(),
+                width as usize,
+                height as usize,
+                inner_x as usize,
+                inner_y as usize,
+                inner_w as usize,
+                inner_h as usize,
+                OMNIBAR_POPUP_BG,
+            );
+            // Input bar + suggestions inside the popup.
+            bar.paint_at(
+                buf.as_mut(),
+                width as usize,
+                height as usize,
+                inner_x as usize,
+                inner_y as usize,
+                inner_w as usize,
+                inner_h as usize,
+            );
+            // Damage only the popup region.
+            if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(popup_w), NonZeroU32::new(popup_h)) {
                 damage.push(softbuffer::Rect {
-                    x: 0,
-                    y: 0,
-                    width: nz_w,
+                    x: popup_x,
+                    y: popup_y,
+                    width: w_nz,
                     height: h_nz,
                 });
             }
@@ -1970,12 +2011,11 @@ impl AppState {
     ///
     /// Vertical layout (top → bottom):
     ///
-    /// 1. Input bar (when overlay open)
-    /// 2. Download notice strip (`DOWNLOAD_NOTICE_HEIGHT`, when queued)
-    /// 3. Permissions prompt (`PERMISSIONS_PROMPT_HEIGHT`, when active)
-    /// 4. Tab strip (always, `TAB_STRIP_HEIGHT` px)
-    /// 5. CEF page area
-    /// 6. Statusline (always, `STATUSLINE_HEIGHT` px)
+    /// 1. Download notice strip (`DOWNLOAD_NOTICE_HEIGHT`, when queued)
+    /// 2. Permissions prompt (`PERMISSIONS_PROMPT_HEIGHT`, when active)
+    /// 3. Tab strip (always, `TAB_STRIP_HEIGHT` px)
+    /// 4. CEF page area  ← overlay floats *over* this, no resize on toggle
+    /// 5. Statusline (always, `STATUSLINE_HEIGHT` px)
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
         let status_h = STATUSLINE_HEIGHT.min(full_h);
         let remaining_after_status = full_h.saturating_sub(status_h);
@@ -1993,28 +2033,18 @@ impl AppState {
             0
         };
         let remaining_after_notice = remaining_after_prompt.saturating_sub(notice_h);
-        let overlay_h = self
-            .overlay
-            .as_ref()
-            .map(|o| o.input().total_height())
-            .unwrap_or(0)
-            .min(remaining_after_notice);
         let cef_w = full_w.max(1);
-        let cef_h = remaining_after_notice.saturating_sub(overlay_h).max(1);
-        let cef_y = overlay_h + notice_h + prompt_h + tab_h;
+        let cef_h = remaining_after_notice.max(1);
+        let cef_y = notice_h + prompt_h + tab_h;
         (0, cef_y, cef_w, cef_h)
     }
 
     /// The pixel row at which the tab strip begins (top of the
     /// `TAB_STRIP_HEIGHT` band). Mirrors the math in
     /// [`Self::cef_child_rect`] without depending on the CEF rect
-    /// itself.
+    /// itself. The overlay is a floating popup and does not affect
+    /// the tab strip position.
     fn tab_strip_y(&self, full_h: u32) -> u32 {
-        let overlay_h = self
-            .overlay
-            .as_ref()
-            .map(|o| o.input().total_height())
-            .unwrap_or(0);
         let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
             DOWNLOAD_NOTICE_HEIGHT
         } else {
@@ -2025,32 +2055,25 @@ impl AppState {
         } else {
             0
         };
-        (overlay_h + notice_h + prompt_h).min(full_h)
+        (notice_h + prompt_h).min(full_h)
     }
 
-    /// Top-of-window y for the download notice strip. Sits right below
-    /// the input bar (when open) and above the permissions prompt.
+    /// Top-of-window y for the download notice strip. Sits at the
+    /// top of the window above the permissions prompt. The overlay is
+    /// a floating popup and does not affect this position.
     fn download_notice_y(&self) -> u32 {
-        self.overlay
-            .as_ref()
-            .map(|o| o.input().total_height())
-            .unwrap_or(0)
+        0
     }
 
     /// Top-of-window y for the permissions prompt strip. Sits right
     /// below the download notice (when active) and above the tab strip.
+    /// The overlay is a floating popup and does not affect this position.
     fn permissions_prompt_y(&self) -> u32 {
-        let overlay_h = self
-            .overlay
-            .as_ref()
-            .map(|o| o.input().total_height())
-            .unwrap_or(0);
-        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
+        if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
             DOWNLOAD_NOTICE_HEIGHT
         } else {
             0
-        };
-        overlay_h + notice_h
+        }
     }
 
     /// Re-issue the CEF resize call for the current window dimensions.
@@ -2070,7 +2093,7 @@ impl AppState {
     fn open_command_line(&mut self) {
         self.overlay = Some(OverlayState::Command(InputBar::with_prefix(":")));
         self.refresh_overlay_suggestions();
-        self.resync_cef_rect();
+        // Overlay is a floating popup — no CEF resize on toggle.
         self.request_redraw();
     }
 
@@ -2087,7 +2110,7 @@ impl AppState {
         }
         self.overlay = Some(OverlayState::Omnibar(bar));
         self.refresh_overlay_suggestions();
-        self.resync_cef_rect();
+        // Overlay is a floating popup — no CEF resize on toggle.
         self.request_redraw();
     }
 
@@ -2100,7 +2123,7 @@ impl AppState {
         if let Ok(mut e) = self.engine.lock() {
             e.set_mode(PageMode::Normal);
         }
-        self.resync_cef_rect();
+        // Overlay is a floating popup — no CEF resize on toggle.
         self.refresh_title();
     }
 
@@ -2934,6 +2957,36 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
                 focus_on_editable_field: 0,
                 ..KeyEvent::default()
             }]
+        }
+    }
+}
+
+/// Omnibar / command-line popup geometry.
+const OMNIBAR_POPUP_MAX_WIDTH: u32 = 800;
+const OMNIBAR_POPUP_BORDER: u32 = 2;
+const OMNIBAR_POPUP_BG: u32 = 0x1a1b26;
+const OMNIBAR_POPUP_BORDER_COLOR: u32 = 0x7aa2f7;
+
+/// Fill a rectangle in a u32 pixel buffer with stride `buf_w`.
+#[allow(clippy::too_many_arguments)]
+fn fill_rect_u32(
+    buf: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
+    let x1 = (x + w).min(buf_w);
+    let y1 = (y + h).min(buf_h);
+    for row in y..y1 {
+        let base = row * buf_w;
+        for col in x..x1 {
+            if let Some(px) = buf.get_mut(base + col) {
+                *px = color;
+            }
         }
     }
 }

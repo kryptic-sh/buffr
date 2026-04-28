@@ -293,42 +293,57 @@ impl InputBar {
     /// below `total_height()` are left untouched — the caller has
     /// either reserved that space or has nothing else to draw there.
     pub fn paint(&self, buffer: &mut [u32], width: usize, height: usize) {
-        if width == 0 || height < INPUT_HEIGHT as usize {
+        self.paint_at(buffer, width, height, 0, 0, width, height);
+    }
+
+    /// Paint into a sub-rectangle of the surface buffer. `x`, `y`, `w`, `h`
+    /// are pixel positions in the full surface (stride = `buf_w`). The bar
+    /// draws at the top of the rect; suggestions extend downward within it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_at(
+        &self,
+        buffer: &mut [u32],
+        buf_w: usize,
+        buf_h: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if w == 0 || h < INPUT_HEIGHT as usize {
             return;
         }
-        if buffer.len() < width * height {
+        if buffer.len() < buf_w * buf_h {
             return;
         }
 
         let p = &self.palette;
         let bar_h = INPUT_HEIGHT as usize;
 
-        // Background.
-        fill_rect(buffer, width, height, 0, 0, width, bar_h, p.bg);
+        // Background — fills the input row within the sub-rect.
+        fill_rect(buffer, buf_w, buf_h, x as i32, y as i32, w, bar_h, p.bg);
 
-        // Bottom 1-px border so the bar has a visual separation from
-        // the page area below. Even when suggestions are open, this
-        // sits between input row and dropdown.
+        // Bottom 1-px border of the input row.
         fill_rect(
             buffer,
-            width,
-            height,
-            0,
-            bar_h as i32 - 1,
-            width,
+            buf_w,
+            buf_h,
+            x as i32,
+            (y + bar_h) as i32 - 1,
+            w,
             1,
             p.border,
         );
 
         // Glyph baseline: 28 px row, 10 px glyph → top padding (28-10)/2 = 9.
-        let text_y = ((bar_h as i32) - font::GLYPH_H as i32) / 2;
+        let text_y = y as i32 + ((bar_h as i32) - font::GLYPH_H as i32) / 2;
 
         // Prefix in accent.
-        let prefix_x = 6i32;
+        let prefix_x = x as i32 + 6;
         font::draw_text(
             buffer,
-            width,
-            height,
+            buf_w,
+            buf_h,
             prefix_x,
             text_y,
             &self.prefix,
@@ -338,11 +353,9 @@ impl InputBar {
         let buffer_x = prefix_x + prefix_w + 6;
 
         // Buffer text in fg.
-        font::draw_text(buffer, width, height, buffer_x, text_y, &self.buffer, p.fg);
+        font::draw_text(buffer, buf_w, buf_h, buffer_x, text_y, &self.buffer, p.fg);
 
         // Cursor: 2-px-wide vertical bar at `cursor` byte position.
-        // Width is approximated by the count of glyphs before the
-        // cursor — matches our monospace bitmap font exactly.
         if self.cursor_visible && self.selected.is_none() {
             let prefix_chars = self.buffer[..self.cursor].chars().count();
             let cursor_px = if prefix_chars == 0 {
@@ -353,8 +366,8 @@ impl InputBar {
             let cursor_x = buffer_x + cursor_px as i32;
             fill_rect(
                 buffer,
-                width,
-                height,
+                buf_w,
+                buf_h,
                 cursor_x,
                 text_y - 1,
                 2,
@@ -369,8 +382,8 @@ impl InputBar {
         }
         let row_h = SUGGESTION_ROW_HEIGHT as usize;
         for (i, sug) in self.suggestions.iter().take(MAX_SUGGESTIONS).enumerate() {
-            let row_y = bar_h + i * row_h;
-            if row_y + row_h > height {
+            let row_y = y + bar_h + i * row_h;
+            if row_y + row_h > y + h {
                 break;
             }
             let bg = if Some(i) == self.selected {
@@ -378,7 +391,7 @@ impl InputBar {
             } else {
                 p.dropdown_bg
             };
-            fill_rect(buffer, width, height, 0, row_y as i32, width, row_h, bg);
+            fill_rect(buffer, buf_w, buf_h, x as i32, row_y as i32, w, row_h, bg);
             // Kind pip.
             let pip_colour = match sug.kind {
                 SuggestionKind::History => p.dropdown_kind_history,
@@ -388,16 +401,24 @@ impl InputBar {
             };
             fill_rect(
                 buffer,
-                width,
-                height,
-                6,
+                buf_w,
+                buf_h,
+                x as i32 + 6,
                 row_y as i32 + 8,
                 3,
                 font::GLYPH_H,
                 pip_colour,
             );
             let row_text_y = row_y as i32 + ((row_h as i32 - font::GLYPH_H as i32) / 2);
-            font::draw_text(buffer, width, height, 16, row_text_y, &sug.display, p.fg);
+            font::draw_text(
+                buffer,
+                buf_w,
+                buf_h,
+                x as i32 + 16,
+                row_text_y,
+                &sug.display,
+                p.fg,
+            );
         }
     }
 }
