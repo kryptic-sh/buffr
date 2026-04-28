@@ -3651,6 +3651,16 @@ impl ApplicationHandler for AppState {
             self.refresh_title();
         }
 
+        // Address-change events: drain URL updates pushed by
+        // on_address_change. No CEF call; purely reads from the shared
+        // VecDeque. Fires before find so Tab.url is current.
+        if let Some(host) = self.host.as_ref()
+            && host.pump_address_changes()
+        {
+            self.session_dirty = true;
+            self.request_redraw();
+        }
+
         // Drain any find result the CEF browser thread posted since
         // the last tick, then check whether the `--find` smoke
         // dispatch is due.
@@ -3694,10 +3704,9 @@ impl ApplicationHandler for AppState {
             self.request_redraw();
         }
 
-        // Live URL sync: throttled to ~4 Hz (250 ms) to silence the
-        // cef-rs "Invalid UTF-16 string" stderr spam that fires on
-        // every call while a page is mid-navigation. At 60 Hz this
-        // would flood the log; 4 Hz is imperceptible to users.
+        // Live URL / zoom sync: throttled to ~4 Hz (250 ms).
+        // URL is now cheap (reads cached Tab.url; no CEF call).
+        // Zoom polls host.zoom_level() at the same cadence.
         // Also detects navigation, active-index, and tab-list changes
         // for the session dirty flag.
         if let Some(host) = self.host.as_ref() {
@@ -3723,6 +3732,12 @@ impl ApplicationHandler for AppState {
                     host.tabs_summary().iter().map(|t| t.id).collect();
                 if current_ids != self.last_session_tab_ids {
                     self.session_dirty = true;
+                }
+                // Zoom level: poll active tab and update statusline.
+                let zoom = host.active_zoom_level();
+                if (zoom - self.statusline.zoom_level).abs() > f64::EPSILON {
+                    self.statusline.zoom_level = zoom;
+                    self.request_redraw();
                 }
             }
         }

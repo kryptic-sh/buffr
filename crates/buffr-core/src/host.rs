@@ -17,6 +17,7 @@
 //! `was_hidden(true)` on the previous and `was_hidden(false)` +
 //! `set_focus(true)` on the next. See `docs/multi-tab.md`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -126,6 +127,11 @@ pub struct TabSummary {
     pub private: bool,
 }
 
+/// Thread-safe queue of `(cef_browser_id, url)` pairs pushed by
+/// `BuffrDisplayHandler::on_address_change` on the CEF IO thread and
+/// drained by [`BrowserHost::pump_address_changes`] on the UI thread.
+pub type AddressSink = Arc<Mutex<VecDeque<(i32, String)>>>;
+
 /// Owns N concurrent CEF browsers.
 ///
 /// The host is created **after** `cef::initialize` succeeds. On Linux
@@ -206,6 +212,10 @@ pub struct BrowserHost {
     /// drains these each tick and calls `open_tab` so popups/OAuth flows
     /// open as tabs rather than spawning a separate OS window.
     popup_queue: PopupQueue,
+    /// Address changes pushed by `BuffrDisplayHandler::on_address_change`
+    /// on the CEF IO thread. The UI thread drains via
+    /// [`Self::pump_address_changes`] each tick and writes `Tab.url`.
+    address_sink: AddressSink,
 }
 
 impl BrowserHost {
@@ -297,6 +307,7 @@ impl BrowserHost {
         let osr_frame = Arc::new(Mutex::new(OsrFrame::new(osr_w, osr_h)));
 
         let popup_queue = new_popup_queue();
+        let address_sink: AddressSink = Arc::new(Mutex::new(VecDeque::new()));
         let host = Self {
             tabs: Mutex::new(Vec::new()),
             active: Mutex::new(None),
@@ -321,6 +332,7 @@ impl BrowserHost {
             osr_view,
             clipboard: Mutex::new(hjkl_clipboard::Clipboard::new()),
             popup_queue,
+            address_sink,
         };
         host.open_tab(url)?;
         Ok(host)
@@ -351,8 +363,9 @@ impl BrowserHost {
         self.mode
     }
 
-    /// Returns the current main-frame URL of the active tab, freshly
-    /// queried from CEF. Empty string if no active tab or no main frame.
+    /// Returns the cached main-frame URL of the active tab. Updated by
+    /// `pump_address_changes` whenever CEF fires `on_address_change`.
+    /// Empty string if no active tab.
     pub fn active_tab_live_url(&self) -> String {
         let Ok(tabs) = self.tabs.lock() else {
             return String::new();
@@ -360,11 +373,58 @@ impl BrowserHost {
         let active_idx = self.active.lock().ok().and_then(|g| *g);
         if let Some(idx) = active_idx
             && let Some(t) = tabs.get(idx)
-            && let Some(frame) = t.browser.main_frame()
         {
-            CefStringUtf16::from(&frame.url()).to_string()
+            t.url.clone()
         } else {
             String::new()
+        }
+    }
+
+    /// Drain all queued `on_address_change` events and apply them to the
+    /// matching tab's `url` field. Returns `true` when at least one tab
+    /// URL changed so the caller can request a redraw and mark the
+    /// session dirty.
+    pub fn pump_address_changes(&self) -> bool {
+        let changes: Vec<(i32, String)> = {
+            let Ok(mut guard) = self.address_sink.lock() else {
+                return false;
+            };
+            guard.drain(..).collect()
+        };
+        if changes.is_empty() {
+            return false;
+        }
+        let Ok(mut tabs) = self.tabs.lock() else {
+            return false;
+        };
+        let mut changed = false;
+        for (browser_id, url) in changes {
+            for t in tabs.iter_mut() {
+                if t.browser.identifier() == browser_id {
+                    t.url = url;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Active tab's CEF zoom level. Returns 0.0 when no active tab —
+    /// CEF's "default" baseline. Each integer step is roughly a 20%
+    /// change (1.0 ≈ 120%, -1.0 ≈ 83%).
+    pub fn active_zoom_level(&self) -> f64 {
+        let Ok(tabs) = self.tabs.lock() else {
+            return 0.0;
+        };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            host.zoom_level()
+        } else {
+            0.0
         }
     }
 
@@ -652,6 +712,7 @@ impl BrowserHost {
             self.notice_queue.clone(),
             render_handler,
             self.popup_queue.clone(),
+            self.address_sink.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -767,20 +828,10 @@ impl BrowserHost {
     }
 
     fn summarize(&self, t: &Tab) -> TabSummary {
-        // Prefer the live main-frame URL — the stored `t.url` is set
-        // on creation and isn't mutated as the user navigates within
-        // the tab. Fall back to the stored URL when the frame is
-        // unavailable (between create and first commit).
-        let live_url = t
-            .browser
-            .main_frame()
-            .map(|f| CefStringUtf16::from(&f.url()).to_string())
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| t.url.clone());
         TabSummary {
             id: t.id,
             title: t.display_title(),
-            url: live_url,
+            url: t.url.clone(),
             progress: t.progress,
             is_loading: t.is_loading,
             pinned: t.pinned,

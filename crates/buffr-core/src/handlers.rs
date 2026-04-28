@@ -74,6 +74,7 @@ pub fn make_client(
     notice_queue: DownloadNoticeQueue,
     render_handler: Option<RenderHandler>,
     popup_queue: PopupQueue,
+    address_sink: crate::host::AddressSink,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -89,6 +90,7 @@ pub fn make_client(
         notice_queue,
         render_handler,
         popup_queue,
+        address_sink,
     )
 }
 
@@ -116,8 +118,9 @@ pub fn make_display_handler(
     history: Arc<History>,
     hint_sink: HintEventSink,
     edit_sink: EditEventSink,
+    address_sink: crate::host::AddressSink,
 ) -> DisplayHandler {
-    BuffrDisplayHandler::new(history, hint_sink, edit_sink)
+    BuffrDisplayHandler::new(history, hint_sink, edit_sink, address_sink)
 }
 
 /// Standalone factory for the download handler.
@@ -198,6 +201,7 @@ wrap_client! {
         notice_queue: DownloadNoticeQueue,
         render_handler: Option<RenderHandler>,
         popup_queue: PopupQueue,
+        address_sink: crate::host::AddressSink,
     }
 
     impl Client {
@@ -220,6 +224,7 @@ wrap_client! {
                 self.history.clone(),
                 self.hint_sink.clone(),
                 self.edit_sink.clone(),
+                self.address_sink.clone(),
             ))
         }
 
@@ -443,9 +448,35 @@ wrap_display_handler! {
         // `__buffr_edit__:`-prefixed console lines. Stage 2 drains
         // this from the UI render loop to drive EditSession lifecycle.
         edit_sink: EditEventSink,
+        // address_sink: shared with BrowserHost; drained each tick via pump_address_changes.
+        address_sink: crate::host::AddressSink,
     }
 
     impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // Only track main-frame navigations; sub-frame address
+            // changes (iframes, ads) must not overwrite the tab URL.
+            let Some(frame) = frame else { return };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let Some(browser) = browser else { return };
+            let Some(url) = url else { return };
+            let browser_id = cef::ImplBrowser::identifier(browser);
+            let url_str = url.to_string();
+            if url_str.is_empty() {
+                return;
+            }
+            if let Ok(mut guard) = self.address_sink.lock() {
+                guard.push_back((browser_id, url_str));
+            }
+        }
+
         fn on_title_change(
             &self,
             browser: Option<&mut Browser>,

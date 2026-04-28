@@ -104,6 +104,10 @@ pub struct Statusline {
     /// Phase 6 a11y: when `true`, the strip uses the high-contrast
     /// palette (white on black) instead of the accent-tinted defaults.
     pub high_contrast: bool,
+    /// Active tab's CEF zoom level. 0.0 is the page default; positive
+    /// values zoom in, negative out. Rendered as a percentage in the
+    /// statusline ("125%"). Hidden when at default.
+    pub zoom_level: f64,
 }
 
 impl Default for Statusline {
@@ -119,6 +123,7 @@ impl Default for Statusline {
             hint_state: None,
             update_indicator: None,
             high_contrast: false,
+            zoom_level: 0.0,
         }
     }
 }
@@ -230,6 +235,16 @@ impl Statusline {
             && count > 0
         {
             let s = format!("{count}");
+            let w = font::text_width(&s) as i32;
+            right_pen -= w;
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
+            right_pen -= 8;
+        }
+        // Zoom indicator. Hidden at default (0.0). CEF uses ~1.2^level
+        // so 1 step ≈ 120%, -1 ≈ 83%. Round to nearest percent.
+        if self.zoom_level.abs() > f64::EPSILON {
+            let pct = (1.2_f64.powf(self.zoom_level) * 100.0).round() as i64;
+            let s = format!("{pct}%");
             let w = font::text_width(&s) as i32;
             right_pen -= w;
             font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
