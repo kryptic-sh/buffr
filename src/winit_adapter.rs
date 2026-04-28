@@ -83,15 +83,25 @@ fn chord_from_logical(logical: &WKey, modifiers: ModifiersState) -> Option<KeyCh
             // canonical form. ASCII alphabetic stays untouched: `Shift+a`
             // → `A` keeps SHIFT so it matches the parser's `(SHIFT, 'A')`.
             let mut effective = mods;
+            let mut ch = first;
             if effective.contains(Modifiers::SHIFT)
                 && first.is_ascii()
                 && !first.is_ascii_alphabetic()
             {
                 effective.remove(Modifiers::SHIFT);
             }
+            // Ctrl+letter is case-insensitive in the parser
+            // (`<C-h>` and `<C-H>` both produce `(CTRL, 'h')`),
+            // so the adapter normalizes uppercase letters to
+            // lowercase whenever CTRL is set. Without this,
+            // `<C-S-h>` (parsed as `(CTRL|SHIFT, 'h')`) never
+            // matched the adapter's `(CTRL|SHIFT, 'H')`.
+            if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
+                ch = ch.to_ascii_lowercase();
+            }
             Some(KeyChord {
                 modifiers: effective,
-                key: Key::Char(first),
+                key: Key::Char(ch),
             })
         }
         WKey::Named(named) => {
