@@ -2319,13 +2319,19 @@ impl AppState {
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        let inner = window.inner_size();
         let (width, height) = match override_size {
             Some((w, h)) => (w.max(1), h.max(1)),
-            None => {
-                let size = window.inner_size();
-                (size.width.max(1), size.height.max(1))
-            }
+            None => (inner.width.max(1), inner.height.max(1)),
         };
+        debug!(
+            width,
+            height,
+            inner_w = inner.width,
+            inner_h = inner.height,
+            override_present = override_size.is_some(),
+            "paint_chrome_with: enter",
+        );
 
         // Sync subsurface position to whatever dims this paint will use.
         // winit fires both Resized and RedrawRequested per configure on
@@ -4017,7 +4023,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                tracing::trace!("redraw: RedrawRequested");
+                debug!("winit: RedrawRequested");
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
