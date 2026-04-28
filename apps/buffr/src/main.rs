@@ -27,6 +27,14 @@ use std::time::{Duration, Instant};
 /// change resets the clock.
 const SESSION_SAVE_DEBOUNCE_MS: u64 = 500;
 
+/// Grace window after a Blur event during Insert mode. If a Focus
+/// event for a different field arrives within this window, the pair
+/// is treated as a Tab/Shift+Tab transfer (stay in Insert, update
+/// last_focused_field). Otherwise the engine flips to Normal. The
+/// window absorbs the renderer→browser console-IPC latency that can
+/// split a synchronous focusout/focusin pair across drain ticks.
+const BLUR_TRANSFER_WINDOW_MS: u64 = 250;
+
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -665,8 +673,18 @@ fn main() -> Result<()> {
             warn!(error = %err, "ctrlc handler already installed — using existing");
         }
     }
+    // Cold-start initial URL: if no session is being restored (missing
+    // or empty), land on the internal new-tab page rather than the
+    // configured homepage so a fresh launch shows the buffr UI. The
+    // homepage value still drives `:tabnew` and the `gh` chord.
+    let initial_url = if pending_session_tabs.is_empty() {
+        buffr_core::NEW_TAB_URL.to_string()
+    } else {
+        homepage.clone()
+    };
     let mut app_state = AppState::new(
         homepage,
+        initial_url,
         engine,
         history.clone(),
         bookmarks.clone(),
@@ -1263,6 +1281,11 @@ fn clear_cookies() {
 ///   idempotent but cheap → cheaper still to skip.
 struct AppState {
     homepage: String,
+    /// URL to load into the very first tab when the browser host is
+    /// created. Diverges from `homepage` on cold start: an empty /
+    /// missing session steers the initial tab to `buffr://new` so the
+    /// user sees the internal new-tab page rather than blank.
+    initial_url: String,
     window: Option<Arc<Window>>,
     host: Option<buffr_core::BrowserHost>,
     engine: Arc<Mutex<Engine>>,
@@ -1324,6 +1347,13 @@ struct AppState {
     /// events from the page are ignored — pages can't drag us into
     /// Insert via autofocus or programmatic `.focus()` calls.
     insert_intent_at: Option<Instant>,
+    /// Wall-clock of the most recent in-Insert-mode Blur. The mode
+    /// flip to Normal is deferred by `BLUR_TRANSFER_WINDOW` so a
+    /// Tab/Shift+Tab navigation between fields (which fires
+    /// blur(old) → focus(new)) is treated as a transfer rather than
+    /// an exit. Cleared when a transferring Focus arrives or when the
+    /// window expires.
+    pending_blur_at: Option<Instant>,
     /// Index of the tab the user pressed left-click on inside the tab
     /// strip. Set on press, cleared on release; if the release lands on
     /// a different tab slot, the drag triggers a `move_tab`.
@@ -1494,6 +1524,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         homepage: String,
+        initial_url: String,
         engine: Arc<Mutex<Engine>>,
         history: Arc<buffr_history::History>,
         bookmarks: Arc<buffr_bookmarks::Bookmarks>,
@@ -1532,6 +1563,7 @@ impl AppState {
         statusline.mode = PageMode::Normal;
         Self {
             homepage,
+            initial_url,
             window: None,
             host: None,
             engine,
@@ -1555,6 +1587,7 @@ impl AppState {
             edit_sink,
             edit_focus: EditFocus::None,
             insert_intent_at: None,
+            pending_blur_at: None,
             tab_drag_src: None,
             cancel_closes_tab: None,
             hint_alphabet,
@@ -2764,15 +2797,24 @@ impl AppState {
                         .insert_intent_at
                         .map(|t| t.elapsed() <= INTENT_WINDOW)
                         .unwrap_or(false);
-                    if !already_editing && user_intent {
+                    // Tab/Shift+Tab transfer: a Blur from the previously
+                    // focused field landed within BLUR_TRANSFER_WINDOW.
+                    // Treat the Focus as a continuation of Insert mode.
+                    let transfer_window = std::time::Duration::from_millis(BLUR_TRANSFER_WINDOW_MS);
+                    let is_transfer = self
+                        .pending_blur_at
+                        .map(|t| t.elapsed() <= transfer_window)
+                        .unwrap_or(false);
+                    if !already_editing && (user_intent || is_transfer) {
                         self.insert_intent_at = None;
+                        self.pending_blur_at = None;
                         if let Some(host) = self.host.as_ref() {
                             host.run_edit_attach(&field_id);
                         }
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Insert);
                         }
-                        tracing::debug!(%field_id, "edit-mode entered");
+                        tracing::debug!(%field_id, is_transfer, "edit-mode entered");
                         // Remember the last field that received user-driven
                         // focus so `i` can re-focus it on the next press.
                         self.last_focused_field = Some(field_id.clone());
@@ -2788,11 +2830,13 @@ impl AppState {
                         EditFocus::None => false,
                     };
                     if matches_current {
+                        // Defer the engine-mode flip: a Tab/Shift+Tab
+                        // transfer fires Focus on a sibling field within
+                        // BLUR_TRANSFER_WINDOW, in which case we stay in
+                        // Insert. The expiry path in about_to_wait flips
+                        // to Normal if no Focus arrives.
                         self.edit_focus = EditFocus::None;
-                        if let Ok(mut e) = self.engine.lock() {
-                            e.set_mode(buffr_modal::PageMode::Normal);
-                        }
-                        mode_changed = true;
+                        self.pending_blur_at = Some(Instant::now());
                     }
                 }
                 EditConsoleEvent::Mutate { field_id, .. } => {
@@ -2808,6 +2852,34 @@ impl AppState {
             }
         }
         if mode_changed {
+            self.refresh_title();
+        }
+    }
+
+    /// Expire a pending Blur if no transferring Focus arrived within
+    /// the grace window. Flips the engine to Normal at that point so a
+    /// real exit from Insert (click outside an input, or a blur with
+    /// no follow-up) still leaves the chrome consistent.
+    fn expire_pending_blur(&mut self) {
+        let Some(blurred_at) = self.pending_blur_at else {
+            return;
+        };
+        let window = std::time::Duration::from_millis(BLUR_TRANSFER_WINDOW_MS);
+        if blurred_at.elapsed() < window {
+            return;
+        }
+        self.pending_blur_at = None;
+        // Only flip to Normal if no other path already advanced the
+        // engine (e.g. the Esc handler ran in the same window).
+        let still_insert = self
+            .engine
+            .lock()
+            .map(|e| matches!(e.mode(), PageMode::Insert))
+            .unwrap_or(false);
+        if still_insert {
+            if let Ok(mut e) = self.engine.lock() {
+                e.set_mode(buffr_modal::PageMode::Normal);
+            }
             self.refresh_title();
         }
     }
@@ -3333,7 +3405,7 @@ impl ApplicationHandler for AppState {
 
         match buffr_core::BrowserHost::new_with_options(
             raw,
-            &self.homepage,
+            &self.initial_url,
             self.history.clone(),
             self.downloads.clone(),
             self.downloads_config.clone(),
@@ -3351,7 +3423,7 @@ impl ApplicationHandler for AppState {
         ) {
             Ok(host) => {
                 info!(mode = ?host.mode(), "browser host created");
-                debug!(url = %self.homepage, "browser host created — initial url");
+                debug!(url = %self.initial_url, "browser host created — initial url");
                 // CEF stays focused for the lifetime of the browser
                 // so DOM clicks deliver focus to inputs. We do NOT
                 // forward OS-level Focused(false) (alt-tab) so pages
@@ -3728,6 +3800,10 @@ impl ApplicationHandler for AppState {
         // Runs before the engine tick so state is consistent when key
         // routing fires later in the same event-loop iteration.
         self.drain_edit_focus_events();
+        // Defer-then-flip for Tab transfer: if the grace window after a
+        // Blur expired without a sibling Focus arriving, finalize the
+        // exit from Insert mode now.
+        self.expire_pending_blur();
 
         // Engine ambiguity timeout: if a single-chord prefix is
         // sitting on the buffer past the timeout window, fire the
