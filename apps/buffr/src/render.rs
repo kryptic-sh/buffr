@@ -246,6 +246,13 @@ impl Renderer {
         if w == self.width && h == self.height {
             return;
         }
+        tracing::debug!(
+            old_w = self.width,
+            old_h = self.height,
+            new_w = w,
+            new_h = h,
+            "renderer.resize"
+        );
         self.width = w;
         self.height = h;
         self.config.width = w;
@@ -307,7 +314,19 @@ impl Renderer {
         // burning more time. Without recovery the surface stays
         // wedged and every subsequent frame stalls another ~1s.
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
+            Ok(f) => {
+                let actual = (f.texture.width(), f.texture.height());
+                if actual != (self.width, self.height) {
+                    tracing::warn!(
+                        config_w = self.width,
+                        config_h = self.height,
+                        actual_w = actual.0,
+                        actual_h = actual.1,
+                        "wgpu surface: acquired texture size differs from configured"
+                    );
+                }
+                f
+            }
             Err(wgpu::SurfaceError::Timeout) => {
                 tracing::warn!("wgpu surface: get_current_texture timed out, skipping frame");
                 return Ok(());

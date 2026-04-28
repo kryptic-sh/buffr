@@ -3904,11 +3904,24 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
+                let inner = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.inner_size())
+                    .unwrap_or_default();
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor())
+                    .unwrap_or(1.0);
                 let (_x, _y, cef_w, cef_h) =
                     self.cef_child_rect(new_size.width.max(1), new_size.height.max(1));
                 debug!(
-                    win_w = new_size.width,
-                    win_h = new_size.height,
+                    new_w = new_size.width,
+                    new_h = new_size.height,
+                    inner_w = inner.width,
+                    inner_h = inner.height,
+                    scale,
                     cef_w,
                     cef_h,
                     has_host = self.host.is_some(),
