@@ -542,11 +542,10 @@ fn main() -> Result<()> {
 
     // -------- winit event loop --------
     //
-    // Allow winit to pick the best backend. On Wayland sessions winit
-    // will use Wayland natively; HostMode::Osr is auto-detected from
-    // the resulting RawWindowHandle in resumed(). On X11 sessions winit
-    // uses X11 and HostMode::Windowed is selected. XWayland sessions
-    // where WAYLAND_DISPLAY is absent fall back to X11 naturally.
+    // Allow winit to pick the best Wayland backend. Linux always uses
+    // HostMode::Osr (softbuffer composite over Wayland) — X11/XWayland
+    // windowed embedding is not supported. macOS and Windows use native
+    // child-window embedding (HostMode::Windowed).
     let event_loop = EventLoop::new().context("creating winit event loop")?;
 
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -3026,11 +3025,8 @@ impl ApplicationHandler for AppState {
         let cef_w = inner.width.max(1);
         let cef_h = inner.height.saturating_sub(chrome_h).max(1);
 
-        let raw_display = window.display_handle().ok().map(|h| h.as_raw());
-
         match buffr_core::BrowserHost::new_with_options(
             raw,
-            raw_display,
             &self.homepage,
             self.history.clone(),
             self.downloads.clone(),

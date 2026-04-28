@@ -18,7 +18,7 @@ first. No Electron. No web UI for chrome. Snappy, low memory, good battery.
 
 | Platform | Tier | Notes                                     |
 | -------- | ---- | ----------------------------------------- |
-| Linux    | 1    | Wayland + X11. Primary dev target.        |
+| Linux    | 1    | Wayland (OSR-only). Primary dev target.   |
 | macOS    | 1    | Cocoa host. Helper bundle + code signing. |
 | Windows  | 2    | Win32/HWND host. MSI installer.           |
 
@@ -116,10 +116,9 @@ Goal: empty native window renders `https://example.com` via CEF.
       profile/cache dir via `directories`.
 - [x] `buffr-core::Host`: create browser, attach to native window handle.
 - [x] `apps/buffr` main: init tracing, CEF init, open one tab, run loop.
-- [x] Wayland: XWayland default; native Wayland gated behind `--features osr`
-      (Phase 3 scope). `apps/buffr` forces the winit X11 backend via
-      `EventLoopBuilderExtX11::with_x11()` so Wayland sessions transparently run
-      via XWayland.
+- [x] Wayland: Linux always uses OSR mode (softbuffer composite over Wayland).
+      X11/XWayland windowed embedding was dropped — Linux is OSR-only.
+      macOS and Windows use native child-window embedding.
 - [x] CI: Linux build + smoke test (window opens, page loads, exits clean).
       `.github/workflows/ci.yml` runs the smoke job under `xvfb` after
       installing `xkbcommon-x11` + GL libs (commits `51070da`, `9b75326`).
@@ -203,10 +202,8 @@ Goal: tab strip + statusline + command line + omnibar, all native.
       a `softbuffer = "0.4"` strip docked below the CEF child window. Decision
       recorded in [`docs/ui-stack.md`](./docs/ui-stack.md). `wgpu`/OSR
       compositor reserved for the hint-mode migration.
-- [ ] Implement `crates/buffr-core/src/osr.rs` (currently scaffolded). Wire
-      `OsrHost::new` to real CEF windowless mode + wgpu compositor so Wayland
-      sessions can run natively without XWayland. **Status:** scaffolded;
-      deferred to post-1.0. XWayland covers Wayland sessions today. See
+- [x] OSR mode active on Linux: CEF windowless rendering + softbuffer composite.
+      Linux is OSR-only; macOS/Windows use native windowed embedding. See
       [`docs/ui-stack.md`](./docs/ui-stack.md).
 - [x] Tab strip: render via `buffr-ui::TabStrip` (softbuffer paint), wired to
       multi-tab `BrowserHost`. Active tab highlighted with accent stripe; pinned
@@ -435,7 +432,7 @@ Goal: user TOML config drives keymap, theme, startup, search engines.
 | CEF binary size + distribution friction      | `xtask fetch-cef`; cache in CI; mirror tarballs.                                               |
 | Native chrome over CEF surface compositing   | Prototype early in Phase 3; fall back to OSR if hard.                                          |
 | macOS code signing / notarization complexity | Set up Apple cert in CI before Phase 6.                                                        |
-| Wayland vs X11 input handling differences    | Test both in CI from Phase 1.                                                                  |
+| Wayland input handling on Linux              | Linux is OSR-only; X11 windowed path removed.                                                  |
 | Modal engine ambiguity / timeout UX          | Vim-parity defaults; configurable via TOML.                                                    |
 | `hjkl-*` 0.0.x churn breaks edit-mode        | Pin `=0.0.x`; lockstep update PR per hjkl release.                                             |
 | DOM ↔ rope sync drift (concurrent edits)     | Pull model: `Editor::take_changes()` per frame; JS-side edits remap via `apply_external_edit`. |
@@ -500,8 +497,8 @@ wire it to `EditSession`.
 Phases 0–6 are all landed. Outstanding items are tracked above under "What gates
 `v0.1.0`". Other open work:
 
-- **Phase 3 OSR** — scaffolded; full implementation reserved for native Wayland.
-  XWayland covers Wayland sessions today. Targeting 0.2.0+.
+- **Phase 3 OSR** — active on Linux (softbuffer composite). macOS/Windows
+  windowed embedding still uses native child windows.
 - **Signing infrastructure** — deferred to 1.0. Unsigned packages from
   `xtask package-{linux,macos-dmg,windows-msi}` are the 0.1.0 artifacts.
 

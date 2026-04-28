@@ -55,9 +55,6 @@ buffr-permissions.workspace = true
 ureq.workspace = true
 semver.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-x11 = { version = "2", features = ["xlib"] }
-
 [dev-dependencies]
 # Tests for `telemetry` and `crash` write to scratch directories.
 tempfile.workspace = true

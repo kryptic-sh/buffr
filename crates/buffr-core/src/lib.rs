@@ -25,9 +25,8 @@ pub mod permissions;
 pub mod telemetry;
 pub mod updates;
 
-/// Off-screen rendering support. Auto-detected at runtime based on the
-/// `RawWindowHandle` variant — Wayland handles route to OSR, X11 handles
-/// to windowed embedding.
+/// Off-screen rendering support. Linux always uses OSR; macOS/Windows
+/// use native windowed embedding.
 pub mod osr;
 pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
 
