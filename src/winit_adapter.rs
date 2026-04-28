@@ -75,8 +75,22 @@ fn chord_from_logical(logical: &WKey, modifiers: ModifiersState) -> Option<KeyCh
             if chars.next().is_some() {
                 return None;
             }
+            // Drop the SHIFT bit when the keyboard layout has already
+            // baked it into the produced glyph. `+`, `!`, `?` etc. are
+            // shifted forms of `=`, `1`, `/` — typing them always
+            // requires Shift on a US layout, but the parser writes
+            // these bindings without `<S->` because the glyph is the
+            // canonical form. ASCII alphabetic stays untouched: `Shift+a`
+            // → `A` keeps SHIFT so it matches the parser's `(SHIFT, 'A')`.
+            let mut effective = mods;
+            if effective.contains(Modifiers::SHIFT)
+                && first.is_ascii()
+                && !first.is_ascii_alphabetic()
+            {
+                effective.remove(Modifiers::SHIFT);
+            }
             Some(KeyChord {
-                modifiers: mods,
+                modifiers: effective,
                 key: Key::Char(first),
             })
         }
