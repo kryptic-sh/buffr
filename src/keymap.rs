@@ -115,6 +115,18 @@ impl Keymap {
         self.mode_map(mode).resolve_timeout(chords)
     }
 
+    /// Flatten every binding under `mode` to `(chord_sequence, action)`
+    /// pairs. Order is unspecified — callers that want deterministic
+    /// output should sort the result. Used by the new-tab page renderer
+    /// to list the live keymap, including any hot-reloaded user
+    /// overrides.
+    pub fn entries(&self, mode: PageMode) -> Vec<(Vec<KeyChord>, PageAction)> {
+        let mut out = Vec::new();
+        let mut prefix = Vec::new();
+        self.mode_map(mode).root.collect(&mut prefix, &mut out);
+        out
+    }
+
     fn resolve_keys(&self, keys: &str) -> Result<Vec<KeyChord>, BindError> {
         let mut chords = parse_keys(keys)?;
         for c in &mut chords {
@@ -254,6 +266,22 @@ impl Keymap {
                 .expect("static default-bindings table parses");
         }
         km
+    }
+}
+
+impl Node {
+    /// Walk the trie depth-first and append every (prefix, action)
+    /// pair to `out`. `prefix` is mutated as a working buffer; the
+    /// caller starts with an empty `Vec`.
+    fn collect(&self, prefix: &mut Vec<KeyChord>, out: &mut Vec<(Vec<KeyChord>, PageAction)>) {
+        if let Some(a) = &self.action {
+            out.push((prefix.clone(), a.clone()));
+        }
+        for (chord, child) in &self.children {
+            prefix.push(*chord);
+            child.collect(prefix, out);
+            prefix.pop();
+        }
     }
 }
 
