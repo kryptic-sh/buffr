@@ -1310,6 +1310,10 @@ struct AppState {
     /// events from the page are ignored — pages can't drag us into
     /// Insert via autofocus or programmatic `.focus()` calls.
     insert_intent_at: Option<Instant>,
+    /// Index of the tab the user pressed left-click on inside the tab
+    /// strip. Set on press, cleared on release; if the release lands on
+    /// a different tab slot, the drag triggers a `move_tab`.
+    tab_drag_src: Option<usize>,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1504,6 +1508,7 @@ impl AppState {
             edit_sink,
             edit_focus: EditFocus::None,
             insert_intent_at: None,
+            tab_drag_src: None,
             hint_alphabet,
             pending_find,
             find_smoke_at: None,
@@ -2085,6 +2090,35 @@ impl AppState {
     /// [`Self::cef_child_rect`] without depending on the CEF rect
     /// itself. The overlay is a floating popup and does not affect
     /// the tab strip position.
+    /// Hit-test the current cursor position against the tab strip.
+    /// Returns the index of the tab under the cursor, or `None` if the
+    /// cursor isn't in the strip or the tab list is empty.
+    fn hit_test_tab_strip(&self) -> Option<usize> {
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        let full_w = size.width.max(1);
+        let full_h = size.height.max(1);
+        let tab_y = self.tab_strip_y(full_h);
+        let tab_y_end = tab_y + TAB_STRIP_HEIGHT;
+        let (_, cef_y, _, _) = self.cef_child_rect(full_w, full_h);
+        let wx = self.osr_cursor.0 as u32;
+        let wy = (self.osr_cursor.1 + cef_y as i32).max(0) as u32;
+        if wy < tab_y || wy >= tab_y_end || self.tab_ids.is_empty() {
+            return None;
+        }
+        let n = self.tab_ids.len() as u32;
+        const GUTTER: u32 = 4;
+        let available = full_w.saturating_sub((n + 1) * GUTTER);
+        let raw_w = available / n.max(1);
+        let tab_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
+        if wx < GUTTER {
+            return None;
+        }
+        let rel_x = wx - GUTTER;
+        let idx = (rel_x / (tab_w + GUTTER)) as usize;
+        (idx < self.tab_ids.len()).then_some(idx)
+    }
+
     fn tab_strip_y(&self, full_h: u32) -> u32 {
         let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
             DOWNLOAD_NOTICE_HEIGHT
@@ -3322,54 +3356,50 @@ impl ApplicationHandler for AppState {
                     }
                 }
 
-                // Tab-strip click: Left = focus, Middle = close. Both
-                // on press. Intercept before OSR.
+                // Tab-strip click: Left = focus / drag, Middle = close.
+                // Press on left selects the tab AND records a drag src;
+                // release on left finalizes the drag if the cursor moved
+                // to a different slot.
+                let tab_strip_idx = self.hit_test_tab_strip();
                 if state == Pressed
-                    && (button == MouseButton::Left || button == MouseButton::Middle)
-                    && let Some(window) = self.window.as_ref()
+                    && button == MouseButton::Left
+                    && let Some(idx) = tab_strip_idx
                 {
-                    let size = window.inner_size();
-                    let full_w = size.width.max(1);
-                    let full_h = size.height.max(1);
-                    let tab_y = self.tab_strip_y(full_h);
-                    let tab_y_end = tab_y + TAB_STRIP_HEIGHT;
-                    // osr_cursor is in browser-region coords:
-                    //   bx = position.x, by = position.y - cef_y
-                    // So window_y = osr_cursor.1 + cef_y.
-                    let (_, cef_y, _, _) = self.cef_child_rect(full_w, full_h);
-                    let wx = self.osr_cursor.0 as u32;
-                    let wy = (self.osr_cursor.1 + cef_y as i32).max(0) as u32;
-                    if wy >= tab_y && wy < tab_y_end && !self.tab_ids.is_empty() {
-                        // Compute tab width using same algorithm as TabStrip::paint.
-                        let n = self.tab_ids.len() as u32;
-                        const GUTTER: u32 = 4;
-                        let available = full_w.saturating_sub((n + 1) * GUTTER);
-                        let raw_w = available / n.max(1);
-                        let tab_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
-                        // Tabs start at x = GUTTER, each occupies tab_w + GUTTER.
-                        if wx >= GUTTER {
-                            let rel_x = wx - GUTTER;
-                            let idx = (rel_x / (tab_w + GUTTER)) as usize;
-                            if idx < self.tab_ids.len() {
-                                let id = self.tab_ids[idx];
-                                if button == MouseButton::Middle {
-                                    let remaining = if let Some(host) = self.host.as_ref() {
-                                        let _ = host.close_tab(id);
-                                        host.tab_count()
-                                    } else {
-                                        0
-                                    };
-                                    self.refresh_tab_strip();
-                                    if remaining == 0 {
-                                        event_loop.exit();
-                                    }
-                                } else if let Some(host) = self.host.as_ref() {
-                                    host.select_tab(id);
-                                }
-                                return;
-                            }
+                    if let Some(host) = self.host.as_ref() {
+                        host.select_tab(self.tab_ids[idx]);
+                    }
+                    self.tab_drag_src = Some(idx);
+                    return;
+                }
+                if state != Pressed && button == MouseButton::Left {
+                    if let Some(src) = self.tab_drag_src.take() {
+                        if let Some(dst) = tab_strip_idx
+                            && dst != src
+                            && let Some(host) = self.host.as_ref()
+                        {
+                            host.move_tab(src, dst);
+                            self.refresh_tab_strip();
+                            self.request_redraw();
+                            return;
                         }
                     }
+                }
+                if state == Pressed
+                    && button == MouseButton::Middle
+                    && let Some(idx) = tab_strip_idx
+                {
+                    let id = self.tab_ids[idx];
+                    let remaining = if let Some(host) = self.host.as_ref() {
+                        let _ = host.close_tab(id);
+                        host.tab_count()
+                    } else {
+                        0
+                    };
+                    self.refresh_tab_strip();
+                    if remaining == 0 {
+                        event_loop.exit();
+                    }
+                    return;
                 }
 
                 if let Some(host) = self.host.as_ref()
