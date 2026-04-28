@@ -4346,16 +4346,23 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // while no redraw is queued show on the next compositor-driven
         // frame.
 
-        // Cap the event-loop wakeup cadence at ~60Hz so CEF's message
-        // pump (which needs regular service) stops pinning the main
-        // thread at 100% CPU. Real-time wakeups (input, OSR on_paint
-        // → EventLoopProxy, Resized) preempt the deadline; the
-        // deadline only fires when nothing else woke us. wgpu's
-        // surface itself runs Fifo (vsync) so render rate is already
-        // capped to the display refresh.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(16),
-        ));
+        // Cap the event-loop wakeup cadence at the display's refresh
+        // rate so CEF's message pump (which needs regular service)
+        // stops pinning the main thread at 100% CPU. Real-time
+        // wakeups (input, OSR on_paint → EventLoopProxy, Resized)
+        // preempt the deadline; the deadline only fires when nothing
+        // else woke us. wgpu's surface itself runs Fifo (vsync) so
+        // render rate is already capped to display refresh; this
+        // matches the pump cadence to it.
+        let frame_period = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|&mhz| mhz > 0)
+            .map(|mhz| Duration::from_nanos(1_000_000_000_000 / u64::from(mhz)))
+            .unwrap_or(Duration::from_millis(16));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + frame_period));
     }
 }
 
