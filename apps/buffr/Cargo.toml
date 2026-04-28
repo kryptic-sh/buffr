@@ -38,3 +38,4 @@ tempfile.workspace = true
 softbuffer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ctrlc = "3.5.2"

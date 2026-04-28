@@ -18,6 +18,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -636,6 +637,13 @@ fn main() -> Result<()> {
 
     let download_notice_queue = new_download_notice_queue();
 
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    {
+        let flag = Arc::clone(&shutdown_flag);
+        if let Err(err) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+            warn!(error = %err, "ctrlc handler already installed — using existing");
+        }
+    }
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -661,6 +669,7 @@ fn main() -> Result<()> {
         update_checker.clone(),
         initial_update_status,
         config.theme.high_contrast,
+        shutdown_flag,
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -1364,6 +1373,9 @@ struct AppState {
     osr_last_click_button: Option<cef::MouseButtonType>,
     /// Click count within the current double-click window (1 or 2).
     osr_click_count: i32,
+    /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
+    /// polled in `about_to_wait` to exit with a single key press.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 /// Edit-mode focus state machine.
@@ -1443,6 +1455,7 @@ impl AppState {
         update_checker: Arc<buffr_core::UpdateChecker>,
         initial_update_status: buffr_core::UpdateStatus,
         high_contrast: bool,
+        shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         let update_indicator = update_indicator_from(&initial_update_status);
         let mut statusline = Statusline {
@@ -1498,6 +1511,7 @@ impl AppState {
             osr_last_click_at: Instant::now(),
             osr_last_click_button: None,
             osr_click_count: 1,
+            shutdown_flag,
         }
     }
 
@@ -3324,7 +3338,16 @@ impl ApplicationHandler for AppState {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Ctrl+C single-press exit: the ctrlc handler sets this flag;
+        // we check it here before doing any other work so the exit is
+        // clean (session saved, CEF not left in a wedged state).
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            self.save_session_now();
+            event_loop.exit();
+            return;
+        }
+
         // Pump CEF every frame. With `ControlFlow::Poll` this fires
         // continuously, which is the simplest correct cadence for
         // Phase 1 — Phase 3 will switch to a tickless wakeup.
