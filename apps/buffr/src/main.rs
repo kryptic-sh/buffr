@@ -3183,6 +3183,23 @@ impl ApplicationHandler for AppState {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                use winit::event::{ElementState::Pressed, MouseButton};
+                // Back/Forward side buttons → history navigation regardless
+                // of host mode. Intercept before OSR dispatch.
+                if state == Pressed {
+                    match button {
+                        MouseButton::Back => {
+                            self.dispatch_action(&buffr_modal::PageAction::HistoryBack);
+                            return;
+                        }
+                        MouseButton::Forward => {
+                            self.dispatch_action(&buffr_modal::PageAction::HistoryForward);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 if let Some(host) = self.host.as_ref()
                     && host.mode() == buffr_core::HostMode::Osr
                     && let Some(cef_button) = winit_button_to_cef(&button)
