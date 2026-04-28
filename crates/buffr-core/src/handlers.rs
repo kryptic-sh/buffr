@@ -359,19 +359,25 @@ wrap_load_handler! {
             // committed URL is final, and CEF's renderer is ready to
             // accept zoom changes.
             let domain = buffr_zoom::domain_for_url(&url);
-            match self.zoom.get(&domain) {
-                Ok(level) if level != 0.0 => {
-                    if let Some(browser) = browser
-                        && let Some(host) = cef::ImplBrowser::host(browser)
-                    {
-                        host.set_zoom_level(level);
-                        tracing::trace!(%domain, level, "zoom: applied persisted");
-                    }
-                }
-                Ok(_) => {}
+            let zoom_level = match self.zoom.get(&domain) {
+                Ok(level) if level != 0.0 => Some(level),
+                Ok(_) => None,
                 Err(err) => {
                     tracing::warn!(error = %err, %domain, "zoom: get failed");
+                    None
                 }
+            };
+            if let Some(browser) = browser
+                && let Some(host) = cef::ImplBrowser::host(browser)
+            {
+                if let Some(level) = zoom_level {
+                    host.set_zoom_level(level);
+                    tracing::trace!(%domain, level, "zoom: applied persisted");
+                }
+                // Re-assert CEF focus on every main-frame load so the
+                // newly committed page receives input correctly. Mirrors
+                // the focus reapplication on tab switch.
+                host.set_focus(1);
             }
 
             // Edit-mode Stage 1: inject edit.js once per main-frame load.
