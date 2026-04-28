@@ -160,9 +160,9 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
     ""
 }
 
-const COLOUR_PROMPT_FG: u32 = 0xF0_E8_D8;
-const COLOUR_PROMPT_HINT: u32 = 0xC8_C8_C0;
-const COLOUR_PROMPT_PENDING: u32 = 0xFF_C8_8C;
+const COLOUR_PROMPT_FG: u32 = 0xFF_F0_E8_D8;
+const COLOUR_PROMPT_HINT: u32 = 0xFF_C8_C8_C0;
+const COLOUR_PROMPT_PENDING: u32 = 0xFF_FF_C8_8C;
 
 #[cfg(test)]
 mod tests {

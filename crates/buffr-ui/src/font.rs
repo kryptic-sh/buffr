@@ -173,7 +173,7 @@ fn draw_ttf_char(
             let out_r = (fg_r * c + bg_r * inv) / 255;
             let out_g = (fg_g * c + bg_g * inv) / 255;
             let out_b = (fg_b * c + bg_b * inv) / 255;
-            *slot = (out_r << 16) | (out_g << 8) | out_b;
+            *slot = 0xFF_00_00_00 | (out_r << 16) | (out_g << 8) | out_b;
         }
     }
 }

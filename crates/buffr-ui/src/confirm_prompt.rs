@@ -123,9 +123,9 @@ pub fn rect_contains(rect: ConfirmRect, px: i32, py: i32) -> bool {
 const BUTTON_H: i32 = 28;
 const BUTTON_PAD_X: i32 = 14;
 
-const COLOUR_FG: u32 = 0xF0_E8_D8;
-const COLOUR_BTN_YES: u32 = 0x40_28_28;
-const COLOUR_BTN_NO: u32 = 0x28_28_28;
+const COLOUR_FG: u32 = 0xFF_F0_E8_D8;
+const COLOUR_BTN_YES: u32 = 0xFF_40_28_28;
+const COLOUR_BTN_NO: u32 = 0xFF_28_28_28;
 
 #[cfg(test)]
 mod tests {
