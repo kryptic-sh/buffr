@@ -10,12 +10,6 @@ authors.workspace = true
 description = "CEF integration and browser host for buffr."
 build = "build.rs"
 
-[features]
-default = []
-# Off-screen rendering for native Wayland (Phase 3). Currently
-# scaffolded (see `src/osr.rs`) but not implemented — runtime entry
-# points panic with `unimplemented!()`.
-osr = []
 
 [dependencies]
 cef.workspace = true
@@ -60,6 +54,9 @@ buffr-permissions.workspace = true
 # implementation is the production path.
 ureq.workspace = true
 semver.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11 = { version = "2", features = ["xlib"] }
 
 [dev-dependencies]
 # Tests for `telemetry` and `crash` write to scratch directories.

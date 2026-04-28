@@ -25,11 +25,9 @@ pub mod permissions;
 pub mod telemetry;
 pub mod updates;
 
-/// Off-screen rendering scaffold. Gated behind the `osr` feature
-/// because it pulls in (eventually) `wgpu` and `softbuffer` deps.
-/// Currently scaffolded only — runtime entries panic. See `PLAN.md`
-/// Phase 3.
-#[cfg(feature = "osr")]
+/// Off-screen rendering support. Auto-detected at runtime based on the
+/// `RawWindowHandle` variant — Wayland handles route to OSR, X11 handles
+/// to windowed embedding. RenderHandler wiring lands in step 2.
 pub mod osr;
 
 pub use app::{
@@ -56,7 +54,7 @@ pub use hint::{
     HintEventSink, HintKind, HintLabel, HintRect, HintSession, build_inject_script,
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
-pub use host::{BrowserHost, HintStatus, Tab, TabId, TabSession, TabSummary};
+pub use host::{BrowserHost, HintStatus, HostMode, Tab, TabId, TabSession, TabSummary};
 pub use permissions::{
     PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
     capabilities_for_request_mask, drain_with_defer as drain_permissions_with_defer,

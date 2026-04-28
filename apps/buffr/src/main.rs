@@ -50,8 +50,6 @@ use clap::Parser;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tempfile::TempDir;
 use tracing::{info, trace, warn};
-#[cfg(all(target_os = "linux", not(feature = "osr")))]
-use winit::platform::x11::EventLoopBuilderExtX11;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -519,6 +517,9 @@ fn main() -> Result<()> {
         // Field confirmed in cef-147's bindings:
         // `Settings::root_cache_path: CefString`.
         root_cache_path: cef::CefString::from(cache_path.as_str()),
+        // Must be set at init time for OSR to be usable. Has no effect
+        // on windowed browsers; safe to always enable.
+        windowless_rendering_enabled: 1,
         ..Default::default()
     };
 
@@ -541,32 +542,11 @@ fn main() -> Result<()> {
 
     // -------- winit event loop --------
     //
-    // CEF's windowed embedding only supports X11 on Linux. On Wayland
-    // sessions we run via XWayland — winit 0.30 prefers Wayland by
-    // default when `WAYLAND_DISPLAY` is set, so we force the X11
-    // backend explicitly. Native Wayland is blocked on OSR (compile
-    // with `--features osr`, Phase 3 scope).
-    //
-    // Note: winit 0.29 removed the `WINIT_UNIX_BACKEND` env var; the
-    // supported way to pin a backend in winit 0.30 is
-    // `EventLoopBuilderExtX11::with_x11()` on the builder, which sets
-    // `forced_backend = Backend::X` before backend selection.
-    #[cfg(all(target_os = "linux", not(feature = "osr")))]
-    let event_loop = {
-        let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-        if session_type == "wayland" || !wayland_display.is_empty() {
-            warn!(
-                "running under XWayland — native Wayland needs OSR (Phase 3); rebuild with `--features osr` once OSR lands"
-            );
-        }
-        EventLoop::builder()
-            .with_x11()
-            .build()
-            .context("creating winit event loop (forced X11 backend)")?
-    };
-
-    #[cfg(not(all(target_os = "linux", not(feature = "osr"))))]
+    // Allow winit to pick the best backend. On Wayland sessions winit
+    // will use Wayland natively; HostMode::Osr is auto-detected from
+    // the resulting RawWindowHandle in resumed(). On X11 sessions winit
+    // uses X11 and HostMode::Windowed is selected. XWayland sessions
+    // where WAYLAND_DISPLAY is absent fall back to X11 naturally.
     let event_loop = EventLoop::new().context("creating winit event loop")?;
 
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -2755,8 +2735,11 @@ impl ApplicationHandler for AppState {
         let cef_w = inner.width.max(1);
         let cef_h = inner.height.saturating_sub(chrome_h).max(1);
 
+        let raw_display = window.display_handle().ok().map(|h| h.as_raw());
+
         match buffr_core::BrowserHost::new_with_options(
             raw,
+            raw_display,
             &self.homepage,
             self.history.clone(),
             self.downloads.clone(),
@@ -2774,7 +2757,11 @@ impl ApplicationHandler for AppState {
             Some(self.counters.clone()),
         ) {
             Ok(host) => {
-                info!(url = %self.homepage, "browser host created");
+                info!(
+                    url = %self.homepage,
+                    mode = ?host.mode(),
+                    "browser host created"
+                );
                 self.host = Some(host);
             }
             Err(err) => {

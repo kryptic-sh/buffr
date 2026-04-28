@@ -41,7 +41,7 @@
 //! ## See also
 //!
 //! - `PLAN.md` — Phase 3 OSR roadmap.
-//! - [`crate::host::BrowserHost::new_osr`] — the future entry point.
+//! - [`crate::host::HostMode`] — runtime mode selection.
 
 use raw_window_handle::RawWindowHandle;
 

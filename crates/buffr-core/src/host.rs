@@ -1,17 +1,13 @@
-//! [`BrowserHost`] — a tab manager owning N concurrent CEF browsers
-//! parented to one X11 window.
+//! [`BrowserHost`] — a tab manager owning N concurrent CEF browsers.
 //!
 //! ## Linux backend matrix
 //!
-//! - **Default build (no `osr` feature)**: windowed embedding only.
-//!   CEF on Linux only supports embedding into an X11 window. We force
-//!   winit to its X11 backend in `apps/buffr/src/main.rs`, so on
-//!   Wayland sessions we transparently run via XWayland and CEF still
-//!   gets an X11 XID.
-//! - **`osr` feature (Phase 3)**: native Wayland via off-screen
-//!   rendering. CEF paints into a buffer, we composite it onto a
-//!   winit/wgpu Wayland surface ourselves. Scaffolded in
-//!   [`crate::osr`] but not yet implemented.
+//! - **Windowed embedding** (`HostMode::Windowed`): CEF child window
+//!   parented into an X11 XID. Works on native X11 and XWayland.
+//! - **Off-screen rendering** (`HostMode::Osr`): CEF paints into a
+//!   buffer; we composite it onto a Wayland surface. Auto-detected
+//!   from the `RawWindowHandle` variant at construction time.
+//!   RenderHandler wiring lands in step 2; compositing in step 4.
 //!
 //! ## Multi-tab architecture
 //!
@@ -36,7 +32,7 @@ use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
     WindowInfo, browser_host_create_browser_sync,
 };
-use raw_window_handle::RawWindowHandle;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use tracing::{info, warn};
 
 use crate::download_notice::DownloadNoticeQueue;
@@ -49,6 +45,22 @@ use crate::hint::{
 use crate::permissions::PermissionsQueue;
 use crate::telemetry::{KEY_TABS_OPENED, UsageCounters};
 use crate::{CoreError, handlers};
+
+/// Rendering mode for a [`BrowserHost`].
+///
+/// Auto-detected from the `RawWindowHandle` variant passed to
+/// [`BrowserHost::new_with_options`]:
+/// - `RawWindowHandle::Xlib` → [`HostMode::Windowed`]
+/// - `RawWindowHandle::Wayland` → [`HostMode::Osr`]
+/// - macOS / Windows native handles → [`HostMode::Windowed`]
+/// - Any other handle → [`HostMode::Osr`] (safe fallback)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMode {
+    /// Windowed embedding via OS-native child window (X11 only on Linux).
+    Windowed,
+    /// Off-screen rendering — CEF paints to a buffer we composite ourselves.
+    Osr,
+}
 
 /// Monotonic tab identifier minted by [`BrowserHost`]. Distinct from
 /// CEF's `Browser::identifier()` (which can collide on close+reopen).
@@ -134,6 +146,11 @@ pub struct BrowserHost {
     /// Stored on construction so `open_tab` can build new browsers
     /// after the manager is up.
     parent_handle: Mutex<Option<RawWindowHandle>>,
+    /// X11 display handle parallel to `parent_handle`. Used by the
+    /// Linux-only post-creation `XReparentWindow` call that forces
+    /// CEF's child window into our winit X11 parent even when CEF's
+    /// internal reparent fails under XWayland.
+    parent_display: Mutex<Option<RawDisplayHandle>>,
     /// Last known CEF child rect (width, height). Caller-passed via
     /// [`Self::resize`]. Used by `open_tab` to size new browsers
     /// consistently.
@@ -141,6 +158,9 @@ pub struct BrowserHost {
     /// Whether the host is in private mode. Threaded into
     /// [`TabSummary`] so chrome can mark every tab private.
     private: bool,
+    /// Rendering mode — windowed embedding or off-screen rendering.
+    /// Detected from the `RawWindowHandle` variant at construction time.
+    mode: HostMode,
     /// Shared stores — every tab's CEF client funnels into the same
     /// history / downloads / zoom rows.
     history: Arc<History>,
@@ -189,6 +209,7 @@ impl BrowserHost {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         window_handle: RawWindowHandle,
+        display_handle: Option<RawDisplayHandle>,
         url: &str,
         history: Arc<History>,
         downloads: Arc<Downloads>,
@@ -205,6 +226,7 @@ impl BrowserHost {
     ) -> Result<Self, CoreError> {
         Self::new_with_options(
             window_handle,
+            display_handle,
             url,
             history,
             downloads,
@@ -230,6 +252,7 @@ impl BrowserHost {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_options(
         window_handle: RawWindowHandle,
+        display_handle: Option<RawDisplayHandle>,
         url: &str,
         history: Arc<History>,
         downloads: Arc<Downloads>,
@@ -246,14 +269,27 @@ impl BrowserHost {
         private: bool,
         counters: Option<Arc<UsageCounters>>,
     ) -> Result<Self, CoreError> {
-        info!(target: "buffr_core::host", %url, "creating CEF browser (initial tab)");
+        let mode = match window_handle {
+            #[cfg(target_os = "linux")]
+            RawWindowHandle::Xlib(_) => HostMode::Windowed,
+            #[cfg(target_os = "linux")]
+            RawWindowHandle::Wayland(_) => HostMode::Osr,
+            #[cfg(target_os = "macos")]
+            RawWindowHandle::AppKit(_) => HostMode::Windowed,
+            #[cfg(target_os = "windows")]
+            RawWindowHandle::Win32(_) => HostMode::Windowed,
+            _ => HostMode::Osr,
+        };
+        info!(target: "buffr_core::host", %url, ?mode, "creating CEF browser (initial tab)");
         let host = Self {
             tabs: Mutex::new(Vec::new()),
             active: Mutex::new(None),
             next_id: AtomicU64::new(0),
             parent_handle: Mutex::new(Some(window_handle)),
+            parent_display: Mutex::new(display_handle),
             last_size: Mutex::new(initial_size),
             private,
+            mode,
             history,
             downloads,
             downloads_config,
@@ -282,6 +318,11 @@ impl BrowserHost {
     /// each tick.
     pub fn permissions_queue(&self) -> &PermissionsQueue {
         &self.permissions_queue
+    }
+
+    /// Current rendering mode (windowed embedding or OSR).
+    pub fn mode(&self) -> HostMode {
+        self.mode
     }
 
     fn mint_id(&self) -> TabId {
@@ -331,18 +372,28 @@ impl BrowserHost {
             runtime_style: cef::sys::cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY.into(),
             ..WindowInfo::default()
         };
-        match handle {
-            #[cfg(target_os = "linux")]
-            RawWindowHandle::Xlib(h) => {
-                window_info.parent_window = h.window as _;
-            }
-            other => {
-                tracing::warn!(
-                    ?other,
-                    "unsupported window handle for windowed embedding; \
-                     native Wayland requires the `osr` feature (Phase 3)"
-                );
-                return Err(CoreError::CreateBrowserFailed);
+        match self.mode {
+            HostMode::Windowed => match handle {
+                #[cfg(target_os = "linux")]
+                RawWindowHandle::Xlib(h) => {
+                    window_info.parent_window = h.window as _;
+                }
+                other => {
+                    tracing::warn!(
+                        ?other,
+                        "windowed mode but unrecognised handle variant — \
+                             cannot embed CEF child window"
+                    );
+                    return Err(CoreError::CreateBrowserFailed);
+                }
+            },
+            HostMode::Osr => {
+                // Off-screen rendering: no parent_window; CEF will call the
+                // RenderHandler instead of creating a child window.
+                // windowless_rendering_enabled is set on the WindowInfo so CEF
+                // takes the OSR path. RenderHandler wiring comes in step 2.
+                window_info.windowless_rendering_enabled = 1;
+                tracing::info!("creating CEF browser in OSR mode");
             }
         }
         tracing::info!(
@@ -378,6 +429,53 @@ impl BrowserHost {
             None,
         )
         .ok_or(CoreError::CreateBrowserFailed)?;
+
+        // Linux/X11 windowed mode only: manually reparent CEF's child
+        // window into the winit parent. CEF's internal XReparentWindow
+        // can silently fail under XWayland (the browser pops as a
+        // top-level window despite parent_window being set). Calling
+        // XReparentWindow ourselves after creation forces the embedding
+        // in all cases. Skipped for OSR — there is no child window.
+        #[cfg(target_os = "linux")]
+        if self.mode == HostMode::Windowed {
+            let display_handle = self.parent_display.lock().ok().and_then(|g| *g);
+            if let (Some(RawDisplayHandle::Xlib(dh)), Some(RawWindowHandle::Xlib(wh))) =
+                (display_handle, Some(handle))
+            {
+                if let Some(display_ptr) = dh.display {
+                    if let Some(host_ref) = browser.host() {
+                        let cef_xid = host_ref.window_handle();
+                        let parent_xid = wh.window;
+                        tracing::info!(
+                            cef_xid,
+                            parent_xid,
+                            "xreparent: forcing CEF child into winit X11 parent"
+                        );
+                        unsafe {
+                            x11::xlib::XReparentWindow(
+                                display_ptr.as_ptr() as *mut x11::xlib::Display,
+                                cef_xid,
+                                parent_xid,
+                                0,
+                                0,
+                            );
+                            x11::xlib::XMapWindow(
+                                display_ptr.as_ptr() as *mut x11::xlib::Display,
+                                cef_xid,
+                            );
+                            x11::xlib::XSync(display_ptr.as_ptr() as *mut x11::xlib::Display, 0);
+                        }
+                        tracing::info!(cef_xid, parent_xid, "xreparent: done");
+                    } else {
+                        tracing::warn!("xreparent: browser.host() returned None after creation");
+                    }
+                } else {
+                    tracing::warn!("xreparent: Xlib display pointer is None — skipping reparent");
+                }
+            } else {
+                tracing::info!("xreparent: non-Xlib handles — skipping reparent");
+            }
+        }
 
         let id = self.mint_id();
         let tab = Tab {
@@ -739,22 +837,6 @@ impl BrowserHost {
             let cef_query = CefString::from(query.as_str());
             host.find(Some(&cef_query), forward as i32, 0, 1);
         });
-    }
-
-    /// Construct a browser in **off-screen rendering** mode. **Not yet
-    /// implemented** — currently panics. See [`crate::osr`] and
-    /// `PLAN.md` (Phase 3).
-    #[cfg(feature = "osr")]
-    pub fn new_osr(
-        _window_handle: RawWindowHandle,
-        url: &str,
-        _paint_callback: impl Fn(&[u8], u32, u32) + Send + 'static,
-    ) -> Result<Self, CoreError> {
-        tracing::error!(
-            %url,
-            "BrowserHost::new_osr called but OSR mode is not implemented yet"
-        );
-        unimplemented!("OSR mode coming in Phase 3 — see PLAN.md")
     }
 
     /// Dispatch a [`buffr_modal::PageAction`] against the active tab.

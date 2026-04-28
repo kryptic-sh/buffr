@@ -13,12 +13,6 @@ description = "Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
 name = "buffr"
 path = "src/main.rs"
 
-[features]
-default = []
-# Forwards to `buffr-core/osr`. Enables native Wayland via off-screen
-# rendering once Phase 3 lands; default builds use windowed embedding
-# (XWayland on Wayland sessions).
-osr = ["buffr-core/osr"]
 
 [dependencies]
 buffr-core.workspace = true
