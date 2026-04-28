@@ -740,6 +740,16 @@ fn main() -> Result<()> {
         warn!(error = %err, "winit event loop exited with error");
     }
 
+    // Drop AppState BEFORE cef::shutdown(). AppState owns the
+    // BrowserHost (which holds CEF browser refs) and the wgpu
+    // Renderer (which holds the surface + Arc<Window>). Letting it
+    // live past cef::shutdown() tears those resources down after
+    // CEF has already torn down the GPU process, which segfaults on
+    // recent CEF builds with hardware compositing on. Explicit drop
+    // here guarantees order: browsers close → wgpu surface drops →
+    // window drops → cef::shutdown finalises.
+    drop(app_state);
+
     // Defer-dismiss any permission requests still queued at shutdown.
     // Dropping a CEF callback without invoking it would wedge the
     // renderer; resolving with `Defer` fires the right "DISMISS"
@@ -4335,6 +4345,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // input, mode/url change). OSR `on_paint` updates that arrive
         // while no redraw is queued show on the next compositor-driven
         // frame.
+
+        // Cap the event-loop wakeup cadence at ~60Hz so CEF's message
+        // pump (which needs regular service) stops pinning the main
+        // thread at 100% CPU. Real-time wakeups (input, OSR on_paint
+        // → EventLoopProxy, Resized) preempt the deadline; the
+        // deadline only fires when nothing else woke us. wgpu's
+        // surface itself runs Fifo (vsync) so render rate is already
+        // capped to the display refresh.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(16),
+        ));
     }
 }
 
