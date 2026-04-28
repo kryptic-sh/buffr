@@ -2113,12 +2113,25 @@ impl AppState {
     }
 
     fn paint_chrome(&mut self) {
+        self.paint_chrome_with(None);
+    }
+
+    /// Paint chrome at explicit dims when caller has fresher size info
+    /// than `window.inner_size()` returns. Wayland's configure handshake
+    /// can leave `window.inner_size()` reporting the previous dims at
+    /// the moment `WindowEvent::Resized` fires; passing the event's
+    /// `new_size` directly avoids painting at stale width/height.
+    fn paint_chrome_with(&mut self, override_size: Option<(u32, u32)>) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+        let (width, height) = match override_size {
+            Some((w, h)) => (w.max(1), h.max(1)),
+            None => {
+                let size = window.inner_size();
+                (size.width.max(1), size.height.max(1))
+            }
+        };
         // Precompute geometry-derived inputs before acquiring the
         // softbuffer surface borrow — geometry helpers and Arc-queue
         // peeks all need `&self`; the borrow is released once `surface`
@@ -3811,8 +3824,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // commits a buffer at the new dims in this event tick.
                 // request_redraw is gated by Wayland frame callbacks and
                 // lags one frame behind configure during continuous drag,
-                // letting the compositor stretch the old buffer.
-                self.paint_chrome();
+                // letting the compositor stretch the old buffer. Pass
+                // new_size explicitly — `window.inner_size()` can still
+                // report the previous dims here on Wayland.
+                self.paint_chrome_with(Some((new_size.width, new_size.height)));
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
