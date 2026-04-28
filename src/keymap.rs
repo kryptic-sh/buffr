@@ -396,6 +396,7 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::FindNext => "FindNext",
         PageAction::FindPrev => "FindPrev",
         PageAction::YankUrl => "YankUrl",
+        PageAction::YankSelection => "YankSelection",
         PageAction::ZoomIn => "ZoomIn",
         PageAction::ZoomOut => "ZoomOut",
         PageAction::ZoomReset => "ZoomReset",
@@ -524,9 +525,13 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "<F12>", PageAction::OpenDevTools),
     (PageMode::Normal, "<C-S-i>", PageAction::OpenDevTools),
     // -- visual-mode minimal ---------------------------------------
-    // Esc returns to normal — the engine handles this via the mode
-    // transition code path; the binding here is a placeholder so
-    // the visual-mode trie is populated at all.
+    // Visual mode is entered automatically when the user drags with
+    // the left mouse button in the page area; the embedded CEF view
+    // handles the on-screen text-selection rendering. `y` yanks the
+    // current page selection to the system clipboard (via CEF's
+    // native frame.copy()) and returns to Normal. `<Esc>` cancels
+    // without yanking.
+    (PageMode::Visual, "y", PageAction::YankSelection),
     (
         PageMode::Visual,
         "<Esc>",

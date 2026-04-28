@@ -140,6 +140,10 @@ pub enum PageAction {
     /// Yank the current page URL. Phase 2 emits the action; clipboard
     /// plumbing lands with the host wiring in `buffr-core`.
     YankUrl,
+    /// Yank the active text selection in the page to the system
+    /// clipboard. Bound to `y` in Visual mode. After the copy, the
+    /// apps layer transitions back to Normal.
+    YankSelection,
 
     // -- zoom ---------------------------------------------------------
     ZoomIn,
