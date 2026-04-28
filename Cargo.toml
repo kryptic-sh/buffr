@@ -14,6 +14,7 @@ members = [
     "apps/buffr-helper",
     "xtask",
 ]
+default-members = ["apps/buffr"]
 
 [workspace.package]
 version = "0.0.1"
