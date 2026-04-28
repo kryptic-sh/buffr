@@ -68,7 +68,7 @@ impl PermissionsPrompt {
         // Two text rows.
         let text_x: i32 = content_x as i32 + 8;
         let text_y0 = top + 8;
-        let text_y1 = top + 8 + (font::GLYPH_H as i32 + 8);
+        let text_y1 = top + 8 + (font::glyph_h() as i32 + 8);
 
         let caps_joined = self.capabilities.join(", ");
         let line1 = if caps_joined.is_empty() {

@@ -28,11 +28,11 @@ pub use input_bar::{
 pub use permissions_prompt::{ACTION_HINT, PERMISSIONS_PROMPT_HEIGHT, PermissionsPrompt};
 pub use tab_strip::{MAX_TAB_WIDTH, MIN_TAB_WIDTH, TAB_STRIP_HEIGHT, TabStrip, TabView};
 
-/// Statusline strip height in pixels. 24 px fits a 10-px glyph row
+/// Statusline strip height in pixels. 30 px fits a 14-px glyph row
 /// with comfortable padding above + below; matches the recommendation
 /// in `docs/ui-stack.md`. Bumping this requires the host window to
 /// re-layout the CEF child rect.
-pub const STATUSLINE_HEIGHT: u32 = 24;
+pub const STATUSLINE_HEIGHT: u32 = 30;
 
 /// Public re-export so embedders can pull `Mode` from one place.
 pub use buffr_modal::Mode;
@@ -183,9 +183,7 @@ impl Statusline {
             strip_h,
             accent,
         );
-        // Vertically center: glyph height is 10, strip height is 24
-        // → top padding (24 - 10) / 2 = 7.
-        let text_y = strip_y as i32 + ((strip_h as i32 - font::GLYPH_H as i32) / 2);
+        let text_y = strip_y as i32 + ((strip_h as i32 - font::glyph_h() as i32) / 2);
         font::draw_text(buffer, width, height, 6, text_y, mode_text, fg);
 
         // Right-side cell: count buffer, find status, update channel,
@@ -272,7 +270,7 @@ impl Statusline {
             url_x,
             strip_y as i32 + 8,
             2,
-            font::GLYPH_H,
+            font::glyph_h(),
             cert_colour,
         );
         font::draw_text(buffer, width, height, url_x + 6, text_y, url_text, fg);
@@ -451,7 +449,7 @@ mod tests {
     #[test]
     fn paint_fills_strip_row_with_mode_bg() {
         let w = 200;
-        let h = 24;
+        let h = STATUSLINE_HEIGHT as usize;
         let mut buf = make_buf(w, h);
         let s = Statusline {
             url: "https://example.com".into(),
@@ -466,7 +464,7 @@ mod tests {
     #[test]
     fn paint_strip_pixel_outside_mode_block_uses_strip_bg() {
         let w = 400;
-        let h = 24;
+        let h = STATUSLINE_HEIGHT as usize;
         let mut buf = make_buf(w, h);
         let s = Statusline {
             url: "x".into(),
@@ -575,7 +573,7 @@ mod tests {
     #[test]
     fn high_contrast_uses_distinct_palette() {
         let w = 400;
-        let h = 24;
+        let h = STATUSLINE_HEIGHT as usize;
         let mut buf_default = make_buf(w, h);
         let mut buf_hc = make_buf(w, h);
         let default_s = Statusline {
@@ -618,7 +616,7 @@ mod tests {
     #[test]
     fn update_indicator_renders_when_set() {
         let w = 600;
-        let h = 24;
+        let h = STATUSLINE_HEIGHT as usize;
         let mut buf_off = make_buf(w, h);
         let mut buf_on = make_buf(w, h);
         let off_s = Statusline {
@@ -638,7 +636,7 @@ mod tests {
     #[test]
     fn private_marker_renders_distinctly() {
         let w = 400;
-        let h = 24;
+        let h = STATUSLINE_HEIGHT as usize;
         let mut buf_priv = make_buf(w, h);
         let mut buf_norm = make_buf(w, h);
         let priv_s = Statusline {
