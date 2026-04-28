@@ -749,8 +749,8 @@ fn main() -> Result<()> {
     if let Some(host) = app_state.host.as_ref() {
         host.close_all_browsers();
     }
-    info!("shutdown: pumping CEF message loop (2s)");
-    for _ in 0..200 {
+    info!("shutdown: pumping CEF message loop (500ms)");
+    for _ in 0..50 {
         cef::do_message_loop_work();
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -761,8 +761,8 @@ fn main() -> Result<()> {
     // own shutdown.
     info!("shutdown: dropping host");
     drop(app_state.host.take());
-    info!("shutdown: pumping CEF after host drop (300ms)");
-    for _ in 0..30 {
+    info!("shutdown: pumping CEF after host drop (100ms)");
+    for _ in 0..10 {
         cef::do_message_loop_work();
         std::thread::sleep(Duration::from_millis(10));
     }
