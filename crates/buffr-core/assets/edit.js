@@ -34,6 +34,23 @@
     var SENTINEL = '%%SENTINEL%%';
     var OVERLAY_CLASS = '%%OVERLAY_CLASS%%';
 
+    // Strip any auto-focus the page applied on load. buffr starts every
+    // page in Normal mode; the user explicitly enters Insert via `i`
+    // or by clicking an input. Without this, sites like google.com
+    // autofocus their search box and create the click-on-already-focused
+    // race where DOM doesn't fire focusin.
+    function clearInitialFocus() {
+        var el = document.activeElement;
+        if (el && el !== document.body && el !== document.documentElement
+            && typeof el.blur === 'function') {
+            el.blur();
+        }
+    }
+    clearInitialFocus();
+    if (document.readyState !== 'complete') {
+        window.addEventListener('load', clearInitialFocus, { once: true });
+    }
+
     // ---- stable per-element ID ------------------------------------------
     //
     // We need a stable string ID for each DOM element so the Rust side can
