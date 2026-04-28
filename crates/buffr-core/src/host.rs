@@ -332,6 +332,23 @@ impl BrowserHost {
         self.mode
     }
 
+    /// Returns the current main-frame URL of the active tab, freshly
+    /// queried from CEF. Empty string if no active tab or no main frame.
+    pub fn active_tab_live_url(&self) -> String {
+        let Ok(tabs) = self.tabs.lock() else {
+            return String::new();
+        };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(frame) = t.browser.main_frame()
+        {
+            CefStringUtf16::from(&frame.url()).to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// Clone the shared OSR frame buffer handle.
     ///
     /// The compositor (step 4) holds this to read the latest painted frame

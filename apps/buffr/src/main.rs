@@ -3014,6 +3014,11 @@ impl ApplicationHandler for AppState {
                     mode = ?host.mode(),
                     "browser host created"
                 );
+                // Wayland may not fire Focused(true) on initial map.
+                // Tell CEF the browser is focused so Google's
+                // document.hasFocus() checks pass and inputs accept
+                // focus on first click.
+                host.osr_focus(true);
                 self.host = Some(host);
             }
             Err(err) => {
@@ -3420,6 +3425,17 @@ impl ApplicationHandler for AppState {
         if self.sync_permissions_prompt() {
             self.resync_cef_rect();
             self.request_redraw();
+        }
+
+        // Live URL sync: poll the active tab's main-frame URL each tick
+        // and push it into the statusline. Cheap (one CEF call + string
+        // compare); redraw only on change.
+        if let Some(host) = self.host.as_ref() {
+            let live = host.active_tab_live_url();
+            if !live.is_empty() && live != self.statusline.url {
+                self.statusline.url = live;
+                self.request_redraw();
+            }
         }
 
         // Download notices: drop any that have lived past their expiry
