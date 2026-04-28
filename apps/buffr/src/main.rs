@@ -1389,6 +1389,9 @@ struct AppState {
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
+    /// Last full window title we set. Cached so we only call winit's
+    /// `set_title` when mode or URL actually changes.
+    current_title: String,
     /// Find-in-page mailbox shared with the CEF `FindHandler`. The UI
     /// thread polls this each frame and copies the latest result
     /// into `statusline.find_query`.
@@ -1508,11 +1511,6 @@ struct AppState {
     /// we know there is new content to show; when they match we can skip
     /// the BGRA→RGB copy and re-present the existing buffer.
     last_osr_generation: u64,
-    /// Timestamp of the last OSR redraw request.  Used by `about_to_wait`
-    /// to throttle to ≈60 Hz while paint→redraw signalling is still polled.
-    /// TODO: replace with a direct signal from `OsrPaintHandler::on_paint`
-    ///       once a cross-thread wakeup channel (e.g. EventLoopProxy) lands.
-    last_osr_redraw: Instant,
     /// Last known cursor position in browser-region coordinates.
     /// Updated on every `CursorMoved` event; used when forwarding click and
     /// wheel events so we don't have to thread the position through each arm.
@@ -1643,6 +1641,7 @@ impl AppState {
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
+            current_title: String::new(),
             find_sink,
             hint_sink,
             edit_sink,
@@ -1667,7 +1666,6 @@ impl AppState {
             counters_flush_at: Instant::now(),
             update_checker,
             last_osr_generation: 0,
-            last_osr_redraw: Instant::now(),
             osr_cursor: (0, 0),
             osr_last_click_at: Instant::now(),
             osr_last_click_button: None,
@@ -1684,15 +1682,21 @@ impl AppState {
         }
     }
 
-    /// Window-title prefix. Persistent runs render `buffr — NORMAL`;
+    /// Window title. Persistent runs render `buffr — NORMAL — <url>`;
     /// private mode inserts a marker between the brand and the mode
     /// stamp so glancing at the taskbar makes the privacy state
-    /// obvious: `buffr — PRIVATE — NORMAL`.
-    fn title_for(&self, mode_label: &str) -> String {
-        if self.private {
+    /// obvious: `buffr — PRIVATE — NORMAL — <url>`. The URL trailer is
+    /// omitted when no page is loaded yet.
+    fn title_for(&self, mode_label: &str, url: &str) -> String {
+        let head = if self.private {
             format!("buffr — PRIVATE — {mode_label}")
         } else {
             format!("buffr — {mode_label}")
+        };
+        if url.is_empty() {
+            head
+        } else {
+            format!("{head} — {url}")
         }
     }
 
@@ -2009,10 +2013,13 @@ impl AppState {
             Err(_) => (PageMode::Normal, None),
         };
         let label = mode_label(mode);
-        if label != self.current_mode_label {
-            self.current_mode_label = label;
+        self.current_mode_label = label;
+        let url = self.statusline.url.clone();
+        let title = self.title_for(label, &url);
+        if title != self.current_title {
+            self.current_title = title.clone();
             if let Some(window) = self.window.as_ref() {
-                window.set_title(&self.title_for(label));
+                window.set_title(&title);
             }
         }
         // Statusline reflects mode + count every refresh — both can
@@ -3611,7 +3618,7 @@ impl ApplicationHandler for AppState {
             return;
         }
         let win_attrs = Window::default_attributes()
-            .with_title(self.title_for(self.current_mode_label))
+            .with_title(self.title_for(self.current_mode_label, &self.statusline.url))
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
         let window = match event_loop.create_window(win_attrs) {
             Ok(w) => w,
@@ -4199,6 +4206,7 @@ impl ApplicationHandler for AppState {
         if let Some((live, active_idx, current_ids, zoom)) = url_poll_result {
             if !live.is_empty() && live != self.statusline.url {
                 self.statusline.url = live.clone();
+                self.refresh_title();
                 self.request_redraw();
             }
             // Session dirty detection: URL changed since last save.
@@ -4286,29 +4294,11 @@ impl ApplicationHandler for AppState {
             }
         }
 
-        // OSR poll-redraw throttle — ~60 Hz.
-        //
-        // We paint directly from `about_to_wait` rather than relying on
-        // `request_redraw` -> RedrawRequested. On Wayland, request_redraw
-        // is a hint that's only delivered on the compositor's next frame
-        // callback; if nothing's animating (idle page), no callback ever
-        // arrives and the surface freezes. The most visible failure was
-        // a window resize: after osr_resize / was_resized scheduled a
-        // CEF repaint, the new on_paint output never reached softbuffer
-        // because RedrawRequested never fired. Painting unconditionally
-        // every 16 ms keeps the surface in lock-step with whatever the
-        // OSR frame buffer holds — including post-resize updates.
-        //
-        // TODO: replace with EventLoopProxy-based wakeup from on_paint.
-        if let Some(host) = self.host.as_ref()
-            && host.mode() == buffr_core::HostMode::Osr
-        {
-            let now = Instant::now();
-            if now.duration_since(self.last_osr_redraw) >= Duration::from_millis(16) {
-                self.last_osr_redraw = now;
-                self.paint_chrome();
-            }
-        }
+        // No idle paint loop: we respect Wayland's frame-callback model
+        // and only repaint on explicit `request_redraw` (e.g. resize,
+        // input, mode/url change). OSR `on_paint` updates that arrive
+        // while no redraw is queued show on the next compositor-driven
+        // frame.
     }
 }
 
