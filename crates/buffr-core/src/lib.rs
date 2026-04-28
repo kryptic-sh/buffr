@@ -77,7 +77,10 @@ pub fn drain_popup_urls(q: &PopupQueue) -> Vec<String> {
     }
     Vec::new()
 }
-pub use new_tab::{NEW_TAB_URL, register_buffr_handler_factory, register_buffr_scheme};
+pub use new_tab::{
+    NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_URL, NewTabHtmlProvider,
+    register_buffr_handler_factory, register_buffr_handler_factory_static, register_buffr_scheme,
+};
 pub use permissions::{
     PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
     capabilities_for_request_mask, drain_with_defer as drain_permissions_with_defer,

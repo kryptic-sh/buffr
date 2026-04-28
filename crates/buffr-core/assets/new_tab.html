@@ -6,26 +6,63 @@
   <style>
     :root { color-scheme: dark light; }
     html, body {
-      margin: 0; padding: 0; height: 100vh;
-      display: flex; align-items: center; justify-content: center;
+      margin: 0; padding: 0; min-height: 100vh;
       font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
       background: #1a1b26; color: #c0caf5;
     }
-    .wrap { text-align: center; }
+    main {
+      max-width: 56rem; margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+    header { text-align: center; margin-bottom: 3rem; }
     h1 { font-size: 4rem; margin: 0; letter-spacing: -0.05em; }
-    p  { font-size: 1rem; opacity: 0.6; margin: 1rem 0 0; }
+    header p { font-size: 1rem; opacity: 0.6; margin: 1rem 0 0; }
+    section h2 {
+      font-size: 0.85rem; text-transform: uppercase;
+      letter-spacing: 0.1em; opacity: 0.55;
+      margin: 0 0 0.75rem; font-weight: 600;
+    }
+    table {
+      width: 100%; border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    td {
+      padding: 0.35rem 0.5rem;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    td.k {
+      width: 12rem; white-space: nowrap;
+      font-family: ui-monospace, monospace;
+    }
+    td.a {
+      opacity: 0.85;
+      font-family: ui-monospace, monospace;
+    }
     kbd {
       font-family: ui-monospace, monospace;
       background: rgba(255,255,255,0.08);
       padding: 0.15em 0.4em; border-radius: 4px;
-      font-size: 0.85rem;
+      font-size: 0.85em;
+    }
+    .empty {
+      opacity: 0.5; font-style: italic; padding: 1rem 0;
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>buffr</h1>
-    <p>Press <kbd>e</kbd> to open the omnibar.</p>
-  </div>
+  <main>
+    <header>
+      <h1>buffr</h1>
+      <p>Press <kbd>e</kbd> to open the omnibar.</p>
+    </header>
+    <section>
+      <h2>Keybindings</h2>
+      <table>
+        <tbody>
+        <!--KEYBINDS-->
+        </tbody>
+      </table>
+    </section>
+  </main>
 </body>
 </html>

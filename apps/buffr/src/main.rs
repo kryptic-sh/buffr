@@ -556,11 +556,6 @@ fn main() -> Result<()> {
     }
     info!("cef initialized");
 
-    // Register the `buffr://` scheme handler factory so that internal URLs
-    // such as `buffr://new` (the new-tab page) are served by Rust code
-    // rather than delegated to the network stack.
-    register_buffr_handler_factory();
-
     // Phase 6 telemetry: count the successful CEF init as one
     // `app_starts` event. No-op when disabled. We tick *after*
     // `cef::initialize` returns 1 so a launch that crashes during CEF
@@ -578,6 +573,16 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let engine = Arc::new(Mutex::new(Engine::new(keymap)));
+
+    // Register the `buffr://` scheme handler factory after the engine
+    // exists so the new-tab renderer can read the live keymap on each
+    // request (hot-reloaded user overrides land on the next visit).
+    {
+        let engine_for_newtab = Arc::clone(&engine);
+        let provider: buffr_core::NewTabHtmlProvider =
+            Arc::new(move || render_new_tab_html(&engine_for_newtab));
+        register_buffr_handler_factory(provider);
+    }
 
     // -------- spawn config watcher (keymap-only hot reload) ------------
     //
@@ -1073,6 +1078,58 @@ fn print_update_status(status: &buffr_core::UpdateStatus) {
 /// Project [`buffr_core::UpdateStatus`] onto the
 /// [`buffr_ui::UpdateIndicator`] surface. `Available` and `Stale`
 /// surface; everything else hides.
+/// Render the `buffr://new` page bytes — substitutes the keymap into
+/// the embedded template each time the page is requested so config
+/// hot-reloads land without a binary rebuild.
+fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Ok(e) = engine.lock() {
+        let entries = e.keymap().entries(buffr_modal::PageMode::Normal);
+        for (chords, action) in entries {
+            let keys: String = chords.iter().map(|c| c.to_string()).collect();
+            rows.push((keys, format!("{action:?}")));
+        }
+    }
+    // Sort by keys for stable output.
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let body = if rows.is_empty() {
+        "<tr><td class=\"empty\" colspan=\"2\">no bindings</td></tr>".to_string()
+    } else {
+        let mut s = String::with_capacity(rows.len() * 64);
+        for (keys, action) in rows {
+            use std::fmt::Write;
+            let _ = write!(
+                s,
+                "<tr><td class=\"k\"><kbd>{}</kbd></td><td class=\"a\">{}</td></tr>",
+                html_escape(&keys),
+                html_escape(&action),
+            );
+        }
+        s
+    };
+    buffr_core::NEW_TAB_HTML_TEMPLATE
+        .replacen(buffr_core::NEW_TAB_KEYBINDS_MARKER, &body, 1)
+        .into_bytes()
+}
+
+/// Minimal HTML escaper for the new-tab page renderer. Covers the
+/// five characters that matter when injecting keybinding labels into
+/// table cells.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn update_indicator_from(status: &buffr_core::UpdateStatus) -> Option<buffr_ui::UpdateIndicator> {
     match status {
         buffr_core::UpdateStatus::Available { .. } => Some(buffr_ui::UpdateIndicator::Available),
@@ -2986,6 +3043,27 @@ impl AppState {
                 host.run_edit_cycle(!self.modifiers.shift_key());
             }
             return true;
+        }
+
+        // Conventional-browser tab shortcuts that the user expects to
+        // work even while typing in an input: `<C-t>`, `<C-S-t>`,
+        // `<C-w>`. Dispatch the matching PageAction directly so the
+        // user doesn't have to leave Insert first.
+        if event.state == winit::event::ElementState::Pressed
+            && self.modifiers.control_key()
+            && let Some(PlannedInput::Char(c, _)) = planned
+        {
+            let lower = c.to_ascii_lowercase();
+            let action = match (lower, self.modifiers.shift_key()) {
+                ('t', false) => Some(buffr_modal::PageAction::TabNewRight),
+                ('t', true) => Some(buffr_modal::PageAction::ReopenClosedTab),
+                ('w', false) => Some(buffr_modal::PageAction::TabClose),
+                _ => None,
+            };
+            if let Some(a) = action {
+                self.dispatch_action(&a);
+                return true;
+            }
         }
 
         // Forward every other key directly to CEF. The page handles it

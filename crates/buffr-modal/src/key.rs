@@ -283,6 +283,74 @@ impl fmt::Display for Modifiers {
     }
 }
 
+impl fmt::Display for NamedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            NamedKey::Esc => "Esc",
+            NamedKey::CR => "CR",
+            NamedKey::Tab => "Tab",
+            NamedKey::BackTab => "S-Tab",
+            NamedKey::BS => "BS",
+            NamedKey::Space => "Space",
+            NamedKey::Up => "Up",
+            NamedKey::Down => "Down",
+            NamedKey::Left => "Left",
+            NamedKey::Right => "Right",
+            NamedKey::Home => "Home",
+            NamedKey::End => "End",
+            NamedKey::PageUp => "PageUp",
+            NamedKey::PageDown => "PageDown",
+            NamedKey::Insert => "Insert",
+            NamedKey::Delete => "Delete",
+            NamedKey::F(n) => return write!(f, "F{n}"),
+            NamedKey::Leader => "leader",
+        };
+        f.write_str(s)
+    }
+}
+
+impl fmt::Display for KeyChord {
+    /// Render as vim notation — `<C-w>`, `gT`, `<S-Tab>`. Bare ASCII
+    /// chars without modifiers (or with only the implicit Shift on an
+    /// uppercase letter) print without angle brackets to match how
+    /// users write the binding in their config.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mods = self.modifiers;
+        // Bare chord (no modifiers) — letter / punctuation prints raw.
+        if mods.is_empty() {
+            return match self.key {
+                Key::Char(c) => write!(f, "{c}"),
+                Key::Named(n) => write!(f, "<{n}>"),
+            };
+        }
+        // Shift-only on uppercase letter: drop the modifier since the
+        // uppercase form already implies Shift in the parser.
+        if mods == Modifiers::SHIFT
+            && let Key::Char(c) = self.key
+            && c.is_ascii_uppercase()
+        {
+            return write!(f, "{c}");
+        }
+        write!(f, "<")?;
+        if mods.contains(Modifiers::CTRL) {
+            write!(f, "C-")?;
+        }
+        if mods.contains(Modifiers::SHIFT) {
+            write!(f, "S-")?;
+        }
+        if mods.contains(Modifiers::ALT) {
+            write!(f, "A-")?;
+        }
+        if mods.contains(Modifiers::SUPER) {
+            write!(f, "D-")?;
+        }
+        match self.key {
+            Key::Char(c) => write!(f, "{c}>"),
+            Key::Named(n) => write!(f, "{n}>"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

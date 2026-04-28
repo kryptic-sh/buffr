@@ -22,9 +22,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// The URL opened when the user presses `t` (TabNew).
 pub const NEW_TAB_URL: &str = "buffr://new";
 
-/// Embedded new-tab HTML — included at compile time from the assets directory.
-static NEW_TAB_HTML: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/new_tab.html"));
+/// Embedded new-tab HTML template. Contains a `<!--KEYBINDS-->` marker
+/// that the apps layer fills in with rendered keybindings each time
+/// the page is requested, so a config hot-reload is reflected on the
+/// next visit without a binary rebuild.
+pub static NEW_TAB_HTML_TEMPLATE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/new_tab.html"));
+
+/// The marker the apps layer replaces with rendered keybinding rows.
+pub const NEW_TAB_KEYBINDS_MARKER: &str = "<!--KEYBINDS-->";
+
+/// Closure invoked on each `buffr://new` request to produce the page
+/// bytes. Returning a fresh `Vec<u8>` each call lets the apps layer
+/// re-render the dynamic keybinding section without restarting CEF.
+pub type NewTabHtmlProvider = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
+
+/// Fallback provider — serves the raw template (with the keybinds
+/// marker still in it). Used by callers that don't supply a renderer
+/// and by tests.
+fn static_provider() -> NewTabHtmlProvider {
+    Arc::new(|| NEW_TAB_HTML_TEMPLATE.as_bytes().to_vec())
+}
 
 /// Register the `buffr` scheme with CEF.
 ///
@@ -43,11 +61,21 @@ pub fn register_buffr_scheme(registrar: &mut cef::SchemeRegistrar) {
 
 /// Register the scheme handler factory for `buffr://`.
 ///
-/// Must be called **after** `cef::initialize` returns successfully.
-pub fn register_buffr_handler_factory() {
+/// `provider` is invoked on every page request to produce the response
+/// body. Pass [`static_provider`]'s output (or a custom closure) to
+/// inject dynamic content like the live keymap. Must be called
+/// **after** `cef::initialize` returns successfully.
+pub fn register_buffr_handler_factory(provider: NewTabHtmlProvider) {
     let scheme = CefString::from("buffr");
-    let mut factory = BuffrSchemeHandlerFactory::new();
+    let mut factory = BuffrSchemeHandlerFactory::new(provider);
     cef::register_scheme_handler_factory(Some(&scheme), None, Some(&mut factory));
+}
+
+/// Register with the static template only (no dynamic content). Useful
+/// in tests and as a stop-gap before the apps layer wires its renderer
+/// in.
+pub fn register_buffr_handler_factory_static() {
+    register_buffr_handler_factory(static_provider());
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +83,9 @@ pub fn register_buffr_handler_factory() {
 // ---------------------------------------------------------------------------
 
 wrap_scheme_handler_factory! {
-    pub struct BuffrSchemeHandlerFactory;
+    pub struct BuffrSchemeHandlerFactory {
+        provider: NewTabHtmlProvider,
+    }
 
     impl SchemeHandlerFactory {
         fn create(
@@ -65,7 +95,13 @@ wrap_scheme_handler_factory! {
             _scheme_name: Option<&CefString>,
             _request: Option<&mut cef::Request>,
         ) -> Option<cef::ResourceHandler> {
-            Some(BuffrResourceHandler::new(Arc::new(AtomicUsize::new(0))))
+            // Fresh bytes per request so a config hot-reload picks up
+            // on the next visit.
+            let bytes = (self.provider)();
+            Some(BuffrResourceHandler::new(
+                Arc::new(bytes),
+                Arc::new(AtomicUsize::new(0)),
+            ))
         }
     }
 }
@@ -76,6 +112,7 @@ wrap_scheme_handler_factory! {
 
 wrap_resource_handler! {
     pub struct BuffrResourceHandler {
+        bytes: Arc<Vec<u8>>,
         cursor: Arc<AtomicUsize>,
     }
 
@@ -104,7 +141,7 @@ wrap_resource_handler! {
                 r.set_mime_type(Some(&mime));
             }
             if let Some(len) = response_length {
-                *len = NEW_TAB_HTML.len() as i64;
+                *len = self.bytes.len() as i64;
             }
         }
 
@@ -116,7 +153,7 @@ wrap_resource_handler! {
             bytes_read: Option<&mut ::std::os::raw::c_int>,
             _callback: Option<&mut cef::ResourceReadCallback>,
         ) -> ::std::os::raw::c_int {
-            let len = NEW_TAB_HTML.len();
+            let len = self.bytes.len();
             let pos = self.cursor.load(Ordering::SeqCst);
             if pos >= len || bytes_to_read <= 0 {
                 if let Some(br) = bytes_read {
@@ -131,7 +168,7 @@ wrap_resource_handler! {
             // of at least `bytes_to_read` bytes.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    NEW_TAB_HTML.as_ptr().add(pos),
+                    self.bytes.as_ptr().add(pos),
                     data_out,
                     to_copy,
                 );
