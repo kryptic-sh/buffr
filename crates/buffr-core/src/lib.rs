@@ -27,8 +27,9 @@ pub mod updates;
 
 /// Off-screen rendering support. Auto-detected at runtime based on the
 /// `RawWindowHandle` variant — Wayland handles route to OSR, X11 handles
-/// to windowed embedding. RenderHandler wiring lands in step 2.
+/// to windowed embedding.
 pub mod osr;
+pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
 
 pub use app::{
     BuffrApp, ProfilePaths, force_renderer_accessibility_enabled, set_force_renderer_accessibility,

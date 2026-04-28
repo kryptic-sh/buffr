@@ -42,6 +42,7 @@ use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
     build_inject_script,
 };
+use crate::osr::{OsrFrame, OsrPaintHandler, OsrViewState, SharedOsrFrame, SharedOsrViewState};
 use crate::permissions::PermissionsQueue;
 use crate::telemetry::{KEY_TABS_OPENED, UsageCounters};
 use crate::{CoreError, handlers};
@@ -197,6 +198,14 @@ pub struct BrowserHost {
     /// goes through this handle. The counters themselves no-op on
     /// `enabled = false`, so the `Some(...)` arm is cheap when off.
     counters: Option<Arc<UsageCounters>>,
+    /// Shared OSR frame buffer. Written by the CEF IO thread
+    /// (`OsrPaintHandler::on_paint`), read by the compositor (step 4).
+    /// Always allocated — cheap even in windowed mode.
+    osr_frame: SharedOsrFrame,
+    /// Shared OSR viewport dimensions and scale factor. Written from
+    /// the UI thread via [`Self::osr_resize`]; read by the CEF IO
+    /// thread inside `OsrPaintHandler::view_rect`.
+    osr_view: SharedOsrViewState,
 }
 
 impl BrowserHost {
@@ -281,6 +290,16 @@ impl BrowserHost {
             _ => HostMode::Osr,
         };
         info!(target: "buffr_core::host", %url, ?mode, "creating CEF browser (initial tab)");
+        let (osr_w, osr_h) = initial_size;
+        let osr_view = Arc::new(OsrViewState::new());
+        osr_view
+            .width
+            .store(osr_w, std::sync::atomic::Ordering::Relaxed);
+        osr_view
+            .height
+            .store(osr_h, std::sync::atomic::Ordering::Relaxed);
+        let osr_frame = Arc::new(Mutex::new(OsrFrame::new(osr_w, osr_h)));
+
         let host = Self {
             tabs: Mutex::new(Vec::new()),
             active: Mutex::new(None),
@@ -302,6 +321,8 @@ impl BrowserHost {
             edit_sink,
             hint_alphabet,
             counters,
+            osr_frame,
+            osr_view,
         };
         host.open_tab(url)?;
         Ok(host)
@@ -323,6 +344,44 @@ impl BrowserHost {
     /// Current rendering mode (windowed embedding or OSR).
     pub fn mode(&self) -> HostMode {
         self.mode
+    }
+
+    /// Clone the shared OSR frame buffer handle.
+    ///
+    /// The compositor (step 4) holds this to read the latest painted frame
+    /// each vsync without holding any CEF locks.
+    pub fn osr_frame(&self) -> SharedOsrFrame {
+        self.osr_frame.clone()
+    }
+
+    /// Clone the shared OSR viewport state handle.
+    ///
+    /// The UI thread calls [`Self::osr_resize`] to update the dimensions;
+    /// the CEF IO thread reads them inside `view_rect`.
+    pub fn osr_view(&self) -> SharedOsrViewState {
+        self.osr_view.clone()
+    }
+
+    /// Notify CEF that the viewport has been resized.
+    ///
+    /// Updates the atomic viewport dimensions so the next `view_rect` call
+    /// from CEF returns the correct size, then calls `was_resized()` on the
+    /// active browser so CEF schedules a repaint at the new dimensions.
+    pub fn osr_resize(&self, width: u32, height: u32) {
+        use std::sync::atomic::Ordering;
+        self.osr_view.width.store(width, Ordering::Relaxed);
+        self.osr_view.height.store(height, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_size.lock() {
+            *last = (width, height);
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            host.was_resized();
+        }
     }
 
     fn mint_id(&self) -> TabId {
@@ -407,6 +466,17 @@ impl BrowserHost {
 
         let cef_url = CefString::from(url);
         let settings = BrowserSettings::default();
+
+        // Build the render handler for OSR mode; None for windowed.
+        let render_handler = if self.mode == HostMode::Osr {
+            Some(OsrPaintHandler::new(
+                self.osr_frame.clone(),
+                self.osr_view.clone(),
+            ))
+        } else {
+            None
+        };
+
         let mut client = handlers::make_client(
             self.history.clone(),
             self.downloads.clone(),
@@ -419,6 +489,7 @@ impl BrowserHost {
             self.edit_sink.clone(),
             self.counters.clone(),
             self.notice_queue.clone(),
+            render_handler,
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),

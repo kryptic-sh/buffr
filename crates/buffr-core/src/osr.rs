@@ -1,97 +1,179 @@
-//! Off-screen rendering (OSR) host — native Wayland path.
+//! Off-screen rendering (OSR) shared frame buffer + RenderHandler.
 //!
-//! ## Status: scaffold
+//! ## Architecture
 //!
-//! Phase 3 work. Public surface here is intentionally a stub so the
-//! shape is visible from the outside, but no entry point does real
-//! work — every constructor panics with `unimplemented!()`.
-//!
-//! ## Architecture (planned)
-//!
-//! In windowed mode (default build, see [`crate::host::BrowserHost`])
-//! CEF owns the embedded X11 child window itself and we hand it a
-//! parent XID. That doesn't work on Wayland because:
-//!
-//! 1. Wayland has no concept of foreign-process subsurface embedding
-//!    that CEF can target.
-//! 2. CEF's Linux backend hard-codes X11 for windowed mode.
-//!
-//! OSR sidesteps both: CEF renders into a CPU/GPU buffer that we
-//! receive in `CefRenderHandler::OnPaint`, and *we* composite it onto
-//! a winit-owned Wayland surface. That decouples rendering from
-//! windowing entirely.
+//! CEF's OSR path skips all windowed embedding:
 //!
 //! ```text
-//!   +--------------+    OnPaint(rgba, w, h)     +----------------------+
-//!   |  CEF (OSR)   | -------------------------> |  Compositor (wgpu /  |
-//!   |  no window   |                            |  softbuffer fallback)|
+//!   +--------------+    on_paint(BGRA, w, h)    +----------------------+
+//!   |  CEF (OSR)   | -------------------------> |  OsrPaintHandler     |
+//!   |  no window   |                            |  → SharedOsrFrame    |
 //!   +--------------+                            +----------+-----------+
 //!                                                          |
 //!                                                          v
 //!                                              +-----------+----------+
-//!                                              |   winit Wayland      |
-//!                                              |   surface            |
+//!                                              |   step 4 compositor  |
+//!                                              |   (winit surface)    |
 //!                                              +----------------------+
 //! ```
 //!
-//! The fallback path (`softbuffer`) lets us ship Wayland support even
-//! on systems without a wgpu-capable GPU; the fast path uses a wgpu
-//! texture upload + a fullscreen quad blit.
+//! [`OsrPaintHandler`] implements CEF's `RenderHandler` trait. It writes
+//! raw BGRA pixels into a [`SharedOsrFrame`] on every `on_paint` call and
+//! bumps a monotonic `generation` counter so downstream compositors can
+//! skip work when nothing changed.
 //!
-//! ## See also
-//!
-//! - `PLAN.md` — Phase 3 OSR roadmap.
-//! - [`crate::host::HostMode`] — runtime mode selection.
+//! [`OsrViewState`] holds the current viewport dimensions as atomics so
+//! both the CEF IO thread (reading from `view_rect`) and the UI thread
+//! (writing via `BrowserHost::osr_resize`) can access them without a mutex.
 
-use raw_window_handle::RawWindowHandle;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::CoreError;
+use cef::*;
 
-/// Off-screen rendering browser host.
+// ── Shared data types ──────────────────────────────────────────────────────────
+
+/// A single captured OSR frame.
 ///
-/// Owns a CEF browser running in windowless mode plus the compositor
-/// that blits its frames onto a Wayland surface. Fields are TBD until
-/// Phase 3 wires real CEF + wgpu in.
-pub struct OsrHost {
-    // Intentionally empty for the scaffold. Real fields will land with
-    // the Phase 3 implementation: a `cef::Browser` handle, a
-    // `Box<dyn Compositor>`, and the parent window handle for
-    // resize/DPI tracking.
-    _phantom: (),
+/// The `pixels` buffer is raw BGRA, 4 bytes/pixel; length == `width * height * 4`.
+/// `generation` is bumped on every successful [`on_paint`] so consumers can
+/// skip compositing when nothing changed.
+pub struct OsrFrame {
+    pub width: u32,
+    pub height: u32,
+    /// BGRA pixels straight from CEF; length = width * height * 4.
+    pub pixels: Vec<u8>,
+    /// Bumped on every successful on_paint so consumers can skip composite
+    /// when nothing changed.
+    pub generation: u64,
 }
 
-impl OsrHost {
-    /// Construct an OSR host bound to `window_handle`, navigating to
-    /// `url`, with frames forwarded to `compositor`.
-    ///
-    /// **Not yet implemented.** Panics with `unimplemented!()` — see
-    /// `PLAN.md` (Phase 3).
-    pub fn new(
-        _window_handle: RawWindowHandle,
-        url: &str,
-        _compositor: Box<dyn Compositor>,
-    ) -> Result<Self, CoreError> {
-        tracing::error!(%url, "OsrHost::new called — OSR mode is not implemented yet");
-        unimplemented!("Phase 3: wire CEF windowless mode + wgpu compositor")
+impl OsrFrame {
+    /// Allocate a zeroed frame of the given dimensions.
+    pub fn new(width: u32, height: u32) -> Self {
+        let len = (width as usize) * (height as usize) * 4;
+        Self {
+            width,
+            height,
+            pixels: vec![0u8; len],
+            generation: 0,
+        }
     }
 }
 
-/// Sink for CEF paint events.
+/// Thread-safe shared frame buffer.
+pub type SharedOsrFrame = Arc<Mutex<OsrFrame>>;
+
+/// Viewport dimensions + device scale factor, readable from any thread.
 ///
-/// Implementations upload the RGBA `buffer` (size `w * h * 4`,
-/// pre-multiplied BGRA per CEF's convention) into a GPU texture and
-/// blit it onto the host window's surface.
-///
-/// The Phase 3 implementation will provide:
-///
-/// - `WgpuCompositor` — fast path. Uploads via `queue.write_texture`,
-///   draws a fullscreen quad through a `wgpu::RenderPipeline`.
-/// - `SoftbufferCompositor` — CPU fallback. Direct memcpy into a
-///   `softbuffer::Buffer`.
-pub trait Compositor: Send {
-    /// Called once per CEF frame with a freshly painted buffer.
-    ///
-    /// `buffer` is borrowed for the duration of the call; implementors
-    /// must copy/upload before returning.
-    fn on_paint(&mut self, buffer: &[u8], w: u32, h: u32);
+/// All values are accessed with `Ordering::Relaxed` — they are written from
+/// the UI thread and read from the CEF IO thread. Tearing is not a concern
+/// because each field is a single 32-bit atomic; slight lag between a width
+/// and height write is acceptable (CEF will call `view_rect` again).
+pub struct OsrViewState {
+    pub width: AtomicU32,
+    pub height: AtomicU32,
+    /// Device scale factor stored as thousandths (e.g. 1000 = 1.0×, 1500 = 1.5×).
+    pub scale: AtomicU32,
+}
+
+impl OsrViewState {
+    /// Default viewport: 1280×800, scale 1.0×.
+    pub fn new() -> Self {
+        Self {
+            width: AtomicU32::new(1280),
+            height: AtomicU32::new(800),
+            scale: AtomicU32::new(1000),
+        }
+    }
+}
+
+impl Default for OsrViewState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Thread-safe shared viewport state.
+pub type SharedOsrViewState = Arc<OsrViewState>;
+
+// ── RenderHandler impl ─────────────────────────────────────────────────────────
+
+wrap_render_handler! {
+    pub struct OsrPaintHandler {
+        frame: SharedOsrFrame,
+        view: SharedOsrViewState,
+    }
+
+    impl RenderHandler {
+        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            let Some(rect) = rect else { return };
+            rect.x = 0;
+            rect.y = 0;
+            rect.width = self.view.width.load(Ordering::Relaxed) as i32;
+            rect.height = self.view.height.load(Ordering::Relaxed) as i32;
+        }
+
+        fn screen_point(
+            &self,
+            _browser: Option<&mut Browser>,
+            view_x: ::std::os::raw::c_int,
+            view_y: ::std::os::raw::c_int,
+            screen_x: Option<&mut ::std::os::raw::c_int>,
+            screen_y: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            // No multi-monitor positioning yet — view coords == screen coords.
+            if let Some(sx) = screen_x {
+                *sx = view_x;
+            }
+            if let Some(sy) = screen_y {
+                *sy = view_y;
+            }
+            1
+        }
+
+        // The `buffer` raw pointer is provided by CEF and is valid for
+        // `width * height * 4` bytes for the duration of this call. The
+        // lint fires because the trait method signature contains `*const u8`,
+        // but the safety obligation is on CEF, not on our call site.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        fn on_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            buffer: *const u8,
+            width: ::std::os::raw::c_int,
+            height: ::std::os::raw::c_int,
+        ) {
+            // Only handle the main View paint. Popup compositing is deferred.
+            if type_.get_raw() != PaintElementType::VIEW.get_raw() {
+                tracing::trace!("osr: on_paint Popup — deferred (TODO: composite popup)");
+                return;
+            }
+
+            let w = width as u32;
+            let h = height as u32;
+            let len = (w as usize) * (h as usize) * 4;
+
+            // SAFETY: CEF guarantees `buffer` points to `width * height * 4`
+            // valid bytes for the duration of this call.
+            let src = unsafe { std::slice::from_raw_parts(buffer, len) };
+
+            let Ok(mut guard) = self.frame.lock() else {
+                tracing::warn!("osr: on_paint — frame mutex poisoned, skipping");
+                return;
+            };
+
+            // Resize the backing buffer only when dimensions change.
+            if guard.width != w || guard.height != h {
+                guard.pixels.resize(len, 0);
+                guard.width = w;
+                guard.height = h;
+            }
+
+            guard.pixels.copy_from_slice(src);
+            guard.generation = guard.generation.wrapping_add(1);
+        }
+    }
 }

@@ -55,6 +55,9 @@ use crate::open_finder::{OsSpawn, open_path};
 /// handlers when CEF asks for them. This is the entry point
 /// `BrowserHost::new` uses; consumers don't construct `BuffrClient`
 /// directly.
+///
+/// `render_handler` is `Some` only in OSR mode; windowed mode passes `None`
+/// and the default no-op path is preserved.
 #[allow(clippy::too_many_arguments)]
 pub fn make_client(
     history: Arc<History>,
@@ -68,6 +71,7 @@ pub fn make_client(
     edit_sink: EditEventSink,
     counters: Option<Arc<UsageCounters>>,
     notice_queue: DownloadNoticeQueue,
+    render_handler: Option<RenderHandler>,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -81,6 +85,7 @@ pub fn make_client(
         edit_sink,
         counters,
         notice_queue,
+        render_handler,
     )
 }
 
@@ -152,9 +157,14 @@ wrap_client! {
         edit_sink: EditEventSink,
         counters: Option<Arc<UsageCounters>>,
         notice_queue: DownloadNoticeQueue,
+        render_handler: Option<RenderHandler>,
     }
 
     impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> {
+            self.render_handler.clone()
+        }
+
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(BuffrLoadHandler::new(
                 self.history.clone(),
