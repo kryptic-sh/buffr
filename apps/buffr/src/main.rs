@@ -58,11 +58,13 @@ use buffr_ui::{
 
 mod render;
 mod session;
+mod wayland_sub;
 use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
 use raw_window_handle::HasWindowHandle;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
+use wayland_sub::WaylandSub;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -1644,6 +1646,12 @@ struct AppState {
     /// When equal to `chrome_generation`, the texture is valid and no
     /// repaint is needed.
     last_painted_chrome_gen: u64,
+    /// Wayland `wl_subsurface` for the statusline (PoC). `Some` only on
+    /// Wayland sessions; `None` on X11, macOS, Windows, or when global
+    /// binding fails. When `Some`, the statusline rows in the main chrome
+    /// buffer are skipped — the subsurface paints them independently so
+    /// they stay anchored to the window bottom even during top-edge drags.
+    wayland_sub: Option<WaylandSub>,
 }
 
 /// Edit-mode focus state machine.
@@ -1794,6 +1802,8 @@ impl AppState {
             event_proxy,
             chrome_generation: 1,
             last_painted_chrome_gen: 0,
+            // Initialized in `resumed` after the window is created.
+            wayland_sub: None,
         }
     }
 
@@ -2352,6 +2362,9 @@ impl AppState {
         let confirm_close_pinned = self.confirm_close_pinned;
         let permissions_prompt = self.permissions_prompt.clone();
         let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
+        // When the subsurface is active, skip the statusline in the main
+        // chrome buffer so it isn't double-drawn over the subsurface pixels.
+        let sub_active = self.wayland_sub.is_some();
 
         let frame_start = Instant::now();
 
@@ -2385,6 +2398,7 @@ impl AppState {
                         confirm_close_pinned,
                         permissions_prompt.as_ref(),
                         overlay_data.as_ref(),
+                        sub_active,
                     );
                 },
                 Some(osr_upload),
@@ -2406,6 +2420,7 @@ impl AppState {
                         confirm_close_pinned,
                         permissions_prompt.as_ref(),
                         overlay_data.as_ref(),
+                        sub_active,
                     );
                 },
                 None,
@@ -2438,6 +2453,12 @@ impl AppState {
 
         if let Err(err) = res {
             warn!(error = %err, "wgpu frame failed");
+        }
+
+        // Repaint the statusline subsurface whenever chrome is dirty. This
+        // keeps the subsurface in sync with mode/URL/hint state changes.
+        if chrome_dirty && let Some(sub) = self.wayland_sub.as_mut() {
+            sub.paint(|buf, w, h| statusline.paint(buf, w, h));
         }
     }
 
@@ -3653,6 +3674,10 @@ fn fill_rect_u32(
 ///
 /// All colours written here use `0xFF_RR_GG_BB` (fully-opaque BGRA) so
 /// the GPU alpha-blend composite produces crisp chrome-over-OSR output.
+///
+/// When `skip_statusline` is `true` the statusline rows are **not** painted
+/// into `buf`. The caller owns a `wl_subsurface` that paints the statusline
+/// independently so the two paths don't double-draw.
 #[allow(clippy::too_many_arguments)]
 fn paint_chrome_strips(
     buf: &mut [u32],
@@ -3666,11 +3691,14 @@ fn paint_chrome_strips(
     confirm_close_pinned: Option<buffr_core::TabId>,
     permissions_prompt: Option<&PermissionsPrompt>,
     overlay_data: Option<&InputBar>,
+    skip_statusline: bool,
 ) {
     let h = height as usize;
 
-    // Statusline — bottom strip.
-    statusline.paint(buf, w, h);
+    // Statusline — bottom strip. Skipped when a wl_subsurface paints it.
+    if !skip_statusline {
+        statusline.paint(buf, w, h);
+    }
 
     // Tab strip — between download notice and CEF region.
     tab_strip.paint(buf, w, h, tab_y);
@@ -3928,6 +3956,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         self.open_pending_tabs();
         self.refresh_tab_strip();
 
+        // Attempt to set up a wl_subsurface for the statusline. On X11 or
+        // non-Linux platforms WaylandSub::new returns None and the existing
+        // single-surface path is used unchanged.
+        self.wayland_sub = WaylandSub::new(window.as_ref());
+        if self.wayland_sub.is_some() {
+            let inner = window.inner_size();
+            if let Some(sub) = self.wayland_sub.as_mut() {
+                sub.set_size(inner.width.max(1), inner.height.max(1));
+                let sl = self.statusline.clone();
+                sub.paint(|buf, w, h| sl.paint(buf, w, h));
+            }
+            info!("wayland_sub: statusline subsurface active");
+        } else {
+            info!("wayland_sub: subsurface unavailable — using single-surface path");
+        }
+
         self.window = Some(window);
     }
 
@@ -4009,6 +4053,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // which reads as a "stretched" bottom bar.
                 self.mark_chrome_dirty();
                 self.paint_chrome_with(Some((new_size.width.max(1), new_size.height.max(1))));
+                // Update the subsurface position + repaint the statusline
+                // immediately so it tracks the bottom edge of the window
+                // while the parent buffer is still catching up.
+                let w = new_size.width.max(1);
+                let h = new_size.height.max(1);
+                if let Some(sub) = self.wayland_sub.as_mut() {
+                    sub.set_size(w, h);
+                    let sl = self.statusline.clone();
+                    sub.paint(|buf, bw, bh| sl.paint(buf, bw, bh));
+                    debug!(w, h, "wayland_sub: repainted on Resized");
+                }
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
@@ -4713,6 +4768,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.mark_chrome_dirty();
                 self.request_redraw();
             }
+        }
+
+        // Flush the subsurface Wayland connection once per tick so any
+        // protocol writes from `paint()` or `set_size()` reach the compositor
+        // without waiting for the next explicit commit.
+        if let Some(sub) = self.wayland_sub.as_mut() {
+            sub.flush();
         }
 
         // No idle paint loop: we respect Wayland's frame-callback model
