@@ -23,7 +23,7 @@
 //!
 //! Coverage: ASCII printable (`0x20..=0x7e`) — full enough for any URL
 //! plus the mode words (`NORMAL`, `INSERT`, `VISUAL`, `COMMAND`,
-//! `HINT`, `EDIT`, `PRIVATE`, `PENDING`).
+//! `HINT`, `INSERT`, `PRIVATE`, `PENDING`).
 
 /// Glyph width in pixels.
 pub const GLYPH_W: usize = 6;
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn glyph_table_covers_mode_words() {
-        for c in "NORMALINSERTVISUALCOMMANDHINTEDITPRIVATEPENDING".chars() {
+        for c in "NORMALINSERTVISUALCOMMANDHINPRIVATEPENDING".chars() {
             assert_ne!(glyph(c), MISSING, "missing glyph for {c}");
         }
     }

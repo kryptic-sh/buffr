@@ -367,7 +367,7 @@ fn mode_label(mode: PageMode) -> &'static str {
         PageMode::Visual => "VISUAL",
         PageMode::Command => "COMMAND",
         PageMode::Hint => "HINT",
-        PageMode::Edit => "EDIT",
+        PageMode::Insert => "INSERT",
         PageMode::Pending => "PENDING",
     }
 }
@@ -405,7 +405,7 @@ const fn mode_bg(mode: PageMode) -> u32 {
         PageMode::Visual => 0x33_22_06,
         PageMode::Command => 0x1A_1F_2E,
         PageMode::Hint => 0x2A_1A_2E,
-        PageMode::Edit => 0x10_1F_30,
+        PageMode::Insert => 0x10_1F_30,
     }
 }
 
@@ -415,7 +415,7 @@ const fn mode_accent(mode: PageMode) -> u32 {
         PageMode::Visual => 0xE0_8B_2A,
         PageMode::Command => 0x55_88_FF,
         PageMode::Hint => 0xC8_5A_E0,
-        PageMode::Edit => 0x5A_AA_E0,
+        PageMode::Insert => 0x5A_AA_E0,
     }
 }
 
@@ -482,7 +482,7 @@ mod tests {
             PageMode::Visual,
             PageMode::Command,
             PageMode::Hint,
-            PageMode::Edit,
+            PageMode::Insert,
         ];
         for (i, a) in modes.iter().enumerate() {
             for b in &modes[i + 1..] {
@@ -590,7 +590,7 @@ mod tests {
             PageMode::Visual,
             PageMode::Command,
             PageMode::Hint,
-            PageMode::Edit,
+            PageMode::Insert,
         ];
         for m in modes {
             assert_ne!(HC_ACCENT, mode_accent(m));
