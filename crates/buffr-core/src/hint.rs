@@ -275,8 +275,12 @@ pub struct Hint {
     pub label: String,
     /// Renderer-assigned numeric id; round-trips on commit so the JS
     /// can find the right `[data-buffr-hint-target-id="…"]`.
+    /// JS posts this as `id`; we keep `element_id` in Rust for clarity.
+    #[serde(rename = "id")]
     pub element_id: u32,
-    /// Bounding box at the moment of injection.
+    /// Bounding box at the moment of injection. JS flattens `x/y/w/h`
+    /// at the same level as `id`/`label`; flatten matches that.
+    #[serde(flatten)]
     pub rect: HintRect,
     pub kind: HintKind,
 }
