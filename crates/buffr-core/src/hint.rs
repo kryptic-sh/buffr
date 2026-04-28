@@ -450,7 +450,10 @@ pub fn take_hint_event(sink: &HintEventSink) -> Option<HintConsoleEvent> {
 /// parse — useful so callers can log malformed renderer output without
 /// silently dropping it.
 pub fn parse_console_event(message: &str) -> Option<Result<HintConsoleEvent, serde_json::Error>> {
-    let suffix = message.strip_prefix(HINT_CONSOLE_SENTINEL)?;
+    // Find the sentinel anywhere in the line — some sites wrap
+    // `console.log` to prepend styling format strings.
+    let idx = message.find(HINT_CONSOLE_SENTINEL)?;
+    let suffix = &message[idx + HINT_CONSOLE_SENTINEL.len()..];
     Some(serde_json::from_str::<HintConsoleEvent>(suffix))
 }
 

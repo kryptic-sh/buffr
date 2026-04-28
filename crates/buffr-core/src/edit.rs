@@ -160,7 +160,11 @@ struct TypeTag {
 /// - `Some(Err(err))` — prefix present but decoding failed; callers
 ///   should log the error rather than silently dropping it.
 pub fn parse_console_event(line: &str) -> Option<Result<EditConsoleEvent, ParseError>> {
-    let suffix = line.strip_prefix(EDIT_CONSOLE_SENTINEL)?;
+    // Some pages (monkeytype, etc.) wrap `console.log` to prepend their
+    // own styling format string (e.g. `%cINFO ...`). Find the sentinel
+    // anywhere in the line, not just at the start.
+    let idx = line.find(EDIT_CONSOLE_SENTINEL)?;
+    let suffix = &line[idx + EDIT_CONSOLE_SENTINEL.len()..];
 
     // Two-pass approach: first extract the "type" discriminant, then
     // deserialise the full payload into the appropriate variant. Avoids

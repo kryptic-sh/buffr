@@ -1099,13 +1099,21 @@ impl BrowserHost {
             }
 
             A::FocusFirstInput => {
-                // Focus the first interactive text field on the page. The
-                // injected `edit.js` listener picks up the focusin event and
-                // emits a console message; the main loop drains it and flips
-                // to PageMode::Insert. No need to set the engine mode here.
+                // Focus the first interactive text field. If the page
+                // already has one focused (e.g. monkeytype.com auto-
+                // focuses #wordsInput on load), refire focusin so
+                // edit.js notifies buffr regardless.
                 let js = "(function(){\
                     var sel='input:not([type=hidden]):not([disabled]):not([readonly]),\
 textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
+                    function editable(el){if(!el)return false;\
+                        var t=(el.tagName||'').toUpperCase();\
+                        return t==='INPUT'||t==='TEXTAREA'||el.isContentEditable;}\
+                    var cur=document.activeElement;\
+                    if(editable(cur)){\
+                        cur.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));\
+                        return;\
+                    }\
                     var el=document.querySelector(sel);\
                     if(el){el.focus();el.scrollIntoView({block:'center'});}\
                 })();";
