@@ -1925,12 +1925,20 @@ impl AppState {
                 if let Err(err) = host.navigate(&t.url) {
                     warn!(error = %err, url = %t.url, "session: navigate first tab failed");
                 }
+                if t.pinned
+                    && let Some(active) = host.active_tab()
+                {
+                    host.set_pinned(active.id, true);
+                }
                 continue;
             }
             match host.open_tab_background(&t.url) {
-                Ok(_id) => {
+                Ok(id) => {
                     if t.pinned {
-                        host.toggle_pin_active();
+                        // The new tab is in the background, so the
+                        // pin must target it by id rather than the
+                        // currently-active tab.
+                        host.set_pinned(id, true);
                     }
                 }
                 Err(err) => warn!(error = %err, url = %t.url, "session: open_tab failed"),

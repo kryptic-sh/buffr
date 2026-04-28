@@ -1129,6 +1129,18 @@ impl BrowserHost {
         }
     }
 
+    /// Set the pinned bit on the tab with `id`. Used by session
+    /// restore to apply the saved pin state without depending on
+    /// which tab is currently active.
+    pub fn set_pinned(&self, id: TabId, pinned: bool) {
+        let Ok(mut tabs) = self.tabs.lock() else {
+            return;
+        };
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == id) {
+            t.pinned = pinned;
+        }
+    }
+
     /// Update the URL field on the tab whose `Browser::identifier`
     /// matches `cef_id`. Used by the load handler to keep the chrome
     /// in sync. Returns the [`TabId`] of the affected tab, if any.
@@ -1330,6 +1342,21 @@ impl BrowserHost {
                 tracing::debug!("PasteUrl reached host dispatch — apps layer should handle it");
             }
             A::TabReorder { from, to } => self.move_tab(*from as usize, *to as usize),
+            A::MoveTabLeft => {
+                if let Some(idx) = self.active_index()
+                    && idx > 0
+                {
+                    self.move_tab(idx, idx - 1);
+                }
+            }
+            A::MoveTabRight => {
+                if let Some(idx) = self.active_index() {
+                    let last = self.tab_count().saturating_sub(1);
+                    if idx < last {
+                        self.move_tab(idx, idx + 1);
+                    }
+                }
+            }
 
             A::OpenOmnibar | A::OpenCommandLine => {
                 tracing::info!("UI action — overlay rendering owned by apps layer");

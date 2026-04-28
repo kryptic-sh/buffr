@@ -101,6 +101,12 @@ pub enum PageAction {
         from: u32,
         to: u32,
     },
+    /// Shuffle the active tab one slot left in the strip. Default
+    /// keybind `<C-S-h>`; clamps at index 0.
+    MoveTabLeft,
+    /// Shuffle the active tab one slot right in the strip. Default
+    /// keybind `<C-S-l>`; clamps at the last index.
+    MoveTabRight,
 
     // -- history ------------------------------------------------------
     HistoryBack,
