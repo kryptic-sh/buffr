@@ -2246,45 +2246,50 @@ impl AppState {
             //
             // HostMode::Windowed: CEF owns an X11 child window that sits over
             // the top region — we must NOT write there or we would clobber it.
-            if let Some((osr_frame, last_gen)) = &osr_data {
-                let new_gen = osr_frame.lock().map(|f| f.generation).unwrap_or(*last_gen);
-                // Blit regardless of generation change — the wgpu CPU buffer
-                // is freshly allocated on each resize, so we always fill the
-                // browser region to avoid showing garbage. The generation check
-                // is kept as a future optimisation hook but not applied.
-                let _ = new_gen;
+            if let Some((osr_frame, _)) = &osr_data
+                && let Ok(frame) = osr_frame.lock()
+            {
+                let osr_w = frame.width as usize;
+                let osr_h = frame.height as usize;
+                let bw = browser_w as usize;
+                let bh = browser_h as usize;
+                let by = browser_y as usize;
 
-                if let Ok(frame) = osr_frame.lock() {
-                    let osr_w = frame.width as usize;
-                    let osr_h = frame.height as usize;
-                    let pixels = &frame.pixels;
-                    let bw = browser_w as usize;
-                    let bh = browser_h as usize;
-                    let by = browser_y as usize;
+                // Clip + memcpy. While CEF catches up to a live resize
+                // the OSR frame can be smaller or larger than the
+                // chrome's browser region; copy the overlap and fill
+                // any leftover strip with a solid grey so the gap
+                // reads cleanly instead of as undefined memory. No
+                // scaling — at rest dims match and this is a straight
+                // per-row memcpy. CEF emits BGRA bytes which already
+                // match the wgpu Bgra8Unorm texture, so we copy as u32
+                // without any swizzle.
+                if osr_w > 0 && osr_h > 0 {
+                    let copy_w = bw.min(osr_w);
+                    let copy_h = bh.min(osr_h);
+                    let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
 
-                    // OSR-to-chrome blit. While CEF catches up to a live
-                    // resize the OSR frame can be a different size than
-                    // the chrome's browser region; we nearest-neighbour
-                    // stretch so the gap reads as a slightly scaled page
-                    // (better than any gap-fill heuristic). At rest the
-                    // dimensions match and this is a 1:1 copy.
-                    if osr_w > 0 && osr_h > 0 {
-                        for row in 0..bh {
-                            let src_row = row * osr_h / bh;
-                            let dst_row_base = (by + row) * w;
-                            let src_row_base = src_row * osr_w * 4;
-                            for col in 0..bw {
-                                let src_col = col * osr_w / bw;
-                                let src = src_row_base + src_col * 4;
-                                let b = pixels[src] as u32;
-                                let g = pixels[src + 1] as u32;
-                                let r = pixels[src + 2] as u32;
-                                buf[dst_row_base + col] = (r << 16) | (g << 8) | b;
-                            }
+                    for row in 0..copy_h {
+                        let dst = (by + row) * w;
+                        let src = row * osr_w;
+                        buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
+                    }
+
+                    const GAP: u32 = 0x202020;
+                    if copy_w < bw {
+                        for row in 0..copy_h {
+                            let dst = (by + row) * w + copy_w;
+                            buf[dst..dst + (bw - copy_w)].fill(GAP);
                         }
                     }
-                    new_osr_generation = frame.generation;
+                    if copy_h < bh {
+                        for row in copy_h..bh {
+                            let dst = (by + row) * w;
+                            buf[dst..dst + bw].fill(GAP);
+                        }
+                    }
                 }
+                new_osr_generation = frame.generation;
             }
 
             // Statusline — bottom strip.
