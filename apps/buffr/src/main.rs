@@ -1603,6 +1603,15 @@ struct AppState {
     /// selection. CEF natively renders the on-screen text selection
     /// during the drag.
     osr_drag_start: Option<(i32, i32)>,
+    /// Wheel-momentum state. Native Chrome decelerates after a touchpad
+    /// flick via the gesture-recognizer / smooth-scroll path; CEF's
+    /// `send_mouse_wheel_event` API is event-driven only, so we synthesize
+    /// the deceleration in `about_to_wait` after high-res input goes
+    /// quiet. `osr_wheel_velocity` tracks the most recent CEF-unit delta;
+    /// `osr_wheel_last_at` is the last time we forwarded a real wheel
+    /// event. Cleared when momentum drops below the cutoff.
+    osr_wheel_velocity: (f32, f32),
+    osr_wheel_last_at: Option<Instant>,
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
@@ -1753,6 +1762,8 @@ impl AppState {
             osr_last_click_button: None,
             osr_click_count: 1,
             osr_drag_start: None,
+            osr_wheel_velocity: (0.0, 0.0),
+            osr_wheel_last_at: None,
             shutdown_flag,
             tab_ids: Vec::new(),
             session_dirty: false,
@@ -2183,6 +2194,46 @@ impl AppState {
 
     fn paint_chrome(&mut self) {
         self.paint_chrome_with(None);
+    }
+
+    /// Synthesize wheel-momentum decay frames after high-res input
+    /// stops. Called from `about_to_wait` at ~60 Hz when the event loop
+    /// is otherwise idle. Constants tuned by feel; tweak `DECAY` toward
+    /// 1.0 for a longer tail or down for snappier stops.
+    fn tick_wheel_momentum(&mut self) {
+        let Some(last_at) = self.osr_wheel_last_at else {
+            return;
+        };
+        // Grace window: real wheel events typically arrive every ~6 ms.
+        // Don't decay until the input has been quiet for ≥ 30 ms so
+        // momentum doesn't fight a still-active scroll gesture.
+        if last_at.elapsed() < Duration::from_millis(30) {
+            return;
+        }
+        const DECAY: f32 = 0.92;
+        const MIN_VEL: f32 = 8.0;
+        self.osr_wheel_velocity.0 *= DECAY;
+        self.osr_wheel_velocity.1 *= DECAY;
+        if self.osr_wheel_velocity.0.abs() < MIN_VEL {
+            self.osr_wheel_velocity.0 = 0.0;
+        }
+        if self.osr_wheel_velocity.1.abs() < MIN_VEL {
+            self.osr_wheel_velocity.1 = 0.0;
+        }
+        let dx = self.osr_wheel_velocity.0 as i32;
+        let dy = self.osr_wheel_velocity.1 as i32;
+        if dx == 0 && dy == 0 {
+            self.osr_wheel_last_at = None;
+            return;
+        }
+        if let Some(host) = self.host.as_ref()
+            && host.mode() == buffr_core::HostMode::Osr
+        {
+            let mods = winit_mods_to_cef(&self.modifiers);
+            let (bx, by) = self.osr_cursor;
+            tracing::trace!(dx, dy, "input: wheel_momentum -> CEF");
+            host.osr_mouse_wheel(bx, by, dx, dy, mods);
+        }
     }
 
     /// Paint chrome at explicit dims when caller has fresher size info
@@ -4077,15 +4128,26 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // flag. 10× multiplier on PixelDelta is the empirical
                     // sweet spot for touchpad feel after testing.
                     const PIXEL_DELTA_SCALE: f32 = 10.0;
-                    let (dx, dy) = match delta {
+                    let (dx, dy, is_pixel) = match delta {
                         MouseScrollDelta::LineDelta(x, y) => {
-                            ((x * 120.0) as i32, (y * 120.0) as i32)
+                            ((x * 120.0) as i32, (y * 120.0) as i32, false)
                         }
                         MouseScrollDelta::PixelDelta(p) => (
                             (p.x as f32 * PIXEL_DELTA_SCALE) as i32,
                             (p.y as f32 * PIXEL_DELTA_SCALE) as i32,
+                            true,
                         ),
                     };
+                    if is_pixel {
+                        // Track velocity only for high-res input; discrete
+                        // wheel ticks have their own physical inertia.
+                        self.osr_wheel_velocity = (dx as f32, dy as f32);
+                        self.osr_wheel_last_at = Some(Instant::now());
+                    } else {
+                        // Cancel any in-flight momentum on discrete tick.
+                        self.osr_wheel_velocity = (0.0, 0.0);
+                        self.osr_wheel_last_at = None;
+                    }
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
                     tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
@@ -4239,6 +4301,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // continuously, which is the simplest correct cadence for
         // Phase 1 — Phase 3 will switch to a tickless wakeup.
         cef::do_message_loop_work();
+
+        // Wheel-momentum tick: synthesize a decaying wheel event once
+        // high-res input has gone quiet, mimicking native Chrome's
+        // post-swipe ease-out. No-op while real input is still arriving.
+        self.tick_wheel_momentum();
 
         // Edit-mode: drain focus/blur/mutate events from the JS bridge.
         // Runs before the engine tick so state is consistent when key
