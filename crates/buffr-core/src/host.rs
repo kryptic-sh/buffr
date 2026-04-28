@@ -345,6 +345,14 @@ impl BrowserHost {
                 return Err(CoreError::CreateBrowserFailed);
             }
         }
+        tracing::info!(
+            parent_window = window_info.parent_window,
+            bounds_w = window_info.bounds.width,
+            bounds_h = window_info.bounds.height,
+            windowless_rendering_enabled = window_info.windowless_rendering_enabled,
+            runtime_style = ?window_info.runtime_style,
+            "create_browser: window_info"
+        );
 
         let cef_url = CefString::from(url);
         let settings = BrowserSettings::default();
