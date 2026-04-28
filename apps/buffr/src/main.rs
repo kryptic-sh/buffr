@@ -4128,6 +4128,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
 
                 let mut enter_visual = false;
+                let mut exit_visual = false;
                 if let Some(host) = self.host.as_ref()
                     && host.mode() == buffr_core::HostMode::Osr
                     && let Some(cef_button) = winit_button_to_cef(&button)
@@ -4185,16 +4186,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             // selects the swept text).
                             self.osr_drag_start = Some(self.osr_cursor);
                         }
-                    } else if button == MouseButton::Left
-                        && let Some((sx, sy)) = self.osr_drag_start.take()
-                    {
-                        let (cx, cy) = self.osr_cursor;
-                        const DRAG_THRESHOLD_PX: i32 = 4;
-                        let dx = (cx - sx).abs();
-                        let dy = (cy - sy).abs();
-                        if dx > DRAG_THRESHOLD_PX || dy > DRAG_THRESHOLD_PX {
-                            enter_visual = true;
-                            tracing::debug!(dx, dy, "osr drag → Visual mode");
+                    } else if button == MouseButton::Left {
+                        // osr_drag_start = Some at release ⇒ press did
+                        // not cross the drag threshold (CursorMoved would
+                        // have cleared it). That's a click — branch on
+                        // click_count. None means a drag already promoted
+                        // to Visual during the move; nothing to do.
+                        if self.osr_drag_start.take().is_some() {
+                            if self.osr_click_count >= 2 {
+                                // Double / triple click — CEF auto-selects
+                                // a word / line. Reflect that in the
+                                // engine.
+                                enter_visual = true;
+                                tracing::debug!(
+                                    n = self.osr_click_count,
+                                    "osr multi-click → Visual mode"
+                                );
+                            } else {
+                                // Single click. Drop Visual if active.
+                                // Clicking an input still goes to Insert
+                                // via the JS focusin path.
+                                exit_visual = true;
+                            }
                         }
                     }
                     let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
@@ -4207,6 +4220,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                     self.refresh_title();
                     self.request_redraw();
+                } else if exit_visual {
+                    let was_visual = self
+                        .engine
+                        .lock()
+                        .map(|e| e.mode() == PageMode::Visual)
+                        .unwrap_or(false);
+                    if was_visual {
+                        if let Ok(mut e) = self.engine.lock() {
+                            e.set_mode(PageMode::Normal);
+                        }
+                        self.refresh_title();
+                        self.request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
