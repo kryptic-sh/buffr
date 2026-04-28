@@ -4062,19 +4062,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // compositor then fills the gap by replicating the
                 // bottom edge of the buffer (statusline last row),
                 // which reads as a "stretched" bottom bar.
-                self.mark_chrome_dirty();
-                self.paint_chrome_with(Some((new_size.width.max(1), new_size.height.max(1))));
-                // Update the subsurface position + repaint the statusline
-                // immediately so it tracks the bottom edge of the window
-                // while the parent buffer is still catching up.
+                // Update the subsurface position BEFORE paint_chrome runs.
+                // wl_subsurface.set_position is double-buffered against the
+                // PARENT surface commit (applies on parent commit, not on
+                // child commit, even in desync mode). paint_chrome below
+                // commits the parent via wgpu present, so set_size must
+                // queue the new position into the parent's pending state
+                // first — otherwise the position update is one frame
+                // behind and the subsurface tracks the previous resize.
                 let w = new_size.width.max(1);
                 let h = new_size.height.max(1);
                 if let Some(sub) = self.wayland_sub.as_mut() {
                     sub.set_size(w, h);
-                    let sl = self.statusline.clone();
-                    sub.paint(|buf, bw, bh| sl.paint(buf, bw, bh));
-                    debug!(w, h, "wayland_sub: repainted on Resized");
+                    debug!(w, h, "wayland_sub: set_size pre-paint");
                 }
+                self.mark_chrome_dirty();
+                self.paint_chrome_with(Some((w, h)));
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
