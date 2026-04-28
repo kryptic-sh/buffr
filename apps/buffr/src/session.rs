@@ -46,6 +46,11 @@ pub struct Session {
     pub version: u32,
     #[serde(default)]
     pub tabs: Vec<PersistedTab>,
+    /// Index of the active tab when the session was saved. `None` for
+    /// older session files that didn't track focus; the restorer falls
+    /// back to tab 0 in that case.
+    #[serde(default)]
+    pub active: Option<usize>,
 }
 
 impl Default for Session {
@@ -53,6 +58,7 @@ impl Default for Session {
         Self {
             version: SCHEMA_VERSION,
             tabs: Vec::new(),
+            active: None,
         }
     }
 }
@@ -77,7 +83,18 @@ impl Session {
                     pinned,
                 })
                 .collect(),
+            active: None,
         }
+    }
+
+    /// Like [`from_tabs`] but also records the active tab index.
+    pub fn from_tabs_with_active<'a, I>(tabs: I, active: Option<usize>) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, bool)>,
+    {
+        let mut s = Self::from_tabs(tabs);
+        s.active = active;
+        s
     }
 }
 

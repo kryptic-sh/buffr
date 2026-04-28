@@ -616,26 +616,30 @@ fn main() -> Result<()> {
     } else {
         Some(session::default_path(&paths.data))
     };
-    let pending_session_tabs: Vec<session::PersistedTab> = if cli.private || cli.no_restore {
-        Vec::new()
+    let (pending_session_tabs, pending_session_active): (
+        Vec<session::PersistedTab>,
+        Option<usize>,
+    ) = if cli.private || cli.no_restore {
+        (Vec::new(), None)
     } else if let Some(p) = session_path.as_ref() {
         match session::read(p) {
             Ok(Some(s)) => {
                 info!(
                     path = %p.display(),
                     tabs = s.tabs.len(),
+                    active = ?s.active,
                     "session: restored",
                 );
-                s.tabs
+                (s.tabs, s.active)
             }
-            Ok(None) => Vec::new(),
+            Ok(None) => (Vec::new(), None),
             Err(err) => {
                 warn!(error = %err, "session: read failed — starting fresh");
-                Vec::new()
+                (Vec::new(), None)
             }
         }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     let download_notice_queue = new_download_notice_queue();
@@ -667,6 +671,7 @@ fn main() -> Result<()> {
         cli.find.clone(),
         cli.new_tab.clone(),
         pending_session_tabs,
+        pending_session_active,
         session_path,
         counters.clone(),
         update_checker.clone(),
@@ -1387,6 +1392,10 @@ struct AppState {
     /// every `about_to_wait` tick alongside the strip; used for
     /// tab-strip click hit-testing.
     tab_ids: Vec<TabId>,
+    /// Active-tab index read from the restored session. Applied once in
+    /// [`AppState::open_pending_tabs`] after all session tabs are opened,
+    /// then cleared so subsequent ticks don't re-apply it.
+    pending_session_active: Option<usize>,
 }
 
 /// Edit-mode focus state machine.
@@ -1452,6 +1461,7 @@ impl AppState {
         pending_find: Option<String>,
         pending_new_tabs: Vec<String>,
         pending_session_tabs: Vec<session::PersistedTab>,
+        pending_session_active: Option<usize>,
         session_path: Option<PathBuf>,
         counters: Arc<buffr_core::UsageCounters>,
         update_checker: Arc<buffr_core::UpdateChecker>,
@@ -1501,6 +1511,7 @@ impl AppState {
             tab_strip: TabStrip::default(),
             pending_new_tabs,
             pending_session_tabs,
+            pending_session_active,
             session_path,
             softbuffer_ctx: None,
             softbuffer_surface: None,
@@ -1609,7 +1620,11 @@ impl AppState {
             return;
         };
         let summaries = host.tabs_summary();
-        let s = session::Session::from_tabs(summaries.iter().map(|t| (t.url.as_str(), t.pinned)));
+        let active = host.active_index();
+        let s = session::Session::from_tabs_with_active(
+            summaries.iter().map(|t| (t.url.as_str(), t.pinned)),
+            active,
+        );
         if let Err(err) = session::write(path, &s) {
             warn!(error = %err, "session: write failed");
         }
@@ -1644,6 +1659,13 @@ impl AppState {
                     }
                 }
                 Err(err) => warn!(error = %err, url = %t.url, "session: open_tab failed"),
+            }
+        }
+        // Restore the active tab from the session, if any.
+        if let Some(idx) = self.pending_session_active.take() {
+            let summaries = host.tabs_summary();
+            if let Some(tab) = summaries.get(idx) {
+                host.select_tab(tab.id);
             }
         }
         // CLI `--new-tab` URLs append after the session.
