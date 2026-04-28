@@ -49,6 +49,7 @@ use crate::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters}
 // whole crate. We do the same here.
 use cef::*;
 
+use crate::PopupQueue;
 use crate::open_finder::{OsSpawn, open_path};
 
 /// Build a CEF `Client` that returns our load + display + download
@@ -72,6 +73,7 @@ pub fn make_client(
     counters: Option<Arc<UsageCounters>>,
     notice_queue: DownloadNoticeQueue,
     render_handler: Option<RenderHandler>,
+    popup_queue: PopupQueue,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -86,6 +88,7 @@ pub fn make_client(
         counters,
         notice_queue,
         render_handler,
+        popup_queue,
     )
 }
 
@@ -144,6 +147,42 @@ pub fn make_permission_handler(
     BuffrPermissionHandler::new(permissions, queue)
 }
 
+wrap_life_span_handler! {
+    pub struct BuffrLifeSpanHandler {
+        popup_queue: PopupQueue,
+    }
+
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(url) = target_url {
+                let url_str = url.to_string();
+                if !url_str.is_empty()
+                    && let Ok(mut guard) = self.popup_queue.lock()
+                {
+                    guard.push_back(url_str);
+                }
+            }
+            // Return 1 to cancel the popup — we'll open it as a tab instead.
+            1
+        }
+    }
+}
+
 wrap_client! {
     pub struct BuffrClient {
         history: Arc<History>,
@@ -158,6 +197,7 @@ wrap_client! {
         counters: Option<Arc<UsageCounters>>,
         notice_queue: DownloadNoticeQueue,
         render_handler: Option<RenderHandler>,
+        popup_queue: PopupQueue,
     }
 
     impl Client {
@@ -201,6 +241,10 @@ wrap_client! {
                 self.permissions.clone(),
                 self.permissions_queue.clone(),
             ))
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(BuffrLifeSpanHandler::new(self.popup_queue.clone()))
         }
     }
 }
