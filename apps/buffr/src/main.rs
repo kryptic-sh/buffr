@@ -2161,8 +2161,8 @@ impl AppState {
 
         // Snapshot OSR state we need inside the closure.
         // SharedOsrFrame = Arc<Mutex<OsrFrame>>; clone is cheap (Arc clone).
-        let osr_data: Option<(buffr_core::SharedOsrFrame, u64)> =
-            if let Some(host) = self.host.as_ref()
+        let osr_data: Option<(buffr_core::SharedOsrFrame, u64)> = if let Some(host) =
+            self.host.as_ref()
             && host.mode() == buffr_core::HostMode::Osr
         {
             Some((host.osr_frame(), self.last_osr_generation))
@@ -2178,7 +2178,7 @@ impl AppState {
         // Clone/snapshot values needed in the closure (can't borrow self).
         let statusline = self.statusline.clone();
         let tab_strip = self.tab_strip.clone();
-        let confirm_close_pinned = self.confirm_close_pinned.clone();
+        let confirm_close_pinned = self.confirm_close_pinned;
         let permissions_prompt = self.permissions_prompt.clone();
         let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
 
@@ -2194,10 +2194,7 @@ impl AppState {
             // HostMode::Windowed: CEF owns an X11 child window that sits over
             // the top region — we must NOT write there or we would clobber it.
             if let Some((osr_frame, last_gen)) = &osr_data {
-                let new_gen = osr_frame
-                    .lock()
-                    .map(|f| f.generation)
-                    .unwrap_or(*last_gen);
+                let new_gen = osr_frame.lock().map(|f| f.generation).unwrap_or(*last_gen);
                 // Blit regardless of generation change — the wgpu CPU buffer
                 // is freshly allocated on each resize, so we always fill the
                 // browser region to avoid showing garbage. The generation check
