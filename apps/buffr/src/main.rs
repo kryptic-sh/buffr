@@ -2346,35 +2346,38 @@ impl AppState {
                     let by = browser_y as usize;
                     osr_dims = Some((osr_w as u32, osr_h as u32, bw as u32, bh as u32));
 
-                    // Two paths. CEF emits BGRA bytes which already match
-                    // the wgpu Bgra8Unorm texture, so both copy as u32
-                    // without any swizzle.
+                    // CEF emits BGRA matching the wgpu Bgra8Unorm
+                    // texture, so we copy as u32 without swizzle.
                     //
-                    // Fast: dims match → per-row memcpy.
-                    //
-                    // Slow: dims mismatch (transient catch-up while
-                    // host.resize is deferred during a live drag) →
-                    // nearest-neighbour stretch across the browser
-                    // region. Slightly fuzzy during the transient; the
-                    // page snaps back to crisp once host.resize fires.
+                    // Letterbox: blit the OSR frame at its native size,
+                    // top-left aligned within the CEF rect, and fill
+                    // the leftover with a solid colour. The previous
+                    // NN-scale path took ~15 ms per frame on its
+                    // per-pixel integer-divide scaler, which couldn't
+                    // keep up with Wayland's ~30 ms Resized cadence;
+                    // the buffer fell behind the surface and the
+                    // compositor letterboxed the right/bottom gap.
+                    // Per-row memcpy here is ~1 ms.
                     if osr_w > 0 && osr_h > 0 {
                         let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
-                        if osr_w == bw && osr_h == bh {
-                            for row in 0..bh {
-                                let dst = (by + row) * w;
-                                let src = row * osr_w;
-                                buf[dst..dst + bw].copy_from_slice(&src_u32[src..src + bw]);
-                            }
-                        } else {
-                            for row in 0..bh {
-                                let src_row = row * osr_h / bh;
-                                let dst_base = (by + row) * w;
-                                let src_base = src_row * osr_w;
-                                for col in 0..bw {
-                                    let src_col = col * osr_w / bw;
-                                    buf[dst_base + col] = src_u32[src_base + src_col];
-                                }
-                            }
+                        let copy_h = osr_h.min(bh);
+                        let copy_w = osr_w.min(bw);
+                        if osr_w != bw || osr_h != bh {
+                            fill_rect_u32(
+                                buf,
+                                w,
+                                height as usize,
+                                0,
+                                by,
+                                bw,
+                                bh,
+                                OSR_LETTERBOX_BG,
+                            );
+                        }
+                        for row in 0..copy_h {
+                            let dst = (by + row) * w;
+                            let src = row * osr_w;
+                            buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
                         }
                     }
                     new_osr_generation = frame.generation;
@@ -3708,6 +3711,10 @@ const OMNIBAR_POPUP_MAX_WIDTH: u32 = 800;
 const OMNIBAR_POPUP_BORDER: u32 = 2;
 const OMNIBAR_POPUP_BG: u32 = 0x1a1b26;
 const OMNIBAR_POPUP_BORDER_COLOR: u32 = 0x7aa2f7;
+
+/// Fill colour for the gap between the OSR frame and the CEF rect when
+/// dimensions disagree (transient state during a deferred resize).
+const OSR_LETTERBOX_BG: u32 = 0x1a1b26;
 
 /// Fill a rectangle in a u32 pixel buffer with stride `buf_w`.
 #[allow(clippy::too_many_arguments)]
