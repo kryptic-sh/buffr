@@ -2379,6 +2379,17 @@ impl AppState {
 
         let frame_start = Instant::now();
 
+        // Paint the statusline subsurface BEFORE the wgpu present below.
+        // Child surface commits in desync mode apply their pending state
+        // immediately; running this first means by the time the parent
+        // surface commits (renderer.frame -> wgpu present) the subsurface
+        // already has its new buffer in place, so the parent commit's
+        // set_position update and the subsurface buffer update are
+        // observed atomically by the compositor.
+        if chrome_dirty && let Some(sub) = self.wayland_sub.as_mut() {
+            sub.paint(|buf, w, h| statusline.paint(buf, w, h));
+        }
+
         // Build the OsrUpload, passing a reference to the cloned pixels.
         let new_osr_generation;
         let res = if let Some((ref pixels, osr_w, osr_h, osr_gen)) = osr_pixels_and_meta {
@@ -2464,12 +2475,6 @@ impl AppState {
 
         if let Err(err) = res {
             warn!(error = %err, "wgpu frame failed");
-        }
-
-        // Repaint the statusline subsurface whenever chrome is dirty. This
-        // keeps the subsurface in sync with mode/URL/hint state changes.
-        if chrome_dirty && let Some(sub) = self.wayland_sub.as_mut() {
-            sub.paint(|buf, w, h| statusline.paint(buf, w, h));
         }
     }
 

@@ -447,6 +447,17 @@ mod linux {
             }
 
             self.child_subsurface.set_position(0, sl_y.max(0));
+
+            // Flush so the set_position protocol message reaches libwayland's
+            // send queue before wgpu's surface present writes the parent
+            // commit. Otherwise wayland-client may keep the message buffered
+            // and the parent commit lands without the new pending position
+            // applied — same observable result as setting position after
+            // commit (subsurface tracks the previous resize).
+            if let Err(e) = self.connection.flush() {
+                debug!(?e, "wayland_sub: flush after set_position warning");
+            }
+
             debug!(window_w, window_h, sl_y, "wayland_sub: set_size");
         }
 
