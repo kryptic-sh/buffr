@@ -192,6 +192,12 @@ fn parse_named(raw: &str) -> Result<KeyChord, ParseError> {
     // Resolve the tail.
     let key = if tail.eq_ignore_ascii_case("leader") {
         Key::Named(NamedKey::Leader)
+    } else if tail.eq_ignore_ascii_case("space") {
+        // `<Space>` and a literal ` ` chord must produce the same
+        // canonical form so a leader=' ' binding matches whether the
+        // user wrote `<leader>p` or `<Space>p`. Adapter does the same
+        // mapping on input.
+        Key::Char(' ')
     } else if tail.chars().count() == 1 {
         // `chars().count() == 1` so we don't slice on a multi-byte
         // char by accident.
@@ -426,8 +432,11 @@ mod tests {
 
     #[test]
     fn space_special() {
+        // <Space> normalizes to Char(' ') so it shares the canonical
+        // form a leader=' ' binding produces — keeps the input adapter
+        // and the parser in lock-step.
         let chords = parse_keys("<Space>x").unwrap();
-        assert_eq!(chords[0].key, Key::Named(NamedKey::Space));
+        assert_eq!(chords[0].key, Key::Char(' '));
         assert_eq!(chords[1], k('x'));
     }
 
