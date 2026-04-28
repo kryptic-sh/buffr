@@ -216,7 +216,22 @@ pub struct BrowserHost {
     /// on the CEF IO thread. The UI thread drains via
     /// [`Self::pump_address_changes`] each tick and writes `Tab.url`.
     address_sink: AddressSink,
+    /// Stack of recently closed tabs — `(url, original_index, pinned)`.
+    /// Pushed in `close_index`; popped by `reopen_closed_tab`. Capped to
+    /// keep memory bounded for long-running sessions.
+    closed_stack: Mutex<Vec<ClosedTab>>,
 }
+
+/// Snapshot retained for a closed tab so `reopen_closed_tab` can put
+/// it back at the same slot in the strip.
+#[derive(Debug, Clone)]
+struct ClosedTab {
+    url: String,
+    index: usize,
+    pinned: bool,
+}
+
+const CLOSED_STACK_CAP: usize = 32;
 
 impl BrowserHost {
     /// Create the host with a single initial tab loading `url`.
@@ -334,6 +349,7 @@ impl BrowserHost {
             clipboard: Mutex::new(hjkl_clipboard::Clipboard::new()),
             popup_queue,
             address_sink,
+            closed_stack: Mutex::new(Vec::new()),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -610,6 +626,33 @@ impl BrowserHost {
     /// the active tab does not change.
     pub fn open_tab_background(&self, url: &str) -> Result<TabId, CoreError> {
         self.create_browser(url, true)
+    }
+
+    /// Pop the most recently closed tab off the undo stack and open
+    /// it back at its original position. Re-pins the tab if it was
+    /// pinned at close time. Returns `Ok(None)` when the stack is
+    /// empty so the caller can no-op without logging a warning.
+    pub fn reopen_closed_tab(&self) -> Result<Option<TabId>, CoreError> {
+        let entry = match self.closed_stack.lock() {
+            Ok(mut s) => s.pop(),
+            Err(_) => None,
+        };
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let id = self.open_tab_at(&entry.url, entry.index)?;
+        if entry.pinned {
+            // toggle_pin_active flips the active tab's pin; the just-
+            // opened tab is active after open_tab_at.
+            self.toggle_pin_active();
+        }
+        Ok(Some(id))
+    }
+
+    /// Number of tabs currently sitting on the closed-tab undo stack.
+    /// Cheap; use to gate the apps-layer "no closed tabs" feedback.
+    pub fn closed_stack_len(&self) -> usize {
+        self.closed_stack.lock().map(|s| s.len()).unwrap_or(0)
     }
 
     /// Open a new tab and place it at `insert_idx` in the tab list.
@@ -945,6 +988,23 @@ impl BrowserHost {
             }
             tabs.remove(idx)
         };
+        // Push onto the closed-tabs undo stack before tearing the
+        // browser down. Skip blank entries — re-opening a true blank
+        // page is the same as `:tabnew`, so the stack stays signal.
+        if !removed.url.is_empty()
+            && removed.url != "about:blank"
+            && let Ok(mut stack) = self.closed_stack.lock()
+        {
+            stack.push(ClosedTab {
+                url: removed.url.clone(),
+                index: idx,
+                pinned: removed.pinned,
+            });
+            let extra = stack.len().saturating_sub(CLOSED_STACK_CAP);
+            if extra > 0 {
+                stack.drain(0..extra);
+            }
+        }
         // Tell CEF to tear the browser down. The browser drop also
         // runs at end-of-scope but `close_browser(1)` flushes IO and
         // releases the child window immediately.
@@ -1220,6 +1280,11 @@ impl BrowserHost {
                 let _ = self.duplicate_active();
             }
             A::PinTab => self.toggle_pin_active(),
+            A::ReopenClosedTab => match self.reopen_closed_tab() {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::debug!("reopen_closed_tab: stack empty"),
+                Err(err) => tracing::warn!(error = %err, "reopen_closed_tab: failed"),
+            },
             A::TabReorder { from, to } => self.move_tab(*from as usize, *to as usize),
 
             A::OpenOmnibar | A::OpenCommandLine => {
@@ -1485,6 +1550,17 @@ impl BrowserHost {
         let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
         self.run_main_frame_js(
             &format!("if (window.__buffrEditFocus) window.__buffrEditFocus({escaped_id})"),
+            "buffr://edit",
+        );
+    }
+
+    /// Move focus to the next (or previous) visible input via
+    /// `__buffrCycleInput`. Used to override Tab/Shift+Tab in Insert
+    /// mode so cycling skips links/buttons.
+    pub fn run_edit_cycle(&self, forward: bool) {
+        let arg = if forward { "true" } else { "false" };
+        self.run_main_frame_js(
+            &format!("if (window.__buffrCycleInput) window.__buffrCycleInput({arg})"),
             "buffr://edit",
         );
     }

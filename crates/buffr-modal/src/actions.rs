@@ -86,6 +86,10 @@ pub enum PageAction {
     /// Pin / unpin the active tab. Pinned tabs sort first; pin does
     /// **not** prevent close. Default keybind `<C-w>p`.
     PinTab,
+    /// Re-open the most recently closed tab. Repeated invocation
+    /// pops further entries from the close stack so successive
+    /// closes can be undone in reverse order. Default keybind `u`.
+    ReopenClosedTab,
     /// Reorder the tab list. Currently unbound; reserved for the
     /// eventual mouse-drag handler.
     TabReorder {

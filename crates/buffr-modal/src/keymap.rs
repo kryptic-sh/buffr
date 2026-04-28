@@ -212,6 +212,7 @@ impl Keymap {
             "TabNewLeft",
             "DuplicateTab",
             "PinTab",
+            "ReopenClosedTab",
             "HistoryBack",
             "HistoryForward",
             "Reload",
@@ -347,6 +348,7 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::TabNewLeft => "TabNewLeft",
         PageAction::DuplicateTab => "DuplicateTab",
         PageAction::PinTab => "PinTab",
+        PageAction::ReopenClosedTab => "ReopenClosedTab",
         PageAction::TabReorder { .. } => "TabReorder",
         PageAction::HistoryBack => "HistoryBack",
         PageAction::HistoryForward => "HistoryForward",
@@ -416,6 +418,9 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "<C-w>n", PageAction::DuplicateTab),
     // buffr extension: <C-w>p for PinTab (no direct Vieb equivalent)
     (PageMode::Normal, "<C-w>p", PageAction::PinTab),
+    // Re-open the most recently closed tab (vim-flavored undo). Stack-based
+    // so repeated `u` undoes successive closes in reverse order.
+    (PageMode::Normal, "u", PageAction::ReopenClosedTab),
     // -- history --------------------------------------------------
     // User preference: J/K = history back/forward (NOT vieb default of tabs).
     (PageMode::Normal, "J", PageAction::HistoryBack),

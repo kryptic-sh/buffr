@@ -232,6 +232,46 @@
         return true;
     };
 
+    // Cycle focus among visible editable text fields. Insert mode's
+    // Tab/Shift+Tab is intercepted by the apps layer and routed here
+    // so navigation skips links/buttons and only lands on inputs.
+    //
+    // "Visible" mirrors focus_first_input.js: non-zero rect, not
+    // display:none, not visibility:hidden. Wraps at both ends.
+    window.__buffrCycleInput = function (forward) {
+        var sel = 'input:not([type=hidden]):not([disabled]):not([readonly]),'
+            + 'textarea:not([disabled]):not([readonly]),'
+            + '[contenteditable="true"]';
+        function visible(el) {
+            if (!el) return false;
+            var r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return false;
+            var s = getComputedStyle(el);
+            if (s.visibility === 'hidden' || s.display === 'none') return false;
+            return true;
+        }
+        var nodes = [];
+        var all = document.querySelectorAll(sel);
+        for (var i = 0; i < all.length; i++) {
+            if (visible(all[i])) { nodes.push(all[i]); }
+        }
+        if (nodes.length === 0) { return; }
+        var cur = document.activeElement;
+        var idx = nodes.indexOf(cur);
+        var nextIdx;
+        if (idx === -1) {
+            nextIdx = forward ? 0 : nodes.length - 1;
+        } else {
+            nextIdx = forward
+                ? (idx + 1) % nodes.length
+                : (idx - 1 + nodes.length) % nodes.length;
+        }
+        var target = nodes[nextIdx];
+        target.focus();
+        target.scrollIntoView({ block: 'center' });
+        target.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    };
+
     // Re-focus a previously-focused field by its buffr-assigned ID.
     // Called by Rust when the user presses `i` and a last-focused ID
     // is known.  Falls through to the page's own focusin handling;

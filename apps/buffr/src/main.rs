@@ -2975,6 +2975,19 @@ impl AppState {
             return true;
         }
 
+        // Tab / Shift+Tab in Insert mode cycles among VISIBLE inputs
+        // only. The browser's native Tab handler also lands on links
+        // and buttons; routing through `__buffrCycleInput` keeps focus
+        // inside the editable set.
+        if event.state == winit::event::ElementState::Pressed
+            && matches!(planned, Some(PlannedInput::Key(SpecialKey::Tab, _)))
+        {
+            if let Some(host) = self.host.as_ref() {
+                host.run_edit_cycle(!self.modifiers.shift_key());
+            }
+            return true;
+        }
+
         // Forward every other key directly to CEF. The page handles it
         // natively — no Rust-side editor model.
         if let Some(host) = self.host.as_ref() {
