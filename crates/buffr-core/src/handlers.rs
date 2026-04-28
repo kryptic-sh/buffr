@@ -374,16 +374,18 @@ wrap_load_handler! {
             };
             if let Some(browser) = browser
                 && let Some(host) = cef::ImplBrowser::host(browser)
+                && let Some(level) = zoom_level
             {
-                if let Some(level) = zoom_level {
-                    host.set_zoom_level(level);
-                    tracing::trace!(%domain, level, "zoom: applied persisted");
-                }
-                // Re-assert CEF focus on every main-frame load so the
-                // newly committed page receives input correctly. Mirrors
-                // the focus reapplication on tab switch.
-                host.set_focus(1);
+                host.set_zoom_level(level);
+                tracing::trace!(%domain, level, "zoom: applied persisted");
             }
+            // Intentionally no `set_focus(1)` here. Granting CEF widget
+            // focus on every load made the renderer paint the caret
+            // for any page-autofocused input, which produced a steady
+            // 60 Hz on_paint stream from the blink animation alone.
+            // Widget focus is now driven by the user's first real
+            // focus action (DOM .focus() from a click or `i` keypress
+            // promotes widget focus implicitly via Chromium).
 
             // Edit-mode Stage 1: inject edit.js once per main-frame load.
             // The script is idempotent (`window.__buffrEditWired` guard)
