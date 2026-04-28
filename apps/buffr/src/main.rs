@@ -745,23 +745,25 @@ fn main() -> Result<()> {
     // browser before `cef::shutdown()` — otherwise its internal
     // teardown segfaults when it finds active browsers. The pump
     // loop below gives OnBeforeClose a chance to fire on each tab.
+    info!("shutdown: closing browsers");
     if let Some(host) = app_state.host.as_ref() {
         host.close_all_browsers();
     }
-    for _ in 0..30 {
+    info!("shutdown: pumping CEF message loop (1s)");
+    for _ in 0..100 {
         cef::do_message_loop_work();
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Drop AppState BEFORE cef::shutdown(). AppState owns the
-    // BrowserHost (which holds CEF browser refs) and the wgpu
-    // Renderer (which holds the surface + Arc<Window>). Letting it
-    // live past cef::shutdown() tears those resources down after
-    // CEF has already torn down the GPU process, which segfaults on
-    // recent CEF builds with hardware compositing on. Explicit drop
-    // here guarantees order: browsers close → wgpu surface drops →
-    // window drops → cef::shutdown finalises.
+    // Drop AppState BEFORE cef::shutdown(). Field declaration order
+    // ensures host drops first (releasing CEF browser refs while CEF
+    // is still alive), then renderer (wgpu surface), then window.
+    // Letting it live past cef::shutdown() tears those resources down
+    // after CEF has already torn down the GPU process, which
+    // segfaults on recent CEF builds with hardware compositing on.
+    info!("shutdown: dropping app_state");
     drop(app_state);
+    info!("shutdown: app_state dropped");
 
     // Defer-dismiss any permission requests still queued at shutdown.
     // Dropping a CEF callback without invoking it would wedge the
@@ -795,9 +797,11 @@ fn main() -> Result<()> {
     // -------- shutdown --------
     info!("cef shutting down");
     cef::shutdown();
+    info!("shutdown: cef::shutdown returned");
     // Tempdir drops here (after CEF is gone), removing the private
     // profile root tree.
     drop(_private_tmp);
+    info!("shutdown: complete");
     Ok(())
 }
 
@@ -1394,8 +1398,14 @@ struct AppState {
     /// `buffr://new` and is overridable via `general.homepage` and
     /// `--homepage`.
     homepage: String,
-    window: Option<Arc<Window>>,
+    // Drop order matters at shutdown: `host` MUST drop before `window`
+    // and `renderer`. CEF browsers hold raw handles tied to the window
+    // surface and to the GPU process; dropping the window or wgpu
+    // device first leaves CEF dereferencing freed memory during its
+    // own teardown. Rust drops struct fields in declaration order, so
+    // host comes first.
     host: Option<buffr_core::BrowserHost>,
+    window: Option<Arc<Window>>,
     engine: Arc<Mutex<Engine>>,
     history: Arc<buffr_history::History>,
     bookmarks: Arc<buffr_bookmarks::Bookmarks>,
@@ -1691,8 +1701,8 @@ impl AppState {
         statusline.mode = PageMode::Normal;
         Self {
             homepage,
-            window: None,
             host: None,
+            window: None,
             engine,
             history,
             bookmarks,
