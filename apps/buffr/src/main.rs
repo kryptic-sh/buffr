@@ -2395,17 +2395,39 @@ impl AppState {
         if wy < tab_y || wy >= tab_y_end || self.tab_ids.is_empty() {
             return None;
         }
-        let n = self.tab_ids.len() as u32;
+        // Mirror the layout in `TabStrip::paint`: pinned tabs occupy
+        // PINNED_TAB_WIDTH each, unpinned tabs share whatever's left.
         const GUTTER: u32 = 4;
-        let available = full_w.saturating_sub((n + 1) * GUTTER);
-        let raw_w = available / n.max(1);
-        let tab_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
+        let pinned_count = self.tab_strip.tabs.iter().filter(|t| t.pinned).count() as u32;
+        let total_count = self.tab_ids.len() as u32;
+        let unpinned_count = total_count.saturating_sub(pinned_count);
+        let pinned_total_w = pinned_count * buffr_ui::tab_strip::PINNED_TAB_WIDTH;
+        let gutter_total = (total_count + 1) * GUTTER;
+        let avail_for_unpinned = full_w
+            .saturating_sub(pinned_total_w)
+            .saturating_sub(gutter_total);
+        let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
+        let unpinned_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
+
         if wx < GUTTER {
             return None;
         }
-        let rel_x = wx - GUTTER;
-        let idx = (rel_x / (tab_w + GUTTER)) as usize;
-        (idx < self.tab_ids.len()).then_some(idx)
+        // Walk the pills left-to-right and pick the one whose rect
+        // contains `wx`.
+        let mut x = GUTTER;
+        for (i, tab) in self.tab_strip.tabs.iter().enumerate() {
+            let pill_w = if tab.pinned {
+                buffr_ui::tab_strip::PINNED_TAB_WIDTH
+            } else {
+                unpinned_w
+            };
+            let right = x + pill_w;
+            if wx >= x && wx < right {
+                return Some(i);
+            }
+            x = right + GUTTER;
+        }
+        None
     }
 
     fn tab_strip_y(&self, full_h: u32) -> u32 {
