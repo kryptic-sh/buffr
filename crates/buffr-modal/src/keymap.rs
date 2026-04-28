@@ -228,8 +228,8 @@ impl Keymap {
             "ZoomOut",
             "ZoomReset",
             "OpenDevTools",
-            "EnterEditMode",
             "FocusFirstInput",
+            "ExitInsertMode",
         ];
         expected
             .iter()
@@ -366,6 +366,7 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::ClearCompletedDownloads => "ClearCompletedDownloads",
         PageAction::EnterEditMode => "EnterEditMode",
         PageAction::FocusFirstInput => "FocusFirstInput",
+        PageAction::ExitInsertMode => "ExitInsertMode",
     }
 }
 
@@ -423,8 +424,8 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "r", PageAction::Reload),
     (PageMode::Normal, "R", PageAction::ReloadHard),
     (PageMode::Normal, "<C-r>", PageAction::ReloadHard),
-    // buffr keeps <Esc> as StopLoading (Vieb: stopLoadingPage)
-    (PageMode::Normal, "<Esc>", PageAction::StopLoading),
+    // <Esc> now exits insert/edit mode unconditionally.
+    (PageMode::Normal, "<Esc>", PageAction::ExitInsertMode),
     // buffr extension: <C-c> as StopLoading (Vieb: copyText)
     (PageMode::Normal, "<C-c>", PageAction::StopLoading),
     // -- omnibar / command ----------------------------------------
@@ -455,7 +456,10 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "=", PageAction::ZoomReset),
     (PageMode::Normal, "<C-0>", PageAction::ZoomReset),
     // -- edit mode ------------------------------------------------
-    (PageMode::Normal, "i", PageAction::EnterEditMode),
+    // `i` and `gi` both focus the first form input (same as Vieb's
+    // insertAtFirstInput / gi). EnterEditMode stays in the enum for
+    // advanced user config but is unbound by default.
+    (PageMode::Normal, "i", PageAction::FocusFirstInput),
     (PageMode::Normal, "gi", PageAction::FocusFirstInput),
     // -- devtools -------------------------------------------------
     (PageMode::Normal, "<F12>", PageAction::OpenDevTools),

@@ -1543,6 +1543,18 @@ impl AppState {
                 }
             }
             A::PinTab => host.toggle_pin_active(),
+            A::ExitInsertMode => {
+                // Run the JS blur via the host arm.
+                host.dispatch(action);
+                // Clear local edit state synchronously — don't wait for the
+                // JS-driven blur event to arrive.
+                self.edit_focus = EditFocus::None;
+                if let Ok(mut e) = self.engine.lock() {
+                    e.set_mode(PageMode::Normal);
+                }
+                self.refresh_title();
+                self.request_redraw();
+            }
             _ => host.dispatch(action),
         }
     }

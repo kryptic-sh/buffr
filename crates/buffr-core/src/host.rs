@@ -1089,6 +1089,15 @@ textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
                 self.run_js(js);
             }
 
+            A::ExitInsertMode => {
+                // Blur whatever the page has focused. The DOM blur event will
+                // propagate to edit.js, which posts a `blur` console event;
+                // the main loop drains it and resets EditFocus. As a defensive
+                // measure, the caller (apps/buffr/src/main.rs's dispatch_action
+                // path) should ALSO clear local state synchronously.
+                self.run_js("if(document.activeElement)document.activeElement.blur();");
+            }
+
             A::ClearCompletedDownloads => match self.downloads.clear_completed() {
                 Ok(n) => tracing::info!(removed = n, "downloads: cleared completed"),
                 Err(err) => tracing::warn!(error = %err, "downloads: clear_completed failed"),

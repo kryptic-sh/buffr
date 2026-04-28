@@ -100,8 +100,11 @@ See [`multi-tab.md`](./multi-tab.md).
 | `r`     | `Reload`      |                                                                      |
 | `R`     | `ReloadHard`  |                                                                      |
 | `<C-r>` | `ReloadHard`  |                                                                      |
-| `<Esc>` | `StopLoading` |                                                                      |
 | `<C-c>` | `StopLoading` | **[buffr]** Vieb uses `<C-c>` for copyText; buffr keeps StopLoading. |
+
+> **Note:** `<Esc>` is no longer bound to `StopLoading` in Normal mode. Use
+> `<C-c>` to stop a page load. `<Esc>` is now `ExitInsertMode` — it blurs the
+> focused DOM element and resets the engine to Normal unconditionally.
 
 ### Omnibar / command line
 
@@ -154,10 +157,14 @@ See [`multi-tab.md`](./multi-tab.md).
 
 ### Edit mode
 
-| Keys | Action            | Notes                                                                                   |
-| ---- | ----------------- | --------------------------------------------------------------------------------------- |
-| `i`  | `EnterEditMode`   | Flip engine to Edit mode. Useful if focusin auto-promote desyncs.                       |
-| `gi` | `FocusFirstInput` | **[buffr]** Vieb's `insertAtFirstInput`. JS focuses first input; focusin auto-promotes. |
+| Keys    | Action            | Notes                                                                                   |
+| ------- | ----------------- | --------------------------------------------------------------------------------------- |
+| `i`     | `FocusFirstInput` | **[buffr]** Same as `gi` — JS focuses first form input; focusin auto-promotes to Edit.  |
+| `gi`    | `FocusFirstInput` | **[buffr]** Vieb's `insertAtFirstInput`. JS focuses first input; focusin auto-promotes. |
+| `<Esc>` | `ExitInsertMode`  | Blurs the active DOM element; resets edit state and engine to Normal unconditionally.   |
+
+> `EnterEditMode` remains in the action enum for advanced user config (e.g.
+> `[keymap.normal] "<F2>" = "enter_edit_mode"`) but is unbound by default.
 
 ## Mode transitions
 
@@ -166,9 +173,10 @@ The engine reads the resolved [`PageAction`] and auto-transitions:
 - `OpenOmnibar`, `OpenCommandLine` → `Command`
 - `EnterHintMode`, `EnterHintModeBackground` → `Hint`
 - `EnterEditMode` → `Edit` (trie bypassed; `feed_edit_mode_key` takes over)
+- `ExitInsertMode` → `Normal` (blurs DOM active element; clears EditFocus)
 - `EnterMode(m)` → `m`
 
-`<Esc>` is bound in Normal to `StopLoading` and in Visual / Command / Hint to
+`<Esc>` is bound in Normal to `ExitInsertMode` and in Visual / Command / Hint to
 `EnterMode(Normal)` so every mode has a guaranteed escape hatch.
 
 ## In-overlay shortcuts (command line / omnibar)

@@ -141,6 +141,10 @@ pub enum PageAction {
     /// Focus the first text input on the page and enter edit mode.
     /// Vieb's `gi` / `insertAtFirstInput`.
     FocusFirstInput,
+
+    /// Exit insert/edit mode unconditionally — blurs the focused DOM element
+    /// and returns the engine to PageMode::Normal.
+    ExitInsertMode,
 }
 
 #[cfg(test)]
