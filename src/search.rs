@@ -189,6 +189,7 @@ fn is_real_scheme(s: &str) -> bool {
             | "view-source"
             | "javascript"
             | "mailto"
+            | "buffr"
     )
 }
 
