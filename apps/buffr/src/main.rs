@@ -2455,6 +2455,7 @@ impl AppState {
 
     /// Drain queued edit-focus events and update `self.edit_focus`.
     fn drain_edit_focus_events(&mut self) {
+        let mut mode_changed = false;
         for ev in drain_edit_events(&self.edit_sink) {
             match ev {
                 EditConsoleEvent::Focus {
@@ -2482,6 +2483,7 @@ impl AppState {
                         }
                         tracing::info!(%field_id, "edit-mode entered");
                         self.edit_focus = EditFocus::Editing { field_id };
+                        mode_changed = true;
                     }
                 }
                 EditConsoleEvent::Blur { field_id } => {
@@ -2491,6 +2493,10 @@ impl AppState {
                     };
                     if matches_current {
                         self.edit_focus = EditFocus::None;
+                        if let Ok(mut e) = self.engine.lock() {
+                            e.set_mode(buffr_modal::PageMode::Normal);
+                        }
+                        mode_changed = true;
                     }
                 }
                 EditConsoleEvent::Mutate { field_id, .. } => {
@@ -2504,6 +2510,9 @@ impl AppState {
                     }
                 }
             }
+        }
+        if mode_changed {
+            self.refresh_title();
         }
     }
 
