@@ -82,16 +82,38 @@ wrap_app! {
             let Some(command_line) = command_line else { return };
             // Defaults that make CEF behave nicely on a Linux laptop:
             //
-            // - `enable-features=...` opts into Vulkan / Wayland / hardware decoding
-            //   when available. CEF silently ignores features its build doesn't ship.
+            // - `enable-features=...` opts into Vulkan / Wayland / hardware
+            //   decoding when available. CEF silently ignores features its
+            //   build doesn't ship.
+            // - Chromium only respects the last `enable-features` switch, so
+            //   all features are merged into a single comma-separated value.
             //
             // Switches use the same names Chromium does; see chromium's
             // `chrome/common/chrome_switches.cc`.
             append_switch_with_value(
                 command_line,
                 "enable-features",
-                "UseOzonePlatform,VaapiVideoDecodeLinuxGL",
+                // UseOzonePlatform   — Wayland/Ozone backend (Linux)
+                // VaapiVideoDecodeLinuxGL — VA-API hardware video decode via GL
+                // AcceleratedVideoDecodeLinuxGL — encode/decode on GPU on Linux
+                // VaapiVideoEncoder  — VA-API hardware video encoding
+                // CanvasOopRasterization — canvas rasterisation on the GPU
+                "UseOzonePlatform,VaapiVideoDecodeLinuxGL,\
+                 AcceleratedVideoDecodeLinuxGL,VaapiVideoEncoder,\
+                 CanvasOopRasterization",
             );
+            // GPU compositing: turn on the page compositor on the GPU even in
+            // OSR mode. Without these, chrome://gpu reports "Software only"
+            // for canvas, WebGL, and video decode. CEF's OSR mode does NOT
+            // require software compositing — that's a historical default.
+            append_switch(command_line, "enable-gpu");
+            append_switch(command_line, "enable-gpu-compositing");
+            append_switch(command_line, "enable-gpu-rasterization");
+            append_switch(command_line, "enable-zero-copy");
+            // Chromium's GPU blocklist often disables hardware accel on Linux
+            // laptops with integrated GPUs. We accept the risk — modern Mesa
+            // drivers handle this fine.
+            append_switch(command_line, "ignore-gpu-blocklist");
             // No-sandbox is set in `Settings`, but a redundant switch
             // keeps CEF from re-enabling on certain code paths.
             append_switch(command_line, "no-sandbox");
