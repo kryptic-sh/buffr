@@ -3730,13 +3730,16 @@ fn fill_rect_u32(
 ) {
     let x1 = (x + w).min(buf_w);
     let y1 = (y + h).min(buf_h);
+    if x >= x1 || y >= y1 {
+        return;
+    }
     for row in y..y1 {
         let base = row * buf_w;
-        for col in x..x1 {
-            if let Some(px) = buf.get_mut(base + col) {
-                *px = color;
-            }
+        let row_end = base + buf_w;
+        if row_end > buf.len() {
+            break;
         }
+        buf[base + x..base + x1].fill(color);
     }
 }
 
