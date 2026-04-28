@@ -2077,9 +2077,14 @@ impl AppState {
     fn open_omnibar(&mut self) {
         let mut bar = InputBar::with_prefix("> ");
         // Pre-populate with the current page URL so the user can edit
-        // it in place — Vimium / qutebrowser convention.
-        bar.buffer = self.statusline.url.clone();
-        bar.cursor = bar.buffer.len();
+        // it in place — Vimium / qutebrowser convention. Internal
+        // buffr:// URLs (new-tab page, etc.) start empty so the user
+        // can type a fresh query immediately.
+        let url = &self.statusline.url;
+        if !url.starts_with("buffr:") {
+            bar.buffer = url.clone();
+            bar.cursor = bar.buffer.len();
+        }
         self.overlay = Some(OverlayState::Omnibar(bar));
         self.refresh_overlay_suggestions();
         self.resync_cef_rect();
