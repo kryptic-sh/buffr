@@ -170,6 +170,40 @@ pub enum PageAction {
     ExitInsertMode,
 }
 
+impl PageAction {
+    /// Whether the action is safe to fire from an OS auto-repeat
+    /// keystroke. Idempotent or stream-friendly actions (scrolls, tab
+    /// cycling, history nav, find-next, zoom) return `true`; one-shot
+    /// state mutations (close tab, paste, mode change, devtools) return
+    /// `false` so holding the key doesn't spam them.
+    pub fn is_repeatable(&self) -> bool {
+        use PageAction::*;
+        matches!(
+            self,
+            ScrollUp(_)
+                | ScrollDown(_)
+                | ScrollLeft(_)
+                | ScrollRight(_)
+                | ScrollPageUp
+                | ScrollPageDown
+                | ScrollFullPageDown
+                | ScrollFullPageUp
+                | ScrollHalfPageDown
+                | ScrollHalfPageUp
+                | TabNext
+                | TabPrev
+                | MoveTabLeft
+                | MoveTabRight
+                | HistoryBack
+                | HistoryForward
+                | FindNext
+                | FindPrev
+                | ZoomIn
+                | ZoomOut
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

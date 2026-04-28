@@ -3999,7 +3999,12 @@ impl ApplicationHandler for AppState {
                 {
                     return;
                 }
-                let Some(chord) = key_event_to_chord(&event, self.modifiers) else {
+                // Page-mode dispatch accepts auto-repeat events so
+                // holding e.g. `H` / `L` cycles tabs at OS repeat speed.
+                // Per-action filtering happens after resolution: see
+                // `PageAction::is_repeatable`.
+                let is_repeat = event.repeat;
+                let Some(chord) = key_event_to_chord_with_repeat(&event, self.modifiers) else {
                     return;
                 };
                 let now = self.startup.elapsed();
@@ -4013,6 +4018,11 @@ impl ApplicationHandler for AppState {
                 };
                 match step {
                     Step::Resolved(action) => {
+                        // Drop auto-repeat events for actions that
+                        // shouldn't stream (TabClose, OpenOmnibar, etc).
+                        if is_repeat && !action.is_repeatable() {
+                            return;
+                        }
                         // `EnterInsertMode` (`i`) flips the engine into
                         // PageMode::Insert. Entry into a specific field is
                         // handled via the JS focusin bridge; `i` alone
