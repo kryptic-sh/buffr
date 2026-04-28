@@ -65,8 +65,8 @@ pub struct General {
 impl Default for General {
     fn default() -> Self {
         Self {
-            homepage: "https://example.com".into(),
-            leader: "\\".into(),
+            homepage: "about:blank".into(),
+            leader: " ".into(),
         }
     }
 }
