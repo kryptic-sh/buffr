@@ -21,7 +21,7 @@ Shift, `<M-...>` / `<A-...>` = Alt, `<D-...>` = Super (Cmd on macOS), `<leader>`
 | `Command` | `:` or `e`        | Command line / omnibar focused. `<Esc>` returns.       |
 | `Hint`    | `f` / `F`         | DOM hint overlay active. `<Esc>` returns.              |
 | `Pending` | (transient)       | Multi-key prefix in flight. Not user-bindable.         |
-| `Edit`    | text-field focus  | Forwarded to `hjkl_editor::Editor` once Phase 2 ships. |
+| `Insert`  | text-field focus  | Forwarded to `hjkl_editor::Editor` once Phase 2 ships. |
 
 ## Count and register prefixes
 
@@ -155,16 +155,16 @@ See [`multi-tab.md`](./multi-tab.md).
 | `<F12>`   | `OpenDevTools` |
 | `<C-S-i>` | `OpenDevTools` |
 
-### Edit mode
+### Insert mode
 
-| Keys    | Action            | Notes                                                                                   |
-| ------- | ----------------- | --------------------------------------------------------------------------------------- |
-| `i`     | `FocusFirstInput` | **[buffr]** Same as `gi` — JS focuses first form input; focusin auto-promotes to Edit.  |
-| `gi`    | `FocusFirstInput` | **[buffr]** Vieb's `insertAtFirstInput`. JS focuses first input; focusin auto-promotes. |
-| `<Esc>` | `ExitInsertMode`  | Blurs the active DOM element; resets edit state and engine to Normal unconditionally.   |
+| Keys    | Action            | Notes                                                                                    |
+| ------- | ----------------- | ---------------------------------------------------------------------------------------- |
+| `i`     | `FocusFirstInput` | **[buffr]** Same as `gi` — JS focuses first form input; focusin auto-promotes to Insert. |
+| `gi`    | `FocusFirstInput` | **[buffr]** Vieb's `insertAtFirstInput`. JS focuses first input; focusin auto-promotes.  |
+| `<Esc>` | `ExitInsertMode`  | Blurs the active DOM element; resets edit state and engine to Normal unconditionally.    |
 
-> `EnterEditMode` remains in the action enum for advanced user config (e.g.
-> `[keymap.normal] "<F2>" = "enter_edit_mode"`) but is unbound by default.
+> `EnterInsertMode` remains in the action enum for advanced user config (e.g.
+> `[keymap.normal] "<F2>" = "enter_insert_mode"`) but is unbound by default.
 
 ## Mode transitions
 
@@ -172,7 +172,7 @@ The engine reads the resolved [`PageAction`] and auto-transitions:
 
 - `OpenOmnibar`, `OpenCommandLine` → `Command`
 - `EnterHintMode`, `EnterHintModeBackground` → `Hint`
-- `EnterEditMode` → `Edit` (trie bypassed; `feed_edit_mode_key` takes over)
+- `EnterInsertMode` → `Insert` (trie bypassed; `feed_edit_mode_key` takes over)
 - `ExitInsertMode` → `Normal` (blurs DOM active element; clears EditFocus)
 - `EnterMode(m)` → `m`
 

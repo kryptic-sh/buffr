@@ -1085,9 +1085,9 @@ impl BrowserHost {
             A::EnterMode(mode) => {
                 tracing::info!(?mode, "EnterMode — engine tracks mode internally");
             }
-            A::EnterEditMode => {
+            A::EnterInsertMode => {
                 tracing::info!(
-                    "edit-mode requested — hjkl-engine integration is Phase 2b \
+                    "insert-mode requested — hjkl-engine integration is Phase 2b \
                      (blocked on hjkl Host trait)"
                 );
             }
@@ -1096,7 +1096,7 @@ impl BrowserHost {
                 // Focus the first interactive text field on the page. The
                 // injected `edit.js` listener picks up the focusin event and
                 // emits a console message; the main loop drains it and flips
-                // to PageMode::Edit. No need to set the engine mode here.
+                // to PageMode::Insert. No need to set the engine mode here.
                 let js = "(function(){\
                     var sel='input:not([type=hidden]):not([disabled]):not([readonly]),\
 textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\

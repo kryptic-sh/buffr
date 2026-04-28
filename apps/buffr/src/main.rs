@@ -2510,7 +2510,7 @@ impl AppState {
                     field_id, ref kind, ..
                 } => {
                     // Browser UX: clicking/tabbing to an input auto-enters
-                    // Edit mode. A spurious re-focus for the already-active
+                    // Insert mode. A spurious re-focus for the already-active
                     // field must not clobber the existing state.
                     let already_editing = matches!(
                         &self.edit_focus,
@@ -2527,7 +2527,7 @@ impl AppState {
                             host.run_edit_attach(&field_id);
                         }
                         if let Ok(mut e) = self.engine.lock() {
-                            e.set_mode(buffr_modal::PageMode::Edit);
+                            e.set_mode(buffr_modal::PageMode::Insert);
                         }
                         tracing::info!(%field_id, "edit-mode entered");
                         self.edit_focus = EditFocus::Editing { field_id };
@@ -2632,10 +2632,10 @@ impl AppState {
     /// Handle a key event while in `Editing` state. Returns `true` if
     /// the event was consumed (the caller must not forward it further).
     ///
-    /// Edit mode is "transparent" — every key is forwarded straight to
+    /// Insert mode is "transparent" — every key is forwarded straight to
     /// CEF so the focused input field handles input natively (typing,
     /// arrow keys, selection, copy/paste, IME, etc.). The only key
-    /// intercepted is `Esc`, which exits Edit mode and returns to
+    /// intercepted is `Esc`, which exits Insert mode and returns to
     /// Normal page mode.
     fn edit_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         let planned = Self::winit_key_to_planned(event, self.modifiers);
@@ -3029,7 +3029,7 @@ fn mode_label(mode: PageMode) -> &'static str {
         PageMode::Visual => "VISUAL",
         PageMode::Command => "COMMAND",
         PageMode::Hint => "HINT",
-        PageMode::Edit => "INSERT",
+        PageMode::Insert => "INSERT",
     }
 }
 
@@ -3377,13 +3377,13 @@ impl ApplicationHandler for AppState {
                 };
                 match step {
                     Step::Resolved(action) => {
-                        // `EnterEditMode` (`i`) flips the engine into
-                        // PageMode::Edit. Entry into a specific field is
+                        // `EnterInsertMode` (`i`) flips the engine into
+                        // PageMode::Insert. Entry into a specific field is
                         // handled via the JS focusin bridge; `i` alone
                         // without a focused input is a no-op at the page
                         // level — the engine mode flip is sufficient to
                         // unblock subsequent keys once a field is clicked.
-                        if action == buffr_modal::PageAction::EnterEditMode {
+                        if action == buffr_modal::PageAction::EnterInsertMode {
                             self.refresh_title();
                             return;
                         }
@@ -3417,7 +3417,8 @@ impl ApplicationHandler for AppState {
                         // swallow so typing `a`, `s`, etc. doesn't
                         // type into a focused field or trigger browser
                         // shortcuts.
-                        let pass_through = matches!(post_mode, PageMode::Edit | PageMode::Command);
+                        let pass_through =
+                            matches!(post_mode, PageMode::Insert | PageMode::Command);
                         if pass_through {
                             if let Some(host) = self.host.as_ref() {
                                 let mods = winit_mods_to_cef(&self.modifiers);
@@ -3434,7 +3435,7 @@ impl ApplicationHandler for AppState {
                         }
                     }
                     Step::EditModeActive => {
-                        // Engine is already in PageMode::Edit; consume
+                        // Engine is already in PageMode::Insert; consume
                         // the key. If a field is focused, edit_mode_handle_key
                         // above already handled it; otherwise the key is
                         // silently dropped (no input is active).

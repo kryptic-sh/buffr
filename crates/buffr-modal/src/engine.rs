@@ -14,7 +14,7 @@
 //!   register wiring lands in Phase 5.
 //! - **mode** — current [`PageMode`]. Mode transitions arrive two
 //!   ways: implicit (specific actions like `OpenOmnibar` /
-//!   `EnterHintMode` / `EnterEditMode` move the engine into the
+//!   `EnterHintMode` / `EnterInsertMode` move the engine into the
 //!   matching mode after dispatch) and explicit
 //!   ([`PageAction::EnterMode`]). The user-config friendly catch-all
 //!   `EnterMode` co-exists with the legacy specific actions because
@@ -33,10 +33,10 @@
 //! (open the omnibar UI, paint the hint overlay), so they shouldn't
 //! collapse into `EnterMode`. The engine treats both as triggers.
 //!
-//! # Edit-mode stub
+//! # Insert-mode stub
 //!
-//! When the trie returns `EnterEditMode`, the engine sets `mode =
-//! Edit` and *stops processing keys via the trie*. Subsequent keys
+//! When the trie returns `EnterInsertMode`, the engine sets `mode =
+//! Insert` and *stops processing keys via the trie*. Subsequent keys
 //! must go through [`Engine::feed_edit_mode_key`] which currently
 //! returns `EditModeStep::PassThrough(chord)`. Real wiring lands
 //! when `hjkl_engine::Host` extraction ships upstream.
@@ -195,7 +195,7 @@ impl Engine {
     /// duration since some fixed epoch (the engine never reads the
     /// clock itself; the host owns timekeeping).
     pub fn feed(&mut self, chord: KeyChord, now: Duration) -> Step {
-        if matches!(self.mode, PageMode::Edit) {
+        if matches!(self.mode, PageMode::Insert) {
             return Step::EditModeActive;
         }
 
@@ -285,13 +285,13 @@ impl Engine {
         Some(self.finalise_action(action))
     }
 
-    /// Edit-mode key path. Returns a stub today — once
+    /// Insert-mode key path. Returns a stub today — once
     /// `hjkl_engine::Host` lands upstream this routes through
     /// `hjkl_editor::Editor`.
     // TODO(phase-2-edit): once hjkl_engine::Host lands, route here
     // through hjkl_editor::Editor.
     pub fn feed_edit_mode_key(&mut self, chord: KeyChord) -> EditModeStep {
-        // Esc returns to the pre-edit mode.
+        // Esc returns to the pre-insert mode.
         if chord.modifiers.is_empty() && chord.key == Key::Named(NamedKey::Esc) {
             self.mode = self.return_mode;
             return EditModeStep::Exited;
@@ -322,9 +322,9 @@ impl Engine {
         let new_mode = match action {
             PageAction::OpenOmnibar | PageAction::OpenCommandLine => Some(PageMode::Command),
             PageAction::EnterHintMode | PageAction::EnterHintModeBackground => Some(PageMode::Hint),
-            PageAction::EnterEditMode => {
+            PageAction::EnterInsertMode => {
                 self.return_mode = self.mode;
-                Some(PageMode::Edit)
+                Some(PageMode::Insert)
             }
             PageAction::EnterMode(m) => Some(*m),
             _ => None,
@@ -526,28 +526,28 @@ mod tests {
     #[test]
     fn edit_mode_blocks_trie() {
         let mut e = engine_with(&[
-            (PageMode::Normal, "i", PageAction::EnterEditMode),
+            (PageMode::Normal, "i", PageAction::EnterInsertMode),
             (PageMode::Normal, "j", PageAction::ScrollDown(1)),
         ]);
         let r = e.feed(parse_key("i").unwrap(), t(0));
-        assert_eq!(r, Step::Resolved(PageAction::EnterEditMode));
-        assert_eq!(e.mode(), PageMode::Edit);
-        // After entering edit-mode the trie is bypassed.
+        assert_eq!(r, Step::Resolved(PageAction::EnterInsertMode));
+        assert_eq!(e.mode(), PageMode::Insert);
+        // After entering insert-mode the trie is bypassed.
         let r2 = e.feed(parse_key("j").unwrap(), t(0));
         assert_eq!(r2, Step::EditModeActive);
     }
 
     #[test]
     fn edit_mode_passthrough_then_esc_exits() {
-        let mut e = engine_with(&[(PageMode::Normal, "i", PageAction::EnterEditMode)]);
+        let mut e = engine_with(&[(PageMode::Normal, "i", PageAction::EnterInsertMode)]);
         let _ = e.feed(parse_key("i").unwrap(), t(0));
-        assert_eq!(e.mode(), PageMode::Edit);
+        assert_eq!(e.mode(), PageMode::Insert);
         let chord = parse_key("a").unwrap();
         assert_eq!(
             e.feed_edit_mode_key(chord),
             EditModeStep::PassThrough(chord)
         );
-        assert_eq!(e.mode(), PageMode::Edit);
+        assert_eq!(e.mode(), PageMode::Insert);
         let exit = e.feed_edit_mode_key(parse_key("<Esc>").unwrap());
         assert_eq!(exit, EditModeStep::Exited);
         assert_eq!(e.mode(), PageMode::Normal);
