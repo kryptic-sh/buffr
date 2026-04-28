@@ -40,11 +40,11 @@ use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
-    HintAlphabet, HintEventSink, NEW_TAB_URL, PermissionsQueue, PromptOutcome, TabId,
-    drain_edit_events, drain_permissions_with_defer, drain_popup_urls, expire_stale_notices,
-    init_cef_api, new_download_notice_queue, new_edit_event_sink, new_find_sink,
-    new_hint_event_sink, new_permissions_queue, peek_download_notice, peek_permission_front,
-    permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
+    HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId, drain_edit_events,
+    drain_permissions_with_defer, drain_popup_urls, expire_stale_notices, init_cef_api,
+    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
+    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
+    pop_permission_front, profile_paths, register_buffr_handler_factory,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -673,18 +673,8 @@ fn main() -> Result<()> {
             warn!(error = %err, "ctrlc handler already installed — using existing");
         }
     }
-    // Cold-start initial URL: if no session is being restored (missing
-    // or empty), land on the internal new-tab page rather than the
-    // configured homepage so a fresh launch shows the buffr UI. The
-    // homepage value still drives `:tabnew` and the `gh` chord.
-    let initial_url = if pending_session_tabs.is_empty() {
-        buffr_core::NEW_TAB_URL.to_string()
-    } else {
-        homepage.clone()
-    };
     let mut app_state = AppState::new(
         homepage,
-        initial_url,
         engine,
         history.clone(),
         bookmarks.clone(),
@@ -1280,12 +1270,11 @@ fn clear_cookies() {
 ///   only call `set_title` when this changes. winit's `set_title` is
 ///   idempotent but cheap → cheaper still to skip.
 struct AppState {
+    /// URL loaded into a fresh tab everywhere — cold-start tab 0,
+    /// `:tabnew`, the `gh` chord, and `o`/`O`. Defaults to
+    /// `buffr://new` and is overridable via `general.homepage` and
+    /// `--homepage`.
     homepage: String,
-    /// URL to load into the very first tab when the browser host is
-    /// created. Diverges from `homepage` on cold start: an empty /
-    /// missing session steers the initial tab to `buffr://new` so the
-    /// user sees the internal new-tab page rather than blank.
-    initial_url: String,
     window: Option<Arc<Window>>,
     host: Option<buffr_core::BrowserHost>,
     engine: Arc<Mutex<Engine>>,
@@ -1524,7 +1513,6 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         homepage: String,
-        initial_url: String,
         engine: Arc<Mutex<Engine>>,
         history: Arc<buffr_history::History>,
         bookmarks: Arc<buffr_bookmarks::Bookmarks>,
@@ -1563,7 +1551,6 @@ impl AppState {
         statusline.mode = PageMode::Normal;
         Self {
             homepage,
-            initial_url,
             window: None,
             host: None,
             engine,
@@ -1651,7 +1638,7 @@ impl AppState {
                 host.active_index().unwrap_or(0)
             };
             // Last use of `host` — NLL releases the shared borrow here.
-            let result = host.open_tab_at(NEW_TAB_URL, insert_idx);
+            let result = host.open_tab_at(&self.homepage, insert_idx);
             match result {
                 Ok(new_id) => {
                     // If the user cancels the omnibar without typing a
@@ -1675,8 +1662,8 @@ impl AppState {
         match action {
             A::TabNewRight | A::TabNewLeft => unreachable!("handled above"),
             A::TabNew => {
-                let url = NEW_TAB_URL;
-                if let Err(err) = host.open_tab(url) {
+                let url = self.homepage.clone();
+                if let Err(err) = host.open_tab(&url) {
                     warn!(error = %err, %url, "tab_new: failed");
                 }
             }
@@ -3405,7 +3392,7 @@ impl ApplicationHandler for AppState {
 
         match buffr_core::BrowserHost::new_with_options(
             raw,
-            &self.initial_url,
+            &self.homepage,
             self.history.clone(),
             self.downloads.clone(),
             self.downloads_config.clone(),
@@ -3423,7 +3410,7 @@ impl ApplicationHandler for AppState {
         ) {
             Ok(host) => {
                 info!(mode = ?host.mode(), "browser host created");
-                debug!(url = %self.initial_url, "browser host created — initial url");
+                debug!(url = %self.homepage, "browser host created — initial url");
                 // CEF stays focused for the lifetime of the browser
                 // so DOM clicks deliver focus to inputs. We do NOT
                 // forward OS-level Focused(false) (alt-tab) so pages
