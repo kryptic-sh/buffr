@@ -431,13 +431,16 @@ impl InputBar {
                 pip_colour,
             );
             let row_text_y = row_y as i32 + ((row_h as i32 - font::GLYPH_H as i32) / 2);
+            let text_left = x + 16;
+            let text_max_px = (x + w).saturating_sub(text_left + 8);
+            let display = crate::truncate_to_width(&sug.display, text_max_px);
             font::draw_text(
                 buffer,
                 buf_w,
                 buf_h,
-                x as i32 + 16,
+                text_left as i32,
                 row_text_y,
-                &sug.display,
+                display,
                 p.fg,
             );
         }
