@@ -614,13 +614,25 @@ impl BrowserHost {
         if let Ok(mut last) = self.last_size.lock() {
             *last = (width, height);
         }
-        let Ok(tabs) = self.tabs.lock() else { return };
+        let Ok(tabs) = self.tabs.lock() else {
+            tracing::debug!(width, height, "osr_resize: tabs mutex poisoned");
+            return;
+        };
         let active_idx = self.active.lock().ok().and_then(|g| *g);
         if let Some(idx) = active_idx
             && let Some(t) = tabs.get(idx)
             && let Some(host) = t.browser.host()
         {
+            tracing::debug!(width, height, idx, "osr_resize: calling was_resized");
             host.was_resized();
+        } else {
+            tracing::debug!(
+                width,
+                height,
+                ?active_idx,
+                tab_count = tabs.len(),
+                "osr_resize: no active browser host to notify",
+            );
         }
     }
 

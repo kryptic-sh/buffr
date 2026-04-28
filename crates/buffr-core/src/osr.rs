@@ -118,6 +118,7 @@ wrap_render_handler! {
             rect.y = 0;
             rect.width = self.view.width.load(Ordering::Relaxed) as i32;
             rect.height = self.view.height.load(Ordering::Relaxed) as i32;
+            tracing::trace!(w = rect.width, h = rect.height, "osr: view_rect");
         }
 
         fn screen_point(
@@ -161,6 +162,7 @@ wrap_render_handler! {
             let w = width as u32;
             let h = height as u32;
             let len = (w as usize) * (h as usize) * 4;
+            tracing::trace!(w, h, "osr: on_paint");
 
             // SAFETY: CEF guarantees `buffer` points to `width * height * 4`
             // valid bytes for the duration of this call.
