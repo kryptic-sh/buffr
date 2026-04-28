@@ -388,8 +388,21 @@ mod linux {
             let child_subsurface =
                 subcompositor.get_subsurface(&child_surface, &parent_surface, &qh, ());
 
-            // Desync mode: child commits are independent of the parent.
-            child_subsurface.set_desync();
+            // Sync mode (the wl_subsurface default — we omit set_desync).
+            // In sync mode the child surface's pending state (new buffer,
+            // damage) and the subsurface's own pending state (set_position)
+            // are both applied atomically on the PARENT's commit. Under
+            // rapid top-edge drag desync mode let the compositor see a
+            // frame where the new buffer was applied but the new position
+            // wasn't yet (or the inverse), making the statusline briefly
+            // jump. Sync mode collapses both updates into the same parent
+            // commit boundary so the user only ever observes consistent
+            // states.
+            //
+            // Tradeoff: chrome state changes that don't resize the window
+            // (URL change, mode change) still need a parent commit to be
+            // visible. paint_chrome already commits the parent via wgpu
+            // present whenever chrome_generation bumps, so this is free.
 
             // Crucially, leak the parent_surface wrapper. We constructed it
             // from a raw ptr that winit owns; dropping our wrapper would
