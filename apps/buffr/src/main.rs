@@ -52,8 +52,8 @@ use buffr_modal::{
 use buffr_permissions::Permissions;
 use buffr_ui::{
     CertState, DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip, FindStatus,
-    HintStatus as UiHintStatus, InputBar, PERMISSIONS_PROMPT_HEIGHT, PermissionsPrompt,
-    STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
+    HintStatus as UiHintStatus, InputBar, PermissionsPrompt, STATUSLINE_HEIGHT, Statusline,
+    Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
 mod render;
@@ -1863,6 +1863,7 @@ impl AppState {
                 host.toggle_pin_active();
                 self.refresh_tab_strip();
                 self.mark_session_dirty();
+                self.request_redraw();
             }
             A::PasteUrl { after } => {
                 let active_idx = host.active_index().unwrap_or(0);
@@ -2283,7 +2284,6 @@ impl AppState {
         // Precompute geometry-derived inputs before the renderer frame
         // closure — geometry helpers and Arc-queue peeks all need `&self`.
         let tab_y = self.tab_strip_y(height);
-        let prompt_y = self.permissions_prompt_y();
         let notice_y = self.download_notice_y();
         // Snapshot the front of the download notice queue before the
         // renderer frame closure so we don't borrow self inside it.
@@ -2389,17 +2389,50 @@ impl AppState {
             // Tab strip — sits between chrome strip and CEF page area.
             tab_strip.paint(buf, w, height as usize, tab_y);
 
-            // Permissions prompt OR pinned-close confirmation.
-            if let Some(ref confirm) = confirm_close_pinned {
-                let _ = confirm; // type is present; paint the generic confirm widget
-                let confirm_widget = buffr_ui::ConfirmPrompt {
-                    message: "Close pinned tab?".to_string(),
-                    yes_label: "Yes (y)".to_string(),
-                    no_label: "No (n)".to_string(),
-                };
-                confirm_widget.paint(buf, w, height as usize, prompt_y);
-            } else if let Some(ref prompt) = permissions_prompt {
-                prompt.paint(buf, w, height as usize, prompt_y);
+            // Permissions prompt OR pinned-close confirmation — centered
+            // floating popup, top 1/3 of the window. CEF is never resized.
+            let has_prompt = confirm_close_pinned.is_some() || permissions_prompt.is_some();
+            if has_prompt {
+                let popup_w = ((width * 60) / 100).clamp(300, OMNIBAR_POPUP_MAX_WIDTH);
+                let popup_x = (width - popup_w) / 2;
+                let popup_y = height / 3;
+                let content_h = buffr_ui::CONFIRM_PROMPT_HEIGHT;
+                let popup_h =
+                    (content_h + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
+                fill_rect_u32(
+                    buf,
+                    w,
+                    height as usize,
+                    popup_x as usize,
+                    popup_y as usize,
+                    popup_w as usize,
+                    popup_h as usize,
+                    OMNIBAR_POPUP_BORDER_COLOR,
+                );
+                let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
+                let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
+                let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+                let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
+                fill_rect_u32(
+                    buf,
+                    w,
+                    height as usize,
+                    inner_x as usize,
+                    inner_y as usize,
+                    inner_w as usize,
+                    inner_h as usize,
+                    OMNIBAR_POPUP_BG,
+                );
+                if let Some(ref _confirm) = confirm_close_pinned {
+                    let confirm_widget = buffr_ui::ConfirmPrompt {
+                        message: "Close pinned tab?".to_string(),
+                        yes_label: "Yes (y)".to_string(),
+                        no_label: "No (n)".to_string(),
+                    };
+                    confirm_widget.paint_at(buf, w, height as usize, inner_x, inner_y, inner_w);
+                } else if let Some(ref prompt) = permissions_prompt {
+                    prompt.paint_at(buf, w, height as usize, inner_x, inner_y, inner_w);
+                }
             }
 
             // Download notice strip — drawn last (highest priority layer).
@@ -2511,32 +2544,23 @@ impl AppState {
     /// Vertical layout (top → bottom):
     ///
     /// 1. Download notice strip (`DOWNLOAD_NOTICE_HEIGHT`, when queued)
-    /// 2. Permissions prompt (`PERMISSIONS_PROMPT_HEIGHT`, when active)
-    /// 3. Tab strip (always, `TAB_STRIP_HEIGHT` px)
-    /// 4. CEF page area  ← overlay floats *over* this, no resize on toggle
-    /// 5. Statusline (always, `STATUSLINE_HEIGHT` px)
+    /// 2. Tab strip (always, `TAB_STRIP_HEIGHT` px)
+    /// 3. CEF page area  ← confirm/permissions/omnibar popups float over this
+    /// 4. Statusline (always, `STATUSLINE_HEIGHT` px)
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
         let status_h = STATUSLINE_HEIGHT.min(full_h);
         let remaining_after_status = full_h.saturating_sub(status_h);
         let tab_h = TAB_STRIP_HEIGHT.min(remaining_after_status);
         let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
-        let prompt_h = if self.confirm_close_pinned.is_some() {
-            buffr_ui::CONFIRM_PROMPT_HEIGHT.min(remaining_after_tabs)
-        } else if self.permissions_prompt.is_some() {
-            PERMISSIONS_PROMPT_HEIGHT.min(remaining_after_tabs)
-        } else {
-            0
-        };
-        let remaining_after_prompt = remaining_after_tabs.saturating_sub(prompt_h);
         let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
-            DOWNLOAD_NOTICE_HEIGHT.min(remaining_after_prompt)
+            DOWNLOAD_NOTICE_HEIGHT.min(remaining_after_tabs)
         } else {
             0
         };
-        let remaining_after_notice = remaining_after_prompt.saturating_sub(notice_h);
+        let remaining_after_notice = remaining_after_tabs.saturating_sub(notice_h);
         let cef_w = full_w.max(1);
         let cef_h = remaining_after_notice.max(1);
-        let cef_y = notice_h + prompt_h + tab_h;
+        let cef_y = notice_h + tab_h;
         (0, cef_y, cef_w, cef_h)
     }
 
@@ -2602,14 +2626,7 @@ impl AppState {
         } else {
             0
         };
-        let prompt_h = if self.confirm_close_pinned.is_some() {
-            buffr_ui::CONFIRM_PROMPT_HEIGHT
-        } else if self.permissions_prompt.is_some() {
-            PERMISSIONS_PROMPT_HEIGHT
-        } else {
-            0
-        };
-        (notice_h + prompt_h).min(full_h)
+        notice_h.min(full_h)
     }
 
     /// Top-of-window y for the download notice strip. Sits at the
@@ -2617,17 +2634,6 @@ impl AppState {
     /// a floating popup and does not affect this position.
     fn download_notice_y(&self) -> u32 {
         0
-    }
-
-    /// Top-of-window y for the permissions prompt strip. Sits right
-    /// below the download notice (when active) and above the tab strip.
-    /// The overlay is a floating popup and does not affect this position.
-    fn permissions_prompt_y(&self) -> u32 {
-        if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
-            DOWNLOAD_NOTICE_HEIGHT
-        } else {
-            0
-        }
     }
 
     /// Re-issue the CEF resize call for the current window dimensions.
@@ -3410,7 +3416,6 @@ impl AppState {
         // Pull the next prompt immediately so the chrome shows it
         // without waiting for the next tick.
         self.sync_permissions_prompt();
-        self.resync_cef_rect();
         self.request_redraw();
     }
 
@@ -4021,24 +4026,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && self.confirm_close_pinned.is_some()
                 {
                     let (px, py) = self.osr_cursor;
-                    // osr_cursor is in browser-region coords; convert
-                    // back to absolute window coords so the rects from
-                    // ConfirmPrompt match.
                     let size = self
                         .window
                         .as_ref()
                         .map(|w| w.inner_size())
                         .unwrap_or_default();
-                    let prompt_y = self.permissions_prompt_y();
+                    let win_w = size.width.max(1);
+                    let win_h = size.height.max(1);
+                    let abs_x = px;
+                    let abs_y = py + self.cef_child_rect(win_w, win_h).1 as i32;
+                    // Mirror popup geometry from the paint site exactly.
+                    let popup_w = ((win_w * 60) / 100).clamp(300, OMNIBAR_POPUP_MAX_WIDTH);
+                    let popup_x = (win_w - popup_w) / 2;
+                    let popup_y = win_h / 3;
+                    let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
+                    let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
+                    let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
                     let confirm = buffr_ui::ConfirmPrompt {
                         message: String::new(),
                         yes_label: "Yes (y)".to_string(),
                         no_label: "No (n)".to_string(),
                     };
-                    let abs_x = px;
-                    let abs_y =
-                        py + self.cef_child_rect(size.width.max(1), size.height.max(1)).1 as i32;
-                    let (yes_rect, no_rect) = confirm.button_rects(size.width.max(1), prompt_y);
+                    let (yes_rect, no_rect) = confirm.button_rects_at(inner_x, inner_y, inner_w);
                     if buffr_ui::rect_contains(yes_rect, abs_x, abs_y) {
                         self.resolve_pinned_close(true);
                         return;
@@ -4501,7 +4510,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // prompt is already active, so the user always sees one
         // request at a time.
         if self.sync_permissions_prompt() {
-            self.resync_cef_rect();
             self.request_redraw();
         }
 
