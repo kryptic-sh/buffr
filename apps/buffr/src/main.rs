@@ -4083,6 +4083,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
                 self.mark_chrome_dirty();
                 self.paint_chrome_with(Some((w, h)));
+                // Force wgpu's parent commit to reach the compositor in
+                // lockstep with the set_position queued before paint_chrome.
+                // wgpu marshals attach/damage/commit but doesn't always
+                // call wl_display_flush — the messages can sit in the
+                // shared libwayland send buffer until the next event
+                // dispatch, by which time another Resized may have
+                // overwritten the parent's pending set_position. The
+                // compositor would then apply the wrong frame's set_position
+                // to this frame's parent commit, briefly mispositioning the
+                // statusline. Flush forces the commit to dispatch now.
+                if let Some(sub) = self.wayland_sub.as_mut() {
+                    sub.flush();
+                }
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
