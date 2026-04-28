@@ -2334,9 +2334,7 @@ impl AppState {
             //
             // HostMode::Windowed: CEF owns an X11 child window that sits over
             // the top region — we must NOT write there or we would clobber it.
-            // FIXME(test): OSR composite disabled to isolate chrome-only
-            // resize behavior. Restore by removing the `false &&`.
-            if false && let Some((osr_frame, _)) = &osr_data {
+            if let Some((osr_frame, _)) = &osr_data {
                 let lock_start = Instant::now();
                 if let Ok(frame) = osr_frame.lock() {
                     osr_lock_us = lock_start.elapsed().as_micros() as u64;
@@ -2348,31 +2346,35 @@ impl AppState {
                     let by = browser_y as usize;
                     osr_dims = Some((osr_w as u32, osr_h as u32, bw as u32, bh as u32));
 
-                    // CEF emits BGRA bytes which already match the wgpu
-                    // Bgra8Unorm texture, so we copy as u32 with no swizzle.
+                    // Two paths. CEF emits BGRA bytes which already match
+                    // the wgpu Bgra8Unorm texture, so both copy as u32
+                    // without any swizzle.
                     //
-                    // Letterbox: blit the OSR frame at its native size,
-                    // top-left aligned within the browser region, and fill
-                    // any remaining rows / columns with a solid colour.
-                    // While CEF is catching up after a Resized event the
-                    // OSR frame is the OLD size; previously we NN-scaled
-                    // it across the new region, which made the page
-                    // content visibly stretch on every resize step.
-                    // Letterboxing instead keeps the page crisp; the gap
-                    // between the (stale-size) OSR and the current chrome
-                    // edges is a fixed-colour band that grows or shrinks
-                    // until `pending_resize_finalize` fires `host.resize`.
+                    // Fast: dims match → per-row memcpy.
+                    //
+                    // Slow: dims mismatch (transient catch-up while
+                    // host.resize is deferred during a live drag) →
+                    // nearest-neighbour stretch across the browser
+                    // region. Slightly fuzzy during the transient; the
+                    // page snaps back to crisp once host.resize fires.
                     if osr_w > 0 && osr_h > 0 {
                         let src_u32: &[u32] = bytemuck::cast_slice(&frame.pixels);
-                        let copy_h = osr_h.min(bh);
-                        let copy_w = osr_w.min(bw);
-                        if osr_w != bw || osr_h != bh {
-                            fill_rect_u32(buf, w, height as usize, 0, by, bw, bh, OSR_LETTERBOX_BG);
-                        }
-                        for row in 0..copy_h {
-                            let dst = (by + row) * w;
-                            let src = row * osr_w;
-                            buf[dst..dst + copy_w].copy_from_slice(&src_u32[src..src + copy_w]);
+                        if osr_w == bw && osr_h == bh {
+                            for row in 0..bh {
+                                let dst = (by + row) * w;
+                                let src = row * osr_w;
+                                buf[dst..dst + bw].copy_from_slice(&src_u32[src..src + bw]);
+                            }
+                        } else {
+                            for row in 0..bh {
+                                let src_row = row * osr_h / bh;
+                                let dst_base = (by + row) * w;
+                                let src_base = src_row * osr_w;
+                                for col in 0..bw {
+                                    let src_col = col * osr_w / bw;
+                                    buf[dst_base + col] = src_u32[src_base + src_col];
+                                }
+                            }
                         }
                     }
                     new_osr_generation = frame.generation;
@@ -3706,10 +3708,6 @@ const OMNIBAR_POPUP_MAX_WIDTH: u32 = 800;
 const OMNIBAR_POPUP_BORDER: u32 = 2;
 const OMNIBAR_POPUP_BG: u32 = 0x1a1b26;
 const OMNIBAR_POPUP_BORDER_COLOR: u32 = 0x7aa2f7;
-
-/// Fill colour for the gap between the OSR frame and the CEF rect when
-/// dimensions disagree (transient state during a deferred resize).
-const OSR_LETTERBOX_BG: u32 = 0x1a1b26;
 
 /// Fill a rectangle in a u32 pixel buffer with stride `buf_w`.
 #[allow(clippy::too_many_arguments)]
