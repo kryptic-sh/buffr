@@ -3999,8 +3999,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // attached. With the GPU compositor a paint is ~1-2 ms
                 // so doing it inline here is cheaper than the visible
                 // lag coalescing produces.
+                //
+                // Pass `new_size` explicitly: `window.inner_size()` can
+                // lag the event on Hyprland during a fast top-edge drag,
+                // and if paint_chrome reads the stale value we present
+                // a buffer smaller than the configured surface — the
+                // compositor then fills the gap by replicating the
+                // bottom edge of the buffer (statusline last row),
+                // which reads as a "stretched" bottom bar.
                 self.mark_chrome_dirty();
-                self.paint_chrome();
+                self.paint_chrome_with(Some((new_size.width.max(1), new_size.height.max(1))));
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
