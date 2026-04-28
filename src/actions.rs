@@ -80,16 +80,21 @@ pub enum PageAction {
     /// auto-opens the omnibar after creation so the user can type a URL.
     /// Inserts the new tab immediately to the left of the active tab.
     TabNewLeft,
-    /// Duplicate the active tab — clones the URL into a fresh tab.
-    /// Default keybind `<C-w>n` (see `docs/keymap.md`).
-    DuplicateTab,
-    /// Pin / unpin the active tab. Pinned tabs sort first; pin does
-    /// **not** prevent close. Default keybind `<C-w>p`.
+    /// Pin / unpin the active tab. Toggle — pinned tabs sort first;
+    /// pin does **not** prevent close. Default keybind `<leader>p`.
     PinTab,
     /// Re-open the most recently closed tab. Repeated invocation
     /// pops further entries from the close stack so successive
     /// closes can be undone in reverse order. Default keybind `u`.
     ReopenClosedTab,
+    /// Paste a URL from the clipboard into a new tab adjacent to the
+    /// active one. The clipboard text must classify as Url or Host
+    /// (per buffr-config's `classify_input`); other content is a
+    /// no-op. `after = true` inserts to the right (`p`), `false` to
+    /// the left (`P`).
+    PasteUrl {
+        after: bool,
+    },
     /// Reorder the tab list. Currently unbound; reserved for the
     /// eventual mouse-drag handler.
     TabReorder {
