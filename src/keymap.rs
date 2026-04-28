@@ -446,7 +446,6 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "gt", PageAction::TabNext),
     (PageMode::Normal, "gT", PageAction::TabPrev),
     (PageMode::Normal, "d", PageAction::TabClose),
-    (PageMode::Normal, "<C-w>c", PageAction::TabClose),
     // PinTab toggles the active tab's pin state. `<leader>p` keeps the
     // chord off the `<C-w>` prefix space so the leaf <C-w> = TabClose
     // bind doesn't have to wait for an ambiguity timeout.
@@ -460,9 +459,8 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // so repeated `u` undoes successive closes in reverse order.
     (PageMode::Normal, "u", PageAction::ReopenClosedTab),
     // Conventional-browser alternates for users migrating from Chromium /
-    // Firefox. `<C-w>` overlaps with the `<C-w>X` prefix chords above; the
-    // engine's ambiguity timeout fires the leaf binding once the prefix
-    // window expires, so `<C-w>c/n/p` still work when typed quickly.
+    // Firefox. `<C-w>` is now a leaf binding (no `<C-w>X` prefix chords)
+    // so it fires immediately without an ambiguity timeout.
     (PageMode::Normal, "<C-t>", PageAction::TabNewRight),
     (PageMode::Normal, "<C-S-t>", PageAction::ReopenClosedTab),
     (PageMode::Normal, "<C-w>", PageAction::TabClose),
@@ -702,9 +700,9 @@ mod tests {
     }
 
     #[test]
-    fn default_ctrl_w_c_closes_tab() {
+    fn default_ctrl_w_closes_tab() {
         let km = Keymap::default_bindings('\\');
-        let r = km.lookup(PageMode::Normal, &chords("<C-w>c"));
+        let r = km.lookup(PageMode::Normal, &chords("<C-w>"));
         assert!(matches!(r, Lookup::Match(PageAction::TabClose)));
     }
 
