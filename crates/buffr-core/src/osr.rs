@@ -27,7 +27,7 @@
 //! (writing via `BrowserHost::osr_resize`) can access them without a mutex.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cef::*;
 
@@ -75,6 +75,11 @@ pub struct OsrViewState {
     pub height: AtomicU32,
     /// Device scale factor stored as thousandths (e.g. 1000 = 1.0×, 1500 = 1.5×).
     pub scale: AtomicU32,
+    /// Optional callback invoked from `on_paint` after a frame lands. The
+    /// embedder uses this to wake the winit event loop (via
+    /// `EventLoopProxy`) so the UI can pump a redraw without polling.
+    /// Set once at startup via [`crate::BrowserHost::set_osr_wake`].
+    pub wake: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl OsrViewState {
@@ -84,6 +89,7 @@ impl OsrViewState {
             width: AtomicU32::new(1280),
             height: AtomicU32::new(800),
             scale: AtomicU32::new(1000),
+            wake: OnceLock::new(),
         }
     }
 }
@@ -174,6 +180,11 @@ wrap_render_handler! {
 
             guard.pixels.copy_from_slice(src);
             guard.generation = guard.generation.wrapping_add(1);
+            drop(guard);
+            // Wake the embedder so the UI loop can pump a redraw.
+            if let Some(wake) = self.view.wake.get() {
+                wake();
+            }
         }
     }
 }

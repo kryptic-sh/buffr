@@ -66,10 +66,18 @@ use tracing::{debug, info, trace, warn};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::ModifiersState,
     window::{Window, WindowId},
 };
+
+/// Custom user events sent into the winit loop from background threads.
+/// Today there's just one: a wakeup from CEF's OSR paint handler so the
+/// UI can pump a redraw the moment a new frame lands.
+#[derive(Debug, Clone, Copy)]
+enum BuffrUserEvent {
+    OsrFrame,
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -568,7 +576,9 @@ fn main() -> Result<()> {
     // HostMode::Osr (softbuffer composite over Wayland) — X11/XWayland
     // windowed embedding is not supported. macOS and Windows use native
     // child-window embedding (HostMode::Windowed).
-    let event_loop = EventLoop::new().context("creating winit event loop")?;
+    let event_loop = EventLoop::<BuffrUserEvent>::with_user_event()
+        .build()
+        .context("creating winit event loop")?;
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -706,6 +716,7 @@ fn main() -> Result<()> {
         initial_update_status,
         config.theme.high_contrast,
         shutdown_flag,
+        event_loop.create_proxy(),
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -1451,6 +1462,10 @@ struct AppState {
     /// Throttled to ~4 Hz (250 ms) to bound the cef-rs
     /// "Invalid UTF-16 string" stderr spam during page loads.
     last_url_poll: Instant,
+    /// Cross-thread wake handle for the winit event loop. Cloned and
+    /// installed into `BrowserHost` so OSR `on_paint` from the CEF IO
+    /// thread can post a redraw without polling.
+    event_proxy: EventLoopProxy<BuffrUserEvent>,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1609,6 +1624,7 @@ impl AppState {
         initial_update_status: buffr_core::UpdateStatus,
         high_contrast: bool,
         shutdown_flag: Arc<AtomicBool>,
+        event_proxy: EventLoopProxy<BuffrUserEvent>,
     ) -> Self {
         let update_indicator = update_indicator_from(&initial_update_status);
         let mut statusline = Statusline {
@@ -1679,6 +1695,7 @@ impl AppState {
             last_session_active: None,
             last_session_tab_ids: Vec::new(),
             last_url_poll: Instant::now(),
+            event_proxy,
         }
     }
 
@@ -3612,7 +3629,13 @@ fn mode_label(mode: PageMode) -> &'static str {
     }
 }
 
-impl ApplicationHandler for AppState {
+impl ApplicationHandler<BuffrUserEvent> for AppState {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
+        match event {
+            BuffrUserEvent::OsrFrame => self.request_redraw(),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -3674,6 +3697,14 @@ impl ApplicationHandler for AppState {
                 // retain state. Insert mode transitions are tracked
                 // independently via the modal engine.
                 host.osr_focus(true);
+                // Wire OSR on_paint → winit redraw via EventLoopProxy.
+                // Wayland's frame-callback model means request_redraw on
+                // an idle surface never fires; this wakeup is what
+                // delivers freshly-painted CEF frames to softbuffer.
+                let proxy = self.event_proxy.clone();
+                host.set_osr_wake(Arc::new(move || {
+                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                }));
                 self.host = Some(host);
             }
             Err(err) => {

@@ -466,6 +466,15 @@ impl BrowserHost {
         self.osr_view.clone()
     }
 
+    /// Install a wake callback fired from `OsrPaintHandler::on_paint`
+    /// every time CEF lands a new frame. Embedders use this to nudge
+    /// their UI loop (e.g. `winit::EventLoopProxy::send_event`) so the
+    /// surface can be repainted without a polling tick. First setter
+    /// wins; subsequent calls are silently ignored.
+    pub fn set_osr_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.osr_view.wake.set(wake);
+    }
+
     // ---- OSR input forwarding -------------------------------------------
 
     /// Forward a mouse-move to the active tab's browser host.
