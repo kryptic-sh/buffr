@@ -1083,27 +1083,36 @@ fn print_update_status(status: &buffr_core::UpdateStatus) {
 /// the embedded template each time the page is requested so config
 /// hot-reloads land without a binary rebuild.
 fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
-    let mut rows: Vec<(String, String)> = Vec::new();
+    use std::collections::BTreeMap;
+    // Group chord-strings by action so multiple binds for the same
+    // action collapse onto one row.
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     if let Ok(e) = engine.lock() {
         let entries = e.keymap().entries(buffr_modal::PageMode::Normal);
         for (chords, action) in entries {
             let keys: String = chords.iter().map(|c| c.to_string()).collect();
-            rows.push((keys, format!("{action:?}")));
+            grouped.entry(format!("{action:?}")).or_default().push(keys);
         }
     }
-    // Sort by keys for stable output.
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let body = if rows.is_empty() {
+    for keys in grouped.values_mut() {
+        keys.sort();
+    }
+    let body = if grouped.is_empty() {
         "<tr><td class=\"empty\" colspan=\"2\">no bindings</td></tr>".to_string()
     } else {
-        let mut s = String::with_capacity(rows.len() * 64);
-        for (keys, action) in rows {
+        let mut s = String::with_capacity(grouped.len() * 96);
+        for (action, keys) in &grouped {
             use std::fmt::Write;
+            let kbds: String = keys
+                .iter()
+                .map(|k| format!("<kbd>{}</kbd>", html_escape(k)))
+                .collect::<Vec<_>>()
+                .join(" ");
             let _ = write!(
                 s,
-                "<tr><td class=\"k\"><kbd>{}</kbd></td><td class=\"a\">{}</td></tr>",
-                html_escape(&keys),
-                html_escape(&action),
+                "<tr><td class=\"k\">{}</td><td class=\"a\">{}</td></tr>",
+                kbds,
+                html_escape(action),
             );
         }
         s
