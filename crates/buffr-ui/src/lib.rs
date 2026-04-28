@@ -321,7 +321,7 @@ fn format_find(f: &FindStatus) -> String {
 
 /// Truncate `s` to at most `max_px` pixels of rendered width. Adds a
 /// trailing `..` ellipsis when the original didn't fit.
-fn truncate_to_width(s: &str, max_px: usize) -> &str {
+pub(crate) fn truncate_to_width(s: &str, max_px: usize) -> &str {
     if font::text_width(s) <= max_px {
         return s;
     }
