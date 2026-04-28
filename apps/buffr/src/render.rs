@@ -326,15 +326,35 @@ impl Renderer {
         frame.present();
         let t_present = t0.elapsed();
 
+        let paint_us = t_paint.as_micros() as u64;
+        let upload_us = (t_upload - t_paint).as_micros() as u64;
+        let acquire_us = (t_acquire - t_upload).as_micros() as u64;
+        let submit_us = (t_submit - t_acquire).as_micros() as u64;
+        let present_us = (t_present - t_submit).as_micros() as u64;
+        let total_us = t_present.as_micros() as u64;
         tracing::trace!(
-            paint_us = t_paint.as_micros() as u64,
-            upload_us = (t_upload - t_paint).as_micros() as u64,
-            acquire_us = (t_acquire - t_upload).as_micros() as u64,
-            submit_us = (t_submit - t_acquire).as_micros() as u64,
-            present_us = (t_present - t_submit).as_micros() as u64,
-            total_us = t_present.as_micros() as u64,
+            paint_us,
+            upload_us,
+            acquire_us,
+            submit_us,
+            present_us,
+            total_us,
             "renderer.frame",
         );
+        // Surface a slow-frame breakdown at debug level when total
+        // exceeds vsync budget. This stays visible without needing
+        // RUST_LOG=trace so we can pinpoint which sub-step stalls.
+        if total_us > 16_000 {
+            tracing::debug!(
+                paint_us,
+                upload_us,
+                acquire_us,
+                submit_us,
+                present_us,
+                total_us,
+                "renderer.frame: slow",
+            );
+        }
 
         Ok(())
     }
