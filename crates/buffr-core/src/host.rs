@@ -625,6 +625,12 @@ impl BrowserHost {
         {
             tracing::debug!(width, height, idx, "osr_resize: calling was_resized");
             host.was_resized();
+            // Wayland live-drag fires Resized at ~60Hz; CEF silently
+            // coalesces the rapid was_resized() calls and never queries
+            // view_rect or repaints. Force a paint so the chain
+            // (view_rect → on_paint → wake → request_redraw) actually
+            // runs at the new dimensions.
+            host.invalidate(cef::PaintElementType::VIEW);
         } else {
             tracing::debug!(
                 width,
