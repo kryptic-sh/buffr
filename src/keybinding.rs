@@ -106,7 +106,7 @@ fn parse_unit(name: &str) -> Result<PageAction, KeyBindingError> {
         "zoom_reset" => ZoomReset,
         "open_dev_tools" => OpenDevTools,
         "clear_completed_downloads" => ClearCompletedDownloads,
-        "enter_edit_mode" => EnterEditMode,
+        "enter_insert_mode" => EnterInsertMode,
         "focus_first_input" => FocusFirstInput,
         "exit_insert_mode" => ExitInsertMode,
         other => return Err(KeyBindingError::UnknownAction(other.into())),
@@ -229,7 +229,7 @@ fn action_to_string(action: &PageAction) -> String {
         ZoomReset => "zoom_reset".into(),
         OpenDevTools => "open_dev_tools".into(),
         ClearCompletedDownloads => "clear_completed_downloads".into(),
-        EnterEditMode => "enter_edit_mode".into(),
+        EnterInsertMode => "enter_insert_mode".into(),
         FocusFirstInput => "focus_first_input".into(),
         ExitInsertMode => "exit_insert_mode".into(),
     }
@@ -242,7 +242,7 @@ fn mode_name(m: PageMode) -> &'static str {
         PageMode::Command => "command",
         PageMode::Hint => "hint",
         PageMode::Pending => "pending",
-        PageMode::Edit => "edit",
+        PageMode::Insert => "insert",
     }
 }
 
