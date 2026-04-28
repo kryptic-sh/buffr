@@ -1462,6 +1462,12 @@ struct AppState {
     /// Throttled to ~4 Hz (250 ms) to bound the cef-rs
     /// "Invalid UTF-16 string" stderr spam during page loads.
     last_url_poll: Instant,
+    /// Pending trailing-edge OSR resize. Set on every `Resized` while
+    /// the user is dragging; about_to_wait fires
+    /// `host.osr_resize_finalize` once `Resized` stops arriving so
+    /// CEF lands at the final dimensions even after the throttle
+    /// dropped intermediate notifications.
+    pending_resize_finalize: Option<(u32, u32, Instant)>,
     /// Cross-thread wake handle for the winit event loop. Cloned and
     /// installed into `BrowserHost` so OSR `on_paint` from the CEF IO
     /// thread can post a redraw without polling.
@@ -1695,6 +1701,7 @@ impl AppState {
             last_session_active: None,
             last_session_tab_ids: Vec::new(),
             last_url_poll: Instant::now(),
+            pending_resize_finalize: None,
             event_proxy,
         }
     }
@@ -3788,6 +3795,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                         buffr_core::HostMode::Osr => {
                             host.osr_resize(cef_w, cef_h);
+                            // Track final pending dims so about_to_wait
+                            // can fire a trailing osr_resize_finalize
+                            // once the drag stops firing Resized.
+                            self.pending_resize_finalize = Some((cef_w, cef_h, Instant::now()));
                             debug!(cef_w, cef_h, "winit: Resized -> osr_resize");
                         }
                     }
@@ -4296,6 +4307,20 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             if elapsed_enough {
                 self.save_session_now();
             }
+        }
+
+        // Trailing-edge OSR resize finalize: once `Resized` events
+        // stop arriving for ≥ 60 ms, send one un-throttled was_resized
+        // at the final dims. CEF can drop intermediate notifications
+        // during a Wayland live-drag, so without this the renderer
+        // can stay stuck at an interim size after the drag ends.
+        if let Some((w, h, at)) = self.pending_resize_finalize
+            && at.elapsed() >= Duration::from_millis(60)
+            && let Some(host) = self.host.as_ref()
+            && host.mode() == buffr_core::HostMode::Osr
+        {
+            host.osr_resize_finalize(w, h);
+            self.pending_resize_finalize = None;
         }
 
         // Download notices: drop any that have lived past their expiry

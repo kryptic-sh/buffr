@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use buffr_config::DownloadsConfig;
 use buffr_downloads::Downloads;
@@ -44,6 +45,13 @@ use crate::osr::{OsrFrame, OsrPaintHandler, OsrViewState, SharedOsrFrame, Shared
 use crate::permissions::PermissionsQueue;
 use crate::telemetry::{KEY_TABS_OPENED, UsageCounters};
 use crate::{CoreError, PopupQueue, handlers, new_popup_queue};
+
+/// Minimum interval between consecutive `was_resized` notifications
+/// to CEF. Wayland live-drag fires Resized at ~60Hz; CEF coalesces
+/// rapid notifications and silently drops view_rect re-queries, so we
+/// rate-limit on our side and let the apps layer fire a trailing call
+/// via `osr_resize_finalize` once the drag settles.
+const WAS_RESIZED_THROTTLE: Duration = Duration::from_millis(30);
 
 /// Rendering mode for a [`BrowserHost`].
 ///
@@ -153,6 +161,13 @@ pub struct BrowserHost {
     /// [`Self::resize`]. Used by `open_tab` to size new browsers
     /// consistently.
     last_size: Mutex<(u32, u32)>,
+    /// Wall-clock instant of the last `was_resized` call CEF actually
+    /// got. Wayland live-drag fires Resized at ~60Hz; CEF coalesces and
+    /// silently drops the rapid notifications, so we throttle to
+    /// `WAS_RESIZED_THROTTLE`. The apps layer fires a trailing
+    /// `osr_resize_finalize` after the drag settles to ensure CEF lands
+    /// at the final dimensions.
+    last_was_resized_at: Mutex<Instant>,
     /// Whether the host is in private mode. Threaded into
     /// [`TabSummary`] so chrome can mark every tab private.
     private: bool,
@@ -335,6 +350,7 @@ impl BrowserHost {
             next_id: AtomicU64::new(0),
             parent_handle: Mutex::new(Some(window_handle)),
             last_size: Mutex::new(initial_size),
+            last_was_resized_at: Mutex::new(Instant::now() - Duration::from_secs(1)),
             private,
             mode,
             history,
@@ -608,14 +624,43 @@ impl BrowserHost {
     /// from CEF returns the correct size, then calls `was_resized()` on the
     /// active browser so CEF schedules a repaint at the new dimensions.
     pub fn osr_resize(&self, width: u32, height: u32) {
-        use std::sync::atomic::Ordering;
         self.osr_view.width.store(width, Ordering::Relaxed);
         self.osr_view.height.store(height, Ordering::Relaxed);
         if let Ok(mut last) = self.last_size.lock() {
             *last = (width, height);
         }
+        // Throttle: rapid was_resized calls during Wayland live-drag
+        // (~60Hz) cause CEF to coalesce and stop querying view_rect.
+        // Skip if we notified <30ms ago; the apps layer's debounce
+        // calls `osr_resize_finalize` after the drag settles.
+        if let Ok(last_at) = self.last_was_resized_at.lock()
+            && last_at.elapsed() < WAS_RESIZED_THROTTLE
+        {
+            tracing::debug!(width, height, "osr_resize: throttled");
+            return;
+        }
+        self.notify_was_resized(width, height);
+    }
+
+    /// Trailing-edge resize notify. Bypasses the throttle so the final
+    /// dimensions of an interactive drag always reach CEF. Apps layer
+    /// fires this after `Resized` events stop arriving.
+    pub fn osr_resize_finalize(&self, width: u32, height: u32) {
+        self.osr_view.width.store(width, Ordering::Relaxed);
+        self.osr_view.height.store(height, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_size.lock() {
+            *last = (width, height);
+        }
+        tracing::debug!(width, height, "osr_resize_finalize: trailing call");
+        self.notify_was_resized(width, height);
+    }
+
+    fn notify_was_resized(&self, width: u32, height: u32) {
+        if let Ok(mut last_at) = self.last_was_resized_at.lock() {
+            *last_at = Instant::now();
+        }
         let Ok(tabs) = self.tabs.lock() else {
-            tracing::debug!(width, height, "osr_resize: tabs mutex poisoned");
+            tracing::debug!(width, height, "notify_was_resized: tabs mutex poisoned");
             return;
         };
         let active_idx = self.active.lock().ok().and_then(|g| *g);
@@ -623,13 +668,13 @@ impl BrowserHost {
             && let Some(t) = tabs.get(idx)
             && let Some(host) = t.browser.host()
         {
-            tracing::debug!(width, height, idx, "osr_resize: calling was_resized");
+            tracing::debug!(
+                width,
+                height,
+                idx,
+                "notify_was_resized: calling was_resized"
+            );
             host.was_resized();
-            // Wayland live-drag fires Resized at ~60Hz; CEF silently
-            // coalesces the rapid was_resized() calls and never queries
-            // view_rect or repaints. Force a paint so the chain
-            // (view_rect → on_paint → wake → request_redraw) actually
-            // runs at the new dimensions.
             host.invalidate(cef::PaintElementType::VIEW);
         } else {
             tracing::debug!(
@@ -637,7 +682,7 @@ impl BrowserHost {
                 height,
                 ?active_idx,
                 tab_count = tabs.len(),
-                "osr_resize: no active browser host to notify",
+                "notify_was_resized: no active browser host",
             );
         }
     }
