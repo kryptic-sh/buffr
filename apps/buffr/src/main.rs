@@ -1328,6 +1328,11 @@ struct AppState {
     /// strip. Set on press, cleared on release; if the release lands on
     /// a different tab slot, the drag triggers a `move_tab`.
     tab_drag_src: Option<usize>,
+    /// When the omnibar was auto-opened by `o` / `O` (TabNewRight /
+    /// TabNewLeft), this carries the freshly-created tab's id. If the
+    /// user cancels the omnibar without confirming a URL, the tab is
+    /// closed (unless it's the only remaining tab).
+    cancel_closes_tab: Option<buffr_core::TabId>,
     /// Set whenever something the session-restore cares about changes
     /// (tab open / close / reorder / active switch / URL navigation).
     /// `about_to_wait` flushes the session JSON to disk while this is
@@ -1551,6 +1556,7 @@ impl AppState {
             edit_focus: EditFocus::None,
             insert_intent_at: None,
             tab_drag_src: None,
+            cancel_closes_tab: None,
             hint_alphabet,
             pending_find,
             find_smoke_at: None,
@@ -1614,7 +1620,13 @@ impl AppState {
             // Last use of `host` — NLL releases the shared borrow here.
             let result = host.open_tab_at(NEW_TAB_URL, insert_idx);
             match result {
-                Ok(_) => self.open_omnibar(),
+                Ok(new_id) => {
+                    // If the user cancels the omnibar without typing a
+                    // URL, this tab gets closed back out (unless it's
+                    // the last tab open).
+                    self.cancel_closes_tab = Some(new_id);
+                    self.open_omnibar();
+                }
                 Err(ref err) => warn!(error = %err, "tab_new adjacent: failed"),
             }
             return;
@@ -2325,6 +2337,17 @@ impl AppState {
         if let Ok(mut e) = self.engine.lock() {
             e.set_mode(PageMode::Normal);
         }
+        // If this overlay was the auto-omnibar of a freshly-opened
+        // tab (`o` / `O`), close that tab on cancel — but only if
+        // there'd be at least one tab left.
+        if let Some(tab_id) = self.cancel_closes_tab.take()
+            && let Some(host) = self.host.as_ref()
+            && host.tab_count() > 1
+        {
+            let _ = host.close_tab(tab_id);
+            self.refresh_tab_strip();
+            self.mark_session_dirty();
+        }
         // Overlay is a floating popup — no CEF resize on toggle.
         self.refresh_title();
     }
@@ -2523,6 +2546,8 @@ impl AppState {
         let Some(overlay) = self.overlay.take() else {
             return;
         };
+        // User confirmed — keep the freshly-opened tab around.
+        self.cancel_closes_tab = None;
         // Engine flips back regardless of dispatch outcome.
         if let Ok(mut e) = self.engine.lock() {
             e.set_mode(PageMode::Normal);
