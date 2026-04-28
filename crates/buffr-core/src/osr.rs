@@ -118,7 +118,20 @@ wrap_render_handler! {
             rect.y = 0;
             rect.width = self.view.width.load(Ordering::Relaxed) as i32;
             rect.height = self.view.height.load(Ordering::Relaxed) as i32;
-            tracing::trace!(w = rect.width, h = rect.height, "osr: view_rect");
+            // Log only when CEF asks for a different size than the last
+            // paint — gives us a clear "CEF saw the new viewport" signal
+            // without per-frame spam.
+            if let Ok(frame) = self.frame.lock()
+                && (rect.width as u32 != frame.width || rect.height as u32 != frame.height)
+            {
+                tracing::debug!(
+                    last_w = frame.width,
+                    last_h = frame.height,
+                    new_w = rect.width,
+                    new_h = rect.height,
+                    "osr: view_rect reports new dims",
+                );
+            }
         }
 
         fn screen_point(
@@ -175,6 +188,13 @@ wrap_render_handler! {
 
             // Resize the backing buffer only when dimensions change.
             if guard.width != w || guard.height != h {
+                tracing::debug!(
+                    old_w = guard.width,
+                    old_h = guard.height,
+                    new_w = w,
+                    new_h = h,
+                    "osr: on_paint dimension change",
+                );
                 guard.pixels.resize(len, 0);
                 guard.width = w;
                 guard.height = h;
