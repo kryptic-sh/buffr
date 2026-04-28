@@ -352,17 +352,38 @@ impl InputBar {
         let prefix_w = font::text_width(&self.prefix) as i32;
         let buffer_x = prefix_x + prefix_w + 6;
 
-        // Buffer text in fg.
-        font::draw_text(buffer, buf_w, buf_h, buffer_x, text_y, &self.buffer, p.fg);
+        // Compute available pixel width for the buffer text and the
+        // char-based scroll offset that keeps the cursor visible.
+        let glyph_advance = font::GLYPH_W + 1;
+        let inner_w = (x as i32 + w as i32 - 6 - buffer_x).max(0) as usize;
+        let chars_visible = (inner_w / glyph_advance).max(1);
+        let cursor_chars = self.buffer[..self.cursor].chars().count();
+        let total_chars = self.buffer.chars().count();
+        let mut scroll_chars: usize = if cursor_chars >= chars_visible {
+            cursor_chars + 1 - chars_visible
+        } else {
+            0
+        };
+        // Don't scroll past the end — keep the trailing edge of the
+        // text within view when the buffer is shorter than scroll.
+        let max_scroll = total_chars.saturating_sub(chars_visible.saturating_sub(1));
+        if scroll_chars > max_scroll {
+            scroll_chars = max_scroll;
+        }
+        // Visible substring.
+        let visible: String = self
+            .buffer
+            .chars()
+            .skip(scroll_chars)
+            .take(chars_visible)
+            .collect();
+        font::draw_text(buffer, buf_w, buf_h, buffer_x, text_y, &visible, p.fg);
 
-        // Cursor: 2-px-wide vertical bar at `cursor` byte position.
+        // Cursor: 2-px-wide vertical bar at `cursor` char position
+        // (relative to the scrolled substring).
         if self.cursor_visible && self.selected.is_none() {
-            let prefix_chars = self.buffer[..self.cursor].chars().count();
-            let cursor_px = if prefix_chars == 0 {
-                0
-            } else {
-                prefix_chars * (font::GLYPH_W + 1)
-            };
+            let cursor_offset = cursor_chars.saturating_sub(scroll_chars);
+            let cursor_px = cursor_offset * glyph_advance;
             let cursor_x = buffer_x + cursor_px as i32;
             fill_rect(
                 buffer,
