@@ -3946,14 +3946,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                     }
                 }
-                // Paint synchronously so chrome (tab strip, statusline)
-                // commits a buffer at the new dims in this event tick.
-                // request_redraw is gated by Wayland frame callbacks and
-                // lags one frame behind configure during continuous drag,
-                // letting the compositor stretch the old buffer. Pass
-                // new_size explicitly — `window.inner_size()` can still
-                // report the previous dims here on Wayland.
-                self.paint_chrome_with(Some((new_size.width, new_size.height)));
+                // Coalesce: request a redraw and let the event-loop's
+                // RedrawRequested handler paint once at the LATEST
+                // inner_size. Painting synchronously per Resized was
+                // committing a buffer matching the *event*'s size, but
+                // on Wayland the compositor can have a newer configure
+                // pending — wgpu's commit then ack's the later configure
+                // while attaching the older-size buffer, and the
+                // compositor letterboxes the right/bottom gap.
+                // winit collapses multiple request_redraw into one
+                // delivery, so we paint exactly once per drag step.
+                self.request_redraw();
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
