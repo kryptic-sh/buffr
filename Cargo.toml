@@ -60,6 +60,14 @@ tempfile = "3"
 # below the CEF child window. No GPU dependency; drawing is a per-pixel
 # `&mut [u32]` blit driven by the bitmap font in `buffr-ui::font`.
 softbuffer = "0.4"
+# wgpu present layer — replaces softbuffer in apps/buffr. CPU-composite
+# buffer is uploaded to a single GPU texture and drawn as a fullscreen
+# triangle. No platform branching: Vulkan on Linux, Metal on macOS, DX12.
+wgpu = "22"
+# block_on for async adapter / device request
+pollster = "0.3"
+# safe cast from &[u32] to &[u8] for texture upload
+bytemuck = { version = "1", features = ["derive"] }
 # Phase 6 update channel: `UpdateChecker` compares the running version
 # against GitHub releases. SemVer parsing handles rc/beta suffixes.
 semver = { version = "1", features = ["serde"] }
