@@ -798,6 +798,17 @@ fn main() -> Result<()> {
     info!("shutdown: cef shutting down");
     cef::shutdown();
     info!("shutdown: cef::shutdown returned");
+    // Leak the wl_subsurface state before AppState's natural drop.
+    // It attached to winit's foreign Wayland connection and lazily holds
+    // child surface / subsurface / shm pool / bound globals on top of
+    // it. Dropping those proxies normally races with winit's connection
+    // teardown — libwayland-client segfaults internally when destroy
+    // requests hit a half-unwound socket. The kernel reclaims the shm
+    // fd + mmap on process exit and the compositor cleans up server
+    // objects when winit closes the connection.
+    if let Some(sub) = app_state.wayland_sub.take() {
+        std::mem::forget(sub);
+    }
     // Drop the rest of AppState now (renderer/wgpu, window, engine,
     // sinks). CEF is fully gone, so wgpu can release the GPU surface
     // without racing CEF's GPU process teardown.

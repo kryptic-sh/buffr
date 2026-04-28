@@ -500,47 +500,6 @@ mod linux {
             }
         }
     }
-
-    impl Drop for WaylandSub {
-        fn drop(&mut self) {
-            // We attached to a foreign Wayland connection that winit owns
-            // and will tear down on its own schedule. Sending destroy
-            // requests for our proxies (or letting wayland-client's normal
-            // Drop impls do so) races with winit's shutdown — at AppState
-            // drop time the renderer's wgpu surface has already been torn
-            // down, libwayland-client's internal state is partially
-            // unwound, and any further protocol writes segfault inside
-            // libwayland.so.
-            //
-            // Leak everything. The kernel reclaims the shm fd + mmap when
-            // the process exits, and the compositor releases server-side
-            // objects when the connection closes. No real memory is lost
-            // since this only runs at app exit.
-            //
-            // SAFETY: We move each field out of `&mut self` and forget it,
-            // so its Drop never runs. After this function returns, `self`
-            // is dropped without any field destructors firing — fine
-            // because `WaylandSub` itself has no inline allocations.
-            unsafe {
-                let connection = std::ptr::read(&self.connection);
-                std::mem::forget(connection);
-                let event_queue = std::ptr::read(&self.event_queue);
-                std::mem::forget(event_queue);
-                let state = std::ptr::read(&self.state);
-                std::mem::forget(state);
-                let qh = std::ptr::read(&self.qh);
-                std::mem::forget(qh);
-                let globals = std::ptr::read(&self._globals);
-                std::mem::forget(globals);
-                let child_surface = std::ptr::read(&self.child_surface);
-                std::mem::forget(child_surface);
-                let child_subsurface = std::ptr::read(&self.child_subsurface);
-                std::mem::forget(child_subsurface);
-                let shm_pool = std::ptr::read(&self.shm_pool);
-                std::mem::forget(shm_pool);
-            }
-        }
-    }
 }
 
 // Re-export the real type on Linux.
