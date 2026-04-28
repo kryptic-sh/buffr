@@ -421,6 +421,13 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // Re-open the most recently closed tab (vim-flavored undo). Stack-based
     // so repeated `u` undoes successive closes in reverse order.
     (PageMode::Normal, "u", PageAction::ReopenClosedTab),
+    // Conventional-browser alternates for users migrating from Chromium /
+    // Firefox. `<C-w>` overlaps with the `<C-w>X` prefix chords above; the
+    // engine's ambiguity timeout fires the leaf binding once the prefix
+    // window expires, so `<C-w>c/n/p` still work when typed quickly.
+    (PageMode::Normal, "<C-t>", PageAction::TabNewRight),
+    (PageMode::Normal, "<C-S-t>", PageAction::ReopenClosedTab),
+    (PageMode::Normal, "<C-w>", PageAction::TabClose),
     // -- history --------------------------------------------------
     // User preference: J/K = history back/forward (NOT vieb default of tabs).
     (PageMode::Normal, "J", PageAction::HistoryBack),
