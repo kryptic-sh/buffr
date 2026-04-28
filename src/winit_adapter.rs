@@ -50,14 +50,26 @@ pub fn key_event_to_chord(event: &KeyEvent, modifiers: ModifiersState) -> Option
     if event.repeat {
         return None;
     }
+    chord_from_logical(&event.logical_key, modifiers)
+}
 
+/// Like [`key_event_to_chord`] but accepts auto-repeat events. Used by
+/// text-input surfaces (omnibar, command line) where holding backspace
+/// or a character key should fire continuously.
+pub fn key_event_to_chord_with_repeat(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+) -> Option<KeyChord> {
+    if event.state != ElementState::Pressed {
+        return None;
+    }
+    chord_from_logical(&event.logical_key, modifiers)
+}
+
+fn chord_from_logical(logical: &WKey, modifiers: ModifiersState) -> Option<KeyChord> {
     let mods = modifiers_to_internal(modifiers);
-
-    match &event.logical_key {
+    match logical {
         WKey::Character(s) => {
-            // Multi-codepoint strings (e.g. composed dead-key result
-            // landing as "ä" with two scalar values via certain
-            // layouts) drop for now — see module docs.
             let mut chars = s.chars();
             let first = chars.next()?;
             if chars.next().is_some() {
@@ -75,7 +87,6 @@ pub fn key_event_to_chord(event: &KeyEvent, modifiers: ModifiersState) -> Option
                 key: Key::Named(mapped),
             })
         }
-        // Unidentified / Dead — not routable through the trie today.
         _ => None,
     }
 }
