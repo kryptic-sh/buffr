@@ -2286,9 +2286,17 @@ impl AppState {
         // it in place — Vimium / qutebrowser convention. Internal
         // buffr:// URLs (new-tab page, etc.) start empty so the user
         // can type a fresh query immediately.
-        let url = &self.statusline.url;
+        //
+        // Query the host directly — `statusline.url` is updated by a
+        // 250ms-throttled poll, so it can lag a tab switch and pre-fill
+        // the omnibar with the previous tab's URL.
+        let url = self
+            .host
+            .as_ref()
+            .map(|h| h.active_tab_live_url())
+            .unwrap_or_default();
         if !url.starts_with("buffr:") {
-            bar.buffer = url.clone();
+            bar.buffer = url;
             bar.cursor = bar.buffer.len();
         }
         self.overlay = Some(OverlayState::Omnibar(bar));
