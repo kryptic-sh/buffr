@@ -1953,7 +1953,11 @@ impl AppState {
             let popup_w = ((width * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
             let popup_x = (width - popup_w) / 2;
             let popup_y = height / 3;
-            let popup_h = bar.total_height().min(height.saturating_sub(popup_y));
+            // Add border so the inner rect always has room for the
+            // input row (paint_at bails when inner_h < INPUT_HEIGHT,
+            // which previously hid the input on empty omnibar).
+            let popup_h =
+                (bar.total_height() + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
 
             // Border fill.
             fill_rect_u32(
@@ -3025,7 +3029,7 @@ fn mode_label(mode: PageMode) -> &'static str {
         PageMode::Visual => "VISUAL",
         PageMode::Command => "COMMAND",
         PageMode::Hint => "HINT",
-        PageMode::Edit => "EDIT",
+        PageMode::Edit => "INSERT",
     }
 }
 
