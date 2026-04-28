@@ -315,6 +315,12 @@ impl BrowserHost {
             Err(_) => return Err(CoreError::CreateBrowserFailed),
         };
 
+        // Force Alloy runtime style. CEF 147's `default` is Chrome style,
+        // which spawns its own top-level window with the full Chrome UI even
+        // when `parent_window` is set — that's why an unmodified `default()`
+        // renders as a separate window instead of embedding into the winit
+        // surface. Alloy honours `parent_window` for windowed embedding and
+        // is the right pick for a custom-chrome browser like buffr.
         let mut window_info = WindowInfo {
             bounds: cef::Rect {
                 x: 0,
@@ -322,6 +328,7 @@ impl BrowserHost {
                 width: init_w as i32,
                 height: init_h as i32,
             },
+            runtime_style: cef::sys::cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY.into(),
             ..WindowInfo::default()
         };
         match handle {
