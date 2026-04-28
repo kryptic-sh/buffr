@@ -1311,7 +1311,7 @@ textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
         );
     }
 
-    fn run_js(&self, code: &str) {
+    pub fn run_js(&self, code: &str) {
         self.with_active(|t| {
             let Some(frame) = t.browser.main_frame() else {
                 warn!("run_js: main frame unavailable");

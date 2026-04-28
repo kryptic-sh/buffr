@@ -26,16 +26,15 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, EditFieldKind, FindResultSink,
-    HintAction, HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId,
-    drain_edit_events, drain_permissions_with_defer, expire_stale_notices, init_cef_api,
-    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
-    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
-    pop_permission_front, profile_paths,
+    BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
+    HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId, drain_edit_events,
+    drain_permissions_with_defer, expire_stale_notices, init_cef_api, new_download_notice_queue,
+    new_edit_event_sink, new_find_sink, new_hint_event_sink, new_permissions_queue,
+    peek_download_notice, peek_permission_front, permissions_queue_len, pop_permission_front,
+    profile_paths,
 };
-use buffr_modal::edit_mode::EditSession;
 use buffr_modal::{
-    Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step, VimMode,
+    Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
     key_event_to_chord,
 };
 use buffr_permissions::Permissions;
@@ -585,10 +584,9 @@ fn main() -> Result<()> {
 
     let find_sink = new_find_sink();
     let hint_sink = new_hint_event_sink();
-    // Edit-mode Stage 1: construct the event queue now so it can be
-    // threaded through AppState → BrowserHost → handlers. Stage 2 will
-    // drain it from the render loop to drive EditSession lifecycle.
-    // TODO(stage2): drain edit_sink each tick; spawn/destroy EditSession.
+    // Edit-mode: construct the event queue so it can be threaded through
+    // AppState → BrowserHost → handlers. Drained each tick; keys forward
+    // directly to CEF once a field is focused (no Rust EditSession).
     let edit_sink = new_edit_event_sink();
     // Build the hint alphabet up front so a misconfigured config
     // surfaces an error before CEF has a chance to start. The
@@ -1291,12 +1289,10 @@ struct AppState {
     hint_sink: HintEventSink,
     /// Edit-mode event queue shared with the CEF load handler (which
     /// injects `edit.js`) and display handler (which parses its console
-    /// output). Drained each `about_to_wait` tick to drive `EditSession`
-    /// lifecycle.
+    /// output). Drained each `about_to_wait` tick to update focus state.
     edit_sink: EditEventSink,
-    /// Current edit-mode focus state. Drives keyboard routing and
-    /// `EditSession` lifecycle. Drained via [`drain_edit_events`] each
-    /// tick and mutated by the keystroke path.
+    /// Current edit-mode focus state. Drives keyboard routing.
+    /// Updated via [`drain_edit_events`] each tick and by the Esc path.
     edit_focus: EditFocus,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
@@ -1385,26 +1381,14 @@ struct AppState {
 /// Edit-mode focus state machine.
 ///
 /// Transitions:
-///   `None` → (JS Focus event) → `Tracking`
-///   `Tracking` → (i/a/I/A etc.) → `Editing`
-///   `Editing` → (Esc while Normal) → `Tracking`
-///   `Tracking | Editing` → (JS Blur event for same field) → `None`
-#[allow(clippy::large_enum_variant)]
+///   `None` → (JS focusin event) → `Editing`
+///   `Editing` → (Esc) → `None`
+///   `Editing` → (JS Blur event for same field) → `None`
 enum EditFocus {
     /// No editable field is focused.
     None,
-    /// JS reported a focused field; user has not yet entered insert mode.
-    Tracking {
-        field_id: String,
-        kind: EditFieldKind,
-        value: String,
-    },
-    /// `i`/`a`/`I`/`A` pressed on a tracked field — engine is live.
-    Editing {
-        field_id: String,
-        kind: EditFieldKind,
-        session: EditSession,
-    },
+    /// JS reported a focused field; keys forward directly to CEF.
+    Editing { field_id: String },
 }
 
 /// Active overlay above the CEF child window.
@@ -2461,61 +2445,43 @@ impl AppState {
     fn drain_edit_focus_events(&mut self) {
         for ev in drain_edit_events(&self.edit_sink) {
             match ev {
-                EditConsoleEvent::Focus {
-                    field_id,
-                    kind,
-                    value,
-                    ..
-                } => {
-                    // Browser UX: clicking an input enters Edit mode
-                    // immediately (no `i` step). A spurious re-focus
-                    // during engine-attached state must not clobber
-                    // an existing session for the same field.
+                EditConsoleEvent::Focus { field_id, .. } => {
+                    // Browser UX: clicking/tabbing to an input auto-enters
+                    // Edit mode. A spurious re-focus for the already-active
+                    // field must not clobber the existing state.
                     let already_editing = matches!(
                         &self.edit_focus,
-                        EditFocus::Editing { field_id: f, .. } if *f == field_id
+                        EditFocus::Editing { field_id: f } if *f == field_id
                     );
                     if !already_editing {
-                        let session = buffr_modal::EditSession::new(&value);
                         if let Some(host) = self.host.as_ref() {
                             host.run_edit_attach(&field_id);
                         }
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Edit);
                         }
-                        self.edit_focus = EditFocus::Editing {
-                            field_id,
-                            kind,
-                            session,
-                        };
+                        self.edit_focus = EditFocus::Editing { field_id };
                     }
                 }
                 EditConsoleEvent::Blur { field_id } => {
                     let matches_current = match &self.edit_focus {
-                        EditFocus::Editing { field_id: f, .. }
-                        | EditFocus::Tracking { field_id: f, .. } => *f == field_id,
+                        EditFocus::Editing { field_id: f } => *f == field_id,
                         EditFocus::None => false,
                     };
                     if matches_current {
                         self.edit_focus = EditFocus::None;
                     }
                 }
-                EditConsoleEvent::Mutate { field_id, value } => match &mut self.edit_focus {
-                    EditFocus::Tracking {
-                        field_id: f,
-                        value: v,
-                        ..
-                    } if *f == field_id => {
-                        *v = value;
-                    }
-                    EditFocus::Editing { field_id: f, .. } if *f == field_id => {
+                EditConsoleEvent::Mutate { field_id, .. } => {
+                    if let EditFocus::Editing { field_id: f } = &self.edit_focus
+                        && *f == field_id
+                    {
                         tracing::trace!(
                             %field_id,
                             "edit-mode: page mutation while engine attached; ignored"
                         );
                     }
-                    _ => {}
-                },
+                }
             }
         }
     }
@@ -2587,115 +2553,43 @@ impl AppState {
 
     /// Handle a key event while in `Editing` state. Returns `true` if
     /// the event was consumed (the caller must not forward it further).
+    ///
+    /// Edit mode is "transparent" — every key is forwarded straight to
+    /// CEF so the focused input field handles input natively (typing,
+    /// arrow keys, selection, copy/paste, IME, etc.). The only key
+    /// intercepted is `Esc`, which exits Edit mode and returns to
+    /// Normal page mode.
     fn edit_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         let planned = Self::winit_key_to_planned(event, self.modifiers);
+        let is_esc_pressed = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
 
-        let EditFocus::Editing {
-            field_id, session, ..
-        } = &mut self.edit_focus
-        else {
+        let EditFocus::Editing { field_id, .. } = &self.edit_focus else {
             return false;
         };
 
-        let pre_mode = session.vim_mode();
-        let is_esc = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
-
-        if let Some(p) = planned {
-            session.feed_planned(p);
-        } else {
-            // Unmapped key — consumed (edit-mode owns the keyboard).
-            return true;
-        }
-
-        let post_mode = session.vim_mode();
-
-        // Drain any content change and push it to the DOM.
-        if let Some(arc) = session.take_content_change()
-            && let Some(host) = self.host.as_ref()
-        {
-            host.run_edit_apply(field_id, &arc);
-        }
-
-        // Esc while already Normal → demote to Tracking.
-        // Esc while Insert → the engine transitioned to Normal; stay Editing.
-        if is_esc && pre_mode == VimMode::Normal && post_mode == VimMode::Normal {
-            // Borrow checker: we need to read `field_id` after the mut borrow.
+        if is_esc_pressed {
             let fid = field_id.clone();
-            if let EditFocus::Editing {
-                field_id: f,
-                kind: k,
-                session: s,
-            } = std::mem::replace(&mut self.edit_focus, EditFocus::None)
-            {
-                let last_value = s.content();
-                self.edit_focus = EditFocus::Tracking {
-                    field_id: f,
-                    kind: k,
-                    value: last_value,
-                };
-            }
+            self.edit_focus = EditFocus::None;
             if let Some(host) = self.host.as_ref() {
                 host.run_edit_detach(&fid);
+                // Blur the field so further typing doesn't go to it.
+                host.run_js("if(document.activeElement)document.activeElement.blur();");
             }
-            // Return engine to Normal page mode.
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(PageMode::Normal);
             }
+            return true;
         }
 
-        true
-    }
-
-    /// Promote `Tracking` → `Editing` after the engine fired
-    /// `EnterEditMode` (i.e. the user pressed `i`/`a`/`I`/`A` etc.).
-    ///
-    /// If there is no `Tracking` focus, the promotion is a no-op (the
-    /// engine already set `PageMode::Edit` in response to the chord —
-    /// nothing else to wire up).
-    fn promote_tracking_to_editing(&mut self, event: &winit::event::KeyEvent) {
-        let EditFocus::Tracking {
-            field_id,
-            kind,
-            value,
-        } = std::mem::replace(&mut self.edit_focus, EditFocus::None)
-        else {
-            // No tracked field — restore None and let the engine sit in
-            // Edit mode (it will return EditModeActive on subsequent keys
-            // until Esc fires feed_edit_mode_key → Exited).
-            return;
-        };
-
-        let mut session = EditSession::new(&value);
-        // Forward the triggering chord so the engine sees the intended
-        // entry key (i/a/I/A).
-        if let Some(p) = Self::winit_key_to_planned(event, self.modifiers) {
-            session.feed_planned(p);
-        }
-        // Drain any immediate content change from the entry key.
-        if let Some(arc) = session.take_content_change()
-            && let Some(host) = self.host.as_ref()
-        {
-            host.run_edit_apply(&field_id, &arc);
-        }
+        // Forward every other key directly to CEF. The page handles it
+        // natively — no Rust-side editor model.
         if let Some(host) = self.host.as_ref() {
-            host.run_edit_attach(&field_id);
+            let mods = winit_mods_to_cef(&self.modifiers);
+            for ev in winit_key_to_cef_events(event, mods) {
+                host.osr_key_event(ev);
+            }
         }
-        self.edit_focus = EditFocus::Editing {
-            field_id,
-            kind,
-            session,
-        };
-    }
-
-    /// Called when `Engine::feed` returns `EditModeActive` — the engine
-    /// is already in Edit mode but the Rust side had not yet constructed
-    /// a session (e.g. user pressed a non-entry chord while Tracking).
-    /// We try to promote if there is a tracked field; otherwise no-op.
-    fn maybe_promote_to_editing(&mut self, event: &winit::event::KeyEvent) {
-        if matches!(&self.edit_focus, EditFocus::Tracking { .. }) {
-            self.promote_tracking_to_editing(event);
-        }
-        // If already Editing or None, the event is simply consumed.
+        true
     }
 
     /// Pull the front of the permissions queue into a renderable
@@ -3323,8 +3217,8 @@ impl ApplicationHandler for AppState {
                     return;
                 }
                 // Edit-mode takes precedence over the page-mode FSM
-                // once an engine is attached (Editing state). Tracking
-                // falls through so `i`/`a`/… can upgrade to Editing.
+                // once a field is focused (Editing state). Esc is
+                // intercepted; all other keys forward directly to CEF.
                 if matches!(&self.edit_focus, EditFocus::Editing { .. })
                     && self.edit_mode_handle_key(&event)
                 {
@@ -3344,12 +3238,13 @@ impl ApplicationHandler for AppState {
                 };
                 match step {
                     Step::Resolved(action) => {
-                        // When the engine resolves `EnterEditMode` and
-                        // we have a Tracking focus, promote to Editing.
-                        // The triggering chord is forwarded so the
-                        // engine sees the intended entry key (i/a/I/A).
+                        // `EnterEditMode` (`i`) flips the engine into
+                        // PageMode::Edit. Entry into a specific field is
+                        // handled via the JS focusin bridge; `i` alone
+                        // without a focused input is a no-op at the page
+                        // level — the engine mode flip is sufficient to
+                        // unblock subsequent keys once a field is clicked.
                         if action == buffr_modal::PageAction::EnterEditMode {
-                            self.promote_tracking_to_editing(&event);
                             self.refresh_title();
                             return;
                         }
@@ -3400,10 +3295,10 @@ impl ApplicationHandler for AppState {
                         }
                     }
                     Step::EditModeActive => {
-                        // Engine is already in PageMode::Edit — route
-                        // to the edit-mode handler if we have a Tracking
-                        // focus that can be promoted, or just consume.
-                        self.maybe_promote_to_editing(&event);
+                        // Engine is already in PageMode::Edit; consume
+                        // the key. If a field is focused, edit_mode_handle_key
+                        // above already handled it; otherwise the key is
+                        // silently dropped (no input is active).
                     }
                 }
                 self.refresh_title();
@@ -3716,7 +3611,7 @@ mod tests {
         }
     }
 
-    /// Test the `EditFocus` FSM state transitions via `drain_edit_focus_events`.
+    /// Test the `EditFocus` FSM state transitions (None ↔ Editing).
     mod edit_focus_fsm_tests {
         use super::*;
         use buffr_core::edit::{EditFieldKind, new_edit_event_sink};
@@ -3748,36 +3643,38 @@ mod tests {
             }
         }
 
+        /// Minimal inline drain that mirrors `drain_edit_focus_events`.
+        fn drain_into(focus: &mut EditFocus, evs: Vec<EditConsoleEvent>) {
+            for ev in evs {
+                match ev {
+                    EditConsoleEvent::Focus { field_id, .. } => {
+                        let already = matches!(
+                            &*focus,
+                            EditFocus::Editing { field_id: f } if *f == field_id
+                        );
+                        if !already {
+                            *focus = EditFocus::Editing { field_id };
+                        }
+                    }
+                    EditConsoleEvent::Blur { field_id } => {
+                        if matches!(&*focus, EditFocus::Editing { field_id: f } if *f == field_id) {
+                            *focus = EditFocus::None;
+                        }
+                    }
+                    EditConsoleEvent::Mutate { .. } => {}
+                }
+            }
+        }
+
         #[test]
-        fn focus_moves_to_tracking() {
+        fn focus_moves_to_editing() {
             let sink = new_edit_event_sink();
             push_event(&sink, focus_event("f1"));
             let evs = drain_edit_events(&sink);
 
             let mut focus = EditFocus::None;
-            // Simulate the drain logic inline (no full AppState needed).
-            for ev in evs {
-                if let EditConsoleEvent::Focus {
-                    field_id,
-                    kind,
-                    value,
-                    ..
-                } = ev
-                {
-                    let already_editing = matches!(
-                        &focus,
-                        EditFocus::Editing { field_id: f, .. } if *f == field_id
-                    );
-                    if !already_editing {
-                        focus = EditFocus::Tracking {
-                            field_id,
-                            kind,
-                            value,
-                        };
-                    }
-                }
-            }
-            assert!(matches!(&focus, EditFocus::Tracking { field_id, .. } if field_id == "f1"));
+            drain_into(&mut focus, evs);
+            assert!(matches!(&focus, EditFocus::Editing { field_id } if field_id == "f1"));
         }
 
         #[test]
@@ -3787,74 +3684,24 @@ mod tests {
             push_event(&sink, blur_event("f1"));
             let evs = drain_edit_events(&sink);
 
-            let mut focus: EditFocus = EditFocus::None;
-            for ev in evs {
-                match ev {
-                    EditConsoleEvent::Focus {
-                        field_id,
-                        kind,
-                        value,
-                        ..
-                    } => {
-                        focus = EditFocus::Tracking {
-                            field_id,
-                            kind,
-                            value,
-                        };
-                    }
-                    EditConsoleEvent::Blur { field_id } => {
-                        let matches_cur = match &focus {
-                            EditFocus::Tracking { field_id: f, .. }
-                            | EditFocus::Editing { field_id: f, .. } => *f == field_id,
-                            EditFocus::None => false,
-                        };
-                        if matches_cur {
-                            focus = EditFocus::None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            let mut focus = EditFocus::None;
+            drain_into(&mut focus, evs);
             assert!(matches!(focus, EditFocus::None));
         }
 
         #[test]
-        fn mutate_updates_tracking_value() {
+        fn mutate_while_editing_is_ignored() {
+            // Mutate events are no-ops in the simplified FSM — just verify
+            // focus state is unchanged after receiving one.
             let sink = new_edit_event_sink();
             push_event(&sink, focus_event("f1"));
             push_event(&sink, mutate_event("f1", "world"));
             let evs = drain_edit_events(&sink);
 
             let mut focus = EditFocus::None;
-            for ev in evs {
-                match ev {
-                    EditConsoleEvent::Focus {
-                        field_id,
-                        kind,
-                        value,
-                        ..
-                    } => {
-                        focus = EditFocus::Tracking {
-                            field_id,
-                            kind,
-                            value,
-                        };
-                    }
-                    EditConsoleEvent::Mutate { field_id, value } => {
-                        if let EditFocus::Tracking {
-                            field_id: f,
-                            value: v,
-                            ..
-                        } = &mut focus
-                            && *f == field_id
-                        {
-                            *v = value;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            assert!(matches!(&focus, EditFocus::Tracking { value, .. } if value == "world"));
+            drain_into(&mut focus, evs);
+            // Still Editing; the mutate was silently consumed.
+            assert!(matches!(&focus, EditFocus::Editing { field_id } if field_id == "f1"));
         }
 
         #[test]
@@ -3865,35 +3712,9 @@ mod tests {
             let evs = drain_edit_events(&sink);
 
             let mut focus = EditFocus::None;
-            for ev in evs {
-                match ev {
-                    EditConsoleEvent::Focus {
-                        field_id,
-                        kind,
-                        value,
-                        ..
-                    } => {
-                        focus = EditFocus::Tracking {
-                            field_id,
-                            kind,
-                            value,
-                        };
-                    }
-                    EditConsoleEvent::Blur { field_id } => {
-                        let matches_cur = match &focus {
-                            EditFocus::Tracking { field_id: f, .. }
-                            | EditFocus::Editing { field_id: f, .. } => *f == field_id,
-                            EditFocus::None => false,
-                        };
-                        if matches_cur {
-                            focus = EditFocus::None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // f1 focus still active; blur for f99 was a no-op.
-            assert!(matches!(&focus, EditFocus::Tracking { field_id, .. } if field_id == "f1"));
+            drain_into(&mut focus, evs);
+            // f1 still active; blur for f99 was a no-op.
+            assert!(matches!(&focus, EditFocus::Editing { field_id } if field_id == "f1"));
         }
     }
 }
