@@ -2593,6 +2593,9 @@ impl AppState {
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(PageMode::Normal);
             }
+            self.refresh_title();
+            self.request_redraw();
+            tracing::info!("edit_mode: exited via Esc — engine=Normal, edit_focus=None");
             return true;
         }
 
