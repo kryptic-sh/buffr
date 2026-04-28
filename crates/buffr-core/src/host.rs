@@ -1541,6 +1541,23 @@ impl BrowserHost {
                     }
                 });
             }
+
+            A::YankSelection => {
+                // CEF natively copies the active selection in the
+                // focused frame to the system clipboard via
+                // `Frame::copy()`. We try the focused frame first
+                // (selection lives there if the user clicked into an
+                // iframe); fall back to main frame.
+                self.with_active(|t| {
+                    let frame = t.browser.focused_frame().or_else(|| t.browser.main_frame());
+                    if let Some(frame) = frame {
+                        frame.copy();
+                        tracing::debug!("yanked selection via frame.copy()");
+                    } else {
+                        tracing::warn!("YankSelection: no frame available");
+                    }
+                });
+            }
         }
     }
 

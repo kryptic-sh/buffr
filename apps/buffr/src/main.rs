@@ -1559,6 +1559,13 @@ struct AppState {
     osr_last_click_button: Option<cef::MouseButtonType>,
     /// Click count within the current double-click window (1 or 2).
     osr_click_count: i32,
+    /// Cursor position when the left mouse button was last pressed.
+    /// `None` between drags. On left-button release, if the cursor
+    /// has moved more than `DRAG_THRESHOLD_PX` from this position the
+    /// engine transitions to Visual mode so the user can `y` the
+    /// selection. CEF natively renders the on-screen text selection
+    /// during the drag.
+    osr_drag_start: Option<(i32, i32)>,
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
@@ -1708,6 +1715,7 @@ impl AppState {
             osr_last_click_at: Instant::now(),
             osr_last_click_button: None,
             osr_click_count: 1,
+            osr_drag_start: None,
             shutdown_flag,
             tab_ids: Vec::new(),
             session_dirty: false,
@@ -1845,6 +1853,14 @@ impl AppState {
                 // Clear local edit state synchronously — don't wait for the
                 // JS-driven blur event to arrive.
                 self.edit_focus = EditFocus::None;
+                if let Ok(mut e) = self.engine.lock() {
+                    e.set_mode(PageMode::Normal);
+                }
+                self.refresh_title();
+                self.request_redraw();
+            }
+            A::YankSelection => {
+                host.dispatch(action);
                 if let Ok(mut e) = self.engine.lock() {
                     e.set_mode(PageMode::Normal);
                 }
@@ -3884,6 +3900,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     return;
                 }
 
+                let mut enter_visual = false;
                 if let Some(host) = self.host.as_ref()
                     && host.mode() == buffr_core::HostMode::Osr
                     && let Some(cef_button) = winit_button_to_cef(&button)
@@ -3910,11 +3927,34 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         // Insert mode.
                         if button == MouseButton::Left {
                             self.insert_intent_at = Some(Instant::now());
+                            // Track drag origin so a left-button release
+                            // far from the press point promotes the
+                            // engine to Visual mode (CEF natively
+                            // selects the swept text).
+                            self.osr_drag_start = Some(self.osr_cursor);
+                        }
+                    } else if button == MouseButton::Left
+                        && let Some((sx, sy)) = self.osr_drag_start.take()
+                    {
+                        let (cx, cy) = self.osr_cursor;
+                        const DRAG_THRESHOLD_PX: i32 = 4;
+                        let dx = (cx - sx).abs();
+                        let dy = (cy - sy).abs();
+                        if dx > DRAG_THRESHOLD_PX || dy > DRAG_THRESHOLD_PX {
+                            enter_visual = true;
+                            tracing::debug!(dx, dy, "osr drag → Visual mode");
                         }
                     }
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
+                }
+                if enter_visual {
+                    if let Ok(mut e) = self.engine.lock() {
+                        e.set_mode(PageMode::Visual);
+                    }
+                    self.refresh_title();
+                    self.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
