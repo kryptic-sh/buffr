@@ -3230,6 +3230,12 @@ impl ApplicationHandler for AppState {
                     }
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
+                    // Force CEF focus on every click — Wayland's
+                    // Focused event is unreliable; without this Google
+                    // and other pages reject input on first click.
+                    if !mouse_up {
+                        host.osr_focus(true);
+                    }
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
                 }
             }
