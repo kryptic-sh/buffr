@@ -1863,11 +1863,31 @@ impl BrowserHost {
     /// Returns the underlying `set_text` result (`true` on success).
     /// Used by both YankUrl and YankSelection so both yanks land on
     /// the same `+` register rather than Chromium's internal one.
+    //
+    // FIXME: arboard 3.6.1 (under hjkl-clipboard 0.3.0) reports
+    // set_text=true on Wayland but the wl_data_source is held in an
+    // internal worker thread that doesn't reliably serve paste
+    // requests from other clients — yanks land in the advertisement
+    // but pasting in another app comes up empty. As a stopgap we
+    // also pipe the text to `wl-copy` when running under Wayland;
+    // it forks a child that owns the selection from its own process
+    // and works universally. Drop this branch once hjkl-clipboard
+    // 0.4.0 ships the same fallback (see memory:
+    // project_hjkl_clipboard_wayland).
     pub fn clipboard_set_text(&self, text: &str) -> bool {
-        match self.clipboard.lock() {
+        let arboard_ok = match self.clipboard.lock() {
             Ok(mut cb) => cb.set_text(text),
             Err(_) => false,
+        };
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                let wl_ok = wl_copy_pipe(text);
+                tracing::debug!(arboard_ok, wl_ok, "clipboard_set_text: wl-copy fallback");
+                return arboard_ok || wl_ok;
+            }
         }
+        arboard_ok
     }
 
     pub fn run_edit_cycle(&self, forward: bool) {
@@ -1988,6 +2008,38 @@ fn json_string_literal(s: &str) -> String {
 
 #[allow(dead_code)]
 fn _hint_used(_: Hint) {}
+
+// FIXME: drop once hjkl-clipboard 0.4.0 ships a built-in wl-copy
+// fallback (see memory: project_hjkl_clipboard_wayland).
+//
+// Pipe `text` into `wl-copy`'s stdin. Returns true only if the
+// binary spawned, accepted the write, and exited 0. Silently
+// returns false when `wl-copy` isn't on PATH (no warning — most
+// X11 / non-Linux machines won't have it and that's fine).
+#[cfg(target_os = "linux")]
+fn wl_copy_pipe(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(text.as_bytes()).is_err()
+    {
+        let _ = child.wait();
+        return false;
+    }
+    match child.wait() {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
 
 /// Pixels per scroll-unit. `ScrollDown(3)` therefore moves 120px,
 /// matching a typical "tap j three times" feel without making each
