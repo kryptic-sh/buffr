@@ -1299,6 +1299,12 @@ struct AppState {
     /// Current edit-mode focus state. Drives keyboard routing.
     /// Updated via [`drain_edit_events`] each tick and by the Esc path.
     edit_focus: EditFocus,
+    /// Wall-clock instant of the most recent user gesture that should
+    /// allow auto-entering Insert mode on the next page-driven focusin
+    /// (left mouse press, `i` chord). When unset or stale, focusin
+    /// events from the page are ignored — pages can't drag us into
+    /// Insert via autofocus or programmatic `.focus()` calls.
+    insert_intent_at: Option<Instant>,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1487,6 +1493,7 @@ impl AppState {
             hint_sink,
             edit_sink,
             edit_focus: EditFocus::None,
+            insert_intent_at: None,
             hint_alphabet,
             pending_find,
             find_smoke_at: None,
@@ -1551,6 +1558,11 @@ impl AppState {
                 }
             }
             A::PinTab => host.toggle_pin_active(),
+            A::FocusFirstInput => {
+                // User gesture — allow the next focusin to enter Insert.
+                self.insert_intent_at = Some(Instant::now());
+                host.dispatch(action);
+            }
             A::ExitInsertMode => {
                 // Run the JS blur via the host arm.
                 host.dispatch(action);
@@ -2538,7 +2550,19 @@ impl AppState {
                         already_editing,
                         "drain_edit_focus_events: Focus received"
                     );
-                    if !already_editing {
+                    // Only enter Insert mode if a recent user gesture
+                    // (left-click or `i`) preceded this focusin. Pages
+                    // that autofocus on load or call `.focus()`
+                    // programmatically (e.g. monkeytype's Esc-to-reload
+                    // refocuses the test input) get ignored.
+                    const INTENT_WINDOW: std::time::Duration =
+                        std::time::Duration::from_millis(500);
+                    let user_intent = self
+                        .insert_intent_at
+                        .map(|t| t.elapsed() <= INTENT_WINDOW)
+                        .unwrap_or(false);
+                    if !already_editing && user_intent {
+                        self.insert_intent_at = None;
                         if let Some(host) = self.host.as_ref() {
                             host.run_edit_attach(&field_id);
                         }
@@ -2548,6 +2572,8 @@ impl AppState {
                         tracing::info!(%field_id, "edit-mode entered");
                         self.edit_focus = EditFocus::Editing { field_id };
                         mode_changed = true;
+                    } else if !already_editing {
+                        tracing::info!(%field_id, "focus ignored — no recent user gesture");
                     }
                 }
                 EditConsoleEvent::Blur { field_id } => {
@@ -3345,6 +3371,12 @@ impl ApplicationHandler for AppState {
                         }
                         self.osr_last_click_at = now;
                         self.osr_last_click_button = Some(cef_button);
+                        // Left-click is a user gesture that may focus
+                        // an input — allow the next focusin to enter
+                        // Insert mode.
+                        if button == MouseButton::Left {
+                            self.insert_intent_at = Some(Instant::now());
+                        }
                     }
                     let mods = winit_mods_to_cef(&self.modifiers);
                     let (bx, by) = self.osr_cursor;
