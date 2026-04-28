@@ -232,4 +232,16 @@
         return true;
     };
 
+    // Re-focus a previously-focused field by its buffr-assigned ID.
+    // Called by Rust when the user presses `i` and a last-focused ID
+    // is known.  Falls through to the page's own focusin handling;
+    // edit.js will fire a Focus event back through the console bridge.
+    window.__buffrEditFocus = function (id) {
+        var el = elFor(id);
+        if (!el) { return; }
+        el.focus();
+        el.scrollIntoView({ block: 'center' });
+        el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    };
+
 })();

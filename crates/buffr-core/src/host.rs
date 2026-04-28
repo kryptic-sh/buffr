@@ -1480,6 +1480,15 @@ impl BrowserHost {
         );
     }
 
+    /// Re-focus a field by its buffr-assigned ID via `__buffrEditFocus`.
+    pub fn run_edit_focus(&self, field_id: &str) {
+        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        self.run_main_frame_js(
+            &format!("if (window.__buffrEditFocus) window.__buffrEditFocus({escaped_id})"),
+            "buffr://edit",
+        );
+    }
+
     /// Remove the edit-active CSS class from the field via `__buffrEditDetach`.
     pub fn run_edit_detach(&self, field_id: &str) {
         let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());

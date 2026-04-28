@@ -1430,6 +1430,11 @@ struct AppState {
     /// [`AppState::open_pending_tabs`] after all session tabs are opened,
     /// then cleared so subsequent ticks don't re-apply it.
     pending_session_active: Option<usize>,
+    /// The buffr-assigned field ID of the most recently focused input on
+    /// the current page load. Used by `FocusFirstInput` (`i`) to restore
+    /// focus to the last-touched field rather than always jumping to the
+    /// first one. Reset to `None` on navigation (IDs are per-load).
+    last_focused_field: Option<String>,
 }
 
 /// Edit-mode focus state machine.
@@ -1565,6 +1570,7 @@ impl AppState {
             session_dirty: false,
             session_dirty_since: None,
             last_session_url: String::new(),
+            last_focused_field: None,
             last_session_active: None,
             last_session_tab_ids: Vec::new(),
             last_url_poll: Instant::now(),
@@ -1636,7 +1642,14 @@ impl AppState {
             A::FocusFirstInput => {
                 // User gesture — allow the next focusin to enter Insert.
                 self.insert_intent_at = Some(Instant::now());
-                host.dispatch(action);
+                if let Some(ref id) = self.last_focused_field.clone() {
+                    // Re-focus the previously-focused field by its stable
+                    // buffr ID rather than always jumping to the first one.
+                    host.run_edit_focus(id);
+                } else {
+                    // No prior focus on this page — fall back to first-input.
+                    host.dispatch(action);
+                }
             }
             A::ExitInsertMode => {
                 // Run the JS blur via the host arm.
@@ -2714,6 +2727,9 @@ impl AppState {
                             e.set_mode(buffr_modal::PageMode::Insert);
                         }
                         tracing::debug!(%field_id, "edit-mode entered");
+                        // Remember the last field that received user-driven
+                        // focus so `i` can re-focus it on the next press.
+                        self.last_focused_field = Some(field_id.clone());
                         self.edit_focus = EditFocus::Editing { field_id };
                         mode_changed = true;
                     } else if !already_editing {
@@ -3687,6 +3703,9 @@ impl ApplicationHandler for AppState {
             && host.pump_address_changes()
         {
             self.mark_session_dirty();
+            // edit.js is re-injected on each new page load, which
+            // reassigns all field IDs from f1. Any saved ID is stale.
+            self.last_focused_field = None;
             self.request_redraw();
         }
 
