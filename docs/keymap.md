@@ -152,6 +152,13 @@ See [`multi-tab.md`](./multi-tab.md).
 | `<F12>`   | `OpenDevTools` |
 | `<C-S-i>` | `OpenDevTools` |
 
+### Edit mode
+
+| Keys | Action            | Notes                                                                                   |
+| ---- | ----------------- | --------------------------------------------------------------------------------------- |
+| `i`  | `EnterEditMode`   | Flip engine to Edit mode. Useful if focusin auto-promote desyncs.                       |
+| `gi` | `FocusFirstInput` | **[buffr]** Vieb's `insertAtFirstInput`. JS focuses first input; focusin auto-promotes. |
+
 ## Mode transitions
 
 The engine reads the resolved [`PageAction`] and auto-transitions:

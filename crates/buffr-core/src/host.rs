@@ -1068,6 +1068,20 @@ impl BrowserHost {
                 );
             }
 
+            A::FocusFirstInput => {
+                // Focus the first interactive text field on the page. The
+                // injected `edit.js` listener picks up the focusin event and
+                // emits a console message; the main loop drains it and flips
+                // to PageMode::Edit. No need to set the engine mode here.
+                let js = "(function(){\
+                    var sel='input:not([type=hidden]):not([disabled]):not([readonly]),\
+textarea:not([disabled]):not([readonly]),[contenteditable=\"true\"]';\
+                    var el=document.querySelector(sel);\
+                    if(el){el.focus();el.scrollIntoView({block:'center'});}\
+                })();";
+                self.run_js(js);
+            }
+
             A::ClearCompletedDownloads => match self.downloads.clear_completed() {
                 Ok(n) => tracing::info!(removed = n, "downloads: cleared completed"),
                 Err(err) => tracing::warn!(error = %err, "downloads: clear_completed failed"),
