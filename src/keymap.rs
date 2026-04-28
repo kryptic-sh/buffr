@@ -208,7 +208,8 @@ impl Keymap {
             "TabNext",
             "TabPrev",
             "TabClose",
-            "TabNew",
+            "TabNewRight",
+            "TabNewLeft",
             "DuplicateTab",
             "PinTab",
             "HistoryBack",
@@ -342,6 +343,8 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::TabPrev => "TabPrev",
         PageAction::TabClose => "TabClose",
         PageAction::TabNew => "TabNew",
+        PageAction::TabNewRight => "TabNewRight",
+        PageAction::TabNewLeft => "TabNewLeft",
         PageAction::DuplicateTab => "DuplicateTab",
         PageAction::PinTab => "PinTab",
         PageAction::TabReorder { .. } => "TabReorder",
@@ -408,7 +411,6 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "L", PageAction::TabNext),
     (PageMode::Normal, "gt", PageAction::TabNext),
     (PageMode::Normal, "gT", PageAction::TabPrev),
-    (PageMode::Normal, "t", PageAction::TabNew),
     (PageMode::Normal, "d", PageAction::TabClose),
     (PageMode::Normal, "<C-w>c", PageAction::TabClose),
     (PageMode::Normal, "<C-w>n", PageAction::DuplicateTab),
@@ -428,11 +430,14 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "<Esc>", PageAction::ExitInsertMode),
     // buffr extension: <C-c> as StopLoading (Vieb: copyText)
     (PageMode::Normal, "<C-c>", PageAction::StopLoading),
+    // -- tabs (adjacent open) -------------------------------------
+    // `o` opens a new tab to the right of the active tab and auto-opens
+    // the omnibar. `O` opens to the left.
+    (PageMode::Normal, "o", PageAction::TabNewRight),
+    (PageMode::Normal, "O", PageAction::TabNewLeft),
     // -- omnibar / command ----------------------------------------
     (PageMode::Normal, "e", PageAction::OpenOmnibar),
     (PageMode::Normal, "<C-l>", PageAction::OpenOmnibar),
-    // buffr extension: `o` kept as omnibar alias
-    (PageMode::Normal, "o", PageAction::OpenOmnibar),
     (PageMode::Normal, ":", PageAction::OpenCommandLine),
     // buffr extension: `;` as command line alias
     (PageMode::Normal, ";", PageAction::OpenCommandLine),
