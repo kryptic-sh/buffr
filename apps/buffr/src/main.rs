@@ -3807,7 +3807,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                     }
                 }
-                self.request_redraw();
+                // Paint synchronously so chrome (tab strip, statusline)
+                // commits a buffer at the new dims in this event tick.
+                // request_redraw is gated by Wayland frame callbacks and
+                // lags one frame behind configure during continuous drag,
+                // letting the compositor stretch the old buffer.
+                self.paint_chrome();
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
