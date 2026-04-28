@@ -4068,12 +4068,16 @@ impl ApplicationHandler for AppState {
 
         // OSR poll-redraw throttle — ~60 Hz.
         //
-        // In a complete pipeline, `OsrPaintHandler::on_paint` would post a
-        // wakeup through an `EventLoopProxy` and we'd only redraw when CEF
-        // delivers a new frame.  That signal channel is not yet wired up
-        // (deferred to step 5 / a follow-up).  Until then we request a redraw
-        // at ≈60 Hz whenever the host is in OSR mode so the page stays live.
-        // This only fires for Wayland sessions; X11 windowed mode is unaffected.
+        // We paint directly from `about_to_wait` rather than relying on
+        // `request_redraw` -> RedrawRequested. On Wayland, request_redraw
+        // is a hint that's only delivered on the compositor's next frame
+        // callback; if nothing's animating (idle page), no callback ever
+        // arrives and the surface freezes. The most visible failure was
+        // a window resize: after osr_resize / was_resized scheduled a
+        // CEF repaint, the new on_paint output never reached softbuffer
+        // because RedrawRequested never fired. Painting unconditionally
+        // every 16 ms keeps the surface in lock-step with whatever the
+        // OSR frame buffer holds — including post-resize updates.
         //
         // TODO: replace with EventLoopProxy-based wakeup from on_paint.
         if let Some(host) = self.host.as_ref()
@@ -4082,7 +4086,7 @@ impl ApplicationHandler for AppState {
             let now = Instant::now();
             if now.duration_since(self.last_osr_redraw) >= Duration::from_millis(16) {
                 self.last_osr_redraw = now;
-                self.request_redraw();
+                self.paint_chrome();
             }
         }
     }
