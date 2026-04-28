@@ -290,10 +290,27 @@ impl Renderer {
 
         let t_upload = t0.elapsed();
 
-        let frame = self
-            .surface
-            .get_current_texture()
-            .context("wgpu: get_current_texture")?;
+        // get_current_texture can return SurfaceError::{Timeout,
+        // Outdated, Lost, OutOfMemory}. On Outdated / Lost we
+        // reconfigure the surface so the next frame can recover; on
+        // Timeout (1s default) we just skip this frame to avoid
+        // burning more time. Without recovery the surface stays
+        // wedged and every subsequent frame stalls another ~1s.
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(wgpu::SurfaceError::Timeout) => {
+                tracing::warn!("wgpu surface: get_current_texture timed out, skipping frame");
+                return Ok(());
+            }
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                tracing::warn!("wgpu surface: outdated/lost, reconfiguring");
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            Err(e @ wgpu::SurfaceError::OutOfMemory) => {
+                return Err(anyhow::anyhow!("wgpu surface OOM: {e:?}"));
+            }
+        };
 
         let t_acquire = t0.elapsed();
         let frame_view = frame
