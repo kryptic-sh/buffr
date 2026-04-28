@@ -399,10 +399,9 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "<Home>", PageAction::ScrollTop),
     (PageMode::Normal, "<End>", PageAction::ScrollBottom),
     // -- tabs -----------------------------------------------------
-    (PageMode::Normal, "J", PageAction::TabNext),
-    (PageMode::Normal, "K", PageAction::TabPrev),
-    (PageMode::Normal, "w", PageAction::TabNext),
-    (PageMode::Normal, "b", PageAction::TabPrev),
+    // User preference: H/L = tab prev/next (NOT vieb default of history).
+    (PageMode::Normal, "H", PageAction::TabPrev),
+    (PageMode::Normal, "L", PageAction::TabNext),
     (PageMode::Normal, "gt", PageAction::TabNext),
     (PageMode::Normal, "gT", PageAction::TabPrev),
     (PageMode::Normal, "t", PageAction::TabNew),
@@ -412,8 +411,9 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // buffr extension: <C-w>p for PinTab (no direct Vieb equivalent)
     (PageMode::Normal, "<C-w>p", PageAction::PinTab),
     // -- history --------------------------------------------------
-    (PageMode::Normal, "H", PageAction::HistoryBack),
-    (PageMode::Normal, "L", PageAction::HistoryForward),
+    // User preference: J/K = history back/forward (NOT vieb default of tabs).
+    (PageMode::Normal, "J", PageAction::HistoryBack),
+    (PageMode::Normal, "K", PageAction::HistoryForward),
     (PageMode::Normal, "<C-o>", PageAction::HistoryBack),
     (PageMode::Normal, "<C-i>", PageAction::HistoryForward),
     // -- reload / stop --------------------------------------------
