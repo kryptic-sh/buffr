@@ -28,9 +28,9 @@
 
 use crate::{fill_rect, font};
 
-/// Strip height in pixels. 2 px accent + 6 px top pad + 10 px glyph
-/// row + 6 px bottom pad = 24.  Chosen as half of
-/// `PERMISSIONS_PROMPT_HEIGHT` (60) so the chrome footprint stays
+/// Strip height in pixels. 2 px accent + 6 px top pad + 14 px glyph
+/// row + 6 px bottom pad = 28.  Chosen as half of
+/// `PERMISSIONS_PROMPT_HEIGHT` so the chrome footprint stays
 /// proportional to the importance of the notice.
 pub const DOWNLOAD_NOTICE_HEIGHT: u32 = 28;
 
@@ -85,7 +85,7 @@ impl DownloadNoticeStrip {
 
         // Single text row, vertically centred.
         let text_x: i32 = 8;
-        let text_y = top + (strip_h as i32 - font::GLYPH_H as i32) / 2;
+        let text_y = top + (strip_h as i32 - font::glyph_h() as i32) / 2;
 
         let line = format_line(self.kind, &self.filename, &self.path);
 

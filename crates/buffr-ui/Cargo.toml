@@ -14,3 +14,5 @@ anyhow.workspace = true
 tracing.workspace = true
 buffr-modal.workspace = true
 softbuffer.workspace = true
+fontdb = { version = "0.23", default-features = false, features = ["fs", "memmap"] }
+fontdue = "0.9"

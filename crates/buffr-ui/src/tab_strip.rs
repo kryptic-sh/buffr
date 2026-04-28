@@ -30,11 +30,11 @@
 use crate::fill_rect;
 use crate::font;
 
-/// Tab strip strip height in pixels. 30 px gives a 10-px glyph row
+/// Tab strip strip height in pixels. 34 px gives a 14-px glyph row
 /// with comfortable padding above + below plus a 2-px progress bar
 /// reserved at the bottom. Bumping this requires the host window to
 /// re-layout the CEF child rect.
-pub const TAB_STRIP_HEIGHT: u32 = 30;
+pub const TAB_STRIP_HEIGHT: u32 = 34;
 
 /// Minimum width of a single tab pill in pixels. With 8 px gutter the
 /// layout falls back to overflow truncation when the strip is too
@@ -128,7 +128,7 @@ impl TabStrip {
         let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
         let tab_w = raw_w.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
 
-        let text_y = start_y as i32 + ((strip_h as i32 - font::GLYPH_H as i32) / 2);
+        let text_y = start_y as i32 + ((strip_h as i32 - font::glyph_h() as i32) / 2);
         let progress_y = start_y as i32 + strip_h as i32 - 2;
 
         let mut x = GUTTER as i32;
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn paint_fills_strip_bg_when_no_tabs() {
         let w = 200;
-        let h = 30;
+        let h = TAB_STRIP_HEIGHT as usize;
         let mut buf = make_buf(w, h);
         let s = TabStrip::default();
         s.paint(&mut buf, w, h, 0);

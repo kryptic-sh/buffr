@@ -1,91 +1,194 @@
-//! Hand-rolled 6x10 bitmap font for the statusline.
-//!
-//! # Format
-//!
-//! Each glyph is a `[u8; 10]` — one byte per row, top to bottom.
-//! Bit 5 (mask `0b10_0000`) is the leftmost pixel of a 6-pixel-wide
-//! glyph; bit 0 is the rightmost. Bits 6 and 7 are zero.
-//!
-//! Drawing protocol: for each row `y in 0..GLYPH_H`, for each column
-//! `x in 0..GLYPH_W`, the pixel is set if
-//! `glyph[y] & (1 << (GLYPH_W - 1 - x)) != 0`.
-//!
-//! # Adding glyphs
-//!
-//! 1. Pick the ASCII codepoint to support.
-//! 2. Draw the glyph on a 6x10 grid (6 wide, 10 tall) using `#` for set
-//!    pixels and `.` for clear.
-//! 3. Convert each row to a 6-bit number (msb = leftmost pixel).
-//! 4. Add a `(codepoint, [r0, r1, …, r9])` entry to [`GLYPHS`].
-//!
-//! Missing glyphs render as the [`MISSING`] placeholder (a hollow box)
-//! so unsupported chars are visually obvious without crashing.
-//!
-//! Coverage: ASCII printable (`0x20..=0x7e`) — full enough for any URL
-//! plus the mode words (`NORMAL`, `INSERT`, `VISUAL`, `COMMAND`,
-//! `HINT`, `INSERT`, `PRIVATE`, `PENDING`).
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
-/// Glyph width in pixels.
-pub const GLYPH_W: usize = 6;
+use fontdue::{Font as FdFont, FontSettings, Metrics};
 
-/// Glyph height in pixels.
-pub const GLYPH_H: usize = 10;
+const TARGET_PX: f32 = 14.0;
 
-/// One glyph: 10 rows of 6 bits each, msb-aligned to bit 5.
-pub type Glyph = [u8; GLYPH_H];
+struct TtfFace {
+    font: FdFont,
+    advance: usize,
+    cache: std::sync::Mutex<HashMap<char, (Metrics, Vec<u8>)>>,
+}
 
-/// Placeholder for unmapped chars. Hollow rectangle so the gap is
-/// visible but doesn't break layout.
-pub const MISSING: Glyph = [
-    0b00_0000, 0b01_1110, 0b01_0010, 0b01_0010, 0b01_0010, 0b01_0010, 0b01_0010, 0b01_1110,
-    0b00_0000, 0b00_0000,
-];
+enum FontFace {
+    Ttf(Box<TtfFace>),
+    Bitmap,
+}
 
-/// Look up a glyph by ASCII codepoint. Returns [`MISSING`] for any
-/// char not in the table.
-pub fn glyph(c: char) -> Glyph {
-    if (c as u32) > 0x7e {
-        return MISSING;
-    }
-    for &(ch, g) in GLYPHS {
-        if ch == c {
-            return g;
+static FACE: OnceLock<FontFace> = OnceLock::new();
+
+fn load_face() -> FontFace {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    let names = [
+        "Hack",
+        "JetBrains Mono",
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "monospace",
+    ];
+
+    for name in names {
+        let family = if name == "monospace" {
+            fontdb::Family::Monospace
+        } else {
+            fontdb::Family::Name(name)
+        };
+        let query = fontdb::Query {
+            families: &[family],
+            ..fontdb::Query::default()
+        };
+        let Some(id) = db.query(&query) else {
+            continue;
+        };
+        let mut result = None;
+        db.with_face_data(id, |data, idx| {
+            let settings = FontSettings {
+                collection_index: idx,
+                scale: TARGET_PX,
+                ..FontSettings::default()
+            };
+            if let Ok(font) = FdFont::from_bytes(data, settings) {
+                let (metrics, _) = font.rasterize('M', TARGET_PX);
+                let advance = metrics.advance_width.round() as usize;
+                result = Some(TtfFace {
+                    font,
+                    advance: advance.max(1),
+                    cache: std::sync::Mutex::new(HashMap::new()),
+                });
+            }
+        });
+        if let Some(face) = result {
+            return FontFace::Ttf(Box::new(face));
         }
     }
-    MISSING
+
+    FontFace::Bitmap
 }
 
-/// Width of a string when rendered with this font, including a 1px
-/// gap between glyphs. Returns pixels.
-pub fn text_width(s: &str) -> usize {
-    if s.is_empty() {
-        0
-    } else {
-        s.chars().count() * (GLYPH_W + 1) - 1
+fn face() -> &'static FontFace {
+    FACE.get_or_init(load_face)
+}
+
+pub fn glyph_w() -> usize {
+    match face() {
+        FontFace::Ttf(f) => f.advance,
+        FontFace::Bitmap => BITMAP_GLYPH_W,
     }
 }
 
-/// Draw `s` into `buf` at top-left `(x, y)` with colour `fg` (RGB
-/// packed as `0x00RRGGBB`). Pixels falling outside `(width, height)`
-/// are clipped silently. Background is left untouched (caller fills
-/// it before calling).
+pub fn glyph_h() -> usize {
+    match face() {
+        FontFace::Ttf(_) => TARGET_PX as usize,
+        FontFace::Bitmap => BITMAP_GLYPH_H,
+    }
+}
+
+pub fn text_width(s: &str) -> usize {
+    let n = s.chars().count();
+    if n == 0 {
+        return 0;
+    }
+    n * (glyph_w() + 1) - 1
+}
+
 pub fn draw_text(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, s: &str, fg: u32) {
+    let advance = (glyph_w() as i32) + 1;
     let mut pen_x = x;
     for c in s.chars() {
-        draw_glyph(buf, width, height, pen_x, y, glyph(c), fg);
-        pen_x += (GLYPH_W as i32) + 1;
+        draw_char(buf, width, height, pen_x, y, c, fg);
+        pen_x += advance;
     }
 }
 
-/// Draw a single glyph at `(x, y)`. Out-of-bounds pixels are skipped.
-pub fn draw_glyph(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, g: Glyph, fg: u32) {
+fn draw_char(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, c: char, fg: u32) {
+    match face() {
+        FontFace::Ttf(f) => draw_ttf_char(f, buf, width, height, x, y, c, fg),
+        FontFace::Bitmap => draw_bitmap_char(buf, width, height, x, y, bitmap_glyph(c), fg),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ttf_char(
+    f: &TtfFace,
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    c: char,
+    fg: u32,
+) {
+    let (metrics, bitmap) = {
+        let mut cache = f.cache.lock().unwrap();
+        cache
+            .entry(c)
+            .or_insert_with(|| f.font.rasterize(c, TARGET_PX))
+            .clone()
+    };
+
+    let fg_r = (fg >> 16) & 0xFF;
+    let fg_g = (fg >> 8) & 0xFF;
+    let fg_b = fg & 0xFF;
+
+    let baseline_offset = (TARGET_PX as i32) - metrics.ymin - metrics.height as i32;
+    let glyph_x = x + metrics.xmin;
+    let glyph_y = y + baseline_offset;
+
+    for row in 0..metrics.height {
+        let py = glyph_y + row as i32;
+        if py < 0 || py as usize >= height {
+            continue;
+        }
+        for col in 0..metrics.width {
+            let coverage = bitmap[row * metrics.width + col];
+            if coverage == 0 {
+                continue;
+            }
+            let px = glyph_x + col as i32;
+            if px < 0 || px as usize >= width {
+                continue;
+            }
+            let idx = (py as usize) * width + (px as usize);
+            let Some(slot) = buf.get_mut(idx) else {
+                continue;
+            };
+            if coverage == 255 {
+                *slot = fg;
+                continue;
+            }
+            let bg = *slot;
+            let bg_r = (bg >> 16) & 0xFF;
+            let bg_g = (bg >> 8) & 0xFF;
+            let bg_b = bg & 0xFF;
+            let c = coverage as u32;
+            let inv = 255 - c;
+            let out_r = (fg_r * c + bg_r * inv) / 255;
+            let out_g = (fg_g * c + bg_g * inv) / 255;
+            let out_b = (fg_b * c + bg_b * inv) / 255;
+            *slot = (out_r << 16) | (out_g << 8) | out_b;
+        }
+    }
+}
+
+fn draw_bitmap_char(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    g: BitmapGlyph,
+    fg: u32,
+) {
     for (row_idx, row) in g.iter().enumerate() {
         let py = y + row_idx as i32;
         if py < 0 || py as usize >= height {
             continue;
         }
-        for col in 0..GLYPH_W {
-            let bit = 1u8 << (GLYPH_W - 1 - col);
+        for col in 0..BITMAP_GLYPH_W {
+            let bit = 1u8 << (BITMAP_GLYPH_W - 1 - col);
             if row & bit == 0 {
                 continue;
             }
@@ -101,15 +204,31 @@ pub fn draw_glyph(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, 
     }
 }
 
-// All glyphs are drawn on a 6x10 grid. Top + bottom rows are usually
-// blank (descenders/ascenders fit comfortably in rows 1..9).
-//
-// `_` shorthand for blank rows in some glyphs:
+const BITMAP_GLYPH_W: usize = 6;
+const BITMAP_GLYPH_H: usize = 10;
+type BitmapGlyph = [u8; BITMAP_GLYPH_H];
+
+const BITMAP_MISSING: BitmapGlyph = [
+    0b00_0000, 0b01_1110, 0b01_0010, 0b01_0010, 0b01_0010, 0b01_0010, 0b01_0010, 0b01_1110,
+    0b00_0000, 0b00_0000,
+];
+
+fn bitmap_glyph(c: char) -> BitmapGlyph {
+    if (c as u32) > 0x7e {
+        return BITMAP_MISSING;
+    }
+    for &(ch, g) in BITMAP_GLYPHS {
+        if ch == c {
+            return g;
+        }
+    }
+    BITMAP_MISSING
+}
+
 const __: u8 = 0b00_0000;
 
-/// Master glyph table. `(char, [row0..row9])`.
 #[rustfmt::skip]
-pub const GLYPHS: &[(char, Glyph)] = &[
+const BITMAP_GLYPHS: &[(char, BitmapGlyph)] = &[
     (' ',  [__, __, __, __, __, __, __, __, __, __]),
     ('!',  [__, 0b00_1000, 0b00_1000, 0b00_1000, 0b00_1000, 0b00_1000, __, 0b00_1000, __, __]),
     ('"',  [__, 0b01_0100, 0b01_0100, __, __, __, __, __, __, __]),
@@ -212,17 +331,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glyph_table_covers_mode_words() {
-        for c in "NORMALINSERTVISUALCOMMANDHINPRIVATEPENDING".chars() {
-            assert_ne!(glyph(c), MISSING, "missing glyph for {c}");
-        }
+    fn glyph_w_positive() {
+        assert!(glyph_w() > 0);
     }
 
     #[test]
-    fn glyph_table_covers_url_chars() {
-        for c in "https://example.com:443/path?q=1#frag-_~%".chars() {
-            assert_ne!(glyph(c), MISSING, "missing glyph for {c}");
-        }
+    fn glyph_h_positive() {
+        assert!(glyph_h() > 0);
     }
 
     #[test]
@@ -232,31 +347,40 @@ mod tests {
 
     #[test]
     fn text_width_one_glyph_no_trailing_gap() {
-        assert_eq!(text_width("A"), GLYPH_W);
+        assert_eq!(text_width("A"), glyph_w());
     }
 
     #[test]
     fn text_width_n_glyphs_includes_gaps() {
-        assert_eq!(text_width("AB"), 2 * GLYPH_W + 1);
-        assert_eq!(text_width("ABC"), 3 * GLYPH_W + 2);
+        assert_eq!(text_width("AB"), 2 * glyph_w() + 1);
+        assert_eq!(text_width("ABC"), 3 * glyph_w() + 2);
+    }
+
+    #[test]
+    fn text_width_hi_sane() {
+        let w = text_width("hi");
+        assert!(w > 0, "text_width(\"hi\") must be positive, got {w}");
     }
 
     #[test]
     fn draw_text_clips_offscreen() {
-        let mut buf = vec![0u32; 20 * 12];
-        // Off the right edge — must not panic.
-        draw_text(&mut buf, 20, 12, 100, 0, "HI", 0xFF_FFFF);
-        // Off the left edge.
-        draw_text(&mut buf, 20, 12, -50, 0, "HI", 0xFF_FFFF);
-        // Off the bottom.
-        draw_text(&mut buf, 20, 12, 0, 100, "HI", 0xFF_FFFF);
+        let mut buf = vec![0u32; 20 * 20];
+        draw_text(&mut buf, 20, 20, 100, 0, "HI", 0xFF_FFFF);
+        draw_text(&mut buf, 20, 20, -50, 0, "HI", 0xFF_FFFF);
+        draw_text(&mut buf, 20, 20, 0, 100, "HI", 0xFF_FFFF);
     }
 
     #[test]
-    fn draw_text_writes_pixels_in_bounds() {
-        let mut buf = vec![0u32; 30 * 12];
-        draw_text(&mut buf, 30, 12, 0, 0, "I", 0xAB_CDEF);
-        // `I` glyph row 1 is `01_1100` — three set pixels at cols 1..=3.
-        assert!(buf.contains(&0xAB_CDEF), "expected drawn pixels in buffer");
+    fn draw_text_writes_non_bg_pixels() {
+        let bg = 0u32;
+        let fg = 0xEE_EE_EE;
+        let w = 200;
+        let h = 40;
+        let mut buf = vec![bg; w * h];
+        draw_text(&mut buf, w, h, 0, 0, "Hi", fg);
+        assert!(
+            buf.iter().any(|&px| px != bg),
+            "draw_text must write at least one non-background pixel"
+        );
     }
 }

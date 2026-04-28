@@ -25,10 +25,8 @@
 //!
 //! # Glyph coverage
 //!
-//! The bundled bitmap font already covers ASCII printable; URLs are
-//! ASCII so the input bar Just Works for typical inputs. Non-ASCII
-//! codepoints render as the [`crate::font::MISSING`] placeholder for
-//! now — Unicode shaping is Phase 6 polish.
+//! The system font covers full Unicode; ASCII URLs work out of the box.
+//! A bitmap fallback activates when no suitable system font is found.
 
 use crate::font;
 use crate::{STATUSLINE_HEIGHT, fill_rect};
@@ -335,8 +333,7 @@ impl InputBar {
             p.border,
         );
 
-        // Glyph baseline: 28 px row, 10 px glyph → top padding (28-10)/2 = 9.
-        let text_y = y as i32 + ((bar_h as i32) - font::GLYPH_H as i32) / 2;
+        let text_y = y as i32 + ((bar_h as i32) - font::glyph_h() as i32) / 2;
 
         // Prefix in accent.
         let prefix_x = x as i32 + 6;
@@ -354,7 +351,7 @@ impl InputBar {
 
         // Compute available pixel width for the buffer text and the
         // char-based scroll offset that keeps the cursor visible.
-        let glyph_advance = font::GLYPH_W + 1;
+        let glyph_advance = font::glyph_w() + 1;
         let inner_w = (x as i32 + w as i32 - 6 - buffer_x).max(0) as usize;
         let chars_visible = (inner_w / glyph_advance).max(1);
         let cursor_chars = self.buffer[..self.cursor].chars().count();
@@ -392,7 +389,7 @@ impl InputBar {
                 cursor_x,
                 text_y - 1,
                 2,
-                font::GLYPH_H + 2,
+                font::glyph_h() + 2,
                 p.fg,
             );
         }
@@ -427,10 +424,10 @@ impl InputBar {
                 x as i32 + 6,
                 row_y as i32 + 8,
                 3,
-                font::GLYPH_H,
+                font::glyph_h(),
                 pip_colour,
             );
-            let row_text_y = row_y as i32 + ((row_h as i32 - font::GLYPH_H as i32) / 2);
+            let row_text_y = row_y as i32 + ((row_h as i32 - font::glyph_h() as i32) / 2);
             let text_left = x + 16;
             let text_max_px = (x + w).saturating_sub(text_left + 8);
             let display = crate::truncate_to_width(&sug.display, text_max_px);

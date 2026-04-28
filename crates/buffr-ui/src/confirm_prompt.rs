@@ -76,7 +76,7 @@ impl ConfirmPrompt {
         }
 
         let text_x = content_x as i32 + 8;
-        let text_y = top + (CONFIRM_PROMPT_HEIGHT as i32 - font::GLYPH_H as i32) / 2;
+        let text_y = top + (CONFIRM_PROMPT_HEIGHT as i32 - font::glyph_h() as i32) / 2;
         font::draw_text(
             buffer,
             width,
@@ -110,7 +110,7 @@ fn paint_button(
     fill_rect(buffer, width, height, x, y, w as usize, h as usize, bg);
     let label_w = font::text_width(label) as i32;
     let label_x = x + (w - label_w) / 2;
-    let label_y = y + (h - font::GLYPH_H as i32) / 2;
+    let label_y = y + (h - font::glyph_h() as i32) / 2;
     font::draw_text(buffer, width, height, label_x, label_y, label, COLOUR_FG);
 }
 
