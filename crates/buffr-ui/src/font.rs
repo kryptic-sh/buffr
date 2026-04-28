@@ -8,6 +8,10 @@ const TARGET_PX: f32 = 14.0;
 struct TtfFace {
     font: FdFont,
     advance: usize,
+    /// Pixel height of an upper-case glyph (rasterized 'M'). Used to
+    /// position the baseline so caps are visually centred inside the
+    /// `TARGET_PX`-tall cell instead of bottom-aligned.
+    cap_height: usize,
     cache: std::sync::Mutex<HashMap<char, (Metrics, Vec<u8>)>>,
 }
 
@@ -56,6 +60,7 @@ fn load_face() -> FontFace {
                 result = Some(TtfFace {
                     font,
                     advance: advance.max(1),
+                    cap_height: metrics.height.max(1),
                     cache: std::sync::Mutex::new(HashMap::new()),
                 });
             }
@@ -133,9 +138,9 @@ fn draw_ttf_char(
     let fg_g = (fg >> 8) & 0xFF;
     let fg_b = fg & 0xFF;
 
-    let baseline_offset = (TARGET_PX as i32) - metrics.ymin - metrics.height as i32;
+    let baseline_y = y + (TARGET_PX as i32 + f.cap_height as i32) / 2;
     let glyph_x = x + metrics.xmin;
-    let glyph_y = y + baseline_offset;
+    let glyph_y = baseline_y - metrics.height as i32 - metrics.ymin;
 
     for row in 0..metrics.height {
         let py = glyph_y + row as i32;
