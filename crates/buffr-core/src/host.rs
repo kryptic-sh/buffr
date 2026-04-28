@@ -924,6 +924,17 @@ impl BrowserHost {
         self.tabs.lock().map(|g| g.len()).unwrap_or(0)
     }
 
+    /// Number of pinned tabs. Equal to the index of the first
+    /// unpinned tab in the strip (since pinned tabs always lead).
+    /// Apps use this to clamp `o` / `O` insertion so a new unpinned
+    /// tab can never land in the pinned region.
+    pub fn pinned_count(&self) -> usize {
+        self.tabs
+            .lock()
+            .map(|g| g.iter().filter(|t| t.pinned).count())
+            .unwrap_or(0)
+    }
+
     /// Active tab snapshot, if any.
     pub fn active_tab(&self) -> Option<TabSummary> {
         let tabs = self.tabs.lock().ok()?;
@@ -1078,7 +1089,18 @@ impl BrowserHost {
         if len == 0 || from == to || from >= len {
             return;
         }
-        let to = to.min(len - 1);
+        // Confine the move to the source tab's region so a pinned
+        // drag can't land in the unpinned band (and vice versa).
+        let pinned_count = tabs.iter().filter(|t| t.pinned).count();
+        let (region_lo, region_hi) = if tabs[from].pinned {
+            (0_usize, pinned_count.saturating_sub(1))
+        } else {
+            (pinned_count, len - 1)
+        };
+        let to = to.clamp(region_lo, region_hi);
+        if to == from {
+            return;
+        }
         let tab = tabs.remove(from);
         tabs.insert(to, tab);
         // Fix up active index so it points at the same tab.

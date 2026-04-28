@@ -1697,11 +1697,16 @@ impl AppState {
                 warn!(?action, "no browser host yet — dropping action");
                 return;
             };
-            let insert_idx = if matches!(action, A::TabNewRight) {
+            let raw_idx = if matches!(action, A::TabNewRight) {
                 host.active_index().unwrap_or(0).saturating_add(1)
             } else {
                 host.active_index().unwrap_or(0)
             };
+            // The new tab is unpinned, so clamp to the unpinned region
+            // (i.e. at or after the last pinned slot). Otherwise an
+            // `O` from the first pinned tab would push the unpinned
+            // entry into the pinned-only leading band.
+            let insert_idx = raw_idx.max(host.pinned_count());
             // Last use of `host` — NLL releases the shared borrow here.
             let result = host.open_tab_at(&self.homepage, insert_idx);
             match result {
