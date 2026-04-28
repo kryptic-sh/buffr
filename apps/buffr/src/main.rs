@@ -1328,6 +1328,10 @@ struct AppState {
     /// Snapshot of the tab count + ID list at the last session save —
     /// detects open / close / reorder events the moment they happen.
     last_session_tab_ids: Vec<buffr_core::TabId>,
+    /// Wall-clock instant of the last `active_tab_live_url()` call.
+    /// Throttled to ~4 Hz (250 ms) to bound the cef-rs
+    /// "Invalid UTF-16 string" stderr spam during page loads.
+    last_url_poll: Instant,
     /// Configured hint alphabet, threaded through to the host on
     /// browser creation.
     hint_alphabet: HintAlphabet,
@@ -1550,6 +1554,7 @@ impl AppState {
             last_session_url: String::new(),
             last_session_active: None,
             last_session_tab_ids: Vec::new(),
+            last_url_poll: Instant::now(),
         }
     }
 
@@ -3689,30 +3694,36 @@ impl ApplicationHandler for AppState {
             self.request_redraw();
         }
 
-        // Live URL sync: poll the active tab's main-frame URL each tick
-        // and push it into the statusline. Cheap (one CEF call + string
-        // compare); redraw only on change. Also detects navigation,
-        // active-index, and tab-list changes for the session dirty flag.
+        // Live URL sync: throttled to ~4 Hz (250 ms) to silence the
+        // cef-rs "Invalid UTF-16 string" stderr spam that fires on
+        // every call while a page is mid-navigation. At 60 Hz this
+        // would flood the log; 4 Hz is imperceptible to users.
+        // Also detects navigation, active-index, and tab-list changes
+        // for the session dirty flag.
         if let Some(host) = self.host.as_ref() {
-            let live = host.active_tab_live_url();
-            if !live.is_empty() && live != self.statusline.url {
-                self.statusline.url = live.clone();
-                self.request_redraw();
-            }
-            // Session dirty detection: URL changed since last save.
-            if !live.is_empty() && live != self.last_session_url {
-                self.session_dirty = true;
-            }
-            // Active-index changed.
-            let active_idx = host.active_index();
-            if active_idx != self.last_session_active {
-                self.session_dirty = true;
-            }
-            // Tab-list (open / close / reorder) changed.
-            let current_ids: Vec<buffr_core::TabId> =
-                host.tabs_summary().iter().map(|t| t.id).collect();
-            if current_ids != self.last_session_tab_ids {
-                self.session_dirty = true;
+            let now = Instant::now();
+            if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
+                self.last_url_poll = now;
+                let live = host.active_tab_live_url();
+                if !live.is_empty() && live != self.statusline.url {
+                    self.statusline.url = live.clone();
+                    self.request_redraw();
+                }
+                // Session dirty detection: URL changed since last save.
+                if !live.is_empty() && live != self.last_session_url {
+                    self.session_dirty = true;
+                }
+                // Active-index changed.
+                let active_idx = host.active_index();
+                if active_idx != self.last_session_active {
+                    self.session_dirty = true;
+                }
+                // Tab-list (open / close / reorder) changed.
+                let current_ids: Vec<buffr_core::TabId> =
+                    host.tabs_summary().iter().map(|t| t.id).collect();
+                if current_ids != self.last_session_tab_ids {
+                    self.session_dirty = true;
+                }
             }
         }
 
