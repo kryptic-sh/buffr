@@ -225,6 +225,8 @@ impl Keymap {
             "PinTab",
             "ReopenClosedTab",
             "PasteUrl",
+            "MoveTabLeft",
+            "MoveTabRight",
             "HistoryBack",
             "HistoryForward",
             "Reload",
@@ -378,6 +380,8 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::ReopenClosedTab => "ReopenClosedTab",
         PageAction::PasteUrl { .. } => "PasteUrl",
         PageAction::TabReorder { .. } => "TabReorder",
+        PageAction::MoveTabLeft => "MoveTabLeft",
+        PageAction::MoveTabRight => "MoveTabRight",
         PageAction::HistoryBack => "HistoryBack",
         PageAction::HistoryForward => "HistoryForward",
         PageAction::Reload => "Reload",
@@ -462,6 +466,10 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "<C-t>", PageAction::TabNewRight),
     (PageMode::Normal, "<C-S-t>", PageAction::ReopenClosedTab),
     (PageMode::Normal, "<C-w>", PageAction::TabClose),
+    // Shuffle the active tab one slot. Mirrors H/L direction (prev/next)
+    // with Shift added — same hand position, different verb.
+    (PageMode::Normal, "<C-S-h>", PageAction::MoveTabLeft),
+    (PageMode::Normal, "<C-S-l>", PageAction::MoveTabRight),
     // -- history --------------------------------------------------
     // User preference: J/K = history back/forward (NOT vieb default of tabs).
     (PageMode::Normal, "J", PageAction::HistoryBack),
