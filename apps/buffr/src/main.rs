@@ -22,6 +22,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Minimum quiet time after the last session-dirtying event before
+/// the session file is written to disk.  Sliding window: each new
+/// change resets the clock.
+const SESSION_SAVE_DEBOUNCE_MS: u64 = 500;
+
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -1321,6 +1326,11 @@ struct AppState {
     /// `about_to_wait` flushes the session JSON to disk while this is
     /// true, then clears it. On shutdown we only re-save when dirty.
     session_dirty: bool,
+    /// Timestamp of the most recent event that set `session_dirty`.
+    /// The actual write is deferred until `SESSION_SAVE_DEBOUNCE_MS`
+    /// has elapsed since this instant (sliding window — each new dirty
+    /// event resets the clock). `None` when the session is clean.
+    session_dirty_since: Option<Instant>,
     /// Snapshot of the active tab's URL at the last session save.
     /// Compared against `host.active_tab_live_url()` each tick to
     /// detect navigation.
@@ -1553,6 +1563,7 @@ impl AppState {
             shutdown_flag,
             tab_ids: Vec::new(),
             session_dirty: false,
+            session_dirty_since: None,
             last_session_url: String::new(),
             last_session_active: None,
             last_session_tab_ids: Vec::new(),
@@ -1697,17 +1708,19 @@ impl AppState {
             return;
         }
 
-        // Update snapshots and clear dirty flag.
+        // Update snapshots and clear dirty flag + debounce clock.
         self.last_session_url = url;
         self.last_session_active = active;
         self.last_session_tab_ids = ids;
         self.session_dirty = false;
+        self.session_dirty_since = None;
     }
 
     /// Mark the session as needing a flush. Call this at any site that
     /// mutates tab state outside the `about_to_wait` URL-poll path.
     fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+        self.session_dirty_since = Some(Instant::now());
     }
 
     /// Open any extra `--new-tab` URLs after the homepage / session
@@ -3673,7 +3686,7 @@ impl ApplicationHandler for AppState {
         if let Some(host) = self.host.as_ref()
             && host.pump_address_changes()
         {
-            self.session_dirty = true;
+            self.mark_session_dirty();
             self.request_redraw();
         }
 
@@ -3725,42 +3738,61 @@ impl ApplicationHandler for AppState {
         // Zoom polls host.zoom_level() at the same cadence.
         // Also detects navigation, active-index, and tab-list changes
         // for the session dirty flag.
-        if let Some(host) = self.host.as_ref() {
-            let now = Instant::now();
-            if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
-                self.last_url_poll = now;
-                let live = host.active_tab_live_url();
-                if !live.is_empty() && live != self.statusline.url {
-                    self.statusline.url = live.clone();
-                    self.request_redraw();
+        // Collect the poll results outside the borrow so we can call
+        // `mark_session_dirty` (which takes &mut self) afterwards.
+        let url_poll_result: Option<(String, Option<usize>, Vec<buffr_core::TabId>, f64)> =
+            if let Some(host) = self.host.as_ref() {
+                let now = Instant::now();
+                if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
+                    self.last_url_poll = now;
+                    let live = host.active_tab_live_url();
+                    let active_idx = host.active_index();
+                    let current_ids: Vec<buffr_core::TabId> =
+                        host.tabs_summary().iter().map(|t| t.id).collect();
+                    let zoom = host.active_zoom_level();
+                    Some((live, active_idx, current_ids, zoom))
+                } else {
+                    None
                 }
-                // Session dirty detection: URL changed since last save.
-                if !live.is_empty() && live != self.last_session_url {
-                    self.session_dirty = true;
-                }
-                // Active-index changed.
-                let active_idx = host.active_index();
-                if active_idx != self.last_session_active {
-                    self.session_dirty = true;
-                }
-                // Tab-list (open / close / reorder) changed.
-                let current_ids: Vec<buffr_core::TabId> =
-                    host.tabs_summary().iter().map(|t| t.id).collect();
-                if current_ids != self.last_session_tab_ids {
-                    self.session_dirty = true;
-                }
-                // Zoom level: poll active tab and update statusline.
-                let zoom = host.active_zoom_level();
-                if (zoom - self.statusline.zoom_level).abs() > f64::EPSILON {
-                    self.statusline.zoom_level = zoom;
-                    self.request_redraw();
-                }
+            } else {
+                None
+            };
+        if let Some((live, active_idx, current_ids, zoom)) = url_poll_result {
+            if !live.is_empty() && live != self.statusline.url {
+                self.statusline.url = live.clone();
+                self.request_redraw();
+            }
+            // Session dirty detection: URL changed since last save.
+            if !live.is_empty() && live != self.last_session_url {
+                self.mark_session_dirty();
+            }
+            // Active-index changed.
+            if active_idx != self.last_session_active {
+                self.mark_session_dirty();
+            }
+            // Tab-list (open / close / reorder) changed.
+            if current_ids != self.last_session_tab_ids {
+                self.mark_session_dirty();
+            }
+            // Zoom level: poll active tab and update statusline.
+            if (zoom - self.statusline.zoom_level).abs() > f64::EPSILON {
+                self.statusline.zoom_level = zoom;
+                self.request_redraw();
             }
         }
 
-        // Flush session when dirty.
+        // Flush session when dirty and the debounce window has expired.
+        // Shutdown paths (CloseRequested, last-tab-gone, ctrl-c) call
+        // `save_session_now` directly, bypassing this check.
         if self.session_dirty {
-            self.save_session_now();
+            let debounce = Duration::from_millis(SESSION_SAVE_DEBOUNCE_MS);
+            let elapsed_enough = self
+                .session_dirty_since
+                .map(|t| t.elapsed() >= debounce)
+                .unwrap_or(true);
+            if elapsed_enough {
+                self.save_session_now();
+            }
         }
 
         // Download notices: drop any that have lived past their expiry
