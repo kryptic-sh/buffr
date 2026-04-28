@@ -34,6 +34,20 @@
     var SENTINEL = '%%SENTINEL%%';
     var OVERLAY_CLASS = '%%OVERLAY_CLASS%%';
 
+    // User-gesture gate. Stays false until the user actually interacts
+    // with the page (mouse / touch / pen). The Rust side flips this to
+    // true via run_js before deliberate keyboard-driven focuses (i,
+    // FocusFirstInput, etc.). Until it flips, every DOM focus is
+    // immediately blurred — pages that autofocus inputs on load
+    // (or post-load via setTimeout / rAF / observers) would otherwise
+    // keep the caret blinking, which forces continuous on_paint frames
+    // from CEF and pegs buffr's render pipeline at idle.
+    window.__buffrUserGesture = false;
+    function markGesture() { window.__buffrUserGesture = true; }
+    document.addEventListener('mousedown', markGesture, true);
+    document.addEventListener('pointerdown', markGesture, true);
+    document.addEventListener('touchstart', markGesture, true);
+
     // Strip any auto-focus the page applied on load. buffr starts every
     // page in Normal mode; the user explicitly enters Insert via `i`
     // or by clicking an input. Without this, sites like google.com
@@ -132,6 +146,14 @@
         var el = ev.target;
         var kind = kindOf(el);
         if (!kind) { return; }
+
+        // No real user gesture yet → page-driven autofocus. Re-blur
+        // immediately so the caret doesn't blink and don't emit a
+        // focus event up to Rust (avoids pointless engine work).
+        if (!window.__buffrUserGesture) {
+            if (typeof el.blur === 'function') { el.blur(); }
+            return;
+        }
 
         var id = idFor(el);
         el.classList.add(OVERLAY_CLASS);

@@ -1564,6 +1564,10 @@ impl BrowserHost {
             }
 
             A::FocusFirstInput => {
+                // Mark user gesture before focusing — edit.js's focusin
+                // handler blurs any focus that arrives without a gesture
+                // flag, so without this the script would self-cancel.
+                self.run_js("window.__buffrUserGesture = true;");
                 self.run_js(crate::scripts::FOCUS_FIRST_INPUT);
             }
 
@@ -1852,8 +1856,14 @@ impl BrowserHost {
     /// Re-focus a field by its buffr-assigned ID via `__buffrEditFocus`.
     pub fn run_edit_focus(&self, field_id: &str) {
         let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        // Mark user gesture so edit.js's focusin gate doesn't blur the
+        // re-focus call. This is invoked from `i` / FocusFirstInput
+        // when last_focused_field is set — both are deliberate.
         self.run_main_frame_js(
-            &format!("if (window.__buffrEditFocus) window.__buffrEditFocus({escaped_id})"),
+            &format!(
+                "window.__buffrUserGesture = true; \
+                 if (window.__buffrEditFocus) window.__buffrEditFocus({escaped_id})"
+            ),
             "buffr://edit",
         );
     }
