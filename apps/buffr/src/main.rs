@@ -45,7 +45,7 @@ use buffr_ui::{
 };
 
 mod session;
-use cef::{ImplBrowser, Settings};
+use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tempfile::TempDir;
@@ -1355,6 +1355,16 @@ struct AppState {
     /// TODO: replace with a direct signal from `OsrPaintHandler::on_paint`
     ///       once a cross-thread wakeup channel (e.g. EventLoopProxy) lands.
     last_osr_redraw: Instant,
+    /// Last known cursor position in browser-region coordinates.
+    /// Updated on every `CursorMoved` event; used when forwarding click and
+    /// wheel events so we don't have to thread the position through each arm.
+    osr_cursor: (i32, i32),
+    /// Timestamp of the last mouse click, used for double-click detection.
+    osr_last_click_at: Instant,
+    /// Button of the last click.  `None` before the first click.
+    osr_last_click_button: Option<cef::MouseButtonType>,
+    /// Click count within the current double-click window (1 or 2).
+    osr_click_count: i32,
 }
 
 /// Edit-mode focus state machine.
@@ -1485,6 +1495,10 @@ impl AppState {
             update_checker,
             last_osr_generation: 0,
             last_osr_redraw: Instant::now(),
+            osr_cursor: (0, 0),
+            osr_last_click_at: Instant::now(),
+            osr_last_click_button: None,
+            osr_click_count: 1,
         }
     }
 
@@ -2775,6 +2789,194 @@ impl AppState {
     }
 }
 
+// ---- OSR input helpers ---------------------------------------------------
+
+/// Convert winit `ModifiersState` to CEF event-flag bits.
+///
+/// CEF bit values (from cef_dll_sys `cef_event_flags_t`):
+///   SHIFT   = 2
+///   CONTROL = 4
+///   ALT     = 8
+///   COMMAND = 128
+fn winit_mods_to_cef(m: &ModifiersState) -> u32 {
+    let mut flags: u32 = 0;
+    if m.shift_key() {
+        flags |= 2;
+    }
+    if m.control_key() {
+        flags |= 4;
+    }
+    if m.alt_key() {
+        flags |= 8;
+    }
+    if m.super_key() {
+        flags |= 128;
+    }
+    flags
+}
+
+/// Map a winit `PhysicalKey` to a Windows virtual-key code for CEF.
+///
+/// Coverage: A-Z, 0-9, F1-F12, common navigation and editing keys.
+/// Unknowns map to 0 (CEF ignores `windows_key_code == 0` for non-printable
+/// keys; printable keys use `character` instead).
+fn physical_key_to_vk(key: &winit::keyboard::PhysicalKey) -> i32 {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    let PhysicalKey::Code(code) = key else {
+        return 0;
+    };
+    match code {
+        KeyCode::KeyA => 0x41,
+        KeyCode::KeyB => 0x42,
+        KeyCode::KeyC => 0x43,
+        KeyCode::KeyD => 0x44,
+        KeyCode::KeyE => 0x45,
+        KeyCode::KeyF => 0x46,
+        KeyCode::KeyG => 0x47,
+        KeyCode::KeyH => 0x48,
+        KeyCode::KeyI => 0x49,
+        KeyCode::KeyJ => 0x4A,
+        KeyCode::KeyK => 0x4B,
+        KeyCode::KeyL => 0x4C,
+        KeyCode::KeyM => 0x4D,
+        KeyCode::KeyN => 0x4E,
+        KeyCode::KeyO => 0x4F,
+        KeyCode::KeyP => 0x50,
+        KeyCode::KeyQ => 0x51,
+        KeyCode::KeyR => 0x52,
+        KeyCode::KeyS => 0x53,
+        KeyCode::KeyT => 0x54,
+        KeyCode::KeyU => 0x55,
+        KeyCode::KeyV => 0x56,
+        KeyCode::KeyW => 0x57,
+        KeyCode::KeyX => 0x58,
+        KeyCode::KeyY => 0x59,
+        KeyCode::KeyZ => 0x5A,
+        KeyCode::Digit0 => 0x30,
+        KeyCode::Digit1 => 0x31,
+        KeyCode::Digit2 => 0x32,
+        KeyCode::Digit3 => 0x33,
+        KeyCode::Digit4 => 0x34,
+        KeyCode::Digit5 => 0x35,
+        KeyCode::Digit6 => 0x36,
+        KeyCode::Digit7 => 0x37,
+        KeyCode::Digit8 => 0x38,
+        KeyCode::Digit9 => 0x39,
+        KeyCode::F1 => 0x70,
+        KeyCode::F2 => 0x71,
+        KeyCode::F3 => 0x72,
+        KeyCode::F4 => 0x73,
+        KeyCode::F5 => 0x74,
+        KeyCode::F6 => 0x75,
+        KeyCode::F7 => 0x76,
+        KeyCode::F8 => 0x77,
+        KeyCode::F9 => 0x78,
+        KeyCode::F10 => 0x79,
+        KeyCode::F11 => 0x7A,
+        KeyCode::F12 => 0x7B,
+        KeyCode::ArrowLeft => 0x25,
+        KeyCode::ArrowUp => 0x26,
+        KeyCode::ArrowRight => 0x27,
+        KeyCode::ArrowDown => 0x28,
+        KeyCode::Enter => 0x0D,
+        KeyCode::Backspace => 0x08,
+        KeyCode::Delete => 0x2E,
+        KeyCode::Tab => 0x09,
+        KeyCode::Escape => 0x1B,
+        KeyCode::Space => 0x20,
+        KeyCode::Home => 0x24,
+        KeyCode::End => 0x23,
+        KeyCode::PageUp => 0x21,
+        KeyCode::PageDown => 0x22,
+        KeyCode::Insert => 0x2D,
+        _ => 0,
+    }
+}
+
+/// Build a CEF `KeyEvent` from a winit keyboard event.
+///
+/// Returns `None` for modifier-only presses (no VK code, no character).
+fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Vec<KeyEvent> {
+    use winit::event::ElementState;
+
+    let vk = physical_key_to_vk(&event.physical_key);
+    let ch: u16 = event
+        .text
+        .as_ref()
+        .and_then(|t| t.chars().next())
+        .map(|c| {
+            let mut buf = [0u16; 2];
+            let encoded = c.encode_utf16(&mut buf);
+            if encoded.len() == 1 { encoded[0] } else { 0 }
+        })
+        .unwrap_or(0);
+
+    // Skip pure modifier keys (no VK, no character text).
+    if vk == 0 && ch == 0 {
+        return Vec::new();
+    }
+
+    match event.state {
+        ElementState::Pressed => {
+            let raw = KeyEvent {
+                type_: KeyEventType::RAWKEYDOWN,
+                modifiers,
+                windows_key_code: vk,
+                native_key_code: 0,
+                is_system_key: 0,
+                character: ch,
+                unmodified_character: ch,
+                focus_on_editable_field: 0,
+                ..KeyEvent::default()
+            };
+            if ch != 0 {
+                let char_ev = KeyEvent {
+                    type_: KeyEventType::CHAR,
+                    modifiers,
+                    windows_key_code: ch as i32,
+                    native_key_code: 0,
+                    is_system_key: 0,
+                    character: ch,
+                    unmodified_character: ch,
+                    focus_on_editable_field: 0,
+                    ..KeyEvent::default()
+                };
+                vec![raw, char_ev]
+            } else {
+                vec![raw]
+            }
+        }
+        ElementState::Released => {
+            vec![KeyEvent {
+                type_: KeyEventType::KEYUP,
+                modifiers,
+                windows_key_code: vk,
+                native_key_code: 0,
+                is_system_key: 0,
+                character: ch,
+                unmodified_character: ch,
+                focus_on_editable_field: 0,
+                ..KeyEvent::default()
+            }]
+        }
+    }
+}
+
+/// Double-click detection window.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+/// Map a winit `MouseButton` to a CEF `MouseButtonType`.
+/// Returns `None` for `Other(_)` buttons.
+fn winit_button_to_cef(button: &winit::event::MouseButton) -> Option<MouseButtonType> {
+    use winit::event::MouseButton;
+    match button {
+        MouseButton::Left => Some(MouseButtonType::LEFT),
+        MouseButton::Right => Some(MouseButtonType::RIGHT),
+        MouseButton::Middle => Some(MouseButtonType::MIDDLE),
+        _ => None,
+    }
+}
+
 /// Map a [`PageMode`] to the status-line label rendered into the
 /// window title. `Pending` collapses to `NORMAL` because the engine
 /// only enters `Pending` mid-multi-chord and we don't want the title
@@ -2939,6 +3141,83 @@ impl ApplicationHandler for AppState {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
+            WindowEvent::Focused(focused) => {
+                if let Some(host) = self.host.as_ref() {
+                    host.osr_focus(focused);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(host) = self.host.as_ref() {
+                    let mods = winit_mods_to_cef(&self.modifiers);
+                    host.osr_mouse_leave(mods);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(host) = self.host.as_ref()
+                    && host.mode() == buffr_core::HostMode::Osr
+                {
+                    // Convert from window coords to browser-region coords.
+                    // The browser region starts at `cef_y` (below the chrome strips).
+                    let size = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.inner_size())
+                        .unwrap_or_default();
+                    let (_cx, cef_y, _cw, _ch) =
+                        self.cef_child_rect(size.width.max(1), size.height.max(1));
+                    let bx = position.x as i32;
+                    let by = (position.y as i32).saturating_sub(cef_y as i32);
+                    self.osr_cursor = (bx, by);
+                    let mods = winit_mods_to_cef(&self.modifiers);
+                    host.osr_mouse_move(bx, by, mods);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(host) = self.host.as_ref()
+                    && host.mode() == buffr_core::HostMode::Osr
+                    && let Some(cef_button) = winit_button_to_cef(&button)
+                {
+                    let mouse_up = state == winit::event::ElementState::Released;
+                    // Double-click detection.
+                    let now = Instant::now();
+                    let same_button = self
+                        .osr_last_click_button
+                        .map(|b| b == cef_button)
+                        .unwrap_or(false);
+                    if !mouse_up {
+                        if same_button
+                            && now.duration_since(self.osr_last_click_at) < DOUBLE_CLICK_WINDOW
+                        {
+                            self.osr_click_count = (self.osr_click_count + 1).min(3);
+                        } else {
+                            self.osr_click_count = 1;
+                        }
+                        self.osr_last_click_at = now;
+                        self.osr_last_click_button = Some(cef_button);
+                    }
+                    let mods = winit_mods_to_cef(&self.modifiers);
+                    let (bx, by) = self.osr_cursor;
+                    host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(host) = self.host.as_ref()
+                    && host.mode() == buffr_core::HostMode::Osr
+                {
+                    use winit::event::MouseScrollDelta;
+                    let (dx, dy) = match delta {
+                        // Line delta: 120 per tick matches Chromium's wheel
+                        // tick magnitude expectation.
+                        MouseScrollDelta::LineDelta(x, y) => {
+                            ((x * 120.0) as i32, (y * 120.0) as i32)
+                        }
+                        MouseScrollDelta::PixelDelta(p) => (p.x as i32, p.y as i32),
+                    };
+                    let mods = winit_mods_to_cef(&self.modifiers);
+                    let (bx, by) = self.osr_cursor;
+                    host.osr_mouse_wheel(bx, by, dx, dy, mods);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 // Permissions prompt takes precedence over every other
                 // key sink. Pressing `a`/`d`/`A`/`D`/Esc resolves the
@@ -3010,6 +3289,16 @@ impl ApplicationHandler for AppState {
                     }
                     Step::Reject => {
                         trace!(?chord, "key not bound");
+                        // OSR: forward unhandled keys to CEF (the page
+                        // may handle them — e.g. arrow keys in a form,
+                        // Ctrl-A, etc.). In windowed mode the X11 child
+                        // window receives them natively.
+                        if let Some(host) = self.host.as_ref() {
+                            let mods = winit_mods_to_cef(&self.modifiers);
+                            for ev in winit_key_to_cef_events(&event, mods) {
+                                host.osr_key_event(ev);
+                            }
+                        }
                     }
                     Step::EditModeActive => {
                         // Engine is already in PageMode::Edit — route

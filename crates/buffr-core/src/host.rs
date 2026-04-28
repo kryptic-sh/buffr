@@ -362,6 +362,126 @@ impl BrowserHost {
         self.osr_view.clone()
     }
 
+    // ---- OSR input forwarding -------------------------------------------
+
+    /// Forward a mouse-move to the active tab's browser host.
+    ///
+    /// No-op when the host is in `Windowed` mode (X11 routes input natively).
+    pub fn osr_mouse_move(&self, x: i32, y: i32, modifiers: u32) {
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            let event = cef::MouseEvent { x, y, modifiers };
+            host.send_mouse_move_event(Some(&event), 0);
+        }
+    }
+
+    /// Forward a mouse-click to the active tab's browser host.
+    ///
+    /// No-op when the host is in `Windowed` mode.
+    pub fn osr_mouse_click(
+        &self,
+        x: i32,
+        y: i32,
+        button: cef::MouseButtonType,
+        mouse_up: bool,
+        click_count: i32,
+        modifiers: u32,
+    ) {
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            let event = cef::MouseEvent { x, y, modifiers };
+            host.send_mouse_click_event(Some(&event), button, mouse_up as i32, click_count);
+        }
+    }
+
+    /// Notify CEF the mouse left the window.
+    ///
+    /// No-op when the host is in `Windowed` mode.
+    pub fn osr_mouse_leave(&self, modifiers: u32) {
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            let event = cef::MouseEvent {
+                x: 0,
+                y: 0,
+                modifiers,
+            };
+            host.send_mouse_move_event(Some(&event), 1);
+        }
+    }
+
+    /// Forward a mouse-wheel event to the active tab's browser host.
+    ///
+    /// No-op when the host is in `Windowed` mode.
+    pub fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            let event = cef::MouseEvent { x, y, modifiers };
+            host.send_mouse_wheel_event(Some(&event), delta_x, delta_y);
+        }
+    }
+
+    /// Forward a keyboard event to the active tab's browser host.
+    ///
+    /// No-op when the host is in `Windowed` mode.
+    pub fn osr_key_event(&self, event: cef::KeyEvent) {
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            host.send_key_event(Some(&event));
+        }
+    }
+
+    /// Notify CEF of focus changes.
+    ///
+    /// No-op when the host is in `Windowed` mode.
+    pub fn osr_focus(&self, focused: bool) {
+        if self.mode != HostMode::Osr {
+            return;
+        }
+        let Ok(tabs) = self.tabs.lock() else { return };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+            && let Some(host) = t.browser.host()
+        {
+            host.set_focus(if focused { 1 } else { 0 });
+        }
+    }
+
     /// Notify CEF that the viewport has been resized.
     ///
     /// Updates the atomic viewport dimensions so the next `view_rect` call
