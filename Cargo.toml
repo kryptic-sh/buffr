@@ -19,3 +19,6 @@ directories = "6"
 notify = "8"
 url = "2"
 buffr-modal = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
