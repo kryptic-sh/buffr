@@ -76,6 +76,7 @@ pub fn make_client(
     render_handler: Option<RenderHandler>,
     popup_queue: PopupQueue,
     address_sink: crate::host::AddressSink,
+    popup_title_sink: crate::host::AddressSink,
     popup_frames: PopupFrameMap,
     pending_popup_alloc: PendingPopupAlloc,
     popup_create_sink: PopupCreateSink,
@@ -97,6 +98,7 @@ pub fn make_client(
         render_handler,
         popup_queue,
         address_sink,
+        popup_title_sink,
         popup_frames,
         pending_popup_alloc,
         popup_create_sink,
@@ -130,8 +132,15 @@ pub fn make_display_handler(
     hint_sink: HintEventSink,
     edit_sink: EditEventSink,
     address_sink: crate::host::AddressSink,
+    popup_title_sink: crate::host::AddressSink,
 ) -> DisplayHandler {
-    BuffrDisplayHandler::new(history, hint_sink, edit_sink, address_sink)
+    BuffrDisplayHandler::new(
+        history,
+        hint_sink,
+        edit_sink,
+        address_sink,
+        popup_title_sink,
+    )
 }
 
 /// Standalone factory for the download handler.
@@ -364,6 +373,7 @@ wrap_client! {
         render_handler: Option<RenderHandler>,
         popup_queue: PopupQueue,
         address_sink: crate::host::AddressSink,
+        popup_title_sink: crate::host::AddressSink,
         popup_frames: PopupFrameMap,
         pending_popup_alloc: PendingPopupAlloc,
         popup_create_sink: PopupCreateSink,
@@ -392,6 +402,7 @@ wrap_client! {
                 self.hint_sink.clone(),
                 self.edit_sink.clone(),
                 self.address_sink.clone(),
+                self.popup_title_sink.clone(),
             ))
         }
 
@@ -630,6 +641,9 @@ wrap_display_handler! {
         edit_sink: EditEventSink,
         // address_sink: shared with BrowserHost; drained each tick via pump_address_changes.
         address_sink: crate::host::AddressSink,
+        // popup_title_sink: title changes for popup browsers (browser.is_popup() != 0).
+        // Drained by BrowserHost::popup_drain_title_changes each tick.
+        popup_title_sink: crate::host::AddressSink,
     }
 
     impl DisplayHandler {
@@ -664,6 +678,15 @@ wrap_display_handler! {
         ) {
             let Some(browser) = browser else { return };
             let Some(title) = title else { return };
+            let title_str = title.to_string();
+            // Route popup titles to the popup_title_sink; update history for tabs.
+            if cef::ImplBrowser::is_popup(browser) != 0 {
+                let browser_id = cef::ImplBrowser::identifier(browser);
+                if let Ok(mut sink) = self.popup_title_sink.lock() {
+                    sink.push_back((browser_id, title_str));
+                }
+                return;
+            }
             // `browser.main_frame()` returns the live main frame; we
             // need its URL so the title attaches to the right row.
             let frame = match cef::ImplBrowser::main_frame(browser) {
@@ -671,8 +694,7 @@ wrap_display_handler! {
                 None => return,
             };
             let url = CefStringUtf16::from(&frame.url()).to_string();
-            let title = title.to_string();
-            if let Err(err) = self.history.update_latest_title(&url, &title) {
+            if let Err(err) = self.history.update_latest_title(&url, &title_str) {
                 tracing::warn!(error = %err, %url, "history: update_latest_title failed");
             }
         }

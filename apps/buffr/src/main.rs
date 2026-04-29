@@ -798,6 +798,9 @@ fn main() -> Result<()> {
     // wgpu after CEF has dismantled the GPU process segfaults.
     info!("shutdown: dropping renderer");
     drop(app_state.renderer.take());
+    // Drop all popup renderers for the same reason.
+    info!("shutdown: dropping popup renderers");
+    app_state.popups.clear();
 
     // Defer-dismiss any permission requests still queued at shutdown.
     // Dropping a CEF callback without invoking it would wedge the
@@ -5002,6 +5005,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 popup.chrome_generation = popup.chrome_generation.wrapping_add(1);
                 popup.window.request_redraw();
                 debug!(browser_id, %url, "popup: URL updated");
+            }
+        }
+
+        // Popup title updates: drain title-change events for popup browsers
+        // and update the winit window title.
+        let popup_title_changes: Vec<(i32, String)> = if let Some(host) = self.host.as_ref() {
+            host.popup_drain_title_changes()
+        } else {
+            Vec::new()
+        };
+        for (browser_id, title) in popup_title_changes {
+            if let Some(&wid) = self.popup_window_id_by_browser.get(&browser_id)
+                && let Some(popup) = self.popups.get(&wid)
+            {
+                popup.window.set_title(&title);
+                debug!(browser_id, %title, "popup: title updated");
             }
         }
 

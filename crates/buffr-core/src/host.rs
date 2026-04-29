@@ -252,6 +252,10 @@ pub struct BrowserHost {
     /// any tab in `pump_address_changes`. The apps layer drains these
     /// each tick to update the popup window's URL bar.
     popup_address_sink: Arc<Mutex<VecDeque<(i32, String)>>>,
+    /// Title changes for popup browsers, pushed by `BuffrDisplayHandler::on_title_change`
+    /// when `browser.is_popup() != 0`. The apps layer drains these each
+    /// tick to update the popup window's winit title.
+    popup_title_sink: Arc<Mutex<VecDeque<(i32, String)>>>,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -409,6 +413,7 @@ impl BrowserHost {
             popup_close_sink,
             popup_browsers: Arc::new(Mutex::new(HashMap::new())),
             popup_address_sink: Arc::new(Mutex::new(VecDeque::new())),
+            popup_title_sink: Arc::new(Mutex::new(VecDeque::new())),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -504,6 +509,16 @@ impl BrowserHost {
     /// to update popup window URL bars.
     pub fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
         if let Ok(mut sink) = self.popup_address_sink.lock() {
+            sink.drain(..).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Drain title-change events for popup browsers. Called by the apps
+    /// layer each tick to update popup window titles.
+    pub fn popup_drain_title_changes(&self) -> Vec<(i32, String)> {
+        if let Ok(mut sink) = self.popup_title_sink.lock() {
             sink.drain(..).collect()
         } else {
             Vec::new()
@@ -1130,6 +1145,7 @@ impl BrowserHost {
             render_handler,
             self.popup_queue.clone(),
             self.address_sink.clone(),
+            self.popup_title_sink.clone(),
             self.popup_frames.clone(),
             self.pending_popup_alloc.clone(),
             self.popup_create_sink.clone(),
