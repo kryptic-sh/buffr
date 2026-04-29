@@ -124,24 +124,29 @@ struct OsrSlot {
 /// after our deferred `was_resized`), Chromium hasn't always finished
 /// compositing the new-dim viewport yet — parts of the buffer can be
 /// zero-filled (visible as black bars at the edges of the CEF region).
-/// To paper over that single transition frame, we keep the previous
-/// fully-composited slot for `HOLD_PREVIOUS_PAINTS` upcoming paints
-/// and sample from it (stretched to the new browser_rect) instead of
-/// the freshly-uploaded but incomplete `current`. After that window we
-/// drop `previous` and resume sampling `current`.
+/// To paper over that transition we keep the previous fully-composited
+/// slot and sample from it (stretched to the new browser_rect) until
+/// CEF has delivered `DROP_PREVIOUS_AFTER_FRAMES` frames at the new
+/// dims. After that window we drop `previous` and resume sampling
+/// `current`.
+///
+/// Counting **CEF frames** (uploads), not our render paints, matters:
+/// `RedrawRequested` storms cause many paints per CEF frame, and a
+/// per-paint counter would burn through before CEF had a chance to
+/// produce a clean new-dim frame.
 struct OsrTexture {
     current: OsrSlot,
     previous: Option<OsrSlot>,
-    /// Number of paints remaining where we should sample `previous`
-    /// instead of `current`. Set on every dim change, decremented in
-    /// `tick_after_render`.
-    hold_previous_paints: u32,
+    /// Count of CEF uploads received at the post-dim-change dims.
+    /// Once this reaches `DROP_PREVIOUS_AFTER_FRAMES`, `previous`
+    /// is dropped.
+    new_dim_uploads_seen: u32,
 }
 
-/// How many paints to sample the previous slot before promoting the new
-/// one. Two seems to be enough on Chromium 147 to cover the layout +
-/// composite churn after `was_resized`.
-const HOLD_PREVIOUS_PAINTS: u32 = 2;
+/// How many CEF frames at the new dims to ignore before promoting them.
+/// Two is usually enough on Chromium 147: the first new-dim frame is
+/// often the partial layout, the second is the fully-composited result.
+const DROP_PREVIOUS_AFTER_FRAMES: u32 = 2;
 
 impl OsrSlot {
     fn new(
@@ -202,14 +207,16 @@ impl OsrTexture {
         Self {
             current: OsrSlot::new(device, bgl, sampler, uniform_buf, format, width, height),
             previous: None,
-            hold_previous_paints: 0,
+            new_dim_uploads_seen: 0,
         }
     }
 
     /// Upload new pixels if generation changed or dimensions differ.
     /// On a dim change, the existing slot is moved into `previous` and
-    /// a fresh slot is allocated at the new dims. Returns true if the
-    /// uniform buffer needs updating (dims changed).
+    /// a fresh slot is allocated at the new dims. Each subsequent
+    /// upload at the new dims advances `new_dim_uploads_seen`; once it
+    /// reaches `DROP_PREVIOUS_AFTER_FRAMES`, `previous` is dropped.
+    /// Returns true if the uniform buffer needs updating (dims changed).
     #[allow(clippy::too_many_arguments)]
     fn maybe_upload(
         &mut self,
@@ -233,38 +240,33 @@ impl OsrTexture {
                 upload.width,
                 upload.height,
             );
-            // Retire the old slot — we'll keep sampling it for a couple
-            // paints while CEF finishes composing at the new dims.
+            // Retire the old slot — we'll keep sampling it until CEF
+            // emits enough fresh frames at the new dims.
             let old = std::mem::replace(&mut self.current, new_slot);
             self.previous = Some(old);
-            self.hold_previous_paints = HOLD_PREVIOUS_PAINTS;
+            self.new_dim_uploads_seen = 0;
         }
-        if upload.generation != self.current.last_generation {
+        let needs_upload = upload.generation != self.current.last_generation;
+        if needs_upload {
             self.current.upload(queue, upload);
+            if self.previous.is_some() {
+                self.new_dim_uploads_seen += 1;
+                if self.new_dim_uploads_seen >= DROP_PREVIOUS_AFTER_FRAMES {
+                    self.previous = None;
+                }
+            }
         }
         dims_changed
     }
 
     /// Bind group to sample for this paint. Returns the previous slot's
-    /// while we're holding off on the freshly-resized current.
+    /// as long as we still have one — i.e., until CEF has delivered
+    /// enough new-dim frames to drop it.
     fn sample_bind_group(&self) -> &wgpu::BindGroup {
-        if self.hold_previous_paints > 0
-            && let Some(prev) = &self.previous
-        {
+        if let Some(prev) = &self.previous {
             return &prev.bind_group;
         }
         &self.current.bind_group
-    }
-
-    /// Advance the post-resize hold window. Call once per paint after
-    /// the draw call has been recorded.
-    fn tick_after_render(&mut self) {
-        if self.hold_previous_paints > 0 {
-            self.hold_previous_paints -= 1;
-            if self.hold_previous_paints == 0 {
-                self.previous = None;
-            }
-        }
     }
 }
 
@@ -758,13 +760,6 @@ impl Renderer {
             rpass.set_pipeline(&self.pipeline_chrome);
             rpass.set_bind_group(0, &self.chrome_bind_group, &[]);
             rpass.draw(0..6, 0..1);
-        }
-
-        // Advance the OSR post-resize hold window. After this paint we
-        // either drop `previous` (if the hold expired) or keep it for
-        // another paint.
-        if let Some(osr_tex) = self.osr.as_mut() {
-            osr_tex.tick_after_render();
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
