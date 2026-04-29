@@ -651,10 +651,15 @@ impl Renderer {
                     view: &frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // TEMP DIAGNOSTIC: bright magenta clear so any
+                        // uncovered region in the surface texture is
+                        // immediately visible. Revert to dark navy
+                        // (0x1a, 0x1b, 0x26) once the source of the
+                        // "black bars during resize" is identified.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0x1a as f64 / 255.0,
-                            g: 0x1b as f64 / 255.0,
-                            b: 0x26 as f64 / 255.0,
+                            r: 1.0,
+                            g: 0.0,
+                            b: 1.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
