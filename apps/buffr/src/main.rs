@@ -1701,8 +1701,10 @@ struct AppState {
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
-    /// Whether CEF has requested external message-pump integration.
-    cef_pump_active: bool,
+    /// Next time CEF expects a pump, or `None` when idle.
+    /// Set by `OnScheduleMessagePumpWork(delay_ms)`; cleared after
+    /// pumping so we wait for CEF to schedule the next work item.
+    cef_next_pump_at: Option<Instant>,
     /// Ordered list of `TabId`s mirroring `tab_strip.tabs`. Refreshed
     /// every `about_to_wait` tick alongside the strip; used for
     /// tab-strip click hit-testing.
@@ -1886,7 +1888,7 @@ impl AppState {
             swipe_last_at: None,
             swipe_committed: false,
             shutdown_flag,
-            cef_pump_active: false,
+            cef_next_pump_at: None,
             tab_ids: Vec::new(),
             session_dirty: false,
             session_dirty_since: None,
@@ -5035,7 +5037,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // with AppKit; calling CefDoMessageLoopWork from inside winit's
         // AppKit event handler can re-enter winit and trip its macOS
         // reentrancy guard.
-        pump_cef_message_loop(&mut self.cef_pump_active);
+        pump_cef_message_loop(&mut self.cef_next_pump_at);
 
         // Wheel-momentum tick: synthesize a decaying wheel event once
         // high-res input has gone quiet, mimicking native Chrome's
@@ -5379,19 +5381,29 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             .map(|mhz| Duration::from_nanos(1_000_000_000_000 / u64::from(mhz)))
             .unwrap_or(Duration::from_millis(16));
         let next_wakeup = Instant::now() + frame_period;
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next_wakeup));
+        // If CEF has scheduled a pump, wake up no later than that.
+        let deadline = match self.cef_next_pump_at {
+            Some(at) if at < next_wakeup => at,
+            _ => next_wakeup,
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
 
 #[cfg(target_os = "macos")]
-fn pump_cef_message_loop(pump_active: &mut bool) {
+fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
     if let Some(delay_ms) = buffr_core::take_scheduled_message_pump_delay_ms() {
-        tracing::trace!(delay_ms, "cef: external pump activated");
-        *pump_active = true;
+        let delay = Duration::from_millis(delay_ms.try_into().unwrap_or(0));
+        let at = Instant::now() + delay;
+        tracing::trace!(delay_ms, ?at, "cef: schedule next pump");
+        *next_pump_at = Some(at);
     }
-    if *pump_active {
-        tracing::trace!("cef: do_message_loop_work");
-        cef::do_message_loop_work();
+    if let Some(at) = *next_pump_at {
+        if Instant::now() >= at {
+            tracing::trace!("cef: do_message_loop_work");
+            cef::do_message_loop_work();
+            *next_pump_at = None;
+        }
     }
 }
 

@@ -127,7 +127,9 @@ wrap_app! {
             // Keychain item through OSCrypt for cookie/password encryption.
             // buffr does not intentionally use that store, and prompting on
             // every dev launch is hostile, so use Chromium's mock keychain.
-            #[cfg(target_os = "macos")]
+            // Gate to dev builds only — release builds should use the real
+            // OS keychain so cookies and future saved passwords are encrypted.
+            #[cfg(all(target_os = "macos", debug_assertions))]
             append_switch(command_line, "use-mock-keychain");
             // Phase 6 accessibility: opt-in renderer accessibility tree.
             // The renderer feeds this into Chromium's a11y subsystem,
