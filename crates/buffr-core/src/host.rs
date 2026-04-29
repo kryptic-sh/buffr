@@ -43,7 +43,7 @@ use crate::hint::{
 use crate::osr::{OsrFrame, OsrPaintHandler, OsrViewState, SharedOsrFrame, SharedOsrViewState};
 use crate::permissions::PermissionsQueue;
 use crate::telemetry::{KEY_TABS_OPENED, UsageCounters};
-use crate::{CoreError, handlers};
+use crate::{CoreError, PopupQueue, handlers, new_popup_queue};
 
 /// Rendering mode for a [`BrowserHost`].
 ///
@@ -208,6 +208,10 @@ pub struct BrowserHost {
     /// requiring `&mut self`. `hjkl_clipboard::Clipboard::new` is
     /// infallible, so this is always `Some` after construction.
     clipboard: Mutex<hjkl_clipboard::Clipboard>,
+    /// URLs queued by `LifeSpanHandler::on_before_popup` for new-tab
+    /// dispositions (`NEW_FOREGROUND_TAB`, `NEW_BACKGROUND_TAB`). The
+    /// main loop drains each tick and opens them as tabs.
+    popup_queue: PopupQueue,
     /// Address changes pushed by `BuffrDisplayHandler::on_address_change`
     /// on the CEF IO thread. The UI thread drains via
     /// [`Self::pump_address_changes`] each tick and writes `Tab.url`.
@@ -323,6 +327,7 @@ impl BrowserHost {
             .store(osr_h, std::sync::atomic::Ordering::Relaxed);
         let osr_frame = Arc::new(Mutex::new(OsrFrame::new(osr_w, osr_h)));
 
+        let popup_queue = new_popup_queue();
         let address_sink: AddressSink = Arc::new(Mutex::new(VecDeque::new()));
         let host = Self {
             tabs: Mutex::new(Vec::new()),
@@ -359,6 +364,7 @@ impl BrowserHost {
                 );
                 Mutex::new(cb)
             },
+            popup_queue,
             address_sink,
             closed_stack: Mutex::new(Vec::new()),
         };
@@ -377,6 +383,13 @@ impl BrowserHost {
     /// each tick.
     pub fn permissions_queue(&self) -> &PermissionsQueue {
         &self.permissions_queue
+    }
+
+    /// Clone the popup URL queue. The main loop drains it each tick
+    /// and calls [`Self::open_tab`] for `target=_blank` / Ctrl+click
+    /// intents that `on_before_popup` re-routed.
+    pub fn popup_queue(&self) -> PopupQueue {
+        self.popup_queue.clone()
     }
 
     /// Current rendering mode (windowed embedding or OSR).
@@ -915,6 +928,7 @@ impl BrowserHost {
             self.counters.clone(),
             self.notice_queue.clone(),
             render_handler,
+            self.popup_queue.clone(),
             self.address_sink.clone(),
         );
         let browser = browser_host_create_browser_sync(

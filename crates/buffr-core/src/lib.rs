@@ -6,7 +6,9 @@
 //! minimal — Phase 2 will expand them to wire up the modal engine
 //! and render-process IPC.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use directories::ProjectDirs;
 use thiserror::Error;
@@ -57,6 +59,25 @@ pub use hint::{
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use host::{BrowserHost, HintStatus, HostMode, Tab, TabId, TabSession, TabSummary};
+
+/// URLs queued by `LifeSpanHandler::on_before_popup` for dispositions
+/// that should open as a new tab (`NEW_FOREGROUND_TAB`,
+/// `NEW_BACKGROUND_TAB` — typically `target="_blank"` and Ctrl+click).
+/// `NEW_POPUP` / `NEW_WINDOW` (OAuth, `window.open` with features) are
+/// not enqueued — CEF handles them natively.
+pub type PopupQueue = Arc<Mutex<VecDeque<String>>>;
+
+pub fn new_popup_queue() -> PopupQueue {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
+
+pub fn drain_popup_urls(q: &PopupQueue) -> Vec<String> {
+    if let Ok(mut g) = q.lock() {
+        return g.drain(..).collect();
+    }
+    Vec::new()
+}
+
 pub use new_tab::{
     NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_URL, NewTabHtmlProvider,
     register_buffr_handler_factory, register_buffr_handler_factory_static, register_buffr_scheme,
