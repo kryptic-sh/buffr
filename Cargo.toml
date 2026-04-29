@@ -17,7 +17,7 @@ members = [
 default-members = ["apps/buffr"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -72,15 +72,15 @@ bytemuck = { version = "1", features = ["derive"] }
 # against GitHub releases. SemVer parsing handles rc/beta suffixes.
 semver = { version = "1", features = ["serde"] }
 
-buffr-core = { path = "crates/buffr-core", version = "=0.1.0" }
-buffr-modal = { path = "crates/buffr-modal", version = "=0.1.0" }
-buffr-ui = { path = "crates/buffr-ui", version = "=0.1.0" }
-buffr-config = { path = "crates/buffr-config", version = "=0.1.0" }
-buffr-history = { path = "crates/buffr-history", version = "=0.1.0" }
-buffr-bookmarks = { path = "crates/buffr-bookmarks", version = "=0.1.0" }
-buffr-downloads = { path = "crates/buffr-downloads", version = "=0.1.0" }
-buffr-zoom = { path = "crates/buffr-zoom", version = "=0.1.0" }
-buffr-permissions = { path = "crates/buffr-permissions", version = "=0.1.0" }
+buffr-core = { path = "crates/buffr-core", version = "=0.1.1" }
+buffr-modal = { path = "crates/buffr-modal", version = "=0.1.1" }
+buffr-ui = { path = "crates/buffr-ui", version = "=0.1.1" }
+buffr-config = { path = "crates/buffr-config", version = "=0.1.1" }
+buffr-history = { path = "crates/buffr-history", version = "=0.1.1" }
+buffr-bookmarks = { path = "crates/buffr-bookmarks", version = "=0.1.1" }
+buffr-downloads = { path = "crates/buffr-downloads", version = "=0.1.1" }
+buffr-zoom = { path = "crates/buffr-zoom", version = "=0.1.1" }
+buffr-permissions = { path = "crates/buffr-permissions", version = "=0.1.1" }
 
 # Vim engine + rope buffer extracted into a standalone repo. Pinned
 # exact via "=0.1.x" — hjkl 0.1.0 freezes the SPEC trait surface, but
