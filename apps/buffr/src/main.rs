@@ -40,10 +40,10 @@ use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
     HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId, drain_edit_events,
-    drain_permissions_with_defer, drain_popup_urls, expire_stale_notices, init_cef_api,
-    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
-    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
-    pop_permission_front, profile_paths, register_buffr_handler_factory,
+    drain_permissions_with_defer, expire_stale_notices, init_cef_api, new_download_notice_queue,
+    new_edit_event_sink, new_find_sink, new_hint_event_sink, new_permissions_queue,
+    peek_download_notice, peek_permission_front, permissions_queue_len, pop_permission_front,
+    profile_paths, register_buffr_handler_factory,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -4570,17 +4570,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.statusline.hint_state = new_status;
                 self.mark_chrome_dirty();
                 self.request_redraw();
-            }
-        }
-
-        // CEF popup interception: drain URLs queued by on_before_popup and
-        // open each one as a new tab. This covers OAuth sign-in flows and
-        // any window.open() / target="_blank" with a user gesture.
-        if let Some(host) = self.host.as_ref() {
-            for url in drain_popup_urls(&host.popup_queue()) {
-                if let Err(err) = host.open_tab(&url) {
-                    warn!(error = %err, %url, "popup -> open_tab failed");
-                }
             }
         }
 

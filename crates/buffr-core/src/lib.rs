@@ -6,9 +6,7 @@
 //! minimal — Phase 2 will expand them to wire up the modal engine
 //! and render-process IPC.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use directories::ProjectDirs;
 use thiserror::Error;
@@ -59,24 +57,6 @@ pub use hint::{
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use host::{BrowserHost, HintStatus, HostMode, Tab, TabId, TabSession, TabSummary};
-
-/// Thread-safe queue for URLs that CEF's `on_before_popup` intercepts.
-/// The main loop drains this each tick and calls [`BrowserHost::open_tab`].
-pub type PopupQueue = Arc<Mutex<VecDeque<String>>>;
-
-/// Create a new, empty [`PopupQueue`].
-pub fn new_popup_queue() -> PopupQueue {
-    Arc::new(Mutex::new(VecDeque::new()))
-}
-
-/// Drain all pending popup URLs from the queue. Returns an empty `Vec` on
-/// lock poisoning (defensive — should never happen in practice).
-pub fn drain_popup_urls(q: &PopupQueue) -> Vec<String> {
-    if let Ok(mut g) = q.lock() {
-        return g.drain(..).collect();
-    }
-    Vec::new()
-}
 pub use new_tab::{
     NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_URL, NewTabHtmlProvider,
     register_buffr_handler_factory, register_buffr_handler_factory_static, register_buffr_scheme,
