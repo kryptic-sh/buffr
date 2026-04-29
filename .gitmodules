@@ -1,0 +1,27 @@
+[submodule "crates/buffr-bookmarks"]
+	path = crates/buffr-bookmarks
+	url = https://github.com/kryptic-sh/buffr-bookmarks.git
+[submodule "crates/buffr-downloads"]
+	path = crates/buffr-downloads
+	url = https://github.com/kryptic-sh/buffr-downloads.git
+[submodule "crates/buffr-history"]
+	path = crates/buffr-history
+	url = https://github.com/kryptic-sh/buffr-history.git
+[submodule "crates/buffr-modal"]
+	path = crates/buffr-modal
+	url = https://github.com/kryptic-sh/buffr-modal.git
+[submodule "crates/buffr-permissions"]
+	path = crates/buffr-permissions
+	url = https://github.com/kryptic-sh/buffr-permissions.git
+[submodule "crates/buffr-zoom"]
+	path = crates/buffr-zoom
+	url = https://github.com/kryptic-sh/buffr-zoom.git
+[submodule "crates/buffr-config"]
+	path = crates/buffr-config
+	url = https://github.com/kryptic-sh/buffr-config.git
+[submodule "crates/buffr-ui"]
+	path = crates/buffr-ui
+	url = https://github.com/kryptic-sh/buffr-ui.git
+[submodule "crates/buffr-core"]
+	path = crates/buffr-core
+	url = https://github.com/kryptic-sh/buffr-core.git

@@ -96,6 +96,23 @@ hjkl-engine = "=0.1.0"
 hjkl-buffer = "=0.1.0"
 hjkl-clipboard = "=0.3.0"
 
+# Force every transitive crates.io reference to a buffr-* crate to
+# resolve to the workspace member at crates/<name>/ (a submodule). The
+# submodule Cargo.tomls list deps as plain registry pins
+# (e.g. `buffr-modal = "0.1"`) for standalone CI; without these patches
+# cargo would mix the registry copy with the workspace member, producing
+# `multiple different versions of crate buffr_<name>` build errors.
+[patch.crates-io]
+buffr-bookmarks = { path = "crates/buffr-bookmarks" }
+buffr-config = { path = "crates/buffr-config" }
+buffr-core = { path = "crates/buffr-core" }
+buffr-downloads = { path = "crates/buffr-downloads" }
+buffr-history = { path = "crates/buffr-history" }
+buffr-modal = { path = "crates/buffr-modal" }
+buffr-permissions = { path = "crates/buffr-permissions" }
+buffr-ui = { path = "crates/buffr-ui" }
+buffr-zoom = { path = "crates/buffr-zoom" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
