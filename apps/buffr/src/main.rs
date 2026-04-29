@@ -3674,9 +3674,18 @@ impl AppState {
                 let (bx, by) = popup.cursor;
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 let click_count = popup.click_count;
+                let in_content = by >= 0;
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
+                    // Pressed inside the OSR content (below the address bar)
+                    // → focus the popup browser so DOM clicks deliver focus
+                    // to inputs and keystrokes route to this popup. Wayland
+                    // doesn't reliably emit Focused() on click, so we drive
+                    // it explicitly.
+                    if !mouse_up && in_content {
+                        host.popup_osr_focus(browser_id, true);
+                    }
                     host.popup_osr_mouse_click(
                         browser_id,
                         bx,
@@ -3689,16 +3698,12 @@ impl AppState {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                use winit::event::MouseScrollDelta;
                 let Some(popup) = self.popups.get(&window_id) else {
                     return;
                 };
                 let (bx, by) = popup.cursor;
                 let mods = winit_mods_to_cef(&popup.modifiers);
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => ((x * 120.0) as i32, (y * 120.0) as i32),
-                    MouseScrollDelta::PixelDelta(px) => (px.x as i32, px.y as i32),
-                };
+                let (dx, dy, _is_pixel) = winit_wheel_to_cef_delta(&delta);
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -3725,6 +3730,26 @@ impl AppState {
 }
 
 // ---- OSR input helpers ---------------------------------------------------
+
+/// Convert a winit `MouseScrollDelta` to a CEF wheel delta (dx, dy, is_pixel).
+///
+/// CEF's `send_mouse_wheel_event` takes integer deltas in wheel-tick units
+/// (~120 = 1 line). winit's `PixelDelta` is raw px per event (~4-6 px on
+/// touchpads / high-res wheels), which CEF rounds to near-zero on its own,
+/// so we scale by `PIXEL_DELTA_SCALE` (10× — empirical sweet spot for
+/// touchpad feel after testing).
+fn winit_wheel_to_cef_delta(delta: &winit::event::MouseScrollDelta) -> (i32, i32, bool) {
+    use winit::event::MouseScrollDelta;
+    const PIXEL_DELTA_SCALE: f32 = 10.0;
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => ((x * 120.0) as i32, (y * 120.0) as i32, false),
+        MouseScrollDelta::PixelDelta(p) => (
+            (p.x as f32 * PIXEL_DELTA_SCALE) as i32,
+            (p.y as f32 * PIXEL_DELTA_SCALE) as i32,
+            true,
+        ),
+    }
+}
 
 /// Convert winit `ModifiersState` to CEF event-flag bits.
 ///
@@ -4650,25 +4675,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 if let Some(host) = self.host.as_ref()
                     && host.mode() == buffr_core::HostMode::Osr
                 {
-                    use winit::event::MouseScrollDelta;
-                    // CEF's send_mouse_wheel_event takes int delta in
-                    // wheel-tick units (120 ≈ 1 line). winit's PixelDelta
-                    // is raw px per event (~4-6 px from touchpad / high-res
-                    // wheel), which CEF rounds to near-zero on its own,
-                    // and the C API exposes no precision / phase / momentum
-                    // flag. 10× multiplier on PixelDelta is the empirical
-                    // sweet spot for touchpad feel after testing.
-                    const PIXEL_DELTA_SCALE: f32 = 10.0;
-                    let (dx, dy, is_pixel) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => {
-                            ((x * 120.0) as i32, (y * 120.0) as i32, false)
-                        }
-                        MouseScrollDelta::PixelDelta(p) => (
-                            (p.x as f32 * PIXEL_DELTA_SCALE) as i32,
-                            (p.y as f32 * PIXEL_DELTA_SCALE) as i32,
-                            true,
-                        ),
-                    };
+                    let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
                     if is_pixel {
                         // Track velocity only for high-res input; discrete
                         // wheel ticks have their own physical inertia.
