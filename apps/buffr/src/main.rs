@@ -16,6 +16,7 @@
 //! Phase 4 additions: clap CLI, TOML config loader, hot-reload watcher
 //! that swaps the live keymap on file changes.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,8 +40,9 @@ use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
-    HintAlphabet, HintEventSink, PermissionsQueue, PromptOutcome, TabId, drain_edit_events,
-    drain_permissions_with_defer, drain_popup_urls, expire_stale_notices, init_cef_api,
+    HintAlphabet, HintEventSink, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
+    SharedOsrFrame, SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer,
+    drain_popup_closes, drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
     new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
     new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
     pop_permission_front, profile_paths, register_buffr_handler_factory,
@@ -72,11 +74,36 @@ use winit::{
 };
 
 /// Custom user events sent into the winit loop from background threads.
-/// Today there's just one: a wakeup from CEF's OSR paint handler so the
-/// UI can pump a redraw the moment a new frame lands.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum BuffrUserEvent {
+    /// CEF OSR on_paint fired for the main browser; request main-window redraw.
     OsrFrame,
+    /// CEF OSR on_paint fired for popup browser `browser_id`; request that
+    /// popup's window redraw.
+    OsrFramePopup(i32),
+}
+
+/// Per-popup-window state. Owns the winit window, wgpu renderer, and the
+/// OSR frame/view shared with the CEF paint handler.
+struct PopupWindow {
+    window: Arc<Window>,
+    renderer: crate::render::Renderer,
+    /// CEF browser id — used to route CEF close events back to this window.
+    browser_id: i32,
+    frame: SharedOsrFrame,
+    #[allow(dead_code)]
+    view: SharedOsrViewState,
+    /// URL shown in the popup's address bar. Updated when CEF's
+    /// `on_address_change` fires for this browser (Phase 3).
+    url: String,
+    /// Generation of the last OSR frame we composited.
+    last_osr_generation: u64,
+    /// Reusable scratch buffer for the same mem::swap trick as the main window.
+    osr_scratch: Vec<u8>,
+    /// Chrome generation counter — bumped when URL or size changes.
+    chrome_generation: u64,
+    /// Chrome generation at the last GPU upload.
+    last_painted_chrome_gen: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -1646,6 +1673,17 @@ struct AppState {
     /// no per-paint allocation; CEF's on_paint resizes the empty buffer
     /// it gets back exactly once after the swap.
     osr_scratch: Vec<u8>,
+    /// Live popup windows keyed by their winit `WindowId`.
+    popups: HashMap<WindowId, PopupWindow>,
+    /// Reverse map: CEF browser id → winit `WindowId`, for fast lookup
+    /// in the PopupCloseSink drain and CEF event routing.
+    popup_window_id_by_browser: HashMap<i32, WindowId>,
+    /// Popup-created event queue. Drained each `about_to_wait` tick to
+    /// spawn new popup windows. Obtained from `host.popup_create_sink()`.
+    popup_create_sink: PopupCreateSink,
+    /// Popup-closed event queue. Drained each `about_to_wait` tick to
+    /// drop popup windows. Obtained from `host.popup_close_sink()`.
+    popup_close_sink: PopupCloseSink,
 }
 
 /// Edit-mode focus state machine.
@@ -1796,6 +1834,11 @@ impl AppState {
             chrome_generation: 1,
             last_painted_chrome_gen: 0,
             osr_scratch: Vec::new(),
+            popups: HashMap::new(),
+            popup_window_id_by_browser: HashMap::new(),
+            // Replaced in `resumed` once the host is constructed.
+            popup_create_sink: buffr_core::new_popup_create_sink(),
+            popup_close_sink: buffr_core::new_popup_close_sink(),
         }
     }
 
@@ -3438,6 +3481,114 @@ impl AppState {
             host.start_find(&query, forward);
         }
     }
+
+    /// Paint one popup window frame: a minimal address bar + OSR content.
+    fn paint_popup_window(&mut self, window_id: WindowId) {
+        let popup = match self.popups.get_mut(&window_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let inner = popup.window.inner_size();
+        let width = inner.width.max(1);
+        let height = inner.height.max(1);
+        let bar_h = STATUSLINE_HEIGHT;
+
+        let osr_meta: Option<(u32, u32, u64)> = if let Ok(mut frame) = popup.frame.lock() {
+            if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
+                std::mem::swap(&mut popup.osr_scratch, &mut frame.pixels);
+                Some((frame.width, frame.height, frame.generation))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let chrome_dirty = popup.chrome_generation != popup.last_painted_chrome_gen;
+        popup.renderer.resize(width, height);
+        let url = popup.url.clone();
+        let new_gen;
+        let res = if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
+            new_gen = osr_gen;
+            let osr_upload = crate::render::OsrUpload {
+                pixels: &popup.osr_scratch,
+                width: osr_w,
+                height: osr_h,
+                generation: osr_gen,
+                dst_rect: (0, bar_h, width, height.saturating_sub(bar_h).max(1)),
+            };
+            popup.renderer.frame(
+                chrome_dirty,
+                |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
+                Some(osr_upload),
+            )
+        } else {
+            new_gen = popup.last_osr_generation;
+            popup.renderer.frame(
+                chrome_dirty,
+                |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
+                None,
+            )
+        };
+
+        popup.last_osr_generation = new_gen;
+        if chrome_dirty {
+            popup.last_painted_chrome_gen = popup.chrome_generation;
+        }
+        if let Err(err) = res {
+            warn!(error = %err, "popup: wgpu frame failed");
+        }
+    }
+
+    /// Handle a `WindowEvent` for a popup window.
+    fn handle_popup_window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                let browser_id = self
+                    .popups
+                    .get(&window_id)
+                    .map(|p| p.browser_id)
+                    .unwrap_or(-1);
+                debug!(browser_id, "popup: CloseRequested");
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    host.popup_close(browser_id);
+                }
+                // Remove immediately; CEF on_before_close will also drain
+                // popup_close_sink on the next about_to_wait tick.
+                self.popup_window_id_by_browser.remove(&browser_id);
+                self.popups.remove(&window_id);
+            }
+            WindowEvent::RedrawRequested => {
+                self.paint_popup_window(window_id);
+            }
+            WindowEvent::Resized(new_size) => {
+                let browser_id = self
+                    .popups
+                    .get(&window_id)
+                    .map(|p| p.browser_id)
+                    .unwrap_or(-1);
+                if browser_id >= 0 {
+                    let w = new_size.width.max(1);
+                    let h = new_size.height.max(1);
+                    if let Some(host) = self.host.as_ref() {
+                        host.popup_resize(browser_id, w, h);
+                    }
+                    if let Some(popup) = self.popups.get_mut(&window_id) {
+                        popup.chrome_generation = popup.chrome_generation.wrapping_add(1);
+                    }
+                }
+                self.paint_popup_window(window_id);
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---- OSR input helpers ---------------------------------------------------
@@ -3611,6 +3762,30 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
             }]
         }
     }
+}
+
+/// Paint a minimal popup chrome: one address-bar strip at the top.
+fn paint_popup_chrome(buf: &mut [u32], w: usize, h: usize, url: &str, bar_h: u32) {
+    use buffr_ui::font;
+    let bar_h = bar_h as usize;
+    if w == 0 || h < bar_h {
+        return;
+    }
+    // Background — same shade as the Normal statusline.
+    let bg: u32 = 0xFF_16_30_18;
+    let fg: u32 = 0xFF_EE_EE_EE;
+    for row in 0..bar_h {
+        let start = row * w;
+        let end = (start + w).min(buf.len());
+        if let Some(slice) = buf.get_mut(start..end) {
+            for pixel in slice {
+                *pixel = bg;
+            }
+        }
+    }
+    // URL text, left-padded by 8 px, vertically centred in bar_h.
+    let text_y = ((bar_h as i32 - font::glyph_h() as i32) / 2).max(0) as i32;
+    font::draw_text(buf, w, h, 8, text_y, url, fg);
 }
 
 /// Omnibar / command-line popup geometry.
@@ -3813,6 +3988,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 tracing::trace!("user_event: OsrFrame -> request_redraw");
                 self.request_redraw();
             }
+            BuffrUserEvent::OsrFramePopup(browser_id) => {
+                tracing::trace!(browser_id, "user_event: OsrFramePopup -> request_redraw");
+                if let Some(&wid) = self.popup_window_id_by_browser.get(&browser_id)
+                    && let Some(popup) = self.popups.get(&wid)
+                {
+                    popup.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -3877,6 +4060,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // retain state. Insert mode transitions are tracked
                 // independently via the modal engine.
                 host.osr_focus(true);
+                // Store the popup event sinks so `about_to_wait` can drain them.
+                self.popup_create_sink = host.popup_create_sink();
+                self.popup_close_sink = host.popup_close_sink();
                 // Wire OSR on_paint → winit redraw via EventLoopProxy.
                 // Wayland's frame-callback model means request_redraw on
                 // an idle surface never fires; this wakeup is what
@@ -3934,9 +4120,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Dispatch popup windows before the main window path.
+        if self.popups.contains_key(&window_id) {
+            self.handle_popup_window_event(event_loop, window_id, event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 info!("close requested");
@@ -4582,6 +4773,80 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 if let Err(err) = host.open_tab(&url) {
                     warn!(error = %err, %url, "popup -> open_tab failed");
                 }
+            }
+        }
+
+        // Popup create: drain PopupCreated events and spawn a winit window
+        // + wgpu renderer for each new popup browser.
+        let popup_creates = drain_popup_creates(&self.popup_create_sink);
+        for created in popup_creates {
+            let title = if created.url.is_empty() {
+                "buffr popup".to_string()
+            } else {
+                created.url.clone()
+            };
+            let win_attrs = Window::default_attributes()
+                .with_title(&title)
+                .with_inner_size(winit::dpi::LogicalSize::new(800u32, 600u32))
+                .with_decorations(true);
+            let popup_win = match event_loop.create_window(win_attrs) {
+                Ok(w) => Arc::new(w),
+                Err(err) => {
+                    warn!(error = %err, browser_id = created.browser_id, "popup: create_window failed");
+                    continue;
+                }
+            };
+            let popup_renderer = match crate::render::Renderer::new(popup_win.clone()) {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!(error = %err, browser_id = created.browser_id, "popup: renderer init failed");
+                    continue;
+                }
+            };
+            // Initial OSR resize to match the window's actual inner size.
+            let inner = popup_win.inner_size();
+            let pw = inner.width.max(1);
+            let ph = inner.height.max(1);
+            if let Some(host) = self.host.as_ref() {
+                host.popup_resize(created.browser_id, pw, ph);
+            }
+            // Wire OSR on_paint → popup window redraw via EventLoopProxy.
+            let proxy = self.event_proxy.clone();
+            let bid = created.browser_id;
+            created.view.set_wake(Arc::new(move || {
+                let _ = proxy.send_event(BuffrUserEvent::OsrFramePopup(bid));
+            }));
+            let wid = popup_win.id();
+            debug!(
+                browser_id = created.browser_id,
+                ?wid,
+                "popup: window created"
+            );
+            self.popup_window_id_by_browser
+                .insert(created.browser_id, wid);
+            self.popups.insert(
+                wid,
+                PopupWindow {
+                    window: popup_win,
+                    renderer: popup_renderer,
+                    browser_id: created.browser_id,
+                    frame: created.frame,
+                    view: created.view,
+                    url: created.url,
+                    last_osr_generation: 0,
+                    osr_scratch: Vec::new(),
+                    chrome_generation: 1,
+                    last_painted_chrome_gen: 0,
+                },
+            );
+        }
+
+        // Popup close: drain browser-id events and drop their windows.
+        let popup_closes: Vec<i32> = drain_popup_closes(&self.popup_close_sink);
+        for browser_id in popup_closes {
+            if let Some(wid) = self.popup_window_id_by_browser.remove(&browser_id) {
+                self.popups.remove(&wid);
+                debug!(browser_id, "popup: window dropped");
             }
         }
 
