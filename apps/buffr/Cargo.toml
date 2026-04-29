@@ -1,5 +1,5 @@
 [package]
-name = "buffr"
+name = "buffr-bin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,11 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
+# Real binary lives here; the on-crates.io `buffr` is a stub at
+# apps/buffr-stub that points users at GitHub releases. Two workspace
+# members can't share a package name — this one had to be renamed, but
+# the produced binary is still `target/<profile>/buffr`.
+publish = false
 
 [[bin]]
 name = "buffr"

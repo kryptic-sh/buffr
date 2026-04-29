@@ -452,7 +452,7 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     cmd.current_dir(&workspace)
         .arg("build")
         .arg("-p")
-        .arg("buffr")
+        .arg("buffr-bin")
         .arg("-p")
         .arg("buffr-helper");
     if parsed.release {
@@ -804,7 +804,7 @@ fn package_linux(args: Vec<String>) -> Result<()> {
     cmd.current_dir(&workspace)
         .arg("build")
         .arg("-p")
-        .arg("buffr")
+        .arg("buffr-bin")
         .arg("-p")
         .arg("buffr-helper");
     if parsed.release {

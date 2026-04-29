@@ -53,9 +53,19 @@ cargo xtask fetch-cef
 # Build the workspace.
 cargo build
 
-# Run.
-cargo run -p buffr
+# Run (the workspace's default-members points at the real binary,
+# so bare `cargo run` works; use `-p buffr-bin` if you want to be
+# explicit).
+cargo run
 ```
+
+> **Heads-up:** `cargo install buffr` is **not** a supported install path.
+> The `buffr` crate on crates.io is a stub that prints download
+> instructions — CEF apps need a ~150 MB runtime payload (libcef, paks,
+> locales, sandbox) that `cargo install` can't bundle. Grab a prebuilt
+> release from
+> [github.com/kryptic-sh/buffr/releases](https://github.com/kryptic-sh/buffr/releases),
+> or build from source as shown above.
 
 See [`docs/dev.md`](docs/dev.md) for full prerequisites, platform matrix, and
 CEF path overrides.

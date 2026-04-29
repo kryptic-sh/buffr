@@ -404,7 +404,7 @@ jobs:
         run: cargo xtask fetch-cef --target windows64
 
       - name: cargo build (release)
-        run: cargo build --release -p buffr -p buffr-helper
+        run: cargo build --release -p buffr-bin -p buffr-helper
 
       - name: cargo xtask package-windows-msi
         run: cargo xtask package-windows-msi --release

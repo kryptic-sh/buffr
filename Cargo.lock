@@ -259,7 +259,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "buffr"
+name = "buffr-bin"
 version = "0.1.1"
 dependencies = [
  "anyhow",

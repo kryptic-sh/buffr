@@ -1,0 +1,18 @@
+[package]
+name = "buffr"
+# Keep this in lockstep with the workspace `version` in ../../Cargo.toml.
+# This crate is excluded from the workspace because its `buffr` bin
+# collides with the real binary at apps/buffr. Bump together on release.
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr"
+homepage = "https://kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+description = "Stub for `cargo install buffr` — points users at GitHub release artifacts. The real browser ships as a binary tarball; cargo install can't bundle CEF runtime."
+readme = "README.md"
+
+[[bin]]
+name = "buffr"
+path = "src/main.rs"

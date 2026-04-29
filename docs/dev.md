@@ -29,7 +29,7 @@ cargo xtask fetch-cef
 cargo build
 
 # Run.
-cargo run -p buffr
+cargo run -p buffr-bin
 ```
 
 `cargo xtask fetch-cef` accepts:
@@ -76,7 +76,7 @@ buffr/
 ## Running
 
 ```sh
-RUST_LOG=buffr=debug,buffr_core=debug cargo run -p buffr
+RUST_LOG=buffr=debug,buffr_core=debug cargo run -p buffr-bin
 ```
 
 ### Wayland
@@ -96,7 +96,7 @@ feature:
 
 ```sh
 # Currently panics at runtime — only compiles. Tracking issue: PLAN.md Phase 3.
-cargo run -p buffr --features osr
+cargo run -p buffr-bin --features osr
 ```
 
 The OSR path will run CEF in windowless mode, blitting paint events onto a

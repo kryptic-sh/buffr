@@ -220,7 +220,7 @@ jobs:
         run: cargo xtask fetch-cef --target windows64
 
       - name: Build binaries (release)
-        run: cargo build --release -p buffr -p buffr-helper
+        run: cargo build --release -p buffr-bin -p buffr-helper
 
       - name: Package Windows MSI
         run: cargo xtask package-windows-msi --release
@@ -266,6 +266,8 @@ jobs:
 #   cargo publish -p buffr-core --locked
 #   cargo publish -p buffr-config --locked
 #   # ... remaining crates in topological dep order ...
+#   # `buffr` (the crates.io name) is the install-instructions stub at
+#   # apps/buffr-stub; the real binary is `buffr-bin` and is publish=false.
 #   cargo publish -p buffr --locked
 #
 # ---------------------------------------------------------------------------

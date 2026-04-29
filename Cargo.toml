@@ -14,6 +14,12 @@ members = [
     "apps/buffr-helper",
     "xtask",
 ]
+# `apps/buffr-stub` is intentionally *not* a workspace member. It's the
+# crates.io-published stub that owns the `buffr` package name, and its
+# bin output filename collides with `apps/buffr` (the real binary). Keep
+# it out of `cargo build --workspace` paths and publish it independently:
+#   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
+exclude = ["apps/buffr-stub"]
 default-members = ["apps/buffr"]
 
 [workspace.package]

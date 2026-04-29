@@ -25,7 +25,7 @@ No pre-built binaries yet. Build from source:
 # Vendor the CEF binary distribution (~500 MB extracted).
 cargo xtask fetch-cef
 
-cargo build --release -p buffr
+cargo build --release -p buffr-bin
 ```
 
 See [`docs/dev.md`](../../docs/dev.md) for full prerequisites.
