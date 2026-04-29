@@ -57,12 +57,13 @@ use crate::{
 /// [`BrowserHost::new_with_options`]:
 /// - Linux: always [`HostMode::Osr`] (Wayland softbuffer composite;
 ///   X11/XWayland windowed embedding is not supported)
-/// - macOS (`AppKit(_)`) → [`HostMode::Windowed`]
+/// - macOS (`AppKit(_)`) → [`HostMode::Osr`] (wgpu composite; AppKit child
+///   views cannot be layered predictably with buffr's custom chrome)
 /// - Windows (`Win32(_)`) → [`HostMode::Windowed`]
 /// - Any other handle → [`HostMode::Osr`] (safe fallback)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMode {
-    /// Windowed embedding via OS-native child window (macOS / Windows).
+    /// Windowed embedding via OS-native child window (Windows).
     Windowed,
     /// Off-screen rendering — CEF paints to a buffer we composite ourselves.
     Osr,
@@ -140,9 +141,9 @@ pub type AddressSink = Arc<Mutex<VecDeque<(i32, String)>>>;
 
 /// Owns N concurrent CEF browsers.
 ///
-/// The host is created **after** `cef::initialize` succeeds. On Linux
-/// the host always uses OSR mode (softbuffer composite over Wayland).
-/// On macOS/Windows the CEF child window is parented natively.
+/// The host is created **after** `cef::initialize` succeeds. Linux and
+/// macOS use OSR mode so the page and custom chrome share one compositor
+/// surface. On Windows the CEF child window is parented natively.
 pub struct BrowserHost {
     /// Live tab list. Only the active tab is visible; inactive tabs
     /// are `was_hidden(true)`.
@@ -341,12 +342,12 @@ impl BrowserHost {
         private: bool,
         counters: Option<Arc<UsageCounters>>,
     ) -> Result<Self, CoreError> {
-        // Linux is always OSR (Wayland softbuffer composite). X11/XWayland
-        // windowed embedding is not supported. macOS and Windows use their
-        // native child-window paths.
+        // Linux and macOS use OSR so the page and buffr's custom chrome
+        // are composited into one surface. Windows still uses native child
+        // embedding.
         let mode = match window_handle {
             #[cfg(target_os = "macos")]
-            RawWindowHandle::AppKit(_) => HostMode::Windowed,
+            RawWindowHandle::AppKit(_) => HostMode::Osr,
             #[cfg(target_os = "windows")]
             RawWindowHandle::Win32(_) => HostMode::Windowed,
             _ => HostMode::Osr,

@@ -29,13 +29,14 @@ pub mod scripts;
 pub mod telemetry;
 pub mod updates;
 
-/// Off-screen rendering support. Linux always uses OSR; macOS/Windows
-/// use native windowed embedding.
+/// Off-screen rendering support. Linux and macOS use OSR; Windows uses
+/// native windowed embedding.
 pub mod osr;
 pub use osr::{OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState};
 
 pub use app::{
     BuffrApp, ProfilePaths, force_renderer_accessibility_enabled, set_force_renderer_accessibility,
+    take_scheduled_message_pump_delay_ms,
 };
 pub use crash::{CrashError, CrashReport, CrashReporter};
 pub use download_notice::{

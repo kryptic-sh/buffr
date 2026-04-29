@@ -6,6 +6,8 @@ first. No Electron. No web UI for chrome.
 This site is the user-facing docs surface. The chapter list on the left covers:
 
 - **Getting started** — build from source, run the dev tree.
+- **Running on macOS** — Homebrew prerequisites, CEF vendoring, and direct
+  `cargo run` behavior for local Mac development.
 - **Configuration** — the `[general]`, `[search]`, `[theme]`, `[privacy]`,
   `[updates]`, `[accessibility]`, `[keymap]` sections.
 - **Keymap** — every default page-mode binding, with a reference for the

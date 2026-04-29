@@ -12,6 +12,9 @@
 - macOS 12+, Xcode command-line tools.
 - Windows 10+, MSVC build tools.
 
+For a Mac-specific first-run checklist, including Homebrew packages and the
+plain `cargo run` CEF layout, see [`docs/macos-running.md`](./macos-running.md).
+
 ## First build
 
 ```sh
@@ -194,9 +197,9 @@ cargo test --workspace
 
 Phase 3 chrome (statusline today; tab strip / command bar / hint mode later)
 lives in `crates/buffr-ui`. Rendering decisions are in
-[`docs/ui-stack.md`](./ui-stack.md): a `softbuffer` strip docked to the bottom
-of the buffr `winit` window, with the CEF child window sized to the remaining
-rect. The 24-pixel statusline draws via a hand-rolled 6x10 bitmap font in
+[`docs/ui-stack.md`](./ui-stack.md): the page and chrome are composited into
+the buffr `winit` window on Linux/macOS, while Windows uses a native CEF child
+window for the page area. The 24-pixel statusline draws via a hand-rolled 6x10 bitmap font in
 `crates/buffr-ui/src/font.rs`. Find-in-page is wired through
 `BrowserHost::start_find` / `stop_find`; a `--find <query>` CLI flag on
 `apps/buffr` exercises the round trip without a command bar (the Phase 3b

@@ -3,6 +3,7 @@
 [Introduction](./README.md)
 
 - [Getting started](./dev.md)
+- [Running on macOS](./macos-running.md)
 - [Configuration](./config.md)
 - [Keymap](./keymap.md)
 - [Multi-tab](./multi-tab.md)
