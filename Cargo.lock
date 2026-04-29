@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "buffr"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-bookmarks"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "regex",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-config"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffr-modal",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffr-config",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-downloads"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffr-core",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-history"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-modal"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-permissions"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-ui"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffr-modal",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-zoom"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -4838,7 +4838,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bzip2",
