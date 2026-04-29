@@ -58,13 +58,11 @@ use buffr_ui::{
 
 mod render;
 mod session;
-mod wayland_sub;
 use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
 use raw_window_handle::HasWindowHandle;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
-use wayland_sub::WaylandSub;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -798,17 +796,6 @@ fn main() -> Result<()> {
     info!("shutdown: cef shutting down");
     cef::shutdown();
     info!("shutdown: cef::shutdown returned");
-    // Leak the wl_subsurface state before AppState's natural drop.
-    // It attached to winit's foreign Wayland connection and lazily holds
-    // child surface / subsurface / shm pool / bound globals on top of
-    // it. Dropping those proxies normally races with winit's connection
-    // teardown — libwayland-client segfaults internally when destroy
-    // requests hit a half-unwound socket. The kernel reclaims the shm
-    // fd + mmap on process exit and the compositor cleans up server
-    // objects when winit closes the connection.
-    if let Some(sub) = app_state.wayland_sub.take() {
-        std::mem::forget(sub);
-    }
     // Drop the rest of AppState now (renderer/wgpu, window, engine,
     // sinks). CEF is fully gone, so wgpu can release the GPU surface
     // without racing CEF's GPU process teardown.
@@ -1657,12 +1644,6 @@ struct AppState {
     /// When equal to `chrome_generation`, the texture is valid and no
     /// repaint is needed.
     last_painted_chrome_gen: u64,
-    /// Wayland `wl_subsurface` for the statusline (PoC). `Some` only on
-    /// Wayland sessions; `None` on X11, macOS, Windows, or when global
-    /// binding fails. When `Some`, the statusline rows in the main chrome
-    /// buffer are skipped — the subsurface paints them independently so
-    /// they stay anchored to the window bottom even during top-edge drags.
-    wayland_sub: Option<WaylandSub>,
     /// Reusable scratch buffer swapped with the OSR frame's pixel Vec on
     /// each paint. Avoids cloning ~W×H×4 bytes inside the SharedOsrFrame
     /// mutex — `mem::swap` is a few-ns pointer move, so the lock is held
@@ -1821,8 +1802,6 @@ impl AppState {
             event_proxy,
             chrome_generation: 1,
             last_painted_chrome_gen: 0,
-            // Initialized in `resumed` after the window is created.
-            wayland_sub: None,
             osr_scratch: Vec::new(),
         }
     }
@@ -2333,27 +2312,6 @@ impl AppState {
             Some((w, h)) => (w.max(1), h.max(1)),
             None => (inner.width.max(1), inner.height.max(1)),
         };
-        debug!(
-            width,
-            height,
-            inner_w = inner.width,
-            inner_h = inner.height,
-            override_present = override_size.is_some(),
-            "paint_chrome_with: enter",
-        );
-
-        // Sync subsurface position to whatever dims this paint will use.
-        // winit fires both Resized and RedrawRequested per configure on
-        // Wayland, so paint_chrome can run from either event — and the
-        // RedrawRequested handler doesn't have its own set_size call.
-        // If we only updated set_position in the Resized handler the
-        // RedrawRequested commit would carry the previous frame's
-        // subsurface position with this frame's parent buffer, leaving
-        // the statusline offset above the window bottom for that frame.
-        // Doing it here covers every paint path with one call.
-        if let Some(sub) = self.wayland_sub.as_mut() {
-            sub.set_size(width, height);
-        }
 
         // Precompute geometry before the renderer call — helpers need `&self`.
         let tab_y = self.tab_strip_y(height);
@@ -2401,22 +2359,8 @@ impl AppState {
         let confirm_close_pinned = self.confirm_close_pinned;
         let permissions_prompt = self.permissions_prompt.clone();
         let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
-        // When the subsurface is active, skip the statusline in the main
-        // chrome buffer so it isn't double-drawn over the subsurface pixels.
-        let sub_active = self.wayland_sub.is_some();
 
         let frame_start = Instant::now();
-
-        // Paint the statusline subsurface BEFORE the wgpu present below.
-        // Child surface commits in desync mode apply their pending state
-        // immediately; running this first means by the time the parent
-        // surface commits (renderer.frame -> wgpu present) the subsurface
-        // already has its new buffer in place, so the parent commit's
-        // set_position update and the subsurface buffer update are
-        // observed atomically by the compositor.
-        if chrome_dirty && let Some(sub) = self.wayland_sub.as_mut() {
-            sub.paint(|buf, w, h| statusline.paint(buf, w, h));
-        }
 
         // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
@@ -2448,7 +2392,6 @@ impl AppState {
                         confirm_close_pinned,
                         permissions_prompt.as_ref(),
                         overlay_data.as_ref(),
-                        sub_active,
                     );
                 },
                 Some(osr_upload),
@@ -2470,7 +2413,6 @@ impl AppState {
                         confirm_close_pinned,
                         permissions_prompt.as_ref(),
                         overlay_data.as_ref(),
-                        sub_active,
                     );
                 },
                 None,
@@ -3718,10 +3660,6 @@ fn fill_rect_u32(
 ///
 /// All colours written here use `0xFF_RR_GG_BB` (fully-opaque BGRA) so
 /// the GPU alpha-blend composite produces crisp chrome-over-OSR output.
-///
-/// When `skip_statusline` is `true` the statusline rows are **not** painted
-/// into `buf`. The caller owns a `wl_subsurface` that paints the statusline
-/// independently so the two paths don't double-draw.
 #[allow(clippy::too_many_arguments)]
 fn paint_chrome_strips(
     buf: &mut [u32],
@@ -3735,14 +3673,11 @@ fn paint_chrome_strips(
     confirm_close_pinned: Option<buffr_core::TabId>,
     permissions_prompt: Option<&PermissionsPrompt>,
     overlay_data: Option<&InputBar>,
-    skip_statusline: bool,
 ) {
     let h = height as usize;
 
-    // Statusline — bottom strip. Skipped when a wl_subsurface paints it.
-    if !skip_statusline {
-        statusline.paint(buf, w, h);
-    }
+    // Statusline — bottom strip.
+    statusline.paint(buf, w, h);
 
     // Tab strip — between download notice and CEF region.
     tab_strip.paint(buf, w, h, tab_y);
@@ -4000,22 +3935,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         self.open_pending_tabs();
         self.refresh_tab_strip();
 
-        // Attempt to set up a wl_subsurface for the statusline. On X11 or
-        // non-Linux platforms WaylandSub::new returns None and the existing
-        // single-surface path is used unchanged.
-        self.wayland_sub = WaylandSub::new(window.as_ref());
-        if self.wayland_sub.is_some() {
-            let inner = window.inner_size();
-            if let Some(sub) = self.wayland_sub.as_mut() {
-                sub.set_size(inner.width.max(1), inner.height.max(1));
-                let sl = self.statusline.clone();
-                sub.paint(|buf, w, h| sl.paint(buf, w, h));
-            }
-            info!("wayland_sub: statusline subsurface active");
-        } else {
-            info!("wayland_sub: subsurface unavailable — using single-surface path");
-        }
-
         self.window = Some(window);
     }
 
@@ -4032,7 +3951,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                debug!("winit: RedrawRequested");
+                tracing::trace!("redraw: RedrawRequested");
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
@@ -4111,19 +4030,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let h = new_size.height.max(1);
                 self.mark_chrome_dirty();
                 self.paint_chrome_with(Some((w, h)));
-                // Force wgpu's parent commit to reach the compositor in
-                // lockstep with the set_position queued before paint_chrome.
-                // wgpu marshals attach/damage/commit but doesn't always
-                // call wl_display_flush — the messages can sit in the
-                // shared libwayland send buffer until the next event
-                // dispatch, by which time another Resized may have
-                // overwritten the parent's pending set_position. The
-                // compositor would then apply the wrong frame's set_position
-                // to this frame's parent commit, briefly mispositioning the
-                // statusline. Flush forces the commit to dispatch now.
-                if let Some(sub) = self.wayland_sub.as_mut() {
-                    sub.flush();
-                }
             }
             WindowEvent::Moved(pos) => {
                 debug!(x = pos.x, y = pos.y, "winit: Moved");
@@ -4828,13 +4734,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.mark_chrome_dirty();
                 self.request_redraw();
             }
-        }
-
-        // Flush the subsurface Wayland connection once per tick so any
-        // protocol writes from `paint()` or `set_size()` reach the compositor
-        // without waiting for the next explicit commit.
-        if let Some(sub) = self.wayland_sub.as_mut() {
-            sub.flush();
         }
 
         // No idle paint loop: we respect Wayland's frame-callback model
