@@ -196,6 +196,42 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_request_handler! {
+    pub struct BuffrRequestHandler {
+        popup_queue: PopupQueue,
+    }
+
+    impl RequestHandler {
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // Ctrl+click / middle-click come through here (Chromium does
+            // not route them through on_before_popup). Re-route the
+            // new-tab dispositions to our tab queue and cancel.
+            let raw = target_disposition.get_raw();
+            let is_tab = raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw()
+                || raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw();
+            if !is_tab {
+                return 0;
+            }
+            if let Some(url) = target_url {
+                let url_str = url.to_string();
+                if !url_str.is_empty()
+                    && let Ok(mut guard) = self.popup_queue.lock()
+                {
+                    guard.push_back(url_str);
+                }
+            }
+            1
+        }
+    }
+}
+
 wrap_client! {
     pub struct BuffrClient {
         history: Arc<History>,
@@ -260,6 +296,10 @@ wrap_client! {
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(BuffrLifeSpanHandler::new(self.popup_queue.clone()))
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(BuffrRequestHandler::new(self.popup_queue.clone()))
         }
     }
 }
