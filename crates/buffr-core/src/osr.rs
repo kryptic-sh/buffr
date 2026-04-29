@@ -25,8 +25,22 @@
 //! [`OsrViewState`] holds the current viewport dimensions as atomics so
 //! both the CEF IO thread (reading from `view_rect`) and the UI thread
 //! (writing via `BrowserHost::osr_resize`) can access them without a mutex.
+//!
+//! ## Multi-browser routing
+//!
+//! `OsrPaintHandler` is created once per CEF `Client` (one per tab) but
+//! popup browsers created by `on_before_popup` share the same client path;
+//! their browser id differs from the main tab's id.  The handler stores the
+//! main browser id at construction time and a shared map of popup
+//! `(frame, view)` pairs. On every CEF callback it routes by
+//! `browser.identifier()`:
+//!
+//! - matches `main_id` → use main frame / view
+//! - found in `popup_frames` → use that pair
+//! - unknown → skip with a trace log
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cef::*;
@@ -83,7 +97,8 @@ pub struct OsrViewState {
     /// Optional callback invoked from `on_paint` after a frame lands. The
     /// embedder uses this to wake the winit event loop (via
     /// `EventLoopProxy`) so the UI can pump a redraw without polling.
-    /// Set once at startup via [`crate::BrowserHost::set_osr_wake`].
+    /// Set once at startup via [`crate::BrowserHost::set_osr_wake`] or
+    /// via [`OsrViewState::set_wake`].
     pub wake: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -98,6 +113,12 @@ impl OsrViewState {
             wake: OnceLock::new(),
         }
     }
+
+    /// Install the wake callback. First call wins; subsequent calls are
+    /// silently ignored (matches `BrowserHost::set_osr_wake` semantics).
+    pub fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.wake.set(wake);
+    }
 }
 
 impl Default for OsrViewState {
@@ -109,22 +130,30 @@ impl Default for OsrViewState {
 /// Thread-safe shared viewport state.
 pub type SharedOsrViewState = Arc<OsrViewState>;
 
+/// Map of popup browser OSR state, keyed by CEF `browser.identifier()`.
+/// Shared between `BrowserHost` (which inserts/removes entries) and
+/// `OsrPaintHandler` (which reads them on CEF IO callbacks).
+pub type PopupFrameMap = Arc<Mutex<HashMap<i32, (SharedOsrFrame, SharedOsrViewState)>>>;
+
 // ── RenderHandler impl ─────────────────────────────────────────────────────────
 
 wrap_render_handler! {
     pub struct OsrPaintHandler {
+        main_id: Arc<AtomicI32>,
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
+        popup_frames: PopupFrameMap,
     }
 
     impl RenderHandler {
-        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+        fn view_rect(&self, browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             let Some(rect) = rect else { return };
+            let (w, h) = self.resolve_dims(browser.as_deref().map(|b| b.identifier()));
             rect.x = 0;
             rect.y = 0;
-            rect.width = self.view.width.load(Ordering::Relaxed) as i32;
-            rect.height = self.view.height.load(Ordering::Relaxed) as i32;
-            tracing::debug!(w = rect.width, h = rect.height, "osr: view_rect queried");
+            rect.width = w as i32;
+            rect.height = h as i32;
+            tracing::debug!(browser_id = ?browser.as_deref().map(|b| b.identifier()), w = rect.width, h = rect.height, "osr: view_rect queried");
         }
 
         fn screen_point(
@@ -152,7 +181,7 @@ wrap_render_handler! {
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn on_paint(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             type_: PaintElementType,
             _dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
@@ -165,16 +194,29 @@ wrap_render_handler! {
                 return;
             }
 
+            let browser_id = browser.as_deref().map(|b| b.identifier());
             let w = width as u32;
             let h = height as u32;
             let len = (w as usize) * (h as usize) * 4;
-            tracing::trace!(w, h, "osr: on_paint fired");
+            tracing::trace!(w, h, ?browser_id, "osr: on_paint fired");
 
             // SAFETY: CEF guarantees `buffer` points to `width * height * 4`
             // valid bytes for the duration of this call.
             let src = unsafe { std::slice::from_raw_parts(buffer, len) };
 
-            let Ok(mut guard) = self.frame.lock() else {
+            // Route to the correct (frame, view) pair.
+            let (frame, view) = match self.resolve_frame_view(browser_id) {
+                Some(pair) => pair,
+                None => {
+                    tracing::trace!(
+                        ?browser_id,
+                        "osr: on_paint — unknown browser id, skipping"
+                    );
+                    return;
+                }
+            };
+
+            let Ok(mut guard) = frame.lock() else {
                 tracing::warn!("osr: on_paint — frame mutex poisoned, skipping");
                 return;
             };
@@ -202,9 +244,79 @@ wrap_render_handler! {
             guard.generation = guard.generation.wrapping_add(1);
             drop(guard);
             // Wake the embedder so the UI loop can pump a redraw.
-            if let Some(wake) = self.view.wake.get() {
+            if let Some(wake) = view.wake.get() {
                 wake();
             }
         }
     }
+}
+
+impl OsrPaintHandler {
+    /// Resolve (width, height) for the given browser id.
+    fn resolve_dims(&self, browser_id: Option<i32>) -> (u32, u32) {
+        if let Some(id) = browser_id {
+            // Check if this is the known main id.
+            let main = self.main_id.load(Ordering::Relaxed);
+            if main == id || main == -1 {
+                // Set main_id lazily on first callback.
+                if main == -1 {
+                    self.main_id.store(id, Ordering::Relaxed);
+                }
+                return (
+                    self.view.width.load(Ordering::Relaxed),
+                    self.view.height.load(Ordering::Relaxed),
+                );
+            }
+            // Check popup map.
+            if let Ok(map) = self.popup_frames.lock()
+                && let Some((_, popup_view)) = map.get(&id)
+            {
+                return (
+                    popup_view.width.load(Ordering::Relaxed),
+                    popup_view.height.load(Ordering::Relaxed),
+                );
+            }
+        }
+        // Fallback: use main view dims.
+        (
+            self.view.width.load(Ordering::Relaxed),
+            self.view.height.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Resolve the (frame, view) pair for the given browser id.
+    /// Returns `None` if the id is unknown (not main, not a popup).
+    fn resolve_frame_view(
+        &self,
+        browser_id: Option<i32>,
+    ) -> Option<(SharedOsrFrame, SharedOsrViewState)> {
+        let id = browser_id?;
+        let main = self.main_id.load(Ordering::Relaxed);
+        // Lazily set main_id on first on_paint call.
+        if main == -1 || main == id {
+            if main == -1 {
+                self.main_id.store(id, Ordering::Relaxed);
+            }
+            return Some((self.frame.clone(), self.view.clone()));
+        }
+        // Check popup map.
+        if let Ok(map) = self.popup_frames.lock()
+            && let Some((pf, pv)) = map.get(&id)
+        {
+            return Some((pf.clone(), pv.clone()));
+        }
+        None
+    }
+}
+
+/// Construct a new [`OsrPaintHandler`] for a single main-tab browser.
+///
+/// `popup_frames` is shared with [`BrowserHost`] so popup entries can be
+/// inserted/removed without rebuilding the handler.
+pub fn make_osr_paint_handler(
+    frame: SharedOsrFrame,
+    view: SharedOsrViewState,
+    popup_frames: PopupFrameMap,
+) -> RenderHandler {
+    OsrPaintHandler::new(Arc::new(AtomicI32::new(-1)), frame, view, popup_frames)
 }

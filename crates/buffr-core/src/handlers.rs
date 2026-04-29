@@ -49,8 +49,9 @@ use crate::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters}
 // whole crate. We do the same here.
 use cef::*;
 
-use crate::PopupQueue;
 use crate::open_finder::{OsSpawn, open_path};
+use crate::osr::{OsrFrame, OsrViewState, PopupFrameMap};
+use crate::{PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
 
 /// Build a CEF `Client` that returns our load + display + download
 /// handlers when CEF asks for them. This is the entry point
@@ -75,6 +76,11 @@ pub fn make_client(
     render_handler: Option<RenderHandler>,
     popup_queue: PopupQueue,
     address_sink: crate::host::AddressSink,
+    popup_frames: PopupFrameMap,
+    pending_popup_alloc: PendingPopupAlloc,
+    popup_create_sink: PopupCreateSink,
+    popup_close_sink: PopupCloseSink,
+    popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -91,6 +97,11 @@ pub fn make_client(
         render_handler,
         popup_queue,
         address_sink,
+        popup_frames,
+        pending_popup_alloc,
+        popup_create_sink,
+        popup_close_sink,
+        popup_browsers,
     )
 }
 
@@ -153,6 +164,11 @@ pub fn make_permission_handler(
 wrap_life_span_handler! {
     pub struct BuffrLifeSpanHandler {
         popup_queue: PopupQueue,
+        pending_popup_alloc: PendingPopupAlloc,
+        popup_frames: PopupFrameMap,
+        popup_create_sink: PopupCreateSink,
+        popup_close_sink: PopupCloseSink,
+        popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
     }
 
     impl LifeSpanHandler {
@@ -166,32 +182,132 @@ wrap_life_span_handler! {
             target_disposition: WindowOpenDisposition,
             _user_gesture: ::std::os::raw::c_int,
             _popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
+            window_info: Option<&mut WindowInfo>,
             _client: Option<&mut Option<Client>>,
-            _settings: Option<&mut BrowserSettings>,
+            settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             // Re-route only "open in new tab" intents (target=_blank,
             // Ctrl+click). NEW_POPUP / NEW_WINDOW carry features the
             // page expects (window.opener handle for OAuth flows,
-            // postMessage parent ref) — let CEF handle them natively.
+            // postMessage parent ref) — let CEF handle them via OSR
+            // in a new buffr window.
             let raw = target_disposition.get_raw();
             let is_tab = raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw()
                 || raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw();
-            if !is_tab {
-                return 0;
-            }
-            if let Some(url) = target_url {
-                let url_str = url.to_string();
-                if !url_str.is_empty()
-                    && let Ok(mut guard) = self.popup_queue.lock()
-                {
-                    guard.push_back(url_str);
+            if is_tab {
+                if let Some(url) = target_url {
+                    let url_str = url.to_string();
+                    if !url_str.is_empty()
+                        && let Ok(mut guard) = self.popup_queue.lock()
+                    {
+                        guard.push_back(url_str);
+                    }
                 }
+                // Cancel — main loop will open the URL as a tab.
+                return 1;
             }
-            // Cancel — main loop will open the URL as a tab.
-            1
+
+            // For NEW_POPUP / NEW_WINDOW: allocate OSR frame/view, configure
+            // windowless rendering, and let CEF create the popup browser.
+            let url_str = target_url
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            tracing::debug!(
+                %url_str,
+                disposition = raw,
+                "on_before_popup: intercepting popup window for OSR"
+            );
+
+            // Allocate frame + view at a sensible default size. CEF will
+            // immediately call view_rect and resize from there.
+            let frame = Arc::new(Mutex::new(OsrFrame::new(800, 600)));
+            let view = Arc::new(OsrViewState::new());
+            view.width.store(800, std::sync::atomic::Ordering::Relaxed);
+            view.height.store(600, std::sync::atomic::Ordering::Relaxed);
+
+            // Stash for on_after_created to pick up.
+            if let Ok(mut slot) = self.pending_popup_alloc.lock() {
+                *slot = Some((frame, view, url_str));
+            }
+
+            // Configure the popup browser for OSR.
+            if let Some(wi) = window_info {
+                wi.windowless_rendering_enabled = 1;
+                // Alloy runtime — same as main browser.
+                wi.runtime_style =
+                    cef::sys::cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY.into();
+            }
+            if let Some(s) = settings {
+                s.windowless_frame_rate = 60;
+            }
+
+            // Return 0: allow CEF to create the popup browser.
+            // on_after_created will fire next with the assigned id.
+            0
+        }
+
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else { return };
+            if browser.is_popup() == 0 {
+                // Not a popup — main/tab browser; nothing extra to do.
+                return;
+            }
+            let browser_id = cef::ImplBrowser::identifier(browser);
+
+            // Consume the pending alloc.
+            let alloc = match self.pending_popup_alloc.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => None,
+            };
+            let (frame, view, url) = match alloc {
+                Some(a) => a,
+                None => {
+                    tracing::warn!(
+                        browser_id,
+                        "on_after_created: no pending alloc for popup — skipping"
+                    );
+                    return;
+                }
+            };
+
+            // Register in shared frame map so OsrPaintHandler routes paint.
+            if let Ok(mut map) = self.popup_frames.lock() {
+                map.insert(browser_id, (frame.clone(), view.clone()));
+            }
+            // Keep live browser handle for resize / close.
+            if let Ok(mut browsers) = self.popup_browsers.lock() {
+                browsers.insert(browser_id, browser.clone());
+            }
+            // Emit create event for apps layer.
+            if let Ok(mut sink) = self.popup_create_sink.lock() {
+                sink.push_back(PopupCreated {
+                    browser_id,
+                    url,
+                    frame,
+                    view,
+                });
+            }
+            tracing::debug!(browser_id, "on_after_created: popup browser registered");
+        }
+
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else { return };
+            if browser.is_popup() == 0 {
+                return;
+            }
+            let browser_id = cef::ImplBrowser::identifier(browser);
+            if let Ok(mut map) = self.popup_frames.lock() {
+                map.remove(&browser_id);
+            }
+            if let Ok(mut browsers) = self.popup_browsers.lock() {
+                browsers.remove(&browser_id);
+            }
+            if let Ok(mut sink) = self.popup_close_sink.lock() {
+                sink.push_back(browser_id);
+            }
+            tracing::debug!(browser_id, "on_before_close: popup browser deregistered");
         }
     }
 }
@@ -248,6 +364,11 @@ wrap_client! {
         render_handler: Option<RenderHandler>,
         popup_queue: PopupQueue,
         address_sink: crate::host::AddressSink,
+        popup_frames: PopupFrameMap,
+        pending_popup_alloc: PendingPopupAlloc,
+        popup_create_sink: PopupCreateSink,
+        popup_close_sink: PopupCloseSink,
+        popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
     }
 
     impl Client {
@@ -295,7 +416,14 @@ wrap_client! {
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(BuffrLifeSpanHandler::new(self.popup_queue.clone()))
+            Some(BuffrLifeSpanHandler::new(
+                self.popup_queue.clone(),
+                self.pending_popup_alloc.clone(),
+                self.popup_frames.clone(),
+                self.popup_create_sink.clone(),
+                self.popup_close_sink.clone(),
+                self.popup_browsers.clone(),
+            ))
         }
 
         fn request_handler(&self) -> Option<RequestHandler> {

@@ -32,7 +32,7 @@ pub mod updates;
 /// Off-screen rendering support. Linux always uses OSR; macOS/Windows
 /// use native windowed embedding.
 pub mod osr;
-pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
+pub use osr::{OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState};
 
 pub use app::{
     BuffrApp, ProfilePaths, force_renderer_accessibility_enabled, set_force_renderer_accessibility,
@@ -73,6 +73,69 @@ pub fn new_popup_queue() -> PopupQueue {
 
 pub fn drain_popup_urls(q: &PopupQueue) -> Vec<String> {
     if let Ok(mut g) = q.lock() {
+        return g.drain(..).collect();
+    }
+    Vec::new()
+}
+
+/// A popup browser window that has been created and is ready to render.
+///
+/// Emitted by `BuffrLifeSpanHandler::on_after_created` when a popup browser
+/// (created by `window.open` / `NEW_POPUP` disposition) comes into existence.
+/// The apps layer drains these each tick and spawns a corresponding winit
+/// window for each.
+pub struct PopupCreated {
+    /// CEF `Browser::identifier()` for the new popup browser.
+    pub browser_id: i32,
+    /// Initial URL (from `on_before_popup`'s `target_url`). May be empty
+    /// if CEF didn't report one.
+    pub url: String,
+    /// OSR frame buffer shared with `OsrPaintHandler`. The apps layer
+    /// reads from this to blit the popup's pixels.
+    pub frame: SharedOsrFrame,
+    /// OSR viewport state. The apps layer writes width/height here on
+    /// window resize; `OsrPaintHandler::view_rect` reads them.
+    pub view: SharedOsrViewState,
+}
+
+/// Thread-safe queue of popup-created events. Produced by
+/// `BuffrLifeSpanHandler::on_after_created`; consumed by the apps layer.
+pub type PopupCreateSink = Arc<Mutex<VecDeque<PopupCreated>>>;
+
+/// Thread-safe queue of `browser_id` values for popups that have been
+/// closed. Produced by `BuffrLifeSpanHandler::on_before_close`; the apps
+/// layer drops the corresponding winit window.
+pub type PopupCloseSink = Arc<Mutex<VecDeque<i32>>>;
+
+pub fn new_popup_create_sink() -> PopupCreateSink {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
+
+pub fn new_popup_close_sink() -> PopupCloseSink {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
+
+/// Single-slot pending popup allocation. Set by `on_before_popup`
+/// (before the browser id is known), consumed by `on_after_created`.
+pub type PendingPopupAlloc = Arc<Mutex<Option<(SharedOsrFrame, SharedOsrViewState, String)>>>;
+
+pub fn new_pending_popup_alloc() -> PendingPopupAlloc {
+    Arc::new(Mutex::new(None))
+}
+
+/// Drain all pending popup-created events from `sink`. Returns an empty
+/// `Vec` when the mutex is poisoned.
+pub fn drain_popup_creates(sink: &PopupCreateSink) -> Vec<PopupCreated> {
+    if let Ok(mut g) = sink.lock() {
+        return g.drain(..).collect();
+    }
+    Vec::new()
+}
+
+/// Drain all pending popup-close browser ids from `sink`. Returns an empty
+/// `Vec` when the mutex is poisoned.
+pub fn drain_popup_closes(sink: &PopupCloseSink) -> Vec<i32> {
+    if let Ok(mut g) = sink.lock() {
         return g.drain(..).collect();
     }
     Vec::new()

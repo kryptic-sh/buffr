@@ -17,7 +17,7 @@
 //! `was_hidden(true)` on the previous and `was_hidden(false)` +
 //! `set_focus(true)` on the next. See `docs/multi-tab.md`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -40,10 +40,16 @@ use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
     build_inject_script,
 };
-use crate::osr::{OsrFrame, OsrPaintHandler, OsrViewState, SharedOsrFrame, SharedOsrViewState};
+use crate::osr::{
+    OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState,
+    make_osr_paint_handler,
+};
 use crate::permissions::PermissionsQueue;
 use crate::telemetry::{KEY_TABS_OPENED, UsageCounters};
-use crate::{CoreError, PopupQueue, handlers, new_popup_queue};
+use crate::{
+    CoreError, PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupQueue, handlers,
+    new_pending_popup_alloc, new_popup_close_sink, new_popup_create_sink, new_popup_queue,
+};
 
 /// Rendering mode for a [`BrowserHost`].
 ///
@@ -220,6 +226,28 @@ pub struct BrowserHost {
     /// Pushed in `close_index`; popped by `reopen_closed_tab`. Capped to
     /// keep memory bounded for long-running sessions.
     closed_stack: Mutex<Vec<ClosedTab>>,
+    // ── Popup-window OSR plumbing ──────────────────────────────────────────
+    /// Popup browser OSR state, keyed by CEF `browser.identifier()`.
+    /// Shared with every `OsrPaintHandler` so paint callbacks route to
+    /// the right frame buffer. Written by `on_after_created`; removed by
+    /// `popup_close` or at shutdown.
+    popup_frames: PopupFrameMap,
+    /// Single-slot pending alloc: allocated by `on_before_popup` for
+    /// `NEW_POPUP` / `NEW_WINDOW` dispositions before the browser id is
+    /// known, then consumed by `on_after_created` once CEF assigns an id.
+    /// Assumption: `on_before_popup` and the matching `on_after_created`
+    /// are sequenced on the same CEF UI thread without interleaving.
+    pending_popup_alloc: PendingPopupAlloc,
+    /// Events emitted when a popup browser is fully created. The apps
+    /// layer drains these each tick and spawns a winit window per entry.
+    popup_create_sink: PopupCreateSink,
+    /// Events emitted when a popup browser is closed. The apps layer
+    /// drains these each tick and drops the corresponding winit window.
+    popup_close_sink: PopupCloseSink,
+    /// Live popup browsers — kept for `popup_resize` / `popup_close`
+    /// so the apps layer doesn't need to hold a `cef::Browser` handle.
+    /// Keyed by `browser.identifier()`.
+    popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -329,6 +357,10 @@ impl BrowserHost {
 
         let popup_queue = new_popup_queue();
         let address_sink: AddressSink = Arc::new(Mutex::new(VecDeque::new()));
+        let popup_frames: PopupFrameMap = Arc::new(Mutex::new(HashMap::new()));
+        let popup_create_sink = new_popup_create_sink();
+        let popup_close_sink = new_popup_close_sink();
+        let pending_popup_alloc = new_pending_popup_alloc();
         let host = Self {
             tabs: Mutex::new(Vec::new()),
             active: Mutex::new(None),
@@ -367,6 +399,11 @@ impl BrowserHost {
             popup_queue,
             address_sink,
             closed_stack: Mutex::new(Vec::new()),
+            popup_frames,
+            pending_popup_alloc,
+            popup_create_sink,
+            popup_close_sink,
+            popup_browsers: Arc::new(Mutex::new(HashMap::new())),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -487,6 +524,58 @@ impl BrowserHost {
         let _ = self.osr_view.wake.set(wake);
     }
 
+    // ---- Popup sinks -------------------------------------------------------
+
+    /// Clone the popup-create sink so the apps layer can drain it.
+    pub fn popup_create_sink(&self) -> PopupCreateSink {
+        self.popup_create_sink.clone()
+    }
+
+    /// Clone the popup-close sink so the apps layer can drain it.
+    pub fn popup_close_sink(&self) -> PopupCloseSink {
+        self.popup_close_sink.clone()
+    }
+
+    /// Notify CEF that a popup window has been resized.
+    pub fn popup_resize(&self, browser_id: i32, width: u32, height: u32) {
+        // Update the view state so view_rect returns the new dims.
+        if let Ok(map) = self.popup_frames.lock()
+            && let Some((_, view)) = map.get(&browser_id)
+        {
+            view.width.store(width, Ordering::Relaxed);
+            view.height.store(height, Ordering::Relaxed);
+        }
+        // Poke CEF so it schedules a repaint at the new size.
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            host.was_resized();
+            host.invalidate(cef::PaintElementType::VIEW);
+        }
+        tracing::debug!(browser_id, width, height, "popup_resize");
+    }
+
+    /// Request CEF to close a popup browser. The actual teardown is
+    /// asynchronous — `on_before_close` → handler deregisters →
+    /// `PopupCloseSink` is the cleanup path.
+    pub fn popup_close(&self, browser_id: i32) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            host.close_browser(0);
+        }
+        tracing::debug!(browser_id, "popup_close requested");
+    }
+
+    /// Clone the internal Arc for `popup_browsers`. Passed into
+    /// `BuffrLifeSpanHandler` so it can register browsers by id on
+    /// `on_after_created`.
+    fn popup_browsers_arc(&self) -> Arc<Mutex<HashMap<i32, cef::Browser>>> {
+        self.popup_browsers.clone()
+    }
+
     // ---- OSR input forwarding -------------------------------------------
 
     /// Forward a mouse-move to the active tab's browser host.
@@ -604,6 +693,14 @@ impl BrowserHost {
         if let Ok(stack) = self.closed_stack.lock() {
             for c in stack.iter() {
                 if let Some(host) = c.tab.browser.host() {
+                    host.close_browser(1);
+                }
+            }
+        }
+        // Popup browsers.
+        if let Ok(browsers) = self.popup_browsers.lock() {
+            for b in browsers.values() {
+                if let Some(host) = b.host() {
                     host.close_browser(1);
                 }
             }
@@ -907,9 +1004,10 @@ impl BrowserHost {
 
         // Build the render handler for OSR mode; None for windowed.
         let render_handler = if self.mode == HostMode::Osr {
-            Some(OsrPaintHandler::new(
+            Some(make_osr_paint_handler(
                 self.osr_frame.clone(),
                 self.osr_view.clone(),
+                self.popup_frames.clone(),
             ))
         } else {
             None
@@ -930,6 +1028,11 @@ impl BrowserHost {
             render_handler,
             self.popup_queue.clone(),
             self.address_sink.clone(),
+            self.popup_frames.clone(),
+            self.pending_popup_alloc.clone(),
+            self.popup_create_sink.clone(),
+            self.popup_close_sink.clone(),
+            self.popup_browsers_arc(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
