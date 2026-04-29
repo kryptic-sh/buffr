@@ -2877,6 +2877,24 @@ impl AppState {
                 self.refresh_overlay_suggestions();
                 self.request_redraw();
             }
+            (Key::Char('v'), true) => {
+                // Paste clipboard text into the overlay input. Drop CR/LF
+                // so a multiline clipboard doesn't leak past the single
+                // input row.
+                if let Some(host) = self.host.as_ref()
+                    && let Some(text) = host.clipboard_text()
+                    && let Some(o) = self.overlay.as_mut()
+                {
+                    for c in text.chars() {
+                        if c == '\n' || c == '\r' {
+                            continue;
+                        }
+                        o.input_mut().handle_text(c);
+                    }
+                    self.refresh_overlay_suggestions();
+                    self.request_redraw();
+                }
+            }
             (Key::Named(NamedKey::CR), _) => {
                 self.confirm_overlay();
             }
@@ -3386,6 +3404,31 @@ impl AppState {
             };
             if let Some(a) = action {
                 self.dispatch_action(&a);
+                return true;
+            }
+
+            // Ctrl+V paste: CEF on Wayland can't read the system
+            // clipboard itself, so we read via hjkl-clipboard and inject
+            // the text into the focused element via execCommand. Done
+            // here in edit_mode (not overlay/page) because the focused
+            // element model is CEF's, not ours.
+            if lower == 'v' && !self.modifiers.shift_key() {
+                if let Some(host) = self.host.as_ref()
+                    && let Some(text) = host.clipboard_text()
+                    && !text.is_empty()
+                {
+                    let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+                    let js = format!(
+                        "(function(){{var t={};\
+                         var el=document.activeElement;\
+                         if(!el)return;\
+                         try{{document.execCommand('insertText',false,t);}}\
+                         catch(e){{}}\
+                         }})();",
+                        json
+                    );
+                    host.run_js(&js);
+                }
                 return true;
             }
         }
