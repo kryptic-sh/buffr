@@ -29,6 +29,9 @@ use std::{
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CEF_PATH");
+    if let Some(vendor_cef_path) = vendor_cef_path() {
+        println!("cargo:rerun-if-changed={}", vendor_cef_path.display());
+    }
 
     let cef_path = match resolve_cef_path() {
         Some(p) => p,
@@ -91,17 +94,20 @@ fn resolve_cef_path() -> Option<PathBuf> {
         }
     }
 
+    let candidate = vendor_cef_path()?;
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn vendor_cef_path() -> Option<PathBuf> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
     let workspace_root = PathBuf::from(manifest_dir)
         .parent()?
         .parent()?
         .to_path_buf();
-    let platform = host_platform();
-    let candidate = workspace_root.join("vendor/cef").join(platform);
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    None
+    Some(workspace_root.join("vendor/cef").join(host_platform()))
 }
 
 fn host_platform() -> &'static str {
@@ -158,9 +164,33 @@ fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
     {
         let framework = lib_dir.join("Chromium Embedded Framework.framework");
         if framework.exists() {
-            let dest = target_dir.join("Chromium Embedded Framework.framework");
+            // `cef::library_loader::LibraryLoader::new(current_exe, false)`
+            // resolves `../Frameworks/Chromium Embedded Framework.framework`
+            // from `target/debug/buffr`, i.e. `target/Frameworks/...`.
+            // Keep dev-tree staging aligned with the same relative layout as
+            // `buffr.app/Contents/MacOS/../Frameworks`.
+            let frameworks_dir = target_dir
+                .parent()
+                .map(|parent| parent.join("Frameworks"))
+                .unwrap_or_else(|| target_dir.join("Frameworks"));
+            let dest = frameworks_dir.join("Chromium Embedded Framework.framework");
             let _ = fs::remove_dir_all(&dest);
             copy_dir(&framework, &dest)?;
+
+            let libraries_dir = framework.join("Libraries");
+            if libraries_dir.exists() {
+                for entry in fs::read_dir(libraries_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.ends_with(".dylib") || name.ends_with(".json") {
+                            copy_into_dir(&path, &target_dir)?;
+                        }
+                    }
+                }
+            }
         }
     }
 

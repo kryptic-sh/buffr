@@ -579,7 +579,7 @@ fn main() -> Result<()> {
 
     // -------- CEF initialize --------
     let cache_path = paths.cache.to_string_lossy().into_owned();
-    let settings = Settings {
+    let mut settings = Settings {
         no_sandbox: 1,
         // Drive the loop ourselves; don't let CEF spawn its own thread.
         multi_threaded_message_loop: 0,
@@ -593,6 +593,7 @@ fn main() -> Result<()> {
         windowless_rendering_enabled: 1,
         ..Default::default()
     };
+    configure_macos_dev_cef_settings(&mut settings)?;
 
     let init_ok = cef::initialize(
         Some(args.as_main_args()),
@@ -614,8 +615,9 @@ fn main() -> Result<()> {
     // -------- winit event loop --------
     //
     // Allow winit to pick the best Wayland backend. Linux always uses
-    // HostMode::Osr (wgpu composite over Wayland) — X11/XWayland
-    // windowed embedding is not supported. macOS and Windows use native
+    // HostMode::Osr (wgpu composite over Wayland/macOS) — X11/XWayland
+    // windowed embedding is not supported, and AppKit child views do not
+    // layer cleanly with buffr's custom chrome. Windows uses native
     // child-window embedding (HostMode::Windowed).
     //
     // On Linux, `--x11` forces the X11 backend even on a Wayland session
@@ -1325,8 +1327,42 @@ fn resolve_paths(private: bool) -> Result<(buffr_core::ProfilePaths, Option<Temp
         Ok((buffr_core::ProfilePaths { cache, data }, Some(tmp)))
     } else {
         let paths = profile_paths().context("resolving profile dirs")?;
+        std::fs::create_dir_all(&paths.cache).context("creating profile cache dir")?;
+        std::fs::create_dir_all(&paths.data).context("creating profile data dir")?;
         Ok((paths, None))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_dev_cef_settings(settings: &mut Settings) -> Result<()> {
+    // Let CEF tell us when the browser process needs work. Blindly calling
+    // CefDoMessageLoopWork from every winit callback can re-enter AppKit
+    // while winit is already handling an event.
+    settings.external_message_pump = 1;
+
+    let exe = std::env::current_exe().context("resolving current_exe for macOS CEF settings")?;
+    if exe.components().any(|c| c.as_os_str() == "Contents") {
+        return Ok(());
+    }
+
+    let exe_dir = exe
+        .parent()
+        .context("current_exe has no parent for macOS CEF settings")?;
+    let framework_dir = exe_dir
+        .join("../Frameworks/Chromium Embedded Framework.framework")
+        .canonicalize()
+        .context("resolving staged CEF framework for cargo run")?;
+    let resources_dir = framework_dir.join("Resources");
+
+    settings.browser_subprocess_path = cef::CefString::from(exe.to_string_lossy().as_ref());
+    settings.framework_dir_path = cef::CefString::from(framework_dir.to_string_lossy().as_ref());
+    settings.resources_dir_path = cef::CefString::from(resources_dir.to_string_lossy().as_ref());
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_macos_dev_cef_settings(_settings: &mut Settings) -> Result<()> {
+    Ok(())
 }
 
 /// Honour `[privacy] clear_on_exit` after the event loop returns and
@@ -1665,6 +1701,10 @@ struct AppState {
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
+    /// Next time CEF expects a pump, or `None` when idle.
+    /// Set by `OnScheduleMessagePumpWork(delay_ms)`; cleared after
+    /// pumping so we wait for CEF to schedule the next work item.
+    cef_next_pump_at: Option<Instant>,
     /// Ordered list of `TabId`s mirroring `tab_strip.tabs`. Refreshed
     /// every `about_to_wait` tick alongside the strip; used for
     /// tab-strip click hit-testing.
@@ -1721,7 +1761,7 @@ enum EditFocus {
     Editing { field_id: String },
 }
 
-/// Active overlay above the CEF child window.
+/// Active overlay above the CEF page area.
 ///
 /// All variants wrap the same [`InputBar`]; the discriminant decides
 /// which suggestion source to query and how to handle Enter. The
@@ -1848,6 +1888,7 @@ impl AppState {
             swipe_last_at: None,
             swipe_committed: false,
             shutdown_flag,
+            cef_next_pump_at: None,
             tab_ids: Vec::new(),
             session_dirty: false,
             session_dirty_since: None,
@@ -2565,7 +2606,7 @@ impl AppState {
         }
     }
 
-    /// Compute the CEF child window rect for the current overlay state.
+    /// Compute the CEF page rect for the current overlay state.
     ///
     /// Vertical layout (top → bottom):
     ///
@@ -4320,13 +4361,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
         };
 
-        // CEF child window leaves room at the bottom for the chrome
-        // strip. We pass the trimmed size so the X11 child rect is
-        // sized correctly from frame zero.
+        // Pass the same page viewport used by later resize events so
+        // CEF paints the first frame in the area below the tab strip and
+        // above the statusline.
         let inner = window.inner_size();
-        let chrome_h = STATUSLINE_HEIGHT.min(inner.height);
-        let cef_w = inner.width.max(1);
-        let cef_h = inner.height.saturating_sub(chrome_h).max(1);
+        let (_cef_x, _cef_y, cef_w, cef_h) =
+            self.cef_child_rect(inner.width.max(1), inner.height.max(1));
 
         match buffr_core::BrowserHost::new_with_options(
             raw,
@@ -4993,10 +5033,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             return;
         }
 
-        // Pump CEF every frame. With `ControlFlow::Poll` this fires
-        // continuously, which is the simplest correct cadence for
-        // Phase 1 — Phase 3 will switch to a tickless wakeup.
-        cef::do_message_loop_work();
+        // Pump CEF every frame. On macOS native windowed CEF integrates
+        // with AppKit; calling CefDoMessageLoopWork from inside winit's
+        // AppKit event handler can re-enter winit and trip its macOS
+        // reentrancy guard.
+        pump_cef_message_loop(&mut self.cef_next_pump_at);
 
         // Wheel-momentum tick: synthesize a decaying wheel event once
         // high-res input has gone quiet, mimicking native Chrome's
@@ -5339,8 +5380,36 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             .filter(|&mhz| mhz > 0)
             .map(|mhz| Duration::from_nanos(1_000_000_000_000 / u64::from(mhz)))
             .unwrap_or(Duration::from_millis(16));
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + frame_period));
+        let next_wakeup = Instant::now() + frame_period;
+        // If CEF has scheduled a pump, wake up no later than that.
+        let deadline = match self.cef_next_pump_at {
+            Some(at) if at < next_wakeup => at,
+            _ => next_wakeup,
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
+}
+
+#[cfg(target_os = "macos")]
+fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
+    if let Some(delay_ms) = buffr_core::take_scheduled_message_pump_delay_ms() {
+        let delay = Duration::from_millis(delay_ms.try_into().unwrap_or(0));
+        let at = Instant::now() + delay;
+        tracing::trace!(delay_ms, ?at, "cef: schedule next pump");
+        *next_pump_at = Some(at);
+    }
+    if let Some(at) = *next_pump_at {
+        if Instant::now() >= at {
+            tracing::trace!("cef: do_message_loop_work");
+            cef::do_message_loop_work();
+            *next_pump_at = None;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pump_cef_message_loop(_next_pump_at: &mut Option<Instant>) {
+    cef::do_message_loop_work();
 }
 
 // Silence the "unused import" lint when no `Browser` is materialized

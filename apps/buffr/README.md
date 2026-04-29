@@ -7,8 +7,8 @@ Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
 [![Website](https://img.shields.io/badge/website-buffr.kryptic.sh-7ee787)](https://buffr.kryptic.sh)
 
 Main browser binary. Single winit window; CEF renders web content via off-screen
-rendering (OSR) on Linux; native windowed embedding on macOS and Windows. Modal
-keybindings driven by [`buffr-modal`](../../crates/buffr-modal).
+rendering (OSR) on Linux and macOS; Windows uses native windowed embedding.
+Modal keybindings driven by [`buffr-modal`](../../crates/buffr-modal).
 
 ## Status
 

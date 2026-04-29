@@ -15,7 +15,7 @@
 //!   plumbing.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 // `wrap_app!` / `wrap_browser_process_handler!` expand to references
 // to bare `App`, `WrapApp`, `ImplApp`, `BrowserProcessHandler`, etc.
@@ -33,6 +33,7 @@ use crate::new_tab::register_buffr_scheme;
 /// carry state — the cef-rs trait surface for `App` doesn't accept
 /// per-instance fields cleanly.
 static FORCE_RENDERER_ACCESSIBILITY: AtomicBool = AtomicBool::new(false);
+static NEXT_MESSAGE_PUMP_DELAY_MS: AtomicI64 = AtomicI64::new(-1);
 
 /// Toggle the renderer accessibility tree for subsequent CEF launches.
 /// Call before `BuffrApp::new()` if you want the switch picked up.
@@ -48,6 +49,11 @@ pub fn set_force_renderer_accessibility(on: bool) {
 /// Read the current accessibility-flag toggle. Mostly useful for tests.
 pub fn force_renderer_accessibility_enabled() -> bool {
     FORCE_RENDERER_ACCESSIBILITY.load(Ordering::SeqCst)
+}
+
+pub fn take_scheduled_message_pump_delay_ms() -> Option<i64> {
+    let delay = NEXT_MESSAGE_PUMP_DELAY_MS.swap(-1, Ordering::SeqCst);
+    (delay >= 0).then_some(delay)
 }
 
 /// Resolved on-disk paths buffr uses for cache + profile data.
@@ -117,6 +123,14 @@ wrap_app! {
             // No-sandbox is set in `Settings`, but a redundant switch
             // keeps CEF from re-enabling on certain code paths.
             append_switch(command_line, "no-sandbox");
+            // macOS Chromium tries to access the user's "Chromium Safe Storage"
+            // Keychain item through OSCrypt for cookie/password encryption.
+            // buffr does not intentionally use that store, and prompting on
+            // every dev launch is hostile, so use Chromium's mock keychain.
+            // Gate to dev builds only — release builds should use the real
+            // OS keychain so cookies and future saved passwords are encrypted.
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            append_switch(command_line, "use-mock-keychain");
             // Phase 6 accessibility: opt-in renderer accessibility tree.
             // The renderer feeds this into Chromium's a11y subsystem,
             // which platform screen readers consume. Off by default —
@@ -139,6 +153,11 @@ wrap_browser_process_handler! {
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
             tracing::debug!("cef: context initialized");
+        }
+
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            tracing::trace!(delay_ms, "cef: schedule message pump work");
+            NEXT_MESSAGE_PUMP_DELAY_MS.store(delay_ms.max(0), Ordering::SeqCst);
         }
     }
 }
