@@ -200,10 +200,10 @@ pub struct Renderer {
 
     bind_group_layout: wgpu::BindGroupLayout,
 
-    /// Nearest-filter sampler for the OSR texture.
-    sampler_nearest: wgpu::Sampler,
-    /// Linear-filter sampler for the chrome texture (doesn't matter much
-    /// since chrome is 1:1 with the window, but keeps the setup uniform).
+    /// Linear-filter sampler — used for both OSR and chrome textures.
+    /// OSR benefits from bilinear during transient resize stretch (softens
+    /// the stale-frame upscale so the fresh-frame transition isn't a pop);
+    /// chrome is always 1:1 with the window, so bilinear is a no-op there.
     sampler_linear: wgpu::Sampler,
 
     /// OSR texture + state.
@@ -402,15 +402,6 @@ impl Renderer {
             cache: None,
         });
 
-        let sampler_nearest = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("buffr-nearest"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
         let sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("buffr-linear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -446,7 +437,6 @@ impl Renderer {
             pipeline_osr,
             pipeline_chrome,
             bind_group_layout,
-            sampler_nearest,
             sampler_linear,
             osr: None,
             osr_uniform_buf,
@@ -551,11 +541,19 @@ impl Renderer {
             if upload.width == 0 || upload.height == 0 {
                 false
             } else {
+                // Linear sampler for the OSR texture: when the stale CEF
+                // frame is stretched to fill a larger browser_rect during
+                // a resize, bilinear filtering produces a softened image
+                // that's visually close to what the fresh frame will look
+                // like — the moment CEF catches up the transition is a
+                // gentle re-sharpening rather than a sudden pop from
+                // blocky nearest-neighbour upscaling. At steady state
+                // (OSR dims match browser_rect 1:1) bilinear is a no-op.
                 let osr_entry = self.osr.get_or_insert_with(|| {
                     OsrTexture::new(
                         &self.device,
                         &self.bind_group_layout,
-                        &self.sampler_nearest,
+                        &self.sampler_linear,
                         &self.osr_uniform_buf,
                         self.surface_format,
                         upload.width,
@@ -566,7 +564,7 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     &self.bind_group_layout,
-                    &self.sampler_nearest,
+                    &self.sampler_linear,
                     &self.osr_uniform_buf,
                     self.surface_format,
                     upload,
