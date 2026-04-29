@@ -5408,7 +5408,7 @@ fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn pump_cef_message_loop(_pump_active: &mut bool) {
+fn pump_cef_message_loop(_next_pump_at: &mut Option<Instant>) {
     cef::do_message_loop_work();
 }
 
