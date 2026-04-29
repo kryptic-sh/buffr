@@ -104,9 +104,11 @@ pub struct OsrUpload<'a> {
     pub dst_rect: (u32, u32, u32, u32),
 }
 
-/// One slot of the OSR double-buffer — texture + view + bind_group at
-/// a single resolution.
-struct OsrSlot {
+/// OSR GPU state: a single texture sized to whatever CEF most recently
+/// emitted. The renderer GPU-stretches it (linear sampler) to fill the
+/// live browser_rect, so when CEF's buffer dims lag the window dims the
+/// stale frame visually scales to fit instead of letterboxing.
+struct OsrTexture {
     #[allow(dead_code)]
     texture: wgpu::Texture,
     #[allow(dead_code)]
@@ -117,38 +119,7 @@ struct OsrSlot {
     last_generation: u64,
 }
 
-/// OSR GPU state: a `current` slot that receives uploads, and an optional
-/// `previous` slot retained briefly after a dimension change.
-///
-/// When CEF emits its first `on_paint` at a new size (typically right
-/// after our deferred `was_resized`), Chromium hasn't always finished
-/// compositing the new-dim viewport yet — parts of the buffer can be
-/// zero-filled (visible as black bars at the edges of the CEF region).
-/// To paper over that transition we keep the previous fully-composited
-/// slot and sample from it (stretched to the new browser_rect) until
-/// CEF has delivered `DROP_PREVIOUS_AFTER_FRAMES` frames at the new
-/// dims. After that window we drop `previous` and resume sampling
-/// `current`.
-///
-/// Counting **CEF frames** (uploads), not our render paints, matters:
-/// `RedrawRequested` storms cause many paints per CEF frame, and a
-/// per-paint counter would burn through before CEF had a chance to
-/// produce a clean new-dim frame.
-struct OsrTexture {
-    current: OsrSlot,
-    previous: Option<OsrSlot>,
-    /// Count of CEF uploads received at the post-dim-change dims.
-    /// Once this reaches `DROP_PREVIOUS_AFTER_FRAMES`, `previous`
-    /// is dropped.
-    new_dim_uploads_seen: u32,
-}
-
-/// How many CEF frames at the new dims to ignore before promoting them.
-/// Two is usually enough on Chromium 147: the first new-dim frame is
-/// often the partial layout, the second is the fully-composited result.
-const DROP_PREVIOUS_AFTER_FRAMES: u32 = 2;
-
-impl OsrSlot {
+impl OsrTexture {
     fn new(
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
@@ -170,53 +141,9 @@ impl OsrSlot {
         }
     }
 
-    fn upload(&mut self, queue: &wgpu::Queue, upload: &OsrUpload<'_>) {
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            upload.pixels,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * upload.width),
-                rows_per_image: Some(upload.height),
-            },
-            wgpu::Extent3d {
-                width: upload.width,
-                height: upload.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.last_generation = upload.generation;
-    }
-}
-
-impl OsrTexture {
-    fn new(
-        device: &wgpu::Device,
-        bgl: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        uniform_buf: &wgpu::Buffer,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        Self {
-            current: OsrSlot::new(device, bgl, sampler, uniform_buf, format, width, height),
-            previous: None,
-            new_dim_uploads_seen: 0,
-        }
-    }
-
-    /// Upload new pixels if generation changed or dimensions differ.
-    /// On a dim change, the existing slot is moved into `previous` and
-    /// a fresh slot is allocated at the new dims. Each subsequent
-    /// upload at the new dims advances `new_dim_uploads_seen`; once it
-    /// reaches `DROP_PREVIOUS_AFTER_FRAMES`, `previous` is dropped.
-    /// Returns true if the uniform buffer needs updating (dims changed).
+    /// Upload new pixels if generation changed or dims differ. On a dim
+    /// change the texture is reallocated. Returns true on dim change so
+    /// the caller can refresh its uniform.
     #[allow(clippy::too_many_arguments)]
     fn maybe_upload(
         &mut self,
@@ -228,45 +155,39 @@ impl OsrTexture {
         format: wgpu::TextureFormat,
         upload: &OsrUpload<'_>,
     ) -> bool {
-        let dims_changed =
-            upload.width != self.current.width || upload.height != self.current.height;
+        let dims_changed = upload.width != self.width || upload.height != self.height;
         if dims_changed {
-            let new_slot = OsrSlot::new(
-                device,
-                bgl,
-                sampler,
-                uniform_buf,
-                format,
-                upload.width,
-                upload.height,
-            );
-            // Retire the old slot — we'll keep sampling it until CEF
-            // emits enough fresh frames at the new dims.
-            let old = std::mem::replace(&mut self.current, new_slot);
-            self.previous = Some(old);
-            self.new_dim_uploads_seen = 0;
+            let (texture, view) = make_texture(device, upload.width, upload.height, format);
+            self.bind_group = make_bind_group(device, bgl, uniform_buf, &view, sampler);
+            self.texture = texture;
+            self.view = view;
+            self.width = upload.width;
+            self.height = upload.height;
+            self.last_generation = u64::MAX;
         }
-        let needs_upload = upload.generation != self.current.last_generation;
-        if needs_upload {
-            self.current.upload(queue, upload);
-            if self.previous.is_some() {
-                self.new_dim_uploads_seen += 1;
-                if self.new_dim_uploads_seen >= DROP_PREVIOUS_AFTER_FRAMES {
-                    self.previous = None;
-                }
-            }
+        if upload.generation != self.last_generation {
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                upload.pixels,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * upload.width),
+                    rows_per_image: Some(upload.height),
+                },
+                wgpu::Extent3d {
+                    width: upload.width,
+                    height: upload.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.last_generation = upload.generation;
         }
         dims_changed
-    }
-
-    /// Bind group to sample for this paint. Returns the previous slot's
-    /// as long as we still have one — i.e., until CEF has delivered
-    /// enough new-dim frames to drop it.
-    fn sample_bind_group(&self) -> &wgpu::BindGroup {
-        if let Some(prev) = &self.previous {
-            return &prev.bind_group;
-        }
-        &self.current.bind_group
     }
 }
 
@@ -752,7 +673,7 @@ impl Renderer {
             // OSR quad — opaque, underneath chrome.
             if has_osr && let Some(ref osr_tex) = self.osr {
                 rpass.set_pipeline(&self.pipeline_osr);
-                rpass.set_bind_group(0, osr_tex.sample_bind_group(), &[]);
+                rpass.set_bind_group(0, &osr_tex.bind_group, &[]);
                 rpass.draw(0..6, 0..1);
             }
 
