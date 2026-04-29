@@ -26,7 +26,10 @@ pub use input_bar::{
     Suggestion, SuggestionKind,
 };
 pub use permissions_prompt::{ACTION_HINT, PERMISSIONS_PROMPT_HEIGHT, PermissionsPrompt};
-pub use tab_strip::{MAX_TAB_WIDTH, MIN_TAB_WIDTH, TAB_STRIP_HEIGHT, TabStrip, TabView};
+pub use tab_strip::{
+    FAVICON_RENDER_SIZE, MAX_TAB_WIDTH, MIN_TAB_WIDTH, TAB_STRIP_HEIGHT, TabFavicon, TabStrip,
+    TabView,
+};
 
 /// Statusline strip height in pixels. 30 px fits a 14-px glyph row
 /// with comfortable padding above + below; matches the recommendation
