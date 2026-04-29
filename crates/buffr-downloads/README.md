@@ -1,11 +1,13 @@
 # buffr-downloads
 
-SQLite-backed download tracking for [buffr](https://github.com/kryptic-sh/buffr)
-(Phase 5).
+SQLite-backed download tracking for buffr. Phase 5 data layer.
+
+[![CI](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](../../LICENSE)
 
 Pure data layer — no UI, no IPC. CEF wires events into the store via
 `BuffrDownloadHandler` in `buffr-core`; callers (`apps/buffr`, future downloads
-pane) read through the [`Downloads`] handle.
+pane) read through the `Downloads` handle.
 
 ## Public API
 
@@ -34,16 +36,14 @@ let cleared = store.clear_completed()?;
 ```
 
 `record_started` is **idempotent** on `cef_id`: the same `cef_id` always maps to
-the same [`DownloadId`]. CEF can re-fire `OnBeforeDownload` between cancel +
-retry, and we don't want duplicate rows.
+the same `DownloadId`. CEF can re-fire `OnBeforeDownload` between cancel + retry
+— no duplicate rows.
 
-`update_progress` is a **no-op** for terminal statuses
-([`Completed`](DownloadStatus::Completed) /
-[`Canceled`](DownloadStatus::Canceled) / [`Failed`](DownloadStatus::Failed)).
-CEF occasionally emits one final tick after `is_complete()` flips to true.
+`update_progress` is a **no-op** for terminal statuses (`Completed` / `Canceled`
+/ `Failed`). CEF occasionally emits one final tick after `is_complete()` flips
+to true.
 
-`clear_completed` only deletes [`Completed`](DownloadStatus::Completed) rows.
-[`Failed`](DownloadStatus::Failed) and [`Canceled`](DownloadStatus::Canceled)
+`clear_completed` only deletes `Completed` rows. `Failed` and `Canceled` rows
 stay so the user can see why a download didn't land.
 
 ## Schema
@@ -68,30 +68,24 @@ CREATE INDEX idx_downloads_cef_id ON downloads(cef_id);
 ```
 
 `status` is a TEXT tag (`'in_flight' | 'completed' | 'canceled' | 'failed'`) so
-adding new variants doesn't need a migration. Forward-only migrations are
-tracked in a `schema_version` table — see [`schema`](src/schema.rs).
+adding new variants doesn't need a migration. Forward-only migrations tracked in
+a `schema_version` table.
 
-## CEF integration notes
+## CEF integration
 
-`BuffrDownloadHandler` (in `buffr-core::handlers`) implements `DownloadHandler`.
+`BuffrDownloadHandler` in `buffr-core::handlers` implements `DownloadHandler`.
 Two callbacks fire:
 
-- **`on_before_download`** — once per download, immediately. We resolve a target
-  path under the configured `default_dir`, call
-  `BeforeDownloadCallback::cont(target_path, /* show_dialog */ 0)`, and
-  `record_started` the row.
-- **`on_download_updated`** — many times per download. We `update_progress`
-  while in-flight, and on `is_complete() == true` flip the row via
-  `record_completed` (also handling `is_canceled` / `is_interrupted`).
-
-The CEF API exposes byte counts as signed `i64`. We cast to `u64` for storage;
-in practice neither value approaches `i64::MAX` for any realistic download.
+- **`on_before_download`** — once per download; resolves a target path, calls
+  `BeforeDownloadCallback::cont`, and `record_started` the row.
+- **`on_download_updated`** — many times; calls `update_progress` while
+  in-flight; on `is_complete() == true` flips the row via `record_completed`
+  (also handling `is_canceled` / `is_interrupted`).
 
 ## `open_on_finish` caveats
 
-When the resolved [`buffr_config::DownloadsConfig::open_on_finish`] is `true`
-and a download flips to [`Completed`](DownloadStatus::Completed), `buffr-core`
-spawns the platform open command:
+When `buffr_config::DownloadsConfig::open_on_finish` is `true` and a download
+completes, `buffr-core` spawns the platform open command:
 
 | Platform | Command                  |
 | -------- | ------------------------ |
@@ -99,10 +93,19 @@ spawns the platform open command:
 | macOS    | `open <path>`            |
 | Windows  | `cmd /c start "" <path>` |
 
-A spawn failure logs at `warn` and is otherwise silent — buffr never blocks the
-browser thread on the user's launcher misbehaving. See
-`crates/buffr-core/src/open_finder.rs`.
+A spawn failure logs at `warn` and is otherwise silent.
+
+## Concurrency
+
+`Mutex<rusqlite::Connection>`. Public methods take `&self` and lock per call.
+Same model as `buffr-history`.
+
+## Storage location
+
+Production binary writes to `<data>/downloads.sqlite`; on Linux that's
+`~/.local/share/buffr/downloads.sqlite`. See [`docs/dev.md`](../../docs/dev.md)
+"Storage" section.
 
 ## License
 
-MIT (workspace-inherited).
+MIT. See [LICENSE](../../LICENSE).

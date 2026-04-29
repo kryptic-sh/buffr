@@ -2,11 +2,13 @@
 
 SQLite-backed bookmark store for buffr. Phase 5 data layer — no UI yet.
 
-The runtime opens an `Arc<Bookmarks>` next to the existing `Arc<History>` and
-hands both to `BrowserHost`. Unlike history, no CEF callback writes here
-automatically — bookmarks are user-action-driven, so storage is populated either
-by the import CLI or (Phase 5b) by an omnibar / chrome action. See
-[`PLAN.md`](../../PLAN.md) Phase 5.
+[![CI](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](../../LICENSE)
+
+Wired into the live runtime via an `Arc<Bookmarks>` passed to `BrowserHost::new`
+alongside `Arc<History>`. Unlike history, no CEF callback writes here
+automatically — bookmarks are user-action-driven; storage is populated via the
+import CLI or (Phase 5b) an omnibar / chrome action.
 
 ## Public API
 
@@ -64,13 +66,12 @@ CREATE INDEX idx_bookmark_tags_tag    ON bookmark_tags(tag);
 CREATE INDEX idx_bookmarks_modified   ON bookmarks(modified DESC);
 ```
 
-Pragmas tuned per connection: `journal_mode=WAL`, `synchronous=NORMAL`,
-`foreign_keys=ON` — same as `buffr-history`.
+Pragmas per connection: `journal_mode=WAL`, `synchronous=NORMAL`,
+`foreign_keys=ON`.
 
 ## Behaviour
 
-- **URL canonicalisation**: every URL goes through `url::Url::parse`, the
-  round-trip drops trailing whitespace and normalises case in the scheme/host.
+- **URL canonicalisation**: every URL goes through `url::Url::parse`.
   Unparseable URLs return `BookmarkError::Url` (unlike the history path, which
   silently drops them — bookmarks are an explicit user action and a bad URL
   should be loud).
@@ -81,46 +82,20 @@ Pragmas tuned per connection: `journal_mode=WAL`, `synchronous=NORMAL`,
   `["RUST", "  rust  ", "rust", ""]` stores as `["rust"]`.
 - **Search ordering**: title-substring matches outrank url-substring matches
   outrank tag-substring matches; ties break by `modified DESC`. Each bookmark
-  appears at most once even if it matches in several fields.
+  appears at most once.
 
 ## Netscape import
 
 `import_netscape(&self, html: &str)` parses the Netscape Bookmark File Format —
-the de-facto export shape for Chrome ("Export bookmarks…"), Firefox ("Export
-Bookmarks to HTML…"), and Edge.
-
-The format is loose HTML: unbalanced tags, no DTD, no closing `</DT>`. We don't
-run a real HTML parser. Instead we use four small regexes to extract `<H3>`,
-`</DL>`, and `<A>` tokens with their byte positions, sort them into a single
-ordered token stream, and walk it maintaining a folder stack:
-
-```rust
-let h3_re      = Regex::new(r"(?is)<H3[^>]*>(.*?)</H3>");
-let a_re       = Regex::new(r#"(?is)<A\s+([^>]*)>(.*?)</A>"#);
-let dl_close_re = Regex::new(r"(?i)</DL>");
-let attr_re    = Regex::new(r#"(?i)(\w+)\s*=\s*"([^"]*)""#);
-```
-
-For each `<A>` we extract `HREF` and (optionally) `TAGS=` (Pinboard / Chrome
-convention; comma-separated). Folder names from enclosing `<H3>` tags are added
-as additional tags. Malformed entries (unparseable URL, missing `HREF`) are
-skipped — the returned count reflects only successful inserts/upserts.
-
-Why not `scraper`? The dep is heavy (~1 MB compiled, full HTML5 parser) and the
-Netscape format is a single recognisable shape. A regex walker compiles in ms
-and is easy to reason about. If we ever need to import other bookmark formats
-with deeper structure (Safari plist, Pocket JSON), we'll route those through
-dedicated parsers instead of generalising this one.
+the de-facto export from Chrome, Firefox, and Edge. Uses four small regexes
+rather than a full HTML parser; folder names from enclosing `<H3>` tags are
+added as tags. Malformed entries (unparseable URL, missing `HREF`) are skipped;
+the returned count reflects only successful inserts/upserts.
 
 ## Concurrency
 
 `Mutex<rusqlite::Connection>`. Public methods take `&self` and lock per call.
 Same model as `buffr-history`; see that crate's notes.
-
-## Configuration
-
-No config knobs yet. Future work (Phase 5b+): tag-color mapping in the `[theme]`
-table, custom skip-tag lists, default folder for omnibar-driven adds.
 
 ## Testing
 
@@ -131,3 +106,7 @@ table, custom skip-tag lists, default folder for omnibar-driven adds.
 Production binary writes to `<data>/bookmarks.sqlite`; on Linux that's
 `~/.local/share/buffr/bookmarks.sqlite`. See [`docs/dev.md`](../../docs/dev.md)
 "Storage" section.
+
+## License
+
+MIT. See [LICENSE](../../LICENSE).
