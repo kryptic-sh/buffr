@@ -1,0 +1,271 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual re-runs are safe: xtask packaging is idempotent and
+  # softprops/action-gh-release skips files already attached to the release.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: linux package (AppImage + deb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace.package version v$CARGO_VER"
+            exit 1
+          fi
+
+      - name: Install CEF runtime + packaging deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
+            libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
+            libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
+            libgl1 libegl1 libgles2 \
+            libfuse2 dpkg dpkg-dev fakeroot file libxml2-utils
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-release
+
+      - name: Cache CEF binary distribution
+        uses: actions/cache@v5
+        with:
+          path: vendor/cef
+          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+
+      - name: Cache appimagetool
+        uses: actions/cache@v5
+        with:
+          path: vendor/appimagetool
+          key: appimagetool-x86_64-continuous
+
+      - name: Fetch CEF
+        run: cargo xtask fetch-cef
+
+      - name: Package Linux (AppImage + deb)
+        run: cargo xtask package-linux --release --variant all
+
+      - name: List artifacts
+        run: ls -la target/dist/linux/
+
+      - name: Compute sha256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/dist/linux
+          for f in buffr-*.AppImage buffr-*.deb; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+            echo "sha256: $(cat "$f.sha256")"
+          done
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            target/dist/linux/buffr-*.AppImage
+            target/dist/linux/buffr-*.AppImage.sha256
+            target/dist/linux/buffr-*.deb
+            target/dist/linux/buffr-*.deb.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  macos:
+    name: macOS package (.dmg)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace.package version v$CARGO_VER"
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release
+
+      - name: Cache CEF binary distribution
+        uses: actions/cache@v5
+        with:
+          path: vendor/cef
+          key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
+
+      - name: Fetch CEF (macosarm64)
+        run: cargo xtask fetch-cef --target macosarm64
+
+      - name: Bundle macOS .app
+        run: cargo xtask bundle-macos --release
+
+      - name: Package macOS .dmg
+        run: cargo xtask package-macos-dmg --release
+
+      - name: List artifacts
+        run: ls -la target/dist/macos/
+
+      - name: Compute sha256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/dist/macos
+          for f in buffr-*.dmg; do
+            [ -e "$f" ] || continue
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+            echo "sha256: $(cat "$f.sha256")"
+          done
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            target/dist/macos/buffr-*.dmg
+            target/dist/macos/buffr-*.dmg.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  windows:
+    name: Windows package (MSI)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace.package version v$CARGO_VER"
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+
+      - name: Install WiX 3 toolset
+        run: choco install -y wixtoolset
+        shell: powershell
+
+      - name: Add WiX to PATH
+        run: echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: powershell
+
+      - name: Cache CEF binary distribution
+        uses: actions/cache@v5
+        with:
+          path: vendor/cef
+          key: cef-windows64-${{ hashFiles('xtask/src/main.rs') }}
+
+      - name: Fetch CEF (windows64)
+        run: cargo xtask fetch-cef --target windows64
+
+      - name: Build binaries (release)
+        run: cargo build --release -p buffr -p buffr-helper
+
+      - name: Package Windows MSI
+        run: cargo xtask package-windows-msi --release
+
+      - name: List artifacts
+        run: dir target\dist\windows\
+        shell: cmd
+
+      - name: Compute sha256 checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem target\dist\windows\buffr-*.msi | ForEach-Object {
+            $f = $_.FullName
+            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+            $name = $_.Name
+            "$hash  $name" | Out-File -Encoding ASCII "$f.sha256"
+            Write-Host "sha256: $hash  $name"
+          }
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            target/dist/windows/buffr-*.msi
+            target/dist/windows/buffr-*.msi.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ---------------------------------------------------------------------------
+# No crates.io publish job
+#
+# buffr ships 11 workspace crates. crates.io enforces a rate limit on new
+# crate registrations that makes automating all 11 in a single release run
+# unreliable — the first few succeed, then the pipeline hits HTTP 429 and
+# leaves the registry in a half-published state with no safe retry.
+#
+# Releases are cut manually via BCTP (bump → commit → tag → push). If a
+# crates.io publish is ever needed, run it by hand:
+#
+#   cargo publish -p buffr-core --locked
+#   cargo publish -p buffr-config --locked
+#   # ... remaining crates in topological dep order ...
+#   cargo publish -p buffr --locked
+#
+# ---------------------------------------------------------------------------
