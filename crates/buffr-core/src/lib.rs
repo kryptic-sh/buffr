@@ -53,7 +53,10 @@ pub use edit::{
     ParseError as EditParseError, build_inject_script as build_edit_inject_script,
     drain_edit_events, new_edit_event_sink,
 };
-pub use favicon::{FaviconSink, FaviconUpdate, drain_favicon_updates, new_favicon_sink};
+pub use favicon::{
+    FaviconEnabled, FaviconSink, FaviconUpdate, drain_favicon_updates, favicon_is_enabled,
+    new_favicon_enabled, new_favicon_sink, set_favicon_enabled,
+};
 pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
 };

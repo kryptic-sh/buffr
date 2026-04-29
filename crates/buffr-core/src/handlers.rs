@@ -50,7 +50,7 @@ use crate::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters}
 use cef::*;
 
 use crate::cursor::SharedCursorState;
-use crate::favicon::{FaviconSink, FaviconUpdate};
+use crate::favicon::{FaviconEnabled, FaviconSink, FaviconUpdate, favicon_is_enabled};
 use crate::open_finder::{OsSpawn, open_path};
 use crate::osr::{OsrFrame, OsrViewState, PopupFrameMap};
 use crate::{PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
@@ -86,6 +86,7 @@ pub fn make_client(
     popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
     cursor_state: SharedCursorState,
     favicon_sink: FaviconSink,
+    favicon_enabled: FaviconEnabled,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -110,6 +111,7 @@ pub fn make_client(
         popup_browsers,
         cursor_state,
         favicon_sink,
+        favicon_enabled,
     )
 }
 
@@ -141,6 +143,7 @@ pub fn make_display_handler(
     popup_title_sink: crate::host::AddressSink,
     cursor_state: SharedCursorState,
     favicon_sink: FaviconSink,
+    favicon_enabled: FaviconEnabled,
 ) -> DisplayHandler {
     BuffrDisplayHandler::new(
         history,
@@ -150,6 +153,7 @@ pub fn make_display_handler(
         popup_title_sink,
         cursor_state,
         favicon_sink,
+        favicon_enabled,
     )
 }
 
@@ -391,6 +395,7 @@ wrap_client! {
         popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
         cursor_state: SharedCursorState,
         favicon_sink: FaviconSink,
+        favicon_enabled: FaviconEnabled,
     }
 
     impl Client {
@@ -417,6 +422,7 @@ wrap_client! {
                 self.popup_title_sink.clone(),
                 self.cursor_state.clone(),
                 self.favicon_sink.clone(),
+                self.favicon_enabled.clone(),
             ))
         }
 
@@ -665,6 +671,10 @@ wrap_display_handler! {
         // `BuffrDownloadImageCallback` we hand CEF in `on_favicon_urlchange`.
         // The apps layer drains and caches by browser id for the tab strip.
         favicon_sink: FaviconSink,
+        // favicon_enabled: master switch from `[general] show_favicons`. When
+        // false, `on_favicon_urlchange` skips the download_image round-trip
+        // entirely.
+        favicon_enabled: FaviconEnabled,
     }
 
     impl DisplayHandler {
@@ -731,6 +741,9 @@ wrap_display_handler! {
             // root `/favicon.ico` when none is declared). Empty list means
             // the page cleared its icon — leave the cached bitmap in place;
             // it will be overwritten on the next page that sets one.
+            if !favicon_is_enabled(&self.favicon_enabled) {
+                return;
+            }
             let Some(browser) = browser else { return };
             let Some(icon_urls) = icon_urls else { return };
             // The wrapper's `IntoIterator`/`Clone` work on the underlying

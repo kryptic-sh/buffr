@@ -798,6 +798,7 @@ fn main() -> Result<()> {
         update_checker.clone(),
         initial_update_status,
         build_palette(&config.theme),
+        config.general.show_favicons,
         shutdown_flag,
         event_loop.create_proxy(),
     );
@@ -1783,6 +1784,11 @@ struct AppState {
     /// drains and read in `refresh_tab_strip` to attach a `TabFavicon` to
     /// each `TabView`.
     favicons: HashMap<i32, buffr_ui::TabFavicon>,
+    /// Mirror of `[general] show_favicons`. Threaded into `BrowserHost`
+    /// at construction so `on_favicon_urlchange` can short-circuit
+    /// without issuing a `download_image` call. Also gates the apps-side
+    /// pump so disabled-mode never populates the cache.
+    show_favicons: bool,
 }
 
 /// Edit-mode focus state machine.
@@ -1854,6 +1860,7 @@ impl AppState {
         update_checker: Arc<buffr_core::UpdateChecker>,
         initial_update_status: buffr_core::UpdateStatus,
         palette: Palette,
+        show_favicons: bool,
         shutdown_flag: Arc<AtomicBool>,
         event_proxy: EventLoopProxy<BuffrUserEvent>,
     ) -> Self {
@@ -1949,6 +1956,7 @@ impl AppState {
             popup_create_sink: buffr_core::new_popup_create_sink(),
             popup_close_sink: buffr_core::new_popup_close_sink(),
             favicons: HashMap::new(),
+            show_favicons,
         }
     }
 
@@ -2361,6 +2369,15 @@ impl AppState {
         let Some(host) = self.host.as_ref() else {
             return false;
         };
+        if !self.show_favicons {
+            // Drop any stale entries so a runtime toggle to "off" takes
+            // effect immediately on the next refresh.
+            if !self.favicons.is_empty() {
+                self.favicons.clear();
+                return true;
+            }
+            return false;
+        }
         let updates = buffr_core::drain_favicon_updates(&host.favicon_sink());
         if updates.is_empty() {
             return false;
@@ -4631,6 +4648,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             (cef_w, cef_h),
             self.private,
             Some(self.counters.clone()),
+            self.show_favicons,
         ) {
             Ok(host) => {
                 info!(mode = ?host.mode(), "browser host created");

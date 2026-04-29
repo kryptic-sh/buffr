@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use crate::cursor::{CursorState, SharedCursorState};
 use crate::download_notice::DownloadNoticeQueue;
 use crate::edit::EditEventSink;
-use crate::favicon::{FaviconSink, new_favicon_sink};
+use crate::favicon::{FaviconEnabled, FaviconSink, new_favicon_enabled, new_favicon_sink};
 use crate::find::FindResultSink;
 use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
@@ -270,6 +270,10 @@ pub struct BrowserHost {
     /// `BuffrDownloadImageCallback` after a `download_image` round-trip;
     /// drained by the apps layer each tick to populate the tab strip.
     favicon_sink: FaviconSink,
+    /// Master on/off for favicon downloads. Flipped from
+    /// `[general] show_favicons`. When false, `on_favicon_urlchange`
+    /// short-circuits before issuing a `download_image` call.
+    favicon_enabled: FaviconEnabled,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -329,6 +333,7 @@ impl BrowserHost {
             initial_size,
             false,
             None,
+            true,
         )
     }
 
@@ -354,6 +359,7 @@ impl BrowserHost {
         initial_size: (u32, u32),
         private: bool,
         counters: Option<Arc<UsageCounters>>,
+        show_favicons: bool,
     ) -> Result<Self, CoreError> {
         // Linux and macOS use OSR so the page and buffr's custom chrome
         // are composited into one surface. Windows still uses native child
@@ -430,6 +436,7 @@ impl BrowserHost {
             popup_title_sink: Arc::new(Mutex::new(VecDeque::new())),
             cursor_state: Arc::new(CursorState::new()),
             favicon_sink: new_favicon_sink(),
+            favicon_enabled: new_favicon_enabled(show_favicons),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -586,6 +593,18 @@ impl BrowserHost {
     /// per-tab favicon cache.
     pub fn favicon_sink(&self) -> FaviconSink {
         self.favicon_sink.clone()
+    }
+
+    /// Read the current favicon enable flag. Mirrors `[general] show_favicons`
+    /// at startup and reflects any runtime toggle via [`Self::set_favicon_enabled`].
+    pub fn favicons_enabled(&self) -> bool {
+        crate::favicon::favicon_is_enabled(&self.favicon_enabled)
+    }
+
+    /// Toggle favicon downloads at runtime. The display handler picks up the
+    /// new value on the next `on_favicon_urlchange`.
+    pub fn set_favicon_enabled(&self, value: bool) {
+        crate::favicon::set_favicon_enabled(&self.favicon_enabled, value);
     }
 
     /// Install a wake callback fired from `OsrPaintHandler::on_paint`
@@ -1200,6 +1219,7 @@ impl BrowserHost {
             self.popup_browsers_arc(),
             self.cursor_state.clone(),
             self.favicon_sink.clone(),
+            self.favicon_enabled.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),

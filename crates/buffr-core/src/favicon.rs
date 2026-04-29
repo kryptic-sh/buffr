@@ -9,6 +9,7 @@
 //! caches the bitmap by browser id so the tab strip can blit it.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One decoded favicon, ready to blit. `pixels` is BGRA `u32` packed
@@ -37,4 +38,21 @@ pub fn drain_favicon_updates(sink: &FaviconSink) -> Vec<FaviconUpdate> {
     } else {
         Vec::new()
     }
+}
+
+/// Master on/off switch shared by the host and display handler. When `false`
+/// `on_favicon_urlchange` skips the `download_image` round-trip and the apps
+/// layer treats the cache as empty.
+pub type FaviconEnabled = Arc<AtomicBool>;
+
+pub fn new_favicon_enabled(initial: bool) -> FaviconEnabled {
+    Arc::new(AtomicBool::new(initial))
+}
+
+pub fn favicon_is_enabled(flag: &FaviconEnabled) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
+pub fn set_favicon_enabled(flag: &FaviconEnabled, value: bool) {
+    flag.store(value, Ordering::Relaxed);
 }
