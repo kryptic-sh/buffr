@@ -27,6 +27,7 @@
 //! Loading indicator: a 2-px progress bar at the bottom edge of each
 //! tab. `progress >= 1.0` is treated as idle and the bar is hidden.
 
+use crate::Palette;
 use crate::fill_rect;
 use crate::font;
 
@@ -71,11 +72,13 @@ impl Default for TabView {
 }
 
 /// Whole-strip render input. Re-create per frame — the widget owns no
-/// state.
+/// state. `palette` is set once on startup from `config.theme` and
+/// drives every colour the widget paints.
 #[derive(Debug, Clone, Default)]
 pub struct TabStrip {
     pub tabs: Vec<TabView>,
     pub active: Option<usize>,
+    pub palette: Palette,
 }
 
 impl TabStrip {
@@ -98,6 +101,8 @@ impl TabStrip {
             return;
         }
 
+        let p = &self.palette;
+
         // Background fill.
         fill_rect(
             buffer,
@@ -107,7 +112,7 @@ impl TabStrip {
             start_y as i32,
             width,
             strip_h,
-            TAB_STRIP_BG,
+            p.bg,
         );
 
         if self.tabs.is_empty() {
@@ -153,18 +158,8 @@ impl TabStrip {
                 break;
             }
             let is_active = self.active == Some(i);
-            let bg = if is_active {
-                TAB_BG_ACTIVE
-            } else if tab.private {
-                TAB_BG_PRIVATE
-            } else {
-                TAB_BG_INACTIVE
-            };
-            let fg = if is_active {
-                TAB_FG_ACTIVE
-            } else {
-                TAB_FG_INACTIVE
-            };
+            let bg = if is_active { p.bg_lifted } else { p.bg };
+            let fg = if is_active { p.fg } else { p.fg_dim };
 
             fill_rect(
                 buffer,
@@ -189,7 +184,22 @@ impl TabStrip {
                     start_y as i32 + strip_h as i32 - 4,
                     pill_w as usize,
                     2,
-                    TAB_ACCENT_ACTIVE,
+                    p.accent,
+                );
+            }
+            // Private-tab marker — a thin pink top edge so private
+            // tabs read as distinct without the heavy purple fill the
+            // old palette used.
+            if tab.private {
+                fill_rect(
+                    buffer,
+                    width,
+                    height,
+                    x,
+                    start_y as i32,
+                    pill_w as usize,
+                    2,
+                    p.private,
                 );
             }
 
@@ -213,9 +223,9 @@ impl TabStrip {
 
             // Progress bar across the bottom edge of the pill — hidden
             // when idle (progress >= 1.0).
-            let p = tab.progress.clamp(0.0, 1.0);
-            if p > 0.0 && p < 1.0 {
-                let bar_w = ((pill_w as f32) * p) as i32;
+            let frac = tab.progress.clamp(0.0, 1.0);
+            if frac > 0.0 && frac < 1.0 {
+                let bar_w = ((pill_w as f32) * frac) as i32;
                 fill_rect(
                     buffer,
                     width,
@@ -224,7 +234,7 @@ impl TabStrip {
                     progress_y,
                     bar_w.max(1) as usize,
                     2,
-                    TAB_PROGRESS,
+                    p.progress,
                 );
             }
 
@@ -278,16 +288,6 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
 
 const GUTTER: u32 = 4;
 
-// vim-flavoured palette consistent with the Statusline accents (opaque BGRA).
-const TAB_STRIP_BG: u32 = 0xFF_10_18_20;
-const TAB_BG_ACTIVE: u32 = 0xFF_22_2E_22;
-const TAB_BG_INACTIVE: u32 = 0xFF_18_1E_22;
-const TAB_BG_PRIVATE: u32 = 0xFF_2A_18_2A;
-const TAB_FG_ACTIVE: u32 = 0xFF_EE_EE_EE;
-const TAB_FG_INACTIVE: u32 = 0xFF_A0_A8_AC;
-const TAB_ACCENT_ACTIVE: u32 = 0xFF_4A_C9_5C;
-const TAB_PROGRESS: u32 = 0xFF_66_C2_FF;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +305,7 @@ mod tests {
         s.paint(&mut buf, w, h, 0);
         // Every pixel in the strip is the bg colour.
         for &px in &buf {
-            assert_eq!(px, TAB_STRIP_BG);
+            assert_eq!(px, Palette::default().bg);
         }
     }
 
@@ -326,6 +326,7 @@ mod tests {
                 },
             ],
             active: Some(1),
+            ..TabStrip::default()
         };
         s.paint(&mut buf, w, h, 0);
         // The accent stripe is 2 px tall starting at strip_h - 4.
@@ -333,7 +334,7 @@ mod tests {
         // Find at least one accent pixel on that row.
         let row = &buf[stripe_y * w..(stripe_y + 1) * w];
         assert!(
-            row.contains(&TAB_ACCENT_ACTIVE),
+            row.contains(&Palette::default().accent),
             "no accent stripe pixel found on active tab row",
         );
     }
@@ -346,6 +347,7 @@ mod tests {
         let s = TabStrip {
             tabs: vec![TabView::default()],
             active: Some(0),
+            ..TabStrip::default()
         };
         s.paint(&mut buf, w, h, 0);
         assert!(buf.iter().all(|&p| p == 0));
@@ -360,6 +362,7 @@ mod tests {
         let s = TabStrip {
             tabs: vec![TabView::default()],
             active: Some(0),
+            ..TabStrip::default()
         };
         s.paint(&mut buf, w, h, 10);
         // Rows 0..10 untouched.
@@ -383,6 +386,7 @@ mod tests {
                 ..Default::default()
             }],
             active: Some(0),
+            ..TabStrip::default()
         };
         let no_pin = TabStrip {
             tabs: vec![TabView {
@@ -391,6 +395,7 @@ mod tests {
                 ..Default::default()
             }],
             active: Some(0),
+            ..TabStrip::default()
         };
         pin.paint(&mut buf_pin, w, h, 0);
         no_pin.paint(&mut buf_no_pin, w, h, 0);
@@ -416,6 +421,7 @@ mod tests {
                 },
             ],
             active: Some(0),
+            ..TabStrip::default()
         };
         let norm_strip = TabStrip {
             tabs: vec![
@@ -430,6 +436,7 @@ mod tests {
                 },
             ],
             active: Some(0),
+            ..TabStrip::default()
         };
         priv_strip.paint(&mut buf_priv, w, h, 0);
         norm_strip.paint(&mut buf_norm, w, h, 0);
@@ -449,6 +456,7 @@ mod tests {
                 ..Default::default()
             }],
             active: Some(0),
+            ..TabStrip::default()
         };
         let idle = TabStrip {
             tabs: vec![TabView {
@@ -457,14 +465,16 @@ mod tests {
                 ..Default::default()
             }],
             active: Some(0),
+            ..TabStrip::default()
         };
         loading.paint(&mut buf_loading, w, h, 0);
         idle.paint(&mut buf_idle, w, h, 0);
         let progress_y = h - 2;
         let loading_row = &buf_loading[progress_y * w..(progress_y + 1) * w];
         let idle_row = &buf_idle[progress_y * w..(progress_y + 1) * w];
-        assert!(loading_row.contains(&TAB_PROGRESS));
-        assert!(!idle_row.contains(&TAB_PROGRESS));
+        let progress_color = Palette::default().progress;
+        assert!(loading_row.contains(&progress_color));
+        assert!(!idle_row.contains(&progress_color));
     }
 
     #[test]
@@ -492,13 +502,15 @@ mod tests {
                 })
                 .collect(),
             active: Some(0),
+            ..TabStrip::default()
         };
         s.paint(&mut buf, w, h, 0);
         // No panic, no buffer overrun. The far-right column should be
         // either bg (if no pill reached it) or a pill colour, but never
         // an out-of-bounds value.
         let far_right = &buf[(h / 2) * w + (w - 1)];
-        let allowed = [TAB_STRIP_BG, TAB_BG_ACTIVE, TAB_BG_INACTIVE];
+        let p = Palette::default();
+        let allowed = [p.bg, p.bg_lifted];
         assert!(allowed.contains(far_right));
     }
 

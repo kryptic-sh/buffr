@@ -41,6 +41,27 @@ const BLUR_TRANSFER_WINDOW_MS: u64 = 250;
 /// debounce closely enough that highlight churn doesn't lag.
 const FIND_LIVE_DEBOUNCE_MS: u64 = 300;
 
+/// Build a chrome [`Palette`] from the user's `[theme]` config. Each
+/// hex string parses through `buffr_config::parse_hex_rgb`; malformed
+/// values fall back to the corresponding default-palette field so a
+/// stray typo never crashes startup. `theme.high_contrast = true`
+/// short-circuits the whole derivation and returns the WCAG palette.
+fn build_palette(theme: &buffr_config::Theme) -> Palette {
+    if theme.high_contrast {
+        return Palette::high_contrast();
+    }
+    let parse = buffr_config::parse_hex_rgb;
+    let dflt = Palette::default();
+    let accent = parse(&theme.accent).unwrap_or(dflt.accent);
+    Palette::from_accent(accent).with_signals(
+        parse(&theme.cert_secure).unwrap_or(dflt.cert_secure),
+        parse(&theme.cert_insecure).unwrap_or(dflt.cert_insecure),
+        parse(&theme.private).unwrap_or(dflt.private),
+        parse(&theme.progress).unwrap_or(dflt.progress),
+        parse(&theme.update).unwrap_or(dflt.update),
+    )
+}
+
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -60,8 +81,8 @@ use buffr_modal::{
 use buffr_permissions::Permissions;
 use buffr_ui::{
     CertState, DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip, FindStatus,
-    HintStatus as UiHintStatus, InputBar, PermissionsPrompt, STATUSLINE_HEIGHT, Statusline,
-    Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
+    HintStatus as UiHintStatus, InputBar, Palette, PermissionsPrompt, STATUSLINE_HEIGHT,
+    Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
 mod render;
@@ -776,7 +797,7 @@ fn main() -> Result<()> {
         counters.clone(),
         update_checker.clone(),
         initial_update_status,
-        config.theme.high_contrast,
+        build_palette(&config.theme),
         shutdown_flag,
         event_loop.create_proxy(),
     );
@@ -1828,7 +1849,7 @@ impl AppState {
         counters: Arc<buffr_core::UsageCounters>,
         update_checker: Arc<buffr_core::UpdateChecker>,
         initial_update_status: buffr_core::UpdateStatus,
-        high_contrast: bool,
+        palette: Palette,
         shutdown_flag: Arc<AtomicBool>,
         event_proxy: EventLoopProxy<BuffrUserEvent>,
     ) -> Self {
@@ -1838,10 +1859,14 @@ impl AppState {
             private,
             cert_state: CertState::Unknown,
             update_indicator,
-            high_contrast,
+            palette,
             ..Statusline::default()
         };
         statusline.mode = PageMode::Normal;
+        let tab_strip = TabStrip {
+            palette,
+            ..TabStrip::default()
+        };
         Self {
             homepage,
             host: None,
@@ -1877,7 +1902,7 @@ impl AppState {
             pending_find,
             find_smoke_at: None,
             statusline,
-            tab_strip: TabStrip::default(),
+            tab_strip,
             pending_new_tabs,
             pending_session_tabs,
             pending_session_active,

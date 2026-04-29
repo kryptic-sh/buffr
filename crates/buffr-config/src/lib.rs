@@ -134,7 +134,22 @@ pub enum ThemeMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Theme {
+    /// Base accent. Drives the statusline mode block, tab-strip
+    /// active-tab indicator, and the bg/fg/border tints derived in
+    /// `buffr-ui`. All other semantic colours below default to fixed
+    /// signals (cert green/red, private pink, etc.) but are exposed
+    /// here so users can re-tint them.
     pub accent: String,
+    /// Cert-state secure indicator (lock dot, find counts).
+    pub cert_secure: String,
+    /// Cert-state insecure indicator.
+    pub cert_insecure: String,
+    /// PRIVATE marker on the right-hand statusline cell.
+    pub private: String,
+    /// Page-load progress bar at the top of the statusline.
+    pub progress: String,
+    /// Update-available indicator (`* upd`).
+    pub update: String,
     pub mode: ThemeMode,
     /// Phase 6 accessibility: when `true`, the chrome (statusline,
     /// tab strip, input bar, prompt) renders with a high-contrast
@@ -147,10 +162,31 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             accent: "#7aa2f7".into(),
+            cert_secure: "#66e08a".into(),
+            cert_insecure: "#e05a5a".into(),
+            private: "#ffc8c8".into(),
+            progress: "#66c2ff".into(),
+            update: "#e0c85a".into(),
             mode: ThemeMode::Auto,
             high_contrast: false,
         }
     }
+}
+
+/// Parse a leading-`#` hex colour string (`#RRGGBB`) into a packed
+/// BGRA `u32` with alpha 0xFF — the format buffr-ui expects. Returns
+/// `None` if the input isn't a 7-char `#xxxxxx` hex string. `#RGB`
+/// shorthand is intentionally not supported; the config schema only
+/// emits 6-digit hex.
+pub fn parse_hex_rgb(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.len() != 7 || !s.starts_with('#') {
+        return None;
+    }
+    let r = u32::from_str_radix(&s[1..3], 16).ok()?;
+    let g = u32::from_str_radix(&s[3..5], 16).ok()?;
+    let b = u32::from_str_radix(&s[5..7], 16).ok()?;
+    Some(0xFF_00_00_00 | (r << 16) | (g << 8) | b)
 }
 
 /// `[updates]` section — Phase 6 update channel.
@@ -959,6 +995,11 @@ url = "https://duckduckgo.com/?q={query}"
 
 [theme]
 accent = "#7aa2f7"
+cert_secure = "#66e08a"
+cert_insecure = "#e05a5a"
+private = "#ffc8c8"
+progress = "#66c2ff"
+update = "#e0c85a"
 mode = "auto"
 
 [privacy]

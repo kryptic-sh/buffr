@@ -103,13 +103,13 @@ pub struct Statusline {
     /// stale (`* upd?`). Click/tap doesn't go anywhere yet — the user
     /// runs `buffr --check-for-updates` manually.
     pub update_indicator: Option<UpdateIndicator>,
-    /// Phase 6 a11y: when `true`, the strip uses the high-contrast
-    /// palette (white on black) instead of the accent-tinted defaults.
-    pub high_contrast: bool,
     /// Active tab's CEF zoom level. 0.0 is the page default; positive
     /// values zoom in, negative out. Rendered as a percentage in the
     /// statusline ("125%"). Hidden when at default.
     pub zoom_level: f64,
+    /// Chrome colours. Set once on startup from `config.theme`; flip
+    /// to [`Palette::high_contrast`] when `theme.high_contrast = true`.
+    pub palette: Palette,
 }
 
 impl Default for Statusline {
@@ -124,8 +124,8 @@ impl Default for Statusline {
             find_query: None,
             hint_state: None,
             update_indicator: None,
-            high_contrast: false,
             zoom_level: 0.0,
+            palette: Palette::default(),
         }
     }
 }
@@ -149,28 +149,22 @@ impl Statusline {
 
         // Strip starts at this row.
         let strip_y = height - strip_h;
-        let bg = if self.high_contrast {
-            HC_BG
-        } else {
-            mode_bg(self.mode)
-        };
-        let fg = if self.high_contrast {
-            HC_FG
-        } else {
-            mode_fg(self.mode)
-        };
-        let accent = if self.high_contrast {
-            HC_ACCENT
-        } else {
-            mode_accent(self.mode)
-        };
+        let p = &self.palette;
 
         // Background fill — only the strip rows.
-        fill_rect(buffer, width, height, 0, strip_y as i32, width, strip_h, bg);
+        fill_rect(
+            buffer,
+            width,
+            height,
+            0,
+            strip_y as i32,
+            width,
+            strip_h,
+            p.bg,
+        );
 
-        // Mode block — leftmost cell, slightly darker accent so the
-        // text reads even when the rest of the strip shares the same
-        // background colour.
+        // Mode block — leftmost cell, accent-on-dark so the label
+        // pops against the rest of the strip.
         let mode_text = mode_label(self.mode);
         let mode_w = font::text_width(mode_text) + 12;
         fill_rect(
@@ -181,10 +175,10 @@ impl Statusline {
             strip_y as i32,
             mode_w,
             strip_h,
-            accent,
+            p.accent,
         );
         let text_y = strip_y as i32 + ((strip_h as i32 - font::glyph_h() as i32) / 2);
-        font::draw_text(buffer, width, height, 6, text_y, mode_text, fg);
+        font::draw_text(buffer, width, height, 6, text_y, mode_text, p.bg);
 
         // Right-side cell: count buffer, find status, update channel,
         // and PRIVATE marker. Drawn right-to-left so each piece pads
@@ -194,12 +188,7 @@ impl Statusline {
             let s = "PRIVATE";
             let w = font::text_width(s) as i32;
             right_pen -= w;
-            let private_colour = if self.high_contrast {
-                HC_FG
-            } else {
-                COLOUR_PRIVATE
-            };
-            font::draw_text(buffer, width, height, right_pen, text_y, s, private_colour);
+            font::draw_text(buffer, width, height, right_pen, text_y, s, p.private);
             right_pen -= 8;
         }
         if let Some(ind) = self.update_indicator {
@@ -209,26 +198,21 @@ impl Statusline {
             };
             let w = font::text_width(s) as i32;
             right_pen -= w;
-            let upd_colour = if self.high_contrast {
-                HC_FG
-            } else {
-                COLOUR_UPDATE
-            };
-            font::draw_text(buffer, width, height, right_pen, text_y, s, upd_colour);
+            font::draw_text(buffer, width, height, right_pen, text_y, s, p.update);
             right_pen -= 8;
         }
         if let Some(find) = self.find_query.as_ref() {
             let s = format_find(find);
             let w = font::text_width(&s) as i32;
             right_pen -= w;
-            font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, p.fg);
             right_pen -= 8;
         }
         if let Some(hint) = self.hint_state.as_ref() {
             let s = format_hint(hint);
             let w = font::text_width(&s) as i32;
             right_pen -= w;
-            font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, p.fg);
             right_pen -= 8;
         }
         if let Some(count) = self.count_buffer
@@ -237,7 +221,7 @@ impl Statusline {
             let s = format!("{count}");
             let w = font::text_width(&s) as i32;
             right_pen -= w;
-            font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, p.fg);
             right_pen -= 8;
         }
         // Zoom indicator. Hidden at default (0.0). CEF uses ~1.2^level
@@ -247,7 +231,7 @@ impl Statusline {
             let s = format!("{pct}%");
             let w = font::text_width(&s) as i32;
             right_pen -= w;
-            font::draw_text(buffer, width, height, right_pen, text_y, &s, fg);
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, p.fg);
             right_pen -= 8;
         }
 
@@ -258,9 +242,9 @@ impl Statusline {
         let url_max_px = (right_pen - url_x).max(0) as usize;
         let url_text = truncate_to_width(&self.url, url_max_px);
         let cert_colour = match self.cert_state {
-            CertState::Secure => COLOUR_CERT_SECURE,
-            CertState::Insecure => COLOUR_CERT_INSECURE,
-            CertState::Unknown => fg,
+            CertState::Secure => p.cert_secure,
+            CertState::Insecure => p.cert_insecure,
+            CertState::Unknown => p.fg,
         };
         // Cert pip — single 2x6 vertical bar at the URL's left edge.
         fill_rect(
@@ -273,7 +257,7 @@ impl Statusline {
             font::glyph_h(),
             cert_colour,
         );
-        font::draw_text(buffer, width, height, url_x + 6, text_y, url_text, fg);
+        font::draw_text(buffer, width, height, url_x + 6, text_y, url_text, p.fg);
 
         // Progress bar — top 2 px of the strip. 0.0 = invisible,
         // 1.0 = full width. Phase 3 will animate this off CEF's
@@ -289,7 +273,7 @@ impl Statusline {
                 strip_y as i32,
                 bar_w,
                 2,
-                COLOUR_PROGRESS,
+                p.progress,
             );
         }
     }
@@ -393,50 +377,124 @@ fn mode_label(mode: PageMode) -> &'static str {
 // sequence in memory is [B, G, R, A], matching `wgpu::TextureFormat::Bgra8Unorm`.
 // The alpha byte is 0xFF (fully opaque) so the GPU alpha-blend pass
 // composites chrome strips correctly over the OSR texture.
-
-const COLOUR_PROGRESS: u32 = 0xFF_66_C2_FF;
-const COLOUR_PRIVATE: u32 = 0xFF_FF_C8_C8;
-const COLOUR_CERT_SECURE: u32 = 0xFF_66_E0_8A;
-const COLOUR_CERT_INSECURE: u32 = 0xFF_E0_5A_5A;
-const COLOUR_UPDATE: u32 = 0xFF_E0_C8_5A;
-
-// Phase 6 high-contrast palette. Documented in `docs/accessibility.md`.
-// Picked for WCAG-style contrast against the chrome's dark mode: pure
-// white-on-black for body, a saturated yellow accent that survives
-// black + white backgrounds, and a dimmed accent for secondary text.
 //
-// Colour values (opaque BGRA):
-// - HC_BG:        0xFF000000  (pure black, fully opaque)
-// - HC_FG:        0xFFFFFFFF  (pure white, fully opaque)
-// - HC_ACCENT:    0xFFFFFF00  (high-contrast yellow, fully opaque)
-// - HC_ACCENT_DIM:0xFFC0C0C0  (light grey, fully opaque)
-pub const HC_BG: u32 = 0xFF_00_00_00;
-pub const HC_FG: u32 = 0xFF_FF_FF_FF;
-pub const HC_ACCENT: u32 = 0xFF_FF_FF_00;
-pub const HC_ACCENT_DIM: u32 = 0xFF_C0_C0_C0;
+// Every chrome surface (statusline, tab strip, popup address bar) reads
+// from a single [`Palette`], built once on startup from `config.theme`
+// and re-derived when the theme reloads. Mode is communicated by the
+// label glyph in the leftmost cell, not by colour — all five modes
+// share the same accent so the chrome stays visually cohesive.
 
-const fn mode_bg(mode: PageMode) -> u32 {
-    match mode {
-        PageMode::Normal | PageMode::Pending => 0xFF_16_30_18,
-        PageMode::Visual => 0xFF_33_22_06,
-        PageMode::Command => 0xFF_1A_1F_2E,
-        PageMode::Hint => 0xFF_2A_1A_2E,
-        PageMode::Insert => 0xFF_10_1F_30,
+/// Single source of truth for chrome colours. Built from a base
+/// accent plus a handful of semantic signals (cert state, private
+/// marker, update indicator, progress bar). The non-accent fields
+/// default to the historical fixed signals but are configurable via
+/// `config.theme.*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    /// Base accent. Drives the mode block, active-tab indicator,
+    /// and (darkened) the strip background.
+    pub accent: u32,
+    /// Strip / tab background — accent mixed heavily with black.
+    pub bg: u32,
+    /// Body text. Held at near-white for legibility regardless of
+    /// accent hue; only the high-contrast palette overrides this.
+    pub fg: u32,
+    /// Inactive-tab background — slightly lifted from `bg` so tabs
+    /// read as distinct without being visually loud.
+    pub bg_lifted: u32,
+    /// Inactive-tab foreground — dimmed `fg`.
+    pub fg_dim: u32,
+    /// Cert-state secure (lock icon, find counts).
+    pub cert_secure: u32,
+    /// Cert-state insecure.
+    pub cert_insecure: u32,
+    /// PRIVATE marker on the right-hand statusline cell.
+    pub private: u32,
+    /// Page-load progress bar.
+    pub progress: u32,
+    /// Update channel indicator (`* upd`).
+    pub update: u32,
+}
+
+impl Palette {
+    /// Derive a palette from a single base accent. `bg` is the accent
+    /// mixed 92% with black; `bg_lifted` is the accent mixed 80%;
+    /// `fg_dim` is `fg` mixed 35% with black. Semantic colours fall
+    /// back to fixed signal values — callers override via
+    /// [`Palette::with_signals`].
+    pub fn from_accent(accent: u32) -> Self {
+        Self {
+            accent,
+            bg: blend(accent, 0xFF_00_00_00, 0.92),
+            fg: 0xFF_EE_EE_EE,
+            bg_lifted: blend(accent, 0xFF_00_00_00, 0.85),
+            fg_dim: 0xFF_A0_A8_AC,
+            cert_secure: 0xFF_66_E0_8A,
+            cert_insecure: 0xFF_E0_5A_5A,
+            private: 0xFF_FF_C8_C8,
+            progress: 0xFF_66_C2_FF,
+            update: 0xFF_E0_C8_5A,
+        }
+    }
+
+    /// Override the semantic-signal colours. Used when wiring
+    /// `config.theme.{cert_secure,cert_insecure,private,progress,update}`.
+    pub fn with_signals(
+        mut self,
+        cert_secure: u32,
+        cert_insecure: u32,
+        private: u32,
+        progress: u32,
+        update: u32,
+    ) -> Self {
+        self.cert_secure = cert_secure;
+        self.cert_insecure = cert_insecure;
+        self.private = private;
+        self.progress = progress;
+        self.update = update;
+        self
+    }
+
+    /// Phase 6 high-contrast palette. Documented in `docs/accessibility.md`.
+    /// Pure white-on-black + saturated yellow accent that survives both
+    /// black and white backgrounds. Semantic signals collapse to white
+    /// so the chrome stays legible for low-vision users.
+    pub fn high_contrast() -> Self {
+        Self {
+            accent: 0xFF_FF_FF_00,
+            bg: 0xFF_00_00_00,
+            fg: 0xFF_FF_FF_FF,
+            bg_lifted: 0xFF_10_10_10,
+            fg_dim: 0xFF_C0_C0_C0,
+            cert_secure: 0xFF_FF_FF_FF,
+            cert_insecure: 0xFF_FF_FF_FF,
+            private: 0xFF_FF_FF_FF,
+            progress: 0xFF_FF_FF_FF,
+            update: 0xFF_FF_FF_FF,
+        }
     }
 }
 
-const fn mode_accent(mode: PageMode) -> u32 {
-    match mode {
-        PageMode::Normal | PageMode::Pending => 0xFF_4A_C9_5C,
-        PageMode::Visual => 0xFF_E0_8B_2A,
-        PageMode::Command => 0xFF_55_88_FF,
-        PageMode::Hint => 0xFF_C8_5A_E0,
-        PageMode::Insert => 0xFF_5A_AA_E0,
+impl Default for Palette {
+    fn default() -> Self {
+        // Match the page accent on `https://buffr.kryptic.sh/`.
+        Self::from_accent(0xFF_7A_A2_F7)
     }
 }
 
-const fn mode_fg(_mode: PageMode) -> u32 {
-    0xFF_EE_EE_EE
+/// Linear blend between two BGRA pixels. `t = 0.0` returns `a`,
+/// `t = 1.0` returns `b`. Alpha is held at `0xFF`.
+pub(crate) fn blend(a: u32, b: u32, t: f32) -> u32 {
+    let extract = |c: u32, shift: u32| -> u8 { ((c >> shift) & 0xFF) as u8 };
+    let lerp = |x: u8, y: u8| -> u8 {
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    let r = lerp(extract(a, 16), extract(b, 16));
+    let g = lerp(extract(a, 8), extract(b, 8));
+    let bb = lerp(extract(a, 0), extract(b, 0));
+    0xFF_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (bb as u32)
 }
 
 #[cfg(test)]
@@ -459,7 +517,7 @@ mod tests {
         s.paint(&mut buf, w, h);
         // The leftmost column of the strip is owned by the mode-accent
         // cell — pixel (0,0) sits on the strip top row. Alpha is 0xFF (opaque).
-        assert_eq!(buf[0], mode_accent(PageMode::Normal));
+        assert_eq!(buf[0], Palette::default().accent);
     }
 
     #[test]
@@ -475,7 +533,7 @@ mod tests {
         // Far-right column on the bottom row — past mode block, past
         // URL text, almost certainly bg.
         let idx = (h - 1) * w + (w - 1);
-        assert_eq!(buf[idx], mode_bg(PageMode::Normal));
+        assert_eq!(buf[idx], Palette::default().bg);
     }
 
     #[test]
@@ -490,20 +548,16 @@ mod tests {
     }
 
     #[test]
-    fn mode_colours_differ() {
-        // Smoke check that the palette assigns distinct accents per
-        // mode — guards against future copy-paste regressions.
-        let modes = [
-            PageMode::Normal,
-            PageMode::Visual,
-            PageMode::Command,
-            PageMode::Hint,
-            PageMode::Insert,
-        ];
-        for (i, a) in modes.iter().enumerate() {
-            for b in &modes[i + 1..] {
-                assert_ne!(mode_accent(*a), mode_accent(*b), "{a:?} vs {b:?}");
-            }
+    fn palette_from_accent_derives_dark_bg() {
+        // The strip bg is the accent darkened ~92%, so it must be
+        // strictly darker than the accent on every channel.
+        let p = Palette::from_accent(0xFF_7A_A2_F7);
+        let extract = |c: u32, shift: u32| (c >> shift) & 0xFF;
+        for shift in [0, 8, 16] {
+            assert!(
+                extract(p.bg, shift) < extract(p.accent, shift),
+                "bg channel {shift} not darker than accent"
+            );
         }
     }
 
@@ -583,7 +637,7 @@ mod tests {
         };
         let hc_s = Statusline {
             url: "https://x".into(),
-            high_contrast: true,
+            palette: Palette::high_contrast(),
             ..Statusline::default()
         };
         default_s.paint(&mut buf_default, w, h);
@@ -593,25 +647,15 @@ mod tests {
         let idx = (h - 1) * w + (w - 1);
         assert_ne!(buf_default[idx], buf_hc[idx]);
         // High-contrast strip background must be pure black.
-        assert_eq!(buf_hc[idx], HC_BG);
+        assert_eq!(buf_hc[idx], Palette::high_contrast().bg);
     }
 
     #[test]
-    fn high_contrast_palette_distinct_from_default_modes() {
-        // Guard: HC values are not accidentally equal to any per-mode
-        // default. (Catches a future palette refactor that picks the
-        // same accent.)
-        let modes = [
-            PageMode::Normal,
-            PageMode::Visual,
-            PageMode::Command,
-            PageMode::Hint,
-            PageMode::Insert,
-        ];
-        for m in modes {
-            assert_ne!(HC_ACCENT, mode_accent(m));
-            assert_ne!(HC_BG, mode_bg(m));
-        }
+    fn high_contrast_palette_distinct_from_default_accent() {
+        let hc = Palette::high_contrast();
+        let dflt = Palette::default();
+        assert_ne!(hc.accent, dflt.accent);
+        assert_ne!(hc.bg, dflt.bg);
     }
 
     #[test]
