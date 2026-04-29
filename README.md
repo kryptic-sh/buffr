@@ -13,10 +13,13 @@ the [`cef`](https://crates.io/crates/cef) Rust crate. Vim keybindings powered by
 
 ## Status
 
-`0.0.1` — multi-tab browsing wired; OAuth popups open in their own native
-window; vim modal engine (`hjkl 0.1.0`) wired for page-mode dispatch and
-insert-mode text editing; history / downloads / bookmarks / permissions / zoom
-data layers wired and persisted to SQLite. See [CHANGELOG.md](CHANGELOG.md).
+`0.1.0` — first tagged release. Multi-tab browsing; popup windows
+(`window.open`, OAuth) render in dedicated buffr windows with read-only address
+bars and preserve `window.opener`; `target="_blank"` and Ctrl+click open in
+tabs; two-finger horizontal swipe navigates browser history; vim modal engine
+(`hjkl 0.1.0`) wired for page-mode dispatch and insert-mode text editing;
+history / downloads / bookmarks / permissions / zoom data layers wired and
+persisted to SQLite. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Apps
 
