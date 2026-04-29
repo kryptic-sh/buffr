@@ -8,6 +8,32 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-29
+
+### Added
+
+- **Ctrl+V paste** in the omnibar / command line / find overlay (clipboard text
+  pushed into the input buffer, CR/LF stripped) and in CEF-focused page inputs
+  (JS-injected via `document.execCommand('insertText', ...)`). Needed because
+  CEF on Wayland can't read the system clipboard itself even when the keystroke
+  reaches it.
+
+### Fixed
+
+- **Clipboard reads on Wayland.** `clipboard_text()` now falls back to
+  `wl-paste -n` when arboard returns empty under `WAYLAND_DISPLAY` — symmetric
+  to the existing `wl-copy` write fallback. Same root cause: arboard's
+  wl-data-source ownership lives in a worker thread that doesn't reliably serve
+  other clients.
+
+### CI
+
+- Tag-driven `release.yml` builds Linux AppImage + .deb, macOS .dmg, and Windows
+  .msi on `v*` tag pushes and uploads them to the GitHub Release with sha256
+  sidecars. crates.io publishing intentionally manual (11 workspace crates would
+  hit the new-crate rate limit).
+- `ci.yml` now also accepts `workflow_dispatch:` for manual re-runs.
+
 ## [0.1.0] - 2026-04-29
 
 First tagged release. Multi-tab browsing with OAuth-capable popups, modal vim
