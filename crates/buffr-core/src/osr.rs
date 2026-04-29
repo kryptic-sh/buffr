@@ -179,15 +179,20 @@ wrap_render_handler! {
                 return;
             };
 
-            // Resize the backing buffer only when dimensions change.
-            if guard.width != w || guard.height != h {
-                tracing::debug!(
-                    old_w = guard.width,
-                    old_h = guard.height,
-                    new_w = w,
-                    new_h = h,
-                    "osr: on_paint dimension change",
-                );
+            // Resize the backing buffer when dimensions change OR when the
+            // buffer length doesn't match expected — the embedder may have
+            // taken/swapped the Vec out (mem::swap with a scratch buffer)
+            // and left this side with an empty Vec while dims are unchanged.
+            if guard.width != w || guard.height != h || guard.pixels.len() != len {
+                if guard.width != w || guard.height != h {
+                    tracing::debug!(
+                        old_w = guard.width,
+                        old_h = guard.height,
+                        new_w = w,
+                        new_h = h,
+                        "osr: on_paint dimension change",
+                    );
+                }
                 guard.pixels.resize(len, 0);
                 guard.width = w;
                 guard.height = h;

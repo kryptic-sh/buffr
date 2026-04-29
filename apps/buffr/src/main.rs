@@ -1663,6 +1663,14 @@ struct AppState {
     /// buffer are skipped — the subsurface paints them independently so
     /// they stay anchored to the window bottom even during top-edge drags.
     wayland_sub: Option<WaylandSub>,
+    /// Reusable scratch buffer swapped with the OSR frame's pixel Vec on
+    /// each paint. Avoids cloning ~W×H×4 bytes inside the SharedOsrFrame
+    /// mutex — `mem::swap` is a few-ns pointer move, so the lock is held
+    /// only long enough to grab the latest pixels and release CEF's
+    /// `on_paint` thread to fill the next buffer. Reused across frames so
+    /// no per-paint allocation; CEF's on_paint resizes the empty buffer
+    /// it gets back exactly once after the swap.
+    osr_scratch: Vec<u8>,
 }
 
 /// Edit-mode focus state machine.
@@ -1815,6 +1823,7 @@ impl AppState {
             last_painted_chrome_gen: 0,
             // Initialized in `resumed` after the window is created.
             wayland_sub: None,
+            osr_scratch: Vec::new(),
         }
     }
 
@@ -2352,20 +2361,20 @@ impl AppState {
         let current_notice = peek_download_notice(&self.download_notice_queue);
         let (_, browser_y, browser_w, browser_h) = self.cef_child_rect(width, height);
 
-        // Build the OSR upload if in OSR mode. Lock the frame here so
-        // we hold it for as short a time as possible.
-        let osr_pixels_and_meta: Option<(Vec<u8>, u32, u32, u64)> = if let Some(host) =
-            self.host.as_ref()
+        // Acquire the latest OSR pixels by swapping our scratch buffer
+        // with the SharedOsrFrame's pixel Vec. Lock duration is the cost
+        // of a Vec<u8> swap (three usize writes) — negligible. CEF's
+        // on_paint thread, when it next fires, gets the empty Vec we put
+        // in and resizes it; on_paint already handles len mismatch via
+        // the resize check, so no panic. After this block, self.osr_scratch
+        // owns the freshest CEF pixels and self.host's frame.pixels is empty.
+        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref()
             && host.mode() == buffr_core::HostMode::Osr
         {
-            if let Ok(frame) = host.osr_frame().lock() {
-                if frame.width > 0 && frame.height > 0 {
-                    Some((
-                        frame.pixels.clone(),
-                        frame.width,
-                        frame.height,
-                        frame.generation,
-                    ))
+            if let Ok(mut frame) = host.osr_frame().lock() {
+                if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
+                    std::mem::swap(&mut self.osr_scratch, &mut frame.pixels);
+                    Some((frame.width, frame.height, frame.generation))
                 } else {
                     None
                 }
@@ -2409,23 +2418,20 @@ impl AppState {
             sub.paint(|buf, w, h| statusline.paint(buf, w, h));
         }
 
-        // Build the OsrUpload, passing a reference to the cloned pixels.
+        // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
-        let res = if let Some((ref pixels, osr_w, osr_h, osr_gen)) = osr_pixels_and_meta {
+        let res = if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
             new_osr_generation = osr_gen;
-            // TEMP DIAGNOSTIC: scale disabled — clamp dst_rect to the stale
-            // OSR's actual dims so the GPU draws the texture 1:1. Visible
-            // letterbox in the CEF region during resize is expected; the
-            // point is to see whether the chrome flicker tracks this or
-            // is independent of the OSR-stretch path.
-            let copy_w = osr_w.min(browser_w);
-            let copy_h = osr_h.min(browser_h);
+            // dst_rect uses the live browser rect (not min'd against the
+            // stale OSR dims). The renderer GPU-stretches the OSR texture
+            // to fill it, so when CEF's buffer lags the window resize the
+            // stale frame visually scales up instead of letterboxing.
             let osr_upload = crate::render::OsrUpload {
-                pixels,
+                pixels: &self.osr_scratch,
                 width: osr_w,
                 height: osr_h,
                 generation: osr_gen,
-                dst_rect: (0, browser_y, copy_w, copy_h),
+                dst_rect: (0, browser_y, browser_w, browser_h),
             };
             renderer.frame(
                 chrome_dirty,
