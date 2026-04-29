@@ -150,8 +150,12 @@ impl Statusline {
         // Strip starts at this row.
         let strip_y = height - strip_h;
         let p = &self.palette;
+        let mode_bg = p.mode_bg(self.mode);
+        let mode_accent = p.mode_accent(self.mode);
 
-        // Background fill — only the strip rows.
+        // Background fill — only the strip rows. Tinted per-mode so
+        // the whole strip (not just the leftmost cell) carries the
+        // chromatic mode signal.
         fill_rect(
             buffer,
             width,
@@ -160,7 +164,7 @@ impl Statusline {
             strip_y as i32,
             width,
             strip_h,
-            p.bg,
+            mode_bg,
         );
 
         // Mode block — leftmost cell, accent-on-dark so the label
@@ -175,10 +179,10 @@ impl Statusline {
             strip_y as i32,
             mode_w,
             strip_h,
-            p.accent,
+            mode_accent,
         );
         let text_y = strip_y as i32 + ((strip_h as i32 - font::glyph_h() as i32) / 2);
-        font::draw_text(buffer, width, height, 6, text_y, mode_text, p.bg);
+        font::draw_text(buffer, width, height, 6, text_y, mode_text, mode_bg);
 
         // Right-side cell: count buffer, find status, update channel,
         // and PRIVATE marker. Drawn right-to-left so each piece pads
@@ -497,6 +501,110 @@ pub(crate) fn blend(a: u32, b: u32, t: f32) -> u32 {
     0xFF_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (bb as u32)
 }
 
+/// Hue-rotation per-mode offsets (degrees). Picked so the five modes
+/// land on visually distinct hues regardless of where the base accent
+/// sits on the colour wheel — Normal stays at the user's accent, the
+/// others fan out across roughly 360°.
+const HUE_NORMAL: f32 = 0.0;
+const HUE_INSERT: f32 = -40.0;
+const HUE_VISUAL: f32 = 180.0;
+const HUE_COMMAND: f32 = 80.0;
+const HUE_HINT: f32 = 240.0;
+
+fn mode_hue_offset(mode: PageMode) -> f32 {
+    match mode {
+        PageMode::Normal | PageMode::Pending => HUE_NORMAL,
+        PageMode::Insert => HUE_INSERT,
+        PageMode::Visual => HUE_VISUAL,
+        PageMode::Command => HUE_COMMAND,
+        PageMode::Hint => HUE_HINT,
+    }
+}
+
+impl Palette {
+    /// Per-mode accent — base accent hue-rotated so each mode lands on
+    /// a distinct colour. High-contrast palette returns its yellow
+    /// accent across all modes (mode is signaled by the label glyph).
+    pub fn mode_accent(&self, mode: PageMode) -> u32 {
+        if *self == Self::high_contrast() {
+            return self.accent;
+        }
+        rotate_hue(self.accent, mode_hue_offset(mode))
+    }
+
+    /// Per-mode strip background — mode accent darkened the same 92%
+    /// as the base `bg` so mode-tinted backgrounds stay subtle.
+    pub fn mode_bg(&self, mode: PageMode) -> u32 {
+        if *self == Self::high_contrast() {
+            return self.bg;
+        }
+        blend(self.mode_accent(mode), 0xFF_00_00_00, 0.92)
+    }
+}
+
+/// Rotate the hue of a BGRA pixel by `degrees`. Saturation and
+/// lightness are preserved, so the rotated colour reads as "the same
+/// vibe, different hue" — which is what we want for per-mode chrome.
+fn rotate_hue(c: u32, degrees: f32) -> u32 {
+    let r = ((c >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((c >> 8) & 0xFF) as f32 / 255.0;
+    let b = (c & 0xFF) as f32 / 255.0;
+    let (h, s, l) = rgb_to_hsl(r, g, b);
+    let h2 = (h + degrees).rem_euclid(360.0);
+    let (r2, g2, b2) = hsl_to_rgb(h2, s, l);
+    let to_byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u32;
+    0xFF_00_00_00 | (to_byte(r2) << 16) | (to_byte(g2) << 8) | to_byte(b2)
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if (max - r).abs() < f32::EPSILON {
+        ((g - b) / d) + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h * 60.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s.abs() < f32::EPSILON {
+        return (l, l, l);
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let h = h / 360.0;
+    let hue = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (hue(h + 1.0 / 3.0), hue(h), hue(h - 1.0 / 3.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,7 +625,7 @@ mod tests {
         s.paint(&mut buf, w, h);
         // The leftmost column of the strip is owned by the mode-accent
         // cell — pixel (0,0) sits on the strip top row. Alpha is 0xFF (opaque).
-        assert_eq!(buf[0], Palette::default().accent);
+        assert_eq!(buf[0], Palette::default().mode_accent(PageMode::Normal));
     }
 
     #[test]
@@ -533,7 +641,7 @@ mod tests {
         // Far-right column on the bottom row — past mode block, past
         // URL text, almost certainly bg.
         let idx = (h - 1) * w + (w - 1);
-        assert_eq!(buf[idx], Palette::default().bg);
+        assert_eq!(buf[idx], Palette::default().mode_bg(PageMode::Normal));
     }
 
     #[test]
@@ -545,6 +653,26 @@ mod tests {
         s.paint(&mut buf, w, h);
         // Buffer untouched — sentinel zero.
         assert!(buf.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn mode_accents_pairwise_distinct() {
+        // Hue rotation must produce a distinct accent for every mode
+        // pair — guards against future copy-paste regressions on the
+        // HUE_* offsets.
+        let p = Palette::default();
+        let modes = [
+            PageMode::Normal,
+            PageMode::Visual,
+            PageMode::Command,
+            PageMode::Hint,
+            PageMode::Insert,
+        ];
+        for (i, a) in modes.iter().enumerate() {
+            for b in &modes[i + 1..] {
+                assert_ne!(p.mode_accent(*a), p.mode_accent(*b), "{a:?} vs {b:?}");
+            }
+        }
     }
 
     #[test]
