@@ -35,6 +35,12 @@ const SESSION_SAVE_DEBOUNCE_MS: u64 = 500;
 /// split a synchronous focusout/focusin pair across drain ticks.
 const BLUR_TRANSFER_WINDOW_MS: u64 = 250;
 
+/// Quiet time after the last keystroke in a `/` / `?` find overlay
+/// before live-search fires `start_find` against the active tab. Each
+/// keystroke resets the timer. 300 ms tracks Chromium's own find-bar
+/// debounce closely enough that highlight churn doesn't lag.
+const FIND_LIVE_DEBOUNCE_MS: u64 = 300;
+
 use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -1569,6 +1575,12 @@ struct AppState {
     /// user cancels the omnibar without confirming a URL, the tab is
     /// closed (unless it's the only remaining tab).
     cancel_closes_tab: Option<buffr_core::TabId>,
+    /// Debounced live-search trigger for the find overlay. Each
+    /// keystroke while a `/` or `?` overlay is open pushes this
+    /// `FIND_LIVE_DEBOUNCE_MS` into the future; `about_to_wait` fires
+    /// `start_find` once the deadline elapses with no further input.
+    /// `None` outside Find overlays or after the latest tick fired.
+    find_live_due: Option<Instant>,
     /// Set whenever something the session-restore cares about changes
     /// (tab open / close / reorder / active switch / URL navigation).
     /// `about_to_wait` flushes the session JSON to disk while this is
@@ -1860,6 +1872,7 @@ impl AppState {
             pending_blur_at: None,
             tab_drag_src: None,
             cancel_closes_tab: None,
+            find_live_due: None,
             hint_alphabet,
             pending_find,
             find_smoke_at: None,
@@ -2765,6 +2778,16 @@ impl AppState {
         if self.overlay.is_none() {
             return;
         }
+        // Cancelling a `/` / `?` overlay tears down the live highlight
+        // so a half-typed query doesn't leave the page lit up.
+        let was_find = matches!(self.overlay, Some(OverlayState::Find { .. }));
+        self.find_live_due = None;
+        if was_find {
+            if let Some(host) = self.host.as_ref() {
+                host.stop_find();
+            }
+            self.statusline.find_query = None;
+        }
         self.overlay = None;
         self.mark_chrome_dirty();
         // Engine flips back to Normal so the modal trie resumes.
@@ -2798,13 +2821,54 @@ impl AppState {
         let suggestions = match overlay {
             OverlayState::Command(_) => self.command_suggestions(&buffer),
             OverlayState::Omnibar(_) => self.omnibar_suggestions(&buffer),
-            OverlayState::Find { .. } => Vec::new(),
+            OverlayState::Find { .. } => {
+                // Live-find: every keystroke pushes the deadline out by
+                // `FIND_LIVE_DEBOUNCE_MS`; about_to_wait fires start_find
+                // once the user pauses.
+                self.find_live_due =
+                    Some(Instant::now() + Duration::from_millis(FIND_LIVE_DEBOUNCE_MS));
+                Vec::new()
+            }
         };
         // Re-borrow the overlay since `self.command_suggestions` /
         // `omnibar_suggestions` need `&self`.
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.input_mut().set_suggestions(suggestions);
         }
+    }
+
+    /// Run a live-find tick if the debounce deadline has elapsed.
+    /// Called from `about_to_wait`. Cleared once fired so a second
+    /// tick won't repeat without another keystroke.
+    fn maybe_dispatch_find_live(&mut self) {
+        let Some(due) = self.find_live_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.find_live_due = None;
+        let Some(OverlayState::Find { forward, bar }) = self.overlay.as_ref() else {
+            return;
+        };
+        let forward = *forward;
+        let query = bar.current_value().trim().to_string();
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        if query.is_empty() {
+            host.stop_find();
+            self.statusline.find_query = None;
+            self.mark_chrome_dirty();
+            return;
+        }
+        host.start_find(&query, forward);
+        self.statusline.find_query = Some(FindStatus {
+            query,
+            current: 0,
+            total: 0,
+        });
+        self.mark_chrome_dirty();
     }
 
     fn command_suggestions(&self, buffer: &str) -> Vec<Suggestion> {
@@ -3001,6 +3065,9 @@ impl AppState {
         };
         // User confirmed — keep the freshly-opened tab around.
         self.cancel_closes_tab = None;
+        // Submit path runs `start_find` directly; don't let a pending
+        // live tick fire a duplicate after dispatch.
+        self.find_live_due = None;
         // Engine flips back regardless of dispatch outcome.
         if let Ok(mut e) = self.engine.lock() {
             e.set_mode(PageMode::Normal);
@@ -5084,6 +5151,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // dispatch is due.
         self.pump_find_results();
         self.maybe_dispatch_find_smoke();
+        self.maybe_dispatch_find_live();
 
         // Drain any hint event (Ready / Error from the renderer) and
         // refresh the statusline indicator off the live session.
