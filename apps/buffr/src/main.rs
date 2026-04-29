@@ -1652,6 +1652,16 @@ struct AppState {
     /// event. Cleared when momentum drops below the cutoff.
     osr_wheel_velocity: (f32, f32),
     osr_wheel_last_at: Option<Instant>,
+    /// Two-finger horizontal-swipe back/forward gesture state. Only
+    /// `PixelDelta` events accumulate (touchpad). A gesture is bounded
+    /// by `SWIPE_GAP_MS` of inactivity. Once the accumulated horizontal
+    /// distance crosses `SWIPE_THRESHOLD_PX` while staying horizontal-
+    /// dominant, we fire HistoryBack/Forward once and `swipe_committed`
+    /// suppresses further nav until the gesture restarts.
+    swipe_accum_x: f32,
+    swipe_accum_y: f32,
+    swipe_last_at: Option<Instant>,
+    swipe_committed: bool,
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
@@ -1833,6 +1843,10 @@ impl AppState {
             osr_mouse_buttons: 0,
             osr_wheel_velocity: (0.0, 0.0),
             osr_wheel_last_at: None,
+            swipe_accum_x: 0.0,
+            swipe_accum_y: 0.0,
+            swipe_last_at: None,
+            swipe_committed: false,
             shutdown_flag,
             tab_ids: Vec::new(),
             session_dirty: false,
@@ -2304,6 +2318,60 @@ impl AppState {
 
     fn paint_chrome(&mut self) {
         self.paint_chrome_with(None);
+    }
+
+    /// Two-finger horizontal-swipe back/forward gesture detector.
+    /// Call once per touchpad `PixelDelta` event with the raw winit
+    /// delta in screen pixels. Returns `Some(HistoryBack | HistoryForward)`
+    /// the first time a gesture commits; subsequent events of the same
+    /// gesture are bounded by `swipe_committed` (caller swallows them).
+    /// A gesture is bounded by `GAP` of inactivity.
+    ///
+    /// Direction: positive winit `PixelDelta.x` = swipe LEFT (fingers
+    /// moved right-to-left, page slides off-left) → forward. Negative
+    /// = swipe RIGHT → back. Mirrors Chrome/Safari macOS convention.
+    fn detect_swipe(&mut self, dx: f32, dy: f32) -> Option<buffr_modal::PageAction> {
+        const GAP: Duration = Duration::from_millis(200);
+        // Raw px thresholds — touchpad 2-finger swipes deliver ~5-15px
+        // per event at 60Hz, so 150px = ~10-30 events of intent.
+        const HORIZ_THRESHOLD: f32 = 150.0;
+        const HORIZ_DOMINANCE: f32 = 2.0;
+
+        let now = Instant::now();
+        let resumed = self
+            .swipe_last_at
+            .map(|t| now.duration_since(t) > GAP)
+            .unwrap_or(true);
+        if resumed {
+            self.swipe_accum_x = 0.0;
+            self.swipe_accum_y = 0.0;
+            self.swipe_committed = false;
+        }
+        self.swipe_last_at = Some(now);
+        self.swipe_accum_x += dx;
+        self.swipe_accum_y += dy;
+
+        if self.swipe_committed {
+            return None;
+        }
+        let ax = self.swipe_accum_x.abs();
+        let ay = self.swipe_accum_y.abs();
+        if ax >= HORIZ_THRESHOLD && ax > HORIZ_DOMINANCE * ay {
+            self.swipe_committed = true;
+            let action = if self.swipe_accum_x > 0.0 {
+                buffr_modal::PageAction::HistoryForward
+            } else {
+                buffr_modal::PageAction::HistoryBack
+            };
+            tracing::debug!(
+                accum_x = self.swipe_accum_x,
+                accum_y = self.swipe_accum_y,
+                ?action,
+                "swipe gesture committed",
+            );
+            return Some(action);
+        }
+        None
     }
 
     /// Synthesize wheel-momentum decay frames after high-res input
@@ -4672,25 +4740,46 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(host) = self.host.as_ref()
-                    && host.mode() == buffr_core::HostMode::Osr
+                use winit::event::MouseScrollDelta;
+                if !self
+                    .host
+                    .as_ref()
+                    .map(|h| h.mode() == buffr_core::HostMode::Osr)
+                    .unwrap_or(false)
                 {
-                    let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
-                    if is_pixel {
-                        // Track velocity only for high-res input; discrete
-                        // wheel ticks have their own physical inertia.
-                        self.osr_wheel_velocity = (dx as f32, dy as f32);
-                        self.osr_wheel_last_at = Some(Instant::now());
-                    } else {
-                        // Cancel any in-flight momentum on discrete tick.
-                        self.osr_wheel_velocity = (0.0, 0.0);
-                        self.osr_wheel_last_at = None;
-                    }
-                    let mods = winit_mods_to_cef(&self.modifiers);
-                    let (bx, by) = self.osr_cursor;
-                    tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
-                    host.osr_mouse_wheel(bx, by, dx, dy, mods);
+                    return;
                 }
+
+                // Two-finger horizontal-swipe back/forward — only on
+                // touchpad PixelDelta. If a swipe commits or we're still
+                // mid-gesture after a commit, swallow the event so it
+                // doesn't also scroll the page.
+                if let MouseScrollDelta::PixelDelta(px) = delta {
+                    if let Some(action) = self.detect_swipe(px.x as f32, px.y as f32) {
+                        self.dispatch_action(&action);
+                        return;
+                    }
+                    if self.swipe_committed {
+                        return;
+                    }
+                }
+
+                let host = self.host.as_ref().unwrap();
+                let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
+                if is_pixel {
+                    // Track velocity only for high-res input; discrete
+                    // wheel ticks have their own physical inertia.
+                    self.osr_wheel_velocity = (dx as f32, dy as f32);
+                    self.osr_wheel_last_at = Some(Instant::now());
+                } else {
+                    // Cancel any in-flight momentum on discrete tick.
+                    self.osr_wheel_velocity = (0.0, 0.0);
+                    self.osr_wheel_last_at = None;
+                }
+                let mods = winit_mods_to_cef(&self.modifiers);
+                let (bx, by) = self.osr_cursor;
+                tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
+                host.osr_mouse_wheel(bx, by, dx, dy, mods);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // Pinned-close confirmation takes precedence over
