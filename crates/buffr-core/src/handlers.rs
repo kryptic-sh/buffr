@@ -733,10 +733,30 @@ wrap_display_handler! {
             // it will be overwritten on the next page that sets one.
             let Some(browser) = browser else { return };
             let Some(icon_urls) = icon_urls else { return };
-            let urls: Vec<String> = icon_urls.clone().into_iter().collect();
-            let Some(first) = urls.into_iter().find(|u| !u.is_empty()) else {
+            // The wrapper's `IntoIterator`/`Clone` work on the underlying
+            // `_cef_string_list_t` pointer, which is opaque (zero-sized) so
+            // a Rust-level `.clone()` would yield an empty list. Walk the
+            // raw cef-sys handle instead.
+            let raw: *mut cef::sys::_cef_string_list_t = icon_urls.into();
+            if raw.is_null() {
                 return;
-            };
+            }
+            let mut first: Option<String> = None;
+            unsafe {
+                let count = cef::sys::cef_string_list_size(raw);
+                for i in 0..count {
+                    let mut value: cef::sys::cef_string_t = std::mem::zeroed();
+                    if cef::sys::cef_string_list_value(raw, i, &mut value) == 0 {
+                        continue;
+                    }
+                    let s = CefStringUtf16::from(std::ptr::from_ref(&value)).to_string();
+                    if !s.is_empty() {
+                        first = Some(s);
+                        break;
+                    }
+                }
+            }
+            let Some(first) = first else { return };
             let browser_id = cef::ImplBrowser::identifier(browser);
             let host = match cef::ImplBrowser::host(browser) {
                 Some(h) => h,
