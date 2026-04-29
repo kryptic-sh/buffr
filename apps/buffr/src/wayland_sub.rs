@@ -99,44 +99,54 @@ mod linux {
     wayland_client::delegate_noop!(WlState: ignore wl_subsurface::WlSubsurface);
     wayland_client::delegate_noop!(WlState: ignore wl_buffer::WlBuffer);
 
-    // ---- Shm pool + mapped buffer ----------------------------------------
+    // ---- Shm pool + double-buffered slots --------------------------------
+    //
+    // Two slots, alternated per paint to avoid overwriting a buffer the
+    // compositor may still be reading. The pool is sized for 2 × stride ×
+    // height bytes; slot 0 starts at offset 0, slot 1 at offset
+    // (stride × height). On every paint we flip `next_slot`, write into
+    // the now-free slot, and attach that slot's wl_buffer.
 
     struct ShmPool {
         /// The anonymous file backing the shm pool.
         fd: OwnedFd,
         /// Mapped memory as raw pointer. Length = capacity (bytes).
         ptr: *mut c_void,
-        /// Capacity in bytes (allocated).
+        /// Capacity in bytes (allocated). Always 2 × per-slot size.
         capacity: usize,
         /// wl_shm_pool handle.
         pool: wl_shm_pool::WlShmPool,
-        /// Current width (px) of the buffer.
+        /// Current width (px) of each slot's buffer.
         width: u32,
-        /// wl_buffer wrapping the pool bytes.
-        buffer: Option<wl_buffer::WlBuffer>,
+        /// Two wl_buffer wrappers, one per slot. Both share the same pool.
+        buffers: [Option<wl_buffer::WlBuffer>; 2],
+        /// Index of the slot to paint into next (0 or 1).
+        next_slot: usize,
     }
 
     // SAFETY: the mmap'd pointer is only touched from the main thread.
     unsafe impl Send for ShmPool {}
 
     impl ShmPool {
-        /// Create a new shm pool big enough for `initial_bytes`.
-        fn new(
-            shm: &wl_shm::WlShm,
-            qh: &QueueHandle<WlState>,
-            initial_bytes: usize,
-        ) -> Option<Self> {
+        /// Bytes per slot for a given width.
+        fn slot_bytes(width: u32) -> usize {
+            (width * STATUSLINE_HEIGHT * 4) as usize
+        }
+
+        /// Create a new shm pool with capacity for two slots of `slot_bytes`.
+        fn new(shm: &wl_shm::WlShm, qh: &QueueHandle<WlState>, slot_bytes: usize) -> Option<Self> {
+            let total = slot_bytes * 2;
             let fd = memfd_create("buffr-statusline-shm", MemfdFlags::CLOEXEC)
                 .map_err(|e| warn!(?e, "memfd_create failed"))
                 .ok()?;
-            ftruncate(&fd, initial_bytes as u64)
+            ftruncate(&fd, total as u64)
                 .map_err(|e| warn!(?e, "ftruncate failed"))
                 .ok()?;
-            // SAFETY: fd is a valid memfd sized to initial_bytes.
+            // SAFETY: fd is a valid memfd sized to total bytes.
             let ptr = unsafe {
                 mmap(
                     std::ptr::null_mut(),
-                    initial_bytes,
+                    total,
                     ProtFlags::READ | ProtFlags::WRITE,
                     MapFlags::SHARED,
                     &fd,
@@ -147,36 +157,38 @@ mod linux {
             .ok()?;
 
             use std::os::unix::io::AsFd;
-            let pool = shm.create_pool(fd.as_fd(), initial_bytes as i32, qh, ());
-            debug!(bytes = initial_bytes, "shm pool created");
+            let pool = shm.create_pool(fd.as_fd(), total as i32, qh, ());
+            debug!(bytes = total, "shm pool created (double-buffered)");
 
             Some(Self {
                 fd,
                 ptr,
-                capacity: initial_bytes,
+                capacity: total,
                 pool,
                 width: 0,
-                buffer: None,
+                buffers: [None, None],
+                next_slot: 0,
             })
         }
 
-        /// Grow the pool if `needed_bytes` exceeds the current capacity.
-        /// Recreates the pool entirely (correct for PoC; no double-buffering).
+        /// Grow the pool if `needed_slot_bytes × 2` exceeds the current capacity.
+        /// Recreates the pool entirely.
         fn ensure_capacity(
             &mut self,
             shm: &wl_shm::WlShm,
             qh: &QueueHandle<WlState>,
-            needed_bytes: usize,
+            needed_slot_bytes: usize,
         ) -> bool {
-            if needed_bytes <= self.capacity {
+            let total = needed_slot_bytes * 2;
+            if total <= self.capacity {
                 return true;
             }
-            // Destroy old buffer + pool, unmap, realloc.
-            if let Some(buf) = self.buffer.take() {
-                buf.destroy();
+            for slot in &mut self.buffers {
+                if let Some(buf) = slot.take() {
+                    buf.destroy();
+                }
             }
             self.pool.destroy();
-            // Unmap old memory.
             // SAFETY: ptr and capacity came from a successful mmap.
             let _ = unsafe { rustix::mm::munmap(self.ptr, self.capacity) };
 
@@ -187,14 +199,14 @@ mod linux {
                     return false;
                 }
             };
-            if let Err(e) = ftruncate(&fd, needed_bytes as u64) {
+            if let Err(e) = ftruncate(&fd, total as u64) {
                 warn!(?e, "ftruncate (resize) failed");
                 return false;
             }
             let ptr = match unsafe {
                 mmap(
                     std::ptr::null_mut(),
-                    needed_bytes,
+                    total,
                     ProtFlags::READ | ProtFlags::WRITE,
                     MapFlags::SHARED,
                     &fd,
@@ -208,42 +220,54 @@ mod linux {
                 }
             };
             use std::os::unix::io::AsFd;
-            let pool = shm.create_pool(fd.as_fd(), needed_bytes as i32, qh, ());
-            debug!(bytes = needed_bytes, "shm pool recreated (capacity grow)");
+            let pool = shm.create_pool(fd.as_fd(), total as i32, qh, ());
+            debug!(bytes = total, "shm pool recreated (capacity grow)");
             self.fd = fd;
             self.ptr = ptr;
-            self.capacity = needed_bytes;
+            self.capacity = total;
             self.pool = pool;
+            self.width = 0;
             true
         }
 
-        /// Return a mutable slice over the pixel data for `width × STATUSLINE_HEIGHT`.
+        /// Return a mutable slice over slot `slot`'s pixel data for `width`.
         ///
         /// # Safety
         ///
-        /// Caller must ensure `width * STATUSLINE_HEIGHT * 4 <= capacity`.
-        unsafe fn pixels_mut_unchecked(&mut self, width: u32) -> &mut [u32] {
+        /// Caller must ensure `(slot+1) * width * STATUSLINE_HEIGHT * 4 <= capacity`.
+        unsafe fn pixels_mut_unchecked(&mut self, slot: usize, width: u32) -> &mut [u32] {
             let count = (width * STATUSLINE_HEIGHT) as usize;
-            // SAFETY: ptr is mapped RW, count*4 <= capacity, only accessed here.
-            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u32, count) }
+            let slot_offset = slot * count;
+            // SAFETY: pool is sized for 2 slots of width × STATUSLINE_HEIGHT pixels each.
+            unsafe {
+                let base = (self.ptr as *mut u32).add(slot_offset);
+                std::slice::from_raw_parts_mut(base, count)
+            }
         }
 
-        /// Create (or replace) the wl_buffer for the current width.
-        fn create_buffer(&mut self, qh: &QueueHandle<WlState>, width: u32) {
-            if let Some(old) = self.buffer.take() {
-                old.destroy();
+        /// Create (or replace) both slot wl_buffers for the new width.
+        fn create_buffers(&mut self, qh: &QueueHandle<WlState>, width: u32) {
+            for slot in &mut self.buffers {
+                if let Some(buf) = slot.take() {
+                    buf.destroy();
+                }
             }
-            let buf = self.pool.create_buffer(
-                0,
-                width as i32,
-                STATUSLINE_HEIGHT as i32,
-                (width * 4) as i32,
-                wl_shm::Format::Argb8888,
-                qh,
-                (),
-            );
-            self.buffer = Some(buf);
+            let stride = (width * 4) as i32;
+            let slot_bytes = Self::slot_bytes(width) as i32;
+            for (i, slot) in self.buffers.iter_mut().enumerate() {
+                let buf = self.pool.create_buffer(
+                    i as i32 * slot_bytes,
+                    width as i32,
+                    STATUSLINE_HEIGHT as i32,
+                    stride,
+                    wl_shm::Format::Argb8888,
+                    qh,
+                    (),
+                );
+                *slot = Some(buf);
+            }
             self.width = width;
+            self.next_slot = 0;
         }
     }
 
@@ -411,13 +435,13 @@ mod linux {
             // its own proxy and is the canonical owner.
             std::mem::forget(parent_surface);
 
-            // ---- Allocate initial shm pool (4096 px wide × SL_HEIGHT) ---
-            let initial_bytes = (4096 * STATUSLINE_HEIGHT * 4) as usize;
-            let mut shm_pool = ShmPool::new(&shm, &qh, initial_bytes)?;
+            // ---- Allocate initial shm pool (4096 px wide × SL_HEIGHT, 2 slots) ---
+            let initial_slot_bytes = ShmPool::slot_bytes(4096);
+            let mut shm_pool = ShmPool::new(&shm, &qh, initial_slot_bytes)?;
 
-            // Create the initial buffer (assume 1280 px wide until first resize).
+            // Create the initial buffers (assume 1280 px wide until first resize).
             let init_w: u32 = 1280;
-            shm_pool.create_buffer(&qh, init_w);
+            shm_pool.create_buffers(&qh, init_w);
 
             state.compositor = Some(compositor);
             state.subcompositor = Some(subcompositor);
@@ -445,18 +469,21 @@ mod linux {
             self.current_w = window_w.max(1);
             self.current_h = window_h.max(1);
             let sl_y = (window_h as i32) - (STATUSLINE_HEIGHT as i32);
-            let needed_bytes = (self.current_w * STATUSLINE_HEIGHT * 4) as usize;
+            let needed_slot_bytes = ShmPool::slot_bytes(self.current_w);
 
             let shm = match self.state.shm.as_ref() {
                 Some(s) => s.clone(),
                 None => return,
             };
-            if !self.shm_pool.ensure_capacity(&shm, &self.qh, needed_bytes) {
+            if !self
+                .shm_pool
+                .ensure_capacity(&shm, &self.qh, needed_slot_bytes)
+            {
                 return;
             }
-            // Buffer width changed — recreate buffer with new stride.
+            // Buffer width changed — recreate both slot buffers with new stride.
             if self.shm_pool.width != self.current_w {
-                self.shm_pool.create_buffer(&self.qh, self.current_w);
+                self.shm_pool.create_buffers(&self.qh, self.current_w);
             }
 
             self.child_subsurface.set_position(0, sl_y.max(0));
@@ -485,27 +512,39 @@ mod linux {
             if w == 0 {
                 return;
             }
-            let needed = (w * h * 4) as usize;
+            let needed_slot_bytes = ShmPool::slot_bytes(w);
             let shm = match self.state.shm.as_ref() {
                 Some(s) => s.clone(),
                 None => return,
             };
-            if !self.shm_pool.ensure_capacity(&shm, &self.qh, needed) {
+            if !self
+                .shm_pool
+                .ensure_capacity(&shm, &self.qh, needed_slot_bytes)
+            {
                 return;
             }
             if self.shm_pool.width != w {
-                self.shm_pool.create_buffer(&self.qh, w);
+                self.shm_pool.create_buffers(&self.qh, w);
             }
 
-            // Call the painter into the mmap'd pixel slice.
+            // Pick the next slot — alternate every paint so the compositor
+            // never sees us writing into a buffer it might still be reading
+            // from a recent display cycle. With single-buffer reuse during
+            // rapid resize, the compositor occasionally grabbed a frame
+            // mid-paint and showed a torn statusline before the next commit
+            // corrected it.
+            let slot = self.shm_pool.next_slot;
+            self.shm_pool.next_slot = 1 - slot;
+
+            // Call the painter into this slot's mmap'd pixel slice.
             {
-                // SAFETY: w * STATUSLINE_HEIGHT * 4 <= capacity (ensured above).
-                let pixels = unsafe { self.shm_pool.pixels_mut_unchecked(w) };
+                // SAFETY: 2 × w × STATUSLINE_HEIGHT × 4 <= capacity (ensured above).
+                let pixels = unsafe { self.shm_pool.pixels_mut_unchecked(slot, w) };
                 paint_fn(pixels, w as usize, h as usize);
             }
 
-            // Attach + damage + commit the child surface.
-            if let Some(buf) = &self.shm_pool.buffer {
+            // Attach this slot's buffer + damage + commit on the child.
+            if let Some(buf) = self.shm_pool.buffers[slot].as_ref() {
                 self.child_surface.attach(Some(buf), 0, 0);
                 self.child_surface.damage_buffer(0, 0, w as i32, h as i32);
                 self.child_surface.commit();
