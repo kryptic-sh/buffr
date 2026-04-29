@@ -2,7 +2,7 @@
 //!
 //! Phase 4 lands a richer schema:
 //!
-//! - `[general]` — homepage, leader char.
+//! - `[general]` — homepage, leader char, favicon toggle.
 //! - `[startup]` — session restore, new-tab URL.
 //! - `[search]` — default engine + per-engine URL templates.
 //! - `[theme]` — accent + dark/light mode.
@@ -60,6 +60,10 @@ pub struct Config {
 pub struct General {
     pub homepage: String,
     pub leader: String,
+    /// Render per-tab favicons. When `false` the tab strip skips favicon
+    /// rendering entirely (and the host suppresses the CEF favicon
+    /// download to save the network round-trip).
+    pub show_favicons: bool,
 }
 
 impl Default for General {
@@ -67,6 +71,7 @@ impl Default for General {
         Self {
             homepage: "buffr://new".into(),
             leader: " ".into(),
+            show_favicons: true,
         }
     }
 }
@@ -982,6 +987,7 @@ weird = "x"
 [general]
 homepage = "https://example.com"
 leader = "\\"
+show_favicons = true
 
 [startup]
 restore_session = false
