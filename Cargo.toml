@@ -1,23 +1,21 @@
 [package]
 name = "buffr-config"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-authors.workspace = true
 description = "Config loading and parsing for buffr."
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-config"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
 
 [dependencies]
-anyhow.workspace = true
-thiserror.workspace = true
-serde = { workspace = true, features = ["derive"] }
-toml.workspace = true
-directories.workspace = true
-notify.workspace = true
-url.workspace = true
-buffr-modal.workspace = true
-
-[dev-dependencies]
-tempfile = "3"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+directories = "6"
+notify = "8"
+url = "2"
+buffr-modal = "0.1"
