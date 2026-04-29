@@ -2053,7 +2053,24 @@ impl BrowserHost {
     /// or the platform read fails. Used by the apps layer's paste-as
     /// -tab dispatch before classifying the contents as a URL.
     pub fn clipboard_text(&self) -> Option<String> {
-        self.clipboard.lock().ok().and_then(|mut cb| cb.get_text())
+        let arboard = self.clipboard.lock().ok().and_then(|mut cb| cb.get_text());
+        // arboard's Wayland reader has the same data-source-ownership
+        // issue as its writer (see `clipboard_set_text` FIXME): a
+        // selection set by another client can come back empty. Fall
+        // back to `wl-paste -n` (preserves trailing newlines? -n drops
+        // the synthetic one wl-paste appends) on Wayland Linux when
+        // arboard returns nothing.
+        #[cfg(target_os = "linux")]
+        {
+            if arboard.as_deref().is_none_or(str::is_empty)
+                && std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && let Some(text) = wl_paste_pipe()
+            {
+                tracing::debug!(len = text.len(), "clipboard_text: wl-paste fallback hit");
+                return Some(text);
+            }
+        }
+        arboard
     }
 
     /// Write `text` to the system clipboard via `hjkl-clipboard`.
@@ -2212,6 +2229,26 @@ fn _hint_used(_: Hint) {}
 // Pipe `text` into `wl-copy`'s stdin. Returns true only if the
 // binary spawned, accepted the write, and exited 0. Silently
 // returns false when `wl-copy` isn't on PATH (no warning — most
+// Read the system clipboard as text via `wl-paste -n` (no trailing
+// newline). Returns `None` if wl-paste isn't installed, the clipboard
+// is empty, or the read fails. Stopgap for arboard's read-side
+// breakage on Wayland — same root cause as the write side.
+#[cfg(target_os = "linux")]
+fn wl_paste_pipe() -> Option<String> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("wl-paste")
+        .arg("-n")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    if s.is_empty() { None } else { Some(s) }
+}
+
 // X11 / non-Linux machines won't have it and that's fine).
 #[cfg(target_os = "linux")]
 fn wl_copy_pipe(text: &str) -> bool {
