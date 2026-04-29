@@ -2327,9 +2327,10 @@ impl AppState {
     /// gesture are bounded by `swipe_committed` (caller swallows them).
     /// A gesture is bounded by `GAP` of inactivity.
     ///
-    /// Direction: positive winit `PixelDelta.x` = swipe LEFT (fingers
-    /// moved right-to-left, page slides off-left) → forward. Negative
-    /// = swipe RIGHT → back. Mirrors Chrome/Safari macOS convention.
+    /// Direction: positive winit `PixelDelta.x` = swipe RIGHT → back.
+    /// Negative = swipe LEFT → forward. Mirrors Chrome/Safari macOS
+    /// convention (verified on Linux Wayland touchpad with natural
+    /// scrolling enabled — sign matches the physical gesture there).
     fn detect_swipe(&mut self, dx: f32, dy: f32) -> Option<buffr_modal::PageAction> {
         const GAP: Duration = Duration::from_millis(200);
         // Raw px thresholds — touchpad 2-finger swipes deliver ~5-15px
@@ -2359,9 +2360,9 @@ impl AppState {
         if ax >= HORIZ_THRESHOLD && ax > HORIZ_DOMINANCE * ay {
             self.swipe_committed = true;
             let action = if self.swipe_accum_x > 0.0 {
-                buffr_modal::PageAction::HistoryForward
-            } else {
                 buffr_modal::PageAction::HistoryBack
+            } else {
+                buffr_modal::PageAction::HistoryForward
             };
             tracing::debug!(
                 accum_x = self.swipe_accum_x,
