@@ -1779,6 +1779,10 @@ struct AppState {
     /// Popup-closed event queue. Drained each `about_to_wait` tick to
     /// drop popup windows. Obtained from `host.popup_close_sink()`.
     popup_close_sink: PopupCloseSink,
+    /// Per-browser favicon bitmaps. Populated from `host.favicon_sink()`
+    /// drains and read in `refresh_tab_strip` to attach a `TabFavicon` to
+    /// each `TabView`.
+    favicons: HashMap<i32, buffr_ui::TabFavicon>,
 }
 
 /// Edit-mode focus state machine.
@@ -1944,6 +1948,7 @@ impl AppState {
             // Replaced in `resumed` once the host is constructed.
             popup_create_sink: buffr_core::new_popup_create_sink(),
             popup_close_sink: buffr_core::new_popup_close_sink(),
+            favicons: HashMap::new(),
         }
     }
 
@@ -2270,16 +2275,23 @@ impl AppState {
         };
         let summaries = host.tabs_summary();
         let active = host.active_index();
+        // Drop favicon entries for closed browsers so the map doesn't
+        // grow without bound across long sessions.
+        let live_ids: std::collections::HashSet<i32> =
+            summaries.iter().map(|s| s.browser_id).collect();
+        self.favicons.retain(|id, _| live_ids.contains(id));
         let mut ids = Vec::with_capacity(summaries.len());
         let tabs = summaries
             .into_iter()
             .map(|t| {
                 ids.push(t.id);
+                let favicon = self.favicons.get(&t.browser_id).cloned();
                 TabView {
                     title: t.title,
                     progress: t.progress,
                     pinned: t.pinned,
                     private: t.private,
+                    favicon,
                 }
             })
             .collect();
@@ -2339,6 +2351,29 @@ impl AppState {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    /// Drain decoded favicon bitmaps from CEF and stash by browser id.
+    /// `refresh_tab_strip` reads this map to attach the bitmap to each
+    /// `TabView`. Marks chrome dirty when at least one update lands so
+    /// the new favicon shows up on the next paint.
+    fn pump_favicon_updates(&mut self) -> bool {
+        let Some(host) = self.host.as_ref() else {
+            return false;
+        };
+        let updates = buffr_core::drain_favicon_updates(&host.favicon_sink());
+        if updates.is_empty() {
+            return false;
+        }
+        for u in updates {
+            let fav = buffr_ui::TabFavicon {
+                width: u.width,
+                height: u.height,
+                pixels: std::sync::Arc::new(u.pixels),
+            };
+            self.favicons.insert(u.browser_id, fav);
+        }
+        true
     }
 
     /// Drain CEF cursor changes and forward to winit. CEF emits a new
@@ -5293,6 +5328,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Forward any pending CEF cursor change to winit. Reads the
         // shared cursor state and calls `Window::set_cursor` once.
         self.pump_cursor_changes();
+
+        // Drain any decoded favicons from CEF and stash by browser id.
+        // refresh_tab_strip below picks them up on the next tab refresh.
+        if self.pump_favicon_updates() {
+            self.mark_chrome_dirty();
+            self.request_redraw();
+        }
 
         // Drain any find result the CEF browser thread posted since
         // the last tick, then check whether the `--find` smoke

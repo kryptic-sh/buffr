@@ -50,6 +50,7 @@ use crate::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters}
 use cef::*;
 
 use crate::cursor::SharedCursorState;
+use crate::favicon::{FaviconSink, FaviconUpdate};
 use crate::open_finder::{OsSpawn, open_path};
 use crate::osr::{OsrFrame, OsrViewState, PopupFrameMap};
 use crate::{PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
@@ -84,6 +85,7 @@ pub fn make_client(
     popup_close_sink: PopupCloseSink,
     popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
     cursor_state: SharedCursorState,
+    favicon_sink: FaviconSink,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -107,6 +109,7 @@ pub fn make_client(
         popup_close_sink,
         popup_browsers,
         cursor_state,
+        favicon_sink,
     )
 }
 
@@ -137,6 +140,7 @@ pub fn make_display_handler(
     address_sink: crate::host::AddressSink,
     popup_title_sink: crate::host::AddressSink,
     cursor_state: SharedCursorState,
+    favicon_sink: FaviconSink,
 ) -> DisplayHandler {
     BuffrDisplayHandler::new(
         history,
@@ -145,6 +149,7 @@ pub fn make_display_handler(
         address_sink,
         popup_title_sink,
         cursor_state,
+        favicon_sink,
     )
 }
 
@@ -385,6 +390,7 @@ wrap_client! {
         popup_close_sink: PopupCloseSink,
         popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
         cursor_state: SharedCursorState,
+        favicon_sink: FaviconSink,
     }
 
     impl Client {
@@ -410,6 +416,7 @@ wrap_client! {
                 self.address_sink.clone(),
                 self.popup_title_sink.clone(),
                 self.cursor_state.clone(),
+                self.favicon_sink.clone(),
             ))
         }
 
@@ -654,6 +661,10 @@ wrap_display_handler! {
         // cursor_state: latest CEF cursor request. Drained by the apps layer
         // each tick and forwarded to winit's `Window::set_cursor`.
         cursor_state: SharedCursorState,
+        // favicon_sink: decoded favicon bitmaps pushed from the
+        // `BuffrDownloadImageCallback` we hand CEF in `on_favicon_urlchange`.
+        // The apps layer drains and caches by browser id for the tab strip.
+        favicon_sink: FaviconSink,
     }
 
     impl DisplayHandler {
@@ -707,6 +718,46 @@ wrap_display_handler! {
             if let Err(err) = self.history.update_latest_title(&url, &title_str) {
                 tracing::warn!(error = %err, %url, "history: update_latest_title failed");
             }
+        }
+
+        fn on_favicon_urlchange(
+            &self,
+            browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            // Pick the first non-empty URL CEF reports. Chromium hands us
+            // a list ordered by Blink preference, so the head is the best
+            // candidate (typically the page's `<link rel="icon">` or a
+            // root `/favicon.ico` when none is declared). Empty list means
+            // the page cleared its icon — leave the cached bitmap in place;
+            // it will be overwritten on the next page that sets one.
+            let Some(browser) = browser else { return };
+            let Some(icon_urls) = icon_urls else { return };
+            let urls: Vec<String> = icon_urls.clone().into_iter().collect();
+            let Some(first) = urls.into_iter().find(|u| !u.is_empty()) else {
+                return;
+            };
+            let browser_id = cef::ImplBrowser::identifier(browser);
+            let host = match cef::ImplBrowser::host(browser) {
+                Some(h) => h,
+                None => return,
+            };
+            let cef_url = CefString::from(first.as_str());
+            let mut callback = BuffrDownloadImageCallback::new(
+                browser_id,
+                self.favicon_sink.clone(),
+            );
+            // is_favicon = 1 lets CEF apply favicon-specific decoding (ICO);
+            // max_image_size = 64 caps the largest representation it will
+            // download — bigger than the strip needs but lets us pick a
+            // crisp source for HiDPI scaling. bypass_cache = 0 reuses the
+            // disk cache when the URL is unchanged.
+            host.download_image(Some(&cef_url), 1, 64, 0, Some(&mut callback));
+            tracing::debug!(
+                browser_id,
+                url = %first,
+                "favicon: download_image dispatched"
+            );
         }
 
         fn on_cursor_change(
@@ -776,6 +827,98 @@ wrap_display_handler! {
             }
 
             0
+        }
+    }
+}
+
+wrap_download_image_callback! {
+    pub struct BuffrDownloadImageCallback {
+        browser_id: i32,
+        favicon_sink: FaviconSink,
+    }
+
+    impl DownloadImageCallback {
+        fn on_download_image_finished(
+            &self,
+            _image_url: Option<&CefString>,
+            http_status_code: ::std::os::raw::c_int,
+            image: Option<&mut Image>,
+        ) {
+            // Anything other than 2xx (or the synthetic 0 CEF returns
+            // for "loaded from cache") is a fetch error. CEF still hands
+            // us a (possibly empty) Image; gate on `is_empty` to be safe.
+            if http_status_code != 0 && !(200..300).contains(&http_status_code) {
+                tracing::debug!(
+                    http_status_code,
+                    "favicon: download_image failed — discarding"
+                );
+                return;
+            }
+            let Some(image) = image else { return };
+            if image.is_empty() != 0 {
+                return;
+            }
+            // Pull the BGRA representation at 1× scale. CEF re-encodes from
+            // its internal SkBitmap so the buffer is already premultiplied
+            // alpha — exactly what our compositor expects.
+            let mut pw: ::std::os::raw::c_int = 0;
+            let mut ph: ::std::os::raw::c_int = 0;
+            let bin = image.as_bitmap(
+                1.0,
+                ColorType::BGRA_8888,
+                AlphaType::PREMULTIPLIED,
+                Some(&mut pw),
+                Some(&mut ph),
+            );
+            let Some(bin) = bin else {
+                tracing::debug!("favicon: as_bitmap returned None");
+                return;
+            };
+            let width = pw.max(0) as u32;
+            let height = ph.max(0) as u32;
+            if width == 0 || height == 0 {
+                return;
+            }
+            let expected_bytes = (width as usize) * (height as usize) * 4;
+            let total = bin.size();
+            if total < expected_bytes {
+                tracing::warn!(
+                    total,
+                    expected_bytes,
+                    "favicon: BinaryValue smaller than expected — discarding"
+                );
+                return;
+            }
+            // SAFETY: BinaryValue::raw_data points to `bin.size()` valid
+            // bytes for as long as `bin` is alive in this scope. We copy
+            // out before `bin` Drops.
+            let raw = bin.raw_data();
+            if raw.is_null() {
+                return;
+            }
+            let pixel_count = (width as usize) * (height as usize);
+            let mut pixels: Vec<u32> = Vec::with_capacity(pixel_count);
+            unsafe {
+                let bytes = std::slice::from_raw_parts(raw as *const u8, expected_bytes);
+                for chunk in bytes.chunks_exact(4) {
+                    let b = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let r = chunk[2] as u32;
+                    let a = chunk[3] as u32;
+                    // Pack as 0xAARRGGBB — matches the chrome compositor's
+                    // expected u32 layout (alpha in the high byte).
+                    pixels.push((a << 24) | (r << 16) | (g << 8) | b);
+                }
+            }
+            let update = FaviconUpdate {
+                browser_id: self.browser_id,
+                width,
+                height,
+                pixels,
+            };
+            if let Ok(mut sink) = self.favicon_sink.lock() {
+                sink.push_back(update);
+            }
         }
     }
 }

@@ -27,6 +27,8 @@
 //! Loading indicator: a 2-px progress bar at the bottom edge of each
 //! tab. `progress >= 1.0` is treated as idle and the bar is hidden.
 
+use std::sync::Arc;
+
 use crate::Palette;
 use crate::fill_rect;
 use crate::font;
@@ -51,6 +53,18 @@ pub const MAX_TAB_WIDTH: u32 = 220;
 /// initial) — so the user can fit many anchors in a small strip.
 pub const PINNED_TAB_WIDTH: u32 = 32;
 
+/// Decoded favicon bitmap, BGRA `u32` packed (`0xAARRGGBB`). Wrapped in
+/// `Arc` so cloning a `TabView` is O(1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabFavicon {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<Vec<u32>>,
+}
+
+/// Target favicon side length in the strip, in pixels.
+pub const FAVICON_RENDER_SIZE: u32 = 16;
+
 /// Per-tab render input. `progress >= 1.0` hides the loading bar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabView {
@@ -58,6 +72,7 @@ pub struct TabView {
     pub progress: f32,
     pub pinned: bool,
     pub private: bool,
+    pub favicon: Option<TabFavicon>,
 }
 
 impl Default for TabView {
@@ -67,6 +82,7 @@ impl Default for TabView {
             progress: 1.0,
             pinned: false,
             private: false,
+            favicon: None,
         }
     }
 }
@@ -204,21 +220,53 @@ impl TabStrip {
             }
 
             if tab.pinned {
-                // Default-favicon stand-in: a single capitalized letter
-                // pulled from the title (or `*` if the title is empty)
-                // centered in the pill. Real favicon image rendering
-                // is a follow-up — this gives users an at-a-glance
-                // anchor today without any network IO.
-                let glyph: String = pinned_glyph(&tab.title);
-                let glyph_px = font::text_width(&glyph) as i32;
-                let glyph_x = x + (pill_w - glyph_px) / 2;
-                font::draw_text(buffer, width, height, glyph_x, text_y, &glyph, fg);
+                let icon_size = FAVICON_RENDER_SIZE as i32;
+                let icon_x = x + (pill_w - icon_size) / 2;
+                let icon_y = start_y as i32 + ((strip_h as i32 - icon_size) / 2);
+                if let Some(fav) = tab.favicon.as_ref() {
+                    blit_favicon(
+                        buffer,
+                        width,
+                        height,
+                        icon_x,
+                        icon_y,
+                        FAVICON_RENDER_SIZE,
+                        FAVICON_RENDER_SIZE,
+                        fav,
+                        bg,
+                    );
+                } else {
+                    // Stand-in until the favicon arrives: a single
+                    // capitalised glyph centered in the pill.
+                    let glyph: String = pinned_glyph(&tab.title);
+                    let glyph_px = font::text_width(&glyph) as i32;
+                    let glyph_x = x + (pill_w - glyph_px) / 2;
+                    font::draw_text(buffer, width, height, glyph_x, text_y, &glyph, fg);
+                }
             } else {
-                // Title for unpinned tabs. Pre-truncate so the text
-                // never bleeds onto the next pill.
-                let max_text_px = (pill_w as usize).saturating_sub(12);
+                // Favicon (when present) at the left edge, then title.
+                let icon_size = FAVICON_RENDER_SIZE as i32;
+                let icon_y = start_y as i32 + ((strip_h as i32 - icon_size) / 2);
+                let mut text_x = x + 6;
+                if let Some(fav) = tab.favicon.as_ref() {
+                    blit_favicon(
+                        buffer,
+                        width,
+                        height,
+                        x + 6,
+                        icon_y,
+                        FAVICON_RENDER_SIZE,
+                        FAVICON_RENDER_SIZE,
+                        fav,
+                        bg,
+                    );
+                    text_x = x + 6 + icon_size + 4;
+                }
+                let max_text_px = (pill_w as usize)
+                    .saturating_sub((text_x - x) as usize)
+                    .saturating_sub(6);
                 let label = truncate_to_width(&tab.title, max_text_px);
-                font::draw_text(buffer, width, height, x + 6, text_y, label, fg);
+                font::draw_text(buffer, width, height, text_x, text_y, label, fg);
             }
 
             // Progress bar across the bottom edge of the pill — hidden
@@ -287,6 +335,78 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
 }
 
 const GUTTER: u32 = 4;
+
+/// Draw `fav` into the rect `(dst_x, dst_y, dst_w, dst_h)` using
+/// nearest-neighbour scaling and a `bg`-coloured backdrop for transparent
+/// pixels. Source pixels are BGRA-packed `0xAARRGGBB`; we composite over
+/// `bg` so antialiased edges read correctly on whichever pill colour the
+/// caller passes in.
+#[allow(clippy::too_many_arguments)]
+fn blit_favicon(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    dst_x: i32,
+    dst_y: i32,
+    dst_w: u32,
+    dst_h: u32,
+    fav: &TabFavicon,
+    bg: u32,
+) {
+    if fav.width == 0 || fav.height == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    let src_w = fav.width as usize;
+    let src_h = fav.height as usize;
+    let dst_w_us = dst_w as usize;
+    let dst_h_us = dst_h as usize;
+    let src_pixels: &[u32] = fav.pixels.as_slice();
+    if src_pixels.len() < src_w * src_h {
+        return;
+    }
+    // Pre-extract the bg channels; reused for every alpha composite.
+    let bg_r = (bg >> 16) & 0xFF;
+    let bg_g = (bg >> 8) & 0xFF;
+    let bg_b = bg & 0xFF;
+    for dy in 0..dst_h_us {
+        let py = dst_y + dy as i32;
+        if py < 0 {
+            continue;
+        }
+        let py = py as usize;
+        if py >= height {
+            break;
+        }
+        let sy = (dy * src_h) / dst_h_us;
+        for dx in 0..dst_w_us {
+            let px = dst_x + dx as i32;
+            if px < 0 {
+                continue;
+            }
+            let px = px as usize;
+            if px >= width {
+                break;
+            }
+            let sx = (dx * src_w) / dst_w_us;
+            let src = src_pixels[sy * src_w + sx];
+            let a = (src >> 24) & 0xFF;
+            // Source alpha is premultiplied (we asked CEF for
+            // PREMULTIPLIED). Composite over the pill bg with
+            // `out = src + bg * (1 - a)`.
+            let sr = (src >> 16) & 0xFF;
+            let sg = (src >> 8) & 0xFF;
+            let sb = src & 0xFF;
+            let inv = 255 - a;
+            let r = (sr + ((bg_r * inv) + 127) / 255).min(255);
+            let g = (sg + ((bg_g * inv) + 127) / 255).min(255);
+            let b = (sb + ((bg_b * inv) + 127) / 255).min(255);
+            let out = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            if let Some(dst) = buffer.get_mut(py * width + px) {
+                *dst = out;
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

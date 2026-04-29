@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use crate::cursor::{CursorState, SharedCursorState};
 use crate::download_notice::DownloadNoticeQueue;
 use crate::edit::EditEventSink;
+use crate::favicon::{FaviconSink, new_favicon_sink};
 use crate::find::FindResultSink;
 use crate::hint::{
     DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
@@ -127,6 +128,9 @@ impl Tab {
 #[derive(Debug, Clone)]
 pub struct TabSummary {
     pub id: TabId,
+    /// CEF `Browser::identifier()`. Lets the apps layer correlate this
+    /// tab with browser-id-keyed sinks (favicon downloads, cursor state).
+    pub browser_id: i32,
     pub title: String,
     pub url: String,
     pub progress: f32,
@@ -262,6 +266,10 @@ pub struct BrowserHost {
     /// on the CEF IO thread, read by the apps layer each tick to forward into
     /// `winit::Window::set_cursor`.
     cursor_state: SharedCursorState,
+    /// Decoded favicon bitmaps keyed by CEF browser id. Pushed by
+    /// `BuffrDownloadImageCallback` after a `download_image` round-trip;
+    /// drained by the apps layer each tick to populate the tab strip.
+    favicon_sink: FaviconSink,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -421,6 +429,7 @@ impl BrowserHost {
             popup_address_sink: Arc::new(Mutex::new(VecDeque::new())),
             popup_title_sink: Arc::new(Mutex::new(VecDeque::new())),
             cursor_state: Arc::new(CursorState::new()),
+            favicon_sink: new_favicon_sink(),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -571,6 +580,12 @@ impl BrowserHost {
     /// `Window::set_cursor`.
     pub fn cursor_state(&self) -> SharedCursorState {
         self.cursor_state.clone()
+    }
+
+    /// Clone the shared favicon sink. Apps drain it each tick to refresh the
+    /// per-tab favicon cache.
+    pub fn favicon_sink(&self) -> FaviconSink {
+        self.favicon_sink.clone()
     }
 
     /// Install a wake callback fired from `OsrPaintHandler::on_paint`
@@ -1184,6 +1199,7 @@ impl BrowserHost {
             self.popup_close_sink.clone(),
             self.popup_browsers_arc(),
             self.cursor_state.clone(),
+            self.favicon_sink.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -1313,6 +1329,7 @@ impl BrowserHost {
     fn summarize(&self, t: &Tab) -> TabSummary {
         TabSummary {
             id: t.id,
+            browser_id: t.browser.identifier(),
             title: t.display_title(),
             url: t.url.clone(),
             progress: t.progress,
@@ -2326,6 +2343,7 @@ mod tests {
     fn tab_summary_carries_pinned_and_private_flags() {
         let summary = TabSummary {
             id: TabId(7),
+            browser_id: 0,
             title: "x".into(),
             url: "https://x".into(),
             progress: 1.0,
