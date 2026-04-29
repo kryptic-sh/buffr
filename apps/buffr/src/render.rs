@@ -104,9 +104,12 @@ pub struct OsrUpload<'a> {
     pub dst_rect: (u32, u32, u32, u32),
 }
 
-/// Holds the OSR GPU texture and its upload state.
-struct OsrTexture {
+/// One slot of the OSR double-buffer — texture + view + bind_group at
+/// a single resolution.
+struct OsrSlot {
+    #[allow(dead_code)]
     texture: wgpu::Texture,
+    #[allow(dead_code)]
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     width: u32,
@@ -114,7 +117,33 @@ struct OsrTexture {
     last_generation: u64,
 }
 
-impl OsrTexture {
+/// OSR GPU state: a `current` slot that receives uploads, and an optional
+/// `previous` slot retained briefly after a dimension change.
+///
+/// When CEF emits its first `on_paint` at a new size (typically right
+/// after our deferred `was_resized`), Chromium hasn't always finished
+/// compositing the new-dim viewport yet — parts of the buffer can be
+/// zero-filled (visible as black bars at the edges of the CEF region).
+/// To paper over that single transition frame, we keep the previous
+/// fully-composited slot for `HOLD_PREVIOUS_PAINTS` upcoming paints
+/// and sample from it (stretched to the new browser_rect) instead of
+/// the freshly-uploaded but incomplete `current`. After that window we
+/// drop `previous` and resume sampling `current`.
+struct OsrTexture {
+    current: OsrSlot,
+    previous: Option<OsrSlot>,
+    /// Number of paints remaining where we should sample `previous`
+    /// instead of `current`. Set on every dim change, decremented in
+    /// `tick_after_render`.
+    hold_previous_paints: u32,
+}
+
+/// How many paints to sample the previous slot before promoting the new
+/// one. Two seems to be enough on Chromium 147 to cover the layout +
+/// composite churn after `was_resized`.
+const HOLD_PREVIOUS_PAINTS: u32 = 2;
+
+impl OsrSlot {
     fn new(
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
@@ -136,32 +165,7 @@ impl OsrTexture {
         }
     }
 
-    /// Upload new pixels if generation changed or dimensions differ.
-    /// Returns true if the uniform buffer needs updating (dims changed).
-    #[allow(clippy::too_many_arguments)]
-    fn maybe_upload(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        bgl: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        uniform_buf: &wgpu::Buffer,
-        format: wgpu::TextureFormat,
-        upload: &OsrUpload<'_>,
-    ) -> bool {
-        let dims_changed = upload.width != self.width || upload.height != self.height;
-        if dims_changed {
-            let (texture, view) = make_texture(device, upload.width, upload.height, format);
-            self.bind_group = make_bind_group(device, bgl, uniform_buf, &view, sampler);
-            self.texture = texture;
-            self.view = view;
-            self.width = upload.width;
-            self.height = upload.height;
-            self.last_generation = u64::MAX;
-        }
-        if upload.generation == self.last_generation {
-            return dims_changed;
-        }
+    fn upload(&mut self, queue: &wgpu::Queue, upload: &OsrUpload<'_>) {
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.texture,
@@ -182,7 +186,85 @@ impl OsrTexture {
             },
         );
         self.last_generation = upload.generation;
+    }
+}
+
+impl OsrTexture {
+    fn new(
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        uniform_buf: &wgpu::Buffer,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            current: OsrSlot::new(device, bgl, sampler, uniform_buf, format, width, height),
+            previous: None,
+            hold_previous_paints: 0,
+        }
+    }
+
+    /// Upload new pixels if generation changed or dimensions differ.
+    /// On a dim change, the existing slot is moved into `previous` and
+    /// a fresh slot is allocated at the new dims. Returns true if the
+    /// uniform buffer needs updating (dims changed).
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        uniform_buf: &wgpu::Buffer,
+        format: wgpu::TextureFormat,
+        upload: &OsrUpload<'_>,
+    ) -> bool {
+        let dims_changed =
+            upload.width != self.current.width || upload.height != self.current.height;
+        if dims_changed {
+            let new_slot = OsrSlot::new(
+                device,
+                bgl,
+                sampler,
+                uniform_buf,
+                format,
+                upload.width,
+                upload.height,
+            );
+            // Retire the old slot — we'll keep sampling it for a couple
+            // paints while CEF finishes composing at the new dims.
+            let old = std::mem::replace(&mut self.current, new_slot);
+            self.previous = Some(old);
+            self.hold_previous_paints = HOLD_PREVIOUS_PAINTS;
+        }
+        if upload.generation != self.current.last_generation {
+            self.current.upload(queue, upload);
+        }
         dims_changed
+    }
+
+    /// Bind group to sample for this paint. Returns the previous slot's
+    /// while we're holding off on the freshly-resized current.
+    fn sample_bind_group(&self) -> &wgpu::BindGroup {
+        if self.hold_previous_paints > 0
+            && let Some(prev) = &self.previous
+        {
+            return &prev.bind_group;
+        }
+        &self.current.bind_group
+    }
+
+    /// Advance the post-resize hold window. Call once per paint after
+    /// the draw call has been recorded.
+    fn tick_after_render(&mut self) {
+        if self.hold_previous_paints > 0 {
+            self.hold_previous_paints -= 1;
+            if self.hold_previous_paints == 0 {
+                self.previous = None;
+            }
+        }
     }
 }
 
@@ -668,7 +750,7 @@ impl Renderer {
             // OSR quad — opaque, underneath chrome.
             if has_osr && let Some(ref osr_tex) = self.osr {
                 rpass.set_pipeline(&self.pipeline_osr);
-                rpass.set_bind_group(0, &osr_tex.bind_group, &[]);
+                rpass.set_bind_group(0, osr_tex.sample_bind_group(), &[]);
                 rpass.draw(0..6, 0..1);
             }
 
@@ -676,6 +758,13 @@ impl Renderer {
             rpass.set_pipeline(&self.pipeline_chrome);
             rpass.set_bind_group(0, &self.chrome_bind_group, &[]);
             rpass.draw(0..6, 0..1);
+        }
+
+        // Advance the OSR post-resize hold window. After this paint we
+        // either drop `previous` (if the hold expired) or keep it for
+        // another paint.
+        if let Some(osr_tex) = self.osr.as_mut() {
+            osr_tex.tick_after_render();
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
