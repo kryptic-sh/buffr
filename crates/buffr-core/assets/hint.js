@@ -50,7 +50,10 @@
             'box-shadow:0 1px 2px rgba(0,0,0,0.4);' +
             'text-transform:lowercase;' +
             '}' +
-            '.' + CLASS + '.buffr-hint-typed{opacity:0.4;}' +
+            '.' + CLASS + ' .buffr-hint-typed-prefix{' +
+            'opacity:0.45;' +
+            'text-decoration:line-through;' +
+            '}' +
             '.' + CLASS + '.buffr-hint-hidden{display:none !important;}';
         (document.head || document.documentElement).appendChild(s);
     }
@@ -136,16 +139,21 @@
         for (var k = 0; k < overlays.length; k++) {
             var ov = overlays[k];
             var lab = ov.dataset.buffrHintLabel || '';
-            if (typed && lab.indexOf(typed) === 0) {
+            if (!typed) {
                 ov.classList.remove('buffr-hint-hidden');
-                if (typed.length > 0) {
-                    ov.classList.add('buffr-hint-typed');
-                } else {
-                    ov.classList.remove('buffr-hint-typed');
-                }
-            } else if (!typed) {
+                ov.textContent = lab;
+            } else if (lab.indexOf(typed) === 0) {
                 ov.classList.remove('buffr-hint-hidden');
-                ov.classList.remove('buffr-hint-typed');
+                // Strike-through the typed prefix so the user sees how
+                // far they've narrowed the label without losing the
+                // remaining hint chars they still need to press.
+                var prefix = document.createElement('span');
+                prefix.className = 'buffr-hint-typed-prefix';
+                prefix.textContent = lab.slice(0, typed.length);
+                var rest = document.createTextNode(lab.slice(typed.length));
+                ov.textContent = '';
+                ov.appendChild(prefix);
+                ov.appendChild(rest);
             } else {
                 ov.classList.add('buffr-hint-hidden');
             }
