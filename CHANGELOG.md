@@ -8,7 +8,60 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-29
+
+First tagged release. Multi-tab browsing with OAuth-capable popups, modal vim
+keybindings, GPU-accelerated chrome compositor, and per-origin data layers
+(history / bookmarks / downloads / permissions / zoom) all wired and persisted.
+
+### Added
+
+- **Popup windows.** `window.open(...)` and other `NEW_POPUP` / `NEW_WINDOW`
+  dispositions now render in a dedicated buffr winit window with a read-only
+  address-bar strip at top (no tab strip, no statusline). Preserves CEF's native
+  `window.opener` reference so OAuth flows that `postMessage` back to the opener
+  work end-to-end. Multiple concurrent popups supported, each with its own
+  browser, history, and lifecycle. JS-driven `window.close()` and opener-driven
+  `popup.close()` shut the popup window down cleanly.
+- **Two-finger horizontal swipe → back / forward.** Touchpad PixelDelta events
+  accumulate horizontally; once the gesture crosses 150 px while staying ≥ 2×
+  more horizontal than vertical, fire HistoryBack (swipe right) or
+  HistoryForward (swipe left). Works in the main window and in popup windows;
+  popups navigate their own browser history.
+- **`target="_blank"` and Ctrl+click open in new tabs.** Disposition-aware
+  `LifeSpanHandler::on_before_popup` plus a new
+  `RequestHandler::on_open_urlfrom_tab` route `NEW_FOREGROUND_TAB` /
+  `NEW_BACKGROUND_TAB` through our tab queue while leaving popup dispositions to
+  CEF's native handling.
+
+### Fixed
+
+- **Wayland top-edge resize artifacts.** Eliminated black bars / bottom-bar gap
+  during interactive top-edge drags on Hyprland. CEF is notified on every winit
+  `Resized` event (no debounce); the renderer GPU-stretches whatever frame CEF
+  most recently emitted to fill the live browser_rect.
+- **Popup focus on click.** Wayland doesn't reliably emit `WindowEvent::Focused`
+  on click, so we explicitly call `set_focus(true)` on the popup's CEF browser
+  when a press lands inside the OSR content area, ensuring DOM caret state and
+  keyboard input route correctly.
+- **Popup scroll speed.** Popup wheel handler now uses the same
+  `winit_wheel_to_cef_delta` helper as the main window (10× scale on PixelDelta)
+  so touchpad scrolling feels identical across windows.
+
 ### Changed
+
+- **Resize pipeline simplified.** Dropped ~145 LOC of debounce / throttle /
+  double-slot logic. Single OSR texture, GPU-stretched on dim mismatch, CEF told
+  the size on every Resized event.
+
+### Documentation
+
+- Workspace READMEs polished to match the hjkl reference style: per-crate
+  badges, public-API tables, architecture overviews. New READMEs for
+  `apps/buffr`, `apps/buffr-helper`, `buffr-config`, `buffr-core`,
+  `buffr-modal`, and `buffr-ui`.
+
+### Changed (workspace deps)
 
 - Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.25` to
   `=0.0.26`. Pulls in hjkl Phase 5 trait extraction (`spec::*` re-exports,
@@ -72,6 +125,6 @@ and this project adheres to
   not implement a fold provider and consumes only editor-level APIs, so this is
   a transparent pin bump — no source changes required.
 - Bump `hjkl-engine` and `hjkl-buffer` workspace pins from `=0.0.38` to
-  `=0.0.39` — adds `Query::dirty_gen` for cache invalidation on the syntax
-  query layer. Buffr consumes only editor-level APIs, so this is a transparent
-  pin bump — no source changes required.
+  `=0.0.39` — adds `Query::dirty_gen` for cache invalidation on the syntax query
+  layer. Buffr consumes only editor-level APIs, so this is a transparent pin
+  bump — no source changes required.
