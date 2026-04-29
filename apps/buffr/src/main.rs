@@ -93,8 +93,7 @@ struct PopupWindow {
     frame: SharedOsrFrame,
     #[allow(dead_code)]
     view: SharedOsrViewState,
-    /// URL shown in the popup's address bar. Updated when CEF's
-    /// `on_address_change` fires for this browser (Phase 3).
+    /// URL shown in the popup's address bar. Updated by CEF `on_address_change`.
     url: String,
     /// Generation of the last OSR frame we composited.
     last_osr_generation: u64,
@@ -104,6 +103,16 @@ struct PopupWindow {
     chrome_generation: u64,
     /// Chrome generation at the last GPU upload.
     last_painted_chrome_gen: u64,
+    /// Last cursor position in window coordinates (adjusted for address bar).
+    cursor: (i32, i32),
+    /// CEF bitmask of mouse buttons currently held.
+    mouse_buttons: u32,
+    /// Winit modifier state for this popup's events.
+    modifiers: ModifiersState,
+    /// Click state for double-click detection.
+    last_click_at: Instant,
+    last_click_button: Option<cef::MouseButtonType>,
+    click_count: i32,
 }
 
 #[derive(Parser, Debug)]
@@ -3547,20 +3556,21 @@ impl AppState {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        let browser_id = self
+            .popups
+            .get(&window_id)
+            .map(|p| p.browser_id)
+            .unwrap_or(-1);
+
         match event {
             WindowEvent::CloseRequested => {
-                let browser_id = self
-                    .popups
-                    .get(&window_id)
-                    .map(|p| p.browser_id)
-                    .unwrap_or(-1);
                 debug!(browser_id, "popup: CloseRequested");
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
                     host.popup_close(browser_id);
                 }
-                // Remove immediately; CEF on_before_close will also drain
+                // Remove immediately; CEF on_before_close also drains
                 // popup_close_sink on the next about_to_wait tick.
                 self.popup_window_id_by_browser.remove(&browser_id);
                 self.popups.remove(&window_id);
@@ -3569,11 +3579,6 @@ impl AppState {
                 self.paint_popup_window(window_id);
             }
             WindowEvent::Resized(new_size) => {
-                let browser_id = self
-                    .popups
-                    .get(&window_id)
-                    .map(|p| p.browser_id)
-                    .unwrap_or(-1);
                 if browser_id >= 0 {
                     let w = new_size.width.max(1);
                     let h = new_size.height.max(1);
@@ -3585,6 +3590,131 @@ impl AppState {
                     }
                 }
                 self.paint_popup_window(window_id);
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                if let Some(popup) = self.popups.get_mut(&window_id) {
+                    popup.modifiers = mods.state();
+                }
+            }
+            WindowEvent::Focused(focused) => {
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    host.popup_osr_focus(browser_id, focused);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let mods = self
+                    .popups
+                    .get(&window_id)
+                    .map(|p| winit_mods_to_cef(&p.modifiers))
+                    .unwrap_or(0);
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    // Simulate mouse leave by moving to (0,0) outside the
+                    // browser rect — same pattern as main window CursorLeft.
+                    host.popup_osr_mouse_move(browser_id, 0, 0, mods);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(popup) = self.popups.get_mut(&window_id) else {
+                    return;
+                };
+                let bar_h = STATUSLINE_HEIGHT as i32;
+                let bx = position.x as i32;
+                // Cursor y relative to the content area (below address bar).
+                let by = (position.y as i32).saturating_sub(bar_h);
+                popup.cursor = (bx, by);
+                let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    host.popup_osr_mouse_move(browser_id, bx, by, mods);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                use winit::event::ElementState::Pressed;
+                let Some(popup) = self.popups.get_mut(&window_id) else {
+                    return;
+                };
+                let Some(cef_button) = winit_button_to_cef(&button) else {
+                    return;
+                };
+                let mouse_up = state != Pressed;
+                let btn_flag: u32 = if cef_button == MouseButtonType::LEFT {
+                    16
+                } else if cef_button == MouseButtonType::MIDDLE {
+                    32
+                } else {
+                    64
+                };
+                if mouse_up {
+                    popup.mouse_buttons &= !btn_flag;
+                } else {
+                    popup.mouse_buttons |= btn_flag;
+                }
+                let now = Instant::now();
+                if !mouse_up {
+                    let same = popup
+                        .last_click_button
+                        .map(|b| b == cef_button)
+                        .unwrap_or(false);
+                    if same && now.duration_since(popup.last_click_at) < DOUBLE_CLICK_WINDOW {
+                        popup.click_count = (popup.click_count + 1).min(3);
+                    } else {
+                        popup.click_count = 1;
+                    }
+                    popup.last_click_at = now;
+                    popup.last_click_button = Some(cef_button);
+                }
+                let (bx, by) = popup.cursor;
+                let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
+                let click_count = popup.click_count;
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    host.popup_osr_mouse_click(
+                        browser_id,
+                        bx,
+                        by,
+                        cef_button,
+                        mouse_up,
+                        click_count,
+                        mods,
+                    );
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                use winit::event::MouseScrollDelta;
+                let Some(popup) = self.popups.get(&window_id) else {
+                    return;
+                };
+                let (bx, by) = popup.cursor;
+                let mods = winit_mods_to_cef(&popup.modifiers);
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ((x * 120.0) as i32, (y * 120.0) as i32),
+                    MouseScrollDelta::PixelDelta(px) => (px.x as i32, px.y as i32),
+                };
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    host.popup_osr_mouse_wheel(browser_id, bx, by, dx, dy, mods);
+                }
+            }
+            WindowEvent::KeyboardInput { event: key_ev, .. } => {
+                let Some(popup) = self.popups.get(&window_id) else {
+                    return;
+                };
+                let mods = winit_mods_to_cef(&popup.modifiers);
+                let events = winit_key_to_cef_events(&key_ev, mods);
+                if let Some(host) = self.host.as_ref()
+                    && browser_id >= 0
+                {
+                    for ev in events {
+                        host.popup_osr_key_event(browser_id, ev);
+                    }
+                }
             }
             _ => {}
         }
@@ -4837,6 +4967,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     osr_scratch: Vec::new(),
                     chrome_generation: 1,
                     last_painted_chrome_gen: 0,
+                    cursor: (0, 0),
+                    mouse_buttons: 0,
+                    modifiers: ModifiersState::empty(),
+                    last_click_at: Instant::now(),
+                    last_click_button: None,
+                    click_count: 1,
                 },
             );
         }
@@ -4847,6 +4983,25 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             if let Some(wid) = self.popup_window_id_by_browser.remove(&browser_id) {
                 self.popups.remove(&wid);
                 debug!(browser_id, "popup: window dropped");
+            }
+        }
+
+        // Popup URL updates: drain address-change events for popup browsers
+        // and update the corresponding popup window's URL bar.
+        let popup_addr_changes: Vec<(i32, String)> = if let Some(host) = self.host.as_ref() {
+            host.popup_drain_address_changes()
+        } else {
+            Vec::new()
+        };
+        for (browser_id, url) in popup_addr_changes {
+            if let Some(&wid) = self.popup_window_id_by_browser.get(&browser_id)
+                && let Some(popup) = self.popups.get_mut(&wid)
+                && popup.url != url
+            {
+                popup.url = url.clone();
+                popup.chrome_generation = popup.chrome_generation.wrapping_add(1);
+                popup.window.request_redraw();
+                debug!(browser_id, %url, "popup: URL updated");
             }
         }
 

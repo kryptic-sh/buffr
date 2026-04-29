@@ -248,6 +248,10 @@ pub struct BrowserHost {
     /// so the apps layer doesn't need to hold a `cef::Browser` handle.
     /// Keyed by `browser.identifier()`.
     popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+    /// Address changes for popup browsers that were not matched against
+    /// any tab in `pump_address_changes`. The apps layer drains these
+    /// each tick to update the popup window's URL bar.
+    popup_address_sink: Arc<Mutex<VecDeque<(i32, String)>>>,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -404,6 +408,7 @@ impl BrowserHost {
             popup_create_sink,
             popup_close_sink,
             popup_browsers: Arc::new(Mutex::new(HashMap::new())),
+            popup_address_sink: Arc::new(Mutex::new(VecDeque::new())),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -469,16 +474,40 @@ impl BrowserHost {
             return false;
         };
         let mut changed = false;
+        let mut popup_changes: Vec<(i32, String)> = Vec::new();
         for (browser_id, url) in changes {
+            let mut matched = false;
             for t in tabs.iter_mut() {
                 if t.browser.identifier() == browser_id {
-                    t.url = url;
+                    t.url = url.clone();
                     changed = true;
+                    matched = true;
                     break;
                 }
             }
+            if !matched {
+                popup_changes.push((browser_id, url));
+            }
+        }
+        if !popup_changes.is_empty()
+            && let Ok(mut sink) = self.popup_address_sink.lock()
+        {
+            for entry in popup_changes {
+                sink.push_back(entry);
+            }
         }
         changed
+    }
+
+    /// Drain address-change events for popup browsers (those whose browser
+    /// id did not match any open tab). Called by the apps layer each tick
+    /// to update popup window URL bars.
+    pub fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
+        if let Ok(mut sink) = self.popup_address_sink.lock() {
+            sink.drain(..).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Active tab's CEF zoom level. Returns 0.0 when no active tab —
@@ -574,6 +603,79 @@ impl BrowserHost {
     /// `on_after_created`.
     fn popup_browsers_arc(&self) -> Arc<Mutex<HashMap<i32, cef::Browser>>> {
         self.popup_browsers.clone()
+    }
+
+    // ---- Popup OSR input forwarding ------------------------------------
+
+    /// Forward a mouse-move to a popup browser.
+    pub fn popup_osr_mouse_move(&self, browser_id: i32, x: i32, y: i32, modifiers: u32) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            let event = cef::MouseEvent { x, y, modifiers };
+            host.send_mouse_move_event(Some(&event), 0);
+        }
+    }
+
+    /// Forward a mouse-click to a popup browser.
+    #[allow(clippy::too_many_arguments)]
+    pub fn popup_osr_mouse_click(
+        &self,
+        browser_id: i32,
+        x: i32,
+        y: i32,
+        button: cef::MouseButtonType,
+        mouse_up: bool,
+        click_count: i32,
+        modifiers: u32,
+    ) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            let event = cef::MouseEvent { x, y, modifiers };
+            host.send_mouse_click_event(Some(&event), button, mouse_up as i32, click_count);
+        }
+    }
+
+    /// Forward a mouse-wheel event to a popup browser.
+    pub fn popup_osr_mouse_wheel(
+        &self,
+        browser_id: i32,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: u32,
+    ) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            let event = cef::MouseEvent { x, y, modifiers };
+            host.send_mouse_wheel_event(Some(&event), delta_x, delta_y);
+        }
+    }
+
+    /// Forward a keyboard event to a popup browser.
+    pub fn popup_osr_key_event(&self, browser_id: i32, event: cef::KeyEvent) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            host.send_key_event(Some(&event));
+        }
+    }
+
+    /// Set focus on a popup browser.
+    pub fn popup_osr_focus(&self, browser_id: i32, focused: bool) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+            && let Some(host) = b.host()
+        {
+            host.set_focus(if focused { 1 } else { 0 });
+        }
     }
 
     // ---- OSR input forwarding -------------------------------------------
