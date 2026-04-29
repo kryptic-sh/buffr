@@ -265,11 +265,17 @@ impl Renderer {
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or_else(|| caps.formats[0]);
 
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        // Fifo (vsync, single in-flight buffer) instead of Mailbox.
+        // During top-edge drag on Hyprland the wl_subsurface position was
+        // alternating between correct and ~one-step-old, every other
+        // compositor frame. Mailbox keeps multiple swap-chain images in
+        // flight; on frames where compositor read an image that pre-dated
+        // the latest configure, the parent buffer was at a smaller size
+        // than our set_position assumed and the statusline appeared above
+        // the window bottom with a visible gap. Fifo serializes presents
+        // so compositor only ever sees one buffer per frame, eliminating
+        // the race at the cost of vsync-paced latency.
+        let present_mode = wgpu::PresentMode::Fifo;
         tracing::debug!(?present_mode, "wgpu surface present mode selected");
 
         let config = wgpu::SurfaceConfiguration {
