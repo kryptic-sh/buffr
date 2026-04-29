@@ -600,6 +600,24 @@ impl BrowserHost {
         tracing::debug!(browser_id, width, height, "popup_resize");
     }
 
+    /// Navigate the popup browser back in its own history.
+    pub fn popup_history_back(&self, browser_id: i32) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+        {
+            b.go_back();
+        }
+    }
+
+    /// Navigate the popup browser forward in its own history.
+    pub fn popup_history_forward(&self, browser_id: i32) {
+        if let Ok(browsers) = self.popup_browsers.lock()
+            && let Some(b) = browsers.get(&browser_id)
+        {
+            b.go_forward();
+        }
+    }
+
     /// Request CEF to close a popup browser. The actual teardown is
     /// asynchronous — `on_before_close` → handler deregisters →
     /// `PopupCloseSink` is the cleanup path.

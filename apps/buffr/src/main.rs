@@ -3767,6 +3767,31 @@ impl AppState {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                use winit::event::MouseScrollDelta;
+                // Two-finger horizontal-swipe back/forward — same path
+                // as the main window, routed to the popup's own history.
+                if let MouseScrollDelta::PixelDelta(px) = delta {
+                    if let Some(action) = self.detect_swipe(px.x as f32, px.y as f32) {
+                        if let Some(host) = self.host.as_ref()
+                            && browser_id >= 0
+                        {
+                            match action {
+                                buffr_modal::PageAction::HistoryBack => {
+                                    host.popup_history_back(browser_id);
+                                }
+                                buffr_modal::PageAction::HistoryForward => {
+                                    host.popup_history_forward(browser_id);
+                                }
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
+                    if self.swipe_committed {
+                        return;
+                    }
+                }
+
                 let Some(popup) = self.popups.get(&window_id) else {
                     return;
                 };
