@@ -97,7 +97,7 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::ModifiersState,
-    window::{Window, WindowId},
+    window::{CursorIcon, Window, WindowId},
 };
 
 /// Custom user events sent into the winit loop from background threads.
@@ -2341,6 +2341,35 @@ impl AppState {
         }
     }
 
+    /// Drain CEF cursor changes and forward to winit. CEF emits a new
+    /// `CursorType` whenever the page wants the system cursor to change
+    /// (link hover, text-input hover, resize edge, …); we map it to
+    /// winit's [`CursorIcon`] and call `Window::set_cursor` on the window
+    /// owning the originating browser (main tab or popup). Last writer
+    /// wins — coalescing is desirable since CEF can fire many times per
+    /// frame as the cursor moves.
+    fn pump_cursor_changes(&self) {
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        let Some((browser_id, raw)) = host.cursor_state().take() else {
+            return;
+        };
+        let icon = cef_cursor_type_to_winit(raw);
+        // Popup browsers get their own winit window; route by browser id.
+        if let Some(&wid) = self.popup_window_id_by_browser.get(&browser_id)
+            && let Some(popup) = self.popups.get(&wid)
+        {
+            popup.window.set_cursor(icon);
+            return;
+        }
+        // Otherwise treat as main-window event (active tab or
+        // unidentified — `-1` from a synthetic event).
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor(icon);
+        }
+    }
+
     /// Drain the find-result mailbox into the statusline. Called from
     /// `about_to_wait` so the chrome reflects the latest CEF tick on
     /// the next paint.
@@ -4021,6 +4050,96 @@ fn winit_wheel_to_cef_delta(delta: &winit::event::MouseScrollDelta) -> (i32, i32
     }
 }
 
+/// Map a CEF `CursorType` raw discriminant to a winit [`CursorIcon`].
+///
+/// CEF emits the type via `DisplayHandler::on_cursor_change` whenever the
+/// page wants the system cursor to update (link hover → hand, input hover
+/// → ibeam, resize edge → corresponding resize arrow, …). The raw value is
+/// `CursorType::get_raw()` — kept opaque here so buffr-core stays free of
+/// winit deps.
+///
+/// Unknown / unimplemented variants fall back to [`CursorIcon::Default`].
+fn cef_cursor_type_to_winit(raw: u32) -> CursorIcon {
+    use cef::sys::cef_cursor_type_t as T;
+    let v = raw as i32;
+    if v == T::CT_POINTER as i32 {
+        CursorIcon::Default
+    } else if v == T::CT_CROSS as i32 {
+        CursorIcon::Crosshair
+    } else if v == T::CT_HAND as i32 {
+        CursorIcon::Pointer
+    } else if v == T::CT_IBEAM as i32 {
+        CursorIcon::Text
+    } else if v == T::CT_WAIT as i32 {
+        CursorIcon::Wait
+    } else if v == T::CT_HELP as i32 {
+        CursorIcon::Help
+    } else if v == T::CT_EASTRESIZE as i32 {
+        CursorIcon::EResize
+    } else if v == T::CT_NORTHRESIZE as i32 {
+        CursorIcon::NResize
+    } else if v == T::CT_NORTHEASTRESIZE as i32 {
+        CursorIcon::NeResize
+    } else if v == T::CT_NORTHWESTRESIZE as i32 {
+        CursorIcon::NwResize
+    } else if v == T::CT_SOUTHRESIZE as i32 {
+        CursorIcon::SResize
+    } else if v == T::CT_SOUTHEASTRESIZE as i32 {
+        CursorIcon::SeResize
+    } else if v == T::CT_SOUTHWESTRESIZE as i32 {
+        CursorIcon::SwResize
+    } else if v == T::CT_WESTRESIZE as i32 {
+        CursorIcon::WResize
+    } else if v == T::CT_NORTHSOUTHRESIZE as i32 {
+        CursorIcon::NsResize
+    } else if v == T::CT_EASTWESTRESIZE as i32 {
+        CursorIcon::EwResize
+    } else if v == T::CT_NORTHEASTSOUTHWESTRESIZE as i32 {
+        CursorIcon::NeswResize
+    } else if v == T::CT_NORTHWESTSOUTHEASTRESIZE as i32 {
+        CursorIcon::NwseResize
+    } else if v == T::CT_COLUMNRESIZE as i32 {
+        CursorIcon::ColResize
+    } else if v == T::CT_ROWRESIZE as i32 {
+        CursorIcon::RowResize
+    } else if v == T::CT_MOVE as i32 {
+        CursorIcon::Move
+    } else if v == T::CT_VERTICALTEXT as i32 {
+        CursorIcon::VerticalText
+    } else if v == T::CT_CELL as i32 {
+        CursorIcon::Cell
+    } else if v == T::CT_CONTEXTMENU as i32 {
+        CursorIcon::ContextMenu
+    } else if v == T::CT_ALIAS as i32 {
+        CursorIcon::Alias
+    } else if v == T::CT_PROGRESS as i32 {
+        CursorIcon::Progress
+    } else if v == T::CT_NODROP as i32 || v == T::CT_NOTALLOWED as i32 {
+        CursorIcon::NotAllowed
+    } else if v == T::CT_COPY as i32 || v == T::CT_DND_COPY as i32 {
+        CursorIcon::Copy
+    } else if v == T::CT_NONE as i32 {
+        // winit has no "hide cursor" CursorIcon variant; closest match.
+        CursorIcon::Default
+    } else if v == T::CT_ZOOMIN as i32 {
+        CursorIcon::ZoomIn
+    } else if v == T::CT_ZOOMOUT as i32 {
+        CursorIcon::ZoomOut
+    } else if v == T::CT_GRAB as i32 {
+        CursorIcon::Grab
+    } else if v == T::CT_GRABBING as i32 {
+        CursorIcon::Grabbing
+    } else if v == T::CT_DND_NONE as i32 {
+        CursorIcon::NotAllowed
+    } else if v == T::CT_DND_MOVE as i32 {
+        CursorIcon::Move
+    } else if v == T::CT_DND_LINK as i32 {
+        CursorIcon::Alias
+    } else {
+        CursorIcon::Default
+    }
+}
+
 /// Convert winit `ModifiersState` to CEF event-flag bits.
 ///
 /// CEF bit values (from cef_dll_sys `cef_event_flags_t`):
@@ -5170,6 +5289,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             self.last_focused_field = None;
             self.request_redraw();
         }
+
+        // Forward any pending CEF cursor change to winit. Reads the
+        // shared cursor state and calls `Window::set_cursor` once.
+        self.pump_cursor_changes();
 
         // Drain any find result the CEF browser thread posted since
         // the last tick, then check whether the `--find` smoke

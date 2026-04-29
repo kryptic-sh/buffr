@@ -49,6 +49,7 @@ use crate::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters}
 // whole crate. We do the same here.
 use cef::*;
 
+use crate::cursor::SharedCursorState;
 use crate::open_finder::{OsSpawn, open_path};
 use crate::osr::{OsrFrame, OsrViewState, PopupFrameMap};
 use crate::{PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
@@ -82,6 +83,7 @@ pub fn make_client(
     popup_create_sink: PopupCreateSink,
     popup_close_sink: PopupCloseSink,
     popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+    cursor_state: SharedCursorState,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -104,6 +106,7 @@ pub fn make_client(
         popup_create_sink,
         popup_close_sink,
         popup_browsers,
+        cursor_state,
     )
 }
 
@@ -133,6 +136,7 @@ pub fn make_display_handler(
     edit_sink: EditEventSink,
     address_sink: crate::host::AddressSink,
     popup_title_sink: crate::host::AddressSink,
+    cursor_state: SharedCursorState,
 ) -> DisplayHandler {
     BuffrDisplayHandler::new(
         history,
@@ -140,6 +144,7 @@ pub fn make_display_handler(
         edit_sink,
         address_sink,
         popup_title_sink,
+        cursor_state,
     )
 }
 
@@ -379,6 +384,7 @@ wrap_client! {
         popup_create_sink: PopupCreateSink,
         popup_close_sink: PopupCloseSink,
         popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+        cursor_state: SharedCursorState,
     }
 
     impl Client {
@@ -403,6 +409,7 @@ wrap_client! {
                 self.edit_sink.clone(),
                 self.address_sink.clone(),
                 self.popup_title_sink.clone(),
+                self.cursor_state.clone(),
             ))
         }
 
@@ -644,6 +651,9 @@ wrap_display_handler! {
         // popup_title_sink: title changes for popup browsers (browser.is_popup() != 0).
         // Drained by BrowserHost::popup_drain_title_changes each tick.
         popup_title_sink: crate::host::AddressSink,
+        // cursor_state: latest CEF cursor request. Drained by the apps layer
+        // each tick and forwarded to winit's `Window::set_cursor`.
+        cursor_state: SharedCursorState,
     }
 
     impl DisplayHandler {
@@ -697,6 +707,23 @@ wrap_display_handler! {
             if let Err(err) = self.history.update_latest_title(&url, &title_str) {
                 tracing::warn!(error = %err, %url, "history: update_latest_title failed");
             }
+        }
+
+        fn on_cursor_change(
+            &self,
+            browser: Option<&mut Browser>,
+            _cursor: ::std::os::raw::c_ulong,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> ::std::os::raw::c_int {
+            // Forward the semantic cursor type + originating browser id to
+            // the apps layer; ignore the raw OS handle (`cursor`) and any
+            // custom-cursor bitmap. winit's `CursorIcon` covers everything
+            // Chromium hands us. Browser id lets the apps layer route to
+            // the right winit window (main tab vs popup).
+            let browser_id = browser.map(|b| b.identifier()).unwrap_or(-1);
+            self.cursor_state.store(browser_id, type_.get_raw());
+            0
         }
 
         fn on_console_message(

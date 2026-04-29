@@ -16,6 +16,7 @@ use thiserror::Error;
 pub mod app;
 pub mod cmdline;
 pub mod crash;
+pub mod cursor;
 pub mod download_notice;
 pub mod edit;
 pub mod find;
@@ -39,6 +40,7 @@ pub use app::{
     take_scheduled_message_pump_delay_ms,
 };
 pub use crash::{CrashError, CrashReport, CrashReporter};
+pub use cursor::{CursorState, SharedCursorState};
 pub use download_notice::{
     DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue, expire_stale as expire_stale_notices,
     new_queue as new_download_notice_queue, peek_front as peek_download_notice,

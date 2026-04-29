@@ -33,6 +33,7 @@ use cef::{
 use raw_window_handle::RawWindowHandle;
 use tracing::{info, warn};
 
+use crate::cursor::{CursorState, SharedCursorState};
 use crate::download_notice::DownloadNoticeQueue;
 use crate::edit::EditEventSink;
 use crate::find::FindResultSink;
@@ -257,6 +258,10 @@ pub struct BrowserHost {
     /// when `browser.is_popup() != 0`. The apps layer drains these each
     /// tick to update the popup window's winit title.
     popup_title_sink: Arc<Mutex<VecDeque<(i32, String)>>>,
+    /// Latest CEF cursor request. Written by `BuffrDisplayHandler::on_cursor_change`
+    /// on the CEF IO thread, read by the apps layer each tick to forward into
+    /// `winit::Window::set_cursor`.
+    cursor_state: SharedCursorState,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -415,6 +420,7 @@ impl BrowserHost {
             popup_browsers: Arc::new(Mutex::new(HashMap::new())),
             popup_address_sink: Arc::new(Mutex::new(VecDeque::new())),
             popup_title_sink: Arc::new(Mutex::new(VecDeque::new())),
+            cursor_state: Arc::new(CursorState::new()),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -558,6 +564,13 @@ impl BrowserHost {
     /// the CEF IO thread reads them inside `view_rect`.
     pub fn osr_view(&self) -> SharedOsrViewState {
         self.osr_view.clone()
+    }
+
+    /// Clone the shared cursor state. Apps drain it each tick (or on cursor
+    /// movement) and forward the latest CEF cursor request into winit's
+    /// `Window::set_cursor`.
+    pub fn cursor_state(&self) -> SharedCursorState {
+        self.cursor_state.clone()
     }
 
     /// Install a wake callback fired from `OsrPaintHandler::on_paint`
@@ -1170,6 +1183,7 @@ impl BrowserHost {
             self.popup_create_sink.clone(),
             self.popup_close_sink.clone(),
             self.popup_browsers_arc(),
+            self.cursor_state.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
