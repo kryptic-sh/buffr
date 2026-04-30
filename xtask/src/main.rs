@@ -29,7 +29,7 @@
 use std::{
     env,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
@@ -410,7 +410,11 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent)?;
         }
-        io::copy(&mut File::open(from)?, &mut File::create(to)?)?;
+        // `fs::copy` preserves Unix mode bits, so a 0o755 binary
+        // (e.g. Contents/MacOS/buffr) stays executable through DMG
+        // staging. The previous `io::copy(&mut File::open, &mut
+        // File::create)` lost +x, shipping a non-executable bundle.
+        fs::copy(from, to)?;
     }
     Ok(())
 }
