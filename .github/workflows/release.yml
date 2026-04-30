@@ -327,10 +327,14 @@ jobs:
         run: |
           set -euo pipefail
           cd flatpak
-          tar xzf buffr-*.tar.gz
-          # Tarball top-level dir is `buffr-<ver>-<arch>/`; rename to
-          # `payload/` so the manifest's source `path: payload` resolves.
-          mv buffr-*-* payload
+          # Extract straight into `payload/` so the manifest's source
+          # `path: payload` resolves. `--strip-components=1` drops the
+          # tarball's top-level `buffr-<ver>-<arch>/` wrapper. Avoids
+          # the `mv buffr-*-*` glob, which also matched the .tar.gz
+          # itself and produced a "target 'payload': No such file" mv
+          # error when given two sources.
+          mkdir payload
+          tar xzf buffr-*.tar.gz -C payload --strip-components=1
 
       - name: Stage icon
         run: |
@@ -402,8 +406,10 @@ jobs:
         run: |
           set -euo pipefail
           cd snap
-          tar xzf buffr-*.tar.gz
-          mv buffr-*-* payload
+          # See flatpak/Stage tarball payload for why we use
+          # --strip-components=1 instead of `mv buffr-*-* payload`.
+          mkdir payload
+          tar xzf buffr-*.tar.gz -C payload --strip-components=1
 
       - name: Pin snap version to tag
         run: |
