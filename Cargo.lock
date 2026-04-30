@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-bin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "buffr-config",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "buffr-core",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-modal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -1582,9 +1582,9 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hjkl-buffer"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd79a9ce3b46366d6d2acbb0953d7ae1c18b95eac5d4579286eb5de6d11e141e"
+checksum = "7b43e1779d6d694a5aecc8d71ca7518661398893e0bc0aa6808145cbe046e716"
 dependencies = [
  "ratatui",
  "regex",
@@ -1593,18 +1593,18 @@ dependencies = [
 
 [[package]]
 name = "hjkl-clipboard"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c572baf756714f8507bd1ecfe32a66f4662835089e0f300933c3260ef66c71b3"
+checksum = "61be6ce563c25766a4334761c21996526b80b97301fff2a66c759f0d69aea30f"
 dependencies = [
  "arboard",
 ]
 
 [[package]]
 name = "hjkl-engine"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7b8f5e32e9fe51bd665a91344d5279890be1569b97d835407f8f273011ac529"
+checksum = "4a55268e80ee18320bcd1e830951190160e62e42d260e64906f9b1f8920f70d9"
 dependencies = [
  "bitflags 2.11.1",
  "crossterm 0.28.1",
@@ -4838,7 +4838,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bzip2",

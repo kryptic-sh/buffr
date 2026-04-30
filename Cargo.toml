@@ -23,7 +23,7 @@ exclude = ["apps/buffr-stub"]
 default-members = ["apps/buffr"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -78,15 +78,15 @@ bytemuck = { version = "1", features = ["derive"] }
 # against GitHub releases. SemVer parsing handles rc/beta suffixes.
 semver = { version = "1", features = ["serde"] }
 
-buffr-core = { path = "crates/buffr-core", version = "=0.1.1" }
-buffr-modal = { path = "crates/buffr-modal", version = "=0.1.1" }
-buffr-ui = { path = "crates/buffr-ui", version = "=0.1.1" }
-buffr-config = { path = "crates/buffr-config", version = "=0.1.1" }
-buffr-history = { path = "crates/buffr-history", version = "=0.1.1" }
-buffr-bookmarks = { path = "crates/buffr-bookmarks", version = "=0.1.1" }
-buffr-downloads = { path = "crates/buffr-downloads", version = "=0.1.1" }
-buffr-zoom = { path = "crates/buffr-zoom", version = "=0.1.1" }
-buffr-permissions = { path = "crates/buffr-permissions", version = "=0.1.1" }
+buffr-core = { path = "crates/buffr-core", version = "0.1" }
+buffr-modal = { path = "crates/buffr-modal", version = "0.1" }
+buffr-ui = { path = "crates/buffr-ui", version = "0.1" }
+buffr-config = { path = "crates/buffr-config", version = "0.1" }
+buffr-history = { path = "crates/buffr-history", version = "0.1" }
+buffr-bookmarks = { path = "crates/buffr-bookmarks", version = "0.1" }
+buffr-downloads = { path = "crates/buffr-downloads", version = "0.1" }
+buffr-zoom = { path = "crates/buffr-zoom", version = "0.1" }
+buffr-permissions = { path = "crates/buffr-permissions", version = "0.1" }
 
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
 # at 0.1 / 0.3 — patch bumps roll in automatically via workspace member
