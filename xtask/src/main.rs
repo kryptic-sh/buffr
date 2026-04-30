@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //!
-//! - `fetch-cef [--platform <linux64|macosarm64|macosx64|windows64>] [--version <X.Y.Z>]`
+//! - `fetch-cef [--platform <linux64|linuxarm64|macosarm64|macosx64|windows64|windowsarm64>] [--version <X.Y.Z>]`
 //!   downloads the CEF Spotify minimal binary distribution matching the `cef`
 //!   crate version (147 by default) and extracts it into
 //!   `vendor/cef/<platform>/`.
@@ -80,10 +80,9 @@ struct CefIndex {
     macosarm64: CefPlatform,
     macosx64: CefPlatform,
     windows64: CefPlatform,
+    windowsarm64: CefPlatform,
     linux64: CefPlatform,
-    #[serde(default)]
-    #[allow(dead_code)]
-    linuxarm64: serde_json::Value,
+    linuxarm64: CefPlatform,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,7 +145,9 @@ fn print_help() {
     println!("COMMANDS:");
     println!("    fetch-cef [--platform|--target PLATFORM] [--version PREFIX]");
     println!("        Download + extract CEF minimal binary distribution.");
-    println!("        PLATFORM: linux64 (default on Linux), macosarm64, macosx64, windows64.");
+    println!(
+        "        PLATFORM: linux64 (default on Linux), linuxarm64, macosarm64, macosx64,\n         windows64, windowsarm64."
+    );
     println!("        PREFIX:   version prefix to match (default: {CEF_VERSION_PREFIX}).");
     println!();
     println!("    bundle-macos [--release] [--target TRIPLE]");
@@ -216,9 +217,11 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
 
     let plat = match platform.as_str() {
         "linux64" => &index.linux64,
+        "linuxarm64" => &index.linuxarm64,
         "macosarm64" => &index.macosarm64,
         "macosx64" => &index.macosx64,
         "windows64" => &index.windows64,
+        "windowsarm64" => &index.windowsarm64,
         other => bail!("unsupported platform `{other}`"),
     };
 
@@ -282,10 +285,51 @@ fn cef_minimal_url(cdn: &str, platform: &str, cef_version: &str) -> String {
     format!("{cdn}/cef_binary_{cef_version}_{platform}_minimal.tar.bz2")
 }
 
+/// Debian package architecture suffix for the host. `dpkg-deb` is
+/// strict about the value matching the `Architecture:` field in
+/// DEBIAN/control.
+fn host_deb_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "unknown"
+    }
+}
+
+/// RPM `ExclusiveArch` value for the host. rpmbuild rejects the build
+/// outright if the spec arch doesn't match the build host.
+fn host_rpm_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    }
+}
+
+/// MSI / WiX architecture token. Plumbed through `{ARCH}` in
+/// `buffr.wxs` and used in the output filename.
+fn host_msi_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "unknown"
+    }
+}
+
 fn host_platform() -> &'static str {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         "linux64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "linuxarm64"
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -295,9 +339,13 @@ fn host_platform() -> &'static str {
     {
         "macosx64"
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "windows64"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        "windowsarm64"
     }
 }
 
@@ -538,7 +586,15 @@ fn resolve_framework_dir(workspace: &Path, platform_override: Option<&str>) -> R
         return Ok(path);
     }
 
-    let platform = platform_override.unwrap_or("macosarm64");
+    // On macOS hosts default to the host architecture; on cross-builds
+    // (Linux runner staging the bundle for CI parity) default to
+    // arm64 since that's the dominant Apple target.
+    let host_default = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "macosx64"
+    } else {
+        "macosarm64"
+    };
+    let platform = platform_override.unwrap_or(host_default);
     let candidate = workspace
         .join("vendor/cef")
         .join(platform)
@@ -985,7 +1041,10 @@ fn build_deb(
     // DEBIAN/{control,postinst,prerm}.
     let debian = debroot.join("DEBIAN");
     fs::create_dir_all(&debian)?;
-    let control = DEB_CONTROL_TEMPLATE.replace("{VERSION}", version);
+    let arch = host_deb_arch();
+    let control = DEB_CONTROL_TEMPLATE
+        .replace("{VERSION}", version)
+        .replace("{ARCH}", arch);
     fs::write(debian.join("control"), control)?;
     let postinst = debian.join("postinst");
     fs::write(&postinst, DEB_POSTINST)?;
@@ -996,7 +1055,7 @@ fn build_deb(
 
     // Invoke dpkg-deb if available. Otherwise leave the staging tree
     // and let CI pick it up.
-    let out = dist_dir.join(format!("buffr-{version}-amd64.deb"));
+    let out = dist_dir.join(format!("buffr-{version}-{arch}.deb"));
     let dpkg = Command::new("which").arg("dpkg-deb").output().ok();
     let dpkg_ok = dpkg.as_ref().map(|o| o.status.success()).unwrap_or(false);
     if !dpkg_ok {
@@ -1063,12 +1122,16 @@ fn build_rpm(
         fs::copy(&icon_src, sources.join("buffr.png"))?;
     }
 
-    // Render and write the spec.
-    let spec = RPM_SPEC_TEMPLATE.replace("{VERSION}", version);
+    // Render and write the spec. ExclusiveArch must match the build
+    // host or rpmbuild aborts with "package x86_64 not in arches".
+    let arch = host_rpm_arch();
+    let spec = RPM_SPEC_TEMPLATE
+        .replace("{VERSION}", version)
+        .replace("{ARCH}", arch);
     let spec_path = specs.join("buffr.spec");
     fs::write(&spec_path, spec)?;
 
-    eprintln!("xtask: rpmbuild -bb -> {}", rpms.join("x86_64").display());
+    eprintln!("xtask: rpmbuild -bb -> {}", rpms.join(arch).display());
     let topdir = rpmroot.canonicalize().unwrap_or(rpmroot.clone());
     let status = Command::new("rpmbuild")
         .arg("-bb")
@@ -1082,10 +1145,9 @@ fn build_rpm(
         return Ok(());
     }
 
-    // rpmbuild deposits at RPMS/x86_64/buffr-<ver>-1.x86_64.rpm — copy
-    // into target/dist/linux/ with the same name pattern as the deb
-    // (buffr-<ver>-x86_64.rpm).
-    let arch_dir = rpms.join("x86_64");
+    // rpmbuild deposits at RPMS/<arch>/buffr-<ver>-1.<arch>.rpm — copy
+    // into target/dist/linux/ with the same name pattern as the deb.
+    let arch_dir = rpms.join(arch);
     let mut found = None;
     if arch_dir.exists() {
         for entry in fs::read_dir(&arch_dir)? {
@@ -1105,7 +1167,7 @@ fn build_rpm(
         return Ok(());
     };
 
-    let out = dist_dir.join(format!("buffr-{version}-x86_64.rpm"));
+    let out = dist_dir.join(format!("buffr-{version}-{arch}.rpm"));
     fs::copy(&src, &out).with_context(|| format!("copy {} -> {}", src.display(), out.display()))?;
     eprintln!("xtask: rpm written to {}", out.display());
     Ok(())
@@ -1363,7 +1425,8 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
 
     // 1. Always write the WiX source first so it's available for
     //    inspection even on a Linux box without the Windows binaries.
-    let wxs = render_wix(&version, "buffr", "x64");
+    let arch = host_msi_arch();
+    let wxs = render_wix(&version, "buffr", arch);
     let wxs_path = dist_dir.join("buffr.wxs");
     fs::write(&wxs_path, &wxs).with_context(|| format!("writing {}", wxs_path.display()))?;
     eprintln!("xtask: wrote {}", wxs_path.display());
@@ -1456,7 +1519,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
         "candle.exe"
     })
     .arg("-arch")
-    .arg("x64")
+    .arg(arch)
     .arg(format!("-dCefPayloadDir={}", cef_payload_dir.display()))
     .arg("-o")
     .arg(format!("{}\\", dist_dir.display()))
@@ -1469,7 +1532,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
         bail!("candle exited {status:?}");
     }
 
-    let msi_path = dist_dir.join(format!("buffr-{version}-x64.msi"));
+    let msi_path = dist_dir.join(format!("buffr-{version}-{arch}.msi"));
     eprintln!("xtask: light -> {}", msi_path.display());
     // ICE38/ICE64/ICE91 all fire because the install is per-user. The
     // strict reading wants every File component to have an HKCU
@@ -1824,11 +1887,14 @@ mod tests {
 
     #[test]
     fn rpm_spec_template_has_required_fields() {
-        let rendered = RPM_SPEC_TEMPLATE.replace("{VERSION}", "1.2.3");
+        let rendered = RPM_SPEC_TEMPLATE
+            .replace("{VERSION}", "1.2.3")
+            .replace("{ARCH}", "x86_64");
         assert!(rendered.contains("Name:           buffr"));
         assert!(rendered.contains("Version:        1.2.3"));
         assert!(rendered.contains("ExclusiveArch:  x86_64"));
         assert!(!rendered.contains("{VERSION}"));
+        assert!(!rendered.contains("{ARCH}"));
         // post-install symlink mirroring deb postinst.
         assert!(rendered.contains("ln -sf /opt/buffr/buffr /usr/local/bin/buffr"));
     }
@@ -1843,11 +1909,14 @@ mod tests {
 
     #[test]
     fn deb_control_template_substitutes_version() {
-        let rendered = DEB_CONTROL_TEMPLATE.replace("{VERSION}", "1.2.3");
+        let rendered = DEB_CONTROL_TEMPLATE
+            .replace("{VERSION}", "1.2.3")
+            .replace("{ARCH}", "amd64");
         assert!(rendered.contains("Version: 1.2.3"));
         assert!(rendered.contains("Package: buffr"));
         assert!(rendered.contains("Architecture: amd64"));
         assert!(!rendered.contains("{VERSION}"));
+        assert!(!rendered.contains("{ARCH}"));
         // The deb depends list is the contract with apt — surface the
         // exact set so accidental edits show up in CI.
         assert!(rendered.contains("libgtk-3-0"));

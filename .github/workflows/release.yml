@@ -19,13 +19,21 @@ concurrency:
 
 jobs:
   linux:
-    name: linux package (deb + rpm)
-    runs-on: ubuntu-latest
+    name: linux package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux64
+          - runner: ubuntu-24.04-arm
+            platform: linuxarm64
     env:
-      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -60,16 +68,16 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: linux-release
+          shared-key: linux-release-${{ matrix.platform }}
 
       - name: Cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
 
       - name: Fetch CEF
-        run: cargo xtask fetch-cef
+        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: Package Linux (deb + rpm)
         run: cargo xtask package-linux --release --variant all
@@ -103,11 +111,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   macos:
-    name: macOS package (.dmg)
-    runs-on: macos-latest
+    name: macOS package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            platform: macosarm64
+          - runner: macos-13
+            platform: macosx64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -128,16 +144,16 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-release
+          shared-key: macos-release-${{ matrix.platform }}
 
       - name: Cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: Fetch CEF (macosarm64)
-        run: cargo xtask fetch-cef --target macosarm64
+      - name: Fetch CEF (${{ matrix.platform }})
+        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: Bundle macOS .app
         run: cargo xtask bundle-macos --release
@@ -176,11 +192,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   windows:
-    name: Windows package (MSI)
-    runs-on: windows-latest
+    name: Windows package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows64
+            rust_target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windowsarm64
+            rust_target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
         with:
@@ -197,11 +223,13 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: windows-release
+          shared-key: windows-release-${{ matrix.platform }}
 
       - name: Install WiX 3 toolset
         run: choco install -y wixtoolset
@@ -215,10 +243,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-windows64-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: Fetch CEF (windows64)
-        run: cargo xtask fetch-cef --target windows64
+      - name: Fetch CEF (${{ matrix.platform }})
+        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: Build binaries (release)
         run: cargo build --release -p buffr-bin -p buffr-helper

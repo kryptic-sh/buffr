@@ -230,11 +230,23 @@ jobs:
     # signing in this round — Phase 6 release pipeline takes that over.
     # The job verifies the bundle scripts produce installable artifacts
     # and that `dpkg-deb -I` / `rpm -qpi` parse the resulting metadata.
-    name: linux package (deb + rpm + AUR)
-    runs-on: ubuntu-latest
+    name: linux package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linuxarm64
+            deb_arch: arm64
+            rpm_arch: aarch64
     env:
-      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -259,16 +271,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: linux-build
+          shared-key: linux-package-${{ matrix.platform }}
 
       - name: cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
 
       - name: fetch CEF
-        run: cargo xtask fetch-cef
+        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: cargo xtask package-linux (release)
         run: cargo xtask package-linux --release --variant all
@@ -280,7 +292,7 @@ jobs:
         run: |
           set -e
           shopt -s nullglob
-          debs=(target/dist/linux/buffr-*-amd64.deb)
+          debs=(target/dist/linux/buffr-*-${{ matrix.deb_arch }}.deb)
           if [ ${#debs[@]} -eq 0 ]; then
             echo "::error::no .deb produced"
             exit 1
@@ -293,7 +305,7 @@ jobs:
         run: |
           set -e
           shopt -s nullglob
-          rpms=(target/dist/linux/buffr-*-x86_64.rpm)
+          rpms=(target/dist/linux/buffr-*-${{ matrix.rpm_arch }}.rpm)
           if [ ${#rpms[@]} -eq 0 ]; then
             echo "::error::no .rpm produced"
             exit 1
@@ -316,10 +328,18 @@ jobs:
     # of the linux job — a CEF download failure here does not gate
     # main. Unsigned this round; signing + notarization land in the
     # eventual release.yml workflow.
-    name: macOS package (.app + .dmg)
-    runs-on: macos-latest
+    name: macOS package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            platform: macosarm64
+          - runner: macos-13
+            platform: macosx64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -330,16 +350,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-build
+          shared-key: macos-build-${{ matrix.platform }}
 
       - name: cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: fetch CEF (macosarm64)
-        run: cargo xtask fetch-cef --target macosarm64
+      - name: fetch CEF (${{ matrix.platform }})
+        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: cargo xtask bundle-macos
         run: cargo xtask bundle-macos --release
@@ -364,7 +384,7 @@ jobs:
       - name: upload dmg
         uses: actions/upload-artifact@v7
         with:
-          name: buffr-macos-dmg
+          name: buffr-macos-dmg-${{ matrix.platform }}
           path: target/dist/macos/buffr-*.dmg
           if-no-files-found: error
           retention-days: 14
@@ -375,10 +395,20 @@ jobs:
     # explicitly via choco to lock the version. Independent of the
     # linux job — a CEF download failure here does not gate main.
     # Unsigned this round; Authenticode signing lives in release.yml.
-    name: Windows package (MSI)
-    runs-on: windows-latest
+    name: Windows package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows64
+            rust_target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windowsarm64
+            rust_target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
         with:
@@ -386,10 +416,12 @@ jobs:
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: windows-build
+          shared-key: windows-build-${{ matrix.platform }}
 
       - name: install WiX 3 toolset
         run: choco install -y wixtoolset
@@ -405,10 +437,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-windows64-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: fetch CEF (windows64)
-        run: cargo xtask fetch-cef --target windows64
+      - name: fetch CEF (${{ matrix.platform }})
+        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: cargo build (release)
         run: cargo build --release -p buffr-bin -p buffr-helper
@@ -433,7 +465,7 @@ jobs:
       - name: upload msi
         uses: actions/upload-artifact@v7
         with:
-          name: buffr-windows-msi
+          name: buffr-windows-msi-${{ matrix.platform }}
           path: target/dist/windows/buffr-*.msi
           if-no-files-found: error
           retention-days: 14

@@ -5,7 +5,7 @@ Summary:        Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
 
 License:        MIT
 URL:            https://buffr.kryptic.sh/
-ExclusiveArch:  x86_64
+ExclusiveArch:  {ARCH}
 
 # Runtime libraries (Fedora package names, mirroring debian/control).
 Requires:       gtk3
