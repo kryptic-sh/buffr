@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   linux:
-    name: linux package (AppImage + deb)
+    name: linux package (deb)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -51,7 +51,7 @@ jobs:
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
-            libfuse2 dpkg dpkg-dev fakeroot file libxml2-utils
+            dpkg dpkg-dev fakeroot file libxml2-utils
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -67,17 +67,11 @@ jobs:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: Cache appimagetool
-        uses: actions/cache@v5
-        with:
-          path: vendor/appimagetool
-          key: appimagetool-x86_64-continuous
-
       - name: Fetch CEF
         run: cargo xtask fetch-cef
 
-      - name: Package Linux (AppImage + deb)
-        run: cargo xtask package-linux --release --variant all
+      - name: Package Linux (deb)
+        run: cargo xtask package-linux --release --variant deb
 
       - name: List artifacts
         run: ls -la target/dist/linux/
@@ -87,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           cd target/dist/linux
-          for f in buffr-*.AppImage buffr-*.deb; do
+          for f in buffr-*.deb; do
             [ -e "$f" ] || continue
             sha256sum "$f" > "$f.sha256"
             echo "sha256: $(cat "$f.sha256")"
@@ -97,8 +91,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            target/dist/linux/buffr-*.AppImage
-            target/dist/linux/buffr-*.AppImage.sha256
             target/dist/linux/buffr-*.deb
             target/dist/linux/buffr-*.deb.sha256
           fail_on_unmatched_files: true

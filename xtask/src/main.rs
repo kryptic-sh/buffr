@@ -10,10 +10,10 @@
 //!   bundle (with a nested `buffr Helper.app`) under `target/<profile>/`. Runs
 //!   on Linux too; the actual runtime needs macOS, but bundle assembly is
 //!   purely filesystem work and is exercised by CI on a Linux runner.
-//! - `package-linux [--release] [--variant {appimage,deb,aur,all}]` produces
+//! - `package-linux [--release] [--variant {deb,aur,all}]` produces
 //!   Linux distribution artifacts under `target/dist/linux/`. Cross-builds
-//!   from any Linux dev box; `appimagetool` and `dpkg-deb` are auto-detected
-//!   and gracefully degraded if absent.
+//!   from any Linux dev box; `dpkg-deb` is auto-detected and gracefully
+//!   degraded if absent.
 //! - `package-macos-dmg [--release]` wraps the bundle from `bundle-macos`
 //!   into a `.dmg` under `target/dist/macos/`. Requires `hdiutil` (macOS) or
 //!   `genisoimage` (Linux fallback); falls through to a staging tree if
@@ -722,8 +722,6 @@ fn copy_file_executable(src: &Path, dest: &Path) -> Result<()> {
 
 // ----------------------------- package-linux -----------------------------
 
-/// Embedded `AppRun` template for the AppImage AppDir.
-const APPRUN_TEMPLATE: &str = include_str!("../templates/AppRun");
 /// Embedded shared `.desktop` file (canonical source under `pkg/`).
 const DESKTOP_TEMPLATE: &str = include_str!("../../pkg/buffr.desktop");
 /// Embedded Debian control file template.
@@ -735,14 +733,8 @@ const DEB_PRERM: &str = include_str!("../templates/deb.prerm");
 /// Embedded PKGBUILD template (`{VERSION}` substituted).
 const PKGBUILD_TEMPLATE: &str = include_str!("../templates/PKGBUILD.in");
 
-/// Pre-built `appimagetool` URL. We mirror this under
-/// `vendor/appimagetool/` so CI hits the cache after the first run.
-const APPIMAGETOOL_URL: &str = "https://github.com/AppImage/appimagetool/releases/download/continuous/\
-     appimagetool-x86_64.AppImage";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxVariant {
-    AppImage,
     Deb,
     Aur,
     All,
@@ -751,11 +743,10 @@ enum LinuxVariant {
 impl LinuxVariant {
     fn parse(s: &str) -> Result<Self> {
         match s {
-            "appimage" => Ok(Self::AppImage),
             "deb" => Ok(Self::Deb),
             "aur" => Ok(Self::Aur),
             "all" => Ok(Self::All),
-            other => bail!("unknown --variant `{other}` (appimage|deb|aur|all)"),
+            other => bail!("unknown --variant `{other}` (deb|aur|all)"),
         }
     }
 }
@@ -824,13 +815,9 @@ fn package_linux(args: Vec<String>) -> Result<()> {
 
     // 2. Always (re)write the AUR PKGBUILD with the current version. It
     //    is cheap and keeps `pkg/aur/PKGBUILD` in lockstep with the
-    //    workspace version even if the user only asked for AppImage.
+    //    workspace version even if the user only asked for the .deb.
     if matches!(parsed.variant, LinuxVariant::Aur | LinuxVariant::All) {
         write_pkgbuild(&workspace, &version)?;
-    }
-
-    if matches!(parsed.variant, LinuxVariant::AppImage | LinuxVariant::All) {
-        build_appimage(&workspace, &dist_dir, &target_dir, &payload, &version)?;
     }
 
     if matches!(parsed.variant, LinuxVariant::Deb | LinuxVariant::All) {
@@ -921,9 +908,8 @@ fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
     })
 }
 
-/// Stage the shared `/opt/buffr/` payload inside `dest`. Used by both
-/// the AppImage (`<AppDir>/usr/lib/`-ish) and the Debian package
-/// (`/opt/buffr/`).
+/// Stage the runtime payload (binaries + CEF runtime tree) inside
+/// `dest`. Used by the Debian package builder (`/opt/buffr/`).
 fn stage_payload(dest: &Path, payload: &RuntimePayload) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     copy_file_executable(&payload.buffr, &dest.join("buffr"))?;
@@ -939,119 +925,6 @@ fn stage_payload(dest: &Path, payload: &RuntimePayload) -> Result<()> {
     let _ = fs::remove_dir_all(&locales_dest);
     copy_dir_recursive(&payload.locales, &locales_dest)?;
     Ok(())
-}
-
-// ---------------------------- AppImage ----------------------------------
-
-fn build_appimage(
-    workspace: &Path,
-    dist_dir: &Path,
-    target_dir: &Path,
-    payload: &RuntimePayload,
-    version: &str,
-) -> Result<()> {
-    let appdir = target_dir.join("buffr.AppDir");
-    if appdir.exists() {
-        fs::remove_dir_all(&appdir)
-            .with_context(|| format!("wiping existing {}", appdir.display()))?;
-    }
-    let usr_bin = appdir.join("usr/bin");
-    let usr_lib = appdir.join("usr/lib");
-    fs::create_dir_all(&usr_bin)?;
-    fs::create_dir_all(&usr_lib)?;
-
-    // Binaries land in usr/bin/, libcef + paks + locales in usr/lib/.
-    copy_file_executable(&payload.buffr, &usr_bin.join("buffr"))?;
-    copy_file_executable(&payload.helper, &usr_bin.join("buffr-helper"))?;
-    copy_into_dir(&payload.libcef, &usr_lib)?;
-    for pak in &payload.paks {
-        copy_into_dir(pak, &usr_lib)?;
-    }
-    for blob in &payload.blobs {
-        copy_into_dir(blob, &usr_lib)?;
-    }
-    let locales_dest = usr_lib.join("locales");
-    copy_dir_recursive(&payload.locales, &locales_dest)?;
-
-    // AppRun launcher script.
-    let apprun = appdir.join("AppRun");
-    fs::write(&apprun, APPRUN_TEMPLATE).with_context(|| format!("writing {}", apprun.display()))?;
-    set_executable(&apprun)?;
-
-    // .desktop + icon at AppDir root (appimagetool requirement).
-    fs::write(appdir.join("buffr.desktop"), DESKTOP_TEMPLATE)?;
-
-    let icon_src = workspace.join("pkg/buffr.png");
-    if icon_src.exists() {
-        fs::copy(&icon_src, appdir.join("buffr.png"))?;
-    } else {
-        eprintln!("xtask: warning — pkg/buffr.png missing; AppImage will lack an icon");
-    }
-
-    // Try to invoke appimagetool. Resolve in this order:
-    // 1. $PATH
-    // 2. vendor/appimagetool/appimagetool-x86_64.AppImage (cached)
-    // 3. download into vendor/appimagetool/
-    // If none of those work, leave the AppDir as the "artifact" — CI
-    // will exercise the full path on a runner with internet.
-    let tool = match resolve_appimagetool(workspace) {
-        Ok(p) => Some(p),
-        Err(err) => {
-            eprintln!(
-                "xtask: appimagetool unavailable ({err}); leaving AppDir at {}",
-                appdir.display()
-            );
-            None
-        }
-    };
-
-    let Some(tool) = tool else {
-        return Ok(());
-    };
-
-    let out = dist_dir.join(format!("buffr-{version}-x86_64.AppImage"));
-    eprintln!("xtask: running appimagetool -> {}", out.display());
-    let status = Command::new(&tool)
-        .env("ARCH", "x86_64")
-        .arg(&appdir)
-        .arg(&out)
-        .status()
-        .with_context(|| format!("spawning {}", tool.display()))?;
-    if !status.success() {
-        eprintln!("xtask: warning — appimagetool exited {status:?}");
-        return Ok(());
-    }
-    set_executable(&out)?;
-    eprintln!("xtask: AppImage written to {}", out.display());
-    Ok(())
-}
-
-fn resolve_appimagetool(workspace: &Path) -> Result<PathBuf> {
-    // 1. PATH lookup.
-    if let Ok(out) = Command::new("which").arg("appimagetool").output()
-        && out.status.success()
-    {
-        let line = String::from_utf8_lossy(&out.stdout);
-        let line = line.trim();
-        if !line.is_empty() {
-            return Ok(PathBuf::from(line));
-        }
-    }
-
-    // 2. vendor cache.
-    let cache_dir = workspace.join("vendor/appimagetool");
-    let cached = cache_dir.join("appimagetool-x86_64.AppImage");
-    if cached.exists() {
-        return Ok(cached);
-    }
-
-    // 3. Download. Strip whitespace from the URL constant (folded above
-    //    for readability) before handing it to ureq.
-    let url: String = APPIMAGETOOL_URL.split_whitespace().collect();
-    fs::create_dir_all(&cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
-    download(&url, &cached).context("downloading appimagetool")?;
-    set_executable(&cached)?;
-    Ok(cached)
 }
 
 fn set_executable(path: &Path) -> Result<()> {
@@ -1847,10 +1720,6 @@ mod tests {
 
     #[test]
     fn linux_variant_parse_known() {
-        assert_eq!(
-            LinuxVariant::parse("appimage").unwrap(),
-            LinuxVariant::AppImage
-        );
         assert_eq!(LinuxVariant::parse("deb").unwrap(), LinuxVariant::Deb);
         assert_eq!(LinuxVariant::parse("aur").unwrap(), LinuxVariant::Aur);
         assert_eq!(LinuxVariant::parse("all").unwrap(), LinuxVariant::All);
@@ -1888,13 +1757,6 @@ mod tests {
         assert!(!rendered.contains("{VERSION}"));
         // makedepends should pin the toolchain as `rust` + `cargo`.
         assert!(rendered.contains("makedepends=('rust' 'cargo' 'cmake')"));
-    }
-
-    #[test]
-    fn apprun_template_is_bash_launcher() {
-        assert!(APPRUN_TEMPLATE.starts_with("#!/usr/bin/env bash"));
-        assert!(APPRUN_TEMPLATE.contains("LD_LIBRARY_PATH"));
-        assert!(APPRUN_TEMPLATE.contains("usr/bin/buffr"));
     }
 
     #[test]
