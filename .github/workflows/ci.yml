@@ -314,6 +314,20 @@ jobs:
           rpm -qpl "${rpms[0]}" | head -30
           echo "rpm OK: ${rpms[0]}"
 
+      - name: validate tarball
+        run: |
+          set -e
+          shopt -s nullglob
+          tarballs=(target/dist/linux/buffr-*-${{ matrix.rpm_arch }}.tar.gz)
+          if [ ${#tarballs[@]} -eq 0 ]; then
+            echo "::error::no tarball produced"
+            exit 1
+          fi
+          tar tzf "${tarballs[0]}" | head -10
+          tar tzf "${tarballs[0]}" | grep -q '/buffr$'
+          tar tzf "${tarballs[0]}" | grep -q '/libcef.so$'
+          echo "tarball OK: ${tarballs[0]}"
+
       - name: validate PKGBUILD
         run: |
           set -e

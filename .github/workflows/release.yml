@@ -90,7 +90,7 @@ jobs:
         run: |
           set -euo pipefail
           cd target/dist/linux
-          for f in buffr-*.deb buffr-*.rpm; do
+          for f in buffr-*.deb buffr-*.rpm buffr-*.tar.gz; do
             [ -e "$f" ] || continue
             sha256sum "$f" > "$f.sha256"
             echo "sha256: $(cat "$f.sha256")"
@@ -104,6 +104,8 @@ jobs:
             target/dist/linux/buffr-*.deb.sha256
             target/dist/linux/buffr-*.rpm
             target/dist/linux/buffr-*.rpm.sha256
+            target/dist/linux/buffr-*.tar.gz
+            target/dist/linux/buffr-*.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

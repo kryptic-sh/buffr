@@ -10,7 +10,7 @@
 //!   bundle (with a nested `buffr Helper.app`) under `target/<profile>/`. Runs
 //!   on Linux too; the actual runtime needs macOS, but bundle assembly is
 //!   purely filesystem work and is exercised by CI on a Linux runner.
-//! - `package-linux [--release] [--variant {deb,rpm,aur,all}]` produces
+//! - `package-linux [--release] [--variant {deb,rpm,tarball,aur,all}]` produces
 //!   Linux distribution artifacts under `target/dist/linux/`. Cross-builds
 //!   from any Linux dev box; `dpkg-deb` and `rpmbuild` are auto-detected
 //!   and gracefully degraded if absent.
@@ -795,6 +795,7 @@ const RPM_SPEC_TEMPLATE: &str = include_str!("../templates/buffr.spec.in");
 enum LinuxVariant {
     Deb,
     Rpm,
+    Tarball,
     Aur,
     All,
 }
@@ -804,9 +805,10 @@ impl LinuxVariant {
         match s {
             "deb" => Ok(Self::Deb),
             "rpm" => Ok(Self::Rpm),
+            "tarball" | "tar" => Ok(Self::Tarball),
             "aur" => Ok(Self::Aur),
             "all" => Ok(Self::All),
-            other => bail!("unknown --variant `{other}` (deb|rpm|aur|all)"),
+            other => bail!("unknown --variant `{other}` (deb|rpm|tarball|aur|all)"),
         }
     }
 }
@@ -886,6 +888,10 @@ fn package_linux(args: Vec<String>) -> Result<()> {
 
     if matches!(parsed.variant, LinuxVariant::Rpm | LinuxVariant::All) {
         build_rpm(&workspace, &dist_dir, &target_dir, &payload, &version)?;
+    }
+
+    if matches!(parsed.variant, LinuxVariant::Tarball | LinuxVariant::All) {
+        build_tarball(&dist_dir, &target_dir, &payload, &version)?;
     }
 
     eprintln!();
@@ -1170,6 +1176,65 @@ fn build_rpm(
     let out = dist_dir.join(format!("buffr-{version}-{arch}.rpm"));
     fs::copy(&src, &out).with_context(|| format!("copy {} -> {}", src.display(), out.display()))?;
     eprintln!("xtask: rpm written to {}", out.display());
+    Ok(())
+}
+
+// ---------------------------- portable tarball -------------------------
+
+/// Plain `.tar.gz` of the runtime tree (binaries + CEF + pak/locales).
+/// Sandbox packagers (Flatpak, Snap, custom installers) consume this
+/// instead of unpacking the .deb so they don't have to deal with
+/// Debian metadata or the postinst's /usr/local/bin symlink.
+///
+/// Layout inside the tarball:
+///
+/// ```text
+/// buffr-<ver>-<arch>/
+///   buffr               (executable)
+///   buffr-helper        (executable)
+///   libcef.so
+///   *.pak / *.dat / *.bin
+///   locales/...
+/// ```
+fn build_tarball(
+    dist_dir: &Path,
+    target_dir: &Path,
+    payload: &RuntimePayload,
+    version: &str,
+) -> Result<()> {
+    let arch = host_rpm_arch();
+    let stage_name = format!("buffr-{version}-{arch}");
+    let staging = target_dir.join("buffr-tarball").join(&stage_name);
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .with_context(|| format!("wiping existing {}", staging.display()))?;
+    }
+    stage_payload(&staging, payload)?;
+
+    // Shell out to GNU tar — every Linux runner ships it. Avoids a
+    // Rust gzip dep just for this one call site.
+    if !which("tar") {
+        eprintln!("xtask: tar not on PATH; skipping tarball build");
+        return Ok(());
+    }
+    let out = dist_dir.join(format!("{stage_name}.tar.gz"));
+    let parent = staging
+        .parent()
+        .ok_or_else(|| anyhow!("staging has no parent"))?;
+    eprintln!("xtask: tar czf -> {}", out.display());
+    let status = Command::new("tar")
+        .arg("-C")
+        .arg(parent)
+        .arg("-czf")
+        .arg(&out)
+        .arg(&stage_name)
+        .status()
+        .context("spawning tar")?;
+    if !status.success() {
+        eprintln!("xtask: warning — tar exited {status:?}");
+        return Ok(());
+    }
+    eprintln!("xtask: tarball written to {}", out.display());
     Ok(())
 }
 
@@ -1881,6 +1946,11 @@ mod tests {
     fn linux_variant_parse_known() {
         assert_eq!(LinuxVariant::parse("deb").unwrap(), LinuxVariant::Deb);
         assert_eq!(LinuxVariant::parse("rpm").unwrap(), LinuxVariant::Rpm);
+        assert_eq!(
+            LinuxVariant::parse("tarball").unwrap(),
+            LinuxVariant::Tarball
+        );
+        assert_eq!(LinuxVariant::parse("tar").unwrap(), LinuxVariant::Tarball);
         assert_eq!(LinuxVariant::parse("aur").unwrap(), LinuxVariant::Aur);
         assert_eq!(LinuxVariant::parse("all").unwrap(), LinuxVariant::All);
     }
