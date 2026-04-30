@@ -405,11 +405,11 @@ jobs:
       - name: Stage tarball payload
         run: |
           set -euo pipefail
-          cd snap
-          # See flatpak/Stage tarball payload for why we use
-          # --strip-components=1 instead of `mv buffr-*-* payload`.
+          # snapcraft resolves `source: payload` relative to the
+          # project root (the dir containing snap/snapcraft.yaml's
+          # parent), not the `snap/` dir, so stage at repo root.
           mkdir payload
-          tar xzf buffr-*.tar.gz -C payload --strip-components=1
+          tar xzf snap/buffr-*.tar.gz -C payload --strip-components=1
 
       - name: Pin snap version to tag
         run: |
@@ -451,6 +451,110 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # AUR auto-publish for `buffr-bin`. Pulls the just-uploaded tarball
+  # checksums off the release, renders pkg/aur/PKGBUILD-bin.in,
+  # generates .SRCINFO, and pushes to the AUR repo over SSH. Lives in
+  # release.yml (not a separate workflow) because GITHUB_TOKEN-created
+  # releases don't fire downstream `on: release` triggers; running as a
+  # `needs: [linux]` job sidesteps the cascade entirely.
+  #
+  # Required org/repo secret:
+  #   AUR_SSH_KEY  — ed25519 private key whose public half is registered
+  #                  on the AUR account that owns the `buffr-bin` package.
+  aur-bin:
+    name: Publish buffr-bin to AUR
+    needs: [linux]
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          # base-devel pulls in makepkg + fakeroot. openssh + git for
+          # the AUR push. curl fetches the sha256 sidecars off the
+          # release without needing the GitHub CLI.
+          pacman -Sy --noconfirm --needed base-devel git openssh curl
+
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG (pkgver=$VERSION)"
+
+      - name: Fetch tarball sha256 sidecars
+        id: sha
+        run: |
+          set -euo pipefail
+          V="${{ steps.tag.outputs.version }}"
+          BASE="https://github.com/kryptic-sh/buffr/releases/download/v${V}"
+          # The linux matrix uploaded both arches before this job ran
+          # (we `needs: [linux]`), so the sidecars are guaranteed to exist.
+          for arch in x86_64 aarch64; do
+            curl -fsSL "$BASE/buffr-${V}-${arch}.tar.gz.sha256" -o "sha.${arch}"
+          done
+          # sidecar format: `<hash>  <filename>` — keep first column.
+          echo "x86_64=$(awk '{print $1}' sha.x86_64)" >> "$GITHUB_OUTPUT"
+          echo "aarch64=$(awk '{print $1}' sha.aarch64)" >> "$GITHUB_OUTPUT"
+
+      - name: Render PKGBUILD
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          sed \
+            -e "s/{VERSION}/${{ steps.tag.outputs.version }}/g" \
+            -e "s/{SHA256_X86_64}/${{ steps.sha.outputs.x86_64 }}/g" \
+            -e "s/{SHA256_AARCH64}/${{ steps.sha.outputs.aarch64 }}/g" \
+            pkg/aur/PKGBUILD-bin.in > out/PKGBUILD
+          echo "--- rendered PKGBUILD ---"
+          cat out/PKGBUILD
+
+      - name: Generate .SRCINFO
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root; arch container has nobody
+          # already provisioned. Make `out/` writable for it.
+          chown -R nobody:nobody out
+          su nobody -s /bin/bash -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
+          echo "--- .SRCINFO ---"
+          cat out/.SRCINFO
+
+      - name: Configure SSH for AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -dm700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+
+      - name: Push to AUR
+        run: |
+          set -euo pipefail
+          git config --global user.name  "buffr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone ssh://aur@aur.archlinux.org/buffr-bin.git aur-repo
+          cp out/PKGBUILD out/.SRCINFO aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "no changes vs current AUR head; nothing to push"
+            exit 0
+          fi
+          git commit -m "buffr-bin ${{ steps.tag.outputs.version }}-1"
+          git push origin master
+
   # The 9 buffr-* library crates are versioned and released independently
   # via their own submodule repos. Only the `buffr` crates.io stub
   # (apps/buffr-stub) tracks the umbrella tag — it's a "go grab the
@@ -458,7 +562,7 @@ jobs:
   # `cargo install buffr` always points at the matching binary release.
   publish-stub:
     name: Publish buffr stub to crates.io
-    needs: [linux, macos, windows, flatpak, snap]
+    needs: [linux, macos, windows, flatpak, snap, aur-bin]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

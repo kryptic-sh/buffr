@@ -1,12 +1,12 @@
 # Maintainer: kryptic.sh <hello@kryptic.sh>
 pkgname=buffr
-pkgver=0.1.17
+pkgver=0.1.18
 pkgrel=1
 pkgdesc="Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
 arch=('x86_64')
 url="https://buffr.kryptic.sh/"
 license=('MIT')
-depends=('gtk3' 'nss' 'libxss' 'alsa-lib' 'libgbm' 'libxshmfence' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd')
+depends=('gtk3' 'nss' 'libxss' 'alsa-lib' 'mesa' 'libxshmfence' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd')
 makedepends=('rust' 'cargo' 'cmake')
 source=("https://github.com/kryptic-sh/buffr/archive/v${pkgver}.tar.gz")
 sha256sums=('SKIP')
