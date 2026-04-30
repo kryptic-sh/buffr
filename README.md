@@ -21,6 +21,28 @@ tabs; two-finger horizontal swipe navigates browser history; vim modal engine
 history / downloads / bookmarks / permissions / zoom data layers wired and
 persisted to SQLite. See [CHANGELOG.md](CHANGELOG.md).
 
+## Supported platforms
+
+Each release publishes binary artifacts for:
+
+| OS      | Architecture          | Format                    |
+| ------- | --------------------- | ------------------------- |
+| Linux   | x86_64, aarch64       | `.deb`, `.rpm`, `.tar.gz` |
+| macOS   | arm64 (Apple Silicon) | `.dmg`                    |
+| Windows | x64, arm64            | `.msi` (per-user)         |
+
+### Why no Intel Mac (`x86_64-apple-darwin`)?
+
+We dropped Intel Mac builds in `0.1.14`. Apple stopped selling Intel Macs in
+2023, and the GitHub Actions `macos-13` runner pool is heavily contended —
+release tags routinely queued for 1–2 hours waiting on a slot, blocking the
+entire publish pipeline (the crates.io stub publish gates on every binary leg).
+The cost wasn't paying for the user count, so we cut it.
+
+If you're on an Intel Mac and want to run buffr, build from source on your own
+machine — the workspace builds clean against `x86_64-apple-darwin`, the support
+is just absent from the release pipeline, not from the code.
+
 ## Apps
 
 | Binary         | Role                                                               |
@@ -59,11 +81,10 @@ cargo build
 cargo run
 ```
 
-> **Heads-up:** `cargo install buffr` is **not** a supported install path.
-> The `buffr` crate on crates.io is a stub that prints download
-> instructions — CEF apps need a ~150 MB runtime payload (libcef, paks,
-> locales, sandbox) that `cargo install` can't bundle. Grab a prebuilt
-> release from
+> **Heads-up:** `cargo install buffr` is **not** a supported install path. The
+> `buffr` crate on crates.io is a stub that prints download instructions — CEF
+> apps need a ~150 MB runtime payload (libcef, paks, locales, sandbox) that
+> `cargo install` can't bundle. Grab a prebuilt release from
 > [github.com/kryptic-sh/buffr/releases](https://github.com/kryptic-sh/buffr/releases),
 > or build from source as shown above.
 

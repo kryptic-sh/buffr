@@ -342,18 +342,11 @@ jobs:
     # of the linux job — a CEF download failure here does not gate
     # main. Unsigned this round; signing + notarization land in the
     # eventual release.yml workflow.
-    name: macOS package (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    # Apple Silicon only — see release.yml for why Intel Mac was dropped.
+    name: macOS package (macosarm64)
+    runs-on: macos-latest
     timeout-minutes: 60
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            platform: macosarm64
-          - runner: macos-13
-            platform: macosx64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -364,16 +357,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-build-${{ matrix.platform }}
+          shared-key: macos-build-macosarm64
 
       - name: cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: fetch CEF (${{ matrix.platform }})
-        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
+      - name: fetch CEF (macosarm64)
+        run: cargo xtask fetch-cef --target macosarm64
 
       - name: cargo xtask bundle-macos
         run: cargo xtask bundle-macos --release
@@ -398,7 +391,7 @@ jobs:
       - name: upload dmg
         uses: actions/upload-artifact@v7
         with:
-          name: buffr-macos-dmg-${{ matrix.platform }}
+          name: buffr-macos-dmg-macosarm64
           path: target/dist/macos/buffr-*.dmg
           if-no-files-found: error
           retention-days: 14

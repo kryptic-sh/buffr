@@ -113,19 +113,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   macos:
-    name: macOS package (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    # Apple Silicon only. Intel Mac (macos-13 / macosx64) was dropped
+    # in 0.1.14 — see README "Why no Intel Mac?" — the GitHub runner
+    # pool was queueing 1-2h per leg and blocking the publish pipeline.
+    name: macOS package (macosarm64)
+    runs-on: macos-latest
     timeout-minutes: 90
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            platform: macosarm64
-          - runner: macos-13
-            platform: macosx64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -146,16 +141,16 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-release-${{ matrix.platform }}
+          shared-key: macos-release-macosarm64
 
       - name: Cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
+          key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
 
-      - name: Fetch CEF (${{ matrix.platform }})
-        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
+      - name: Fetch CEF (macosarm64)
+        run: cargo xtask fetch-cef --target macosarm64
 
       - name: Bundle macOS .app
         run: cargo xtask bundle-macos --release
