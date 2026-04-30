@@ -604,6 +604,39 @@ fn main() -> Result<()> {
     ));
     let initial_update_status = update_checker.check_cached();
 
+    // -------- HiDPI scale: forward to CEF before initialize ----------
+    //
+    // Chromium has no Linux DPI autodetect (Wayland per-output scale,
+    // X11 Xft.dpi) — the `--force-device-scale-factor` switch is the
+    // only knob that affects every renderer in the process. winit
+    // 0.30's `primary_monitor()` moved to `ActiveEventLoop` so it's
+    // not queryable pre-init; instead we read environment variables
+    // most Linux desktops already export. Precedence:
+    //
+    //   1. `BUFFR_SCALE` — explicit override
+    //   2. `GDK_SCALE`   — set by GTK / many DE startup scripts
+    //
+    // Fractional scales (1.25, 1.5) need manual `BUFFR_SCALE=1.5`.
+    // Windows + macOS use their OS DPI APIs directly and ignore
+    // this static.
+    #[cfg(target_os = "linux")]
+    {
+        let scale = std::env::var("BUFFR_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .or_else(|| {
+                std::env::var("GDK_SCALE")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+            });
+        if let Some(scale) = scale
+            && (scale - 1.0).abs() > 0.01
+        {
+            debug!(scale, "forwarding device scale factor to CEF");
+            buffr_core::set_device_scale_factor(scale);
+        }
+    }
+
     // -------- CEF initialize --------
     let cache_path = paths.cache.to_string_lossy().into_owned();
     let mut settings = Settings {
@@ -657,8 +690,6 @@ fn main() -> Result<()> {
             if cli.x11 {
                 builder.with_x11();
             }
-            // Default: winit auto-picks Wayland when WAYLAND_DISPLAY is
-            // set, otherwise X11. No explicit call needed.
         }
         builder.build().context("creating winit event loop")?
     };
