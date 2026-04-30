@@ -1413,21 +1413,24 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
             return Ok(());
         }
     };
-    let payload_dir = dist_dir.join("payload");
-    if payload_dir.exists() {
-        fs::remove_dir_all(&payload_dir)
-            .with_context(|| format!("wiping {}", payload_dir.display()))?;
+    // Two staging dirs. wxs <File> Source paths reference these.
+    let bin_payload_dir = dist_dir.join("payload-bin");
+    let cef_payload_dir = dist_dir.join("payload-cef");
+    for d in [&bin_payload_dir, &cef_payload_dir] {
+        if d.exists() {
+            fs::remove_dir_all(d).with_context(|| format!("wiping {}", d.display()))?;
+        }
     }
-    fs::create_dir_all(&payload_dir)?;
-    stage_windows_payload(&payload_dir, &payload)?;
+    stage_windows_payload(&bin_payload_dir, &cef_payload_dir, &payload)?;
 
-    // 3. Resolve candle + light. Both must exist; partial WiX 3 install
-    //    is treated as missing.
+    // 3. Resolve candle + light + heat. All three must exist; partial
+    //    WiX 3 install is treated as missing.
     let have_candle = which("candle") || which("candle.exe");
     let have_light = which("light") || which("light.exe");
-    if !have_candle || !have_light {
+    let have_heat = which("heat") || which("heat.exe");
+    if !have_candle || !have_light || !have_heat {
         eprintln!(
-            "xtask: candle/light from the WiX 3 toolset not on PATH; \
+            "xtask: candle/light/heat from the WiX 3 toolset not on PATH; \
              leaving payload + .wxs at {}",
             dist_dir.display()
         );
@@ -1439,9 +1442,40 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    // 4. Drive candle + light. `.wixobj` lands next to the wxs source;
-    //    `light` produces the final `.msi` under `target/dist/windows/`.
+    // 4. heat.exe — harvest the CEF runtime tree into a ComponentGroup.
+    //    `-srd` suppresses the root-dir element so files install
+    //    directly under INSTALLFOLDER. `-var var.CefPayloadDir` makes
+    //    candle resolve $(var.CefPayloadDir) at compile time so we
+    //    don't bake an absolute path into the wxs.
+    let cef_wxs_path = dist_dir.join("cef-payload.wxs");
+    eprintln!("xtask: heat -> {}", cef_wxs_path.display());
+    let status = Command::new(if which("heat") { "heat" } else { "heat.exe" })
+        .arg("dir")
+        .arg(&cef_payload_dir)
+        .arg("-nologo")
+        .arg("-gg") // generate guids now (deterministic)
+        .arg("-srd") // suppress root directory
+        .arg("-sreg") // skip registry harvest
+        .arg("-sfrag") // single fragment
+        .arg("-cg")
+        .arg("CefRuntime")
+        .arg("-dr")
+        .arg("INSTALLFOLDER")
+        .arg("-var")
+        .arg("var.CefPayloadDir")
+        .arg("-out")
+        .arg(&cef_wxs_path)
+        .current_dir(&dist_dir)
+        .status()
+        .context("spawning heat")?;
+    if !status.success() {
+        bail!("heat exited {status:?}");
+    }
+
+    // 5. Drive candle + light. Both wxs files compile together; light
+    //    links both wixobj into a single MSI.
     let wixobj = dist_dir.join("buffr.wixobj");
+    let cef_wixobj = dist_dir.join("cef-payload.wixobj");
     eprintln!("xtask: candle -> {}", wixobj.display());
     let status = Command::new(if which("candle") {
         "candle"
@@ -1450,9 +1484,11 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
     })
     .arg("-arch")
     .arg("x64")
+    .arg(format!("-dCefPayloadDir={}", cef_payload_dir.display()))
     .arg("-o")
-    .arg(&wixobj)
+    .arg(format!("{}\\", dist_dir.display()))
     .arg(&wxs_path)
+    .arg(&cef_wxs_path)
     .current_dir(&dist_dir)
     .status()
     .context("spawning candle")?;
@@ -1466,6 +1502,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
         .arg("-o")
         .arg(&msi_path)
         .arg(&wixobj)
+        .arg(&cef_wixobj)
         .current_dir(&dist_dir)
         .status()
         .context("spawning light")?;
@@ -1487,7 +1524,14 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
 struct WindowsPayload {
     buffr_exe: PathBuf,
     helper_exe: PathBuf,
-    libcef_dll: PathBuf,
+    /// Every .dll under target/<profile>/. Includes libcef.dll plus the
+    /// CEF runtime helpers (chrome_elf, libEGL, libGLESv2, vk_swiftshader,
+    /// vulkan-1, d3dcompiler_47, ...). All required at process start —
+    /// missing any one trips the Windows loader before main runs.
+    dlls: Vec<PathBuf>,
+    /// vk_swiftshader_icd.json (Vulkan ICD descriptor) plus any future
+    /// .json metadata CEF ships in Release/.
+    jsons: Vec<PathBuf>,
     icudtl: PathBuf,
     paks: Vec<PathBuf>,
     blobs: Vec<PathBuf>,
@@ -1511,7 +1555,7 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
         let helper_exe = dir.join("buffr-helper.exe");
         let libcef_dll = dir.join("libcef.dll");
         if buffr_exe.exists() && helper_exe.exists() && libcef_dll.exists() {
-            return collect_windows_payload_from(dir);
+            return collect_windows_payload_from(dir.as_path());
         }
     }
 
@@ -1531,7 +1575,6 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
 fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
     let buffr_exe = dir.join("buffr.exe");
     let helper_exe = dir.join("buffr-helper.exe");
-    let libcef_dll = dir.join("libcef.dll");
     let icudtl = dir.join("icudtl.dat");
     let locales = dir.join("locales");
 
@@ -1545,6 +1588,8 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
         bail!("missing `{}` next to buffr.exe", locales.display());
     }
 
+    let mut dlls = Vec::new();
+    let mut jsons = Vec::new();
     let mut paks = Vec::new();
     let mut blobs = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -1555,19 +1600,41 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
         }
         let name_os = entry.file_name();
         let name = name_os.to_string_lossy();
-        if name.ends_with(".pak") {
+        // buffr.exe + helper.exe are tracked separately so the
+        // Shortcut Target can reference them by id.
+        if name == "buffr.exe" || name == "buffr-helper.exe" {
+            continue;
+        }
+        if name.ends_with(".dll") {
+            dlls.push(path);
+        } else if name.ends_with(".json") {
+            jsons.push(path);
+        } else if name.ends_with(".pak") {
             paks.push(path);
         } else if name.ends_with(".bin") {
             blobs.push(path);
         }
     }
+    dlls.sort();
+    jsons.sort();
     paks.sort();
     blobs.sort();
+
+    if !dlls
+        .iter()
+        .any(|p| p.file_name().map(|n| n == "libcef.dll").unwrap_or(false))
+    {
+        bail!(
+            "missing `libcef.dll` under {} — buffr-core build.rs should have staged it",
+            dir.display()
+        );
+    }
 
     Ok(WindowsPayload {
         buffr_exe,
         helper_exe,
-        libcef_dll,
+        dlls,
+        jsons,
         icudtl,
         paks,
         blobs,
@@ -1575,19 +1642,30 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
     })
 }
 
-fn stage_windows_payload(dest: &Path, p: &WindowsPayload) -> Result<()> {
-    fs::create_dir_all(dest)?;
-    copy_into_dir(&p.buffr_exe, dest)?;
-    copy_into_dir(&p.helper_exe, dest)?;
-    copy_into_dir(&p.libcef_dll, dest)?;
-    copy_into_dir(&p.icudtl, dest)?;
+/// Two-dir staging: buffr.exe / buffr-helper.exe go to `bin_dest` (the
+/// hand-rolled wxs Components reference these explicitly so the
+/// Shortcut Target=`[#filBuffrExe]` resolves), everything else goes to
+/// `cef_dest` (heat.exe harvests it into a generated ComponentGroup).
+fn stage_windows_payload(bin_dest: &Path, cef_dest: &Path, p: &WindowsPayload) -> Result<()> {
+    fs::create_dir_all(bin_dest)?;
+    copy_into_dir(&p.buffr_exe, bin_dest)?;
+    copy_into_dir(&p.helper_exe, bin_dest)?;
+
+    fs::create_dir_all(cef_dest)?;
+    for dll in &p.dlls {
+        copy_into_dir(dll, cef_dest)?;
+    }
+    for json in &p.jsons {
+        copy_into_dir(json, cef_dest)?;
+    }
+    copy_into_dir(&p.icudtl, cef_dest)?;
     for pak in &p.paks {
-        copy_into_dir(pak, dest)?;
+        copy_into_dir(pak, cef_dest)?;
     }
     for blob in &p.blobs {
-        copy_into_dir(blob, dest)?;
+        copy_into_dir(blob, cef_dest)?;
     }
-    let locales_dest = dest.join("locales");
+    let locales_dest = cef_dest.join("locales");
     let _ = fs::remove_dir_all(&locales_dest);
     copy_dir_recursive(&p.locales, &locales_dest)?;
     Ok(())
@@ -1903,9 +1981,10 @@ mod tests {
     fn wix_template_is_per_user() {
         // No UAC prompt on install. Files land under
         // %LOCALAPPDATA%\Programs\buffr\, registry under HKCU.
+        // `InstallScope="perUser"` implicitly sets ALLUSERS + MSIINSTALLPERUSER —
+        // setting them explicitly is rejected by candle.exe (empty Value).
         assert!(WIX_TEMPLATE.contains("InstallScope=\"perUser\""));
         assert!(WIX_TEMPLATE.contains("LocalAppDataFolder"));
-        assert!(WIX_TEMPLATE.contains("MSIINSTALLPERUSER"));
     }
 
     #[test]
@@ -1921,12 +2000,13 @@ mod tests {
 
     #[test]
     fn wix_template_lists_msi_payload() {
-        // The .wxs lists every required runtime file. If something is
-        // dropped from this list the installed product won't run.
+        // The hand-rolled .wxs lists buffr.exe + buffr-helper.exe;
+        // everything else (libcef.dll, paks, locales, ...) is harvested
+        // by heat.exe at build time and referenced via
+        // <ComponentGroupRef Id="CefRuntime" />.
         assert!(WIX_TEMPLATE.contains("buffr.exe"));
         assert!(WIX_TEMPLATE.contains("buffr-helper.exe"));
-        assert!(WIX_TEMPLATE.contains("libcef.dll"));
-        assert!(WIX_TEMPLATE.contains("icudtl.dat"));
+        assert!(WIX_TEMPLATE.contains("ComponentGroupRef Id=\"CefRuntime\""));
     }
 
     #[test]
@@ -1937,24 +2017,34 @@ mod tests {
         fs::write(target.join("buffr.exe"), b"MZ").unwrap();
         fs::write(target.join("buffr-helper.exe"), b"MZ").unwrap();
         fs::write(target.join("libcef.dll"), b"MZ").unwrap();
+        fs::write(target.join("chrome_elf.dll"), b"MZ").unwrap();
+        fs::write(target.join("vk_swiftshader_icd.json"), b"{}").unwrap();
         fs::write(target.join("icudtl.dat"), b"dat").unwrap();
         fs::write(target.join("resources.pak"), b"pak").unwrap();
         fs::write(target.join("v8_context_snapshot.bin"), b"bin").unwrap();
         fs::write(target.join("locales/en-US.pak"), b"locale").unwrap();
 
         let payload = collect_windows_payload_from(&target).unwrap();
+        assert_eq!(payload.dlls.len(), 2, "libcef.dll + chrome_elf.dll");
+        assert_eq!(payload.jsons.len(), 1);
         assert_eq!(payload.paks.len(), 1);
         assert_eq!(payload.blobs.len(), 1);
 
-        let dest = tmp.path().join("staged");
-        stage_windows_payload(&dest, &payload).unwrap();
-        assert!(dest.join("buffr.exe").exists());
-        assert!(dest.join("buffr-helper.exe").exists());
-        assert!(dest.join("libcef.dll").exists());
-        assert!(dest.join("icudtl.dat").exists());
-        assert!(dest.join("resources.pak").exists());
-        assert!(dest.join("v8_context_snapshot.bin").exists());
-        assert!(dest.join("locales/en-US.pak").exists());
+        let bin_dest = tmp.path().join("staged-bin");
+        let cef_dest = tmp.path().join("staged-cef");
+        stage_windows_payload(&bin_dest, &cef_dest, &payload).unwrap();
+        // Bin dir holds only the two executables.
+        assert!(bin_dest.join("buffr.exe").exists());
+        assert!(bin_dest.join("buffr-helper.exe").exists());
+        assert!(!bin_dest.join("libcef.dll").exists());
+        // CEF dir holds the runtime tree.
+        assert!(cef_dest.join("libcef.dll").exists());
+        assert!(cef_dest.join("chrome_elf.dll").exists());
+        assert!(cef_dest.join("vk_swiftshader_icd.json").exists());
+        assert!(cef_dest.join("icudtl.dat").exists());
+        assert!(cef_dest.join("resources.pak").exists());
+        assert!(cef_dest.join("v8_context_snapshot.bin").exists());
+        assert!(cef_dest.join("locales/en-US.pak").exists());
     }
 
     #[test]

@@ -36,17 +36,17 @@
            Manufacturer="kryptic.sh"
            UpgradeCode="98BD6ED5-06C0-4114-BD77-F6FD6E6D6688">
 
+    <!-- InstallScope="perUser" sets ALLUSERS=\"\" and MSIINSTALLPERUSER=1
+         implicitly — no UAC prompt, install lands under HKCU + the
+         user's profile. Don't set those properties explicitly: WiX 3
+         rejects empty-string Property values, and overriding
+         MSIINSTALLPERUSER undoes the perUser scope on some Windows
+         versions. -->
     <Package InstallerVersion="500"
              Compressed="yes"
              InstallScope="perUser"
              Description="buffr - modal browser"
              Manufacturer="kryptic.sh" />
-    <!-- ALLUSERS="" + MSIINSTALLPERUSER=1 explicitly opts the package
-         into the Windows Installer per-user mode. Without these, even
-         InstallScope="perUser" can prompt for elevation on some
-         policies (Group Policy "AlwaysInstallElevated"). -->
-    <Property Id="ALLUSERS" Value="" />
-    <Property Id="MSIINSTALLPERUSER" Value="1" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of buffr is already installed." />
     <MediaTemplate EmbedCab="yes" />
@@ -68,26 +68,21 @@
       <Directory Id="DesktopFolder" Name="Desktop" />
     </Directory>
 
-    <!-- Component group: payload binaries + CEF runtime files. -->
+    <!-- buffr.exe + buffr-helper.exe stay hand-rolled so the
+         Shortcut Target=`[#filBuffrExe]` reference resolves
+         deterministically. The rest of the runtime tree (CEF DLLs,
+         paks, locales, ...) is harvested by heat.exe at xtask time
+         into a separate fragment that defines `<ComponentGroup
+         Id="CefRuntime">`. -->
     <ComponentGroup Id="MainPayload" Directory="INSTALLFOLDER">
       <Component Id="cmpBuffrExe" Guid="*">
         <File Id="filBuffrExe"
-              Source="payload\buffr.exe"
+              Source="payload-bin\buffr.exe"
               KeyPath="yes" />
       </Component>
       <Component Id="cmpHelperExe" Guid="*">
         <File Id="filHelperExe"
-              Source="payload\buffr-helper.exe"
-              KeyPath="yes" />
-      </Component>
-      <Component Id="cmpLibcef" Guid="*">
-        <File Id="filLibcef"
-              Source="payload\libcef.dll"
-              KeyPath="yes" />
-      </Component>
-      <Component Id="cmpIcudtl" Guid="*">
-        <File Id="filIcudtl"
-              Source="payload\icudtl.dat"
+              Source="payload-bin\buffr-helper.exe"
               KeyPath="yes" />
       </Component>
       <!-- Registry component: install path + version under HKCU. Per-user
@@ -151,6 +146,9 @@
              Title="buffr"
              Level="1">
       <ComponentGroupRef Id="MainPayload" />
+      <!-- Defined by cef-payload.wxs (heat.exe-generated; harvested
+           from `target/dist/windows/payload-cef/` at build time). -->
+      <ComponentGroupRef Id="CefRuntime" />
       <ComponentRef Id="cmpStartShortcut" />
       <ComponentRef Id="cmpDesktopShortcut" />
     </Feature>
