@@ -1890,12 +1890,22 @@ mod tests {
 
     #[test]
     fn wix_template_records_install_metadata() {
-        // The HKLM\SOFTWARE\kryptic\buffr key + InstallPath/Version
+        // The HKCU\Software\kryptic\buffr key + InstallPath/Version
         // values are how an external uninstaller / updater discovers
-        // an existing install. Lock them down.
-        assert!(WIX_TEMPLATE.contains("SOFTWARE\\kryptic\\buffr"));
+        // an existing install. Lock them down. (Per-user install
+        // → HKCU; HKLM is reserved for system-wide installs.)
+        assert!(WIX_TEMPLATE.contains("Software\\kryptic\\buffr"));
         assert!(WIX_TEMPLATE.contains("InstallPath"));
         assert!(WIX_TEMPLATE.contains("Version"));
+    }
+
+    #[test]
+    fn wix_template_is_per_user() {
+        // No UAC prompt on install. Files land under
+        // %LOCALAPPDATA%\Programs\buffr\, registry under HKCU.
+        assert!(WIX_TEMPLATE.contains("InstallScope=\"perUser\""));
+        assert!(WIX_TEMPLATE.contains("LocalAppDataFolder"));
+        assert!(WIX_TEMPLATE.contains("MSIINSTALLPERUSER"));
     }
 
     #[test]

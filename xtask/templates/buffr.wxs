@@ -9,14 +9,23 @@
   + `light.exe`); WiX 4 / 5 changed the namespace + element names and
   added a `wix.exe` driver, but the older 3.x tools remain the most
   broadly-available baseline today and produce identical MSIs for our
-  needs (no per-user install, no MSIX, no bundle).
+  needs (no MSIX, no bundle).
+
+  Per-user install (no UAC). Files land under
+  `%LOCALAPPDATA%\Programs\buffr\`, registry writes go to HKCU. Browsers
+  are personal; system-wide installs are rare and worth the
+  authoring-complexity skip.
 
   Placeholders (substituted at xtask runtime via str::replace):
 
     {VERSION}       — workspace.package.version
     {ARCH}          — "x64" (only one supported today)
-    {INSTALL_DIR}   — "buffr"; folder name under Program Files
+    {INSTALL_DIR}   — "buffr"; folder name under %LOCALAPPDATA%\Programs
     {UPGRADE_GUID}  — fixed GUID baked in below; bumped on major rev only
+                       (also bumped 2026-04-30 when switching from per-machine
+                       to per-user — the new install scope is treated as a
+                       different product line; users with the old per-machine
+                       MSI must uninstall manually before installing this one)
     {PRODUCT_GUID}  — fixed GUID; product code stays stable across patches
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
@@ -25,22 +34,32 @@
            Language="1033"
            Version="{VERSION}"
            Manufacturer="kryptic.sh"
-           UpgradeCode="9F4F8E1C-2B3D-4A5E-9C7B-8E1D2F3A4B5C">
+           UpgradeCode="98BD6ED5-06C0-4114-BD77-F6FD6E6D6688">
 
     <Package InstallerVersion="500"
              Compressed="yes"
-             InstallScope="perMachine"
+             InstallScope="perUser"
              Description="buffr - modal browser"
              Manufacturer="kryptic.sh" />
+    <!-- ALLUSERS="" + MSIINSTALLPERUSER=1 explicitly opts the package
+         into the Windows Installer per-user mode. Without these, even
+         InstallScope="perUser" can prompt for elevation on some
+         policies (Group Policy "AlwaysInstallElevated"). -->
+    <Property Id="ALLUSERS" Value="" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of buffr is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Filesystem layout. C:\Program Files\buffr\ -->
+    <!-- Filesystem layout. %LOCALAPPDATA%\Programs\buffr\ — the same
+         convention VS Code, GitHub Desktop, Slack, etc. use for their
+         per-user installs. -->
     <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="{INSTALL_DIR}">
-          <Directory Id="LocalesFolder" Name="locales" />
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="LocalAppDataPrograms" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="{INSTALL_DIR}">
+            <Directory Id="LocalesFolder" Name="locales" />
+          </Directory>
         </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder">
@@ -71,9 +90,10 @@
               Source="payload\icudtl.dat"
               KeyPath="yes" />
       </Component>
-      <!-- Registry component: install path + version under HKLM. -->
+      <!-- Registry component: install path + version under HKCU. Per-user
+           installs cannot write to HKLM. -->
       <Component Id="cmpRegistry" Guid="*">
-        <RegistryKey Root="HKLM" Key="SOFTWARE\kryptic\buffr">
+        <RegistryKey Root="HKCU" Key="Software\kryptic\buffr">
           <RegistryValue Name="InstallPath"
                          Type="string"
                          Value="[INSTALLFOLDER]"
@@ -83,8 +103,8 @@
                          Value="{VERSION}" />
         </RegistryKey>
         <RemoveRegistryKey Action="removeOnUninstall"
-                           Root="HKLM"
-                           Key="SOFTWARE\kryptic\buffr" />
+                           Root="HKCU"
+                           Key="Software\kryptic\buffr" />
         <RemoveFolder Id="rmInstallFolder"
                       Directory="INSTALLFOLDER"
                       On="uninstall" />
