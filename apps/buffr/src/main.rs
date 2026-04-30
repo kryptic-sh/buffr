@@ -89,7 +89,6 @@ mod render;
 mod session;
 use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
-use raw_window_handle::HasWindowHandle;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
 use winit::{
@@ -674,12 +673,8 @@ fn main() -> Result<()> {
 
     // -------- winit event loop --------
     //
-    // Allow winit to pick the best Wayland backend. Linux always uses
-    // HostMode::Osr (wgpu composite over Wayland/macOS) — X11/XWayland
-    // windowed embedding is not supported, and AppKit child views do not
-    // layer cleanly with buffr's custom chrome. Windows uses native
-    // child-window embedding (HostMode::Windowed).
-    //
+    // All platforms run OSR: CEF paints into a shared bitmap, the
+    // wgpu present layer composites it under buffr's chrome strips.
     // On Linux, `--x11` forces the X11 backend even on a Wayland session
     // (useful for regression testing the X11 path).
     let event_loop = {
@@ -2596,9 +2591,7 @@ impl AppState {
             self.osr_wheel_last_at = None;
             return;
         }
-        if let Some(host) = self.host.as_ref()
-            && host.mode() == buffr_core::HostMode::Osr
-        {
+        if let Some(host) = self.host.as_ref() {
             let mods = winit_mods_to_cef(&self.modifiers);
             let (bx, by) = self.osr_cursor;
             tracing::trace!(dx, dy, "input: wheel_momentum -> CEF");
@@ -2634,9 +2627,7 @@ impl AppState {
         // in and resizes it; on_paint already handles len mismatch via
         // the resize check, so no panic. After this block, self.osr_scratch
         // owns the freshest CEF pixels and self.host's frame.pixels is empty.
-        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref()
-            && host.mode() == buffr_core::HostMode::Osr
-        {
+        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref() {
             if let Ok(mut frame) = host.osr_frame().lock() {
                 if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
                     std::mem::swap(&mut self.osr_scratch, &mut frame.pixels);
@@ -4646,15 +4637,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         };
         let window = Arc::new(window);
 
-        let raw = match window.window_handle() {
-            Ok(h) => h.as_raw(),
-            Err(err) => {
-                warn!(error = %err, "no raw window handle");
-                event_loop.exit();
-                return;
-            }
-        };
-
         // Pass the same page viewport used by later resize events so
         // CEF paints the first frame in the area below the tab strip and
         // above the statusline.
@@ -4663,7 +4645,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             self.cef_child_rect(inner.width.max(1), inner.height.max(1));
 
         match buffr_core::BrowserHost::new_with_options(
-            raw,
             &self.homepage,
             self.history.clone(),
             self.downloads.clone(),
@@ -4682,7 +4663,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             self.show_favicons,
         ) {
             Ok(host) => {
-                info!(mode = ?host.mode(), "browser host created");
+                info!("browser host created (OSR)");
                 debug!(url = %self.homepage, "browser host created — initial url");
                 // CEF stays focused for the lifetime of the browser
                 // so DOM clicks deliver focus to inputs. We do NOT
@@ -4793,20 +4774,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     "winit: Resized",
                 );
                 if let Some(host) = self.host.as_ref() {
-                    match host.mode() {
-                        buffr_core::HostMode::Windowed => {
-                            host.resize(cef_w, cef_h);
-                        }
-                        buffr_core::HostMode::Osr => {
-                            // Notify CEF on every Resized. The renderer GPU-
-                            // stretches whatever frame CEF most recently
-                            // emitted to fill the live browser_rect, so
-                            // intermediate CEF frames at any size composite
-                            // correctly without throttling/debouncing.
-                            host.osr_resize(cef_w, cef_h);
-                            debug!(cef_w, cef_h, "winit: Resized -> osr_resize");
-                        }
-                    }
+                    // Notify CEF on every Resized. The renderer GPU-
+                    // stretches whatever frame CEF most recently
+                    // emitted to fill the live browser_rect, so
+                    // intermediate CEF frames at any size composite
+                    // correctly without throttling/debouncing.
+                    host.osr_resize(cef_w, cef_h);
+                    debug!(cef_w, cef_h, "winit: Resized -> osr_resize");
                 }
                 // Paint synchronously so the configure ack carries a
                 // buffer matching this event's size. Hyprland (and other
@@ -4865,9 +4839,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(host) = self.host.as_ref()
-                    && host.mode() == buffr_core::HostMode::Osr
-                {
+                if let Some(host) = self.host.as_ref() {
                     // Convert from window coords to browser-region coords.
                     // The browser region starts at `cef_y` (below the chrome strips).
                     let size = self
@@ -5038,7 +5010,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let mut enter_visual = false;
                 let mut exit_visual = false;
                 if let Some(host) = self.host.as_ref()
-                    && host.mode() == buffr_core::HostMode::Osr
                     && let Some(cef_button) = winit_button_to_cef(&button)
                 {
                     let mouse_up = state == winit::event::ElementState::Released;
@@ -5145,12 +5116,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 use winit::event::MouseScrollDelta;
-                if !self
-                    .host
-                    .as_ref()
-                    .map(|h| h.mode() == buffr_core::HostMode::Osr)
-                    .unwrap_or(false)
-                {
+                if self.host.is_none() {
                     return;
                 }
 
