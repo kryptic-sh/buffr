@@ -10,10 +10,10 @@
 //!   bundle (with a nested `buffr Helper.app`) under `target/<profile>/`. Runs
 //!   on Linux too; the actual runtime needs macOS, but bundle assembly is
 //!   purely filesystem work and is exercised by CI on a Linux runner.
-//! - `package-linux [--release] [--variant {deb,aur,all}]` produces
+//! - `package-linux [--release] [--variant {deb,rpm,aur,all}]` produces
 //!   Linux distribution artifacts under `target/dist/linux/`. Cross-builds
-//!   from any Linux dev box; `dpkg-deb` is auto-detected and gracefully
-//!   degraded if absent.
+//!   from any Linux dev box; `dpkg-deb` and `rpmbuild` are auto-detected
+//!   and gracefully degraded if absent.
 //! - `package-macos-dmg [--release]` wraps the bundle from `bundle-macos`
 //!   into a `.dmg` under `target/dist/macos/`. Requires `hdiutil` (macOS) or
 //!   `genisoimage` (Linux fallback); falls through to a staging tree if
@@ -732,10 +732,13 @@ const DEB_POSTINST: &str = include_str!("../templates/deb.postinst");
 const DEB_PRERM: &str = include_str!("../templates/deb.prerm");
 /// Embedded PKGBUILD template (`{VERSION}` substituted).
 const PKGBUILD_TEMPLATE: &str = include_str!("../templates/PKGBUILD.in");
+/// Embedded RPM spec template (`{VERSION}` substituted).
+const RPM_SPEC_TEMPLATE: &str = include_str!("../templates/buffr.spec.in");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxVariant {
     Deb,
+    Rpm,
     Aur,
     All,
 }
@@ -744,9 +747,10 @@ impl LinuxVariant {
     fn parse(s: &str) -> Result<Self> {
         match s {
             "deb" => Ok(Self::Deb),
+            "rpm" => Ok(Self::Rpm),
             "aur" => Ok(Self::Aur),
             "all" => Ok(Self::All),
-            other => bail!("unknown --variant `{other}` (deb|aur|all)"),
+            other => bail!("unknown --variant `{other}` (deb|rpm|aur|all)"),
         }
     }
 }
@@ -822,6 +826,10 @@ fn package_linux(args: Vec<String>) -> Result<()> {
 
     if matches!(parsed.variant, LinuxVariant::Deb | LinuxVariant::All) {
         build_deb(&workspace, &dist_dir, &target_dir, &payload, &version)?;
+    }
+
+    if matches!(parsed.variant, LinuxVariant::Rpm | LinuxVariant::All) {
+        build_rpm(&workspace, &dist_dir, &target_dir, &payload, &version)?;
     }
 
     eprintln!();
@@ -1012,6 +1020,94 @@ fn build_deb(
         return Ok(());
     }
     eprintln!("xtask: deb written to {}", out.display());
+    Ok(())
+}
+
+// ---------------------------- .rpm --------------------------------------
+
+fn build_rpm(
+    workspace: &Path,
+    dist_dir: &Path,
+    target_dir: &Path,
+    payload: &RuntimePayload,
+    version: &str,
+) -> Result<()> {
+    if !which("rpmbuild") {
+        eprintln!("xtask: rpmbuild not on PATH; skipping rpm build");
+        return Ok(());
+    }
+
+    let rpmroot = target_dir.join("buffr-rpm");
+    if rpmroot.exists() {
+        fs::remove_dir_all(&rpmroot)
+            .with_context(|| format!("wiping existing {}", rpmroot.display()))?;
+    }
+    let sources = rpmroot.join("SOURCES");
+    let specs = rpmroot.join("SPECS");
+    let rpms = rpmroot.join("RPMS");
+    let buildroot = rpmroot.join("BUILDROOT");
+    fs::create_dir_all(sources.join("payload"))?;
+    fs::create_dir_all(&specs)?;
+    fs::create_dir_all(&rpms)?;
+    fs::create_dir_all(&buildroot)?;
+
+    // Stage the runtime payload at SOURCES/payload/ — the spec %install
+    // hook copies from %{_sourcedir}/payload/ into %{buildroot}/opt/buffr.
+    stage_payload(&sources.join("payload"), payload)?;
+
+    // .desktop + icon as plain SOURCES (the spec installs them into
+    // /usr/share/applications and /usr/share/icons/.../apps).
+    fs::write(sources.join("buffr.desktop"), DESKTOP_TEMPLATE)?;
+    let icon_src = workspace.join("pkg/buffr.png");
+    if icon_src.exists() {
+        fs::copy(&icon_src, sources.join("buffr.png"))?;
+    }
+
+    // Render and write the spec.
+    let spec = RPM_SPEC_TEMPLATE.replace("{VERSION}", version);
+    let spec_path = specs.join("buffr.spec");
+    fs::write(&spec_path, spec)?;
+
+    eprintln!("xtask: rpmbuild -bb -> {}", rpms.join("x86_64").display());
+    let topdir = rpmroot.canonicalize().unwrap_or(rpmroot.clone());
+    let status = Command::new("rpmbuild")
+        .arg("-bb")
+        .arg("--define")
+        .arg(format!("_topdir {}", topdir.display()))
+        .arg(&spec_path)
+        .status()
+        .context("spawning rpmbuild")?;
+    if !status.success() {
+        eprintln!("xtask: warning — rpmbuild exited {status:?}");
+        return Ok(());
+    }
+
+    // rpmbuild deposits at RPMS/x86_64/buffr-<ver>-1.x86_64.rpm — copy
+    // into target/dist/linux/ with the same name pattern as the deb
+    // (buffr-<ver>-x86_64.rpm).
+    let arch_dir = rpms.join("x86_64");
+    let mut found = None;
+    if arch_dir.exists() {
+        for entry in fs::read_dir(&arch_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("rpm") {
+                found = Some(path);
+                break;
+            }
+        }
+    }
+    let Some(src) = found else {
+        eprintln!(
+            "xtask: warning — rpmbuild produced no .rpm under {}",
+            arch_dir.display()
+        );
+        return Ok(());
+    };
+
+    let out = dist_dir.join(format!("buffr-{version}-x86_64.rpm"));
+    fs::copy(&src, &out).with_context(|| format!("copy {} -> {}", src.display(), out.display()))?;
+    eprintln!("xtask: rpm written to {}", out.display());
     Ok(())
 }
 
@@ -1721,8 +1817,20 @@ mod tests {
     #[test]
     fn linux_variant_parse_known() {
         assert_eq!(LinuxVariant::parse("deb").unwrap(), LinuxVariant::Deb);
+        assert_eq!(LinuxVariant::parse("rpm").unwrap(), LinuxVariant::Rpm);
         assert_eq!(LinuxVariant::parse("aur").unwrap(), LinuxVariant::Aur);
         assert_eq!(LinuxVariant::parse("all").unwrap(), LinuxVariant::All);
+    }
+
+    #[test]
+    fn rpm_spec_template_has_required_fields() {
+        let rendered = RPM_SPEC_TEMPLATE.replace("{VERSION}", "1.2.3");
+        assert!(rendered.contains("Name:           buffr"));
+        assert!(rendered.contains("Version:        1.2.3"));
+        assert!(rendered.contains("ExclusiveArch:  x86_64"));
+        assert!(!rendered.contains("{VERSION}"));
+        // post-install symlink mirroring deb postinst.
+        assert!(rendered.contains("ln -sf /opt/buffr/buffr /usr/local/bin/buffr"));
     }
 
     #[test]

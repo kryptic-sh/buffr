@@ -226,11 +226,11 @@ jobs:
           xmllint --noout "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/Info.plist"
 
   linux-package:
-    # Cross-build the .deb / AUR PKGBUILD on a Linux runner. No signing
-    # in this round — Phase 6 release pipeline takes that over. The job
-    # verifies the bundle scripts produce installable artifacts and that
-    # `dpkg-deb -I` parses the resulting .deb metadata.
-    name: linux package (deb + AUR)
+    # Cross-build the .deb / .rpm / AUR PKGBUILD on a Linux runner. No
+    # signing in this round — Phase 6 release pipeline takes that over.
+    # The job verifies the bundle scripts produce installable artifacts
+    # and that `dpkg-deb -I` / `rpm -qpi` parse the resulting metadata.
+    name: linux package (deb + rpm + AUR)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -251,7 +251,8 @@ jobs:
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
-            dpkg dpkg-dev fakeroot file
+            dpkg dpkg-dev fakeroot file \
+            rpm
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -287,6 +288,19 @@ jobs:
           dpkg-deb -I "${debs[0]}"
           dpkg-deb -c "${debs[0]}" | head -30
           echo "deb OK: ${debs[0]}"
+
+      - name: validate .rpm metadata
+        run: |
+          set -e
+          shopt -s nullglob
+          rpms=(target/dist/linux/buffr-*-x86_64.rpm)
+          if [ ${#rpms[@]} -eq 0 ]; then
+            echo "::error::no .rpm produced"
+            exit 1
+          fi
+          rpm -qpi "${rpms[0]}"
+          rpm -qpl "${rpms[0]}" | head -30
+          echo "rpm OK: ${rpms[0]}"
 
       - name: validate PKGBUILD
         run: |

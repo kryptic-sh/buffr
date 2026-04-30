@@ -1,0 +1,81 @@
+Name:           buffr
+Version:        {VERSION}
+Release:        1%{?dist}
+Summary:        Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
+
+License:        MIT
+URL:            https://buffr.kryptic.sh/
+ExclusiveArch:  x86_64
+
+# Runtime libraries (Fedora package names, mirroring debian/control).
+Requires:       gtk3
+Requires:       nss
+Requires:       libXScrnSaver
+Requires:       alsa-lib
+Requires:       mesa-libgbm
+Requires:       libxshmfence
+Requires:       libxkbcommon
+Requires:       libxkbcommon-x11
+Requires:       mesa-libGLES
+
+# Skip stripping — the CEF binaries ship pre-stripped and our `buffr`
+# Rust binary uses workspace `strip = "symbols"` already.
+%global __os_install_post %{nil}
+%global debug_package %{nil}
+
+%description
+buffr is a modal Vim-flavored web browser. It composites Chromium
+(via CEF) under a custom statusline + tab strip and exposes an
+hjkl-driven modal command surface.
+
+%prep
+# No-op — the payload tree is staged by xtask before rpmbuild runs.
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}/opt/buffr
+cp -a %{_sourcedir}/payload/. %{buildroot}/opt/buffr/
+
+mkdir -p %{buildroot}%{_datadir}/applications
+install -m 644 %{_sourcedir}/buffr.desktop \
+    %{buildroot}%{_datadir}/applications/buffr.desktop
+
+if [ -f %{_sourcedir}/buffr.png ]; then
+    mkdir -p %{buildroot}%{_datadir}/icons/hicolor/512x512/apps
+    install -m 644 %{_sourcedir}/buffr.png \
+        %{buildroot}%{_datadir}/icons/hicolor/512x512/apps/buffr.png
+fi
+
+%post
+# /usr/local/bin/buffr -> /opt/buffr/buffr symlink. Mirrors deb postinst.
+mkdir -p /usr/local/bin
+ln -sf /opt/buffr/buffr /usr/local/bin/buffr
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t %{_datadir}/icons/hicolor || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q || true
+fi
+
+exit 0
+
+%postun
+# Only unlink if still pointing at /opt/buffr/buffr.
+if [ "$1" = 0 ] && [ -L /usr/local/bin/buffr ]; then
+    target="$(readlink /usr/local/bin/buffr 2>/dev/null || true)"
+    if [ "$target" = "/opt/buffr/buffr" ]; then
+        rm -f /usr/local/bin/buffr
+    fi
+fi
+
+exit 0
+
+%files
+/opt/buffr
+%{_datadir}/applications/buffr.desktop
+%{_datadir}/icons/hicolor/512x512/apps/buffr.png
+
+%changelog
+* Thu Apr 30 2026 kryptic.sh <hello@kryptic.sh> - {VERSION}-1
+- Automated build.
