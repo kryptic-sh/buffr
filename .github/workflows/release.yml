@@ -516,10 +516,12 @@ jobs:
       - name: Generate .SRCINFO
         run: |
           set -euo pipefail
-          # makepkg refuses to run as root; arch container has nobody
-          # already provisioned. Make `out/` writable for it.
-          chown -R nobody:nobody out
-          su nobody -s /bin/bash -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
+          # makepkg refuses to run as root. The archlinux:latest image's
+          # `nobody` user has an expired password (`su: User account has
+          # expired`), so we provision a fresh build user instead.
+          useradd -m builder
+          chown -R builder:builder out
+          su builder -s /bin/bash -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
           echo "--- .SRCINFO ---"
           cat out/.SRCINFO
 
@@ -545,9 +547,13 @@ jobs:
           git config --global user.name  "buffr-ci"
           git config --global user.email "ci@kryptic.sh"
           git clone ssh://aur@aur.archlinux.org/buffr-bin.git aur-repo
+          # PKGBUILD + .SRCINFO are required; LICENSE (0BSD on the
+          # PKGBUILD itself) and .gitignore (exclude-all + force-add)
+          # are wiki recommendations.
           cp out/PKGBUILD out/.SRCINFO aur-repo/
+          cp pkg/aur/LICENSE pkg/aur/.gitignore aur-repo/
           cd aur-repo
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO LICENSE .gitignore
           if git diff --cached --quiet; then
             echo "no changes vs current AUR head; nothing to push"
             exit 0
