@@ -3,7 +3,7 @@ name = "buffr"
 # Keep this in lockstep with the workspace `version` in ../../Cargo.toml.
 # This crate is excluded from the workspace because its `buffr` bin
 # collides with the real binary at apps/buffr. Bump together on release.
-version = "0.1.22"
+version = "0.1.23"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

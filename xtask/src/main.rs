@@ -891,7 +891,7 @@ fn package_linux(args: Vec<String>) -> Result<()> {
     }
 
     if matches!(parsed.variant, LinuxVariant::Tarball | LinuxVariant::All) {
-        build_tarball(&dist_dir, &target_dir, &payload, &version)?;
+        build_tarball(&workspace, &dist_dir, &target_dir, &payload, &version)?;
     }
 
     eprintln!();
@@ -1195,8 +1195,11 @@ fn build_rpm(
 ///   libcef.so
 ///   *.pak / *.dat / *.bin
 ///   locales/...
+///   buffr.desktop       (XDG desktop entry; AUR/manual installs use it)
+///   buffr.png           (512x512 icon; same)
 /// ```
 fn build_tarball(
+    workspace: &Path,
     dist_dir: &Path,
     target_dir: &Path,
     payload: &RuntimePayload,
@@ -1210,6 +1213,15 @@ fn build_tarball(
             .with_context(|| format!("wiping existing {}", staging.display()))?;
     }
     stage_payload(&staging, payload)?;
+
+    // Bundle XDG metadata so packagers (-bin AUR, manual installs) can
+    // wire `buffr.desktop` + icon without fetching extra sources. The
+    // .deb/.rpm builders install these from the workspace directly.
+    fs::write(staging.join("buffr.desktop"), DESKTOP_TEMPLATE)?;
+    let icon_src = workspace.join("pkg/buffr.png");
+    if icon_src.exists() {
+        fs::copy(&icon_src, staging.join("buffr.png"))?;
+    }
 
     // Shell out to GNU tar — every Linux runner ships it. Avoids a
     // Rust gzip dep just for this one call site.

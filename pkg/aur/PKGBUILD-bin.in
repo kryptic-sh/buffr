@@ -42,6 +42,12 @@ package() {
     install -dm755 "$pkgdir/usr/bin"
     ln -sf /opt/buffr/buffr "$pkgdir/usr/bin/buffr"
 
-    # `.desktop` + icon are deferred until the runtime tarball bundles
-    # them — the upstream `pkg/` dir isn't in the AUR build context.
+    # `.desktop` + icon ship inside the runtime tarball (xtask
+    # `build_tarball`). Hoist them out of /opt/buffr/ into the standard
+    # XDG locations so desktop launchers + icon themes pick them up.
+    install -Dm644 "$pkgdir/opt/buffr/buffr.desktop" \
+        "$pkgdir/usr/share/applications/buffr.desktop"
+    install -Dm644 "$pkgdir/opt/buffr/buffr.png" \
+        "$pkgdir/usr/share/icons/hicolor/512x512/apps/buffr.png"
+    rm "$pkgdir/opt/buffr/buffr.desktop" "$pkgdir/opt/buffr/buffr.png"
 }
