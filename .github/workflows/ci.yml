@@ -24,6 +24,8 @@ jobs:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: install CEF runtime deps
         run: |
@@ -110,6 +112,8 @@ jobs:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: install CEF runtime deps
         run: |
@@ -169,6 +173,8 @@ jobs:
       BUFFR_BUNDLE_FRAMEWORK_DIR: ${{ github.workspace }}/.ci/stub-framework
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: install CEF runtime deps
         run: |
@@ -231,6 +237,8 @@ jobs:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: install CEF runtime + packaging deps
         run: |
@@ -319,6 +327,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -376,6 +386,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable

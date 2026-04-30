@@ -28,6 +28,8 @@ jobs:
       CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
@@ -113,6 +115,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
@@ -184,6 +188,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
