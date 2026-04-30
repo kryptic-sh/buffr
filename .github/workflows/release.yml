@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
   # Manual re-runs are safe: xtask packaging is idempotent and
   # softprops/action-gh-release skips files already attached to the release.
   workflow_dispatch:
@@ -233,7 +233,9 @@ jobs:
         shell: powershell
 
       - name: Add WiX to PATH
-        run: echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run:
+          echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" | Out-File
+          -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: powershell
 
       - name: Cache CEF binary distribution
@@ -278,6 +280,171 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  flatpak:
+    name: Flatpak bundle (${{ matrix.arch }})
+    needs: [linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            tar_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tar_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install flatpak + flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            flatpak flatpak-builder
+
+      - name: Add flathub remote + install runtime
+        run: |
+          flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --user flathub \
+            org.gnome.Platform//47 org.gnome.Sdk//47
+
+      - name: Download buffr tarball from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release download "v$VERSION" \
+            -p "buffr-${VERSION}-${{ matrix.tar_arch }}.tar.gz" \
+            -D flatpak/
+
+      - name: Stage tarball payload
+        run: |
+          set -euo pipefail
+          cd flatpak
+          tar xzf buffr-*.tar.gz
+          # Tarball top-level dir is `buffr-<ver>-<arch>/`; rename to
+          # `payload/` so the manifest's source `path: payload` resolves.
+          mv buffr-*-* payload
+
+      - name: Stage icon
+        run: |
+          # Manifest expects sh.kryptic.buffr.png next to it; canonical
+          # icon lives at pkg/buffr.png. flatpak-builder rejects sources
+          # outside the manifest dir, so copy it in.
+          cp pkg/buffr.png flatpak/sh.kryptic.buffr.png
+
+      - name: Build flatpak bundle
+        run: |
+          set -euo pipefail
+          cd flatpak
+          flatpak-builder --user --force-clean --repo=repo build sh.kryptic.buffr.yml
+          VERSION="${GITHUB_REF_NAME#v}"
+          flatpak build-bundle repo \
+            "buffr-${VERSION}-${{ matrix.arch }}.flatpak" sh.kryptic.buffr
+
+      - name: Compute sha256 checksum
+        run: |
+          cd flatpak
+          for f in buffr-*.flatpak; do
+            sha256sum "$f" > "$f.sha256"
+            echo "sha256: $(cat "$f.sha256")"
+          done
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            flatpak/buffr-*.flatpak
+            flatpak/buffr-*.flatpak.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  snap:
+    name: Snap bundle (${{ matrix.arch }})
+    needs: [linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            tar_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tar_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download buffr tarball from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release download "v$VERSION" \
+            -p "buffr-${VERSION}-${{ matrix.tar_arch }}.tar.gz" \
+            -D snap/
+
+      - name: Stage tarball payload
+        run: |
+          set -euo pipefail
+          cd snap
+          tar xzf buffr-*.tar.gz
+          mv buffr-*-* payload
+
+      - name: Pin snap version to tag
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # snapcraft.yaml ships `version: "0.1.0"` as a placeholder so
+          # local builds work; rewrite to the live tag before snapcraft
+          # consumes it.
+          sed -i "s/^version: .*/version: \"${VERSION}\"/" snap/snapcraft.yaml
+
+      - name: Build snap
+        uses: snapcore/action-build@v1
+        id: snapcraft
+        with:
+          path: .
+
+      - name: Rename snap to versioned filename
+        run: |
+          set -euo pipefail
+          mv "${{ steps.snapcraft.outputs.snap }}" \
+             "buffr-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.snap"
+
+      - name: Compute sha256 checksum
+        run: |
+          for f in buffr-*.snap; do
+            sha256sum "$f" > "$f.sha256"
+            echo "sha256: $(cat "$f.sha256")"
+          done
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            buffr-*.snap
+            buffr-*.snap.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # The 9 buffr-* library crates are versioned and released independently
   # via their own submodule repos. Only the `buffr` crates.io stub
   # (apps/buffr-stub) tracks the umbrella tag — it's a "go grab the
@@ -285,7 +452,7 @@ jobs:
   # `cargo install buffr` always points at the matching binary release.
   publish-stub:
     name: Publish buffr stub to crates.io
-    needs: [linux, macos, windows]
+    needs: [linux, macos, windows, flatpak, snap]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

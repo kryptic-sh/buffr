@@ -1,0 +1,11 @@
+#!/bin/sh
+# Flatpak launcher for buffr.
+#
+# CEF's loader resolves libcef.so via $ORIGIN/$LD_LIBRARY_PATH. We
+# stage the runtime under /app/buffr/ rather than /app/lib/ so the
+# entire CEF tree (paks, locales, snapshots) lives in one directory.
+# LD_LIBRARY_PATH is set here (not in finish-args) so it lives in
+# the user's process tree and survives `flatpak run` argv passing —
+# the Flathub guidance discourages env in finish-args.
+export LD_LIBRARY_PATH="/app/buffr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec /app/buffr/buffr "$@"

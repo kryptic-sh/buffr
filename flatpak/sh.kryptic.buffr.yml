@@ -1,0 +1,107 @@
+# Flatpak manifest for buffr.
+#
+# Builds a single-file `.flatpak` bundle from the runtime tarball
+# emitted by `cargo xtask package-linux --variant tarball`. The tarball
+# is staged in the workspace before flatpak-builder runs (CI passes
+# `--state-dir` and the source `path` resolves relative to the manifest
+# directory).
+#
+# Layout inside the bundle:
+#
+#   /app/buffr/                  (binaries + libcef.so + paks + locales)
+#   /app/bin/buffr               (wrapper that fixes up LD_LIBRARY_PATH
+#                                 and execs /app/buffr/buffr)
+#   /app/share/applications/sh.kryptic.buffr.desktop
+#   /app/share/icons/hicolor/512x512/apps/sh.kryptic.buffr.png
+#
+# Runtime: org.gnome.Platform//47 — includes GTK3 + GLib + cairo +
+# pango that CEF's Linux build links against. The freedesktop platform
+# alone would force us to bundle gtk3, which doubles the bundle size.
+#
+# Permissions are tuned for a web browser, mirroring the Chromium /
+# Brave / Vivaldi flatpaks:
+#
+#   --socket=wayland, --socket=fallback-x11   display
+#   --socket=pulseaudio                       audio
+#   --share=network                           obvious
+#   --share=ipc                               X SHM (Wayland still needs)
+#   --device=dri                              GPU acceleration
+#   --filesystem=xdg-download                 default download dest
+#   --filesystem=xdg-config/buffr:create      our config root
+#   --filesystem=xdg-data/buffr:create        history/bookmarks/zoom DBs
+#   --talk-name=org.freedesktop.Notifications HTML5 notifications
+#   --talk-name=org.freedesktop.secrets       login keyring (later)
+#   --own-name=org.mpris.MediaPlayer2.buffr.* MPRIS media keys
+#
+# CEF subprocess helpers run inside the sandbox via plain execve to
+# /app/buffr/buffr-helper — no flatpak-spawn workaround needed. CEF's
+# `--no-sandbox` is set programmatically already; flatpak's own
+# bubblewrap layer provides the isolation.
+app-id: sh.kryptic.buffr
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+command: buffr
+
+# Inhibit the default GTK theme + icon overrides — buffr ships its
+# own chrome and doesn't link GTK directly (CEF does, but we don't
+# care about its theming inside the sandbox).
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --share=network
+  - --share=ipc
+  # Only DRI is needed at the device level. Camera/mic/USB go through
+  # xdg-desktop-portal — no raw `--device=all`, which Flathub reviewers
+  # reject as overscoped.
+  - --device=dri
+  - --filesystem=xdg-download
+  - --filesystem=xdg-config/buffr:create
+  - --filesystem=xdg-data/buffr:create
+  - --filesystem=xdg-cache/buffr:create
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.freedesktop.secrets
+  - --own-name=org.mpris.MediaPlayer2.buffr.*
+
+# Skip stripping — CEF's libcef.so is already stripped upstream and
+# stripping it again breaks symbol lookups in some builds.
+build-options:
+  strip: false
+  no-debuginfo: true
+
+modules:
+  - name: buffr
+    buildsystem: simple
+    build-commands:
+      # Layout: /app/buffr/<runtime tree>, /app/bin/buffr (launcher).
+      - install -d /app/buffr
+      - cp -r payload/. /app/buffr/
+      # Launcher script. LD_LIBRARY_PATH must point at /app/buffr so
+      # the dynamic loader finds libcef.so when the user runs `buffr`.
+      - install -Dm755 buffr-launcher /app/bin/buffr
+      # Desktop + icon for the launcher menu.
+      - install -Dm644 sh.kryptic.buffr.desktop
+        /app/share/applications/sh.kryptic.buffr.desktop
+      - install -Dm644 sh.kryptic.buffr.png
+        /app/share/icons/hicolor/512x512/apps/sh.kryptic.buffr.png
+      # AppStream metadata so GNOME Software / KDE Discover render
+      # the package correctly (icon, screenshots, summary).
+      - install -Dm644 sh.kryptic.buffr.metainfo.xml
+        /app/share/metainfo/sh.kryptic.buffr.metainfo.xml
+    sources:
+      # The tarball is staged in CI before flatpak-builder runs. The
+      # `path:` source unpacks `<dir>/buffr/` from the tarball into
+      # the build dir as `payload/`. CI symlinks the tarball as
+      # `flatpak/payload.tar.gz` after extracting it.
+      - type: dir
+        path: payload
+        dest: payload
+      - type: file
+        path: buffr-launcher
+      - type: file
+        path: sh.kryptic.buffr.desktop
+      - type: file
+        path: sh.kryptic.buffr.png
+      - type: file
+        path: sh.kryptic.buffr.metainfo.xml

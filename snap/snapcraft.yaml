@@ -1,0 +1,59 @@
+# Snapcraft manifest for buffr.
+#
+# Classic confinement is the standard for Chromium-based browsers
+# (Firefox, Brave, Vivaldi, Opera all ship classic). Strict confinement
+# would force us to plumb every CEF subprocess + GPU + audio + camera
+# permission as a connected interface; the cost wouldn't pay for the
+# extra isolation when the runtime already runs `--no-sandbox`.
+#
+# Classic snaps require explicit `--classic` from users until the snap
+# store reviews + approves the registration. Until then, distribute
+# via GitHub Releases (`snap install --dangerous --classic ./buffr.snap`).
+#
+# Build: CI extracts buffr-<ver>-<arch>.tar.gz and points snapcraft at
+# the runtime tree. The `dump` plugin copies it into the snap's
+# `usr/share/buffr/` and `apps:` exposes the binary as `buffr`.
+name: buffr
+title: buffr
+version: '0.1.0'
+summary: Vim-inspired browser. Native, GPU-accelerated.
+description: |
+  buffr is a modal web browser that pairs a Vim-flavored input layer
+  with a Chromium-backed page renderer. Tabs, bookmarks, history,
+  downloads, and per-origin permissions live locally in SQLite;
+  everything ships in one binary.
+
+confinement: classic
+grade: stable
+base: core24
+license: MIT
+contact: hello@kryptic.sh
+issues: https://github.com/kryptic-sh/buffr/issues
+website: https://buffr.kryptic.sh
+source-code: https://github.com/kryptic-sh/buffr
+
+architectures:
+  - build-on: amd64
+    build-for: amd64
+  - build-on: arm64
+    build-for: arm64
+
+# CI overrides this via `--build-for` and `parts.buffr.source` to point
+# at the staged tarball (`snap/payload/`). Local snapcraft runs need
+# the same staging — `tar xzf buffr-*.tar.gz -C snap/ && mv
+# snap/buffr-*-* snap/payload`.
+parts:
+  buffr:
+    plugin: dump
+    source: payload
+    organize:
+      '*': usr/share/buffr/
+
+apps:
+  buffr:
+    command: usr/share/buffr/buffr
+    # .desktop / common-id wiring lands in a follow-up once we apply
+    # for Snap Store registration. Until then this snap installs via
+    # `snap install --dangerous --classic ./buffr.snap` and is
+    # invoked from the terminal — the launcher integration is
+    # cosmetic for the GitHub Releases distribution path.

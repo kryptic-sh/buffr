@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for buffr. GNOME Software, KDE Discover, and the
+  Flathub website read this to render the listing. The schema is loose
+  enough that we keep this minimal; richer fields (releases, content
+  ratings, screenshots) can be filled in once we have stable URLs.
+-->
+<component type="desktop-application">
+  <id>sh.kryptic.buffr</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>buffr</name>
+  <summary>Vim-inspired browser. Native, GPU-accelerated.</summary>
+  <description>
+    <p>
+      buffr is a modal web browser that pairs a Vim-flavored input layer
+      with a Chromium-backed page renderer. Tabs, bookmarks, history,
+      downloads, and per-origin permissions live locally in SQLite;
+      everything ships in one binary.
+    </p>
+  </description>
+  <url type="homepage">https://buffr.kryptic.sh</url>
+  <url type="bugtracker">https://github.com/kryptic-sh/buffr/issues</url>
+  <developer_name>kryptic.sh</developer_name>
+  <launchable type="desktop-id">sh.kryptic.buffr.desktop</launchable>
+  <provides>
+    <binary>buffr</binary>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>WebBrowser</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>

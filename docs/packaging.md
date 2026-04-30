@@ -3,11 +3,13 @@
 Phase 6 lands distribution artifacts for all three tier-1 targets, all unsigned
 in this round (signing infrastructure is the next step):
 
-| Platform | Driver                            | Output                                     |
-| -------- | --------------------------------- | ------------------------------------------ |
-| Linux    | `cargo xtask package-linux`       | AppImage + `.deb` + AUR PKGBUILD           |
-| macOS    | `cargo xtask package-macos-dmg`   | `target/dist/macos/buffr-<ver>-<arch>.dmg` |
-| Windows  | `cargo xtask package-windows-msi` | `target/dist/windows/buffr-<ver>-x64.msi`  |
+| Platform | Driver                            | Output                                             |
+| -------- | --------------------------------- | -------------------------------------------------- |
+| Linux    | `cargo xtask package-linux`       | `.deb` + `.rpm` + `.tar.gz` + AUR PKGBUILD         |
+| Linux    | `flatpak-builder` (CI)            | `.flatpak` (single-file bundle)                    |
+| Linux    | `snapcraft` (CI)                  | `.snap` (classic confinement, single-file bundle)  |
+| macOS    | `cargo xtask package-macos-dmg`   | `target/dist/macos/buffr-<ver>-arm64.dmg`          |
+| Windows  | `cargo xtask package-windows-msi` | `target/dist/windows/buffr-<ver>-<x64\|arm64>.msi` |
 
 The macOS bundle assembly (driving the DMG) lives in
 [`docs/macos-signing.md`](./macos-signing.md); the Windows MSI flow has its own
@@ -271,3 +273,95 @@ Authenticode signing lands.
 
 The CI `windows-package` job runs the full pipeline on a `windows-latest` runner
 with the WiX 3 toolset installed and uploads the MSI as a build artifact.
+
+## Flatpak
+
+`flatpak/sh.kryptic.buffr.yml` builds a single-file `.flatpak` bundle from the
+runtime tarball emitted by `cargo xtask package-linux --variant tarball`. CI
+extracts the tarball into `flatpak/payload/`, invokes `flatpak-builder`, and
+uploads `buffr-<ver>-<arch>.flatpak` to the GitHub release. Users install with:
+
+```sh
+flatpak install --user ./buffr-<ver>-amd64.flatpak
+```
+
+Runtime is `org.gnome.Platform//47`. We don't link GTK from buffr's own code
+(the chrome is wgpu + winit + a bitmap font), but `libcef.so` itself depends on
+`libgtk-3.so.0` for Chromium's native dialogs (file picker, color picker,
+printing). The GNOME Platform provides GTK3 from a shared layer, so we don't
+have to bundle it.
+
+`finish-args` mirrors the Brave/Vivaldi flatpaks closely — Wayland + fallback
+X11 + pulseaudio + DRI for GPU + narrow xdg-config/data/cache filesystem access
+
+- DBus name reservations for MPRIS and notifications. CEF subprocess helpers run
+  inside the same sandbox via plain `execve`; no `flatpak-spawn` shim is needed.
+
+### Phase 2 — Flathub
+
+The current manifest is correct for direct-bundle distribution but not for
+Flathub submission. Phase 2 work, deferred:
+
+- Replace `type: dir, path: payload` with a `type: archive, url: <release URL>`
+  - `sha256` entry — Flathub requires reproducible network sources.
+- Add `<release>` and `<screenshots>` entries to the AppStream metainfo.
+- Verify `--filesystem=xdg-config/buffr` is the narrowest set Flathub accepts.
+
+### Future — drop GTK dependency (option 3)
+
+Long-term, we'd like to swap to `org.freedesktop.Platform//24.08` and route all
+native dialogs through `xdg-desktop-portal` so the flatpak base doesn't identify
+us as a GNOME app. CEF supports portal-based file pickers via the
+`--enable-features=DesktopPortalFileChooser` switch (set in
+`crates/buffr-core/src/app.rs`'s command-line setup); the printing and color
+picker paths still need investigation. Tracked separately because it affects the
+.deb and .rpm runtime deps too — if we patch CEF / disable GTK fallbacks, the
+deb's `libgtk-3-0` Depends and the rpm's `gtk3` Requires can drop.
+
+## Snap
+
+`snap/snapcraft.yaml` builds a `.snap` bundle from the same runtime tarball the
+flatpak job uses. CI extracts the tarball into `snap/payload/` and runs
+`snapcore/action-build@v1`, which boots an LXD VM, runs snapcraft, and emits
+`buffr-<ver>-<arch>.snap`. Users install with:
+
+```sh
+snap install --dangerous --classic ./buffr-<ver>-amd64.snap
+```
+
+Phase 1 ships **classic confinement** because that's the simplest path for
+ad-hoc distribution. Until the Snap Store registration is filed, the snap is
+bundled on GitHub Releases.
+
+### Phase 2 — Snap Store + strict confinement
+
+Modern Chromium-based snaps (Firefox, Brave, Chromium, Edge, Vivaldi) all run
+**strict** confinement with the `browser-support` interface — classic for a
+browser is unconventional today and likely to be flagged by Snap Store
+reviewers. Phase 2 redesign:
+
+```yaml
+confinement: strict
+extensions:
+  - gnome # GTK3 + portal integration shared from the host
+apps:
+  buffr:
+    plugs:
+      - browser-support
+      - network
+      - network-bind
+      - audio-playback
+      - audio-record
+      - opengl
+      - x11
+      - wayland
+      - desktop
+      - desktop-legacy
+      - gsettings
+      - removable-media
+      - screen-inhibit-control
+```
+
+The `gnome` extension shares GTK3 with the host instead of bundling it inside
+the snap (saves ~150 MB). Tracked alongside the flatpak option-3 work since both
+touch CEF's GTK use.

@@ -20,3 +20,21 @@
 # committed because the source markdown is the canonical text.
 /docs-site
 
+# Flatpak build state. CI copies the icon + tarball payload in
+# before invoking flatpak-builder; both are ignored to keep the
+# tree clean for local rebuilds.
+/flatpak/build
+/flatpak/repo
+/flatpak/payload
+/flatpak/buffr-*.tar.gz
+/flatpak/buffr-*.flatpak
+/flatpak/buffr-*.flatpak.sha256
+/flatpak/sh.kryptic.buffr.png
+/flatpak/.flatpak-builder
+
+# Snap build state.
+/snap/payload
+/snap/buffr-*.tar.gz
+/buffr-*.snap
+/buffr-*.snap.sha256
+

@@ -153,7 +153,8 @@ jobs:
         run: cargo build --workspace --features osr
 
       - name: cargo clippy (osr)
-        run: cargo clippy --workspace --all-targets --features osr -- -D warnings
+        run:
+          cargo clippy --workspace --all-targets --features osr -- -D warnings
 
   bundle-macos-cross:
     # Cross-bundle the macOS .app on a Linux runner. Catches
@@ -437,7 +438,9 @@ jobs:
       - name: add WiX to PATH
         # WiX 3 installs candle.exe + light.exe under
         # C:\Program Files (x86)\WiX Toolset v3.x\bin\.
-        run: echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run:
+          echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" | Out-File
+          -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: powershell
 
       - name: cache CEF binary distribution
