@@ -28,8 +28,8 @@ bitflags = "2"
 # the DOM via CEF. hjkl 0.1.0 froze the SPEC trait surface; the
 # `Editor<B, H>` generic now binds `BuffrHost` directly without the
 # pre-0.1.0 dyn-host shim.
-hjkl-engine = "=0.1.0"
-hjkl-buffer = "=0.1.0"
+hjkl-engine = "0.1"
+hjkl-buffer = "0.1"
 
 # crossterm KeyEvent is the engine's input type today; the host
 # bridges from CEF browser keys into it. When trait extraction lands a
