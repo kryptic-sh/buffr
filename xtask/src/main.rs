@@ -1498,19 +1498,18 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
 
     let msi_path = dist_dir.join(format!("buffr-{version}-x64.msi"));
     eprintln!("xtask: light -> {}", msi_path.display());
-    // ICE38 fires on every File component that lands under a per-user
-    // directory without an HKCU-rooted RegistryValue KeyPath. The
-    // recommendation is overly cautious for our shape — the install
-    // is single-user, the files belong to the running user, and the
-    // product registers shortcut/install-path KeyPaths at the
-    // ComponentGroup level. Suppress so heat.exe's harvested fragment
-    // (50+ File components, no per-component HKCU values) links.
-    // ICE91 is the matching warning for the same scenario; suppressed
-    // for symmetry so the linker output stays clean.
+    // ICE38/ICE64/ICE91 all fire because the install is per-user. The
+    // strict reading wants every File component to have an HKCU
+    // RegistryValue KeyPath and every Directory listed in the
+    // RemoveFile table — impractical for the heat-harvested CEF
+    // fragment (50+ files, nested locales/ tree). Suppress: install
+    // scope is already perUser via the Package element and the
+    // INSTALLFOLDER component carries a `RemoveFolder` for the root.
     let status = Command::new(if which("light") { "light" } else { "light.exe" })
         .arg("-o")
         .arg(&msi_path)
         .arg("-sice:ICE38")
+        .arg("-sice:ICE64")
         .arg("-sice:ICE91")
         .arg(&wixobj)
         .arg(&cef_wixobj)
