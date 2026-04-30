@@ -537,22 +537,14 @@ jobs:
           install -dm700 ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          # `ssh-keyscan` can silently emit nothing on transient DNS hiccups;
-          # verify the known_hosts grew, and fall back to `accept-new` so the
-          # first connection populates known_hosts itself instead of failing
-          # the strict host-key check.
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "known_hosts after keyscan:"
-          wc -l ~/.ssh/known_hosts || true
-          cat > ~/.ssh/config <<'EOF'
-          Host aur.archlinux.org
-            User aur
-            IdentityFile ~/.ssh/aur
-            IdentitiesOnly yes
-            StrictHostKeyChecking accept-new
-          EOF
 
       - name: Push to AUR
+        # `GIT_SSH_COMMAND` injects ssh options inline so we don't depend on
+        # `~/.ssh/config` parsing (heredoc indent broke it previously) or on
+        # `ssh-keyscan` output. `accept-new` writes the AUR host key to
+        # known_hosts on first connect; subsequent connects strict-verify.
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
         run: |
           set -euo pipefail
           git config --global user.name  "buffr-ci"
