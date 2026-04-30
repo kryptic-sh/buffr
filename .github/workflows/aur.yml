@@ -1,0 +1,127 @@
+# AUR auto-publish.
+#
+# Fires after a GitHub Release is published. Renders
+# `pkg/aur/PKGBUILD-bin.in` with the release version + per-arch
+# tarball sha256s, generates `.SRCINFO`, then pushes both files to
+# the `buffr-bin` AUR repo over SSH.
+#
+# Required repo secret:
+#   AUR_SSH_KEY  — ed25519 private key whose public half is registered
+#                  on the AUR account that owns the `buffr-bin` package.
+#
+# Generate the keypair with:
+#   ssh-keygen -t ed25519 -f /tmp/aur -N ""
+# Add /tmp/aur.pub at https://aur.archlinux.org/account/<user>/edit
+# under "SSH Public Key", then paste /tmp/aur into the secret.
+name: AUR publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to republish (e.g. v0.1.16)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish-bin:
+    name: Publish buffr-bin to AUR
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          # base-devel pulls in makepkg + fakeroot. openssh + git for
+          # the AUR push. curl for fetching the sha256 sidecar files
+          # off the release without needing the GitHub CLI.
+          pacman -Sy --noconfirm --needed base-devel git openssh curl
+
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag + version
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG (pkgver=$VERSION)"
+
+      - name: Fetch tarball sha256 sidecars
+        id: sha
+        run: |
+          set -euo pipefail
+          V="${{ steps.tag.outputs.version }}"
+          BASE="https://github.com/kryptic-sh/buffr/releases/download/v${V}"
+          for arch in x86_64 aarch64; do
+            curl -fsSL "$BASE/buffr-${V}-${arch}.tar.gz.sha256" -o "sha.${arch}"
+          done
+          # sha256sum sidecar format: `<hash>  <filename>` — keep first column.
+          echo "x86_64=$(awk '{print $1}' sha.x86_64)" >> "$GITHUB_OUTPUT"
+          echo "aarch64=$(awk '{print $1}' sha.aarch64)" >> "$GITHUB_OUTPUT"
+
+      - name: Render PKGBUILD
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          sed \
+            -e "s/{VERSION}/${{ steps.tag.outputs.version }}/g" \
+            -e "s/{SHA256_X86_64}/${{ steps.sha.outputs.x86_64 }}/g" \
+            -e "s/{SHA256_AARCH64}/${{ steps.sha.outputs.aarch64 }}/g" \
+            pkg/aur/PKGBUILD-bin.in > out/PKGBUILD
+          echo "--- rendered PKGBUILD ---"
+          cat out/PKGBUILD
+
+      - name: Generate .SRCINFO
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root; arch container has a
+          # nobody:nobody user already. Make `out/` writable and
+          # invoke makepkg there.
+          chown -R nobody:nobody out
+          su nobody -s /bin/bash -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
+          echo "--- .SRCINFO ---"
+          cat out/.SRCINFO
+
+      - name: Configure SSH for AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -dm700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+
+      - name: Push to AUR
+        run: |
+          set -euo pipefail
+          git config --global user.name  "buffr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          # AUR repo URLs are scoped per package name.
+          git clone ssh://aur@aur.archlinux.org/buffr-bin.git aur-repo
+          cp out/PKGBUILD out/.SRCINFO aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "no changes vs current AUR head; nothing to push"
+            exit 0
+          fi
+          git commit -m "buffr-bin ${{ steps.tag.outputs.version }}-1"
+          git push origin master

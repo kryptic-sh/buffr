@@ -1,0 +1,48 @@
+# Maintainer: kryptic.sh <hello@kryptic.sh>
+#
+# Auto-generated. Source: https://github.com/kryptic-sh/buffr
+# Edits made directly to the AUR repo will be overwritten on the next
+# release. To change this PKGBUILD, edit `pkg/aur/PKGBUILD-bin.in` in
+# the upstream repo and let `.github/workflows/aur.yml` republish.
+pkgname=buffr-bin
+_pkgname=buffr
+pkgver={VERSION}
+pkgrel=1
+pkgdesc="Vim-inspired browser. Native, GPU-accelerated. Rust + CEF. (binary release)"
+arch=('x86_64' 'aarch64')
+url="https://buffr.kryptic.sh/"
+license=('MIT')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+depends=('gtk3' 'nss' 'libxss' 'alsa-lib' 'libgbm' 'libxshmfence' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd')
+options=(!strip)
+
+source_x86_64=("buffr-${pkgver}-x86_64.tar.gz::https://github.com/kryptic-sh/buffr/releases/download/v${pkgver}/buffr-${pkgver}-x86_64.tar.gz")
+source_aarch64=("buffr-${pkgver}-aarch64.tar.gz::https://github.com/kryptic-sh/buffr/releases/download/v${pkgver}/buffr-${pkgver}-aarch64.tar.gz")
+sha256sums_x86_64=('{SHA256_X86_64}')
+sha256sums_aarch64=('{SHA256_AARCH64}')
+
+package() {
+    local _arch
+    case "$CARCH" in
+        x86_64)  _arch=x86_64 ;;
+        aarch64) _arch=aarch64 ;;
+    esac
+
+    cd "$srcdir/buffr-${pkgver}-${_arch}"
+
+    install -dm755 "$pkgdir/opt/buffr"
+    cp -a . "$pkgdir/opt/buffr/"
+
+    install -dm755 "$pkgdir/usr/bin"
+    ln -sf /opt/buffr/buffr "$pkgdir/usr/bin/buffr"
+
+    if [ -f "$srcdir/../pkg/buffr.desktop" ]; then
+        install -Dm644 "$srcdir/../pkg/buffr.desktop" \
+            "$pkgdir/usr/share/applications/buffr.desktop"
+    fi
+    if [ -f "$srcdir/../pkg/buffr.png" ]; then
+        install -Dm644 "$srcdir/../pkg/buffr.png" \
+            "$pkgdir/usr/share/icons/hicolor/512x512/apps/buffr.png"
+    fi
+}

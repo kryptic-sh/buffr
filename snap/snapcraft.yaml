@@ -32,16 +32,21 @@ issues: https://github.com/kryptic-sh/buffr/issues
 website: https://buffr.kryptic.sh
 source-code: https://github.com/kryptic-sh/buffr
 
-architectures:
-  - build-on: amd64
-    build-for: amd64
-  - build-on: arm64
-    build-for: arm64
+# `platforms` replaces the deprecated `architectures` key for core24.
+# Each entry maps a build host arch to a target arch; CI's matrix runs
+# on a runner whose host arch matches `build-on`, so a single matrix
+# leg picks the matching platform automatically.
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+  arm64:
+    build-on: [arm64]
+    build-for: [arm64]
 
-# CI overrides this via `--build-for` and `parts.buffr.source` to point
-# at the staged tarball (`snap/payload/`). Local snapcraft runs need
-# the same staging — `tar xzf buffr-*.tar.gz -C snap/ && mv
-# snap/buffr-*-* snap/payload`.
+# CI overrides nothing here — `parts.buffr.source` points at the staged
+# tarball (`snap/payload/`). Local snapcraft runs need the same staging:
+# `tar xzf buffr-*.tar.gz -C snap/payload --strip-components=1`.
 parts:
   buffr:
     plugin: dump
