@@ -521,7 +521,11 @@ jobs:
           # expired`), so we provision a fresh build user instead.
           useradd -m builder
           chown -R builder:builder out
-          su builder -s /bin/bash -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
+          # `su` parses options BEFORE the username; anything after gets
+          # passed to the shell. The previous form `su builder -s /bin/bash
+          # -c '...'` made bash read commands from stdin (`-s`) and exit
+          # silently with code 0 — makepkg never ran. Put `-s` first.
+          su -s /bin/bash builder -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
           echo "--- .SRCINFO ---"
           cat out/.SRCINFO
 
