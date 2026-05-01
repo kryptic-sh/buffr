@@ -1,4 +1,4 @@
-/target
+target/
 # apps/buffr-stub is excluded from the workspace (it owns the `buffr`
 # crates.io name; the bin output collides with the real binary), so
 # it has its own target/ that the root `/target` rule misses.
