@@ -85,6 +85,7 @@ use buffr_ui::{
     Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
+mod loading_anim;
 mod render;
 mod session;
 use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
@@ -1815,6 +1816,19 @@ struct AppState {
     /// without issuing a `download_image` call. Also gates the apps-side
     /// pump so disabled-mode never populates the cache.
     show_favicons: bool,
+    /// Monotonic frame counter for the loading animation. Incremented on
+    /// each paint while the OSR buffer is unusable. Wraps via
+    /// `wrapping_add(1)` so it never overflows.
+    loading_anim_frame: u64,
+    /// True while the last `paint_chrome_with` used the loading animation
+    /// path (OSR buffer absent or wrong size). Cleared when the OSR path
+    /// resumes. Used to emit the `debug!` transition log exactly once.
+    loading_anim_active: bool,
+    /// When `Some(t)`, the event loop's `about_to_wait` sets
+    /// `ControlFlow::WaitUntil(t)` to ensure the next animation frame
+    /// fires at ~12 fps. Cleared as soon as `loading_anim_active`
+    /// becomes false so the loop returns to event-driven idle.
+    loading_anim_next_wake: Option<Instant>,
 }
 
 /// Edit-mode focus state machine.
@@ -1983,6 +1997,9 @@ impl AppState {
             popup_close_sink: buffr_core::new_popup_close_sink(),
             favicons: HashMap::new(),
             show_favicons,
+            loading_anim_frame: 0,
+            loading_anim_active: false,
+            loading_anim_next_wake: None,
         }
     }
 
@@ -2661,9 +2678,77 @@ impl AppState {
 
         let frame_start = Instant::now();
 
+        // Decide whether to show the loading animation instead of OSR.
+        // Pixel-state gating only — no time threshold.
+        //   • None      → no on_paint received yet, or pixels empty
+        //   • Some(...) → last CEF buffer dims don't match the live browser rect
+        let want_anim = match osr_meta {
+            None => true,
+            Some((osr_w, osr_h, _)) => osr_w != browser_w || osr_h != browser_h,
+        };
+
+        if want_anim != self.loading_anim_active {
+            if want_anim {
+                tracing::debug!(
+                    browser_w,
+                    browser_h,
+                    osr_dims = ?osr_meta.map(|(w, h, _)| (w, h)),
+                    "loading_anim: activated (OSR buffer absent or wrong size)"
+                );
+            } else {
+                tracing::debug!(
+                    browser_w,
+                    browser_h,
+                    "loading_anim: deactivated (OSR buffer matches browser rect)"
+                );
+            }
+            self.loading_anim_active = want_anim;
+        }
+
+        // Snapshot animation state for the closure.
+        let anim_frame = self.loading_anim_frame;
+        let anim_fg = statusline.palette.accent;
+        // bg: accent darkened 92% with black, matching the strip background.
+        let anim_bg = buffr_ui::Palette::from_accent(anim_fg).bg;
+
         // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
-        let res = if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
+        let chrome_dirty_effective = chrome_dirty || want_anim;
+        let res = if want_anim {
+            // Animation path: paint animation into chrome buffer at the browser
+            // rect region (opaque), then composite chrome alone (osr: None).
+            new_osr_generation = self.last_osr_generation;
+            renderer.frame(
+                chrome_dirty_effective,
+                |buf, w, h| {
+                    paint_chrome_strips(
+                        buf,
+                        w,
+                        height,
+                        &statusline,
+                        &tab_strip,
+                        tab_y,
+                        notice_y,
+                        current_notice.as_ref(),
+                        confirm_close_pinned,
+                        permissions_prompt.as_ref(),
+                        overlay_data.as_ref(),
+                    );
+                    // Paint the animation into the browser region so it is
+                    // opaque and composites as chrome (no OSR quad shown).
+                    crate::loading_anim::paint(
+                        buf,
+                        w,
+                        h,
+                        (0, browser_y, browser_w, browser_h),
+                        anim_frame as usize,
+                        anim_fg,
+                        anim_bg,
+                    );
+                },
+                None,
+            )
+        } else if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
             new_osr_generation = osr_gen;
             // dst_rect uses the live browser rect (not min'd against the
             // stale OSR dims). The renderer GPU-stretches the OSR texture
@@ -2719,8 +2804,16 @@ impl AppState {
         };
 
         self.last_osr_generation = new_osr_generation;
-        if chrome_dirty {
+        if chrome_dirty_effective {
             self.last_painted_chrome_gen = self.chrome_generation;
+        }
+
+        // Advance the animation counter and schedule the next wake when active.
+        if want_anim {
+            self.loading_anim_frame = self.loading_anim_frame.wrapping_add(1);
+            self.loading_anim_next_wake = Some(Instant::now() + Duration::from_millis(83)); // ~12 fps
+        } else {
+            self.loading_anim_next_wake = None;
         }
 
         let total_us = frame_start.elapsed().as_micros() as u64;
@@ -5631,6 +5724,20 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
         }
 
+        // Loading animation tick: if the animation is active and its
+        // scheduled wake time has passed, request a redraw so the next
+        // frame advances. `paint_chrome_with` will update
+        // `loading_anim_next_wake` for the subsequent tick, or clear it
+        // when the OSR buffer becomes usable. This is the only place
+        // that drives the animation forward between real input events,
+        // consistent with the no-idle-loop Wayland policy.
+        if self
+            .loading_anim_next_wake
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.request_redraw();
+        }
+
         // No idle paint loop: we respect Wayland's frame-callback model
         // and only repaint on explicit `request_redraw` (e.g. resize,
         // input, mode/url change). OSR `on_paint` updates that arrive
@@ -5658,6 +5765,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         let deadline = match self.cef_next_pump_at {
             Some(at) if at < next_wakeup => at,
             _ => next_wakeup,
+        };
+        // If the loading animation is active, wake up at ~12 fps so it
+        // advances even when no other event arrives. The animation path
+        // requests a redraw inside paint_chrome_with, and `WaitUntil`
+        // ensures the loop wakes to service it. Clamp to the earliest of
+        // the three candidates so we never sleep *past* an animation tick.
+        let deadline = match self.loading_anim_next_wake {
+            Some(anim_at) if anim_at < deadline => anim_at,
+            _ => deadline,
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }

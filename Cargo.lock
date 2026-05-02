@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-bin"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "buffr-core",
@@ -2652,9 +2652,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orbclient"
-version = "0.3.53"
+version = "0.3.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12c6933ddbbd16539a7672e697bb8d41ac3a4e99ac43eeb40c07236bd7fcb2dd"
+checksum = "a570f6bca41d29acb2139229a7c873ec99bc9a313bd10804081d89bfac8ff329"
 dependencies = [
  "libc",
  "libredox",
@@ -4838,7 +4838,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "bzip2",
