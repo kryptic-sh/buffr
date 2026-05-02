@@ -78,15 +78,20 @@ bytemuck = { version = "1", features = ["derive"] }
 # against GitHub releases. SemVer parsing handles rc/beta suffixes.
 semver = { version = "1", features = ["serde"] }
 
-buffr-core = { path = "crates/buffr-core", version = "0.1" }
-buffr-modal = { path = "crates/buffr-modal", version = "0.1" }
-buffr-ui = { path = "crates/buffr-ui", version = "0.1" }
-buffr-config = { path = "crates/buffr-config", version = "0.1" }
-buffr-history = { path = "crates/buffr-history", version = "0.1" }
-buffr-bookmarks = { path = "crates/buffr-bookmarks", version = "0.1" }
-buffr-downloads = { path = "crates/buffr-downloads", version = "0.1" }
-buffr-zoom = { path = "crates/buffr-zoom", version = "0.1" }
-buffr-permissions = { path = "crates/buffr-permissions", version = "0.1" }
+# Buffr-* crates as plain registry pins. Path overrides live in the
+# `[patch.crates-io]` table below so workspace deps and transitive
+# deps from submodule Cargo.tomls (which list `buffr-modal = "0.1"`
+# etc. for their standalone CI) all resolve to the same workspace
+# member, eliminating "multiple versions of buffr_<name>" errors.
+buffr-core = "0.1"
+buffr-modal = "0.1"
+buffr-ui = "0.1"
+buffr-config = "0.1"
+buffr-history = "0.1"
+buffr-bookmarks = "0.1"
+buffr-downloads = "0.1"
+buffr-zoom = "0.1"
+buffr-permissions = "0.1"
 
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
 # at 0.1 / 0.3 — patch bumps roll in automatically via workspace member
