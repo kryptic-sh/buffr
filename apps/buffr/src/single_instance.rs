@@ -53,7 +53,10 @@ pub enum AcquireResult {
 /// down automatically when the `Listener` is dropped.
 pub struct SingletonHandle {
     pub(crate) listener: interprocess::local_socket::Listener,
-    /// Path to unlink at drop (Unix only; empty on Windows).
+    /// Path to unlink at drop (Unix only; empty on Windows). Read by
+    /// `Drop` under `#[cfg(unix)]`; on Windows the field exists to
+    /// keep a uniform constructor shape but is never read.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) socket_path: PathBuf,
 }
 
