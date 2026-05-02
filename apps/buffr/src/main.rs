@@ -5208,6 +5208,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or(scale_factor as f32);
                     host.set_device_scale(s);
                 }
+                // chrome_heights_physical now uses the new scale, so
+                // browser_w/h on the next paint will differ from what
+                // osr_view holds (last set at the OLD scale). Re-sync
+                // osr_view dims so view_rect returns matching values
+                // and CEF on_paint lands at the new browser_w/h.
+                // Without this, monitor swaps with no follow-up Resized
+                // leave the loading animation stuck.
+                self.resync_cef_rect();
                 // Force a chrome repaint so the chrome layer re-rasterizes.
                 self.mark_chrome_dirty();
                 if let Some(window) = self.window.as_ref() {
@@ -6057,10 +6065,23 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // CEF resize debounce: fire the pending osr_resize once the drag
         // has been quiet for CEF_RESIZE_DEBOUNCE. Each Resized event refreshes
         // the deadline; we only call host.osr_resize once per drag gesture.
-        if let Some((w, h, at)) = self.pending_cef_resize
+        //
+        // Recompute dims from the *current* window + chrome state instead of
+        // using the (w, h) queued at the original Resized event. Between then
+        // and now, chrome layout may have changed (e.g. a download notice
+        // expired in `expire_stale_notices` above, which already called
+        // `resync_cef_rect` with the correct no-notice dims). Using the queued
+        // value would clobber that resync with stale dims, leaving CEF
+        // painting at the wrong size and `last_osr_dims != browser_w/h`
+        // forever — the loading animation would stay stuck.
+        if let Some((_, _, at)) = self.pending_cef_resize
             && Instant::now() >= at
         {
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.host.as_ref()
+                && let Some(window) = self.window.as_ref()
+            {
+                let size = window.inner_size();
+                let (_, _, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
                 host.osr_resize(w, h);
                 tracing::debug!(
                     w,
