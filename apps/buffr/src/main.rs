@@ -2794,7 +2794,7 @@ impl AppState {
         // redraw between CEF paints (the swap-out side effect empties
         // frame.pixels). `last_osr_dims` persists across swaps so the animation
         // only activates before the very first paint or during a size mismatch.
-        let want_anim = self.last_osr_dims != Some((browser_w, browser_h));
+        let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h);
 
         if want_anim != self.loading_anim_active {
             if want_anim {
@@ -2989,17 +2989,6 @@ impl AppState {
         }
     }
 
-    /// Scale logical-pixel chrome heights to physical pixels using the
-    /// current device scale factor.
-    fn chrome_heights_physical(&self) -> (u32, u32, u32) {
-        let s = self.current_scale();
-        let scale_up = |h: u32| ((h as f32) * s).round() as u32;
-        let status_h = scale_up(STATUSLINE_HEIGHT);
-        let tab_h = scale_up(TAB_STRIP_HEIGHT);
-        let notice_h = scale_up(DOWNLOAD_NOTICE_HEIGHT);
-        (status_h, tab_h, notice_h)
-    }
-
     /// Compute the CEF page rect for the current overlay state.
     ///
     /// Vertical layout (top → bottom):
@@ -3013,21 +3002,8 @@ impl AppState {
     /// scaled up from their logical-pixel constants before the layout is
     /// computed, so the returned rect is also in physical pixels.
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
-        let (phys_status_h, phys_tab_h, phys_notice_h_max) = self.chrome_heights_physical();
-        let status_h = phys_status_h.min(full_h);
-        let remaining_after_status = full_h.saturating_sub(status_h);
-        let tab_h = phys_tab_h.min(remaining_after_status);
-        let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
-        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
-            phys_notice_h_max.min(remaining_after_tabs)
-        } else {
-            0
-        };
-        let remaining_after_notice = remaining_after_tabs.saturating_sub(notice_h);
-        let cef_w = full_w.max(1);
-        let cef_h = remaining_after_notice.max(1);
-        let cef_y = notice_h + tab_h;
-        (0, cef_y, cef_w, cef_h)
+        let has_notice = buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0;
+        cef_child_rect_pure(full_w, full_h, self.current_scale(), has_notice)
     }
 
     /// Same layout as [`Self::cef_child_rect`] but operates in **logical**
@@ -3035,20 +3011,8 @@ impl AppState {
     /// unscaled constants directly. Used for chrome-painter geometry, which
     /// works in logical pixels.
     fn cef_child_rect_logical(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
-        let status_h = STATUSLINE_HEIGHT.min(full_h);
-        let remaining_after_status = full_h.saturating_sub(status_h);
-        let tab_h = TAB_STRIP_HEIGHT.min(remaining_after_status);
-        let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
-        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
-            DOWNLOAD_NOTICE_HEIGHT.min(remaining_after_tabs)
-        } else {
-            0
-        };
-        let remaining_after_notice = remaining_after_tabs.saturating_sub(notice_h);
-        let cef_w = full_w.max(1);
-        let cef_h = remaining_after_notice.max(1);
-        let cef_y = notice_h + tab_h;
-        (0, cef_y, cef_w, cef_h)
+        let has_notice = buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0;
+        cef_child_rect_pure(full_w, full_h, 1.0, has_notice)
     }
 
     /// The pixel row at which the tab strip begins (top of the
@@ -6202,6 +6166,60 @@ fn _impl_browser_used() {
     fn _f<T: ImplBrowser>(_: &T) {}
 }
 
+/// Pure CEF page-rect computation. Mirrors the body of
+/// `AppState::cef_child_rect` / `cef_child_rect_logical` without depending
+/// on `&self`, so unit tests can drive every (size × scale × notice) case
+/// without constructing an `AppState`.
+///
+/// `scale = 1.0` produces logical (DIP) coords; pass the device scale for
+/// physical-px output.
+fn cef_child_rect_pure(
+    full_w: u32,
+    full_h: u32,
+    scale: f32,
+    has_notice: bool,
+) -> (u32, u32, u32, u32) {
+    let scale_up = |h: u32| ((h as f32) * scale).round() as u32;
+    let phys_status_h = scale_up(STATUSLINE_HEIGHT);
+    let phys_tab_h = scale_up(TAB_STRIP_HEIGHT);
+    let phys_notice_h_max = scale_up(DOWNLOAD_NOTICE_HEIGHT);
+
+    let status_h = phys_status_h.min(full_h);
+    let remaining_after_status = full_h.saturating_sub(status_h);
+    let tab_h = phys_tab_h.min(remaining_after_status);
+    let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
+    let notice_h = if has_notice {
+        phys_notice_h_max.min(remaining_after_tabs)
+    } else {
+        0
+    };
+    let remaining_after_notice = remaining_after_tabs.saturating_sub(notice_h);
+    let cef_w = full_w.max(1);
+    let cef_h = remaining_after_notice.max(1);
+    let cef_y = notice_h + tab_h;
+    (0, cef_y, cef_w, cef_h)
+}
+
+/// Decide whether the loading animation should overlay the page region.
+///
+/// The animation is shown when CEF has not painted at the current
+/// `browser_w/h` — either because no `on_paint` has arrived yet
+/// (`last_osr_dims = None`) or because the last paint's dims don't match
+/// the current rect (CEF still catching up to a resize / chrome-layout
+/// change).
+///
+/// This is the single gate; `paint_chrome_with` calls it once per paint.
+/// Unit tests pin the invariant so future refactors can't reintroduce
+/// the swap-out flicker (where reading empty `frame.pixels` was used as
+/// the gate).
+fn should_show_loading_anim(
+    last_osr_dims: Option<(u32, u32)>,
+    browser_w: u32,
+    browser_h: u32,
+) -> bool {
+    last_osr_dims != Some((browser_w, browser_h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6232,6 +6250,82 @@ mod tests {
     fn resolve_paths_persistent_returns_no_tempdir() {
         let (_paths, tmp) = resolve_paths(false).expect("resolve_paths(false)");
         assert!(tmp.is_none());
+    }
+
+    // ---- render-gate regression tests ------------------------------------
+    //
+    // These cover the loading-animation gate + the chrome-rect math that
+    // the resize debounce flush depends on. Three classes of bug have
+    // bitten this code path:
+    //
+    //   • Reading empty `frame.pixels` as the gate (swap-out flicker).
+    //   • Debounce flush calling `osr_resize` with stale queued dims.
+    //   • `ScaleFactorChanged` not re-syncing osr_view.
+    //
+    // The pure helpers (`should_show_loading_anim`, `cef_child_rect_pure`)
+    // are the testable seams; production code must route through them.
+
+    #[test]
+    fn loading_anim_off_when_dims_match() {
+        // CEF has painted at exactly browser_w/h: no animation.
+        assert!(!should_show_loading_anim(Some((1500, 1050)), 1500, 1050));
+    }
+
+    #[test]
+    fn loading_anim_on_when_no_prior_paint() {
+        // First paint never happened: animation while we wait for CEF.
+        assert!(should_show_loading_anim(None, 1500, 1050));
+    }
+
+    #[test]
+    fn loading_anim_on_when_dims_drift() {
+        // CEF painted at old size; chrome layout (e.g. notice expired)
+        // changed browser_h. Animation must re-arm.
+        assert!(should_show_loading_anim(Some((1500, 1050)), 1500, 1080));
+    }
+
+    #[test]
+    fn loading_anim_on_when_width_drifts() {
+        // Width-only mismatch covers fractional-scale rounding edge cases.
+        assert!(should_show_loading_anim(Some((1499, 1050)), 1500, 1050));
+    }
+
+    #[test]
+    fn cef_rect_chrome_state_changes_height() {
+        // The debounce-flush invariant: chrome state at flush time must
+        // be consulted, because (full_w, full_h) alone do NOT determine
+        // cef_h — has_notice does. A flush that uses queued dims captured
+        // before a notice expired would feed CEF the wrong height.
+        let (_, _, _, with_notice_h) = cef_child_rect_pure(1500, 1050, 1.0, true);
+        let (_, _, _, no_notice_h) = cef_child_rect_pure(1500, 1050, 1.0, false);
+        assert!(
+            no_notice_h > with_notice_h,
+            "cef_h must grow when notice strip drops: with={with_notice_h} no={no_notice_h}",
+        );
+        // Difference is exactly DOWNLOAD_NOTICE_HEIGHT at scale=1.0.
+        assert_eq!(no_notice_h - with_notice_h, DOWNLOAD_NOTICE_HEIGHT);
+    }
+
+    #[test]
+    fn cef_rect_scale_2x_doubles_chrome_height() {
+        // HiDPI invariant: chrome strip heights scale linearly. This
+        // pins the math the ScaleFactorChanged path depends on — after
+        // a scale change, browser_h shifts, so osr_view must be re-synced.
+        let (_, y_1x, _, h_1x) = cef_child_rect_pure(1500, 1050, 1.0, false);
+        let (_, y_2x, _, h_2x) = cef_child_rect_pure(1500, 1050, 2.0, false);
+        // y_2x is statusline+tab+notice scaled up; with no notice that's
+        // exactly 2× the tab strip (no statusline below).
+        assert_eq!(y_2x, y_1x * 2);
+        // cef_h shrinks by the extra chrome height, not doubles.
+        assert!(h_2x < h_1x);
+    }
+
+    #[test]
+    fn cef_rect_clamps_to_at_least_one_pixel() {
+        // Window smaller than chrome: CEF still gets a 1×1 rect rather
+        // than a zero-dim that would panic CEF or the GPU upload.
+        let (_, _, w, h) = cef_child_rect_pure(0, 0, 1.0, true);
+        assert_eq!((w, h), (1, 1));
     }
 
     // ---- edit-mode unit tests --------------------------------------------
