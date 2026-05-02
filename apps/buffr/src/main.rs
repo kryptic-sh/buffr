@@ -3146,6 +3146,14 @@ impl AppState {
     /// Re-issue the CEF resize call for the current window dimensions.
     /// Called whenever the overlay opens or closes so the page region
     /// re-flows to fill the freed space.
+    ///
+    /// Uses `osr_resize` (not `resize`) so the underlying `osr_view`
+    /// atomics get the new dims — otherwise CEF's `view_rect` callback
+    /// returns the stale dims, on_paint fires at the OLD size, and
+    /// `last_osr_dims` never matches the current `browser_w/h` →
+    /// loading animation stays active forever. This bites whenever a
+    /// download notice expires or an overlay closes between window
+    /// resizes (chrome layout changes without `WindowEvent::Resized`).
     fn resync_cef_rect(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -3153,7 +3161,7 @@ impl AppState {
         let size = window.inner_size();
         let (_x, _y, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
         if let Some(host) = self.host.as_ref() {
-            host.resize(w, h);
+            host.osr_resize(w, h);
         }
     }
 
