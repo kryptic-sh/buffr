@@ -46,3 +46,9 @@ bytemuck.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ctrlc = "3.5.2"
+interprocess = "2"
+sha2 = "0.10"
+hex = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

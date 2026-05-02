@@ -88,6 +88,7 @@ use buffr_ui::{
 mod loading_anim;
 mod render;
 mod session;
+mod single_instance;
 use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
 use clap::Parser;
 use tempfile::TempDir;
@@ -108,6 +109,10 @@ enum BuffrUserEvent {
     /// CEF OSR on_paint fired for popup browser `browser_id`; request that
     /// popup's window redraw.
     OsrFramePopup(i32),
+    /// IPC: open these URLs as new tabs. Sent by the accept thread when a
+    /// secondary `buffr` invocation forwards its args. Always focuses the
+    /// main window after opening, so users see something happen.
+    OpenUrls(Vec<String>),
 }
 
 /// Per-popup-window state. Owns the winit window, wgpu renderer, and the
@@ -270,6 +275,11 @@ struct Cli {
     #[cfg(target_os = "linux")]
     #[arg(long)]
     x11: bool,
+    /// URLs to open. Each becomes a new tab. When another buffr instance is
+    /// already running on the same profile, these are forwarded to it and
+    /// this process exits 0. Combined with `--new-tab` URLs for forwarding.
+    #[arg(value_name = "URL")]
+    urls: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -425,6 +435,34 @@ fn main() -> Result<()> {
     } else {
         info!("profile paths resolved");
         debug!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
+    }
+
+    // -------- single-instance check -----------------------------------
+    //
+    // BEFORE CEF init so a secondary invocation that only needs to forward
+    // URLs never initializes CEF at all. `--private` is exempt: each private
+    // session is always standalone with its own tempdir cache.
+    //
+    // `singleton_handle` is `Option` so we can stash it here and spawn the
+    // accept thread later once the winit EventLoop (and its proxy) exist.
+    let mut singleton_handle: Option<single_instance::SingletonHandle> = None;
+    if !cli.private {
+        let cache_str = paths.cache.to_string_lossy();
+        let profile_id = single_instance::profile_id_from(&cache_str);
+        let mut all_urls = cli.urls.clone();
+        all_urls.extend(cli.new_tab.clone());
+        match single_instance::try_acquire(&profile_id, &all_urls)? {
+            single_instance::AcquireResult::Forwarded => {
+                info!(
+                    count = all_urls.len(),
+                    "single_instance: forwarded URLs to existing buffr; exiting"
+                );
+                return Ok(());
+            }
+            single_instance::AcquireResult::Owner(handle) => {
+                singleton_handle = Some(handle);
+            }
+        }
     }
 
     // -------- load config + build initial keymap ----------------------
@@ -791,6 +829,16 @@ fn main() -> Result<()> {
             warn!(error = %err, "ctrlc handler already installed — using existing");
         }
     }
+    // Create the proxy before AppState so we can clone it for the IPC accept
+    // thread. The proxy is cheap to clone (internally an Arc).
+    let event_proxy = event_loop.create_proxy();
+
+    // Spawn the singleton accept thread now that we have a proxy. The handle
+    // is moved in so the Listener stays alive for the whole process lifetime.
+    if let Some(handle) = singleton_handle.take() {
+        single_instance::spawn_accept_thread(handle, event_proxy.clone());
+    }
+
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -809,7 +857,13 @@ fn main() -> Result<()> {
         edit_sink,
         hint_alphabet,
         cli.find.clone(),
-        cli.new_tab.clone(),
+        {
+            // Combine positional URL args with --new-tab values. All open as
+            // background tabs after session restore; order: positional then --new-tab.
+            let mut tabs = cli.urls.clone();
+            tabs.extend(cli.new_tab.clone());
+            tabs
+        },
         pending_session_tabs,
         pending_session_active,
         session_path,
@@ -819,7 +873,7 @@ fn main() -> Result<()> {
         build_palette(&config.theme),
         config.general.show_favicons,
         shutdown_flag,
-        event_loop.create_proxy(),
+        event_proxy,
     );
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -4800,6 +4854,24 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && let Some(popup) = self.popups.get(&wid)
                 {
                     popup.window.request_redraw();
+                }
+            }
+            BuffrUserEvent::OpenUrls(urls) => {
+                debug!(count = urls.len(), "single_instance: opened forwarded URLs");
+                if let Some(host) = self.host.as_ref() {
+                    for url in &urls {
+                        if let Err(err) = host.open_tab_background(url) {
+                            warn!(error = %err, %url, "single_instance: open_tab_background failed");
+                        }
+                    }
+                } else {
+                    // Browser not yet created — queue as pending tabs so they open on resumed.
+                    self.pending_new_tabs.extend(urls.clone());
+                }
+                // Bring the window to the front so the user sees it.
+                if let Some(window) = self.window.as_ref() {
+                    window.set_visible(true);
+                    window.focus_window();
                 }
             }
         }
