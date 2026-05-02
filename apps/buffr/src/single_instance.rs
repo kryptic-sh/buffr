@@ -235,6 +235,78 @@ pub fn try_acquire(profile_id: &str, urls: &[String]) -> Result<AcquireResult> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::profile_id_from;
+
+    // ---- Group 2: profile_id sha256 derivation ------------------------------
+    //
+    // `profile_id_from` hashes the cache path with SHA-256 and takes the first
+    // 8 bytes expressed as 16 lower-case hex digits. These tests pin the exact
+    // output format, stability, and correctness on unusual inputs so regressions
+    // are caught before they break the socket-path scheme.
+
+    #[test]
+    fn profile_id_is_deterministic() {
+        // Same input twice must yield identical output — hash must be stable.
+        let a = profile_id_from("/home/user/.cache/buffr");
+        let b = profile_id_from("/home/user/.cache/buffr");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn profile_id_is_16_hex_chars() {
+        // Exactly 16 lower-case hex digits (8 bytes * 2 chars/byte).
+        let id = profile_id_from("/home/user/.cache/buffr");
+        assert_eq!(id.len(), 16, "expected 16 chars, got {}: {id}", id.len());
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "non-lowercase-hex char in id: {id}"
+        );
+    }
+
+    #[test]
+    fn profile_id_differs_for_different_paths() {
+        // Basic collision smoke test: 3 distinct paths → 3 distinct ids.
+        let ids = [
+            profile_id_from("/home/alice/.cache/buffr"),
+            profile_id_from("/home/bob/.cache/buffr"),
+            profile_id_from("/tmp/buffr-test-profile"),
+        ];
+        // All three must be distinct.
+        assert_ne!(ids[0], ids[1], "alice == bob (collision)");
+        assert_ne!(ids[0], ids[2], "alice == tmp (collision)");
+        assert_ne!(ids[1], ids[2], "bob == tmp (collision)");
+    }
+
+    #[test]
+    fn profile_id_handles_unicode_paths() {
+        // Non-ASCII path bytes must not panic — SHA-256 works on raw bytes.
+        let a = profile_id_from("/tmp/缓存");
+        let b = profile_id_from("/tmp/café");
+        assert_eq!(a.len(), 16);
+        assert_eq!(b.len(), 16);
+        assert_ne!(a, b, "distinct unicode paths must not collide");
+    }
+
+    #[test]
+    fn profile_id_handles_long_paths() {
+        // PATH_MAX on Linux is 4096. Construct a path near that length.
+        let long: String = std::iter::repeat('a').take(4090).collect();
+        let path = format!("/tmp/{long}");
+        let id = profile_id_from(&path);
+        assert_eq!(id.len(), 16);
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "non-hex char in long-path id: {id}"
+        );
+    }
+}
+
 /// Spawn a daemon thread that accepts connections from secondary invocations,
 /// deserializes their [`ForwardPayload`] JSON, and forwards via `proxy`.
 ///

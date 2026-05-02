@@ -2694,11 +2694,10 @@ impl AppState {
         }
         if let Some(host) = self.host.as_ref() {
             let mods = winit_mods_to_cef(&self.modifiers);
-            // osr_cursor is physical; CEF OSR takes DIPs.
+            // osr_cursor is physical (browser-region-relative); CEF OSR takes DIPs.
             let (phys_bx, phys_by) = self.osr_cursor;
             let mom_scale = self.current_scale();
-            let bx = ((phys_bx as f32) / mom_scale).round() as i32;
-            let by = ((phys_by as f32) / mom_scale).round() as i32;
+            let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, mom_scale);
             tracing::trace!(dx, dy, "input: wheel_momentum -> CEF");
             host.osr_mouse_wheel(bx, by, dx, dy, mods);
         }
@@ -4292,10 +4291,9 @@ impl AppState {
                 let phys_by = (position.y as i32).saturating_sub(bar_h);
                 // Store physical coords for any chrome hit-tests.
                 popup.cursor = (phys_bx, phys_by);
-                // CEF OSR consumes DIPs.
+                // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_scale = popup.window.scale_factor() as f32;
-                let bx = ((phys_bx as f32) / pop_scale).round() as i32;
-                let by = ((phys_by as f32) / pop_scale).round() as i32;
+                let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_scale);
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
@@ -4342,10 +4340,9 @@ impl AppState {
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 let click_count = popup.click_count;
                 let in_content = phys_by >= 0;
-                // CEF OSR consumes DIPs.
+                // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_click_scale = popup.window.scale_factor() as f32;
-                let bx = ((phys_bx as f32) / pop_click_scale).round() as i32;
-                let by = ((phys_by as f32) / pop_click_scale).round() as i32;
+                let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_click_scale);
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -4400,10 +4397,9 @@ impl AppState {
                 let (phys_bx, phys_by) = popup.cursor;
                 let mods = winit_mods_to_cef(&popup.modifiers);
                 let (dx, dy, _is_pixel) = winit_wheel_to_cef_delta(&delta);
-                // CEF OSR consumes DIPs.
+                // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_wheel_scale = popup.window.scale_factor() as f32;
-                let bx = ((phys_bx as f32) / pop_wheel_scale).round() as i32;
-                let by = ((phys_by as f32) / pop_wheel_scale).round() as i32;
+                let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_wheel_scale);
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -5235,10 +5231,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let phys_bx = position.x as i32;
                     let phys_by = (position.y as i32).saturating_sub(cef_y as i32);
                     self.osr_cursor = (phys_bx, phys_by);
-                    // Logical (DIP) coords for CEF.
+                    // Logical (DIP) coords for CEF — route through helper.
                     let scale = self.current_scale();
-                    let bx = ((phys_bx as f32) / scale).round() as i32;
-                    let by = ((phys_by as f32) / scale).round() as i32;
+                    let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, scale);
                     let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     host.osr_mouse_move(bx, by, mods);
 
@@ -5477,11 +5472,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                     }
                     let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
-                    // osr_cursor is in physical pixels; CEF OSR takes DIPs.
+                    // osr_cursor is in physical pixels (browser-region-relative);
+                    // CEF OSR takes DIPs — route through helper (cef_y_offset=0
+                    // because osr_cursor is already region-relative).
                     let (phys_bx, phys_by) = self.osr_cursor;
                     let click_scale = self.current_scale();
-                    let bx = ((phys_bx as f32) / click_scale).round() as i32;
-                    let by = ((phys_by as f32) / click_scale).round() as i32;
+                    let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, click_scale);
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
                 }
                 if enter_visual {
@@ -5538,11 +5534,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     self.osr_wheel_last_at = None;
                 }
                 let mods = winit_mods_to_cef(&self.modifiers);
-                // osr_cursor is physical; CEF OSR takes DIPs.
+                // osr_cursor is physical (browser-region-relative); CEF OSR takes DIPs.
                 let (phys_bx, phys_by) = self.osr_cursor;
                 let wheel_scale = self.current_scale();
-                let bx = ((phys_bx as f32) / wheel_scale).round() as i32;
-                let by = ((phys_by as f32) / wheel_scale).round() as i32;
+                let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, wheel_scale);
                 tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
                 host.osr_mouse_wheel(bx, by, dx, dy, mods);
             }
@@ -6202,6 +6197,51 @@ enum PaintPath {
     FreshOsr,
     SyntheticScratch,
     DeadFallback,
+}
+
+// ---------------------------------------------------------------------------
+// Group 0 (internal): Physical-pixel → DIP conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a physical-pixel cursor position (window-relative) to the
+/// CEF OSR coordinate space (DIP, browser-region-relative).
+///
+/// `phys_x` / `phys_y` — cursor in physical pixels relative to the
+///     window origin.
+/// `cef_y_offset` — top of the CEF region in physical pixels (chrome
+///     strips above it).
+/// `scale` — current device scale factor.
+///
+/// Returns DIP coords relative to the CEF browser region's top-left.
+///
+/// Degenerate `scale <= 0.0` is clamped to 1.0 to avoid division by zero.
+/// Cursor above the CEF region (phys_y < cef_y_offset) produces a negative
+/// DIP y — callers that care about clamping must do so themselves.
+fn physical_cursor_to_dip(phys_x: i32, phys_y: i32, cef_y_offset: u32, scale: f32) -> (i32, i32) {
+    let scale = if scale <= 0.0 { 1.0 } else { scale };
+    let region_y = (phys_y).saturating_sub(cef_y_offset as i32);
+    let bx = ((phys_x as f32) / scale).round() as i32;
+    let by = ((region_y as f32) / scale).round() as i32;
+    (bx, by)
+}
+
+/// Scale physical-pixel wheel deltas to DIP units.
+///
+/// CEF's `send_mouse_wheel_event` takes DIP-space deltas. `winit_wheel_to_cef_delta`
+/// already converts line / pixel delta to a CEF-tick count; the remaining
+/// step is dividing by the device scale so the per-pixel magnitude stays
+/// proportional to page logical pixels.
+///
+/// Degenerate `scale <= 0.0` is clamped to 1.0.
+///
+/// Currently only called from tests; kept separate from `physical_cursor_to_dip`
+/// so it can be promoted to a production call site if wheel scaling is tuned.
+#[cfg(test)]
+fn physical_wheel_to_dip(dx_phys: i32, dy_phys: i32, scale: f32) -> (i32, i32) {
+    let scale = if scale <= 0.0 { 1.0 } else { scale };
+    let dx = ((dx_phys as f32) / scale).round() as i32;
+    let dy = ((dy_phys as f32) / scale).round() as i32;
+    (dx, dy)
 }
 
 /// Pure paint-path decision. All callers must route through this function;
@@ -7137,5 +7177,151 @@ mod tests {
             "same logical inputs must produce same result at any physical scale"
         );
         assert_eq!(r1x, Some(0));
+    }
+
+    // ---- Group 1: physical-pixel → DIP conversion ---------------------------
+    //
+    // CEF OSR consumes logical pixels (DIPs). winit gives physical pixels.
+    // Every mouse-forward site divides by `current_scale()`. Past bug class:
+    // rounding at fractional scale (1.25, 1.5) silently dropped clicks at
+    // chrome edges. These tests pin the rounding direction and the cef_y
+    // offset subtraction so the helper can't silently regress.
+
+    #[test]
+    fn dip_at_scale_1x_round_trips() {
+        // Scale 1.0: logical == physical, no offset.
+        assert_eq!(physical_cursor_to_dip(300, 400, 0, 1.0), (300, 400));
+        assert_eq!(physical_cursor_to_dip(0, 0, 0, 1.0), (0, 0));
+        assert_eq!(physical_cursor_to_dip(-5, -5, 0, 1.0), (-5, -5));
+    }
+
+    #[test]
+    fn dip_at_scale_2x_halves_coords() {
+        // Scale 2.0: physical (200, 400) → DIP (100, 200).
+        assert_eq!(physical_cursor_to_dip(200, 400, 0, 2.0), (100, 200));
+        assert_eq!(physical_cursor_to_dip(1, 1, 0, 2.0), (1, 1)); // rounds 0.5 → 1
+    }
+
+    #[test]
+    fn dip_at_fractional_scale_rounds_consistently() {
+        // Pin exact rounding at 1.25 and 1.5 so the direction can't silently
+        // flip. We use `.round()` (rounds half-up), so 0.5 → 1, 0.4 → 0.
+        // 1.25×: phys 1 → 0.8 → rounds to 1.
+        assert_eq!(physical_cursor_to_dip(1, 1, 0, 1.25), (1, 1));
+        // 1.25×: phys 2 → 1.6 → rounds to 2.
+        assert_eq!(physical_cursor_to_dip(2, 2, 0, 1.25), (2, 2));
+        // 1.25×: phys 100 → 80.0 → 80.
+        assert_eq!(physical_cursor_to_dip(100, 100, 0, 1.25), (80, 80));
+        // 1.5×: phys 3 → 2.0 → 2.
+        assert_eq!(physical_cursor_to_dip(3, 3, 0, 1.5), (2, 2));
+        // 1.5×: phys 1 → 0.667 → rounds to 1.
+        assert_eq!(physical_cursor_to_dip(1, 1, 0, 1.5), (1, 1));
+    }
+
+    #[test]
+    fn dip_subtracts_cef_y_offset() {
+        // Chrome strip is 40 px tall. Cursor at y=100 → region-relative y=60 → DIP y=60.
+        assert_eq!(physical_cursor_to_dip(200, 100, 40, 1.0), (200, 60));
+        // At 2× scale: region-relative y=60 → DIP 30.
+        assert_eq!(physical_cursor_to_dip(200, 100, 40, 2.0), (100, 30));
+    }
+
+    #[test]
+    fn dip_at_top_of_chrome_clamps() {
+        // Cursor inside the chrome strip (y < cef_y_offset) → negative DIP y.
+        // Chosen behavior: return negative, let callers decide whether to clamp.
+        // This is intentional — CEF mouse-leave covers the negative case.
+        let (_, by) = physical_cursor_to_dip(100, 10, 40, 1.0);
+        assert!(
+            by < 0,
+            "cursor in chrome strip should yield negative DIP y, got {by}"
+        );
+        // At exact boundary (y == cef_y_offset), y == 0.
+        assert_eq!(physical_cursor_to_dip(100, 40, 40, 1.0), (100, 0));
+    }
+
+    #[test]
+    fn dip_handles_zero_scale_safely() {
+        // scale <= 0 is clamped to 1.0 so no divide-by-zero occurs.
+        assert_eq!(physical_cursor_to_dip(200, 400, 0, 0.0), (200, 400));
+        assert_eq!(physical_cursor_to_dip(200, 400, 0, -1.0), (200, 400));
+    }
+
+    // ---- physical_wheel_to_dip tests ----------------------------------------
+
+    #[test]
+    fn wheel_dip_scale_1x_identity() {
+        assert_eq!(physical_wheel_to_dip(120, -120, 1.0), (120, -120));
+    }
+
+    #[test]
+    fn wheel_dip_scale_2x_halves() {
+        assert_eq!(physical_wheel_to_dip(120, -240, 2.0), (60, -120));
+    }
+
+    #[test]
+    fn wheel_dip_zero_scale_safe() {
+        // Degenerate scale must not divide-by-zero.
+        assert_eq!(physical_wheel_to_dip(60, 60, 0.0), (60, 60));
+    }
+
+    // ---- Group 3: proptest on cef_child_rect_pure ---------------------------
+    //
+    // Random (full_w, full_h, scale, has_notice) inputs drive the pure
+    // CEF-rect helper. Key invariants pinned here catch the "rect spills
+    // past window bottom" bug class and the clamp-to-1 lower bound.
+
+    mod cef_rect_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `cef_w` and `cef_h` are always at least 1 (clamp invariant).
+            /// `cef_w` never exceeds the effective window width.
+            /// `y + cef_h` never exceeds the effective window height
+            ///   — the rect must fit inside the window.
+            /// `y` is always non-negative (trivially u32, but explicit).
+            /// When has_notice=true, `y >= y_without_notice`.
+            #[test]
+            fn rect_invariants(
+                full_w in 0u32..=8000,
+                full_h in 0u32..=8000,
+                scale in 0.5f32..=4.0f32,
+                has_notice in any::<bool>(),
+            ) {
+                let (_, y, cef_w, cef_h) = cef_child_rect_pure(full_w, full_h, scale, has_notice);
+
+                // Clamp: always at least 1×1.
+                prop_assert!(cef_w >= 1, "cef_w must be >= 1, got {cef_w}");
+                prop_assert!(cef_h >= 1, "cef_h must be >= 1, got {cef_h}");
+
+                // Never widens past the effective window width.
+                let eff_w = full_w.max(1);
+                prop_assert!(
+                    cef_w <= eff_w,
+                    "cef_w={cef_w} > eff_w={eff_w}"
+                );
+
+                // Rect fits inside window — most critical invariant.
+                let eff_h = full_h.max(1);
+                prop_assert!(
+                    y.saturating_add(cef_h) <= eff_h,
+                    "rect spills: y={y} + cef_h={cef_h} > eff_h={eff_h}"
+                );
+
+                // y is non-negative (u32, trivially true, but assert for clarity).
+                prop_assert_eq!(y, y); // y: u32 so always >= 0
+
+                // With notice, y >= y without notice (notice strip sits above
+                // the tab strip, which pushes the cef origin down).
+                let (_, y_no_notice, _, _) = cef_child_rect_pure(full_w, full_h, scale, false);
+                if has_notice {
+                    prop_assert!(
+                        y >= y_no_notice,
+                        "has_notice=true should not decrease y: y={y} < y_no_notice={y_no_notice}"
+                    );
+                }
+            }
+        }
     }
 }

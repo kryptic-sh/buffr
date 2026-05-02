@@ -50,5 +50,8 @@ interprocess = "2"
 sha2 = "0.10"
 hex = "0.4"
 
+[dev-dependencies]
+proptest = "1"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
