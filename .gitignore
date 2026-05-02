@@ -6,9 +6,9 @@ target/
 **/*.rs.bk
 *.pdb
 
-# CEF binary distribution (downloaded by build script, not vendored)
-/vendor/cef
-/vendor/cef_*
+# Build-time downloads (CEF binary tree, packaging tools, etc.) —
+# never vendored into git.
+/vendor/
 
 # Editor / OS
 .DS_Store
