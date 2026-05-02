@@ -29,6 +29,13 @@ use std::time::{Duration, Instant};
 /// the window, so there is no visual regression.
 const CEF_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// How long the resize-paint watchdog waits for CEF to produce an
+/// `on_paint` at the expected (post-resize) dims before firing a
+/// force-repaint nudge.  500 ms is long enough to survive a slow
+/// renderer startup and short enough that a stuck animation does not
+/// linger visibly.
+const RESIZE_PAINT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Minimum quiet time after the last session-dirtying event before
 /// the session file is written to disk.  Sliding window: each new
 /// change resets the clock.
@@ -1900,6 +1907,11 @@ struct AppState {
     /// fires at ~12 fps. Cleared as soon as `loading_anim_active`
     /// becomes false so the loop returns to event-driven idle.
     loading_anim_next_wake: Option<Instant>,
+    /// Watchdog for the post-resize CEF paint. Armed when `osr_resize`
+    /// is called; cleared when the freshness gate accepts a paint at
+    /// the expected dims.  Fires a `force_repaint_active` nudge if CEF
+    /// fails to produce the paint within `RESIZE_PAINT_WATCHDOG_TIMEOUT`.
+    resize_paint_watchdog: ResizePaintWatchdog,
 }
 
 /// Edit-mode focus state machine.
@@ -2073,6 +2085,7 @@ impl AppState {
             loading_anim_frame: 0,
             loading_anim_active: false,
             loading_anim_next_wake: None,
+            resize_paint_watchdog: ResizePaintWatchdog::default(),
         }
     }
 
@@ -2784,6 +2797,8 @@ impl AppState {
                 if fresh {
                     // Record dims before the swap (while guard is held).
                     self.last_osr_dims = Some((frame.width, frame.height));
+                    self.resize_paint_watchdog
+                        .observe_paint(frame.width, frame.height);
                     std::mem::swap(&mut self.osr_scratch, &mut frame.pixels);
                     Some((frame.width, frame.height, frame.generation))
                 } else {
@@ -3134,7 +3149,7 @@ impl AppState {
     /// loading animation stays active forever. This bites whenever a
     /// download notice expires or an overlay closes between window
     /// resizes (chrome layout changes without `WindowEvent::Resized`).
-    fn resync_cef_rect(&self) {
+    fn resync_cef_rect(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -3142,6 +3157,8 @@ impl AppState {
         let (_x, _y, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
         if let Some(host) = self.host.as_ref() {
             host.osr_resize(w, h);
+            self.resize_paint_watchdog
+                .arm(w, h, Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
         }
     }
 
@@ -6069,6 +6086,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let size = window.inner_size();
                 let (_, _, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
                 host.osr_resize(w, h);
+                self.resize_paint_watchdog
+                    .arm(w, h, Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
                 tracing::debug!(
                     w,
                     h,
@@ -6103,6 +6122,24 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
                 self.request_redraw();
             }
+        }
+
+        // Resize-paint watchdog: if CEF hasn't produced an on_paint at the
+        // expected (post-resize) dims within RESIZE_PAINT_WATCHDOG_TIMEOUT,
+        // nudge it via a was_hidden cycle — the same repaint trigger the
+        // tab-switch workaround relies on.
+        if self
+            .resize_paint_watchdog
+            .should_force_repaint(Instant::now())
+        {
+            if let Some(host) = self.host.as_ref() {
+                let r = self.resize_paint_watchdog.retry_count();
+                tracing::debug!(retry = r, "watchdog: forcing repaint");
+                host.force_repaint_active();
+            }
+            self.resize_paint_watchdog
+                .record_force_repaint(Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
+            self.request_redraw();
         }
 
         // No idle paint loop: we respect Wayland's frame-callback model
@@ -6155,6 +6192,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             .filter_map(|p| p.pending_cef_resize)
             .map(|(_, _, at)| at)
             .fold(deadline, |acc, at| if at < acc { at } else { acc });
+        // If the resize-paint watchdog is armed, wake up no later than its
+        // deadline so the force-repaint nudge fires on time.
+        let deadline = match self.resize_paint_watchdog.deadline() {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
@@ -6319,6 +6362,88 @@ impl ResizeDebounce {
     /// when the debounce expires.
     fn deadline(&self) -> Option<Instant> {
         self.pending.map(|(_, _, at)| at)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group 2a: Resize-paint watchdog state machine
+// ---------------------------------------------------------------------------
+
+/// Watchdog that detects when CEF fails to emit an on_paint at the
+/// expected (post-resize) dims within a deadline, so the embedder
+/// can nudge it via a was_hidden cycle (mimicking the tab-switch
+/// trick).
+///
+/// Lifecycle: arm() when osr_resize is called with new dims.
+/// observe_paint() each time the freshness gate accepts a paint.
+/// In the event loop, check should_force_repaint(now); if true,
+/// call BrowserHost::force_repaint_active and record_force_repaint
+/// to bump the deadline + retry counter.
+///
+/// Caps retries at MAX_RETRIES so a genuinely stuck CEF doesn't
+/// loop forever.
+#[derive(Debug, Default)]
+struct ResizePaintWatchdog {
+    /// (expected_w, expected_h, deadline, retries_so_far)
+    pending: Option<(u32, u32, Instant, u32)>,
+}
+
+impl ResizePaintWatchdog {
+    /// Maximum number of force-repaint nudges before giving up.
+    /// Three is enough to recover from CEF's worst dedup quirks
+    /// without burning into an infinite loop on a genuinely stuck
+    /// renderer.
+    const MAX_RETRIES: u32 = 3;
+
+    fn arm(&mut self, w: u32, h: u32, now: Instant, timeout: Duration) {
+        self.pending = Some((w, h, now + timeout, 0));
+    }
+
+    /// Called when the freshness gate accepts a paint. Clears the
+    /// watchdog if (painted_w, painted_h) match the awaited dims.
+    /// Returns true if cleared.
+    fn observe_paint(&mut self, painted_w: u32, painted_h: u32) -> bool {
+        if let Some((w, h, _, _)) = self.pending
+            && painted_w == w
+            && painted_h == h
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_force_repaint(&self, now: Instant) -> bool {
+        self.pending
+            .is_some_and(|(_, _, deadline, retries)| now >= deadline && retries < Self::MAX_RETRIES)
+    }
+
+    /// Bump deadline + retry counter after firing a force-repaint
+    /// nudge. If retry count would exceed MAX_RETRIES, clears the
+    /// watchdog (give up).
+    fn record_force_repaint(&mut self, now: Instant, timeout: Duration) {
+        if let Some((w, h, _, retries)) = self.pending {
+            let next_retries = retries + 1;
+            if next_retries >= Self::MAX_RETRIES {
+                self.pending = None;
+            } else {
+                self.pending = Some((w, h, now + timeout, next_retries));
+            }
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.map(|(_, _, d, _)| d)
+    }
+
+    fn retry_count(&self) -> u32 {
+        self.pending.map(|(_, _, _, r)| r).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn is_armed(&self) -> bool {
+        self.pending.is_some()
     }
 }
 
@@ -7414,5 +7539,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- resize-paint watchdog unit tests -----------------------------------
+
+    #[test]
+    fn watchdog_arm_then_observe_clears() {
+        let mut wd = ResizePaintWatchdog::default();
+        let now = Instant::now();
+        wd.arm(1920, 1086, now, Duration::from_millis(500));
+        assert!(wd.is_armed());
+        let cleared = wd.observe_paint(1920, 1086);
+        assert!(cleared, "observe_paint at matching dims must return true");
+        assert!(
+            !wd.is_armed(),
+            "watchdog must be cleared after matching paint"
+        );
+    }
+
+    #[test]
+    fn watchdog_observe_wrong_dims_does_not_clear() {
+        let mut wd = ResizePaintWatchdog::default();
+        let now = Instant::now();
+        wd.arm(1920, 1086, now, Duration::from_millis(500));
+        let cleared = wd.observe_paint(1900, 1066);
+        assert!(!cleared, "observe_paint at wrong dims must return false");
+        assert!(
+            wd.is_armed(),
+            "watchdog must stay armed after mismatched paint"
+        );
+    }
+
+    #[test]
+    fn watchdog_should_force_repaint_after_deadline() {
+        let mut wd = ResizePaintWatchdog::default();
+        let now = Instant::now();
+        wd.arm(1920, 1086, now, Duration::from_millis(500));
+        // Before deadline: must not fire.
+        assert!(
+            !wd.should_force_repaint(now),
+            "must not fire before deadline"
+        );
+        // After deadline: must fire.
+        let after = now + Duration::from_millis(501);
+        assert!(
+            wd.should_force_repaint(after),
+            "must fire after deadline elapses"
+        );
+    }
+
+    #[test]
+    fn watchdog_force_repaint_bumps_deadline_and_retries() {
+        let mut wd = ResizePaintWatchdog::default();
+        let now = Instant::now();
+        let timeout = Duration::from_millis(500);
+        wd.arm(1920, 1086, now, timeout);
+        wd.record_force_repaint(now, timeout);
+        assert_eq!(wd.retry_count(), 1, "retry count must be 1 after one nudge");
+        // Deadline must have been pushed forward.
+        let new_deadline = wd.deadline().expect("watchdog still armed");
+        assert!(
+            new_deadline >= now + timeout,
+            "deadline must be pushed forward by timeout"
+        );
+    }
+
+    #[test]
+    fn watchdog_caps_retries_at_max() {
+        let mut wd = ResizePaintWatchdog::default();
+        let now = Instant::now();
+        let timeout = Duration::from_millis(500);
+        wd.arm(1920, 1086, now, timeout);
+        for _ in 0..ResizePaintWatchdog::MAX_RETRIES {
+            assert!(wd.is_armed(), "watchdog must be armed before hitting cap");
+            wd.record_force_repaint(now, timeout);
+        }
+        assert!(
+            !wd.is_armed(),
+            "watchdog must give up after MAX_RETRIES nudges"
+        );
+    }
+
+    #[test]
+    fn watchdog_unarmed_should_not_fire() {
+        let wd = ResizePaintWatchdog::default();
+        let now = Instant::now();
+        assert!(
+            !wd.should_force_repaint(now),
+            "unarmed watchdog must never fire"
+        );
+        assert!(!wd.is_armed());
     }
 }
