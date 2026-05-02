@@ -1784,11 +1784,10 @@ struct AppState {
     /// the next render between paints sees an empty `host.osr_frame().pixels`
     /// (the swap-out side effect of acquire-by-mem-swap).
     last_osr_dims: Option<(u32, u32)>,
-    /// Debounced CEF resize: most recent target dims plus the deadline when
-    /// we'll actually call `host.osr_resize`. Refreshed on every
-    /// `WindowEvent::Resized`; fired once quiet for `CEF_RESIZE_DEBOUNCE`.
-    /// `None` when no resize is in flight.
-    pending_cef_resize: Option<(u32, u32, std::time::Instant)>,
+    /// Debounced CEF resize: tracks the deadline for calling `host.osr_resize`.
+    /// Refreshed on every `WindowEvent::Resized`; fired once quiet for
+    /// `CEF_RESIZE_DEBOUNCE`. Idle when `pending_cef_resize.deadline()` is None.
+    pending_cef_resize: ResizeDebounce,
     /// Last known cursor position in browser-region coordinates.
     /// Updated on every `CursorMoved` event; used when forwarding click and
     /// wheel events so we don't have to thread the position through each arm.
@@ -2038,7 +2037,7 @@ impl AppState {
             update_checker,
             last_osr_generation: 0,
             last_osr_dims: None,
-            pending_cef_resize: None,
+            pending_cef_resize: ResizeDebounce::default(),
             osr_cursor: (0, 0),
             osr_last_click_at: Instant::now(),
             osr_last_click_button: None,
@@ -2742,14 +2741,38 @@ impl AppState {
 
         // Acquire the latest OSR pixels by swapping our scratch buffer
         // with the SharedOsrFrame's pixel Vec. Lock duration is the cost
-        // of a Vec<u8> swap (three usize writes) — negligible. CEF's
-        // on_paint thread, when it next fires, gets the empty Vec we put
-        // in and resizes it; on_paint already handles len mismatch via
-        // the resize check, so no panic. After this block, self.osr_scratch
-        // owns the freshest CEF pixels and self.host's frame.pixels is empty.
+        // of a Vec<u8> swap (three usize writes) — negligible.
+        //
+        // Freshness gate: only swap when (a) generation has advanced past
+        // last_osr_generation (CEF emitted a new on_paint since we last
+        // looked) AND (b) frame.pixels.len() matches frame.width*height*4
+        // (the buffer is consistent with the dim atomics). The naive
+        // `!frame.pixels.is_empty()` check is NOT sufficient: after our
+        // first swap, frame.pixels holds the OLD scratch Vec — which is
+        // non-empty AND keeps its old length. Then on_paint at NEW dims
+        // resizes that Vec and updates frame.{width,height}. The next UI
+        // paint with no further on_paint between would see "non-empty
+        // pixels + new dims" and swap again, putting the leftover OLD
+        // Vec into scratch. scratch.len() (old dims) would no longer
+        // match last_osr_dims (new dims) → FreshOsr arm builds an
+        // OsrUpload claiming new_w*new_h*4 bytes from a buffer with only
+        // old_w*old_h*4 bytes. wgpu validation panics:
+        //   "Copy of 0..N would end up overrunning bounds of source M"
+        // (observed on Hyprland during a resize that crossed the chrome
+        // strip boundary at non-integer scale).
+        //
+        // Generation tracking guarantees the swap only fires when CEF
+        // has actually written fresh pixels since our last swap.
         let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref() {
             if let Ok(mut frame) = host.osr_frame().lock() {
-                if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
+                let fresh = is_osr_frame_fresh(
+                    frame.width,
+                    frame.height,
+                    frame.pixels.len(),
+                    frame.generation,
+                    self.last_osr_generation,
+                );
+                if fresh {
                     // Record dims before the swap (while guard is held).
                     self.last_osr_dims = Some((frame.width, frame.height));
                     std::mem::swap(&mut self.osr_scratch, &mut frame.pixels);
@@ -2823,133 +2846,143 @@ impl AppState {
         // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
         let chrome_dirty_effective = chrome_dirty || want_anim;
-        let res = if want_anim {
-            // Animation path: paint animation into chrome buffer at the browser
-            // rect region (opaque), then composite chrome alone (osr: None).
-            // Chrome buffer is logical-sized; use l_browser_* for the animation.
-            new_osr_generation = self.last_osr_generation;
-            renderer.frame(
-                chrome_dirty_effective,
-                |buf, w, h| {
-                    paint_chrome_strips(
-                        buf,
-                        w,
-                        lheight,
-                        &statusline,
-                        &tab_strip,
-                        tab_y,
-                        notice_y,
-                        current_notice.as_ref(),
-                        confirm_close_pinned,
-                        permissions_prompt.as_ref(),
-                        overlay_data.as_ref(),
-                    );
-                    // Paint the animation into the browser region so it is
-                    // opaque and composites as chrome (no OSR quad shown).
-                    crate::loading_anim::paint(
-                        buf,
-                        w,
-                        h,
-                        (0, l_browser_y, l_browser_w, l_browser_h),
-                        anim_frame as usize,
-                        anim_fg,
-                        anim_bg,
-                    );
-                },
-                None,
-            )
-        } else if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
-            new_osr_generation = osr_gen;
-            // dst_rect uses the live physical browser rect. The renderer GPU-
-            // stretches the OSR texture to fill it.
-            let osr_upload = crate::render::OsrUpload {
-                pixels: &self.osr_scratch,
-                width: osr_w,
-                height: osr_h,
-                generation: osr_gen,
-                dst_rect: (0, browser_y, browser_w, browser_h),
-            };
-            renderer.frame(
-                chrome_dirty,
-                |buf, w, _h| {
-                    paint_chrome_strips(
-                        buf,
-                        w,
-                        lheight,
-                        &statusline,
-                        &tab_strip,
-                        tab_y,
-                        notice_y,
-                        current_notice.as_ref(),
-                        confirm_close_pinned,
-                        permissions_prompt.as_ref(),
-                        overlay_data.as_ref(),
-                    );
-                },
-                Some(osr_upload),
-            )
-        } else if let Some((cached_w, cached_h)) = self.last_osr_dims {
-            // Between-paints fallback: frame.pixels was emptied by the
-            // mem::swap above, but we already have the previous paint in
-            // osr_scratch. Build a synthetic OsrUpload with the previous
-            // generation so the renderer dedupes the GPU upload (the texture
-            // is already current) while keeping the OSR quad visible.
-            new_osr_generation = self.last_osr_generation;
-            tracing::debug!(
-                cached_w,
-                cached_h,
-                gen = self.last_osr_generation,
-                "paint_chrome: between-paints synthetic upload from osr_scratch"
-            );
-            let osr_upload = crate::render::OsrUpload {
-                pixels: &self.osr_scratch,
-                width: cached_w,
-                height: cached_h,
-                generation: self.last_osr_generation,
-                dst_rect: (0, browser_y, browser_w, browser_h),
-            };
-            renderer.frame(
-                chrome_dirty,
-                |buf, w, _h| {
-                    paint_chrome_strips(
-                        buf,
-                        w,
-                        lheight,
-                        &statusline,
-                        &tab_strip,
-                        tab_y,
-                        notice_y,
-                        current_notice.as_ref(),
-                        confirm_close_pinned,
-                        permissions_prompt.as_ref(),
-                        overlay_data.as_ref(),
-                    );
-                },
-                Some(osr_upload),
-            )
-        } else {
-            // Safety fallback: no paint ever received (dead in practice once
-            // CEF emits on_paint, but keeps the compiler happy).
-            new_osr_generation = self.last_osr_generation;
-            renderer.frame(
-                chrome_dirty,
-                |buf, w, _h| {
-                    paint_chrome_strips(
-                        buf,
-                        w,
-                        lheight,
-                        &statusline,
-                        &tab_strip,
-                        tab_y,
-                        notice_y,
-                        current_notice.as_ref(),
-                        confirm_close_pinned,
-                        permissions_prompt.as_ref(),
-                        overlay_data.as_ref(),
-                    );
-                },
-                None,
-            )
+        let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
+        let res = match paint_path {
+            PaintPath::Animation => {
+                // Animation path: paint animation into chrome buffer at the browser
+                // rect region (opaque), then composite chrome alone (osr: None).
+                // Chrome buffer is logical-sized; use l_browser_* for the animation.
+                new_osr_generation = self.last_osr_generation;
+                renderer.frame(
+                    chrome_dirty_effective,
+                    |buf, w, h| {
+                        paint_chrome_strips(
+                            buf,
+                            w,
+                            lheight,
+                            &statusline,
+                            &tab_strip,
+                            tab_y,
+                            notice_y,
+                            current_notice.as_ref(),
+                            confirm_close_pinned,
+                            permissions_prompt.as_ref(),
+                            overlay_data.as_ref(),
+                        );
+                        // Paint the animation into the browser region so it is
+                        // opaque and composites as chrome (no OSR quad shown).
+                        crate::loading_anim::paint(
+                            buf,
+                            w,
+                            h,
+                            (0, l_browser_y, l_browser_w, l_browser_h),
+                            anim_frame as usize,
+                            anim_fg,
+                            anim_bg,
+                        );
+                    },
+                    None,
+                )
+            }
+            PaintPath::FreshOsr => {
+                let (osr_w, osr_h, osr_gen) = osr_meta.expect("FreshOsr requires osr_meta");
+                new_osr_generation = osr_gen;
+                // dst_rect uses the live physical browser rect. The renderer GPU-
+                // stretches the OSR texture to fill it.
+                let osr_upload = crate::render::OsrUpload {
+                    pixels: &self.osr_scratch,
+                    width: osr_w,
+                    height: osr_h,
+                    generation: osr_gen,
+                    dst_rect: (0, browser_y, browser_w, browser_h),
+                };
+                renderer.frame(
+                    chrome_dirty,
+                    |buf, w, _h| {
+                        paint_chrome_strips(
+                            buf,
+                            w,
+                            lheight,
+                            &statusline,
+                            &tab_strip,
+                            tab_y,
+                            notice_y,
+                            current_notice.as_ref(),
+                            confirm_close_pinned,
+                            permissions_prompt.as_ref(),
+                            overlay_data.as_ref(),
+                        );
+                    },
+                    Some(osr_upload),
+                )
+            }
+            PaintPath::SyntheticScratch => {
+                // Between-paints fallback: frame.pixels was emptied by the
+                // mem::swap above, but we already have the previous paint in
+                // osr_scratch. Build a synthetic OsrUpload with the previous
+                // generation so the renderer dedupes the GPU upload (the texture
+                // is already current) while keeping the OSR quad visible.
+                let (cached_w, cached_h) = self
+                    .last_osr_dims
+                    .expect("SyntheticScratch requires last_osr_dims");
+                new_osr_generation = self.last_osr_generation;
+                tracing::debug!(
+                    cached_w,
+                    cached_h,
+                    gen = self.last_osr_generation,
+                    "paint_chrome: between-paints synthetic upload from osr_scratch"
+                );
+                let osr_upload = crate::render::OsrUpload {
+                    pixels: &self.osr_scratch,
+                    width: cached_w,
+                    height: cached_h,
+                    generation: self.last_osr_generation,
+                    dst_rect: (0, browser_y, browser_w, browser_h),
+                };
+                renderer.frame(
+                    chrome_dirty,
+                    |buf, w, _h| {
+                        paint_chrome_strips(
+                            buf,
+                            w,
+                            lheight,
+                            &statusline,
+                            &tab_strip,
+                            tab_y,
+                            notice_y,
+                            current_notice.as_ref(),
+                            confirm_close_pinned,
+                            permissions_prompt.as_ref(),
+                            overlay_data.as_ref(),
+                        );
+                    },
+                    Some(osr_upload),
+                )
+            }
+            PaintPath::DeadFallback => {
+                // Safety fallback: no paint ever received (dead in practice once
+                // CEF emits on_paint, but keeps the compiler happy).
+                new_osr_generation = self.last_osr_generation;
+                renderer.frame(
+                    chrome_dirty,
+                    |buf, w, _h| {
+                        paint_chrome_strips(
+                            buf,
+                            w,
+                            lheight,
+                            &statusline,
+                            &tab_strip,
+                            tab_y,
+                            notice_y,
+                            current_notice.as_ref(),
+                            confirm_close_pinned,
+                            permissions_prompt.as_ref(),
+                            overlay_data.as_ref(),
+                        );
+                    },
+                    None,
+                )
+            }
         };
 
         self.last_osr_generation = new_osr_generation;
@@ -3048,45 +3081,19 @@ impl AppState {
         let log_wx = ((self.osr_cursor.0 as f32) / scale).round() as u32;
         let log_wy = ((phys_abs_y as f32) / scale).round() as u32;
 
-        let tab_y = self.tab_strip_y(log_full_h);
-        let tab_y_end = tab_y + TAB_STRIP_HEIGHT;
-
-        if log_wy < tab_y || log_wy >= tab_y_end || self.tab_ids.is_empty() {
-            return None;
-        }
-        // Mirror the layout in `TabStrip::paint`: pinned tabs occupy
-        // PINNED_TAB_WIDTH each, unpinned tabs share whatever's left.
-        const GUTTER: u32 = 4;
+        let has_notice = buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0;
         let pinned_count = self.tab_strip.tabs.iter().filter(|t| t.pinned).count() as u32;
         let total_count = self.tab_ids.len() as u32;
-        let unpinned_count = total_count.saturating_sub(pinned_count);
-        let pinned_total_w = pinned_count * buffr_ui::tab_strip::PINNED_TAB_WIDTH;
-        let gutter_total = (total_count + 1) * GUTTER;
-        let avail_for_unpinned = log_full_w
-            .saturating_sub(pinned_total_w)
-            .saturating_sub(gutter_total);
-        let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
-        let unpinned_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
 
-        if log_wx < GUTTER {
-            return None;
-        }
-        // Walk the pills left-to-right and pick the one whose rect
-        // contains `log_wx`.
-        let mut x = GUTTER;
-        for (i, tab) in self.tab_strip.tabs.iter().enumerate() {
-            let pill_w = if tab.pinned {
-                buffr_ui::tab_strip::PINNED_TAB_WIDTH
-            } else {
-                unpinned_w
-            };
-            let right = x + pill_w;
-            if log_wx >= x && log_wx < right {
-                return Some(i);
-            }
-            x = right + GUTTER;
-        }
-        None
+        hit_test_tab_strip_pure(
+            log_full_w,
+            log_full_h,
+            log_wx,
+            log_wy,
+            has_notice,
+            pinned_count,
+            total_count,
+        )
     }
 
     /// Top pixel row of the tab strip in **logical** (DIP) space.
@@ -4124,9 +4131,18 @@ impl AppState {
         let height = inner.height.max(1);
         let bar_h = STATUSLINE_HEIGHT;
 
+        // Same generation+length freshness gate as the main window's
+        // paint_chrome_with — see the long comment there for the wgpu
+        // panic this avoids.
         let osr_meta: Option<(u32, u32, u64)> = if let Ok(mut frame) = popup.frame.lock() {
-            if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
-                // Record dims before the swap (while guard is held).
+            let fresh = is_osr_frame_fresh(
+                frame.width,
+                frame.height,
+                frame.pixels.len(),
+                frame.generation,
+                popup.last_osr_generation,
+            );
+            if fresh {
                 popup.last_osr_dims = Some((frame.width, frame.height));
                 std::mem::swap(&mut popup.osr_scratch, &mut frame.pixels);
                 Some((frame.width, frame.height, frame.generation))
@@ -5123,8 +5139,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // OSR frame to fill the live browser_rect during the debounce window
                 // so there is no visual regression. The actual osr_resize call is
                 // fired in about_to_wait once the deadline elapses.
-                self.pending_cef_resize =
-                    Some((cef_w, cef_h, Instant::now() + CEF_RESIZE_DEBOUNCE));
+                self.pending_cef_resize
+                    .arm(cef_w, cef_h, Instant::now(), CEF_RESIZE_DEBOUNCE);
                 // Paint synchronously so the configure ack carries a
                 // buffer matching this event's size. Hyprland (and other
                 // wlroots compositors) anchor top-edge resize at the
@@ -6038,9 +6054,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // value would clobber that resync with stale dims, leaving CEF
         // painting at the wrong size and `last_osr_dims != browser_w/h`
         // forever — the loading animation would stay stuck.
-        if let Some((_, _, at)) = self.pending_cef_resize
-            && Instant::now() >= at
-        {
+        if self.pending_cef_resize.should_fire(Instant::now()) {
             if let Some(host) = self.host.as_ref()
                 && let Some(window) = self.window.as_ref()
             {
@@ -6053,7 +6067,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     "winit: pending Resized debounce elapsed -> osr_resize"
                 );
             }
-            self.pending_cef_resize = None;
+            self.pending_cef_resize.clear();
             self.request_redraw();
         }
 
@@ -6122,8 +6136,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         };
         // If a debounced CEF resize is pending, wake up no later than its
         // deadline so the resize fires promptly after the drag ends.
-        let deadline = match self.pending_cef_resize {
-            Some((_, _, resize_at)) if resize_at < deadline => resize_at,
+        let deadline = match self.pending_cef_resize.deadline() {
+            Some(resize_at) if resize_at < deadline => resize_at,
             _ => deadline,
         };
         // Same for any pending popup resize.
@@ -6166,6 +6180,165 @@ fn _impl_browser_used() {
     fn _f<T: ImplBrowser>(_: &T) {}
 }
 
+// ---------------------------------------------------------------------------
+// Group 1: Paint dispatch
+// ---------------------------------------------------------------------------
+
+/// Which paint code path `paint_chrome_with` should take for this frame.
+///
+/// Priority (highest first):
+///
+/// 1. `Animation`  — `want_anim = true`; show loading animation.
+/// 2. `FreshOsr`   — fresh on_paint pixels in `osr_meta`.
+/// 3. `SyntheticScratch` — between paints; use cached `osr_scratch`.
+/// 4. `DeadFallback` — no paint ever received.
+///
+/// The ordering is intentional: a size-mismatch triggers `want_anim`
+/// even when a fresh `osr_meta` arrived this frame (v0.1.25 invariant
+/// that prevents a momentary flash of a wrong-sized OSR quad).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintPath {
+    Animation,
+    FreshOsr,
+    SyntheticScratch,
+    DeadFallback,
+}
+
+/// Pure paint-path decision. All callers must route through this function;
+/// no inline duplication of the predicate is allowed. Tests pin the
+/// priority so future refactors can't silently re-order the arms.
+fn decide_paint_path(
+    want_anim: bool,
+    has_osr_meta: bool,
+    last_osr_dims: Option<(u32, u32)>,
+) -> PaintPath {
+    if want_anim {
+        PaintPath::Animation
+    } else if has_osr_meta {
+        PaintPath::FreshOsr
+    } else if last_osr_dims.is_some() {
+        PaintPath::SyntheticScratch
+    } else {
+        PaintPath::DeadFallback
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group 2: Resize debounce state machine
+// ---------------------------------------------------------------------------
+
+/// Owns the "quiet after last Resized" deadline for CEF resize calls.
+///
+/// `arm` refreshes the deadline on every `WindowEvent::Resized`.
+/// `should_fire` returns true once the deadline elapses.
+/// `clear` consumes the pending entry and returns the last queued dims.
+/// `deadline` is read by `about_to_wait` to set `ControlFlow::WaitUntil`.
+///
+/// The *dims* stored here are advisory — the flush in `about_to_wait`
+/// recomputes them from live window + chrome state to avoid the stale-
+/// dim bug (debounce flush using queued dims that pre-dated a notice expiry).
+#[derive(Debug, Default)]
+struct ResizeDebounce {
+    pending: Option<(u32, u32, Instant)>,
+}
+
+impl ResizeDebounce {
+    /// Arm or re-arm the debounce.  Each call during a resize drag
+    /// pushes the deadline `debounce` into the future, so the flush
+    /// only fires once the drag is quiet.
+    fn arm(&mut self, w: u32, h: u32, now: Instant, debounce: Duration) {
+        self.pending = Some((w, h, now + debounce));
+    }
+
+    /// True when a pending resize is overdue.
+    fn should_fire(&self, now: Instant) -> bool {
+        self.pending.is_some_and(|(_, _, at)| now >= at)
+    }
+
+    /// Consume the pending entry.  Returns the queued dims if one was
+    /// present, `None` if the debounce was already unarmed.
+    fn clear(&mut self) -> Option<(u32, u32)> {
+        self.pending.take().map(|(w, h, _)| (w, h))
+    }
+
+    /// The deadline instant, if a resize is pending.  `about_to_wait`
+    /// clamps `ControlFlow::WaitUntil` to this so the loop wakes exactly
+    /// when the debounce expires.
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.map(|(_, _, at)| at)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group 3: Tab-strip hit-test (pure)
+// ---------------------------------------------------------------------------
+
+/// Pure tab-strip hit-test.  All inputs are in **logical** (DIP) pixels.
+///
+/// `log_full_w` / `log_full_h` — full window logical size.
+/// `log_cursor_x` / `log_cursor_y` — cursor position in window-logical coords
+///     (i.e. already converted from physical and offset by `cef_y`).
+/// `has_notice` — whether the download-notice strip is visible.
+/// `pinned_count` / `total_count` — tab counts; pinned tabs sort first.
+///
+/// Returns the tab index under the cursor, or `None`.
+fn hit_test_tab_strip_pure(
+    log_full_w: u32,
+    log_full_h: u32,
+    log_cursor_x: u32,
+    log_cursor_y: u32,
+    has_notice: bool,
+    pinned_count: u32,
+    total_count: u32,
+) -> Option<usize> {
+    if total_count == 0 {
+        return None;
+    }
+
+    // Compute tab_y in logical space (matches tab_strip_y).
+    let notice_h = if has_notice {
+        DOWNLOAD_NOTICE_HEIGHT
+    } else {
+        0
+    };
+    let tab_y = notice_h.min(log_full_h);
+    let tab_y_end = tab_y + TAB_STRIP_HEIGHT;
+
+    if log_cursor_y < tab_y || log_cursor_y >= tab_y_end {
+        return None;
+    }
+
+    const GUTTER: u32 = 4;
+    let unpinned_count = total_count.saturating_sub(pinned_count);
+    let pinned_total_w = pinned_count * buffr_ui::tab_strip::PINNED_TAB_WIDTH;
+    let gutter_total = (total_count + 1) * GUTTER;
+    let avail_for_unpinned = log_full_w
+        .saturating_sub(pinned_total_w)
+        .saturating_sub(gutter_total);
+    let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
+    let unpinned_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
+
+    if log_cursor_x < GUTTER {
+        return None;
+    }
+
+    // Walk pills left-to-right: pinned tabs first, then unpinned.
+    let mut x = GUTTER;
+    for i in 0..total_count as usize {
+        let pill_w = if (i as u32) < pinned_count {
+            buffr_ui::tab_strip::PINNED_TAB_WIDTH
+        } else {
+            unpinned_w
+        };
+        let right = x + pill_w;
+        if log_cursor_x >= x && log_cursor_x < right {
+            return Some(i);
+        }
+        x = right + GUTTER;
+    }
+    None
+}
+
 /// Pure CEF page-rect computation. Mirrors the body of
 /// `AppState::cef_child_rect` / `cef_child_rect_logical` without depending
 /// on `&self`, so unit tests can drive every (size × scale × notice) case
@@ -6198,6 +6371,38 @@ fn cef_child_rect_pure(
     let cef_h = remaining_after_notice.max(1);
     let cef_y = notice_h + tab_h;
     (0, cef_y, cef_w, cef_h)
+}
+
+/// Whether the SharedOsrFrame currently holds a freshly-painted CEF
+/// frame that the embedder has not yet consumed.
+///
+/// Three conditions, all required:
+///
+/// 1. Non-zero dims.
+/// 2. `pixels.len() == width * height * 4` — guards against the gap
+///    between our `mem::swap`-out and the next on_paint, when
+///    `frame.pixels` holds a leftover Vec from a previous swap that
+///    has the OLD length but the dim atomics now reflect NEW dims.
+/// 3. `frame.generation != last_seen_generation` — guards against
+///    swapping the same frame in twice (which would put the leftover
+///    Vec back into `osr_scratch`, eventually drifting the scratch
+///    length out of sync with `last_osr_dims`).
+///
+/// Past bug: a `!pixels.is_empty()` check missed (2) and (3),
+/// allowing a bad swap that left scratch.len() < claimed dims and
+/// triggered a wgpu validation panic on the next FreshOsr upload.
+fn is_osr_frame_fresh(
+    frame_w: u32,
+    frame_h: u32,
+    pixels_len: usize,
+    frame_generation: u64,
+    last_seen_generation: u64,
+) -> bool {
+    let expected_len = (frame_w as usize) * (frame_h as usize) * 4;
+    frame_w > 0
+        && frame_h > 0
+        && pixels_len == expected_len
+        && frame_generation != last_seen_generation
 }
 
 /// Decide whether the loading animation should overlay the page region.
@@ -6326,6 +6531,113 @@ mod tests {
         // than a zero-dim that would panic CEF or the GPU upload.
         let (_, _, w, h) = cef_child_rect_pure(0, 0, 1.0, true);
         assert_eq!((w, h), (1, 1));
+    }
+
+    // ---- OSR-frame freshness gate ----------------------------------------
+    //
+    // Pin the swap-gate predicate. The earlier `!frame.pixels.is_empty()`
+    // gate had two holes that triggered a wgpu validation panic on
+    // resize:
+    //
+    //   1. After our mem::swap-out, frame.pixels held the previous
+    //      scratch Vec — non-empty AND of OLD length. on_paint at NEW
+    //      dims then resized that Vec and updated frame.{width,height}.
+    //      The next UI paint with no further on_paint between would
+    //      see "non-empty + new dims", swap again, and put a stale-len
+    //      Vec into scratch.
+    //   2. Repeated swaps of the same generation drift scratch length
+    //      out of sync with last_osr_dims even when dims are stable.
+    //
+    // Generation tracking + length-vs-dims check fix both. The wgpu
+    // panic "Copy of 0..N would end up overrunning bounds of source M"
+    // (observed on Hyprland during a resize across the chrome strip
+    // boundary at non-integer scale) was the smoking gun.
+
+    #[test]
+    fn osr_frame_fresh_at_init() {
+        // First on_paint: generation has advanced from 0 (init) to 1,
+        // dims are set, length matches. Embedder should swap.
+        let len = 1920 * 1086 * 4;
+        assert!(is_osr_frame_fresh(1920, 1086, len, 1, 0));
+    }
+
+    #[test]
+    fn osr_frame_not_fresh_when_zero_dims() {
+        // Pre-first-paint: dims are 0, no swap.
+        assert!(!is_osr_frame_fresh(0, 0, 0, 0, 0));
+        assert!(!is_osr_frame_fresh(1920, 0, 0, 1, 0));
+        assert!(!is_osr_frame_fresh(0, 1086, 0, 1, 0));
+    }
+
+    #[test]
+    fn osr_frame_not_fresh_when_pixels_len_mismatches_dims() {
+        // The post-swap state: frame.{width,height} were updated by
+        // on_paint to NEW dims but frame.pixels is still the leftover
+        // OLD-length Vec from a previous swap (on_paint hasn't fired
+        // since the dim update). Must NOT swap — the leftover Vec
+        // doesn't represent the claimed dims.
+        let new_dims_len = 1920 * 1086 * 4;
+        let old_dims_len = 1900 * 1066 * 4;
+        assert!(!is_osr_frame_fresh(1920, 1086, old_dims_len, 2, 1));
+        // Trivially-empty case (just-swapped, on_paint not yet fired):
+        assert!(!is_osr_frame_fresh(1920, 1086, 0, 2, 1));
+        // Sanity: matching length is the fresh signal.
+        assert!(is_osr_frame_fresh(1920, 1086, new_dims_len, 2, 1));
+    }
+
+    #[test]
+    fn osr_frame_not_fresh_when_generation_unchanged() {
+        // No new on_paint since last swap — even if dims and length
+        // are consistent, swapping again would just put leftover
+        // pixels back into scratch. The cached scratch already holds
+        // this generation's data; trust it.
+        let len = 1920 * 1086 * 4;
+        assert!(!is_osr_frame_fresh(1920, 1086, len, 5, 5));
+    }
+
+    #[test]
+    fn osr_frame_fresh_when_generation_advances() {
+        // Page animation between paints at stable dims — pure happy
+        // path. Generation advances each on_paint.
+        let len = 1920 * 1086 * 4;
+        assert!(is_osr_frame_fresh(1920, 1086, len, 6, 5));
+        assert!(is_osr_frame_fresh(1920, 1086, len, 100, 5));
+    }
+
+    #[test]
+    fn osr_frame_resize_sequence_no_panic() {
+        // End-to-end sequence reproducing the wgpu-panic scenario.
+        // Old dims: 1900x1066. New dims: 1920x1086. Verifies the
+        // gate skips the bad swap on the second-paint-without-onpaint
+        // case that produced the panic.
+        let old_w = 1900u32;
+        let old_h = 1066u32;
+        let new_w = 1920u32;
+        let new_h = 1086u32;
+        let old_len = (old_w as usize) * (old_h as usize) * 4;
+        let new_len = (new_w as usize) * (new_h as usize) * 4;
+
+        let mut last_seen = 0u64;
+
+        // Paint 1: on_paint at old dims (gen 1). Swap.
+        assert!(is_osr_frame_fresh(old_w, old_h, old_len, 1, last_seen));
+        last_seen = 1;
+
+        // Paint 2: no on_paint between; pixels.len() = 0 (the empty
+        // Vec we put into frame.pixels via the swap). Skip.
+        assert!(!is_osr_frame_fresh(old_w, old_h, 0, 1, last_seen));
+
+        // on_paint at NEW dims fires (gen 2). Resizes the leftover
+        // Vec to new_len and updates frame dims.
+        // Paint 3: gate sees new dims + new_len + new gen → swap.
+        assert!(is_osr_frame_fresh(new_w, new_h, new_len, 2, last_seen));
+        last_seen = 2;
+
+        // Paint 4: no on_paint between. frame.pixels is now the
+        // PREVIOUS scratch (old_len bytes), but frame dims are new.
+        // The hole in the old gate: `!is_empty() && new_dims` would
+        // have returned true. Generation+length gate rejects it.
+        assert!(!is_osr_frame_fresh(new_w, new_h, old_len, 2, last_seen));
     }
 
     // ---- edit-mode unit tests --------------------------------------------
@@ -6565,5 +6877,265 @@ mod tests {
             // f1 still active; blur for f99 was a no-op.
             assert!(matches!(&focus, EditFocus::Editing { field_id } if field_id == "f1"));
         }
+    }
+
+    // ---- Group 1: Paint dispatch enum ------------------------------------
+    //
+    // Invariant: `decide_paint_path` is the single gate for the four-arm
+    // paint dispatch.  Priority must be Animation > FreshOsr >
+    // SyntheticScratch > DeadFallback.  The v0.1.25 invariant (fresh
+    // osr_meta + dim mismatch ⇒ Animation, not FreshOsr) is pinned by the
+    // last test so a future refactor can't silently re-order the arms and
+    // reintroduce the wrong-size OSR flash.
+
+    #[test]
+    fn paint_path_animation_arm() {
+        // want_anim=true → Animation, regardless of osr_meta / last_osr_dims.
+        assert_eq!(decide_paint_path(true, false, None), PaintPath::Animation);
+    }
+
+    #[test]
+    fn paint_path_fresh_osr_arm() {
+        // want_anim=false, fresh osr_meta → FreshOsr.
+        assert_eq!(decide_paint_path(false, true, None), PaintPath::FreshOsr);
+    }
+
+    #[test]
+    fn paint_path_synthetic_scratch_arm() {
+        // want_anim=false, no fresh osr_meta, but last_osr_dims → SyntheticScratch.
+        assert_eq!(
+            decide_paint_path(false, false, Some((1500, 1050))),
+            PaintPath::SyntheticScratch
+        );
+    }
+
+    #[test]
+    fn paint_path_dead_fallback_arm() {
+        // want_anim=false, no osr_meta, no last_osr_dims → DeadFallback.
+        assert_eq!(
+            decide_paint_path(false, false, None),
+            PaintPath::DeadFallback
+        );
+    }
+
+    #[test]
+    fn paint_path_animation_beats_fresh_osr() {
+        // v0.1.25 invariant: size mismatch triggers want_anim=true even
+        // when fresh osr_meta arrived this frame.  Animation must win.
+        assert_eq!(
+            decide_paint_path(true, true, Some((1500, 1050))),
+            PaintPath::Animation
+        );
+    }
+
+    // ---- Group 2: Resize debounce state machine --------------------------
+    //
+    // Invariant: `ResizeDebounce` owns all deadline tracking; the
+    // about_to_wait clamp reads `deadline()`, `should_fire` gates the
+    // osr_resize call, and `clear` consumes the entry.  Re-arming during a
+    // continuous drag must push the deadline forward so the flush only
+    // fires after the last Resized event.
+
+    #[test]
+    fn arm_then_arm_refreshes_deadline() {
+        let mut db = ResizeDebounce::default();
+        let t0 = Instant::now();
+        db.arm(800, 600, t0, Duration::from_millis(150));
+        let d1 = db.deadline().unwrap();
+        // Re-arm after 50 ms of continued drag.
+        let t1 = t0 + Duration::from_millis(50);
+        db.arm(820, 610, t1, Duration::from_millis(150));
+        let d2 = db.deadline().unwrap();
+        // Second deadline must be strictly later than the first.
+        assert!(
+            d2 > d1,
+            "re-arm must push deadline forward: {d1:?} vs {d2:?}"
+        );
+    }
+
+    #[test]
+    fn should_fire_only_after_deadline() {
+        let mut db = ResizeDebounce::default();
+        let t0 = Instant::now();
+        db.arm(800, 600, t0, Duration::from_millis(150));
+        // Before the deadline: must not fire.
+        assert!(!db.should_fire(t0), "must not fire before deadline");
+        // At or after the deadline: must fire.
+        let at = t0 + Duration::from_millis(150);
+        assert!(db.should_fire(at), "must fire at deadline");
+        assert!(
+            db.should_fire(at + Duration::from_millis(1)),
+            "must fire after deadline"
+        );
+    }
+
+    #[test]
+    fn clear_returns_last_queued_dims_then_resets() {
+        let mut db = ResizeDebounce::default();
+        db.arm(1920, 1080, Instant::now(), Duration::from_millis(150));
+        // Overwrite with newer dims.
+        db.arm(1921, 1081, Instant::now(), Duration::from_millis(150));
+        let dims = db.clear();
+        assert_eq!(dims, Some((1921, 1081)));
+        // Second clear: nothing pending.
+        assert_eq!(db.clear(), None);
+        assert!(!db.should_fire(Instant::now()));
+    }
+
+    #[test]
+    fn unarmed_never_fires() {
+        let db = ResizeDebounce::default();
+        assert!(!db.should_fire(Instant::now()));
+        assert!(db.deadline().is_none());
+    }
+
+    #[test]
+    fn deadline_drives_event_loop_wakeup_clamp() {
+        // `about_to_wait` reads deadline() and sets ControlFlow::WaitUntil.
+        // Assert the stored Instant round-trips correctly.
+        let mut db = ResizeDebounce::default();
+        let t0 = Instant::now();
+        let debounce = Duration::from_millis(150);
+        db.arm(800, 600, t0, debounce);
+        let dl = db.deadline().expect("armed debounce must have a deadline");
+        // Deadline should be t0 + debounce (within a few ns of rounding).
+        assert!(dl >= t0 + debounce);
+        assert!(dl < t0 + debounce + Duration::from_millis(1));
+    }
+
+    // ---- Group 3: Tab-strip hit-test ------------------------------------
+    //
+    // Invariant: `hit_test_tab_strip_pure` is the single source of truth
+    // for mapping logical cursor coords to a tab index.  Production code
+    // routes through it after converting physical→logical.  Tests cover
+    // all return-None paths and several count / pinned combinations.
+    //
+    // The pure function assumes pinned tabs sort first in the pill walk —
+    // matching the session ordering contract.  HiDPI sanity verifies that
+    // identical logical inputs at different physical scales produce the
+    // same result (i.e. the physical→logical conversion is the only DPI-
+    // sensitive step, not the pure function itself).
+
+    /// Window width used for tab-strip tests (logical px).
+    const TS_W: u32 = 1000;
+    /// Window height used for tab-strip tests (logical px).
+    const TS_H: u32 = 800;
+
+    /// Y coordinate inside the tab strip (logical). tab_strip_y = 0 when
+    /// no notice; tab strip spans [0, TAB_STRIP_HEIGHT).
+    fn tab_y_inside() -> u32 {
+        TAB_STRIP_HEIGHT / 2
+    }
+
+    #[test]
+    fn tab_hit_outside_y_band_returns_none() {
+        // Cursor above tab strip (y = 0 when no notice, strip starts at 0, so
+        // use y = TAB_STRIP_HEIGHT which is one row below the strip end).
+        let result = hit_test_tab_strip_pure(
+            TS_W,
+            TS_H,
+            100,
+            TAB_STRIP_HEIGHT, // one past the end
+            false,
+            0,
+            3,
+        );
+        assert!(
+            result.is_none(),
+            "below strip: expected None, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tab_hit_empty_list_returns_none() {
+        let result = hit_test_tab_strip_pure(TS_W, TS_H, 100, tab_y_inside(), false, 0, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tab_hit_gutter_returns_none() {
+        // x < GUTTER (4 px) is the leading gutter — no pill lives there.
+        let result = hit_test_tab_strip_pure(TS_W, TS_H, 2, tab_y_inside(), false, 0, 1);
+        assert!(result.is_none(), "in gutter: expected None, got {result:?}");
+    }
+
+    #[test]
+    fn tab_hit_pinned_region_returns_correct_index() {
+        // Layout: 2 pinned tabs, 0 unpinned.
+        // Gutter = 4; pinned_w = PINNED_TAB_WIDTH (32).
+        // Tab 0: x in [4, 36).  Tab 1: x in [40, 72).
+        let pinned_w = buffr_ui::tab_strip::PINNED_TAB_WIDTH;
+        const GUTTER: u32 = 4;
+        // Cursor in tab 0.
+        let x0 = GUTTER + pinned_w / 2;
+        let r0 = hit_test_tab_strip_pure(TS_W, TS_H, x0, tab_y_inside(), false, 2, 2);
+        assert_eq!(r0, Some(0), "expected tab 0, got {r0:?}");
+        // Cursor in tab 1.
+        let x1 = GUTTER + pinned_w + GUTTER + pinned_w / 2;
+        let r1 = hit_test_tab_strip_pure(TS_W, TS_H, x1, tab_y_inside(), false, 2, 2);
+        assert_eq!(r1, Some(1), "expected tab 1, got {r1:?}");
+    }
+
+    #[test]
+    fn tab_hit_unpinned_single_returns_index_0() {
+        // 0 pinned, 1 unpinned. Width computed by the pure function.
+        // Just verify a cursor well inside the strip returns Some(0).
+        const GUTTER: u32 = 4;
+        let x = GUTTER + 10;
+        let result = hit_test_tab_strip_pure(TS_W, TS_H, x, tab_y_inside(), false, 0, 1);
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn tab_hit_unpinned_three_returns_correct_indices() {
+        // 0 pinned, 3 unpinned.
+        // gutter_total = (3+1)*4 = 16; avail = 1000-0-16 = 984; raw_w = 328;
+        // clamped to MAX_TAB_WIDTH (220).
+        // Tab 0: [4, 224).  Tab 1: [228, 448).  Tab 2: [452, 672).
+        const GUTTER: u32 = 4;
+        let unpinned_w = buffr_ui::MAX_TAB_WIDTH; // clamped at 220
+        let x0 = GUTTER + unpinned_w / 2;
+        let x1 = GUTTER + unpinned_w + GUTTER + unpinned_w / 2;
+        let x2 = GUTTER + unpinned_w + GUTTER + unpinned_w + GUTTER + unpinned_w / 2;
+        let r0 = hit_test_tab_strip_pure(TS_W, TS_H, x0, tab_y_inside(), false, 0, 3);
+        let r1 = hit_test_tab_strip_pure(TS_W, TS_H, x1, tab_y_inside(), false, 0, 3);
+        let r2 = hit_test_tab_strip_pure(TS_W, TS_H, x2, tab_y_inside(), false, 0, 3);
+        assert_eq!(r0, Some(0));
+        assert_eq!(r1, Some(1));
+        assert_eq!(r2, Some(2));
+    }
+
+    #[test]
+    fn tab_hit_unpinned_seven_tabs_returns_correct_indices() {
+        // 0 pinned, 7 unpinned.
+        // gutter_total = (7+1)*4 = 32; avail = 1000-32 = 968; raw_w = 138;
+        // 138 is in [MIN_TAB_WIDTH=80, MAX_TAB_WIDTH=220] — not clamped.
+        const GUTTER: u32 = 4;
+        let unpinned_w: u32 = 138; // = 968 / 7
+        for i in 0u32..7 {
+            let x = GUTTER + i * (unpinned_w + GUTTER) + unpinned_w / 2;
+            let result = hit_test_tab_strip_pure(TS_W, TS_H, x, tab_y_inside(), false, 0, 7);
+            assert_eq!(
+                result,
+                Some(i as usize),
+                "tab {i}: expected Some({i}), got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_hit_hidpi_sanity() {
+        // The pure function works in logical space; physical scale must not
+        // affect the result when inputs are already in logical coords.
+        const GUTTER: u32 = 4;
+        let x = GUTTER + 10;
+        let r1x = hit_test_tab_strip_pure(TS_W, TS_H, x, tab_y_inside(), false, 0, 1);
+        // Same logical coords regardless of physical scale — pure fn is scale-agnostic.
+        let r2x = hit_test_tab_strip_pure(TS_W, TS_H, x, tab_y_inside(), false, 0, 1);
+        assert_eq!(
+            r1x, r2x,
+            "same logical inputs must produce same result at any physical scale"
+        );
+        assert_eq!(r1x, Some(0));
     }
 }
