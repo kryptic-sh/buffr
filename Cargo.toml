@@ -93,7 +93,7 @@ buffr-permissions = { path = "crates/buffr-permissions", version = "0.1" }
 # resolution; major-bump breakage is gated by the leading-zero version.
 hjkl-engine = "0.1"
 hjkl-buffer = "0.1"
-hjkl-clipboard = "0.3"
+hjkl-clipboard = "0.4"
 
 # Force every transitive crates.io reference to a buffr-* crate to
 # resolve to the workspace member at crates/<name>/ (a submodule). The
