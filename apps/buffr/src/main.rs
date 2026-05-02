@@ -130,7 +130,6 @@ struct PopupWindow {
     /// CEF browser id — used to route CEF close events back to this window.
     browser_id: i32,
     frame: SharedOsrFrame,
-    #[allow(dead_code)]
     view: SharedOsrViewState,
     /// URL shown in the popup's address bar. Updated by CEF `on_address_change`.
     url: String,
@@ -2763,6 +2762,15 @@ impl AppState {
         // Generation tracking guarantees the swap only fires when CEF
         // has actually written fresh pixels since our last swap.
         let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref() {
+            // Read the dims we asked CEF for (osr_view atomics) so the
+            // gate can reject in-flight stale-dim paints. Reading both
+            // atomics under the frame lock matches CEF's IO-thread
+            // ordering: on_paint holds the same lock when writing
+            // frame.{width,height}, so an osr_view read here is
+            // sequenced with that on_paint.
+            let osr_view = host.osr_view();
+            let expected_w = osr_view.width.load(std::sync::atomic::Ordering::Relaxed);
+            let expected_h = osr_view.height.load(std::sync::atomic::Ordering::Relaxed);
             if let Ok(mut frame) = host.osr_frame().lock() {
                 let fresh = is_osr_frame_fresh(
                     frame.width,
@@ -2770,6 +2778,8 @@ impl AppState {
                     frame.pixels.len(),
                     frame.generation,
                     self.last_osr_generation,
+                    expected_w,
+                    expected_h,
                 );
                 if fresh {
                     // Record dims before the swap (while guard is held).
@@ -4130,9 +4140,10 @@ impl AppState {
         let height = inner.height.max(1);
         let bar_h = STATUSLINE_HEIGHT;
 
-        // Same generation+length freshness gate as the main window's
-        // paint_chrome_with — see the long comment there for the wgpu
-        // panic this avoids.
+        // Same freshness gate as the main window's paint_chrome_with —
+        // including stale-dim rejection via popup.view atomics.
+        let pop_expected_w = popup.view.width.load(std::sync::atomic::Ordering::Relaxed);
+        let pop_expected_h = popup.view.height.load(std::sync::atomic::Ordering::Relaxed);
         let osr_meta: Option<(u32, u32, u64)> = if let Ok(mut frame) = popup.frame.lock() {
             let fresh = is_osr_frame_fresh(
                 frame.width,
@@ -4140,6 +4151,8 @@ impl AppState {
                 frame.pixels.len(),
                 frame.generation,
                 popup.last_osr_generation,
+                pop_expected_w,
+                pop_expected_h,
             );
             if fresh {
                 popup.last_osr_dims = Some((frame.width, frame.height));
@@ -6416,31 +6429,54 @@ fn cef_child_rect_pure(
 /// Whether the SharedOsrFrame currently holds a freshly-painted CEF
 /// frame that the embedder has not yet consumed.
 ///
-/// Three conditions, all required:
+/// Four conditions, all required:
 ///
 /// 1. Non-zero dims.
-/// 2. `pixels.len() == width * height * 4` — guards against the gap
+/// 2. `frame_w == expected_w && frame_h == expected_h` — paint is at
+///    the dims we asked CEF for via `osr_resize`. Rejects "stale" paints
+///    that were in flight on CEF's IO thread when we resized; those
+///    paints carry the OLD dims and would, if accepted, pin
+///    `last_osr_dims` to old dims while `browser_w/h` (computed from
+///    `window.inner_size()`) is new — leaving the loading animation
+///    stuck even though a paint did arrive.
+/// 3. `pixels.len() == frame_w * frame_h * 4` — guards against the gap
 ///    between our `mem::swap`-out and the next on_paint, when
 ///    `frame.pixels` holds a leftover Vec from a previous swap that
 ///    has the OLD length but the dim atomics now reflect NEW dims.
-/// 3. `frame.generation != last_seen_generation` — guards against
+/// 4. `frame.generation != last_seen_generation` — guards against
 ///    swapping the same frame in twice (which would put the leftover
 ///    Vec back into `osr_scratch`, eventually drifting the scratch
 ///    length out of sync with `last_osr_dims`).
 ///
-/// Past bug: a `!pixels.is_empty()` check missed (2) and (3),
-/// allowing a bad swap that left scratch.len() < claimed dims and
-/// triggered a wgpu validation panic on the next FreshOsr upload.
+/// `expected_w` and `expected_h` are the current `osr_view.{width,height}`
+/// atomics (i.e. the dims we last passed to `osr_resize`). The freshness
+/// gate is the only place these atomics are consulted on the embedder
+/// side — once a paint has been accepted, `last_osr_dims` (which we
+/// own) takes over for downstream gating.
+///
+/// Past bugs:
+///   - `!pixels.is_empty()` missed (3) and (4), allowing a bad swap
+///     that triggered a wgpu validation panic on the FreshOsr upload.
+///   - Missing (2) caused a brief OSR flash at old dims during resize
+///     followed by a stuck animation: a stale-dim paint passed the
+///     gate, set `last_osr_dims = old dims`, then the loading-anim
+///     gate flipped back to true because old dims != new browser_w/h,
+///     and CEF's coalesced second invalidate sometimes failed to
+///     produce a follow-up on_paint.
 fn is_osr_frame_fresh(
     frame_w: u32,
     frame_h: u32,
     pixels_len: usize,
     frame_generation: u64,
     last_seen_generation: u64,
+    expected_w: u32,
+    expected_h: u32,
 ) -> bool {
     let expected_len = (frame_w as usize) * (frame_h as usize) * 4;
     frame_w > 0
         && frame_h > 0
+        && frame_w == expected_w
+        && frame_h == expected_h
         && pixels_len == expected_len
         && frame_generation != last_seen_generation
 }
@@ -6596,17 +6632,17 @@ mod tests {
     #[test]
     fn osr_frame_fresh_at_init() {
         // First on_paint: generation has advanced from 0 (init) to 1,
-        // dims are set, length matches. Embedder should swap.
+        // dims are set, length matches, expected matches. Swap.
         let len = 1920 * 1086 * 4;
-        assert!(is_osr_frame_fresh(1920, 1086, len, 1, 0));
+        assert!(is_osr_frame_fresh(1920, 1086, len, 1, 0, 1920, 1086));
     }
 
     #[test]
     fn osr_frame_not_fresh_when_zero_dims() {
         // Pre-first-paint: dims are 0, no swap.
-        assert!(!is_osr_frame_fresh(0, 0, 0, 0, 0));
-        assert!(!is_osr_frame_fresh(1920, 0, 0, 1, 0));
-        assert!(!is_osr_frame_fresh(0, 1086, 0, 1, 0));
+        assert!(!is_osr_frame_fresh(0, 0, 0, 0, 0, 0, 0));
+        assert!(!is_osr_frame_fresh(1920, 0, 0, 1, 0, 1920, 0));
+        assert!(!is_osr_frame_fresh(0, 1086, 0, 1, 0, 0, 1086));
     }
 
     #[test]
@@ -6614,15 +6650,30 @@ mod tests {
         // The post-swap state: frame.{width,height} were updated by
         // on_paint to NEW dims but frame.pixels is still the leftover
         // OLD-length Vec from a previous swap (on_paint hasn't fired
-        // since the dim update). Must NOT swap — the leftover Vec
-        // doesn't represent the claimed dims.
+        // since the dim update). Must NOT swap.
         let new_dims_len = 1920 * 1086 * 4;
         let old_dims_len = 1900 * 1066 * 4;
-        assert!(!is_osr_frame_fresh(1920, 1086, old_dims_len, 2, 1));
+        assert!(!is_osr_frame_fresh(
+            1920,
+            1086,
+            old_dims_len,
+            2,
+            1,
+            1920,
+            1086,
+        ));
         // Trivially-empty case (just-swapped, on_paint not yet fired):
-        assert!(!is_osr_frame_fresh(1920, 1086, 0, 2, 1));
+        assert!(!is_osr_frame_fresh(1920, 1086, 0, 2, 1, 1920, 1086));
         // Sanity: matching length is the fresh signal.
-        assert!(is_osr_frame_fresh(1920, 1086, new_dims_len, 2, 1));
+        assert!(is_osr_frame_fresh(
+            1920,
+            1086,
+            new_dims_len,
+            2,
+            1,
+            1920,
+            1086,
+        ));
     }
 
     #[test]
@@ -6632,7 +6683,7 @@ mod tests {
         // pixels back into scratch. The cached scratch already holds
         // this generation's data; trust it.
         let len = 1920 * 1086 * 4;
-        assert!(!is_osr_frame_fresh(1920, 1086, len, 5, 5));
+        assert!(!is_osr_frame_fresh(1920, 1086, len, 5, 5, 1920, 1086));
     }
 
     #[test]
@@ -6640,8 +6691,42 @@ mod tests {
         // Page animation between paints at stable dims — pure happy
         // path. Generation advances each on_paint.
         let len = 1920 * 1086 * 4;
-        assert!(is_osr_frame_fresh(1920, 1086, len, 6, 5));
-        assert!(is_osr_frame_fresh(1920, 1086, len, 100, 5));
+        assert!(is_osr_frame_fresh(1920, 1086, len, 6, 5, 1920, 1086));
+        assert!(is_osr_frame_fresh(1920, 1086, len, 100, 5, 1920, 1086));
+    }
+
+    #[test]
+    fn osr_frame_rejects_stale_dim_paint() {
+        // The flicker bug. CEF emitted a paint at OLD dims (1900x1066)
+        // after the embedder issued osr_resize to NEW dims (1920x1086).
+        // The paint is internally consistent — generation advanced,
+        // length matches its claimed dims — but it's at the wrong
+        // size. Accepting it would set last_osr_dims = old dims while
+        // browser_w/h is new dims, leaving the loading animation
+        // armed forever (until CEF happens to also fire a new-dims
+        // paint, which is exactly the flake the user observed).
+        let old_w = 1900u32;
+        let old_h = 1066u32;
+        let new_w = 1920u32;
+        let new_h = 1086u32;
+        let old_len = (old_w as usize) * (old_h as usize) * 4;
+        // frame at OLD dims; expected dims are NEW (osr_view post-resize).
+        assert!(
+            !is_osr_frame_fresh(old_w, old_h, old_len, 2, 1, new_w, new_h),
+            "stale-dim paint must be rejected"
+        );
+    }
+
+    #[test]
+    fn osr_frame_accepts_paint_matching_expected_dims() {
+        // Once CEF catches up and produces a paint at expected
+        // (post-resize) dims, the gate accepts it.
+        let new_w = 1920u32;
+        let new_h = 1086u32;
+        let new_len = (new_w as usize) * (new_h as usize) * 4;
+        assert!(is_osr_frame_fresh(
+            new_w, new_h, new_len, 3, 1, new_w, new_h,
+        ));
     }
 
     #[test]
@@ -6659,25 +6744,31 @@ mod tests {
 
         let mut last_seen = 0u64;
 
+        // Phase 1: steady at OLD dims. expected = old.
         // Paint 1: on_paint at old dims (gen 1). Swap.
-        assert!(is_osr_frame_fresh(old_w, old_h, old_len, 1, last_seen));
+        assert!(is_osr_frame_fresh(
+            old_w, old_h, old_len, 1, last_seen, old_w, old_h,
+        ));
         last_seen = 1;
 
-        // Paint 2: no on_paint between; pixels.len() = 0 (the empty
-        // Vec we put into frame.pixels via the swap). Skip.
-        assert!(!is_osr_frame_fresh(old_w, old_h, 0, 1, last_seen));
+        // Paint 2: no on_paint between; pixels.len() = 0. Skip.
+        assert!(!is_osr_frame_fresh(
+            old_w, old_h, 0, 1, last_seen, old_w, old_h,
+        ));
 
-        // on_paint at NEW dims fires (gen 2). Resizes the leftover
-        // Vec to new_len and updates frame dims.
-        // Paint 3: gate sees new dims + new_len + new gen → swap.
-        assert!(is_osr_frame_fresh(new_w, new_h, new_len, 2, last_seen));
+        // Phase 2: embedder issued osr_resize → expected = new.
+        // on_paint at NEW dims fires (gen 2). Length matches.
+        assert!(is_osr_frame_fresh(
+            new_w, new_h, new_len, 2, last_seen, new_w, new_h,
+        ));
         last_seen = 2;
 
         // Paint 4: no on_paint between. frame.pixels is now the
-        // PREVIOUS scratch (old_len bytes), but frame dims are new.
-        // The hole in the old gate: `!is_empty() && new_dims` would
-        // have returned true. Generation+length gate rejects it.
-        assert!(!is_osr_frame_fresh(new_w, new_h, old_len, 2, last_seen));
+        // previous scratch (old_len bytes), frame dims are new.
+        // Length+generation gate rejects.
+        assert!(!is_osr_frame_fresh(
+            new_w, new_h, old_len, 2, last_seen, new_w, new_h,
+        ));
     }
 
     // ---- edit-mode unit tests --------------------------------------------
