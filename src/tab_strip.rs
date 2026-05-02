@@ -337,10 +337,12 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
 const GUTTER: u32 = 4;
 
 /// Draw `fav` into the rect `(dst_x, dst_y, dst_w, dst_h)` using
-/// nearest-neighbour scaling and a `bg`-coloured backdrop for transparent
-/// pixels. Source pixels are BGRA-packed `0xAARRGGBB`; we composite over
-/// `bg` so antialiased edges read correctly on whichever pill colour the
-/// caller passes in.
+/// bilinear scaling and a `bg`-coloured backdrop for transparent pixels.
+/// Source pixels are BGRA-packed `0xAARRGGBB` with PREMULTIPLIED alpha
+/// (we ask CEF for `COLOR_TYPE_BGRA_8888` premul), so linear blends of
+/// the four taps are mathematically correct without an un-premul pass.
+/// We composite over `bg` so the antialiased edges read correctly on
+/// whichever pill colour the caller passes in.
 #[allow(clippy::too_many_arguments)]
 fn blit_favicon(
     buffer: &mut [u32],
@@ -365,9 +367,23 @@ fn blit_favicon(
         return;
     }
     // Pre-extract the bg channels; reused for every alpha composite.
-    let bg_r = (bg >> 16) & 0xFF;
-    let bg_g = (bg >> 8) & 0xFF;
-    let bg_b = bg & 0xFF;
+    let bg_r = ((bg >> 16) & 0xFF) as i32;
+    let bg_g = ((bg >> 8) & 0xFF) as i32;
+    let bg_b = (bg & 0xFF) as i32;
+
+    // Pixel-centre sampling: dst pixel (dx, dy) maps to source coord
+    // ((dx + 0.5) * src/dst - 0.5). Working in fixed-point Q16 so the
+    // hot loop stays integer-only. fx_step / fy_step are the source
+    // increment per dst pixel; fx0 / fy0 are the source coords of the
+    // first dst pixel's centre. Negative values clamp to 0 below.
+    let fx_step: i64 = ((src_w as i64) << 16) / (dst_w_us as i64);
+    let fy_step: i64 = ((src_h as i64) << 16) / (dst_h_us as i64);
+    let fx0: i64 = (fx_step >> 1) - (1 << 15);
+    let fy0: i64 = (fy_step >> 1) - (1 << 15);
+
+    let max_sx = src_w as i64 - 1;
+    let max_sy = src_h as i64 - 1;
+
     for dy in 0..dst_h_us {
         let py = dst_y + dy as i32;
         if py < 0 {
@@ -377,7 +393,15 @@ fn blit_favicon(
         if py >= height {
             break;
         }
-        let sy = (dy * src_h) / dst_h_us;
+        // Source y in Q16, clamped to [0, max_sy << 16].
+        let fy = (fy0 + fy_step * dy as i64).clamp(0, max_sy << 16);
+        let sy0 = (fy >> 16) as usize;
+        let sy1 = (sy0 + 1).min(src_h - 1);
+        let wy: i32 = ((fy & 0xFFFF) >> 8) as i32; // 0..=255
+
+        let row0 = sy0 * src_w;
+        let row1 = sy1 * src_w;
+
         for dx in 0..dst_w_us {
             let px = dst_x + dx as i32;
             if px < 0 {
@@ -387,20 +411,56 @@ fn blit_favicon(
             if px >= width {
                 break;
             }
-            let sx = (dx * src_w) / dst_w_us;
-            let src = src_pixels[sy * src_w + sx];
-            let a = (src >> 24) & 0xFF;
-            // Source alpha is premultiplied (we asked CEF for
-            // PREMULTIPLIED). Composite over the pill bg with
-            // `out = src + bg * (1 - a)`.
-            let sr = (src >> 16) & 0xFF;
-            let sg = (src >> 8) & 0xFF;
-            let sb = src & 0xFF;
+            let fx = (fx0 + fx_step * dx as i64).clamp(0, max_sx << 16);
+            let sx0 = (fx >> 16) as usize;
+            let sx1 = (sx0 + 1).min(src_w - 1);
+            let wx: i32 = ((fx & 0xFFFF) >> 8) as i32; // 0..=255
+
+            // Four taps in source-space corners.
+            let p00 = src_pixels[row0 + sx0];
+            let p10 = src_pixels[row0 + sx1];
+            let p01 = src_pixels[row1 + sx0];
+            let p11 = src_pixels[row1 + sx1];
+
+            // Bilinear over each premultiplied channel. Linear blend of
+            // premultiplied values is correct without un-premul.
+            #[inline(always)]
+            fn lerp(a: i32, b: i32, w: i32) -> i32 {
+                // w in 0..=255; return rounded a + (b - a) * w / 255.
+                a + (((b - a) * w) + 127) / 255
+            }
+            #[inline(always)]
+            fn ch(p: u32, shift: u32) -> i32 {
+                ((p >> shift) & 0xFF) as i32
+            }
+
+            let a = lerp(
+                lerp(ch(p00, 24), ch(p10, 24), wx),
+                lerp(ch(p01, 24), ch(p11, 24), wx),
+                wy,
+            );
+            let r = lerp(
+                lerp(ch(p00, 16), ch(p10, 16), wx),
+                lerp(ch(p01, 16), ch(p11, 16), wx),
+                wy,
+            );
+            let g = lerp(
+                lerp(ch(p00, 8), ch(p10, 8), wx),
+                lerp(ch(p01, 8), ch(p11, 8), wx),
+                wy,
+            );
+            let b = lerp(
+                lerp(ch(p00, 0), ch(p10, 0), wx),
+                lerp(ch(p01, 0), ch(p11, 0), wx),
+                wy,
+            );
+
+            // Composite premultiplied src over bg: out = src + bg * (1 - a).
             let inv = 255 - a;
-            let r = (sr + ((bg_r * inv) + 127) / 255).min(255);
-            let g = (sg + ((bg_g * inv) + 127) / 255).min(255);
-            let b = (sb + ((bg_b * inv) + 127) / 255).min(255);
-            let out = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            let out_r = (r + ((bg_r * inv) + 127) / 255).clamp(0, 255) as u32;
+            let out_g = (g + ((bg_g * inv) + 127) / 255).clamp(0, 255) as u32;
+            let out_b = (b + ((bg_b * inv) + 127) / 255).clamp(0, 255) as u32;
+            let out = 0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
             if let Some(dst) = buffer.get_mut(py * width + px) {
                 *dst = out;
             }
