@@ -1,6 +1,6 @@
 # Maintainer: kryptic.sh <hello at kryptic dot sh>
 pkgname=buffr
-pkgver=0.1.24
+pkgver=0.1.25
 pkgrel=1
 pkgdesc="Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
 arch=('x86_64')
