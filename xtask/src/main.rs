@@ -2022,7 +2022,7 @@ mod tests {
     fn desktop_template_has_required_keys() {
         // Keep the minimum keys that LXQt / GNOME / KDE all parse.
         assert!(DESKTOP_TEMPLATE.contains("[Desktop Entry]"));
-        assert!(DESKTOP_TEMPLATE.contains("Name=buffr"));
+        assert!(DESKTOP_TEMPLATE.contains("Name=Buffr"));
         assert!(DESKTOP_TEMPLATE.contains("Exec=buffr %U"));
         assert!(DESKTOP_TEMPLATE.contains("Icon=buffr"));
         assert!(DESKTOP_TEMPLATE.contains("Type=Application"));

@@ -22,6 +22,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Quiet window after the last `WindowEvent::Resized` before we actually
+/// call `host.osr_resize`. Hyprland fires many Resized events per second
+/// during a drag; CEF should only learn the final post-drag size. The
+/// renderer GPU-stretches the stale OSR over the live browser_rect during
+/// the window, so there is no visual regression.
+const CEF_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// Minimum quiet time after the last session-dirtying event before
 /// the session file is written to disk.  Sliding window: each new
 /// change resets the clock.
@@ -145,6 +152,15 @@ struct PopupWindow {
     last_click_at: Instant,
     last_click_button: Option<cef::MouseButtonType>,
     click_count: i32,
+    /// Dimensions of the most recently received OSR paint for this popup.
+    /// `None` until CEF emits the first on_paint. Guards the synthetic-upload
+    /// fallback so a chrome-dirty redraw between CEF paints doesn't blank the
+    /// OSR quad (same swap-out side effect as the main window).
+    last_osr_dims: Option<(u32, u32)>,
+    /// Debounced CEF resize: most recent target dims plus the deadline when
+    /// `host.popup_resize` will actually be called. Refreshed on every
+    /// Resized event; fired once quiet for `CEF_RESIZE_DEBOUNCE`.
+    pending_cef_resize: Option<(u32, u32, std::time::Instant)>,
 }
 
 #[derive(Parser, Debug)]
@@ -1762,6 +1778,17 @@ struct AppState {
     /// we know there is new content to show; when they match we can skip
     /// the BGRA→RGB copy and re-present the existing buffer.
     last_osr_generation: u64,
+    /// Dimensions of the most recently received OSR paint. `None` until
+    /// CEF emits the first on_paint. Used to gate the loading animation:
+    /// once we've seen a paint we don't fall back to animation just because
+    /// the next render between paints sees an empty `host.osr_frame().pixels`
+    /// (the swap-out side effect of acquire-by-mem-swap).
+    last_osr_dims: Option<(u32, u32)>,
+    /// Debounced CEF resize: most recent target dims plus the deadline when
+    /// we'll actually call `host.osr_resize`. Refreshed on every
+    /// `WindowEvent::Resized`; fired once quiet for `CEF_RESIZE_DEBOUNCE`.
+    /// `None` when no resize is in flight.
+    pending_cef_resize: Option<(u32, u32, std::time::Instant)>,
     /// Last known cursor position in browser-region coordinates.
     /// Updated on every `CursorMoved` event; used when forwarding click and
     /// wheel events so we don't have to thread the position through each arm.
@@ -2010,6 +2037,8 @@ impl AppState {
             counters_flush_at: Instant::now(),
             update_checker,
             last_osr_generation: 0,
+            last_osr_dims: None,
+            pending_cef_resize: None,
             osr_cursor: (0, 0),
             osr_last_click_at: Instant::now(),
             osr_last_click_button: None,
@@ -2721,6 +2750,8 @@ impl AppState {
         let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref() {
             if let Ok(mut frame) = host.osr_frame().lock() {
                 if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
+                    // Record dims before the swap (while guard is held).
+                    self.last_osr_dims = Some((frame.width, frame.height));
                     std::mem::swap(&mut self.osr_scratch, &mut frame.pixels);
                     Some((frame.width, frame.height, frame.generation))
                 } else {
@@ -2757,20 +2788,21 @@ impl AppState {
 
         // Decide whether to show the loading animation instead of OSR.
         // Pixel-state gating only — no time threshold.
-        //   • None      → no on_paint received yet, or pixels empty
-        //   • Some(...) → last CEF buffer dims don't match the live browser rect
-        let want_anim = match osr_meta {
-            None => true,
-            Some((osr_w, osr_h, _)) => osr_w != browser_w || osr_h != browser_h,
-        };
+        //   • None (last_osr_dims)   → no on_paint received yet
+        //   • Some dims != browser   → CEF hasn't caught up to new size yet
+        // We do NOT use `osr_meta.is_none()` here because that fires on every
+        // redraw between CEF paints (the swap-out side effect empties
+        // frame.pixels). `last_osr_dims` persists across swaps so the animation
+        // only activates before the very first paint or during a size mismatch.
+        let want_anim = self.last_osr_dims != Some((browser_w, browser_h));
 
         if want_anim != self.loading_anim_active {
             if want_anim {
                 tracing::debug!(
                     browser_w,
                     browser_h,
-                    osr_dims = ?osr_meta.map(|(w, h, _)| (w, h)),
-                    "loading_anim: activated (OSR buffer absent or wrong size)"
+                    last_osr_dims = ?self.last_osr_dims,
+                    "loading_anim: activated (no prior paint or wrong size)"
                 );
             } else {
                 tracing::debug!(
@@ -2856,7 +2888,48 @@ impl AppState {
                 },
                 Some(osr_upload),
             )
+        } else if let Some((cached_w, cached_h)) = self.last_osr_dims {
+            // Between-paints fallback: frame.pixels was emptied by the
+            // mem::swap above, but we already have the previous paint in
+            // osr_scratch. Build a synthetic OsrUpload with the previous
+            // generation so the renderer dedupes the GPU upload (the texture
+            // is already current) while keeping the OSR quad visible.
+            new_osr_generation = self.last_osr_generation;
+            tracing::debug!(
+                cached_w,
+                cached_h,
+                gen = self.last_osr_generation,
+                "paint_chrome: between-paints synthetic upload from osr_scratch"
+            );
+            let osr_upload = crate::render::OsrUpload {
+                pixels: &self.osr_scratch,
+                width: cached_w,
+                height: cached_h,
+                generation: self.last_osr_generation,
+                dst_rect: (0, browser_y, browser_w, browser_h),
+            };
+            renderer.frame(
+                chrome_dirty,
+                |buf, w, _h| {
+                    paint_chrome_strips(
+                        buf,
+                        w,
+                        lheight,
+                        &statusline,
+                        &tab_strip,
+                        tab_y,
+                        notice_y,
+                        current_notice.as_ref(),
+                        confirm_close_pinned,
+                        permissions_prompt.as_ref(),
+                        overlay_data.as_ref(),
+                    );
+                },
+                Some(osr_upload),
+            )
         } else {
+            // Safety fallback: no paint ever received (dead in practice once
+            // CEF emits on_paint, but keeps the compiler happy).
             new_osr_generation = self.last_osr_generation;
             renderer.frame(
                 chrome_dirty,
@@ -4081,6 +4154,8 @@ impl AppState {
 
         let osr_meta: Option<(u32, u32, u64)> = if let Ok(mut frame) = popup.frame.lock() {
             if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() {
+                // Record dims before the swap (while guard is held).
+                popup.last_osr_dims = Some((frame.width, frame.height));
                 std::mem::swap(&mut popup.osr_scratch, &mut frame.pixels);
                 Some((frame.width, frame.height, frame.generation))
             } else {
@@ -4108,7 +4183,31 @@ impl AppState {
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 Some(osr_upload),
             )
+        } else if let Some((cached_w, cached_h)) = popup.last_osr_dims {
+            // Between-paints fallback: reuse osr_scratch from previous paint.
+            // Same synthetic-upload trick as the main window: generation matches
+            // last_osr_generation so the GPU dedupes the upload.
+            new_gen = popup.last_osr_generation;
+            tracing::debug!(
+                cached_w,
+                cached_h,
+                gen = popup.last_osr_generation,
+                "popup: between-paints synthetic upload from osr_scratch"
+            );
+            let osr_upload = crate::render::OsrUpload {
+                pixels: &popup.osr_scratch,
+                width: cached_w,
+                height: cached_h,
+                generation: popup.last_osr_generation,
+                dst_rect: (0, bar_h, width, height.saturating_sub(bar_h).max(1)),
+            };
+            popup.renderer.frame(
+                chrome_dirty,
+                |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
+                Some(osr_upload),
+            )
         } else {
+            // No paint received yet for this popup.
             new_gen = popup.last_osr_generation;
             popup.renderer.frame(
                 chrome_dirty,
@@ -4159,10 +4258,11 @@ impl AppState {
                 if browser_id >= 0 {
                     let w = new_size.width.max(1);
                     let h = new_size.height.max(1);
-                    if let Some(host) = self.host.as_ref() {
-                        host.popup_resize(browser_id, w, h);
-                    }
+                    // Debounce: arm/refresh the pending deadline rather than
+                    // calling host.popup_resize immediately. Fired in about_to_wait.
                     if let Some(popup) = self.popups.get_mut(&window_id) {
+                        popup.pending_cef_resize =
+                            Some((w, h, Instant::now() + CEF_RESIZE_DEBOUNCE));
                         popup.chrome_generation = popup.chrome_generation.wrapping_add(1);
                     }
                 }
@@ -5044,15 +5144,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     has_host = self.host.is_some(),
                     "winit: Resized",
                 );
-                if let Some(host) = self.host.as_ref() {
-                    // Notify CEF on every Resized. The renderer GPU-
-                    // stretches whatever frame CEF most recently
-                    // emitted to fill the live browser_rect, so
-                    // intermediate CEF frames at any size composite
-                    // correctly without throttling/debouncing.
-                    host.osr_resize(cef_w, cef_h);
-                    debug!(cef_w, cef_h, "winit: Resized -> osr_resize");
-                }
+                // Debounce CEF resize: arm/refresh the pending deadline rather
+                // than calling host.osr_resize immediately. Hyprland fires many
+                // Resized events per second during a drag; CEF only needs to learn
+                // the final post-drag size. The renderer GPU-stretches the stale
+                // OSR frame to fill the live browser_rect during the debounce window
+                // so there is no visual regression. The actual osr_resize call is
+                // fired in about_to_wait once the deadline elapses.
+                self.pending_cef_resize =
+                    Some((cef_w, cef_h, Instant::now() + CEF_RESIZE_DEBOUNCE));
                 // Paint synchronously so the configure ack carries a
                 // buffer matching this event's size. Hyprland (and other
                 // wlroots compositors) anchor top-edge resize at the
@@ -5745,6 +5845,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     view: created.view,
                     url: created.url,
                     last_osr_generation: 0,
+                    last_osr_dims: None,
+                    pending_cef_resize: None,
                     osr_scratch: Vec::new(),
                     chrome_generation: 1,
                     last_painted_chrome_gen: 0,
@@ -5944,6 +6046,50 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             self.request_redraw();
         }
 
+        // CEF resize debounce: fire the pending osr_resize once the drag
+        // has been quiet for CEF_RESIZE_DEBOUNCE. Each Resized event refreshes
+        // the deadline; we only call host.osr_resize once per drag gesture.
+        if let Some((w, h, at)) = self.pending_cef_resize
+            && Instant::now() >= at
+        {
+            if let Some(host) = self.host.as_ref() {
+                host.osr_resize(w, h);
+                tracing::debug!(
+                    w,
+                    h,
+                    "winit: pending Resized debounce elapsed -> osr_resize"
+                );
+            }
+            self.pending_cef_resize = None;
+            self.request_redraw();
+        }
+
+        // Popup CEF resize debounce: same logic for each live popup window.
+        let popup_ids: Vec<WindowId> = self.popups.keys().copied().collect();
+        for wid in popup_ids {
+            let pending = self.popups.get(&wid).and_then(|p| p.pending_cef_resize);
+            if let Some((w, h, at)) = pending
+                && Instant::now() >= at
+            {
+                let browser_id = self.popups.get(&wid).map(|p| p.browser_id).unwrap_or(-1);
+                if browser_id >= 0
+                    && let Some(host) = self.host.as_ref()
+                {
+                    host.popup_resize(browser_id, w, h);
+                    tracing::debug!(
+                        browser_id,
+                        w,
+                        h,
+                        "popup: pending Resized debounce elapsed -> popup_resize"
+                    );
+                }
+                if let Some(popup) = self.popups.get_mut(&wid) {
+                    popup.pending_cef_resize = None;
+                }
+                self.request_redraw();
+            }
+        }
+
         // No idle paint loop: we respect Wayland's frame-callback model
         // and only repaint on explicit `request_redraw` (e.g. resize,
         // input, mode/url change). OSR `on_paint` updates that arrive
@@ -5981,6 +6127,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             Some(anim_at) if anim_at < deadline => anim_at,
             _ => deadline,
         };
+        // If a debounced CEF resize is pending, wake up no later than its
+        // deadline so the resize fires promptly after the drag ends.
+        let deadline = match self.pending_cef_resize {
+            Some((_, _, resize_at)) if resize_at < deadline => resize_at,
+            _ => deadline,
+        };
+        // Same for any pending popup resize.
+        let deadline = self
+            .popups
+            .values()
+            .filter_map(|p| p.pending_cef_resize)
+            .map(|(_, _, at)| at)
+            .fold(deadline, |acc, at| if at < acc { at } else { acc });
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
