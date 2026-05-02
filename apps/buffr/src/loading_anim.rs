@@ -16,14 +16,14 @@ const FRAME_COUNT: usize = 8;
 ///   row 1 – blank separator
 ///   row 2 – "buffr" wordmark (centred inside FRAME_COLS cols by padding)
 pub const FRAMES: &[&str] = &[
-    "·  ·  ·  ·  ·  ·  ·\n \n      buffr      ",
-    "◉  ·  ·  ·  ·  ·  ·\n \n      buffr      ",
-    "·  ◉  ·  ·  ·  ·  ·\n \n      buffr      ",
-    "·  ·  ◉  ·  ·  ·  ·\n \n      buffr      ",
-    "·  ·  ·  ◉  ·  ·  ·\n \n      buffr      ",
-    "·  ·  ·  ·  ◉  ·  ·\n \n      buffr      ",
-    "·  ·  ·  ·  ·  ◉  ·\n \n      buffr      ",
-    "·  ·  ·  ·  ·  ·  ◉\n \n      buffr      ",
+    ".  .  .  .  .  .  .\n \n      buffr      ",
+    "*  .  .  .  .  .  .\n \n      buffr      ",
+    ".  *  .  .  .  .  .\n \n      buffr      ",
+    ".  .  *  .  .  .  .\n \n      buffr      ",
+    ".  .  .  *  .  .  .\n \n      buffr      ",
+    ".  .  .  .  *  .  .\n \n      buffr      ",
+    ".  .  .  .  .  *  .\n \n      buffr      ",
+    ".  .  .  .  .  .  *\n \n      buffr      ",
 ];
 
 /// Total number of animation frames.

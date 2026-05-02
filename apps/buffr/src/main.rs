@@ -606,33 +606,25 @@ fn main() -> Result<()> {
 
     // -------- HiDPI scale: forward to CEF before initialize ----------
     //
-    // Chromium has no Linux DPI autodetect (Wayland per-output scale,
-    // X11 Xft.dpi) — the `--force-device-scale-factor` switch is the
-    // only knob that affects every renderer in the process. winit
-    // 0.30's `primary_monitor()` moved to `ActiveEventLoop` so it's
-    // not queryable pre-init; instead we read environment variables
-    // most Linux desktops already export. Precedence:
+    // `--force-device-scale-factor` is passed here as a fallback for
+    // CEF renderer subprocesses that initialize before any winit window
+    // exists. The live scale is applied properly via
+    // `BrowserHost::set_device_scale` once the window is created, using
+    // `window.scale_factor()` (Wayland per-output, Win32 per-monitor DPI,
+    // macOS NSScreen.backingScaleFactor).
     //
-    //   1. `BUFFR_SCALE` — explicit override
-    //   2. `GDK_SCALE`   — set by GTK / many DE startup scripts
-    //
-    // Fractional scales (1.25, 1.5) need manual `BUFFR_SCALE=1.5`.
-    // Windows + macOS use their OS DPI APIs directly and ignore
-    // this static.
+    // Only `BUFFR_SCALE` is honoured here — it is an explicit user override
+    // for debugging / fractional-scale testing. `GDK_SCALE` is dropped:
+    // winit already reads the OS APIs that subsume it.
     #[cfg(target_os = "linux")]
     {
         let scale = std::env::var("BUFFR_SCALE")
             .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .or_else(|| {
-                std::env::var("GDK_SCALE")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-            });
+            .and_then(|v| v.parse::<f32>().ok());
         if let Some(scale) = scale
             && (scale - 1.0).abs() > 0.01
         {
-            debug!(scale, "forwarding device scale factor to CEF");
+            debug!(scale, "forwarding BUFFR_SCALE device scale factor to CEF");
             buffr_core::set_device_scale_factor(scale);
         }
     }
@@ -2026,6 +2018,16 @@ impl AppState {
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
     }
 
+    /// Current device scale factor. Reads winit's `scale_factor()` when the
+    /// window exists; falls back to 1.0. Used to convert physical mouse
+    /// coordinates to logical DIPs before forwarding to CEF OSR.
+    fn current_scale(&self) -> f32 {
+        self.window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0)
+    }
+
     fn dispatch_action(&mut self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
         // Adjacent-tab opens require both a host call and a &mut self call
@@ -2610,7 +2612,11 @@ impl AppState {
         }
         if let Some(host) = self.host.as_ref() {
             let mods = winit_mods_to_cef(&self.modifiers);
-            let (bx, by) = self.osr_cursor;
+            // osr_cursor is physical; CEF OSR takes DIPs.
+            let (phys_bx, phys_by) = self.osr_cursor;
+            let mom_scale = self.current_scale();
+            let bx = ((phys_bx as f32) / mom_scale).round() as i32;
+            let by = ((phys_by as f32) / mom_scale).round() as i32;
             tracing::trace!(dx, dy, "input: wheel_momentum -> CEF");
             host.osr_mouse_wheel(bx, by, dx, dy, mods);
         }
@@ -2630,12 +2636,26 @@ impl AppState {
             Some((w, h)) => (w.max(1), h.max(1)),
             None => (inner.width.max(1), inner.height.max(1)),
         };
+        // Logical (DIP) dimensions for chrome layout. The chrome CPU buffer
+        // is sized at logical pixels and GPU-stretched to physical by the
+        // bilinear sampler. At integer scales (1×, 2×) the chrome bitmap-font
+        // glyphs sample at exact pixel boundaries, producing crisp text.
+        let scale = window.scale_factor() as f32;
+        let lwidth = ((width as f32) / scale).round() as u32;
+        let lheight = ((height as f32) / scale).round() as u32;
+        let lwidth = lwidth.max(1);
+        let lheight = lheight.max(1);
 
         // Precompute geometry before the renderer call — helpers need `&self`.
-        let tab_y = self.tab_strip_y(height);
+        // Use logical dims for chrome layout so strip heights are in DIPs.
+        let tab_y = self.tab_strip_y(lheight);
         let notice_y = self.download_notice_y();
         let current_notice = peek_download_notice(&self.download_notice_queue);
+        // OSR browser rect uses physical dims (CEF paints physical) for dst_rect.
         let (_, browser_y, browser_w, browser_h) = self.cef_child_rect(width, height);
+        // Logical browser rect for the loading animation (painted into chrome buffer).
+        let (_, l_browser_y, l_browser_w, l_browser_h) =
+            self.cef_child_rect_logical(lwidth, lheight);
 
         // Acquire the latest OSR pixels by swapping our scratch buffer
         // with the SharedOsrFrame's pixel Vec. Lock duration is the cost
@@ -2666,6 +2686,9 @@ impl AppState {
         // Resize bumps chrome_generation via the caller's resize event;
         // the renderer itself tracks whether it needs to reallocate.
         renderer.resize(width, height);
+        // Update the logical chrome dims so the chrome texture is sized at
+        // DIP resolution and GPU-stretched to physical by the bilinear sampler.
+        renderer.set_logical_size(lwidth, lheight);
 
         let chrome_dirty = self.chrome_generation != self.last_painted_chrome_gen;
 
@@ -2717,6 +2740,7 @@ impl AppState {
         let res = if want_anim {
             // Animation path: paint animation into chrome buffer at the browser
             // rect region (opaque), then composite chrome alone (osr: None).
+            // Chrome buffer is logical-sized; use l_browser_* for the animation.
             new_osr_generation = self.last_osr_generation;
             renderer.frame(
                 chrome_dirty_effective,
@@ -2724,7 +2748,7 @@ impl AppState {
                     paint_chrome_strips(
                         buf,
                         w,
-                        height,
+                        lheight,
                         &statusline,
                         &tab_strip,
                         tab_y,
@@ -2740,7 +2764,7 @@ impl AppState {
                         buf,
                         w,
                         h,
-                        (0, browser_y, browser_w, browser_h),
+                        (0, l_browser_y, l_browser_w, l_browser_h),
                         anim_frame as usize,
                         anim_fg,
                         anim_bg,
@@ -2750,10 +2774,8 @@ impl AppState {
             )
         } else if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
             new_osr_generation = osr_gen;
-            // dst_rect uses the live browser rect (not min'd against the
-            // stale OSR dims). The renderer GPU-stretches the OSR texture
-            // to fill it, so when CEF's buffer lags the window resize the
-            // stale frame visually scales up instead of letterboxing.
+            // dst_rect uses the live physical browser rect. The renderer GPU-
+            // stretches the OSR texture to fill it.
             let osr_upload = crate::render::OsrUpload {
                 pixels: &self.osr_scratch,
                 width: osr_w,
@@ -2767,7 +2789,7 @@ impl AppState {
                     paint_chrome_strips(
                         buf,
                         w,
-                        height,
+                        lheight,
                         &statusline,
                         &tab_strip,
                         tab_y,
@@ -2788,7 +2810,7 @@ impl AppState {
                     paint_chrome_strips(
                         buf,
                         w,
-                        height,
+                        lheight,
                         &statusline,
                         &tab_strip,
                         tab_y,
@@ -2840,6 +2862,17 @@ impl AppState {
         }
     }
 
+    /// Scale logical-pixel chrome heights to physical pixels using the
+    /// current device scale factor.
+    fn chrome_heights_physical(&self) -> (u32, u32, u32) {
+        let s = self.current_scale();
+        let scale_up = |h: u32| ((h as f32) * s).round() as u32;
+        let status_h = scale_up(STATUSLINE_HEIGHT);
+        let tab_h = scale_up(TAB_STRIP_HEIGHT);
+        let notice_h = scale_up(DOWNLOAD_NOTICE_HEIGHT);
+        (status_h, tab_h, notice_h)
+    }
+
     /// Compute the CEF page rect for the current overlay state.
     ///
     /// Vertical layout (top → bottom):
@@ -2848,7 +2881,33 @@ impl AppState {
     /// 2. Tab strip (always, `TAB_STRIP_HEIGHT` px)
     /// 3. CEF page area  ← confirm/permissions/omnibar popups float over this
     /// 4. Statusline (always, `STATUSLINE_HEIGHT` px)
+    ///
+    /// `full_w` and `full_h` must be **physical** pixels. Chrome heights are
+    /// scaled up from their logical-pixel constants before the layout is
+    /// computed, so the returned rect is also in physical pixels.
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
+        let (phys_status_h, phys_tab_h, phys_notice_h_max) = self.chrome_heights_physical();
+        let status_h = phys_status_h.min(full_h);
+        let remaining_after_status = full_h.saturating_sub(status_h);
+        let tab_h = phys_tab_h.min(remaining_after_status);
+        let remaining_after_tabs = remaining_after_status.saturating_sub(tab_h);
+        let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
+            phys_notice_h_max.min(remaining_after_tabs)
+        } else {
+            0
+        };
+        let remaining_after_notice = remaining_after_tabs.saturating_sub(notice_h);
+        let cef_w = full_w.max(1);
+        let cef_h = remaining_after_notice.max(1);
+        let cef_y = notice_h + tab_h;
+        (0, cef_y, cef_w, cef_h)
+    }
+
+    /// Same layout as [`Self::cef_child_rect`] but operates in **logical**
+    /// (DIP) space. `full_w` and `full_h` must be logical pixels. Uses the
+    /// unscaled constants directly. Used for chrome-painter geometry, which
+    /// works in logical pixels.
+    fn cef_child_rect_logical(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
         let status_h = STATUSLINE_HEIGHT.min(full_h);
         let remaining_after_status = full_h.saturating_sub(status_h);
         let tab_h = TAB_STRIP_HEIGHT.min(remaining_after_status);
@@ -2873,17 +2932,35 @@ impl AppState {
     /// Hit-test the current cursor position against the tab strip.
     /// Returns the index of the tab under the cursor, or `None` if the
     /// cursor isn't in the strip or the tab list is empty.
+    ///
+    /// `osr_cursor` is stored in physical pixels (browser-region-relative).
+    /// We convert to logical (DIP) space for the hit test because the tab
+    /// strip geometry constants (`TAB_STRIP_HEIGHT`, `PINNED_TAB_WIDTH`,
+    /// etc.) are all expressed in logical pixels.
     fn hit_test_tab_strip(&self) -> Option<usize> {
         let window = self.window.as_ref()?;
         let size = window.inner_size();
-        let full_w = size.width.max(1);
-        let full_h = size.height.max(1);
-        let tab_y = self.tab_strip_y(full_h);
+        let phys_full_w = size.width.max(1);
+        let phys_full_h = size.height.max(1);
+        let scale = self.current_scale();
+
+        // Convert physical window dims to logical for geometry constants.
+        let log_full_w = ((phys_full_w as f32) / scale).round() as u32;
+        let log_full_h = ((phys_full_h as f32) / scale).round() as u32;
+
+        // cef_y in physical px (after the fix, cef_child_rect returns physical).
+        let (_, phys_cef_y, _, _) = self.cef_child_rect(phys_full_w, phys_full_h);
+        // Absolute physical y of the cursor.
+        let phys_abs_y = (self.osr_cursor.1 + phys_cef_y as i32).max(0) as u32;
+
+        // Convert cursor to logical for comparison against logical constants.
+        let log_wx = ((self.osr_cursor.0 as f32) / scale).round() as u32;
+        let log_wy = ((phys_abs_y as f32) / scale).round() as u32;
+
+        let tab_y = self.tab_strip_y(log_full_h);
         let tab_y_end = tab_y + TAB_STRIP_HEIGHT;
-        let (_, cef_y, _, _) = self.cef_child_rect(full_w, full_h);
-        let wx = self.osr_cursor.0 as u32;
-        let wy = (self.osr_cursor.1 + cef_y as i32).max(0) as u32;
-        if wy < tab_y || wy >= tab_y_end || self.tab_ids.is_empty() {
+
+        if log_wy < tab_y || log_wy >= tab_y_end || self.tab_ids.is_empty() {
             return None;
         }
         // Mirror the layout in `TabStrip::paint`: pinned tabs occupy
@@ -2894,17 +2971,17 @@ impl AppState {
         let unpinned_count = total_count.saturating_sub(pinned_count);
         let pinned_total_w = pinned_count * buffr_ui::tab_strip::PINNED_TAB_WIDTH;
         let gutter_total = (total_count + 1) * GUTTER;
-        let avail_for_unpinned = full_w
+        let avail_for_unpinned = log_full_w
             .saturating_sub(pinned_total_w)
             .saturating_sub(gutter_total);
         let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
         let unpinned_w = raw_w.clamp(buffr_ui::MIN_TAB_WIDTH, buffr_ui::MAX_TAB_WIDTH);
 
-        if wx < GUTTER {
+        if log_wx < GUTTER {
             return None;
         }
         // Walk the pills left-to-right and pick the one whose rect
-        // contains `wx`.
+        // contains `log_wx`.
         let mut x = GUTTER;
         for (i, tab) in self.tab_strip.tabs.iter().enumerate() {
             let pill_w = if tab.pinned {
@@ -2913,7 +2990,7 @@ impl AppState {
                 unpinned_w
             };
             let right = x + pill_w;
-            if wx >= x && wx < right {
+            if log_wx >= x && log_wx < right {
                 return Some(i);
             }
             x = right + GUTTER;
@@ -2921,6 +2998,8 @@ impl AppState {
         None
     }
 
+    /// Top pixel row of the tab strip in **logical** (DIP) space.
+    /// `full_h` must be a logical height. Used by the chrome painter.
     fn tab_strip_y(&self, full_h: u32) -> u32 {
         let notice_h = if buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0 {
             DOWNLOAD_NOTICE_HEIGHT
@@ -4066,10 +4145,15 @@ impl AppState {
                     return;
                 };
                 let bar_h = STATUSLINE_HEIGHT as i32;
-                let bx = position.x as i32;
+                let phys_bx = position.x as i32;
                 // Cursor y relative to the content area (below address bar).
-                let by = (position.y as i32).saturating_sub(bar_h);
-                popup.cursor = (bx, by);
+                let phys_by = (position.y as i32).saturating_sub(bar_h);
+                // Store physical coords for any chrome hit-tests.
+                popup.cursor = (phys_bx, phys_by);
+                // CEF OSR consumes DIPs.
+                let pop_scale = popup.window.scale_factor() as f32;
+                let bx = ((phys_bx as f32) / pop_scale).round() as i32;
+                let by = ((phys_by as f32) / pop_scale).round() as i32;
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
@@ -4112,10 +4196,14 @@ impl AppState {
                     popup.last_click_at = now;
                     popup.last_click_button = Some(cef_button);
                 }
-                let (bx, by) = popup.cursor;
+                let (phys_bx, phys_by) = popup.cursor;
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 let click_count = popup.click_count;
-                let in_content = by >= 0;
+                let in_content = phys_by >= 0;
+                // CEF OSR consumes DIPs.
+                let pop_click_scale = popup.window.scale_factor() as f32;
+                let bx = ((phys_bx as f32) / pop_click_scale).round() as i32;
+                let by = ((phys_by as f32) / pop_click_scale).round() as i32;
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -4167,9 +4255,13 @@ impl AppState {
                 let Some(popup) = self.popups.get(&window_id) else {
                     return;
                 };
-                let (bx, by) = popup.cursor;
+                let (phys_bx, phys_by) = popup.cursor;
                 let mods = winit_mods_to_cef(&popup.modifiers);
                 let (dx, dy, _is_pixel) = winit_wheel_to_cef_delta(&delta);
+                // CEF OSR consumes DIPs.
+                let pop_wheel_scale = popup.window.scale_factor() as f32;
+                let bx = ((phys_bx as f32) / pop_wheel_scale).round() as i32;
+                let by = ((phys_by as f32) / pop_wheel_scale).round() as i32;
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -4787,6 +4879,20 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     .unwrap_or(60);
                 host.set_frame_rate(display_hz);
                 tracing::debug!(display_hz, "OSR frame rate set");
+                // Apply the OS-reported scale factor from winit now that the
+                // window exists. BUFFR_SCALE (if set) overrides the OS value
+                // as a debugging knob.
+                let os_scale = window.scale_factor() as f32;
+                let effective_scale = std::env::var("BUFFR_SCALE")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(os_scale);
+                host.set_device_scale(effective_scale);
+                tracing::debug!(
+                    os_scale,
+                    effective_scale,
+                    "initial device scale applied to host",
+                );
                 self.host = Some(host);
             }
             Err(err) => {
@@ -4914,6 +5020,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 debug!(scale_factor, "winit: ScaleFactorChanged");
+                if let Some(host) = self.host.as_ref() {
+                    // BUFFR_SCALE override wins if set; otherwise use winit's value.
+                    let s = std::env::var("BUFFR_SCALE")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(scale_factor as f32);
+                    host.set_device_scale(s);
+                }
+                // Force a chrome repaint so the chrome layer re-rasterizes.
+                self.mark_chrome_dirty();
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -4934,7 +5053,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(host) = self.host.as_ref() {
                     // Convert from window coords to browser-region coords.
-                    // The browser region starts at `cef_y` (below the chrome strips).
+                    // osr_cursor tracks physical pixels for chrome hit-tests.
+                    // CEF OSR consumes DIPs (logical pixels), so we divide by
+                    // scale before forwarding to the CEF mouse methods.
                     let size = self
                         .window
                         .as_ref()
@@ -4942,9 +5063,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or_default();
                     let (_cx, cef_y, _cw, _ch) =
                         self.cef_child_rect(size.width.max(1), size.height.max(1));
-                    let bx = position.x as i32;
-                    let by = (position.y as i32).saturating_sub(cef_y as i32);
-                    self.osr_cursor = (bx, by);
+                    // Physical coords for chrome hit-tests.
+                    let phys_bx = position.x as i32;
+                    let phys_by = (position.y as i32).saturating_sub(cef_y as i32);
+                    self.osr_cursor = (phys_bx, phys_by);
+                    // Logical (DIP) coords for CEF.
+                    let scale = self.current_scale();
+                    let bx = ((phys_bx as f32) / scale).round() as i32;
+                    let by = ((phys_by as f32) / scale).round() as i32;
                     let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     host.osr_mouse_move(bx, by, mods);
 
@@ -5183,7 +5309,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                     }
                     let mods = winit_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
-                    let (bx, by) = self.osr_cursor;
+                    // osr_cursor is in physical pixels; CEF OSR takes DIPs.
+                    let (phys_bx, phys_by) = self.osr_cursor;
+                    let click_scale = self.current_scale();
+                    let bx = ((phys_bx as f32) / click_scale).round() as i32;
+                    let by = ((phys_by as f32) / click_scale).round() as i32;
                     host.osr_mouse_click(bx, by, cef_button, mouse_up, self.osr_click_count, mods);
                 }
                 if enter_visual {
@@ -5240,7 +5370,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     self.osr_wheel_last_at = None;
                 }
                 let mods = winit_mods_to_cef(&self.modifiers);
-                let (bx, by) = self.osr_cursor;
+                // osr_cursor is physical; CEF OSR takes DIPs.
+                let (phys_bx, phys_by) = self.osr_cursor;
+                let wheel_scale = self.current_scale();
+                let bx = ((phys_bx as f32) / wheel_scale).round() as i32;
+                let by = ((phys_by as f32) / wheel_scale).round() as i32;
                 tracing::trace!(dx, dy, bx, by, "input: mouse_wheel -> CEF");
                 host.osr_mouse_wheel(bx, by, dx, dy, mods);
             }

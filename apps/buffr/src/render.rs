@@ -208,7 +208,8 @@ pub struct Renderer {
     /// Linear-filter sampler — used for both OSR and chrome textures.
     /// OSR benefits from bilinear during transient resize stretch (softens
     /// the stale-frame upscale so the fresh-frame transition isn't a pop);
-    /// chrome is always 1:1 with the window, so bilinear is a no-op there.
+    /// chrome at logical size bilinear-stretches to physical — at integer
+    /// scales glyph pixel boundaries align exactly and the result is crisp.
     sampler_linear: wgpu::Sampler,
 
     /// OSR texture + state.
@@ -216,17 +217,24 @@ pub struct Renderer {
     /// Uniform buffer for the OSR quad rect. Written before each draw.
     osr_uniform_buf: wgpu::Buffer,
 
-    /// Chrome texture — window-sized.
+    /// Chrome texture — logical-pixel sized (physical / scale, rounded).
+    /// The chrome quad NDC rect is always fullscreen (-1..+1), so the GPU
+    /// bilinear-stretches the logical texture to fill the physical surface.
     chrome_texture: wgpu::Texture,
     chrome_view: wgpu::TextureView,
     chrome_bind_group: wgpu::BindGroup,
     /// Uniform buffer for the chrome quad (always fullscreen).
     chrome_uniform_buf: wgpu::Buffer,
-    /// CPU-side chrome buffer.
+    /// CPU-side chrome buffer — sized at logical (chrome_lw × chrome_lh).
     chrome_cpu: Vec<u32>,
 
+    /// Physical surface width/height (wgpu swap-chain size).
     width: u32,
     height: u32,
+    /// Logical chrome width/height (physical / scale, rounded up to ≥1).
+    /// The chrome texture and CPU buffer are allocated at this size.
+    chrome_lw: u32,
+    chrome_lh: u32,
 }
 
 impl Renderer {
@@ -419,7 +427,14 @@ impl Renderer {
         let osr_uniform_buf = make_uniform_buf(&device, "buffr-osr-uni");
         let chrome_uniform_buf = make_uniform_buf(&device, "buffr-chrome-uni");
 
-        let (chrome_texture, chrome_view) = make_texture(&device, width, height, surface_format);
+        // Chrome starts at physical size (scale = 1.0 until the window reports
+        // its monitor's DPI via set_logical_size). The GPU quad is always
+        // fullscreen NDC, so if logical == physical the stretch is 1:1.
+        let chrome_lw = width;
+        let chrome_lh = height;
+
+        let (chrome_texture, chrome_view) =
+            make_texture(&device, chrome_lw, chrome_lh, surface_format);
         let chrome_bind_group = make_bind_group(
             &device,
             &bind_group_layout,
@@ -431,7 +446,7 @@ impl Renderer {
         // Write the chrome uniform once — it is always a fullscreen quad.
         write_fullscreen_uniform(&queue, &chrome_uniform_buf);
 
-        let chrome_cpu = vec![0u32; (width * height) as usize];
+        let chrome_cpu = vec![0u32; (chrome_lw * chrome_lh) as usize];
 
         Ok(Self {
             surface,
@@ -452,10 +467,12 @@ impl Renderer {
             chrome_cpu,
             width,
             height,
+            chrome_lw,
+            chrome_lh,
         })
     }
 
-    /// Reconfigure the surface + chrome texture for the new window size.
+    /// Reconfigure the surface + chrome texture for the new physical window size.
     /// Idempotent when dims are unchanged.
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == self.width && h == self.height {
@@ -473,7 +490,42 @@ impl Renderer {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        let (texture, view) = make_texture(&self.device, w, h, self.surface_format);
+        // Keep chrome logical size proportional: scale it to the same ratio
+        // as the physical resize (covers startup before set_logical_size is called).
+        // The caller should call set_logical_size separately when the scale changes.
+        self.reallocate_chrome();
+    }
+
+    /// Update the logical chrome dimensions (physical / scale, rounded).
+    ///
+    /// Called whenever the window scale factor changes so the chrome CPU buffer
+    /// and texture are sized at logical pixels; the GPU bilinear-stretches the
+    /// smaller texture to fill the physical surface. Idempotent when unchanged.
+    pub fn set_logical_size(&mut self, lw: u32, lh: u32) {
+        let lw = lw.max(1);
+        let lh = lh.max(1);
+        if lw == self.chrome_lw && lh == self.chrome_lh {
+            return;
+        }
+        tracing::debug!(
+            old_lw = self.chrome_lw,
+            old_lh = self.chrome_lh,
+            new_lw = lw,
+            new_lh = lh,
+            "renderer.set_logical_size"
+        );
+        self.chrome_lw = lw;
+        self.chrome_lh = lh;
+        self.reallocate_chrome();
+    }
+
+    fn reallocate_chrome(&mut self) {
+        let (texture, view) = make_texture(
+            &self.device,
+            self.chrome_lw,
+            self.chrome_lh,
+            self.surface_format,
+        );
         self.chrome_bind_group = make_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -483,7 +535,8 @@ impl Renderer {
         );
         self.chrome_texture = texture;
         self.chrome_view = view;
-        self.chrome_cpu.resize((w * h) as usize, 0u32);
+        self.chrome_cpu
+            .resize((self.chrome_lw * self.chrome_lh) as usize, 0u32);
     }
 
     /// Composite one frame.
@@ -507,11 +560,13 @@ impl Renderer {
     where
         F: FnOnce(&mut [u32], usize, usize),
     {
-        let w = self.width as usize;
-        let h = self.height as usize;
+        let w = self.chrome_lw as usize;
+        let h = self.chrome_lh as usize;
         let t0 = std::time::Instant::now();
 
-        // Chrome paint + upload.
+        // Chrome paint + upload at logical (DIP) size.
+        // The chrome quad NDC is always fullscreen; the GPU bilinear-stretches
+        // the logical texture to fill the physical surface.
         if chrome_dirty {
             // Zero the buffer first so previous chrome state doesn't bleed
             // into rows that are now transparent (e.g. after CEF rect shrinks).
@@ -528,12 +583,12 @@ impl Renderer {
                 bytes,
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * self.width),
-                    rows_per_image: Some(self.height),
+                    bytes_per_row: Some(4 * self.chrome_lw),
+                    rows_per_image: Some(self.chrome_lh),
                 },
                 wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
+                    width: self.chrome_lw,
+                    height: self.chrome_lh,
                     depth_or_array_layers: 1,
                 },
             );
