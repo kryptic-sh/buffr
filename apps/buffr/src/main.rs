@@ -2843,6 +2843,15 @@ impl AppState {
         // only activates before the very first paint or during a size mismatch.
         let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h);
 
+        // Detect the animation→OSR transition. While the animation was
+        // active, the chrome buffer had OPAQUE animation pixels painted
+        // into the browser region (the chrome quad composites on top of
+        // OSR — see render::frame). When we transition to a non-anim
+        // path with chrome_dirty=false, the renderer skips the chrome
+        // upload, so the chrome texture keeps its last-uploaded state
+        // (with the animation pixels) and occludes the OSR. Force a
+        // chrome repaint THIS frame to clear the browser region.
+        let anim_just_deactivated = self.loading_anim_active && !want_anim;
         if want_anim != self.loading_anim_active {
             if want_anim {
                 tracing::debug!(
@@ -2869,7 +2878,8 @@ impl AppState {
 
         // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
-        let chrome_dirty_effective = chrome_dirty || want_anim;
+        let chrome_dirty_effective =
+            should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated);
         let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
         let res = match paint_path {
             PaintPath::Animation => {
@@ -2921,7 +2931,7 @@ impl AppState {
                     dst_rect: (0, browser_y, browser_w, browser_h),
                 };
                 renderer.frame(
-                    chrome_dirty,
+                    chrome_dirty_effective,
                     |buf, w, _h| {
                         paint_chrome_strips(
                             buf,
@@ -2964,7 +2974,7 @@ impl AppState {
                     dst_rect: (0, browser_y, browser_w, browser_h),
                 };
                 renderer.frame(
-                    chrome_dirty,
+                    chrome_dirty_effective,
                     |buf, w, _h| {
                         paint_chrome_strips(
                             buf,
@@ -2988,7 +2998,7 @@ impl AppState {
                 // CEF emits on_paint, but keeps the compiler happy).
                 new_osr_generation = self.last_osr_generation;
                 renderer.frame(
-                    chrome_dirty,
+                    chrome_dirty_effective,
                     |buf, w, _h| {
                         paint_chrome_strips(
                             buf,
@@ -6606,6 +6616,27 @@ fn is_osr_frame_fresh(
         && frame_generation != last_seen_generation
 }
 
+/// Whether the chrome buffer must be re-uploaded to the GPU this frame.
+///
+/// Three triggers:
+/// 1. Chrome state changed (URL, tab list, statusline, etc).
+/// 2. Animation is currently active — every tick advances the frame.
+/// 3. Animation just deactivated — the chrome texture still holds
+///    opaque animation pixels in the browser region from the last
+///    paint, and the chrome quad composites OVER the OSR quad. If we
+///    don't re-upload a fresh chrome buffer (with the browser region
+///    transparent), the animation's last frame occludes the live OSR
+///    content. Manifests as "animation stops moving but page never
+///    appears" until something else triggers a chrome repaint
+///    (scroll, tab switch, key press).
+fn should_force_chrome_repaint(
+    chrome_dirty: bool,
+    want_anim: bool,
+    anim_just_deactivated: bool,
+) -> bool {
+    chrome_dirty || want_anim || anim_just_deactivated
+}
+
 /// Decide whether the loading animation should overlay the page region.
 ///
 /// The animation is shown when CEF has not painted at the current
@@ -6840,6 +6871,53 @@ mod tests {
             !is_osr_frame_fresh(old_w, old_h, old_len, 2, 1, new_w, new_h),
             "stale-dim paint must be rejected"
         );
+    }
+
+    // ---- chrome repaint trigger -----------------------------------------
+    //
+    // The animation paints opaque pixels into the chrome buffer's browser
+    // region; chrome composites OVER OSR. Without forcing a chrome
+    // repaint on the animation→OSR transition, the chrome texture keeps
+    // the leftover animation pixels and occludes OSR — visible to the
+    // user as "animation stops moving but page never replaces it" until
+    // a scroll/tab-switch/key-press triggers a chrome repaint.
+
+    #[test]
+    fn chrome_repaint_when_chrome_state_dirty() {
+        // Standard case: URL changed, statusline updated, etc.
+        assert!(should_force_chrome_repaint(true, false, false));
+    }
+
+    #[test]
+    fn chrome_repaint_during_animation() {
+        // Each animation tick is a new frame; the chrome buffer needs
+        // re-upload regardless of chrome_dirty.
+        assert!(should_force_chrome_repaint(false, true, false));
+    }
+
+    #[test]
+    fn chrome_repaint_on_animation_deactivation() {
+        // The bug: animation just turned off, chrome buffer still has
+        // opaque animation pixels in browser region. MUST repaint to
+        // clear them before the next OSR composite, otherwise the
+        // animation's last frame occludes the page.
+        assert!(should_force_chrome_repaint(false, false, true));
+    }
+
+    #[test]
+    fn chrome_no_repaint_when_idle_and_steady() {
+        // Steady state: chrome unchanged, no animation, no transition.
+        // Renderer can dedupe the upload.
+        assert!(!should_force_chrome_repaint(false, false, false));
+    }
+
+    #[test]
+    fn chrome_repaint_combinations() {
+        // All non-(false,false,false) inputs trigger repaint.
+        assert!(should_force_chrome_repaint(true, true, false));
+        assert!(should_force_chrome_repaint(true, false, true));
+        assert!(should_force_chrome_repaint(false, true, true));
+        assert!(should_force_chrome_repaint(true, true, true));
     }
 
     #[test]
