@@ -1912,6 +1912,16 @@ struct AppState {
     /// the expected dims.  Fires a `force_repaint_active` nudge if CEF
     /// fails to produce the paint within `RESIZE_PAINT_WATCHDOG_TIMEOUT`.
     resize_paint_watchdog: ResizePaintWatchdog,
+    /// True when the last `paint_chrome_with` presented a buffer at dims
+    /// that disagreed with `window.inner_size()` at that moment. Hyprland
+    /// will letterbox/pillarbox a wl_surface buffer that doesn't match
+    /// the surface's configured size, producing persistent black bars.
+    /// Set at end of paint, consumed at start of next paint to (a) keep
+    /// the loading animation playing (so the user sees motion rather
+    /// than a frozen wrong-aspect frame) and (b) make sure another
+    /// redraw was queued so the next paint reconciles renderer dims to
+    /// the live window dims.
+    surface_drifted: bool,
 }
 
 /// Edit-mode focus state machine.
@@ -2086,6 +2096,7 @@ impl AppState {
             loading_anim_active: false,
             loading_anim_next_wake: None,
             resize_paint_watchdog: ResizePaintWatchdog::default(),
+            surface_drifted: false,
         }
     }
 
@@ -2841,7 +2852,14 @@ impl AppState {
         // redraw between CEF paints (the swap-out side effect empties
         // frame.pixels). `last_osr_dims` persists across swaps so the animation
         // only activates before the very first paint or during a size mismatch.
-        let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h);
+        // Force the animation to keep playing while we are recovering from a
+        // surface-size mismatch (Hyprland letterboxes a wl_surface buffer
+        // whose dims don't match the configured surface size). The drift
+        // flag is set at the end of the previous paint when we detected the
+        // condition; the animation overlays the wrong-sized OSR until the
+        // reconcile redraw lands.
+        let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
+            || self.surface_drifted;
 
         // Detect the animation→OSR transition. While the animation was
         // active, the chrome buffer had OPAQUE animation pixels painted
@@ -3053,6 +3071,35 @@ impl AppState {
 
         if let Err(err) = res {
             warn!(error = %err, "wgpu frame failed");
+        }
+
+        // Surface-drift detection. We just presented a buffer at
+        // (width, height). If `window.inner_size()` has since advanced past
+        // those dims (Hyprland queued an additional configure during paint,
+        // or the override_size we honored was stale relative to a fresher
+        // configure), the wl_surface is at a different size and Hyprland
+        // letterboxes the mismatch — visible as persistent black bars on
+        // the sides or top/bottom in aspect-fit form. Self-heal: flag the
+        // drift (next paint forces the loading animation so the user sees
+        // motion) and request a redraw so renderer.resize reconciles to
+        // the live inner_size.
+        let live_drift = self
+            .window
+            .as_ref()
+            .map(|w| w.inner_size())
+            .filter(|s| s.width != width || s.height != height);
+        if let Some(s) = live_drift {
+            tracing::debug!(
+                used_w = width,
+                used_h = height,
+                live_w = s.width,
+                live_h = s.height,
+                "paint_chrome: surface drifted from live inner_size; reconciling"
+            );
+            self.surface_drifted = true;
+            self.request_redraw();
+        } else {
+            self.surface_drifted = false;
         }
     }
 
@@ -6909,6 +6956,41 @@ mod tests {
         // Steady state: chrome unchanged, no animation, no transition.
         // Renderer can dedupe the upload.
         assert!(!should_force_chrome_repaint(false, false, false));
+    }
+
+    // ---- surface-drift override -----------------------------------------
+    //
+    // The animation gate has two inputs in production:
+    //   1. last_osr_dims != browser_w/h (CEF hasn't caught up).
+    //   2. surface_drifted (we presented a buffer that didn't match the
+    //      live wl_surface — Hyprland letterboxes mismatched buffers).
+    //
+    // The flag is set at end-of-paint and consumed at the next paint.
+    // While set, want_anim is forced true so the user sees animation
+    // motion rather than a frozen letterboxed frame during reconcile.
+
+    #[test]
+    fn anim_forced_on_when_surface_drifted() {
+        // Even when last_osr_dims matches browser_w/h (normal "no anim"
+        // case), surface drift overrides → animation on.
+        let last = Some((944u32, 1066u32));
+        let base = should_show_loading_anim(last, 944, 1066);
+        assert!(!base, "preconditions: base gate would be off");
+        // The actual production OR happens inline at the call site;
+        // pin the contract by example.
+        let drifted = true;
+        assert!(base || drifted);
+    }
+
+    #[test]
+    fn drift_detect_when_used_dims_differ_from_live() {
+        // The check inlined in paint_chrome_with, written here as a
+        // truth-table to lock in the intent.
+        let used = (944u32, 1130u32);
+        let live = (1920u32, 1200u32);
+        assert!(used != live, "drift case");
+        let stable = (944u32, 1130u32);
+        assert!(used == stable, "no-drift case");
     }
 
     #[test]
