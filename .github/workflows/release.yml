@@ -343,6 +343,16 @@ jobs:
           # outside the manifest dir, so copy it in.
           cp pkg/buffr.png flatpak/sh.kryptic.buffr.png
 
+      - name: Stage desktop entry
+        run: |
+          # The unified .desktop source is `pkg/buffr.desktop`. Flatpak
+          # AppStream rules require the .desktop filename + AppStream id
+          # to match (`sh.kryptic.buffr`), and the icon name inside the
+          # flatpak sandbox is the prefixed form. Rename + rewrite Icon=
+          # in one step here so the canonical file stays single-source.
+          sed 's|^Icon=buffr$|Icon=sh.kryptic.buffr|' \
+            pkg/buffr.desktop > flatpak/sh.kryptic.buffr.desktop
+
       - name: Build flatpak bundle
         run: |
           set -euo pipefail

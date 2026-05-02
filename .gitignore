@@ -30,6 +30,7 @@ target/
 /flatpak/buffr-*.flatpak
 /flatpak/buffr-*.flatpak.sha256
 /flatpak/sh.kryptic.buffr.png
+/flatpak/sh.kryptic.buffr.desktop
 /flatpak/.flatpak-builder
 
 # Snap build state.

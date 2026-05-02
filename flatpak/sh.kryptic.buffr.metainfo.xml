@@ -9,7 +9,7 @@
   <id>sh.kryptic.buffr</id>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
-  <name>buffr</name>
+  <name>Buffr</name>
   <summary>Vim-inspired browser. Native, GPU-accelerated.</summary>
   <description>
     <p>

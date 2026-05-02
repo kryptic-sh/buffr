@@ -1,9 +1,12 @@
 [Desktop Entry]
-Name=buffr
-Comment=Vim-inspired browser
+Name=Buffr
+GenericName=Web Browser
+Comment=Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
 Exec=buffr %U
 Icon=buffr
 Type=Application
-Categories=Network;WebBrowser;
-MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+Terminal=false
+StartupNotify=true
 StartupWMClass=buffr
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
