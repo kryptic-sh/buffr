@@ -8,6 +8,14 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-03
+
+### Changed
+
+- Dropped `publish-stub` job from release workflow. `buffr` on crates.io
+  stays at 0.1.28 as a permanent pointer to GitHub releases; no need to
+  bump it on every umbrella tag.
+
 ## [0.2.0] - 2026-05-03
 
 ### Added
@@ -465,7 +473,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.0
 [0.1.28]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.28
 [0.1.27]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.27
