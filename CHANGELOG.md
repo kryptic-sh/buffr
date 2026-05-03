@@ -17,6 +17,290 @@ and this project adheres to
 - CLI smoke tests: `--version` returns `CARGO_PKG_VERSION`, long-form help
   contains the embedded art block and the version string.
 
+## [0.1.28] - 2026-05-03
+
+### Added
+
+- **Loading animation across all main-frame navigations.** Plays the buffr ASCII
+  anim during reload + every navigation gap until the first contentful CEF frame
+  commits, driven by a new `BrowserHost::is_loading()` flag set on
+  `LoadHandler::on_load_start` and cleared by `OsrPaintHandler::on_paint`.
+
+### Fixed
+
+- **Ctrl+V hang in CEF input fields.** Reading the system clipboard on the main
+  thread self-deadlocked: `hjkl-clipboard`'s Wayland `offer.receive` blocks on a
+  pipe whose `wl_data_source.send` callback runs on CEF's UI thread (= main
+  thread). Ctrl+V intercept now reads on a worker thread and posts the result
+  back via `EventLoopProxy` as a `ClipboardPasteText` user event, then injects
+  via `execCommand('insertText', ...)`.
+- **Letterbox / "two sizes behind" CEF paint after rapid resize.** OSR frames
+  now carry a `needs_fresh` flag, set by `osr_resize` and cleared only on
+  successful main-frame paint. The freshness gate now requires a post-resize
+  paint before re-presenting the OSR buffer, preventing persisted stale dims
+  from sticking after a resize burst.
+- **Stale-size swapchain texture acquired during rapid resize.** `render.rs`
+  drops textures whose dims don't match the current surface, reconfigures, and
+  retries up to 2× before skipping the frame.
+- **Image clipboard paste no longer spams "MIME type not supported".** Ctrl+V
+  intercept falls through to CEF when the clipboard isn't text. Image paste is
+  still unsupported in OSR (tracked in #19).
+
+### Changed
+
+- `hjkl-clipboard` 0.3 → 0.4 (Wayland data-control protocol, multi-MIME reads).
+  Subsequent bump to 0.4.8 picks up Wayland thread respawn fix.
+- Workspace `Cargo.toml` routes all `buffr-*` path overrides through
+  `[patch.crates-io]` so consumers without the submodule init get crates.io
+  versions automatically — matches the pattern used in hjkl.
+- `apps/buffr` no longer depends on `hjkl-clipboard` directly; clipboard reads
+  go through the new opaque `buffr_core::ClipboardReader::read_text()`.
+
+## [0.1.27] - 2026-05-03
+
+### Fixed
+
+- Surface-size drift on rapid resize self-heals: the wgpu surface now
+  reconfigures when its cached dims diverge from the window's current size.
+- `single_instance` test module compiles clean on Windows (`dead_code` allow for
+  `socket_path`) and Linux clippy.
+
+## [0.1.26] - 2026-05-03
+
+### Added
+
+- **Single-instance launching with URL forwarding.** A second `buffr <url>`
+  invocation forwards the URL to the existing process via Unix socket / Windows
+  named pipe and exits. The running window opens the URL in a new tab. Disabled
+  by passing `--no-single-instance`.
+- **Per-monitor HiDPI scaling.** Live device-scale plumbing: scale changes (drag
+  between displays, fractional scaling toggle) propagate to CEF via
+  `RenderHandler::screen_info` without restart.
+- **ASCII-only loading frames** rendered when the CEF buffer is unusable
+  (initial paint, between navigations, surface-drift recovery).
+- Bilinear favicon scaling in the tab strip (replaces nearest-neighbour).
+
+### Fixed
+
+- **Resize flicker / stale CEF paints rejected.** Generation-based OSR freshness
+  gate; CEF paints at stale dims are dropped instead of presented. Watchdog
+  forces a repaint when CEF skips a post-resize paint.
+- Resize debounce recomputes target dims at flush so terminal sizes settle to
+  the most recent window size, not an intermediate one.
+- `resync_cef_rect` now routes through `osr_resize` so the freshness gate fires
+  on programmatic resizes (not just user drags).
+- Forced chrome repaint when the loading animation deactivates so the modeline /
+  tab strip doesn't render against a stale frame.
+- Unified `.desktop` file under `pkg/buffr.desktop` (was duplicated).
+
+### Changed
+
+- `/vendor` tree gitignored entirely.
+
+## [0.1.25] - 2026-05-02
+
+### Added
+
+- ASCII loading animation when the CEF buffer is unusable.
+
+## [0.1.24] - 2026-05-01
+
+### Added
+
+- Use the buffr.kryptic.sh website icon in the desktop entry.
+
+## [0.1.23] - 2026-05-01
+
+### Added
+
+- AUR `buffr-bin` runtime tarball now bundles the `.desktop` entry and icon so
+  `pacman -S buffr-bin` produces a launcher in the application menu.
+
+## [0.1.22] - 2026-05-01
+
+### Fixed
+
+- AUR auto-publish: ssh options injected via `GIT_SSH_COMMAND` env var
+  (previously dropped by the wrapper).
+
+## [0.1.21] - 2026-05-01
+
+### Fixed
+
+- AUR auto-publish: `accept-new` host-key policy so the first push from a fresh
+  runner doesn't fail on missing `known_hosts`.
+
+## [0.1.20] - 2026-05-01
+
+### Fixed
+
+- AUR auto-publish: corrected `su` option ordering so `makepkg` actually runs as
+  the build user.
+
+## [0.1.19] - 2026-05-01
+
+### Fixed
+
+- AUR auto-publish: provision build user, ship `LICENSE` + `.gitignore`,
+  obfuscate maintainer email in PKGBUILD per AUR convention.
+
+## [0.1.18] - 2026-05-01
+
+### Fixed
+
+- **Linux release binaries find their own libcef.** `RUNPATH=$ORIGIN` baked into
+  the binary at link time, so the runtime tarball works without setting
+  `LD_LIBRARY_PATH`.
+
+## [0.1.17] - 2026-04-30
+
+### Added
+
+- **AUR auto-publish on release.** `buffr-bin` PKGBUILD bumps and pushes to the
+  AUR on every `v*` tag.
+
+## [0.1.16] - 2026-04-30
+
+### Fixed
+
+- Release: extract tarball with `--strip-components` for the Flatpak + Snap
+  bundle steps.
+
+## [0.1.15] - 2026-04-30
+
+### Added
+
+- **Flatpak + Snap bundles** ship on every release alongside the existing
+  `.deb`, `.rpm`, `.tar.gz`, `.dmg`, `.msi` artifacts.
+
+## [0.1.14] - 2026-04-30
+
+### Removed
+
+- **Intel Mac (`x86_64-apple-darwin`) release leg.** GitHub Actions `macos-13`
+  runner pool is heavily contended (1–2 hour queue times blocking the publish
+  pipeline). Apple stopped selling Intel Macs in 2023; the cost wasn't paying
+  for the user count. Source still builds clean against `x86_64-apple-darwin`,
+  the support is just absent from the release pipeline.
+
+## [0.1.13] - 2026-04-30
+
+### Added
+
+- Linux release emits a portable `.tar.gz` of the runtime tree alongside the
+  `.deb` / `.rpm` packages.
+
+## [0.1.12] - 2026-04-30
+
+### Added
+
+- **Expanded release matrix:** Linux aarch64, Windows arm64, and (briefly,
+  reverted in 0.1.14) Intel Mac binaries.
+
+## [0.1.11] - 2026-04-30
+
+### Added
+
+- Linux release now produces a `.rpm` package (Fedora / RHEL / openSUSE).
+
+## [0.1.10] - 2026-04-30
+
+### Removed
+
+- AppImage build. The `.deb` + `.tar.gz` outputs cover the same ground without
+  the AppImage runtime overhead.
+
+## [0.1.9] - 2026-04-30
+
+### Changed
+
+- **Windows now uses OSR rendering**, matching Linux and macOS. Brings
+  cross-platform parity for the wgpu compositor + overlay UI; the previous
+  Windows-only windowed-CEF path is gone.
+
+## [0.1.8] - 2026-04-30
+
+### Added
+
+- **Linux HiDPI scale forwarded to CEF** via env vars at child-process spawn
+  (`GDK_SCALE`, etc), so fractional scaling on Wayland renders pages at the
+  right DPR instead of CEF's default 1.0.
+- Auto-publish the `buffr` crates.io stub from the release pipeline once all
+  platform artifacts upload.
+
+### Changed
+
+- `apps/buffr-stub/target` no longer tracked in the build artifact gitignore.
+
+## [0.1.7] - 2026-04-30
+
+### Fixed
+
+- **macOS DMG preserves the executable bit** on `Contents/MacOS/buffr`.
+  Previously dropped by the staging step, leaving the `.app` non-runnable.
+
+## [0.1.6] - 2026-04-30
+
+### Fixed
+
+- Windows MSI: suppress ICE64 alongside ICE38/ICE91 in `light.exe` for the
+  per-user install.
+
+## [0.1.5] - 2026-04-30
+
+### Fixed
+
+- Windows MSI: suppress ICE38/ICE91 in `light.exe` so the per-user install
+  validates.
+
+## [0.1.4] - 2026-04-30
+
+### Fixed
+
+- **Windows MSI bundles the full CEF runtime** (libcef, paks, locales) via
+  `heat.exe`. Previously the MSI was missing libcef and refused to launch.
+
+## [0.1.3] - 2026-04-30
+
+### Fixed
+
+- **Windows MSI is now per-user** (no UAC prompt) — `cargo install`-style
+  no-admin install on Windows.
+
+## [0.1.2] - 2026-04-30
+
+### Added
+
+- **Per-tab favicons** rendered in the tab strip via CEF `download_image`.
+- **Native cursor forwarding.** CEF cursor changes (text, pointer, resize, …)
+  now propagate to winit on the main window and popup windows.
+- **Live find highlight** with 300ms debounce — search results highlight as you
+  type, not just on enter.
+- **Per-mode chrome theming** via HSL hue rotation off a single accent colour
+  (`--accent`). `[theme] accent = "#7aa2f7"` drives modeline, selection, hint
+  chips, and prompt cursor.
+- `[general] show_favicons` config toggle (default `on`).
+
+### Fixed
+
+- **Hint mode keeps matched hints bright** while dimming non-matches; the typed
+  prefix is struck through on the matching hint chip.
+- Favicon list iterates raw `cef_string_list_t` instead of cloning (clone
+  produced an empty list on the cef-rs 147 binding).
+- macOS CEF init uses `external_message_pump` and a dev keychain workaround for
+  codesigning identity discovery.
+
+### Changed
+
+- **Workspace crates extracted into standalone submodule repos** (matches the
+  hjkl pattern). `[patch.crates-io]` overrides used for local dev; fresh
+  checkouts without submodule init resolve against crates.io.
+- Buffr is now an install-instructions stub on crates.io (`apps/buffr-stub`);
+  the real binary at `apps/buffr` was renamed to `buffr-bin` to dodge the
+  package-name collision. The produced binary is still `target/<profile>/buffr`.
+- hjkl-\* deps caret-pinned (no longer exact-version pinned).
+- Submodule checkouts in CI are now recursive.
+
 ## [0.1.1] - 2026-04-29
 
 ### Added
