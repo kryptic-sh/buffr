@@ -2253,16 +2253,6 @@ impl AppState {
                 self.refresh_title();
                 self.request_redraw();
             }
-            A::Reload | A::ReloadHard => {
-                host.dispatch(action);
-                // Reset the OSR-dims gate so `should_show_loading_anim`
-                // returns true until CEF commits a fresh on_paint for
-                // the reloaded document. Without this the stale frame
-                // sits on screen during the network roundtrip with no
-                // visible feedback.
-                self.last_osr_dims = None;
-                self.request_redraw();
-            }
             _ => host.dispatch(action),
         }
     }
@@ -2868,8 +2858,10 @@ impl AppState {
         // flag is set at the end of the previous paint when we detected the
         // condition; the animation overlays the wrong-sized OSR until the
         // reconcile redraw lands.
+        let host_is_loading = self.host.as_ref().map(|h| h.is_loading()).unwrap_or(false);
         let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
-            || self.surface_drifted;
+            || self.surface_drifted
+            || host_is_loading;
 
         // Detect the animation→OSR transition. While the animation was
         // active, the chrome buffer had OPAQUE animation pixels painted
