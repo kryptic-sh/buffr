@@ -6,6 +6,13 @@ All notable changes to `buffr-modal` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-04-30
+
+### Changed
+
+- `hjkl-engine` and `hjkl-buffer` deps relaxed from exact-pin to caret `0.1` so
+  consumers pick up patch fixes without a buffr-modal re-publish.
+
 ## [0.1.1] — 2026-04-30
 
 ### Changed
@@ -15,5 +22,6 @@ All notable changes to `buffr-modal` are documented here. Format follows
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-modal/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-modal/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.1
