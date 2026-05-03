@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use directories::UserDirs;
+use hjkl_config::AppConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -38,6 +38,11 @@ pub use search::{InputKind, classify_input, resolve_input};
 pub use watcher::{ConfigWatcher, watch};
 
 /// Top-level config.
+///
+/// Implements [`hjkl_config::AppConfig`] (`APPLICATION = "buffr"`) so the
+/// loader resolves paths through `hjkl-config`'s XDG-everywhere
+/// resolver — same `~/.config/buffr/config.toml` on Linux, macOS, and
+/// Windows.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -53,6 +58,10 @@ pub struct Config {
     pub accessibility: AccessibilityConfig,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
+}
+
+impl AppConfig for Config {
+    const APPLICATION: &'static str = "buffr";
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -403,10 +412,8 @@ pub fn resolve_default_dir(cfg: &DownloadsConfig) -> PathBuf {
     if let Some(p) = cfg.default_dir.as_ref() {
         return p.clone();
     }
-    if let Some(dirs) = UserDirs::new()
-        && let Some(d) = dirs.download_dir()
-    {
-        return d.to_path_buf();
+    if let Some(d) = dirs::download_dir() {
+        return d;
     }
     // `$HOME/Downloads` fallback. `home_dir()` is deprecated on stable
     // for cross-platform reasons but we only need a best-effort

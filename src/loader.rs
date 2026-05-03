@@ -1,8 +1,12 @@
 //! Disk loader: XDG path resolution + parse + span-aware error mapping.
+//!
+//! Path resolution routes through [`hjkl_config::config_path`], which
+//! produces XDG-everywhere paths (`~/.config/buffr/config.toml` on
+//! Linux, macOS, and Windows; `$XDG_CONFIG_HOME` honored on every
+//! platform). Parsing + error mapping stay buffr-local because buffr's
+//! `ConfigError::Validate` variant has no equivalent in `hjkl-config`.
 
 use std::path::{Path, PathBuf};
-
-use directories::ProjectDirs;
 
 use crate::{Config, ConfigError, locate};
 
@@ -15,17 +19,14 @@ pub enum ConfigSource {
     Defaults,
 }
 
-/// Resolve the default `config.toml` path via `directories::ProjectDirs`.
+/// Resolve the default `config.toml` path via [`hjkl_config::config_path`].
 ///
-/// - Linux: `$XDG_CONFIG_HOME/buffr/config.toml` (or `~/.config/buffr/...`).
-/// - macOS: `~/Library/Application Support/buffr/config.toml`.
-/// - Windows: `%APPDATA%\buffr\config.toml`.
-///
-/// Returns `None` if the platform doesn't expose a home dir at all
-/// (effectively only sandboxed test environments).
+/// XDG-everywhere — same `~/.config/buffr/config.toml` on Linux, macOS,
+/// and Windows. `$XDG_CONFIG_HOME` is honored on every platform. Returns
+/// `None` if the platform doesn't expose a home dir at all (effectively
+/// only sandboxed test environments).
 pub fn default_config_path() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("sh", "kryptic", "buffr")?;
-    Some(dirs.config_dir().join("config.toml"))
+    hjkl_config::config_path::<Config>().ok()
 }
 
 /// Load + parse the user's `config.toml` from the default XDG path.
