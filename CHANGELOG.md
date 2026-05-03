@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `buffr --help` now renders an ASCII-art banner (figlet "ANSI Regular" font)
+  with the package version inline. Banner lives in `apps/buffr/src/art.txt`,
+  embedded via `include_str!`. Regenerate with
+  `figlet -f "ANSI Regular" buffr > apps/buffr/src/art.txt`.
+- CLI smoke tests: `--version` returns `CARGO_PKG_VERSION`, long-form help
+  contains the embedded art block and the version string.
+
 ## [0.1.1] - 2026-04-29
 
 ### Added

@@ -177,8 +177,20 @@ struct PopupWindow {
     pending_cef_resize: Option<(u32, u32, std::time::Instant)>,
 }
 
+/// ASCII-art banner. Regenerate with:
+///
+/// ```sh
+/// figlet -f "ANSI Regular" buffr > apps/buffr/src/art.txt
+/// ```
+const LONG_ABOUT: &str = concat!(
+    "\n",
+    include_str!("art.txt"),
+    "\nGPU-accelerated CEF web browser · v",
+    env!("CARGO_PKG_VERSION"),
+);
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(name = "buffr", version, about = "GPU-accelerated CEF web browser", long_about = LONG_ABOUT)]
 struct Cli {
     /// Print resolved config (TOML) to stdout and exit.
     #[arg(long)]
@@ -6751,6 +6763,36 @@ mod tests {
     #[test]
     fn cli_help_renders() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn version_flag_returns_pkg_version() {
+        let cmd = Cli::command();
+        let version = cmd.render_version();
+        assert!(
+            version.contains(env!("CARGO_PKG_VERSION")),
+            "render_version output {version:?} missing CARGO_PKG_VERSION"
+        );
+    }
+
+    #[test]
+    fn long_help_contains_ascii_art() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            help.contains(include_str!("art.txt")),
+            "long_help missing embedded art.txt block; got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn long_help_contains_pkg_version() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            help.contains(env!("CARGO_PKG_VERSION")),
+            "long_help missing CARGO_PKG_VERSION; got:\n{help}"
+        );
     }
 
     #[test]
