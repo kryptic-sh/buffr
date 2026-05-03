@@ -91,6 +91,14 @@ cargo run
 See [`docs/dev.md`](docs/dev.md) for full prerequisites, platform matrix, and
 CEF path overrides.
 
+## Known limitations
+
+- **Image / multimedia clipboard paste is unsupported.** Ctrl+V text paste
+  works, but pasting images or other non-text clipboard content into web pages
+  is a no-op. This is a CEF off-screen-rendering (OSR) limitation, not specific
+  to buffr's implementation. Tracked in
+  [#19](https://github.com/kryptic-sh/buffr/issues/19).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

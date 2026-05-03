@@ -4038,11 +4038,7 @@ impl AppState {
             {
                 let proxy = self.event_proxy.clone();
                 std::thread::spawn(move || {
-                    use hjkl_clipboard::{MimeType, Selection};
-                    let text = match cb.get(Selection::Clipboard, MimeType::Text) {
-                        Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
-                        Err(_) => None,
-                    };
+                    let text = cb.read_text();
                     let _ = proxy.send_event(BuffrUserEvent::ClipboardPasteText(text));
                 });
                 return true;
