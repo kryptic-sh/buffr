@@ -4007,35 +4007,16 @@ impl AppState {
                 return true;
             }
 
-            // Ctrl+V paste: CEF on Wayland can't read the system
-            // clipboard itself, so we read via hjkl-clipboard and inject
-            // the text into the focused element via execCommand. Done
-            // here in edit_mode (not overlay/page) because the focused
-            // element model is CEF's, not ours.
-            //
-            // If the clipboard isn't text (image, files, empty), fall
-            // through to CEF so Chromium's native paste handles
-            // image-into-contenteditable, image-into-file-input, etc.
-            if lower == 'v' && !self.modifiers.shift_key() {
-                if let Some(host) = self.host.as_ref()
-                    && let Some(text) = host.clipboard_text()
-                    && !text.is_empty()
-                {
-                    let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
-                    let js = format!(
-                        "(function(){{var t={};\
-                         var el=document.activeElement;\
-                         if(!el)return;\
-                         try{{document.execCommand('insertText',false,t);}}\
-                         catch(e){{}}\
-                         }})();",
-                        json
-                    );
-                    host.run_js(&js);
-                    return true;
-                }
-                return false;
-            }
+            // Ctrl+V paste: let CEF/Chromium handle it natively via
+            // Chromium's ui::Clipboard. Earlier buffr intercepted this
+            // and injected text via hjkl-clipboard + execCommand, which
+            // self-deadlocked when Chromium owned the clipboard:
+            // hjkl-clipboard's `offer.receive` blocks the main thread
+            // waiting on the pipe, but the wl_data_source.send callback
+            // that would write to that pipe runs on CEF's UI thread —
+            // which IS our main thread. Falling through to CEF avoids
+            // the deadlock and lets Chromium handle text, images, and
+            // file inputs uniformly.
         }
 
         // Forward every other key directly to CEF. The page handles it
