@@ -315,7 +315,8 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "buffr-modal",
- "directories",
+ "dirs",
+ "hjkl-config",
  "notify",
  "serde",
  "tempfile",
@@ -1055,6 +1056,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1612,6 +1622,18 @@ checksum = "739de1b764fd1997230832922ca2b1f2d8efa3e196f3a99c59c552e2e4aa44c0"
 dependencies = [
  "libc",
  "miniz_oxide",
+]
+
+[[package]]
+name = "hjkl-config"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8d05b075482f17725d969c2d86f54e278fdd29f004d3f3d81723cc0be005a91"
+dependencies = [
+ "dirs",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
