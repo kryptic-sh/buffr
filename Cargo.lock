@@ -1606,9 +1606,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-clipboard"
-version = "0.4.7"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0663a6921fd85d997936e03dfd9934b4b412cb21221c3d327f944e1833313720"
+checksum = "739de1b764fd1997230832922ca2b1f2d8efa3e196f3a99c59c552e2e4aa44c0"
 dependencies = [
  "libc",
  "miniz_oxide",
