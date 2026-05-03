@@ -447,3 +447,34 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   `=0.0.39` — adds `Query::dirty_gen` for cache invalidation on the syntax query
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
+
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.1.28...HEAD
+[0.1.28]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.28
+[0.1.27]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.27
+[0.1.26]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.26
+[0.1.25]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.25
+[0.1.24]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.24
+[0.1.23]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.23
+[0.1.22]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.22
+[0.1.21]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.21
+[0.1.20]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.20
+[0.1.19]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.19
+[0.1.18]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.18
+[0.1.17]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.17
+[0.1.16]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.16
+[0.1.15]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.15
+[0.1.14]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.14
+[0.1.13]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.13
+[0.1.12]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.12
+[0.1.11]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.11
+[0.1.10]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.10
+[0.1.9]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.9
+[0.1.8]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.8
+[0.1.7]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.7
+[0.1.6]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.6
+[0.1.5]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.5
+[0.1.4]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.4
+[0.1.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.3
+[0.1.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.2
+[0.1.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.1
+[0.1.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.0
