@@ -4009,6 +4009,10 @@ impl AppState {
             // the text into the focused element via execCommand. Done
             // here in edit_mode (not overlay/page) because the focused
             // element model is CEF's, not ours.
+            //
+            // If the clipboard isn't text (image, files, empty), fall
+            // through to CEF so Chromium's native paste handles
+            // image-into-contenteditable, image-into-file-input, etc.
             if lower == 'v' && !self.modifiers.shift_key() {
                 if let Some(host) = self.host.as_ref()
                     && let Some(text) = host.clipboard_text()
@@ -4025,8 +4029,9 @@ impl AppState {
                         json
                     );
                     host.run_js(&js);
+                    return true;
                 }
-                return true;
+                return false;
             }
         }
 
