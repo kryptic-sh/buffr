@@ -2804,6 +2804,7 @@ impl AppState {
                     self.last_osr_generation,
                     expected_w,
                     expected_h,
+                    frame.needs_fresh,
                 );
                 if fresh {
                     // Record dims before the swap (while guard is held).
@@ -4234,6 +4235,7 @@ impl AppState {
                 popup.last_osr_generation,
                 pop_expected_w,
                 pop_expected_h,
+                frame.needs_fresh,
             );
             if fresh {
                 popup.last_osr_dims = Some((frame.width, frame.height));
@@ -6652,6 +6654,7 @@ fn cef_child_rect_pure(
 ///     gate flipped back to true because old dims != new browser_w/h,
 ///     and CEF's coalesced second invalidate sometimes failed to
 ///     produce a follow-up on_paint.
+#[allow(clippy::too_many_arguments)]
 fn is_osr_frame_fresh(
     frame_w: u32,
     frame_h: u32,
@@ -6660,9 +6663,11 @@ fn is_osr_frame_fresh(
     last_seen_generation: u64,
     expected_w: u32,
     expected_h: u32,
+    needs_fresh: bool,
 ) -> bool {
     let expected_len = (frame_w as usize) * (frame_h as usize) * 4;
-    frame_w > 0
+    !needs_fresh
+        && frame_w > 0
         && frame_h > 0
         && frame_w == expected_w
         && frame_h == expected_h
@@ -6844,15 +6849,15 @@ mod tests {
         // First on_paint: generation has advanced from 0 (init) to 1,
         // dims are set, length matches, expected matches. Swap.
         let len = 1920 * 1086 * 4;
-        assert!(is_osr_frame_fresh(1920, 1086, len, 1, 0, 1920, 1086));
+        assert!(is_osr_frame_fresh(1920, 1086, len, 1, 0, 1920, 1086, false));
     }
 
     #[test]
     fn osr_frame_not_fresh_when_zero_dims() {
         // Pre-first-paint: dims are 0, no swap.
-        assert!(!is_osr_frame_fresh(0, 0, 0, 0, 0, 0, 0));
-        assert!(!is_osr_frame_fresh(1920, 0, 0, 1, 0, 1920, 0));
-        assert!(!is_osr_frame_fresh(0, 1086, 0, 1, 0, 0, 1086));
+        assert!(!is_osr_frame_fresh(0, 0, 0, 0, 0, 0, 0, false));
+        assert!(!is_osr_frame_fresh(1920, 0, 0, 1, 0, 1920, 0, false));
+        assert!(!is_osr_frame_fresh(0, 1086, 0, 1, 0, 0, 1086, false));
     }
 
     #[test]
@@ -6871,9 +6876,10 @@ mod tests {
             1,
             1920,
             1086,
+            false,
         ));
         // Trivially-empty case (just-swapped, on_paint not yet fired):
-        assert!(!is_osr_frame_fresh(1920, 1086, 0, 2, 1, 1920, 1086));
+        assert!(!is_osr_frame_fresh(1920, 1086, 0, 2, 1, 1920, 1086, false));
         // Sanity: matching length is the fresh signal.
         assert!(is_osr_frame_fresh(
             1920,
@@ -6883,6 +6889,7 @@ mod tests {
             1,
             1920,
             1086,
+            false,
         ));
     }
 
@@ -6893,7 +6900,9 @@ mod tests {
         // pixels back into scratch. The cached scratch already holds
         // this generation's data; trust it.
         let len = 1920 * 1086 * 4;
-        assert!(!is_osr_frame_fresh(1920, 1086, len, 5, 5, 1920, 1086));
+        assert!(!is_osr_frame_fresh(
+            1920, 1086, len, 5, 5, 1920, 1086, false
+        ));
     }
 
     #[test]
@@ -6901,8 +6910,10 @@ mod tests {
         // Page animation between paints at stable dims — pure happy
         // path. Generation advances each on_paint.
         let len = 1920 * 1086 * 4;
-        assert!(is_osr_frame_fresh(1920, 1086, len, 6, 5, 1920, 1086));
-        assert!(is_osr_frame_fresh(1920, 1086, len, 100, 5, 1920, 1086));
+        assert!(is_osr_frame_fresh(1920, 1086, len, 6, 5, 1920, 1086, false));
+        assert!(is_osr_frame_fresh(
+            1920, 1086, len, 100, 5, 1920, 1086, false
+        ));
     }
 
     #[test]
@@ -6922,8 +6933,33 @@ mod tests {
         let old_len = (old_w as usize) * (old_h as usize) * 4;
         // frame at OLD dims; expected dims are NEW (osr_view post-resize).
         assert!(
-            !is_osr_frame_fresh(old_w, old_h, old_len, 2, 1, new_w, new_h),
+            !is_osr_frame_fresh(old_w, old_h, old_len, 2, 1, new_w, new_h, false),
             "stale-dim paint must be rejected"
+        );
+    }
+
+    #[test]
+    fn osr_frame_rejects_persisted_stale_paint_on_dim_toggle() {
+        // The toggle bug. CEF emitted on_paint at A while embedder was
+        // resizing to B → gate rejected (A != B), frame.{w,h,gen} kept.
+        // User toggles back to A. osr_view = A again. Without the
+        // needs_fresh guard, the persisted A pixels would be re-accepted
+        // (frame.dims == expected, generation ok) — but that "paint" is
+        // now stale: it predates the resize, and CEF's renderer has
+        // moved on. Setting needs_fresh=true on osr_resize forces the
+        // gate to wait for an actual post-resize on_paint.
+        let w = 1920u32;
+        let h = 1086u32;
+        let len = (w as usize) * (h as usize) * 4;
+        assert!(
+            !is_osr_frame_fresh(w, h, len, 2, 1, w, h, true),
+            "needs_fresh=true must override the dims-match acceptance"
+        );
+        // And the same paint with needs_fresh=false (after on_paint
+        // clears it) is accepted normally.
+        assert!(
+            is_osr_frame_fresh(w, h, len, 2, 1, w, h, false),
+            "post-on_paint frame must be accepted"
         );
     }
 
@@ -7017,7 +7053,7 @@ mod tests {
         let new_h = 1086u32;
         let new_len = (new_w as usize) * (new_h as usize) * 4;
         assert!(is_osr_frame_fresh(
-            new_w, new_h, new_len, 3, 1, new_w, new_h,
+            new_w, new_h, new_len, 3, 1, new_w, new_h, false,
         ));
     }
 
@@ -7039,19 +7075,19 @@ mod tests {
         // Phase 1: steady at OLD dims. expected = old.
         // Paint 1: on_paint at old dims (gen 1). Swap.
         assert!(is_osr_frame_fresh(
-            old_w, old_h, old_len, 1, last_seen, old_w, old_h,
+            old_w, old_h, old_len, 1, last_seen, old_w, old_h, false,
         ));
         last_seen = 1;
 
         // Paint 2: no on_paint between; pixels.len() = 0. Skip.
         assert!(!is_osr_frame_fresh(
-            old_w, old_h, 0, 1, last_seen, old_w, old_h,
+            old_w, old_h, 0, 1, last_seen, old_w, old_h, false,
         ));
 
         // Phase 2: embedder issued osr_resize → expected = new.
         // on_paint at NEW dims fires (gen 2). Length matches.
         assert!(is_osr_frame_fresh(
-            new_w, new_h, new_len, 2, last_seen, new_w, new_h,
+            new_w, new_h, new_len, 2, last_seen, new_w, new_h, false,
         ));
         last_seen = 2;
 
@@ -7059,7 +7095,7 @@ mod tests {
         // previous scratch (old_len bytes), frame dims are new.
         // Length+generation gate rejects.
         assert!(!is_osr_frame_fresh(
-            new_w, new_h, old_len, 2, last_seen, new_w, new_h,
+            new_w, new_h, old_len, 2, last_seen, new_w, new_h, false,
         ));
     }
 
