@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-03
+
 ### Added
 
 - `buffr --help` now renders an ASCII-art banner (figlet "ANSI Regular" font)
@@ -16,6 +18,21 @@ and this project adheres to
   `figlet -f "ANSI Regular" buffr > apps/buffr/src/art.txt`.
 - CLI smoke tests: `--version` returns `CARGO_PKG_VERSION`, long-form help
   contains the embedded art block and the version string.
+
+### Changed
+
+- **XDG-everywhere paths via `hjkl-config` 0.2 (breaking on macOS/Windows).**
+  Bumps `buffr-config` 0.1.1 → 0.2.0 and `buffr-core` 0.2.0 → 0.3.0. Eliminates
+  the macOS/Windows split-brain where `buffr-config` already wrote to
+  `~/.config/buffr/config.toml` while `buffr-core` resolved cache + data via
+  `directories::ProjectDirs` (`sh.kryptic.buffr` Bundle ID). All buffr dirs now
+  honor `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` on every
+  platform; Linux paths unchanged. macOS users move from
+  `~/Library/Application Support/buffr/` + `~/Library/Caches/sh.kryptic.buffr/`
+  to `~/.config/buffr/` + `~/.cache/buffr/`. Windows users move from
+  `%APPDATA%\buffr\` + `%LOCALAPPDATA%\kryptic\buffr\cache\` to
+  `~/.config/buffr/` + `~/.cache/buffr/`. See `crates/buffr-config/CHANGELOG.md`
+  and `crates/buffr-core/CHANGELOG.md` for per-crate detail.
 
 ## [0.1.28] - 2026-05-03
 
@@ -448,7 +465,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.1.28...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.0
 [0.1.28]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.28
 [0.1.27]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.27
 [0.1.26]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.26

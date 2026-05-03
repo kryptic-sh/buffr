@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-bin"
-version = "0.1.28"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-config"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "buffr-modal",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-core"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "buffr-config",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.1.28"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "buffr-core",
@@ -4919,7 +4919,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.28"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bzip2",
