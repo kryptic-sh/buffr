@@ -23,7 +23,7 @@ exclude = ["apps/buffr-stub"]
 default-members = ["apps/buffr"]
 
 [workspace.package]
-version = "0.1.27"
+version = "0.1.28"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -83,7 +83,7 @@ semver = { version = "1", features = ["serde"] }
 # deps from submodule Cargo.tomls (which list `buffr-modal = "0.1"`
 # etc. for their standalone CI) all resolve to the same workspace
 # member, eliminating "multiple versions of buffr_<name>" errors.
-buffr-core = "0.1"
+buffr-core = "0.2"
 buffr-modal = "0.1"
 buffr-ui = "0.1"
 buffr-config = "0.1"
