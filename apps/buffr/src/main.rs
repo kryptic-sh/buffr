@@ -2253,6 +2253,16 @@ impl AppState {
                 self.refresh_title();
                 self.request_redraw();
             }
+            A::Reload | A::ReloadHard => {
+                host.dispatch(action);
+                // Reset the OSR-dims gate so `should_show_loading_anim`
+                // returns true until CEF commits a fresh on_paint for
+                // the reloaded document. Without this the stale frame
+                // sits on screen during the network roundtrip with no
+                // visible feedback.
+                self.last_osr_dims = None;
+                self.request_redraw();
+            }
             _ => host.dispatch(action),
         }
     }
