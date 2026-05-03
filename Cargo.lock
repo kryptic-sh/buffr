@@ -281,6 +281,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "hex",
+ "hjkl-clipboard",
  "interprocess",
  "libc",
  "pollster",

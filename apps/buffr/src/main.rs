@@ -127,6 +127,14 @@ enum BuffrUserEvent {
     /// secondary `buffr` invocation forwards its args. Always focuses the
     /// main window after opening, so users see something happen.
     OpenUrls(Vec<String>),
+    /// Clipboard read completed on a worker thread (kicked off by Ctrl+V
+    /// in CEF Insert mode). Carries the text payload to inject into the
+    /// focused element via execCommand. None = read failed or empty.
+    /// Posted via EventLoopProxy so the main thread doesn't block on
+    /// the wayland data-control read (which would self-deadlock if
+    /// Chromium owns the clipboard — its wl_data_source.send callback
+    /// runs on CEF's UI thread, which is the main thread).
+    ClipboardPasteText(Option<String>),
 }
 
 /// Per-popup-window state. Owns the winit window, wgpu renderer, and the
@@ -4007,16 +4015,38 @@ impl AppState {
                 return true;
             }
 
-            // Ctrl+V paste: let CEF/Chromium handle it natively via
-            // Chromium's ui::Clipboard. Earlier buffr intercepted this
-            // and injected text via hjkl-clipboard + execCommand, which
-            // self-deadlocked when Chromium owned the clipboard:
-            // hjkl-clipboard's `offer.receive` blocks the main thread
-            // waiting on the pipe, but the wl_data_source.send callback
-            // that would write to that pipe runs on CEF's UI thread —
-            // which IS our main thread. Falling through to CEF avoids
-            // the deadlock and lets Chromium handle text, images, and
-            // file inputs uniformly.
+            // Ctrl+V paste: CEF in OSR mode has no native wayland
+            // clipboard wiring, so the renderer's paste path can't
+            // read the system selection on its own. Read it ourselves
+            // via hjkl-clipboard and inject the text into the focused
+            // element via execCommand.
+            //
+            // Done on a worker thread to avoid the self-deadlock when
+            // Chromium owns the clipboard: hjkl-clipboard's wayland
+            // `offer.receive` blocks the calling thread on a pipe, but
+            // the matching wl_data_source.send callback runs on CEF's
+            // UI thread (= the main thread). If we read on the main
+            // thread, we'd block the very thread that needs to write
+            // the pipe, hanging the app until SIGKILL. The worker
+            // thread parks; the main thread keeps pumping CEF, the
+            // pipe is served, and the result is posted back via
+            // EventLoopProxy as `ClipboardPasteText`.
+            if lower == 'v'
+                && !self.modifiers.shift_key()
+                && let Some(host) = self.host.as_ref()
+                && let Some(cb) = host.clipboard_handle()
+            {
+                let proxy = self.event_proxy.clone();
+                std::thread::spawn(move || {
+                    use hjkl_clipboard::{MimeType, Selection};
+                    let text = match cb.get(Selection::Clipboard, MimeType::Text) {
+                        Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+                        Err(_) => None,
+                    };
+                    let _ = proxy.send_event(BuffrUserEvent::ClipboardPasteText(text));
+                });
+                return true;
+            }
         }
 
         // Forward every other key directly to CEF. The page handles it
@@ -5034,6 +5064,26 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     window.set_visible(true);
                     window.focus_window();
                 }
+            }
+            BuffrUserEvent::ClipboardPasteText(text) => {
+                let Some(text) = text else { return };
+                if text.is_empty() {
+                    return;
+                }
+                let Some(host) = self.host.as_ref() else {
+                    return;
+                };
+                let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+                let js = format!(
+                    "(function(){{var t={};\
+                     var el=document.activeElement;\
+                     if(!el)return;\
+                     try{{document.execCommand('insertText',false,t);}}\
+                     catch(e){{}}\
+                     }})();",
+                    json
+                );
+                host.run_js(&js);
             }
         }
     }
