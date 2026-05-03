@@ -662,34 +662,72 @@ impl Renderer {
         let t_osr = t0.elapsed();
 
         // Acquire the swapchain texture.
-        let frame = match self.surface.get_current_texture() {
-            Ok(f) => {
-                let actual = (f.texture.width(), f.texture.height());
-                if actual != (self.width, self.height) {
-                    tracing::warn!(
-                        config_w = self.width,
-                        config_h = self.height,
-                        actual_w = actual.0,
-                        actual_h = actual.1,
-                        "wgpu surface: acquired texture size differs from configured"
-                    );
+        //
+        // After a `surface.configure(new_size)` the swapchain still has
+        // pre-allocated buffers at the previous size queued for present;
+        // the next `get_current_texture()` may hand one back. If we
+        // render into it and present, Hyprland (and other Wayland
+        // compositors) letterboxes the mismatched buffer against the
+        // newly-configured surface — visible as persistent black bars
+        // that "lag one resize behind" because every subsequent acquire
+        // also returns the previous-size buffer until the pipeline
+        // drains. Reconfigure + retry once to flush the stale chain.
+        let frame = {
+            let mut tex = self.surface.get_current_texture();
+            for retry in 0..2 {
+                match tex {
+                    Ok(ref f) => {
+                        let actual = (f.texture.width(), f.texture.height());
+                        if actual == (self.width, self.height) {
+                            break;
+                        }
+                        tracing::debug!(
+                            config_w = self.width,
+                            config_h = self.height,
+                            actual_w = actual.0,
+                            actual_h = actual.1,
+                            retry,
+                            "wgpu surface: stale-size swapchain texture, reconfigure + retry"
+                        );
+                        // Drop the stale texture before reconfigure so
+                        // the swapchain can rebuild without a live
+                        // reference outstanding.
+                        drop(tex);
+                        self.surface.configure(&self.device, &self.config);
+                        tex = self.surface.get_current_texture();
+                    }
+                    Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                        tracing::debug!(retry, "wgpu surface: outdated/lost, reconfigure + retry");
+                        self.surface.configure(&self.device, &self.config);
+                        tex = self.surface.get_current_texture();
+                    }
+                    Err(wgpu::SurfaceError::Timeout) => {
+                        tracing::warn!(
+                            "wgpu surface: get_current_texture timed out, skipping frame"
+                        );
+                        return Ok(());
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => {
+                        return Err(anyhow::anyhow!("wgpu surface OOM"));
+                    }
                 }
-                f
             }
-            Err(wgpu::SurfaceError::Timeout) => {
-                tracing::warn!("wgpu surface: get_current_texture timed out, skipping frame");
-                return Ok(());
-            }
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                tracing::warn!("wgpu surface: outdated/lost, reconfigure + retry");
-                self.surface.configure(&self.device, &self.config);
-                match self.surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(_) => return Ok(()),
+            match tex {
+                Ok(f) => {
+                    let actual = (f.texture.width(), f.texture.height());
+                    if actual != (self.width, self.height) {
+                        tracing::warn!(
+                            config_w = self.width,
+                            config_h = self.height,
+                            actual_w = actual.0,
+                            actual_h = actual.1,
+                            "wgpu surface: still mismatched after retry — skipping frame"
+                        );
+                        return Ok(());
+                    }
+                    f
                 }
-            }
-            Err(e @ wgpu::SurfaceError::OutOfMemory) => {
-                return Err(anyhow::anyhow!("wgpu surface OOM: {e:?}"));
+                Err(_) => return Ok(()),
             }
         };
 
