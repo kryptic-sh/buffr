@@ -6,6 +6,8 @@ All notable changes to `buffr-config` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-03
+
 ### Changed
 
 - **Path resolution migrated to `hjkl-config` 0.2 (XDG-everywhere).**
@@ -24,7 +26,8 @@ All notable changes to `buffr-config` are documented here. Format follows
   `directories::UserDirs::download_dir()` — same XDG resolution, fewer dep
   variants in the lock.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.2.0
 
 ## [0.1.1] — 2026-04-30
 
