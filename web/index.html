@@ -365,6 +365,62 @@
         border-color: #9bbcfa;
       }
 
+      /* terminal-style code block (install / from source) */
+      .terminal {
+        background: var(--panel);
+        border: 1px solid var(--border-strong);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .terminal .bar {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 10px 14px;
+        background: #0d1016;
+        border-bottom: 1px solid var(--border);
+      }
+      .terminal .bar .dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+      }
+      .terminal .bar .dot.r {
+        background: #ff5f56;
+      }
+      .terminal .bar .dot.y {
+        background: #ffbd2e;
+      }
+      .terminal .bar .dot.g {
+        background: #27c93f;
+      }
+      .terminal .bar .title {
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        color: var(--fg-muted);
+        font-family: var(--mono);
+        font-size: 12px;
+        pointer-events: none;
+      }
+      .terminal pre {
+        margin: 0;
+        padding: 14px 16px;
+        font-size: 13px;
+        line-height: 1.6;
+        overflow-x: auto;
+        color: var(--fg);
+        font-family: var(--mono);
+      }
+      .terminal pre .ok {
+        color: var(--accent);
+      }
+      .terminal pre .cm {
+        color: var(--comment);
+        font-style: italic;
+      }
+
       /* browser mock — mirrors apps/buffr layout: tab strip → page → statusline */
       .browser {
         background: var(--panel);
@@ -705,6 +761,7 @@
       </div>
       <div class="links">
         <a href="#why">why</a>
+        <a href="#install">install</a>
         <a href="/docs/">docs</a>
         <a
           href="https://github.com/kryptic-sh/buffr/blob/main/CHANGELOG.md"
@@ -843,6 +900,43 @@
             <h4>Zero telemetry</h4>
             <p>No analytics. No phone-home. Your browsing, your business.</p>
           </div>
+        </div>
+      </section>
+
+      <section id="install">
+        <h2>install</h2>
+        <h3>Prebuilt binaries on every tagged release.</h3>
+        <p style="color: var(--fg-muted); margin: 0 0 20px">
+          Linux (x86_64, aarch64) — .deb / .rpm / .tar.gz / Flatpak / Snap /
+          AUR. macOS (Apple Silicon) — .dmg. Windows (x64, arm64) — .msi.
+          SHA-256 sidecars on every artifact.
+        </p>
+        <div class="cta">
+          <a
+            class="btn primary"
+            href="https://github.com/kryptic-sh/buffr/releases/latest"
+            target="_blank"
+            rel="noopener"
+            >latest release →</a
+          >
+          <a
+            class="btn"
+            href="https://github.com/kryptic-sh/buffr/releases"
+            target="_blank"
+            rel="noopener"
+            >all releases ↗</a
+          >
+        </div>
+        <div class="terminal" style="margin-top: 20px">
+          <div class="bar">
+            <span class="dot r"></span><span class="dot y"></span
+            ><span class="dot g"></span>
+            <span class="title">buffr — from source</span>
+          </div>
+          <pre><span class="ok">$</span> git clone https://github.com/kryptic-sh/buffr
+<span class="ok">$</span> cd buffr
+<span class="ok">$</span> cargo xtask fetch-cef    <span class="cm"># vendor CEF runtime (~500 MB extracted)</span>
+<span class="ok">$</span> cargo build --release</pre>
         </div>
       </section>
     </main>
