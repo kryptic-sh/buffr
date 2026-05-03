@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7aa2f7"/>
+      <stop offset="0.6" stop-color="#bb9af7"/>
+      <stop offset="1" stop-color="#6cb4ff"/>
+    </linearGradient>
+    <radialGradient id="bg1" cx="20%" cy="0%" r="50%">
+      <stop offset="0" stop-color="#7aa2f7" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#7aa2f7" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bg2" cx="80%" cy="100%" r="60%">
+      <stop offset="0" stop-color="#bb9af7" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#bb9af7" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#0b0d10"/>
+  <rect width="1200" height="630" fill="url(#bg1)"/>
+  <rect width="1200" height="630" fill="url(#bg2)"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700">
+    <text x="80" y="150" font-size="42" fill="#7aa2f7">$ buffr<tspan fill="#7aa2f7">_</tspan></text>
+  </g>
+  <g font-family="Inter, system-ui, -apple-system, sans-serif" font-weight="700">
+    <text x="80" y="290" font-size="88" fill="#e5e9f0">Vim-inspired</text>
+    <text x="80" y="395" font-size="88" fill="url(#g)">browser.</text>
+  </g>
+  <g font-family="Inter, system-ui, -apple-system, sans-serif">
+    <text x="80" y="470" font-size="32" fill="#8b95a7" font-weight="500">Native, GPU-accelerated. Rust + CEF.</text>
+    <text x="80" y="515" font-size="32" fill="#8b95a7" font-weight="500">No Electron. No webview wrapper.</text>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" font-weight="500">
+    <rect x="80" y="560" width="100" height="36" rx="4" fill="#11141a" stroke="#7a4a2a"/>
+    <text x="130" y="585" fill="#ff9e64" text-anchor="middle">● early</text>
+    <rect x="190" y="560" width="70" height="36" rx="4" fill="#11141a" stroke="#2a3240"/>
+    <text x="225" y="585" fill="#8b95a7" text-anchor="middle">MIT</text>
+    <rect x="270" y="560" width="140" height="36" rx="4" fill="#11141a" stroke="#2a3240"/>
+    <text x="340" y="585" fill="#8b95a7" text-anchor="middle">Rust + CEF</text>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700">
+    <rect x="770" y="550" width="360" height="56" rx="8" fill="#7aa2f7"/>
+    <text x="950" y="587" font-size="26" fill="#0a142a" text-anchor="middle">→ buffr.kryptic.sh</text>
+  </g>
+</svg>

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#7aa2f7" />
+    <title>404 — buffr</title>
+    <meta name="robots" content="noindex, follow" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --fg: #e5e9f0;
+        --fg-dim: #8b95a7;
+        --accent: #7aa2f7;
+        --border: #2a3240;
+        --mono: "Hack", "JetBrains Mono", "DejaVu Sans Mono", "Liberation Mono", monospace;
+        --sans: "Hack", "JetBrains Mono", "DejaVu Sans Mono", "Liberation Mono", monospace;
+      }
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; }
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--sans);
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 2rem;
+      }
+      main { text-align: center; max-width: 520px; }
+      .code {
+        font-family: var(--mono);
+        font-size: clamp(4rem, 18vw, 9rem);
+        font-weight: 700;
+        color: var(--accent);
+        line-height: 1;
+        letter-spacing: -0.04em;
+        margin: 0;
+      }
+      h1 { font-size: 1.5rem; font-weight: 600; margin: 1rem 0 0.5rem; }
+      p { color: var(--fg-dim); margin: 0 0 2rem; line-height: 1.5; }
+      a.home {
+        display: inline-block;
+        font-family: var(--mono);
+        font-size: 0.95rem;
+        padding: 0.6rem 1rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--fg);
+        text-decoration: none;
+        transition: border-color 120ms, color 120ms;
+      }
+      a.home:hover { border-color: var(--accent); color: var(--accent); }
+      a.home::before { content: "← "; color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="code">404</p>
+      <h1>page not found</h1>
+      <p>That URL doesn't exist on buffr. Maybe a typo, maybe a moved file.</p>
+      <a class="home" href="/">back to buffr</a>
+    </main>
+  </body>
+</html>
