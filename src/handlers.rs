@@ -108,6 +108,7 @@ pub fn make_client(
     loading_busy: Arc<AtomicBool>,
     audio_sink: AudioStateSink,
     audio_queue: AudioEventQueue,
+    video_active: Arc<AtomicBool>,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -136,6 +137,7 @@ pub fn make_client(
         loading_busy,
         audio_sink,
         audio_queue,
+        video_active,
     )
 }
 
@@ -170,6 +172,7 @@ pub fn make_display_handler(
     cursor_state: SharedCursorState,
     favicon_sink: FaviconSink,
     favicon_enabled: FaviconEnabled,
+    video_active: Arc<AtomicBool>,
 ) -> DisplayHandler {
     BuffrDisplayHandler::new(
         history,
@@ -180,6 +183,7 @@ pub fn make_display_handler(
         cursor_state,
         favicon_sink,
         favicon_enabled,
+        video_active,
     )
 }
 
@@ -427,6 +431,10 @@ wrap_client! {
         loading_busy: Arc<AtomicBool>,
         audio_sink: AudioStateSink,
         audio_queue: AudioEventQueue,
+        // video_active: shared with BrowserHost. The DisplayHandler scrapes
+        // `__buffr_media__:` console-log sentinels emitted by
+        // `media_probe_poll.js` and stores the latest video flag here.
+        video_active: Arc<AtomicBool>,
     }
 
     impl Client {
@@ -462,6 +470,7 @@ wrap_client! {
                 self.cursor_state.clone(),
                 self.favicon_sink.clone(),
                 self.favicon_enabled.clone(),
+                self.video_active.clone(),
             ))
         }
 
@@ -752,6 +761,11 @@ wrap_display_handler! {
         // false, `on_favicon_urlchange` skips the download_image round-trip
         // entirely.
         favicon_enabled: FaviconEnabled,
+        // video_active: shared with `BrowserHost`. on_console_message scrapes
+        // `__buffr_media__:` sentinel lines emitted by `media_probe_poll.js`
+        // and writes the latest video flag here for the apps-layer
+        // idle-inhibit policy to consult.
+        video_active: Arc<AtomicBool>,
     }
 
     impl DisplayHandler {
@@ -940,6 +954,28 @@ wrap_display_handler! {
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, line = %text, "edit: malformed console event");
+                    }
+                }
+            }
+
+            // ---- media probe IPC ----------------------------------------
+            // media_probe_poll.js emits `__buffr_media__:{...}` lines on
+            // every transition. Flip the shared video_active atomic so the
+            // apps-layer idle-inhibit policy picks it up next tick.
+            if let Some(parsed) = crate::media_probe::parse(&text) {
+                match parsed {
+                    Ok(event) => {
+                        self.video_active
+                            .store(event.video, std::sync::atomic::Ordering::Relaxed);
+                        tracing::debug!(
+                            target: "buffr_core::media_probe",
+                            media = event.media,
+                            video = event.video,
+                            "media probe transition"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %text, "media_probe: malformed sentinel");
                     }
                 }
             }

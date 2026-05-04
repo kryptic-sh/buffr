@@ -114,4 +114,20 @@
 
     window.__buffr_media_active = active;
     window.__buffr_video_active = videoActive;
+
+    // ── IPC: emit sentinel-prefixed JSON when state changes ──────────────
+    // The Rust DisplayHandler::on_console_message scrapes the sentinel and
+    // updates BrowserHost's video_active atomic. Same console-log shape as
+    // edit.js / hint.js. Cache the last emitted payload so we only fire a
+    // line on transitions — silent pages would otherwise spam every ~2 s.
+    try {
+        var prev = window.__buffr_media_last_emit;
+        if (!prev || prev.media !== active || prev.video !== videoActive) {
+            window.__buffr_media_last_emit = { media: active, video: videoActive };
+            console.log('__buffr_media__:' + JSON.stringify({
+                media: active,
+                video: videoActive
+            }));
+        }
+    } catch (_e) {}
 })();

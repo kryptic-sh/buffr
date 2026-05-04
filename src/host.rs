@@ -271,6 +271,12 @@ pub struct BrowserHost {
     /// transition per browser. Drained by the UI thread each tick via
     /// [`Self::drain_audio_events`].
     audio_queue: AudioEventQueue,
+    /// Latest `__buffr_video_active` snapshot from the JS media probe.
+    /// Written by [`crate::handlers::BuffrDisplayHandler::on_console_message`]
+    /// when it scrapes a `__buffr_media__:` sentinel line; read by
+    /// [`Self::any_video_active`] which the apps-layer idle-inhibit policy
+    /// consults each tick.
+    video_active: Arc<AtomicBool>,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -442,6 +448,7 @@ impl BrowserHost {
             loading_busy: Arc::new(AtomicBool::new(false)),
             audio_sink: new_audio_state_sink(),
             audio_queue: new_audio_event_queue(),
+            video_active: Arc::new(AtomicBool::new(false)),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -1194,6 +1201,7 @@ impl BrowserHost {
             self.loading_busy.clone(),
             self.audio_sink.clone(),
             self.audio_queue.clone(),
+            self.video_active.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -1421,23 +1429,18 @@ impl BrowserHost {
     /// `true` when the last JS media probe reported a *video* signal active
     /// (`window.__buffr_video_active === true`).
     ///
-    /// Unlike [`Self::any_audio_active`] (which is driven by CEF's
-    /// `AudioHandler`), the video flag is purely JS-side: the probe script
-    /// writes `window.__buffr_video_active` and the console-log IPC path
-    /// (issue #22 phase-2) will eventually read it back.  For now this is a
-    /// **no-op placeholder** that always returns `false` — the idle-inhibit
-    /// policy in `apps/buffr` will call this once the IPC reader lands.
+    /// Driven by [`crate::handlers::BuffrDisplayHandler::on_console_message`]:
+    /// `media_probe_poll.js` emits a `__buffr_media__:` sentinel line on every
+    /// transition, the handler parses it via [`crate::media_probe::parse`],
+    /// and flips this atomic. Idle-inhibit policy in `apps/buffr` consults
+    /// the flag each tick.
     ///
-    /// Phase-2 implementation note: run a tiny inline JS snippet that reads
-    /// `window.__buffr_video_active` and pushes the result via a console.log
-    /// sentinel (matching the pattern used by `edit.rs` / `hint.rs`).  Wire
-    /// the parse into `drain_audio_events` or a dedicated queue.  For the
-    /// scaffold phase the no-op is intentional — video_active starts false and
-    /// the inhibitor is never acquired until the reader is filled in.
+    /// Note that the flag is process-wide — all browsers share the atomic, so
+    /// the value reflects "any tab in any browser has video". For per-tab
+    /// reporting we'd need to keep a per-browser-id map (out of scope for
+    /// the idle-inhibit use case, which already wants any-active semantics).
     pub fn any_video_active(&self) -> bool {
-        // Phase-1 stub: always false.
-        // Phase-2: read window.__buffr_video_active via console.log sentinel.
-        false
+        self.video_active.load(Ordering::Relaxed)
     }
 
     /// Drain all pending [`AudioEvent`]s that [`BuffrAudioHandler`] pushed

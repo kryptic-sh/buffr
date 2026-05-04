@@ -24,6 +24,7 @@ pub mod handlers;
 pub mod hint;
 pub mod host;
 pub mod inhibit;
+pub mod media_probe;
 pub mod new_tab;
 pub mod open_finder;
 pub mod permissions;
