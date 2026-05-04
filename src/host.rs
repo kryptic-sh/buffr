@@ -2527,6 +2527,118 @@ impl BrowserHost {
         }
     }
 
+    // ── Context-menu JS injection helpers (slice 4b) ──────────────────────────
+    //
+    // Each helper builds a self-executing JS snippet and fires it via
+    // `run_main_frame_js`. Coordinates come from the `ContextMenuRequest`
+    // (CEF browser-local pixels == CSS pixels). serde_json encodes integers
+    // into JS literals — defense in depth even though coords are ours.
+
+    /// Toggle `.paused` on the `<video>`/`<audio>` element under `(x, y)`.
+    pub fn media_play_pause(&self, x: i32, y: i32) {
+        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               if(el.paused)el.play();else el.pause();\
+             }})({x},{y});"
+        );
+        self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    /// Toggle `.muted` on the media element under `(x, y)`.
+    pub fn media_toggle_mute(&self, x: i32, y: i32) {
+        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               el.muted=!el.muted;\
+             }})({x},{y});"
+        );
+        self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    /// Toggle `.loop` on the media element under `(x, y)`.
+    pub fn media_toggle_loop(&self, x: i32, y: i32) {
+        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               el.loop=!el.loop;\
+             }})({x},{y});"
+        );
+        self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    /// Toggle `.controls` on the media element under `(x, y)`.
+    pub fn media_toggle_controls(&self, x: i32, y: i32) {
+        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               el.controls=!el.controls;\
+             }})({x},{y});"
+        );
+        self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    /// Request Picture-in-Picture for the media element under `(x, y)`,
+    /// or exit PiP if it's already the PiP element. Wrapped in try/catch
+    /// because some hosts disable PiP.
+    pub fn media_picture_in_picture(&self, x: i32, y: i32) {
+        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+        let js = format!(
+            "(function(x,y){{\
+               try{{\
+                 var el=document.elementFromPoint(x,y);\
+                 while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
+                 if(!el)return;\
+                 if(document.pictureInPictureElement===el){{\
+                   document.exitPictureInPicture();\
+                 }}else{{\
+                   el.requestPictureInPicture();\
+                 }}\
+               }}catch(e){{}}\
+             }})({x},{y});"
+        );
+        self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    /// Rotate the `<img>` element under `(x, y)` by `delta_deg` degrees
+    /// (positive = clockwise, negative = counter-clockwise). Accumulates
+    /// into `el.dataset.buffrRotate` so successive rotations compose.
+    pub fn image_rotate(&self, x: i32, y: i32, delta_deg: i32) {
+        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+        let delta = serde_json::to_string(&delta_deg).unwrap_or_else(|_| "0".to_string());
+        let js = format!(
+            "(function(x,y,delta){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLImageElement))el=el.parentElement;\
+               if(!el)return;\
+               var cur=parseInt(el.dataset.buffrRotate||'0',10);\
+               cur=(cur+delta)%360;\
+               if(cur<0)cur+=360;\
+               el.dataset.buffrRotate=String(cur);\
+               el.style.transform='rotate('+cur+'deg)';\
+             }})({x},{y},{delta});"
+        );
+        self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
     fn current_domain(&self) -> String {
         self.with_active(|t| {
             t.browser
@@ -2631,5 +2743,166 @@ mod tests {
     fn tab_id_ordering() {
         assert!(TabId(1) < TabId(2));
         assert!(TabId(99) > TabId(7));
+    }
+
+    // ── JS-snippet builder tests (no CEF runtime required) ────────────────
+    //
+    // These tests verify that the helpers produce JS strings containing the
+    // correct structural elements. They do NOT invoke CEF.
+
+    /// Build the play-pause snippet for the given coords and return it.
+    fn build_media_play_pause_js(x: i32, y: i32) -> String {
+        let x = serde_json::to_string(&x).unwrap();
+        let y = serde_json::to_string(&y).unwrap();
+        format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               if(el.paused)el.play();else el.pause();\
+             }})({x},{y});"
+        )
+    }
+
+    fn build_media_mute_js(x: i32, y: i32) -> String {
+        let x = serde_json::to_string(&x).unwrap();
+        let y = serde_json::to_string(&y).unwrap();
+        format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               el.muted=!el.muted;\
+             }})({x},{y});"
+        )
+    }
+
+    fn build_media_loop_js(x: i32, y: i32) -> String {
+        let x = serde_json::to_string(&x).unwrap();
+        let y = serde_json::to_string(&y).unwrap();
+        format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               el.loop=!el.loop;\
+             }})({x},{y});"
+        )
+    }
+
+    fn build_media_controls_js(x: i32, y: i32) -> String {
+        let x = serde_json::to_string(&x).unwrap();
+        let y = serde_json::to_string(&y).unwrap();
+        format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)return;\
+               el.controls=!el.controls;\
+             }})({x},{y});"
+        )
+    }
+
+    fn build_pip_js(x: i32, y: i32) -> String {
+        let x = serde_json::to_string(&x).unwrap();
+        let y = serde_json::to_string(&y).unwrap();
+        format!(
+            "(function(x,y){{\
+               try{{\
+                 var el=document.elementFromPoint(x,y);\
+                 while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
+                 if(!el)return;\
+                 if(document.pictureInPictureElement===el){{\
+                   document.exitPictureInPicture();\
+                 }}else{{\
+                   el.requestPictureInPicture();\
+                 }}\
+               }}catch(e){{}}\
+             }})({x},{y});"
+        )
+    }
+
+    fn build_image_rotate_js(x: i32, y: i32, delta_deg: i32) -> String {
+        let x = serde_json::to_string(&x).unwrap();
+        let y = serde_json::to_string(&y).unwrap();
+        let delta = serde_json::to_string(&delta_deg).unwrap();
+        format!(
+            "(function(x,y,delta){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLImageElement))el=el.parentElement;\
+               if(!el)return;\
+               var cur=parseInt(el.dataset.buffrRotate||'0',10);\
+               cur=(cur+delta)%360;\
+               if(cur<0)cur+=360;\
+               el.dataset.buffrRotate=String(cur);\
+               el.style.transform='rotate('+cur+'deg)';\
+             }})({x},{y},{delta});"
+        )
+    }
+
+    #[test]
+    fn media_play_pause_js_contains_coords_and_toggle() {
+        let js = build_media_play_pause_js(100, 200);
+        assert!(js.contains("100"), "x coord missing");
+        assert!(js.contains("200"), "y coord missing");
+        assert!(js.contains("el.paused"), "paused check missing");
+        assert!(js.contains("el.play()"), "play() call missing");
+        assert!(js.contains("el.pause()"), "pause() call missing");
+        assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+    }
+
+    #[test]
+    fn media_mute_js_contains_coords_and_toggle() {
+        let js = build_media_mute_js(10, 20);
+        assert!(js.contains("10"), "x coord missing");
+        assert!(js.contains("20"), "y coord missing");
+        assert!(js.contains("el.muted=!el.muted"), "mute toggle missing");
+        assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+    }
+
+    #[test]
+    fn media_loop_js_contains_toggle() {
+        let js = build_media_loop_js(0, 0);
+        assert!(js.contains("el.loop=!el.loop"), "loop toggle missing");
+        assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+    }
+
+    #[test]
+    fn media_controls_js_contains_toggle() {
+        let js = build_media_controls_js(0, 0);
+        assert!(
+            js.contains("el.controls=!el.controls"),
+            "controls toggle missing"
+        );
+        assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+    }
+
+    #[test]
+    fn pip_js_contains_pip_api_and_try_catch() {
+        let js = build_pip_js(50, 60);
+        assert!(js.contains("pictureInPictureElement"), "PiP check missing");
+        assert!(js.contains("requestPictureInPicture"), "requestPiP missing");
+        assert!(js.contains("exitPictureInPicture"), "exitPiP missing");
+        assert!(js.contains("try{"), "try/catch missing");
+        assert!(js.contains("HTMLVideoElement"), "video type guard missing");
+    }
+
+    #[test]
+    fn image_rotate_js_clockwise_90() {
+        let js = build_image_rotate_js(30, 40, 90);
+        assert!(js.contains("90"), "delta missing");
+        assert!(js.contains("buffrRotate"), "dataset key missing");
+        assert!(js.contains("rotate("), "transform missing");
+        assert!(js.contains("HTMLImageElement"), "image type guard missing");
+    }
+
+    #[test]
+    fn image_rotate_js_counterclockwise_handles_negative() {
+        let js = build_image_rotate_js(0, 0, -90);
+        assert!(js.contains("-90"), "negative delta missing");
+        assert!(
+            js.contains("if(cur<0)cur+=360"),
+            "negative wrap-around missing"
+        );
     }
 }

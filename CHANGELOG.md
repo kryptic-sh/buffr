@@ -26,6 +26,20 @@ All notable changes to `buffr-core` are documented here. Format follows
   and write to the system clipboard via `hjkl-clipboard` `MimeType::Png`. Falls
   back to copying the URL as text on backends that don't carry image MIME (OSC52
   over SSH). Adds `image` (PNG/JPEG/WebP/GIF only) and `base64` deps.
+- **Media JS injection helpers** (`BrowserHost::media_play_pause`,
+  `media_toggle_mute`, `media_toggle_loop`, `media_toggle_controls`,
+  `media_picture_in_picture`) — fire-and-forget JS snippets that resolve the
+  `<video>`/`<audio>` element under the right-click coordinates via
+  `document.elementFromPoint` and toggle the corresponding DOM property.
+  `media_picture_in_picture` targets `<video>` only and wraps the PiP API in a
+  `try/catch` for hosts that disable PiP.
+- **Image rotate helper** (`BrowserHost::image_rotate`) — resolves the `<img>`
+  element under click coordinates and increments `el.dataset.buffrRotate` by
+  `delta_deg`, then sets `el.style.transform = rotate(Ndeg)`. Rotations compose
+  across successive calls.
+- **`ContextMenuItem::RotateClockwise` / `RotateCounterclockwise`** — new
+  variants added to the image bucket (`build_model` emits them for
+  `TYPEFLAG_MEDIA + MEDIATYPE_IMAGE` right-clicks).
 
 ## [0.4.0] — 2026-05-04
 
