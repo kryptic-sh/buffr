@@ -8,13 +8,85 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-04
+
+### Added
+
+- **OSR sleep** when the buffr window is occluded. CEF's paint scheduler pauses
+  via `was_hidden(true)` and the wgpu present pipeline short-circuits,
+  eliminating the CPU/GPU spin on hidden workspaces. Driven by
+  `WindowEvent::Occluded` plus a `present_us` heuristic that trips after 1
+  frame > 500 ms or 3-of-5 frames > 100 ms (covers Hyprland and other
+  compositors that don't fire `Occluded` on workspace switch).
+- **Idle-inhibit** scaffold for issue #22 — keeps the screen awake while a video
+  plays in the focused window. Trait + 4 platform backends:
+  - Linux Wayland: `zwp_idle_inhibit_manager_v1`
+  - Linux X11: `org.freedesktop.ScreenSaver` D-Bus
+  - macOS: `IOPMAssertionCreateWithName` (`NoDisplaySleepAssertion`)
+  - Windows: `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` Config section
+    `[idle_inhibit]` with `enabled`, `inhibit_audio_only`, `require_focus`.
+    Currently inert pending the JS→Rust read-back path for
+    `__buffr_video_active`.
+- **JS media-activity probe** with five signal sources via the
+  patched-constructor pattern:
+  1. `navigator.mediaSession.playbackState === 'playing'`
+  2. fullscreen `<video>`
+  3. silent / muted `<video>` or `<audio>` via patched
+     `HTMLMediaElement.prototype.play`
+  4. WebRTC: any `RTCPeerConnection` with non-closed `connectionState`
+  5. Screen Wake Lock: any un-released `WakeLockSentinel` Init script injected
+     once at `on_load_end`; poll script writes `window.__buffr_media_active` and
+     `window.__buffr_video_active` each ~2 s tick.
+- **Audio detection** via CEF `AudioHandler` — `BrowserHost` exposes
+  `any_audio_active()` and `drain_audio_events()` for embedder policies.
+- Debug builds use `buffr-debug` as the in-app `APPLICATION` constant (via
+  `cfg(debug_assertions)` in `buffr-config`), so `cargo run` and release
+  installs no longer share `~/.cache/buffr/` and `~/.local/share/buffr/`.
+
+### Changed
+
+- **Render thread architecture: all wgpu mutating calls run on a dedicated
+  `wgpu-render` worker thread.** The UI thread now does only
+  `surface.get_current_texture()`, the chrome paint closure (CPU only), and an
+  OSR pixel memcpy before sending a `RenderCommand` over a capacity-1 mailbox
+  channel. `queue.write_texture`, `queue.submit`, and
+  `surface_texture.present()` all happen on the worker. Fixes the multi-second
+  UI freeze on Hyprland workspace switches (compositor backpressure used to
+  block the UI thread inside `present()`).
+- `buffr-core` dep bumped from `"0.3"` to `"0.4"`; `buffr-config` from `"0.2"`
+  to `"0.3"`.
+
+### Fixed
+
+- **Ctrl+C now responsive** while the window is occluded — shutdown is
+  dispatched via `EventLoopProxy::send_event(BuffrUserEvent::Shutdown)` from the
+  `ctrlc` handler, so winit wakes immediately instead of waiting for compositor
+  activity.
+- **No more `wgpu` panics** on shutdown or resize during occlusion:
+  - `frames_in_flight` counter gates `surface.get_current_texture()` — only one
+    outstanding acquired SurfaceTexture at a time
+    (`desired_maximum_frame_latency = 1`).
+  - `Renderer::drop` wraps `surface` and `device` in `ManuallyDrop`; when the
+    worker is mid-`present()`, the wgpu state is leaked (process is exiting)
+    instead of triggering "Surface cannot be destroyed because is still in use".
+  - `resize()` defers `surface.configure()` into a `pending_resize` slot when
+    the worker holds an outstanding SurfaceTexture; the next `frame()` applies
+    it once the worker drains.
+- **`idle_inhibitor` drops before `window`** in `AppState` so the Wayland
+  backend's worker doesn't reference a freed `wl_display` during shutdown.
+- **Idle-inhibit Drop** uses `recv_timeout(100ms)` instead of an unconditional
+  `thread::sleep(100ms)` — shutdown returns the moment the worker exits cleanly.
+- **`RTCPeerConnection` patched-constructor** in `media_probe_init.js` aliases
+  the `.prototype` property directly so `pc instanceof RTCPeerConnection` keeps
+  working on the page.
+
 ## [0.2.1] - 2026-05-03
 
 ### Changed
 
-- Dropped `publish-stub` job from release workflow. `buffr` on crates.io
-  stays at 0.1.28 as a permanent pointer to GitHub releases; no need to
-  bump it on every umbrella tag.
+- Dropped `publish-stub` job from release workflow. `buffr` on crates.io stays
+  at 0.1.28 as a permanent pointer to GitHub releases; no need to bump it on
+  every umbrella tag.
 
 ## [0.2.0] - 2026-05-03
 
@@ -473,7 +545,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.0
 [0.1.28]: https://github.com/kryptic-sh/buffr/releases/tag/v0.1.28
