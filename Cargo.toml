@@ -48,6 +48,9 @@ zbus = { version = "5", default-features = false, features = ["blocking-api", "a
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Power"] }
+
 [dev-dependencies]
 tempfile = "3"
 toml = "1.1"

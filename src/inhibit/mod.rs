@@ -13,7 +13,7 @@
 //! | Linux (Wayland) | `xdg-session-inhibit` / D-Bus | implemented |
 //! | Linux (X11)     | `org.freedesktop.ScreenSaver` D-Bus | implemented |
 //! | macOS           | `IOPMAssertionCreateWithName` (IOKit) | implemented |
-//! | Windows         | `SetThreadExecutionState`      | stub (phase-3) |
+//! | Windows         | `SetThreadExecutionState`      | implemented |
 //! | Other           | no-op fallback                 | returns Ok     |
 
 use std::sync::Arc;
@@ -156,19 +156,14 @@ pub mod linux {
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-/// Windows idle-inhibit stub.
+/// Windows idle-inhibit backend.
 ///
-/// TODO (phase-2): Use `SetThreadExecutionState(ES_DISPLAY_REQUIRED |
-/// ES_CONTINUOUS)` / `SetThreadExecutionState(ES_CONTINUOUS)` from
-/// `kernel32` to inhibit display sleep.
+/// Uses `SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_CONTINUOUS)` /
+/// `SetThreadExecutionState(ES_CONTINUOUS)` from `kernel32` to prevent
+/// display sleep. All Win32 calls are made on a dedicated worker thread
+/// to preserve thread affinity required by `SetThreadExecutionState`.
 #[cfg(target_os = "windows")]
-pub mod windows {
-    use super::*;
-
-    pub fn new(_window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
-        Ok(Box::new(NoopInhibitor))
-    }
-}
+pub mod windows;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
