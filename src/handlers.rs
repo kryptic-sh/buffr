@@ -508,6 +508,10 @@ wrap_client! {
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(BuffrRequestHandler::new(self.popup_queue.clone()))
         }
+
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(BuffrContextMenuHandler::new())
+        }
     }
 }
 
@@ -1397,6 +1401,93 @@ wrap_permission_handler! {
             // pending entry will eventually be resolved by the user or
             // by `drain_with_defer` at shutdown.
             tracing::trace!(prompt_id, "permissions: dismissed by CEF");
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    pub struct BuffrContextMenuHandler;
+
+    impl ContextMenuHandler {
+        fn on_before_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            model: Option<&mut MenuModel>,
+        ) {
+            // Wipe CEF's default 50-item menu so nothing renders
+            // accidentally. Future slices will repopulate selectively.
+            if let Some(model) = model {
+                model.clear();
+            }
+        }
+
+        fn run_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut MenuModel>,
+            callback: Option<&mut RunContextMenuCallback>,
+        ) -> ::std::os::raw::c_int {
+            // Log every ContextMenuParams field at debug level.
+            // Return 1 (handled) + cancel so CEF never renders its own
+            // menu; slice 1 has no UI to show.
+            let Some(params) = params else {
+                if let Some(cb) = callback {
+                    cb.cancel();
+                }
+                return 1;
+            };
+            let type_flags = params.type_flags();
+            let link_url = CefStringUtf16::from(&params.link_url()).to_string();
+            let source_url = CefStringUtf16::from(&params.source_url()).to_string();
+            let selection = CefStringUtf16::from(&params.selection_text()).to_string();
+            let media_type = params.media_type();
+            let media_flags = params.media_state_flags();
+            let editable = params.is_editable() != 0;
+            let x = params.xcoord();
+            let y = params.ycoord();
+            tracing::debug!(
+                target: "buffr_core::context_menu",
+                ?type_flags,
+                %link_url,
+                %source_url,
+                %selection,
+                ?media_type,
+                ?media_flags,
+                editable,
+                x,
+                y,
+                "context_menu params"
+            );
+            if let Some(cb) = callback {
+                cb.cancel();
+            }
+            1
+        }
+
+        fn on_context_menu_command(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            command_id: ::std::os::raw::c_int,
+            event_flags: EventFlags,
+        ) -> ::std::os::raw::c_int {
+            // No commands to dispatch in slice 1; log for traceability.
+            let selection = params
+                .map(|p| CefStringUtf16::from(&p.selection_text()).to_string())
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "buffr_core::context_menu",
+                command_id,
+                ?event_flags,
+                %selection,
+                "context_menu command (unhandled)"
+            );
+            0
         }
     }
 }
