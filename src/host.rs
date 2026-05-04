@@ -82,6 +82,63 @@ pub struct TabSession {
     pub hint_session: Option<HintSession>,
 }
 
+/// User-facing prefix for "view source" navigations. Mapped to CEF's
+/// built-in `view-source:` scheme at the navigation boundary so the
+/// underlying renderer still gets a real Chromium view-source page,
+/// while the omnibar / tab strip / session file see the buffr-flavored
+/// prefix.
+pub const BUFFR_SRC_PREFIX: &str = "buffr-src:";
+const CEF_VIEW_SOURCE_PREFIX: &str = "view-source:";
+
+/// Translate a user-facing URL into the form CEF should actually
+/// navigate to. Currently rewrites the `buffr-src:` prefix to
+/// `view-source:`; identity for all other URLs.
+fn to_cef_navigation_url(url: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = url.strip_prefix(BUFFR_SRC_PREFIX) {
+        std::borrow::Cow::Owned(format!("{CEF_VIEW_SOURCE_PREFIX}{rest}"))
+    } else {
+        std::borrow::Cow::Borrowed(url)
+    }
+}
+
+/// Translate a CEF-emitted URL back into the user-facing form. Rewrites
+/// `view-source:` → `buffr-src:` so chrome surfaces show the buffr
+/// prefix uniformly regardless of whether navigation came from the
+/// context menu, an omnibar paste, or a session restore.
+fn to_display_url(url: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = url.strip_prefix(CEF_VIEW_SOURCE_PREFIX) {
+        std::borrow::Cow::Owned(format!("{BUFFR_SRC_PREFIX}{rest}"))
+    } else {
+        std::borrow::Cow::Borrowed(url)
+    }
+}
+
+/// Apply an incoming navigation URL (typically from CEF's
+/// `on_address_change` or `on_load_end`) to `current`, preserving the
+/// `buffr-src:` prefix when CEF strips it. Returns `Some(new_url)` if
+/// the value should change, `None` to leave it untouched.
+fn merge_navigation_url(current: &str, incoming: &str) -> Option<String> {
+    // Preserve `buffr-src:` prefix. CEF's address-change strips
+    // `view-source:` from the URL — but the user's navigation target
+    // (and what the omnibar expects to show on focus) is the prefixed
+    // form. If our current url has the prefix and the incoming
+    // matches the unprefixed suffix, keep ours.
+    if let Some(suffix) = current.strip_prefix(BUFFR_SRC_PREFIX)
+        && suffix == incoming
+    {
+        return None;
+    }
+    // Otherwise the incoming is authoritative — but normalize a raw
+    // `view-source:` (rare; only fires if CEF *doesn't* strip the
+    // prefix) into the buffr-flavored form.
+    let normalized = to_display_url(incoming);
+    if normalized == current {
+        None
+    } else {
+        Some(normalized.into_owned())
+    }
+}
+
 /// One open browser. The `browser` field is the live [`cef::Browser`]
 /// CEF returned from `browser_host_create_browser_sync`.
 pub struct Tab {
@@ -520,19 +577,8 @@ impl BrowserHost {
             let mut matched = false;
             for t in tabs.iter_mut() {
                 if t.browser.identifier() == browser_id {
-                    // Preserve `view-source:` prefix. Chromium/CEF strips
-                    // it from on_address_change so the underlying URL is
-                    // what we receive — but the user's navigation target
-                    // (and what they expect to see in the omnibar when
-                    // they open it for editing) is the prefixed form.
-                    // If our current url has the prefix and the incoming
-                    // matches the unprefixed suffix, keep ours.
-                    let preserve_view_source = t
-                        .url
-                        .strip_prefix("view-source:")
-                        .is_some_and(|suffix| suffix == url);
-                    if !preserve_view_source {
-                        t.url = url.clone();
+                    if let Some(new_url) = merge_navigation_url(&t.url, &url) {
+                        t.url = new_url;
                         changed = true;
                     }
                     matched = true;
@@ -1186,7 +1232,10 @@ impl BrowserHost {
             "create_browser: window_info"
         );
 
-        let cef_url = CefString::from(url);
+        // Translate `buffr-src:` → `view-source:` for CEF; chrome-side
+        // we keep the `buffr-src:` form (see Tab.url assignment below).
+        let cef_navigation_url = to_cef_navigation_url(url);
+        let cef_url = CefString::from(cef_navigation_url.as_ref());
         let mut settings = BrowserSettings::default();
         // CEF's OSR default is 30 fps — that's the lag floor for mouse
         // wheel scrolling, smooth animations, and video playback. We
@@ -1248,7 +1297,7 @@ impl BrowserHost {
         let tab = Tab {
             id,
             browser,
-            url: url.to_string(),
+            url: to_display_url(url).into_owned(),
             title: None,
             progress: 1.0,
             is_loading: false,
@@ -1743,7 +1792,9 @@ impl BrowserHost {
         let mut tabs = self.tabs.lock().ok()?;
         for t in tabs.iter_mut() {
             if t.browser.identifier() == cef_id {
-                t.url = url.to_string();
+                if let Some(new_url) = merge_navigation_url(&t.url, url) {
+                    t.url = new_url;
+                }
                 return Some(t.id);
             }
         }
@@ -1783,9 +1834,10 @@ impl BrowserHost {
                 warn!("navigate: main frame unavailable");
                 return Err(CoreError::CreateBrowserFailed);
             };
-            let cef_url = CefString::from(trimmed);
+            let cef_navigation_url = to_cef_navigation_url(trimmed);
+            let cef_url = CefString::from(cef_navigation_url.as_ref());
             frame.load_url(Some(&cef_url));
-            t.url = trimmed.to_string();
+            t.url = to_display_url(trimmed).into_owned();
             tracing::debug!(target: "buffr_core::host", url = %trimmed, "navigate");
             Ok(())
         })
@@ -2723,6 +2775,60 @@ mod tests {
     fn tab_id_displays_with_prefix() {
         assert_eq!(format!("{}", TabId(0)), "tab#0");
         assert_eq!(format!("{}", TabId(42)), "tab#42");
+    }
+
+    #[test]
+    fn cef_navigation_translates_buffr_src_prefix() {
+        assert_eq!(
+            to_cef_navigation_url("buffr-src:https://example.com").as_ref(),
+            "view-source:https://example.com"
+        );
+        assert_eq!(
+            to_cef_navigation_url("https://example.com").as_ref(),
+            "https://example.com"
+        );
+        assert_eq!(to_cef_navigation_url("").as_ref(), "");
+    }
+
+    #[test]
+    fn display_url_translates_view_source_prefix() {
+        assert_eq!(
+            to_display_url("view-source:https://example.com").as_ref(),
+            "buffr-src:https://example.com"
+        );
+        assert_eq!(
+            to_display_url("https://example.com").as_ref(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_buffr_src_when_incoming_matches_suffix() {
+        assert_eq!(
+            merge_navigation_url("buffr-src:https://x.com", "https://x.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_normalizes_view_source_to_buffr_src() {
+        assert_eq!(
+            merge_navigation_url("https://old.com", "view-source:https://new.com"),
+            Some("buffr-src:https://new.com".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_replaces_on_real_navigation_away() {
+        assert_eq!(
+            merge_navigation_url("buffr-src:https://x.com", "https://other.com"),
+            Some("https://other.com".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_no_op_when_unchanged() {
+        assert_eq!(merge_navigation_url("https://x.com", "https://x.com"), None);
     }
 
     #[test]

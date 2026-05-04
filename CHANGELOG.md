@@ -40,6 +40,19 @@ All notable changes to `buffr-core` are documented here. Format follows
 - **`ContextMenuItem::RotateClockwise` / `RotateCounterclockwise`** — new
   variants added to the image bucket (`build_model` emits them for
   `TYPEFLAG_MEDIA + MEDIATYPE_IMAGE` right-clicks).
+- **`buffr-src:` URL prefix as the user-facing alias for Chromium's
+  `view-source:`.** Navigations to `buffr-src:<url>` rewrite to
+  `view-source:<url>` at the CEF boundary; the omnibar / tab strip / session
+  file see the buffr-flavored prefix uniformly. Incoming address-change events
+  that strip the prefix (Chromium peels it for tracking) are detected and the
+  prefixed form preserved on `Tab.url`. Public const `BUFFR_SRC_PREFIX`.
+
+### Fixed
+
+- **`view-source:` prefix lost from `Tab.url` on first address-change.** Was
+  causing the omnibar to pre-fill with the underlying URL when the user opened
+  it on a view-source page; now subsumed into the `buffr-src:` rename above via
+  `merge_navigation_url`.
 
 ## [0.4.0] — 2026-05-04
 
