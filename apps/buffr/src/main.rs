@@ -61,6 +61,12 @@ const PRESENT_HISTORY_SIZE: usize = 5;
 /// trips it within ~50 ms at 60 Hz.
 const SLOW_FRAMES_TO_OCCLUDE: usize = 3;
 
+/// Single-frame threshold for immediate occlusion.  See
+/// [`SLOW_PRESENT_THRESHOLD_US`] for the rolling-window trigger; this
+/// constant is the fast-path that catches the first hidden-surface
+/// present before it can repeat.
+const IMMEDIATE_OCCLUDE_THRESHOLD_US: u64 = 500_000;
+
 /// How often, while heuristically sleeping, to attempt a probe present
 /// to test whether the compositor is releasing buffers again.  Two
 /// seconds balances wake latency against the cost of the probe (one
@@ -2310,16 +2316,20 @@ impl AppState {
         }
 
         // Active: occlude if the rolling history shows sustained slow
-        // presents.  Single bad frames are absorbed by SLOW_FRAMES_TO_OCCLUDE.
-        if !self.occluded
-            && detect_occluded_from_history(
-                &self.present_us_history,
-                SLOW_PRESENT_THRESHOLD_US,
-                SLOW_FRAMES_TO_OCCLUDE,
-            )
-        {
+        // presents OR if a single frame was egregiously slow (the
+        // 500 ms+ fingerprint of a Wayland compositor blocking present
+        // on a hidden surface).
+        let immediate = present_us > IMMEDIATE_OCCLUDE_THRESHOLD_US;
+        let sustained = detect_occluded_from_history(
+            &self.present_us_history,
+            SLOW_PRESENT_THRESHOLD_US,
+            SLOW_FRAMES_TO_OCCLUDE,
+        );
+        if !self.occluded && (immediate || sustained) {
             tracing::debug!(
                 present_us,
+                immediate,
+                sustained,
                 history = ?self.present_us_history,
                 "occlusion: heuristic-occluded → sleep"
             );
@@ -2987,14 +2997,16 @@ impl AppState {
         // - `probe_pending`: a wake-probe was scheduled by `about_to_wait`
         //   to test whether the compositor is now showing our surface
         //   (heuristic-occlusion case where winit Occluded is unreliable).
-        // - chrome dirty: input / mode change bumped chrome_generation; we
-        //   must honour it even while heuristically sleeping or the user's
-        //   keystroke is silently dropped.
-        let chrome_might_be_dirty = self.chrome_generation != self.last_painted_chrome_gen;
+        //
+        // chrome_dirty is intentionally NOT a bypass: a user keystroke or
+        // mode change while we believe ourselves occluded would otherwise
+        // initiate a wgpu present that can block the UI thread for
+        // multiple seconds (Wayland compositor refusing to release the
+        // buffer for a hidden surface).  The next probe (≤2 s away) will
+        // wake us if visible; chrome catches up then.
         if self.paint_policy == PaintPolicy::Sleeping
             && !self.surface_drifted
             && !self.probe_pending
-            && !chrome_might_be_dirty
         {
             return;
         }
@@ -7275,6 +7287,18 @@ mod tests {
         // Fewer samples than the threshold can never trip the heuristic.
         let h: VecDeque<u64> = [200_000, 200_000].into_iter().collect();
         assert!(!detect_occluded_from_history(&h, 100_000, 3));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn immediate_occlude_threshold_well_above_typical_slow_frame() {
+        // Sanity: the immediate-trip threshold must be far enough above
+        // SLOW_PRESENT_THRESHOLD_US that legitimate slow frames don't
+        // single-handedly trip the fast path (compositor stutter, GC pauses).
+        // The assertion is on constants by design — it's a regression
+        // guard against accidentally lowering IMMEDIATE_OCCLUDE_THRESHOLD_US
+        // below 5x SLOW_PRESENT_THRESHOLD_US.
+        assert!(IMMEDIATE_OCCLUDE_THRESHOLD_US >= SLOW_PRESENT_THRESHOLD_US * 5);
     }
 
     #[test]
