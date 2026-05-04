@@ -187,7 +187,7 @@ fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
             // resolves `../Frameworks/Chromium Embedded Framework.framework`
             // from `target/debug/buffr`, i.e. `target/Frameworks/...`.
             // Keep dev-tree staging aligned with the same relative layout as
-            // `buffr.app/Contents/MacOS/../Frameworks`.
+            // `Buffr.app/Contents/MacOS/../Frameworks`.
             let frameworks_dir = target_dir
                 .parent()
                 .map(|parent| parent.join("Frameworks"))
