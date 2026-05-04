@@ -278,17 +278,31 @@ impl Renderer {
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or_else(|| caps.formats[0]);
 
-        // Mailbox preferred — Fifo blocks `surface.get_current_texture()` on
-        // vsync, and during fast resize that produced 90-150 ms acquire
-        // stalls right after CEF dim changes (wgpu reconfigures swap chain
-        // on each renderer.resize, then Fifo waits for the chain to settle
-        // while RedrawRequested storms paint requests). Mailbox lets the
-        // swap chain advance without stalling. The earlier subsurface
-        // flicker that prompted the Fifo experiment turned out to be
-        // SharedOsrFrame mutex contention (since fixed with mem::swap),
-        // not Mailbox's swap-chain dynamics.
+        // Preference order: Mailbox → Immediate → Fifo.
+        //
+        // Fifo blocks `surface.get_current_texture()` on vsync, and
+        // during fast resize that produced 90-150 ms acquire stalls right
+        // after CEF dim changes (wgpu reconfigures swap chain on each
+        // renderer.resize, then Fifo waits for the chain to settle while
+        // RedrawRequested storms paint requests).  WORSE: when the surface
+        // is occluded (Wayland workspace switch, Hyprland) the compositor
+        // refuses to release the buffer and `present()` blocks the UI
+        // thread for multiple seconds — observed Ctrl+C unresponsiveness
+        // because BuffrUserEvent::Shutdown couldn't be processed until
+        // present returned.
+        //
+        // Mailbox lets the swap chain advance without stalling.  Immediate
+        // is the same plus tearing — acceptable fallback when the GPU stack
+        // doesn't expose Mailbox (e.g. Vulkan unavailable → GL backend).
+        // Fifo last resort.
+        //
+        // The earlier subsurface flicker that prompted a Fifo experiment
+        // turned out to be SharedOsrFrame mutex contention (since fixed
+        // with mem::swap), not the present mode's fault.
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
         } else {
             wgpu::PresentMode::Fifo
         };
