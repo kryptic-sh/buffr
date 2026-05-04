@@ -520,8 +520,21 @@ impl BrowserHost {
             let mut matched = false;
             for t in tabs.iter_mut() {
                 if t.browser.identifier() == browser_id {
-                    t.url = url.clone();
-                    changed = true;
+                    // Preserve `view-source:` prefix. Chromium/CEF strips
+                    // it from on_address_change so the underlying URL is
+                    // what we receive — but the user's navigation target
+                    // (and what they expect to see in the omnibar when
+                    // they open it for editing) is the prefixed form.
+                    // If our current url has the prefix and the incoming
+                    // matches the unprefixed suffix, keep ours.
+                    let preserve_view_source = t
+                        .url
+                        .strip_prefix("view-source:")
+                        .is_some_and(|suffix| suffix == url);
+                    if !preserve_view_source {
+                        t.url = url.clone();
+                        changed = true;
+                    }
                     matched = true;
                     break;
                 }
