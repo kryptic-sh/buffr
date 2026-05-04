@@ -3916,6 +3916,309 @@ impl AppState {
         }
     }
 
+    /// Dispatch the action for a context-menu item activation.
+    ///
+    /// Called from both the Enter-key path and the mouse-click path after the
+    /// menu has been taken (dropped). Logs at INFO so activations are grep-able
+    /// with `RUST_LOG=buffr::context_menu=info`.
+    fn dispatch_context_menu_item(&mut self, item: &ContextMenuItem, request: &ContextMenuRequest) {
+        use ContextMenuItem as I;
+
+        // ── Navigation ────────────────────────────────────────────────────────
+        match item {
+            I::HistoryBack { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "history_back", "dispatch");
+                self.dispatch_action(&buffr_modal::PageAction::HistoryBack);
+            }
+            I::HistoryForward { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "history_forward", "dispatch");
+                self.dispatch_action(&buffr_modal::PageAction::HistoryForward);
+            }
+            I::Reload => {
+                tracing::info!(target: "buffr::context_menu", action = "reload", "dispatch");
+                self.dispatch_action(&buffr_modal::PageAction::Reload);
+            }
+            I::StopLoading => {
+                tracing::info!(target: "buffr::context_menu", action = "stop_loading", "dispatch");
+                self.dispatch_action(&buffr_modal::PageAction::StopLoading);
+            }
+
+            // ── Edit (frame ops) ─────────────────────────────────────────────
+            I::Undo => {
+                tracing::info!(target: "buffr::context_menu", action = "undo", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_undo();
+                }
+            }
+            I::Redo => {
+                tracing::info!(target: "buffr::context_menu", action = "redo", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_redo();
+                }
+            }
+            I::Cut => {
+                tracing::info!(target: "buffr::context_menu", action = "cut", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_cut();
+                }
+            }
+            I::Copy => {
+                tracing::info!(target: "buffr::context_menu", action = "copy", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_copy();
+                }
+            }
+            I::Paste => {
+                tracing::info!(target: "buffr::context_menu", action = "paste", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_paste();
+                }
+            }
+            I::PasteAsPlainText => {
+                tracing::info!(target: "buffr::context_menu", action = "paste_plain", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_paste_plain();
+                }
+            }
+            I::SelectAll => {
+                tracing::info!(target: "buffr::context_menu", action = "select_all", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.frame_select_all();
+                }
+            }
+
+            // ── Selection ────────────────────────────────────────────────────
+            I::CopySelection => {
+                tracing::info!(target: "buffr::context_menu", action = "copy_selection", "dispatch");
+                // selection_text is already extracted by CEF into the request.
+                let text = request.selection_text.clone();
+                if let Some(host) = self.host.as_ref() {
+                    if !text.is_empty() {
+                        if !host.clipboard_set_text(&text) {
+                            tracing::warn!(
+                                target: "buffr::context_menu",
+                                "copy_selection: clipboard write failed"
+                            );
+                        }
+                    } else {
+                        // Fallback: ask CEF to copy the page selection.
+                        host.frame_copy();
+                    }
+                }
+            }
+            I::SearchSelection => {
+                tracing::info!(target: "buffr::context_menu", action = "search_selection", "dispatch");
+                let query = request.selection_text.trim().to_string();
+                if query.is_empty() {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        "search_selection: empty selection text"
+                    );
+                    return;
+                }
+                let url = buffr_config::search::resolve_input(&query, &self.search_config);
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        error = %err,
+                        "search_selection: open_tab failed"
+                    );
+                }
+            }
+
+            // ── Link ─────────────────────────────────────────────────────────
+            I::OpenLinkInNewTab => {
+                tracing::info!(target: "buffr::context_menu", action = "open_link_new_tab", "dispatch");
+                let url = request.link_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        error = %err,
+                        "open_link_new_tab: open_tab failed"
+                    );
+                }
+            }
+            I::OpenLinkInBackgroundTab => {
+                tracing::info!(target: "buffr::context_menu", action = "open_link_background_tab", "dispatch");
+                let url = request.link_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab_background(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        error = %err,
+                        "open_link_background_tab: open_tab_background failed"
+                    );
+                }
+            }
+            I::OpenLinkInNewWindow => {
+                // Multi-window is issue #18 — treat as new tab for now.
+                tracing::info!(
+                    target: "buffr::context_menu",
+                    action = "open_link_new_window",
+                    "dispatch (treated as new tab — multi-window is #18)"
+                );
+                let url = request.link_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        error = %err,
+                        "open_link_new_window: open_tab failed"
+                    );
+                }
+            }
+            I::CopyLinkAddress => {
+                tracing::info!(target: "buffr::context_menu", action = "copy_link_address", "dispatch");
+                let url = request.link_url.clone();
+                if let Some(host) = self.host.as_ref()
+                    && !host.clipboard_set_text(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        "copy_link_address: clipboard write failed"
+                    );
+                }
+            }
+            I::SaveLinkAs => {
+                tracing::info!(target: "buffr::context_menu", action = "save_link_as", "dispatch");
+                let url = request.link_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref() {
+                    host.start_download(&url);
+                }
+            }
+
+            // ── Image ────────────────────────────────────────────────────────
+            I::OpenImageInNewTab => {
+                tracing::info!(target: "buffr::context_menu", action = "open_image_new_tab", "dispatch");
+                let url = request.source_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        error = %err,
+                        "open_image_new_tab: open_tab failed"
+                    );
+                }
+            }
+            I::CopyImageAddress => {
+                tracing::info!(target: "buffr::context_menu", action = "copy_image_address", "dispatch");
+                let url = request.source_url.clone();
+                if let Some(host) = self.host.as_ref()
+                    && !host.clipboard_set_text(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        "copy_image_address: clipboard write failed"
+                    );
+                }
+            }
+            I::CopyImage => {
+                tracing::info!(target: "buffr::context_menu", action = "copy_image", "dispatch");
+                // TODO(slice-4b): off-thread fetch source_url → decode →
+                // PNG-encode → cb.set(MimeType::Png, png_bytes). Requires
+                // `image` crate dep + Capabilities::IMAGE check.
+                // For now: fall back to copying the image URL as text.
+                let url = request.source_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref() {
+                    if host.clipboard_set_text(&url) {
+                        tracing::info!(
+                            target: "buffr::context_menu",
+                            "copy_image: IMAGE capability absent — copied URL as text fallback"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "buffr::context_menu",
+                            "copy_image: clipboard write failed"
+                        );
+                    }
+                }
+            }
+            I::SaveImageAs => {
+                tracing::info!(target: "buffr::context_menu", action = "save_image_as", "dispatch");
+                let url = request.source_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref() {
+                    host.start_download(&url);
+                }
+            }
+
+            // ── Page ─────────────────────────────────────────────────────────
+            I::ViewPageSource => {
+                tracing::info!(target: "buffr::context_menu", action = "view_page_source", "dispatch");
+                let current_url = self
+                    .host
+                    .as_ref()
+                    .map(|h| h.active_tab_live_url())
+                    .unwrap_or_default();
+                if current_url.is_empty() {
+                    return;
+                }
+                let view_src_url = format!("view-source:{current_url}");
+                if let Some(host) = self.host.as_ref()
+                    && let Err(err) = host.open_tab(&view_src_url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        error = %err,
+                        "view_page_source: open_tab failed"
+                    );
+                }
+            }
+            I::InspectElement => {
+                tracing::info!(target: "buffr::context_menu", action = "inspect_element", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.show_dev_tools_at(Some(request.x), Some(request.y));
+                }
+            }
+
+            // ── Media — deferred to slice 4b ─────────────────────────────────
+            I::MediaPlayPause { .. }
+            | I::MediaMute { .. }
+            | I::MediaLoop { .. }
+            | I::MediaShowControls
+            | I::MediaSaveAs
+            | I::CopyMediaAddress
+            | I::PictureInPicture => {
+                tracing::info!(
+                    target: "buffr::context_menu",
+                    ?item,
+                    "media action deferred (slice 4b)"
+                );
+            }
+
+            I::Separator => {
+                // Separators are never activated (disabled in is_enabled).
+            }
+        }
+    }
+
     /// Route a winit `KeyEvent` to the open context menu. Returns `true`
     /// if the event was consumed (caller skips all other key sinks).
     ///
@@ -3960,12 +4263,9 @@ impl AppState {
                     && cm.is_enabled(cm.selected)
                 {
                     let cm = self.context_menu.take().unwrap();
-                    let item = &cm.request.items[cm.selected];
-                    tracing::info!(
-                        target: "buffr::context_menu",
-                        ?item,
-                        "activated"
-                    );
+                    let item = cm.request.items[cm.selected].clone();
+                    let request = cm.request.clone();
+                    self.dispatch_context_menu_item(&item, &request);
                     self.mark_chrome_dirty();
                     self.request_redraw();
                 }
@@ -6081,12 +6381,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                                 Some(row) if overlay.entries[row].enabled => {
                                     // Activate by clicking — same as Enter.
                                     let cm = self.context_menu.take().unwrap();
-                                    let item = &cm.request.items[row];
-                                    tracing::info!(
-                                        target: "buffr::context_menu",
-                                        ?item,
-                                        "activated"
-                                    );
+                                    let item = cm.request.items[row].clone();
+                                    let request = cm.request.clone();
+                                    self.dispatch_context_menu_item(&item, &request);
                                 }
                                 _ => {
                                     // Click on separator or disabled row —
