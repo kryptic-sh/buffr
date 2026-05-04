@@ -109,6 +109,59 @@ pub enum ContextMenuItem {
     Separator,
 }
 
+impl ContextMenuItem {
+    /// Human-readable label for the menu item.
+    ///
+    /// Used by the overlay renderer so label text lives in one place.
+    /// `Separator` returns an empty string — callers render it as a
+    /// divider line, not as text.
+    pub fn label(&self) -> &'static str {
+        use ContextMenuItem as I;
+        match self {
+            I::HistoryBack { .. } => "Back",
+            I::HistoryForward { .. } => "Forward",
+            I::Reload => "Reload",
+            I::StopLoading => "Stop Loading",
+            I::ViewPageSource => "View Page Source",
+            I::InspectElement => "Inspect Element",
+            I::CopySelection => "Copy",
+            I::SearchSelection => "Search for Selection",
+            I::OpenLinkInNewTab => "Open Link in New Tab",
+            I::OpenLinkInBackgroundTab => "Open Link in Background Tab",
+            I::OpenLinkInNewWindow => "Open Link in New Window",
+            I::CopyLinkAddress => "Copy Link Address",
+            I::SaveLinkAs => "Save Link As…",
+            I::OpenImageInNewTab => "Open Image in New Tab",
+            I::SaveImageAs => "Save Image As…",
+            I::CopyImage => "Copy Image",
+            I::CopyImageAddress => "Copy Image Address",
+            I::MediaPlayPause { playing: true } => "Pause",
+            I::MediaPlayPause { playing: false } => "Play",
+            I::MediaMute { muted: true } => "Unmute",
+            I::MediaMute { muted: false } => "Mute",
+            I::MediaLoop { looped: true } => "Disable Loop",
+            I::MediaLoop { looped: false } => "Enable Loop",
+            I::MediaShowControls => "Show Controls",
+            I::MediaSaveAs => "Save Media As…",
+            I::CopyMediaAddress => "Copy Media Address",
+            I::PictureInPicture => "Picture in Picture",
+            I::Cut => "Cut",
+            I::Copy => "Copy",
+            I::Paste => "Paste",
+            I::PasteAsPlainText => "Paste as Plain Text",
+            I::SelectAll => "Select All",
+            I::Undo => "Undo",
+            I::Redo => "Redo",
+            I::Separator => "",
+        }
+    }
+
+    /// Whether this item is a visual separator (non-selectable).
+    pub fn is_separator(&self) -> bool {
+        matches!(self, ContextMenuItem::Separator)
+    }
+}
+
 // ── Request ───────────────────────────────────────────────────────────────────
 
 /// A right-click that has been translated into a menu model.
