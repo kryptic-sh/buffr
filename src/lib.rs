@@ -56,6 +56,7 @@ pub struct Config {
     pub crash_reporter: CrashReporterConfig,
     pub updates: UpdateConfig,
     pub accessibility: AccessibilityConfig,
+    pub idle_inhibit: IdleInhibitConfig,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
@@ -252,6 +253,42 @@ pub struct AccessibilityConfig {
     /// `App::on_before_command_line_processing`. Default `false` —
     /// the tree is non-trivial overhead for users without an AT.
     pub force_renderer_accessibility: bool,
+}
+
+/// `[idle_inhibit]` section — issue #22 idle-inhibit (prevent screen lock).
+///
+/// When `enabled`, buffr acquires a platform idle-inhibitor whenever a video
+/// signal is active in the focused window. The inhibitor is released the moment
+/// video stops or focus is lost (when `require_focus = true`). No platform
+/// action is taken when `enabled = false`.
+///
+/// `inhibit_audio_only` broadens the trigger to include audio-only streams
+/// (e.g. music playback). Off by default — listening to music should not keep
+/// the screen on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdleInhibitConfig {
+    /// Master switch. `true` (the default) allows the inhibitor to be
+    /// acquired when a video signal is active. Set to `false` to disable
+    /// the feature entirely.
+    pub enabled: bool,
+    /// When `true`, audio-only activity (no video signal) also triggers
+    /// the inhibitor. Default `false`.
+    pub inhibit_audio_only: bool,
+    /// When `true`, the inhibitor is only held while the buffr window has
+    /// OS-level focus. Default `true`. Set to `false` to inhibit even
+    /// when the window is in the background (useful for PiP setups).
+    pub require_focus: bool,
+}
+
+impl Default for IdleInhibitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            inhibit_audio_only: false,
+            require_focus: true,
+        }
+    }
 }
 
 /// Categories of locally-stored data the shutdown hook can wipe when
@@ -949,6 +986,39 @@ alphabet = "abcdef"
         cfg.hint.alphabet = "a".into();
         let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, ConfigError::Validate { .. }));
+    }
+
+    #[test]
+    fn idle_inhibit_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.idle_inhibit.enabled);
+        assert!(!cfg.idle_inhibit.inhibit_audio_only);
+        assert!(cfg.idle_inhibit.require_focus);
+    }
+
+    #[test]
+    fn idle_inhibit_parses_from_toml() {
+        let toml = r#"
+[idle_inhibit]
+enabled = false
+inhibit_audio_only = true
+require_focus = false
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.idle_inhibit.enabled);
+        assert!(cfg.idle_inhibit.inhibit_audio_only);
+        assert!(!cfg.idle_inhibit.require_focus);
+    }
+
+    #[test]
+    fn idle_inhibit_unknown_field_rejected() {
+        let toml = r#"
+[idle_inhibit]
+weird = "nope"
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("weird") || msg.contains("unknown"));
     }
 
     #[test]
