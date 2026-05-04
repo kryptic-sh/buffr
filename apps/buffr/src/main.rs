@@ -131,14 +131,14 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
-    HintAlphabet, HintEventSink, IdleInhibitor, PermissionsQueue, PopupCloseSink, PopupCreateSink,
-    PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, drain_edit_events,
-    drain_permissions_with_defer, drain_popup_closes, drain_popup_creates, drain_popup_urls,
-    expire_stale_notices, init_cef_api, new_download_notice_queue, new_edit_event_sink,
-    new_find_sink, new_hint_event_sink, new_inhibitor, new_permissions_queue, peek_download_notice,
-    peek_permission_front, permissions_queue_len, pop_permission_front, profile_paths,
-    register_buffr_handler_factory,
+    BuffrApp, ContextMenuItem, ContextMenuRequest, DownloadNoticeQueue, EditConsoleEvent,
+    EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink, IdleInhibitor,
+    PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome, SharedOsrFrame,
+    SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer, drain_popup_closes,
+    drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
+    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
+    new_inhibitor, new_permissions_queue, peek_download_notice, peek_permission_front,
+    permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -146,9 +146,10 @@ use buffr_modal::{
 };
 use buffr_permissions::Permissions;
 use buffr_ui::{
-    CertState, DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip, FindStatus,
-    HintStatus as UiHintStatus, InputBar, Palette, PermissionsPrompt, STATUSLINE_HEIGHT,
-    Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
+    CertState, ContextMenuEntry, ContextMenuOverlay, DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind,
+    DownloadNoticeStrip, FindStatus, HintStatus as UiHintStatus, InputBar, Palette,
+    PermissionsPrompt, STATUSLINE_HEIGHT, Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT,
+    TabStrip, TabView,
 };
 
 mod loading_anim;
@@ -2075,6 +2076,10 @@ struct AppState {
     /// `WindowEvent::Focused`). Used by the idle-inhibit policy when
     /// `config.idle_inhibit.require_focus = true`.
     window_focused: bool,
+    /// Active right-click context menu, if any. `None` when no menu is
+    /// visible. Set from `host.drain_context_menu_requests()` each tick;
+    /// cleared on Esc, Enter (activation), or click-outside.
+    context_menu: Option<ActiveContextMenu>,
 }
 
 /// OSR paint policy for the window.
@@ -2129,6 +2134,108 @@ impl OverlayState {
         match self {
             OverlayState::Command(b) | OverlayState::Omnibar(b) => b,
             OverlayState::Find { bar, .. } => bar,
+        }
+    }
+}
+
+/// Active right-click context menu state.
+///
+/// Holds the most-recent [`ContextMenuRequest`] and the keyboard-selected
+/// row index. Created when a right-click request arrives; destroyed on
+/// Esc, Enter, or click-outside.
+struct ActiveContextMenu {
+    request: ContextMenuRequest,
+    /// Index into `request.items` of the currently highlighted row.
+    /// Always points at a non-separator item; updated by Up/Down.
+    selected: usize,
+}
+
+impl ActiveContextMenu {
+    fn new(request: ContextMenuRequest) -> Self {
+        // Pre-select the first selectable item.
+        let selected = request
+            .items
+            .iter()
+            .position(|i| !i.is_separator())
+            .unwrap_or(0);
+        Self { request, selected }
+    }
+
+    /// Move selection up, skipping separators. No-op at the first item.
+    fn select_prev(&mut self) {
+        let items = &self.request.items;
+        let mut idx = self.selected;
+        loop {
+            if idx == 0 {
+                break;
+            }
+            idx -= 1;
+            if !items[idx].is_separator() {
+                self.selected = idx;
+                break;
+            }
+        }
+    }
+
+    /// Move selection down, skipping separators. No-op at the last item.
+    fn select_next(&mut self) {
+        let items = &self.request.items;
+        let mut idx = self.selected;
+        loop {
+            if idx + 1 >= items.len() {
+                break;
+            }
+            idx += 1;
+            if !items[idx].is_separator() {
+                self.selected = idx;
+                break;
+            }
+        }
+    }
+
+    /// Set selection by display-row index (direct hover). If the target
+    /// row is a separator the call is a no-op.
+    #[allow(dead_code)]
+    fn select_row(&mut self, row: usize) {
+        if let Some(item) = self.request.items.get(row)
+            && !item.is_separator()
+        {
+            self.selected = row;
+        }
+    }
+
+    /// Build the `ContextMenuOverlay` snapshot for the renderer.
+    fn to_overlay(&self, _win_w: u32, win_h: u32) -> ContextMenuOverlay {
+        let entries: Vec<ContextMenuEntry> = self
+            .request
+            .items
+            .iter()
+            .map(|item| {
+                let enabled = match item {
+                    ContextMenuItem::HistoryBack { enabled } => *enabled,
+                    ContextMenuItem::HistoryForward { enabled } => *enabled,
+                    _ => !item.is_separator(),
+                };
+                ContextMenuEntry {
+                    label: item.label().to_string(),
+                    is_separator: item.is_separator(),
+                    enabled,
+                }
+            })
+            .collect();
+
+        // Convert CEF click coords (browser-local pixels) to chrome buffer
+        // coords. CEF OSR pixel space == logical window pixels on 1× HiDPI;
+        // at 2× CEF sends doubled values. We use the raw coords and clamp
+        // — the overlay widget itself clamps to the buffer bounds.
+        let x = self.request.x;
+        let y = self.request.y.clamp(0, win_h as i32);
+
+        ContextMenuOverlay {
+            entries,
+            selected: self.selected,
+            x,
+            y,
         }
     }
 }
@@ -2278,6 +2385,7 @@ impl AppState {
             idle_inhibitor: None,
             video_active: false,
             window_focused: false,
+            context_menu: None,
         }
     }
 
@@ -3160,6 +3268,10 @@ impl AppState {
         let confirm_close_pinned = self.confirm_close_pinned;
         let permissions_prompt = self.permissions_prompt.clone();
         let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
+        let context_menu_overlay = self
+            .context_menu
+            .as_ref()
+            .map(|cm| cm.to_overlay(lwidth, lheight));
 
         let frame_start = Instant::now();
 
@@ -3259,6 +3371,7 @@ impl AppState {
                             confirm_close_pinned,
                             permissions_prompt.as_ref(),
                             overlay_data.as_ref(),
+                            context_menu_overlay.as_ref(),
                         );
                         // Paint the animation into the browser region so it is
                         // opaque and composites as chrome (no OSR quad shown).
@@ -3302,6 +3415,7 @@ impl AppState {
                             confirm_close_pinned,
                             permissions_prompt.as_ref(),
                             overlay_data.as_ref(),
+                            context_menu_overlay.as_ref(),
                         );
                     },
                     Some(osr_upload),
@@ -3345,6 +3459,7 @@ impl AppState {
                             confirm_close_pinned,
                             permissions_prompt.as_ref(),
                             overlay_data.as_ref(),
+                            context_menu_overlay.as_ref(),
                         );
                     },
                     Some(osr_upload),
@@ -3369,6 +3484,7 @@ impl AppState {
                             confirm_close_pinned,
                             permissions_prompt.as_ref(),
                             overlay_data.as_ref(),
+                            context_menu_overlay.as_ref(),
                         );
                     },
                     None,
@@ -3785,6 +3901,74 @@ impl AppState {
             }
         }
         out
+    }
+
+    /// Dismiss the active context menu and repaint.
+    fn dismiss_context_menu(&mut self) {
+        if self.context_menu.take().is_some() {
+            self.mark_chrome_dirty();
+            self.request_redraw();
+        }
+    }
+
+    /// Route a winit `KeyEvent` to the open context menu. Returns `true`
+    /// if the event was consumed (caller skips all other key sinks).
+    ///
+    /// Up/Down move selection. Enter activates + dismisses. Esc dismisses.
+    /// Any other key dismisses and returns `false` so the key still reaches
+    /// the normal page-mode dispatcher.
+    fn context_menu_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.context_menu.is_none() {
+            return false;
+        }
+        // Only handle key-press, not release.
+        if event.state != winit::event::ElementState::Pressed {
+            return true; // swallow release events while menu is open
+        }
+        let Some(chord) = key_event_to_chord_with_repeat(event, self.modifiers) else {
+            return true; // swallow unmappable keys
+        };
+        let key = chord.key;
+        match key {
+            Key::Named(NamedKey::Esc) => {
+                self.dismiss_context_menu();
+                true
+            }
+            Key::Named(NamedKey::Up) => {
+                if let Some(cm) = self.context_menu.as_mut() {
+                    cm.select_prev();
+                }
+                self.mark_chrome_dirty();
+                self.request_redraw();
+                true
+            }
+            Key::Named(NamedKey::Down) => {
+                if let Some(cm) = self.context_menu.as_mut() {
+                    cm.select_next();
+                }
+                self.mark_chrome_dirty();
+                self.request_redraw();
+                true
+            }
+            Key::Named(NamedKey::CR) => {
+                if let Some(cm) = self.context_menu.take() {
+                    let item = &cm.request.items[cm.selected];
+                    tracing::info!(
+                        target: "buffr::context_menu",
+                        ?item,
+                        "activated"
+                    );
+                    self.mark_chrome_dirty();
+                    self.request_redraw();
+                }
+                true
+            }
+            _ => {
+                // Any other key dismisses the menu but lets the key through.
+                self.dismiss_context_menu();
+                false
+            }
+        }
     }
 
     /// Route a winit `KeyEvent` to the open overlay. Returns `true` if
@@ -5230,6 +5414,7 @@ fn paint_chrome_strips(
     confirm_close_pinned: Option<buffr_core::TabId>,
     permissions_prompt: Option<&PermissionsPrompt>,
     overlay_data: Option<&InputBar>,
+    context_menu: Option<&ContextMenuOverlay>,
 ) {
     let h = height as usize;
 
@@ -5338,6 +5523,12 @@ fn paint_chrome_strips(
             inner_w as usize,
             inner_h as usize,
         );
+    }
+
+    // Context-menu overlay. Rendered last so it floats above all other
+    // chrome layers. Coordinates are clamped by the widget itself.
+    if let Some(menu) = context_menu {
+        menu.paint(buf, w, h);
     }
 }
 
@@ -5828,6 +6019,75 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // testing while the modal is open.
                     return;
                 }
+                // Context-menu click handling: any press dismisses the menu.
+                // A click inside the menu area activates the hovered row
+                // (if any); a click outside just dismisses.
+                if self.context_menu.is_some() && state == Pressed {
+                    let (px, py) = self.osr_cursor;
+                    let size = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.inner_size())
+                        .unwrap_or_default();
+                    let win_w = size.width.max(1);
+                    let win_h = size.height.max(1);
+                    // osr_cursor is browser-region-relative; convert to
+                    // full-window coords by adding the browser y-offset.
+                    let cef_y_offset = self.cef_child_rect(win_w, win_h).1 as i32;
+                    let abs_x = px;
+                    let abs_y = py + cef_y_offset;
+                    if let Some(cm) = self.context_menu.as_ref() {
+                        let overlay = cm.to_overlay(win_w, win_h);
+                        let panel_w = overlay.preferred_width() as i32;
+                        let panel_h = overlay.preferred_height() as i32;
+                        let panel_x = overlay.x.clamp(0, (win_w as i32 - panel_w).max(0));
+                        let panel_y = overlay.y.clamp(0, (win_h as i32 - panel_h).max(0));
+                        // Hit-test: is the click inside the panel?
+                        if abs_x >= panel_x
+                            && abs_x < panel_x + panel_w
+                            && abs_y >= panel_y
+                            && abs_y < panel_y + panel_h
+                        {
+                            // Find which row was clicked.
+                            use buffr_ui::{CONTEXT_MENU_ROW_HEIGHT, CONTEXT_MENU_SEP_HEIGHT};
+                            let mut row_y = panel_y + 1; // skip border pixel
+                            let mut clicked_row: Option<usize> = None;
+                            for (row_idx, entry) in overlay.entries.iter().enumerate() {
+                                let row_h = if entry.is_separator {
+                                    CONTEXT_MENU_SEP_HEIGHT as i32
+                                } else {
+                                    CONTEXT_MENU_ROW_HEIGHT as i32
+                                };
+                                if abs_y >= row_y && abs_y < row_y + row_h {
+                                    if !entry.is_separator {
+                                        clicked_row = Some(row_idx);
+                                    }
+                                    break;
+                                }
+                                row_y += row_h;
+                            }
+                            if let Some(row) = clicked_row {
+                                // Activate by clicking — same as Enter.
+                                let cm = self.context_menu.take().unwrap();
+                                let item = &cm.request.items[row];
+                                tracing::info!(
+                                    target: "buffr::context_menu",
+                                    ?item,
+                                    "activated"
+                                );
+                            } else {
+                                self.dismiss_context_menu();
+                            }
+                        } else {
+                            // Clicked outside — dismiss.
+                            self.dismiss_context_menu();
+                        }
+                    }
+                    self.mark_chrome_dirty();
+                    self.request_redraw();
+                    return;
+                }
+
                 // Back/Forward side buttons → history navigation regardless
                 // of host mode. Intercept before OSR dispatch.
                 if state == Pressed {
@@ -6069,6 +6329,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // request; nothing else is allowed through until the
                 // queue drains.
                 if self.permissions_handle_key(&event) {
+                    return;
+                }
+                // Context-menu overlay: Up/Down/Enter/Esc are consumed.
+                // Other keys dismiss the menu and fall through to normal
+                // key dispatch.
+                if self.context_menu_handle_key(&event) {
                     return;
                 }
                 // Overlay open → all keys route to it.
@@ -6370,6 +6636,23 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             });
             if new_status != self.statusline.hint_state {
                 self.statusline.hint_state = new_status;
+                self.mark_chrome_dirty();
+                self.request_redraw();
+            }
+        }
+
+        // Context-menu: drain any right-click requests. Only the most
+        // recent is shown (earlier ones are dropped — only one menu visible
+        // at a time). Mark chrome dirty so the overlay appears immediately.
+        if let Some(host) = self.host.as_ref() {
+            let requests = host.drain_context_menu_requests();
+            if let Some(req) = requests.into_iter().last() {
+                tracing::debug!(
+                    browser_id = req.browser_id,
+                    items = req.items.len(),
+                    "context_menu: showing overlay"
+                );
+                self.context_menu = Some(ActiveContextMenu::new(req));
                 self.mark_chrome_dirty();
                 self.request_redraw();
             }
