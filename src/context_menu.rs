@@ -165,13 +165,16 @@ impl ContextMenuOverlay {
                 row_bg,
             );
 
-            // Label text, vertically centred in the row.
-            let text_color = if is_selected {
-                FG_SELECTED
-            } else if entry.enabled {
-                FG
-            } else {
+            // Label text, vertically centred in the row. Disabled rows
+            // keep their dimmed text even when highlighted — the bg flips
+            // to BG_SELECTED so the row is still visually picked up by
+            // hover, but the text colour signals "not interactive".
+            let text_color = if !entry.enabled {
                 FG_DISABLED
+            } else if is_selected {
+                FG_SELECTED
+            } else {
+                FG
             };
             let text_y = cursor_y + (row_h - font::glyph_h() as i32) / 2;
             font::draw_text(
@@ -206,8 +209,12 @@ impl ContextMenuOverlay {
         x >= px && x < px + pw && y >= py && y < py + ph
     }
 
-    /// Resolve pixel `(x, y)` to a selectable row index, or `None` if the
-    /// hit lands on a separator, on the border, or outside the panel.
+    /// Resolve pixel `(x, y)` to a row index, or `None` if the hit lands
+    /// on a separator, on the border, or outside the panel.
+    ///
+    /// **Disabled rows are returned by index**, not filtered out — callers
+    /// still want to highlight them on hover for visual continuity. Gate
+    /// activation on the entry's `enabled` flag at the call site.
     pub fn row_at(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> Option<usize> {
         if !self.contains(buf_w, buf_h, x, y) {
             return None;
@@ -221,7 +228,7 @@ impl ContextMenuOverlay {
                 CONTEXT_MENU_ROW_HEIGHT as i32
             };
             if y >= row_y && y < row_y + row_h {
-                if entry.is_separator || !entry.enabled {
+                if entry.is_separator {
                     return None;
                 }
                 return Some(idx);
@@ -341,5 +348,32 @@ mod tests {
         assert_eq!(m.row_at(800, 600, px + 10, row2_y), Some(2));
         // Outside panel.
         assert_eq!(m.row_at(800, 600, 0, 0), None);
+    }
+
+    #[test]
+    fn row_at_returns_disabled_rows_for_hover_continuity() {
+        // Disabled rows should still resolve via row_at so callers can
+        // highlight them on hover; activation gating happens at the call
+        // site. Only separators / outside hits return None.
+        let m = ContextMenuOverlay {
+            entries: vec![
+                ContextMenuEntry {
+                    label: "Back".into(),
+                    is_separator: false,
+                    enabled: false, // disabled
+                },
+                ContextMenuEntry {
+                    label: "Reload".into(),
+                    is_separator: false,
+                    enabled: true,
+                },
+            ],
+            selected: 1,
+            x: 10,
+            y: 10,
+        };
+        let (px, py, _, _) = m.panel_rect(800, 600);
+        let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
+        assert_eq!(m.row_at(800, 600, px + 10, row0_y), Some(0));
     }
 }

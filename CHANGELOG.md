@@ -14,8 +14,15 @@ All notable changes to `buffr-ui` are documented here. Format follows
   the right-click menu surfaced by `buffr-core`'s `ContextMenuHandler`.
 - **`ContextMenuOverlay` hit-test helpers: `panel_rect`, `contains`, `row_at`.**
   Mirror the clamp logic in `paint`, so callers can hit-test the same pixels
-  that render. `row_at` returns `None` for separators / disabled rows / outside
-  the panel.
+  that render. `row_at` returns `None` only for separators / outside the panel —
+  disabled rows still resolve so callers can highlight them on hover; gate
+  activation at the call site.
+
+### Changed
+
+- **Disabled menu rows keep their dimmed text colour even when highlighted.**
+  Hover now flips the row background to the selected colour for visual
+  continuity, but the text stays `FG_DISABLED` to signal "not interactive".
 
 ## [0.1.2] — 2026-05-03
 
