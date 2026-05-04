@@ -6,6 +6,13 @@ All notable changes to `buffr-ui` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`context_menu` module: `ContextMenuOverlay` widget.** Floating panel
+  rendered at click coords (clamped to viewport) with per-row highlight,
+  separator hairlines, and disabled-item dimming. Used by `apps/buffr` to render
+  the right-click menu surfaced by `buffr-core`'s `ContextMenuHandler`.
+
 ## [0.1.2] — 2026-05-03
 
 ### Changed

@@ -13,6 +13,7 @@
 use buffr_modal::PageMode;
 
 pub mod confirm_prompt;
+pub mod context_menu;
 pub mod download_notice;
 pub mod font;
 pub mod input_bar;
@@ -20,6 +21,10 @@ pub mod permissions_prompt;
 pub mod tab_strip;
 
 pub use confirm_prompt::{CONFIRM_PROMPT_HEIGHT, ConfirmPrompt, ConfirmRect, rect_contains};
+pub use context_menu::{
+    CONTEXT_MENU_MIN_WIDTH, CONTEXT_MENU_PADDING_X, CONTEXT_MENU_ROW_HEIGHT,
+    CONTEXT_MENU_SEP_HEIGHT, ContextMenuEntry, ContextMenuOverlay,
+};
 pub use download_notice::{DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip};
 pub use input_bar::{
     INPUT_HEIGHT, InputBar, MAX_SUGGESTIONS, Palette as InputPalette, SUGGESTION_ROW_HEIGHT,
