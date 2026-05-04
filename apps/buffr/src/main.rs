@@ -29,6 +29,19 @@ use std::time::{Duration, Instant};
 /// the window, so there is no visual regression.
 const CEF_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Grace period after a `WindowEvent::Focused(false)` before the OSR paint
+/// pipeline is put to sleep.  Absorbs alt-tab thrash (focus lost then
+/// immediately regained) without emitting spurious sleep/wake cycles that
+/// would produce a flickery on_paint burst on every fast alt-tab.
+const FOCUS_BLUR_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// How often the media-activity probe JS is fired while the window is
+/// unfocused.  Two seconds balances detection latency against JS-execution
+/// overhead.  The CEF AudioHandler fires immediately on stream start/stop,
+/// so the probe is only needed for `navigator.mediaSession` and fullscreen
+/// video — both of which rarely change state at sub-second granularity.
+const MEDIA_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How long the resize-paint watchdog waits for CEF to produce an
 /// `on_paint` at the expected (post-resize) dims before firing a
 /// force-repaint nudge.  500 ms is long enough to survive a slow
@@ -1942,6 +1955,45 @@ struct AppState {
     /// redraw was queued so the next paint reconciles renderer dims to
     /// the live window dims.
     surface_drifted: bool,
+
+    // ── OSR sleep policy (phase 1 — single window) ───────────────────────────
+    //
+    // When #18 (multi-window) lands these fields move into a per-WindowState.
+    /// True while the OS reports the window has focus.  Updated by the
+    /// `WindowEvent::Focused` handler (immediately on focus-in; via
+    /// `focus_deadline` debounce on focus-out).
+    focused: bool,
+    /// Non-None while a focus-loss is pending debounce.  Set to
+    /// `Instant::now() + FOCUS_BLUR_DEBOUNCE` on `Focused(false)`;
+    /// cleared immediately on `Focused(true)` or when `about_to_wait`
+    /// sees the deadline elapse.
+    focus_deadline: Option<Instant>,
+    /// True when the CEF audio handler has at least one active stream in
+    /// any browser, OR when the last JS media probe returned `true`.
+    /// Keeps the paint pipeline alive while the window is unfocused.
+    media_active: bool,
+    /// Deadline for the next media-probe JS fire.  `None` until the first
+    /// probe is scheduled; reset to `now + MEDIA_PROBE_INTERVAL` after
+    /// each fire so the probe runs at steady cadence while unfocused.
+    media_probe_next: Option<Instant>,
+    /// Current paint policy.  Transitions trigger `osr_sleep` / `osr_sleep(false)`
+    /// on the host.  Starts `Active` so the window paints immediately on launch.
+    paint_policy: PaintPolicy,
+}
+
+/// OSR paint policy for the window.
+///
+/// `Active` — CEF paints normally; wgpu presents each frame.
+/// `Sleeping` — `was_hidden(1)` paused the CEF paint scheduler; the
+///   `paint_chrome_with` fast-exit guard skips wgpu present.
+///
+/// Transitions are managed by `AppState::recompute_paint_policy` in
+/// `about_to_wait`.  When #18 (multi-window) lands, this moves into a
+/// per-`WindowState` struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintPolicy {
+    Active,
+    Sleeping,
 }
 
 /// Edit-mode focus state machine.
@@ -2117,6 +2169,11 @@ impl AppState {
             loading_anim_next_wake: None,
             resize_paint_watchdog: ResizePaintWatchdog::default(),
             surface_drifted: false,
+            focused: true,
+            focus_deadline: None,
+            media_active: false,
+            media_probe_next: None,
+            paint_policy: PaintPolicy::Active,
         }
     }
 
@@ -2141,6 +2198,45 @@ impl AppState {
     /// Mark the chrome texture as needing a repaint.
     fn mark_chrome_dirty(&mut self) {
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
+    }
+
+    /// Recompute the paint policy from current `focused` + `media_active`
+    /// state and apply a transition if needed.
+    ///
+    /// Called from:
+    /// - `about_to_wait` after draining audio events and checking focus deadline.
+    /// - `WindowEvent::Focused(true)` (immediate wake).
+    ///
+    /// On Active→Sleeping: calls `host.osr_sleep(true)`.
+    /// On Sleeping→Active: calls `host.osr_sleep(false)` + `host.osr_invalidate_view()`
+    ///   + `window.request_redraw()`.
+    fn recompute_paint_policy(&mut self) {
+        let new_policy = decide_paint_policy(self.focused, self.media_active);
+        if new_policy == self.paint_policy {
+            return;
+        }
+        tracing::debug!(
+            focused = self.focused,
+            media_active = self.media_active,
+            old = ?self.paint_policy,
+            new = ?new_policy,
+            "paint_policy transition"
+        );
+        self.paint_policy = new_policy;
+        if let Some(host) = self.host.as_ref() {
+            match new_policy {
+                PaintPolicy::Sleeping => {
+                    host.osr_sleep(true);
+                }
+                PaintPolicy::Active => {
+                    host.osr_sleep(false);
+                    host.osr_invalidate_view();
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+        }
     }
 
     /// Current device scale factor. Reads winit's `scale_factor()` when the
@@ -2752,6 +2848,17 @@ impl AppState {
     /// the moment `WindowEvent::Resized` fires; passing the event's
     /// `new_size` directly avoids painting at stale width/height.
     fn paint_chrome_with(&mut self, override_size: Option<(u32, u32)>) {
+        // OSR sleep guard: skip the wgpu present while CEF is paused.
+        //
+        // The `surface_drifted` exception is CRITICAL for #17 integration:
+        // if Hyprland sends a configure while we are sleeping, the stale
+        // buffer has the wrong dims and the compositor letterboxes it.
+        // Letting the resize self-heal paint through (surface_drifted=true
+        // is set by the Resized handler) keeps the surface dimensions
+        // consistent even while the paint loop is otherwise paused.
+        if self.paint_policy == PaintPolicy::Sleeping && !self.surface_drifted {
+            return;
+        }
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -5304,6 +5411,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let w = new_size.width.max(1);
                 let h = new_size.height.max(1);
                 self.mark_chrome_dirty();
+                // Option A (issue #17 / sleep integration): set surface_drifted
+                // so the sleep guard in paint_chrome_with lets the resize paint
+                // through even while OSR is paused.  Without this the compositor
+                // keeps a stale-sized buffer and produces a persistent letterbox.
+                self.surface_drifted = true;
                 self.paint_chrome_with(Some((w, h)));
             }
             WindowEvent::Moved(pos) => {
@@ -5336,12 +5448,27 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
-            WindowEvent::Focused(_focused) => {
+            WindowEvent::Focused(focused) => {
                 // OS-level window focus is intentionally NOT forwarded
                 // to CEF. CEF focus tracks buffr's modal state instead
                 // (Insert = focused, Normal = unfocused). This stops
                 // pages losing input state when the user alt-tabs or
                 // brings up another window.
+                //
+                // OSR sleep policy: focus-in wakes immediately; focus-out
+                // starts a 200 ms debounce so alt-tab thrash (lose+regain
+                // within the grace window) does not produce a sleep/wake
+                // cycle and the associated on_paint burst.
+                if focused {
+                    self.focused = true;
+                    self.focus_deadline = None;
+                    self.recompute_paint_policy();
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                } else {
+                    self.focus_deadline = Some(Instant::now() + FOCUS_BLUR_DEBOUNCE);
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(host) = self.host.as_ref() {
@@ -5839,6 +5966,54 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // exit from Insert mode now.
         self.expire_pending_blur();
 
+        // OSR sleep policy: process focus-blur debounce and audio events.
+        // Must run before policy changes affect the rest of the tick.
+        {
+            // 1. Expire focus debounce: if the grace window after Focused(false)
+            //    elapsed without a Focused(true) arriving, commit focus=false.
+            if self
+                .focus_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.focused = false;
+                self.focus_deadline = None;
+            }
+
+            // 2. Drain audio events from BuffrAudioHandler.
+            if let Some(host) = self.host.as_ref() {
+                let events = host.drain_audio_events();
+                if !events.is_empty() {
+                    // Recompute media_active from the authoritative snapshot.
+                    self.media_active = host.any_audio_active();
+                    tracing::debug!(
+                        media_active = self.media_active,
+                        event_count = events.len(),
+                        "audio events drained"
+                    );
+                }
+
+                // 3. Fire the JS media probe while unfocused so navigator.mediaSession
+                //    and fullscreen-video changes are detected at ~2 s cadence.
+                //    Phase-1: relies on AudioHandler for audio; probe covers
+                //    mediaSession/fullscreen.  The result is written to
+                //    window.__buffr_media_active but we cannot read it back
+                //    synchronously (execute_java_script is fire-and-forget in
+                //    cef-rs).  The probe is still fired so it primes the property
+                //    for a future phase-2 reader.
+                if !self.focused {
+                    let now = Instant::now();
+                    let due = self.media_probe_next.map(|t| now >= t).unwrap_or(true);
+                    if due {
+                        host.run_media_probe();
+                        self.media_probe_next = Some(now + MEDIA_PROBE_INTERVAL);
+                    }
+                }
+            }
+
+            // 4. Recompute paint policy and apply transitions.
+            self.recompute_paint_policy();
+        }
+
         // Engine ambiguity timeout: if a single-chord prefix is
         // sitting on the buffer past the timeout window, fire the
         // shorter binding. This is the vim `&timeoutlen` behaviour.
@@ -6233,9 +6408,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // expected (post-resize) dims within RESIZE_PAINT_WATCHDOG_TIMEOUT,
         // nudge it via a was_hidden cycle — the same repaint trigger the
         // tab-switch workaround relies on.
-        if self
-            .resize_paint_watchdog
-            .should_force_repaint(Instant::now())
+        //
+        // Guard: skip while sleeping.  `force_repaint_active` cycles
+        // was_hidden(1)→was_hidden(0) — if CEF is already was_hidden(1) via
+        // osr_sleep, the cycle would wake it spuriously and fight the sleep
+        // policy.  The watchdog is harmless to skip while paused because CEF
+        // isn't painting anyway and the watchdog's purpose (un-stick a stale
+        // paint) is moot.
+        if self.paint_policy == PaintPolicy::Active
+            && self
+                .resize_paint_watchdog
+                .should_force_repaint(Instant::now())
         {
             if let Some(host) = self.host.as_ref() {
                 let r = self.resize_paint_watchdog.retry_count();
@@ -6300,6 +6483,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // If the resize-paint watchdog is armed, wake up no later than its
         // deadline so the force-repaint nudge fires on time.
         let deadline = match self.resize_paint_watchdog.deadline() {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        };
+        // Focus-blur debounce: if a debounce is pending, wake up no later
+        // than its deadline so the sleep transition fires promptly after
+        // the grace window expires (alt-tab detection without busy-wait).
+        let deadline = match self.focus_deadline {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        };
+        // Media probe: if a probe fire is due, ensure we wake up to dispatch it.
+        let deadline = match self.media_probe_next {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
@@ -6403,6 +6598,26 @@ fn physical_wheel_to_dip(dx_phys: i32, dy_phys: i32, scale: f32) -> (i32, i32) {
     let dx = ((dx_phys as f32) / scale).round() as i32;
     let dy = ((dy_phys as f32) / scale).round() as i32;
     (dx, dy)
+}
+
+// ---------------------------------------------------------------------------
+// OSR sleep policy helpers
+// ---------------------------------------------------------------------------
+
+/// Pure policy decision: should the window's OSR paint pipeline be active?
+///
+/// `Active` when the window has OS-level focus OR media is playing.
+/// `Sleeping` only when both are false — no focus and no media.
+///
+/// All callers must route through this function; no inline duplication of
+/// the predicate is allowed.  Tests pin the semantics so future refactors
+/// can't silently change the rule.
+fn decide_paint_policy(focused: bool, media_active: bool) -> PaintPolicy {
+    if focused || media_active {
+        PaintPolicy::Active
+    } else {
+        PaintPolicy::Sleeping
+    }
 }
 
 /// Pure paint-path decision. All callers must route through this function;
@@ -6759,6 +6974,32 @@ fn should_show_loading_anim(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    // ---- OSR sleep policy tests --------------------------------------------
+
+    #[test]
+    fn paint_policy_focused_no_media() {
+        // Focused with no media → Active.
+        assert_eq!(decide_paint_policy(true, false), PaintPolicy::Active);
+    }
+
+    #[test]
+    fn paint_policy_unfocused_no_media() {
+        // Unfocused with no media → Sleeping.
+        assert_eq!(decide_paint_policy(false, false), PaintPolicy::Sleeping);
+    }
+
+    #[test]
+    fn paint_policy_unfocused_with_media() {
+        // Unfocused but media playing → Active (media keeps window awake).
+        assert_eq!(decide_paint_policy(false, true), PaintPolicy::Active);
+    }
+
+    #[test]
+    fn paint_policy_focused_with_media() {
+        // Focused and media playing → Active.
+        assert_eq!(decide_paint_policy(true, true), PaintPolicy::Active);
+    }
 
     #[test]
     fn cli_help_renders() {
