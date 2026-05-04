@@ -2994,6 +2994,24 @@ impl AppState {
             || self.surface_drifted
             || host_is_loading;
 
+        // Idle short-circuit. If nothing has changed since the last paint —
+        // chrome buffer up to date, no fresh CEF paint queued, no animation
+        // pending, and the loading-anim flag is already in sync (so we won't
+        // miss a deactivation chrome-clear) — skip the present entirely.
+        // Without this guard, every spurious winit RedrawRequested (cursor
+        // motion outside the window, compositor frame callback after a
+        // no-op present, periodic poll wakeups in `about_to_wait`) burns a
+        // full wgpu acquire+submit+present cycle re-uploading bytes the GPU
+        // already has, which manifests as a 6 Hz spin under Wayland's
+        // frame-callback coalescing on visible-but-idle pages.
+        if !chrome_dirty
+            && osr_meta.is_none()
+            && !want_anim
+            && want_anim == self.loading_anim_active
+        {
+            return;
+        }
+
         // Detect the animation→OSR transition. While the animation was
         // active, the chrome buffer had OPAQUE animation pixels painted
         // into the browser region (the chrome quad composites on top of
