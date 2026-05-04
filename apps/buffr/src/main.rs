@@ -3384,13 +3384,22 @@ impl AppState {
             );
         }
 
-        // Probe-pending is cleared here regardless of the present outcome.
-        // The actual heuristic decision happens in the next frame's
-        // top-of-paint `poll_present_stats` once the worker reports the
-        // probe present's `present_us`.
+        // Observe THIS frame's submit_done_us: when wgpu's GPU queue is
+        // backpressured by the compositor, queue.write_texture and
+        // queue.submit block on the UI thread (chrome_us / osr_us / submit_us
+        // ballooning to seconds).  This is a same-frame signal that catches
+        // occlusion modes the lagged present_us misses entirely (observed
+        // chrome_us=4.6 s with present_us_prev=164 µs — present looked
+        // healthy, but the very next chrome upload blocked).
+        let probe_was_pending = self.probe_pending;
         self.probe_pending = false;
-        if let Err(err) = res {
-            warn!(error = %err, "wgpu frame failed");
+        match res {
+            Ok(stats) => {
+                self.observe_present_us(stats.submit_done_us, probe_was_pending);
+            }
+            Err(err) => {
+                warn!(error = %err, "wgpu frame failed");
+            }
         }
 
         // Surface-drift detection. We just presented a buffer at

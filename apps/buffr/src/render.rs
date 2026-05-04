@@ -224,7 +224,7 @@ fn present_worker(
         let present_us = t_present_start.elapsed().as_micros() as u64;
         // Ignore send errors — the UI thread may have dropped its receiver
         // during shutdown.
-        let _ = tx.send(FrameStats { present_us });
+        let _ = tx.send(FrameStats { present_us, submit_done_us: 0 });
     }
 }
 
@@ -545,7 +545,7 @@ impl Renderer {
             chrome_lw,
             chrome_lh,
             present_chan,
-            last_present_stats: FrameStats { present_us: 0 },
+            last_present_stats: FrameStats::default(),
         })
     }
 
@@ -801,7 +801,7 @@ impl Renderer {
                         tracing::warn!(
                             "wgpu surface: get_current_texture timed out, skipping frame"
                         );
-                        return Ok(FrameStats { present_us: 0 });
+                        return Ok(FrameStats::default());
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
                         return Err(anyhow::anyhow!("wgpu surface OOM"));
@@ -819,11 +819,11 @@ impl Renderer {
                             actual_h = actual.1,
                             "wgpu surface: still mismatched after retry — skipping frame"
                         );
-                        return Ok(FrameStats { present_us: 0 });
+                        return Ok(FrameStats::default());
                     }
                     f
                 }
-                Err(_) => return Ok(FrameStats { present_us: 0 }),
+                Err(_) => return Ok(FrameStats::default()),
             }
         };
 
@@ -929,7 +929,10 @@ impl Renderer {
             );
         }
 
-        Ok(self.last_present_stats)
+        Ok(FrameStats {
+            present_us: self.last_present_stats.present_us,
+            submit_done_us,
+        })
     }
 }
 
@@ -960,12 +963,21 @@ impl Drop for Renderer {
 /// compositor stopped showing our surface (Wayland workspace switch,
 /// minimize, fully covered window) on platforms where winit doesn't
 /// fire `WindowEvent::Occluded` reliably.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FrameStats {
     /// Microseconds spent inside `wgpu::SurfaceTexture::present()`.
     /// Healthy: <16 ms.  Compositor-throttled invisible surface:
-    /// 100 ms – 1.5 s.
+    /// 100 ms – 1.5 s.  Carries the PREVIOUS frame's present time
+    /// (one-frame lag because present is async on the worker thread).
     pub present_us: u64,
+    /// Microseconds spent on the UI thread inside `frame()` doing the
+    /// chrome paint, OSR upload, surface acquire, and command-buffer
+    /// submit — everything before the texture is handed to the worker.
+    /// Healthy: <16 ms.  When the compositor backpressures the GPU
+    /// queue, `queue.write_texture` and friends inherit the same block
+    /// and `submit_done_us` balloons to seconds — a SAME-frame signal
+    /// that complements the lagged `present_us`.
+    pub submit_done_us: u64,
 }
 
 fn make_texture(
