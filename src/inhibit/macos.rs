@@ -18,6 +18,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+// `TCFType` brings `as_CFTypeRef` into scope. The `as_concrete_TypeRef`
+// method on this trait is unreliable when multiple core-foundation versions
+// coexist in the dep tree (wgpu pulls 0.9; we use 0.10) — fall back to
+// `as_CFTypeRef` + a pointer cast.
+#[allow(unused_imports)]
+use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
 
 use super::{IdleInhibitor, InhibitError};
@@ -102,11 +108,16 @@ impl IdleInhibitor for MacosInhibitor {
         let assertion_name = CFString::new("buffr video playback");
 
         let mut id: IOPMAssertionID = 0;
+        // Two `core-foundation` versions coexist in the dep tree (0.9 from
+        // wgpu/winit, 0.10 from us), which makes `TCFType::as_concrete_TypeRef`
+        // resolution fail on macOS even with the trait imported. Use
+        // `as_CFTypeRef` (returns CFTypeRef = *const c_void) and cast to
+        // CFStringRef = *const __CFString — same opaque pointer at runtime.
         let ret = unsafe {
             IOPMAssertionCreateWithName(
-                assertion_type.as_concrete_TypeRef(),
+                assertion_type.as_CFTypeRef() as CFStringRef,
                 K_IOPM_ASSERTION_LEVEL_ON,
-                assertion_name.as_concrete_TypeRef(),
+                assertion_name.as_CFTypeRef() as CFStringRef,
                 &mut id,
             )
         };

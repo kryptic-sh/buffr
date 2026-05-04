@@ -85,7 +85,11 @@ pub fn new_inhibitor(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, Inhi
 /// No-op fallback for unsupported platforms.
 ///
 /// `acquire` / `release` always return `Ok`; `is_active` is always `false`.
-/// Used by platform stubs until the real impl lands.
+/// Used by Linux as the fall-through when neither Wayland nor X11 is detected,
+/// and by the catch-all branch in `new_inhibitor` for unknown OSes.
+/// Unused on macOS / Windows (where the dispatcher always picks the real impl)
+/// — `allow(dead_code)` keeps `-D warnings` happy on those targets.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct NoopInhibitor;
 
