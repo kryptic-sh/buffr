@@ -498,6 +498,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-sys",
+ "windows-sys 0.59.0",
  "winit",
  "zbus",
 ]
