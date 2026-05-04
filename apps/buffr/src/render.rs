@@ -35,6 +35,7 @@
 //! compositor holds the buffer for an occluded surface).
 
 use std::iter::once;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -480,11 +481,16 @@ fn render_worker(
 /// All heavy GPU work is delegated to the render worker thread via
 /// `RenderChannel`.
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    // ManuallyDrop so the Drop impl can choose to leak these when the
+    // render worker is stuck mid-present (Wayland backpressure). Dropping
+    // wgpu::Surface while a SurfaceTexture is still owned by the worker
+    // panics: "Surface cannot be destroyed because is still in use".
+    surface: ManuallyDrop<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     // Arc-shared device: UI thread uses it for surface.configure() on resize;
     // the worker thread holds the same Arc for all GPU operations.
-    device: Arc<wgpu::Device>,
+    // ManuallyDrop for the same shutdown-leak reason as `surface`.
+    device: ManuallyDrop<Arc<wgpu::Device>>,
 
     /// Physical surface width/height (wgpu swap-chain size).
     width: u32,
@@ -772,9 +778,9 @@ impl Renderer {
         };
 
         Ok(Self {
-            surface,
+            surface: ManuallyDrop::new(surface),
             config,
-            device,
+            device: ManuallyDrop::new(device),
             width,
             height,
             chrome_lw,
@@ -1065,32 +1071,49 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Close the channel so the worker's recv() loop exits when it
-        // returns from whatever GPU call it's currently in.
-        //
-        // We can't move out of `self` in Drop, so swap the sender with
-        // a fresh disconnected one and drop the original.
+        // Close the cmd channel so the worker's recv() loop exits as
+        // soon as it returns from whatever GPU call it's currently in.
         let (dummy_tx, _dummy_rx) = std::sync::mpsc::sync_channel(0);
         let real_tx = std::mem::replace(&mut self.render_chan.tx_cmd, dummy_tx);
         drop(real_tx);
 
-        // Do NOT join. The worker may be stuck inside a multi-second
-        // `present()` call when the Wayland compositor backpressures the
-        // surface (workspace switch on Hyprland). Joining there would
-        // block shutdown — exactly the hang we observed before.
-        //
-        // Instead, drop the JoinHandle (auto-detaches the thread) and
-        // let the worker exit on its own time. The process is shutting
-        // down anyway; OS reaps the thread on exit. wgpu Device + Surface
-        // are internally Arc'd, so the worker's outstanding references
-        // keep them alive until present returns.
+        // Drain any final stats the worker sent — this also decrements
+        // frames_in_flight, so the "no outstanding present" branch can
+        // pick up frames that completed between our last poll and now.
+        while self.render_chan.rx_stats.try_recv().is_ok() {
+            self.frames_in_flight = self.frames_in_flight.saturating_sub(1);
+        }
+
+        if self.frames_in_flight == 0 {
+            // Worker is idle. Join cleanly, then drop wgpu state normally.
+            if let Some(h) = self.render_chan.handle.take() {
+                let _ = h.join();
+            }
+            // SAFETY: nothing else aliases `surface` / `device`; called once
+            // in Drop; ManuallyDrop ensures no double-free.
+            unsafe {
+                ManuallyDrop::drop(&mut self.surface);
+                ManuallyDrop::drop(&mut self.device);
+            }
+            return;
+        }
+
+        // Worker is mid-present. Joining would block multi-seconds on
+        // Wayland compositor backpressure (observed 4.7 s on Hyprland
+        // workspace switch). Detach the thread AND leak surface + device:
+        // the worker still owns a SurfaceTexture borrowing from Surface,
+        // so dropping Surface here would panic with "Surface cannot be
+        // destroyed because is still in use". Leaking is fine — process
+        // is exiting; OS reaps the thread and reclaims GPU resources.
+        tracing::debug!(
+            in_flight = self.frames_in_flight,
+            "renderer drop: worker mid-present, detaching + leaking wgpu state"
+        );
         if let Some(h) = self.render_chan.handle.take() {
-            tracing::debug!(
-                in_flight = self.frames_in_flight,
-                "renderer drop: detaching wgpu-render worker (no join)"
-            );
             drop(h);
         }
+        // surface and device intentionally NOT dropped (ManuallyDrop never
+        // gets its inner Drop invoked).
     }
 }
 
