@@ -220,6 +220,20 @@ See
 [`crates/buffr-permissions/README.md`](../crates/buffr-permissions/README.md)
 for the decision-precedence rules.
 
+## Mouse / context menu
+
+| Gesture / input         | Action                                                                                             |
+| ----------------------- | -------------------------------------------------------------------------------------------------- |
+| Right-click (page area) | Open context menu. Items depend on the hit-test target (see [context-menu.md](./context-menu.md)). |
+| `<Up>` / `<Down>`       | Move row selection in the open menu.                                                               |
+| `<Enter>`               | Activate selected menu item.                                                                       |
+| `<Esc>`                 | Dismiss menu without action.                                                                       |
+| Click outside panel     | Dismiss menu without action.                                                                       |
+| Any non-navigation key  | Dismiss menu and pass key to normal page-mode dispatcher.                                          |
+| Left-click (tab strip)  | Switch tab and close the omnibar overlay (parity with `gt`/`gT`).                                  |
+| Two-finger swipe right  | `HistoryBack` (≥ 150 px horizontal, 2× more horiz than vertical).                                  |
+| Two-finger swipe left   | `HistoryForward` (same threshold).                                                                 |
+
 ## Vieb chords intentionally NOT mapped
 
 The following Vieb normal-mode actions have no buffr `PageAction` equivalent and

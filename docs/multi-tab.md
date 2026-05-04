@@ -102,3 +102,32 @@ naturally when the tab regains focus. The injected hint JS is scoped to the
 active main frame, so other tabs cannot see it. Find-in-page survives tab
 switches because the query is stashed on the inactive tab's
 `TabSession.find_query`.
+
+## OSR sleep on occlusion
+
+Shipped in v0.3.0. When the buffr window is hidden behind other windows or on an
+inactive workspace, CEF's paint scheduler pauses and the wgpu present pipeline
+short-circuits — eliminating the CPU/GPU spin on hidden workspaces.
+
+**Trigger:** `WindowEvent::Occluded(true)` from winit calls
+`BrowserHost::osr_sleep`, which in turn calls `was_hidden(true)` on the active
+tab's CEF browser host. The wgpu frame loop skips `get_current_texture()` and
+`present()` while sleep is active.
+
+**Heuristic fallback:** Hyprland and some other compositors do not fire
+`Occluded` on workspace switches. A `present_us` watchdog kicks in after:
+
+- 1 frame taking > 500 ms, **or**
+- 3 of the last 5 frames taking > 100 ms.
+
+When the heuristic trips, the render thread applies the same `osr_sleep` path as
+a real `Occluded` event. Sleep clears on `WindowEvent::Occluded(false)` or on
+any user input that reaches the window.
+
+**`Ctrl+C` during sleep** is handled: the `ctrlc` crate dispatches
+`BuffrUserEvent::Shutdown` via `EventLoopProxy::send_event`, waking winit
+immediately rather than waiting for compositor activity.
+
+Note: `was_hidden` on the active tab preserves audio playback (CEF 147 behaviour
+on Linux). Background tabs already called `was_hidden(true)` at switch time; OSR
+sleep is additive on top of that.

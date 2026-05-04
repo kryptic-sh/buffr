@@ -8,6 +8,7 @@
 - [Keymap](./keymap.md)
 - [Multi-tab](./multi-tab.md)
 - [Hint mode](./hint-mode.md)
+- [Context menu](./context-menu.md)
 - [Updates](./updates.md)
 - [Privacy](./privacy.md)
 - [Accessibility](./accessibility.md)

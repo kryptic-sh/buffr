@@ -24,8 +24,8 @@ batch of chrome — statusline today, tab strip + command line later in Phase 3.
 ## Decision — Option C with `wgpu` OSR on Linux and macOS
 
 CEF paints the page into an off-screen buffer, then the app composites that
-buffer plus the tab strip, overlays, and statusline into the same `winit`
-window with `wgpu`. Windows still uses the native child-window path for now.
+buffer plus the tab strip, overlays, and statusline into the same `winit` window
+with `wgpu`. Windows still uses the native child-window path for now.
 
 Linux needs OSR because X11/XWayland child-window embedding is not supported.
 macOS also uses OSR because AppKit child views do not layer predictably with
@@ -63,8 +63,36 @@ resize events.
   where `overlay_h` is `INPUT_HEIGHT + dropdown_rows * STATUSLINE_HEIGHT` when
   an overlay is open, `0` otherwise. In OSR mode this rect becomes the CEF
   `view_rect` and the renderer composites the painted buffer at the same
-  position. Whenever overlays open or close, the app re-issues the resize so
-  CEF re-flows the page area.
+  position. Whenever overlays open or close, the app re-issues the resize so CEF
+  re-flows the page area.
 - Renderer surface: a single `wgpu` surface sized to the full window. Each frame
   composites the page, tab strip, statusline, overlays, hints, and popups in one
   pass.
+
+## Update — 2026-05-03
+
+**Dedicated `wgpu-render` worker thread** (v0.3.0).
+
+All `wgpu` mutating calls now run on a dedicated `wgpu-render` worker thread.
+The UI thread does only:
+
+1. `surface.get_current_texture()` — acquire the swapchain image.
+2. Chrome paint closure (CPU-only rasterize of tab strip / statusline).
+3. OSR pixel `memcpy` into a staging buffer.
+4. `try_send(RenderCommand)` over a capacity-1 mailbox channel.
+
+The worker thread handles `queue.write_texture`, `queue.submit`, and
+`surface_texture.present()`. This decouples the UI event loop from Wayland
+compositor backpressure: `present()` was previously blocking the main thread for
+multiple seconds on Hyprland workspace switches, causing perceived freezes.
+
+Additional constraints introduced alongside the worker:
+
+- `frames_in_flight` counter gates `get_current_texture()` — only one acquired
+  `SurfaceTexture` outstanding at a time (`desired_maximum_frame_latency = 1`).
+- `Renderer::drop` wraps `surface` and `device` in `ManuallyDrop`; when the
+  worker is mid-`present()` during shutdown, the wgpu state is leaked rather
+  than triggering a "Surface in use" panic.
+- `resize()` defers `surface.configure()` into a `pending_resize` slot when the
+  worker holds an outstanding `SurfaceTexture`; the next `frame()` applies it
+  once the worker drains.

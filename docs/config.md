@@ -100,6 +100,37 @@ The full default keymap lives in [`keymap.md`](./keymap.md).
 
 Anything else surfaces a validation error pointing at the offending key.
 
+### `[idle_inhibit]`
+
+Keeps the screen awake while video (or optionally audio) is playing in the
+focused window. Backed by four platform implementations:
+
+- **Linux Wayland** — `zwp_idle_inhibit_manager_v1` protocol.
+- **Linux X11** — `org.freedesktop.ScreenSaver.Inhibit` over D-Bus.
+- **macOS** — `IOPMAssertionCreateWithName(NoDisplaySleepAssertion)`.
+- **Windows** — `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` on a worker
+  thread.
+
+The inhibitor is acquired and released at runtime; no restart needed.
+
+> **Note (v0.3.0):** The JS→Rust read-back path for `__buffr_video_active` is
+> scaffolded but not yet wired end-to-end. The section parses and the inhibitor
+> plumbing compiles on all platforms, but the inhibitor will not activate until
+> the signal path lands in a future release.
+
+| Key                  | Type | Default | Notes                                                                                                                                                                           |
+| -------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`            | bool | `true`  | Master switch. `false` disables the feature entirely — no inhibitor is ever acquired.                                                                                           |
+| `inhibit_audio_only` | bool | `false` | When `true`, audio-only activity (no video) also triggers the inhibitor.                                                                                                        |
+| `require_focus`      | bool | `true`  | When `true`, the inhibitor is held only while the buffr window has OS-level focus. Set to `false` to inhibit even when the window is in the background (useful for PiP setups). |
+
+```toml
+[idle_inhibit]
+enabled = true
+inhibit_audio_only = false
+require_focus = true
+```
+
 ## Hot reload
 
 The watcher uses `notify` with a 250ms debounce. On a successful reload, the
