@@ -8,6 +8,47 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-05
+
+### Added
+
+- **Right-click context menu** (#23). Custom-rendered overlay
+  (`buffr-ui::ContextMenuOverlay`) replaces Chromium's native menu while still
+  driven by CEF's `ContextMenuHandler`. Items are bucketed by hit-test (page /
+  link / image / media / editable / selection), with full action wiring
+  including:
+  - **Frame edit ops**: undo, redo, cut, copy, paste, paste-plain, delete,
+    select-all — dispatched per-frame via CEF's `cef_frame_t` edit commands.
+  - **Image ops**: copy URL, save image (off-thread fetch + PNG transcode for
+    clipboard), open image in new tab, rotate clockwise / counter-clockwise.
+  - **Media ops** (video / audio): play/pause, mute, loop, controls,
+    picture-in-picture — JS injection via `document.elementFromPoint` with
+    `querySelector` fallback for sites where the click target is a sibling (not
+    ancestor) of the `<video>` element. Picture-in-picture currently no-ops on
+    YouTube due to a transient-user-activation gap (tracked in #31).
+  - **Page ops**: view source (`buffr-src:` prefix), reload, hard-reload, print,
+    inspect element with hit-point.
+  - **Tab strip click** now closes the omnibar overlay (parity with `gt`/`gT`
+    once those gain non-Normal-mode bindings).
+- **`buffr-src:` URL prefix** as the user-facing alias for Chromium's
+  `view-source:`. Navigations to `buffr-src:<url>` rewrite to
+  `view-source:<url>` at the CEF boundary; the omnibar / tab strip / session
+  file see the buffr-flavored prefix uniformly.
+
+### Fixed
+
+- **Transparent OSR background on pages without a CSS body bg.**
+  `BrowserSettings.background_color` was unset (= 0), which CEF treats as
+  fully-transparent painting for windowless browsers; pages like `buffr-src:` /
+  `view-source:` showed the wgpu clear colour through the OSR quad. Now opaque
+  white, matching standard browser behaviour.
+- **DevTools windows** now close on shutdown so the host process exits cleanly
+  instead of hanging on the DevTools child window (#27).
+
+### Changed
+
+- `buffr-core` 0.4.0 → 0.5.0; `buffr-ui` 0.1.2 → 0.2.0.
+
 ## [0.3.0] - 2026-05-04
 
 ### Added
@@ -545,7 +586,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.0

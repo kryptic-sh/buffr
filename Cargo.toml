@@ -23,7 +23,7 @@ exclude = ["apps/buffr-stub"]
 default-members = ["apps/buffr"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -85,7 +85,7 @@ semver = { version = "1", features = ["serde"] }
 # member, eliminating "multiple versions of buffr_<name>" errors.
 buffr-core = "0.5"
 buffr-modal = "0.1"
-buffr-ui = "0.1"
+buffr-ui = "0.2"
 buffr-config = "0.3"
 buffr-history = "0.1"
 buffr-bookmarks = "0.1"
