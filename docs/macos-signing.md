@@ -8,7 +8,7 @@
 ## Why signing matters
 
 macOS Gatekeeper refuses to run unsigned (or ad-hoc-signed) bundles downloaded
-from the internet. To ship `buffr.app` (or its `.dmg` wrapper) to end users we
+from the internet. To ship `Buffr.app` (or its `.dmg` wrapper) to end users we
 need:
 
 1. **Apple Developer ID** — a paid developer account, with a
@@ -19,7 +19,7 @@ need:
 3. **Notarization** — submit the signed `.app` (zipped or in a `.dmg`) to
    Apple's notary service via `notarytool`. Apple staples a ticket back onto the
    artifact.
-4. **Stapling** — `xcrun stapler staple buffr.app` so first-launch works
+4. **Stapling** — `xcrun stapler staple Buffr.app` so first-launch works
    offline.
 
 ## Bundle signing order
@@ -28,7 +28,7 @@ CEF bundles must be signed inside-out:
 
 1. `Contents/Frameworks/Chromium Embedded Framework.framework/Versions/A/Libraries/*.dylib`
 2. `Contents/Frameworks/Chromium Embedded Framework.framework`
-3. `Contents/Frameworks/buffr Helper.app` (and any
+3. `Contents/Frameworks/Buffr Helper.app` (and any
    `Helper (GPU/Renderer/Plugin).app` once the multi-helper split lands)
 4. `Contents/MacOS/buffr` (the main bundle binary, signed last with the bundle
    plist)
@@ -56,22 +56,22 @@ are the reference; we'll vendor adapted copies once Phase 6 lands.
 ## Helper-flavor split (current layout)
 
 `cargo xtask bundle-macos` ships **four** helper bundles inside
-`buffr.app/Contents/Frameworks/` — Apple's full sandboxing model wants one
+`Buffr.app/Contents/Frameworks/` — Apple's full sandboxing model wants one
 helper per subprocess type so per-flavor entitlements can differ:
 
 | Bundle name                   | Bundle id                          | Plist template                          | Subprocess type          |
 | ----------------------------- | ---------------------------------- | --------------------------------------- | ------------------------ |
-| `buffr Helper.app`            | `sh.kryptic.buffr.helper`          | `xtask/templates/helper.plist`          | utility / generic worker |
-| `buffr Helper (GPU).app`      | `sh.kryptic.buffr.helper.gpu`      | `xtask/templates/helper-gpu.plist`      | GPU process              |
-| `buffr Helper (Renderer).app` | `sh.kryptic.buffr.helper.renderer` | `xtask/templates/helper-renderer.plist` | renderer process         |
-| `buffr Helper (Plugin).app`   | `sh.kryptic.buffr.helper.plugin`   | `xtask/templates/helper-plugin.plist`   | plugin (PPAPI / WASM)    |
+| `Buffr Helper.app`            | `sh.kryptic.buffr.helper`          | `xtask/templates/helper.plist`          | utility / generic worker |
+| `Buffr Helper (GPU).app`      | `sh.kryptic.buffr.helper.gpu`      | `xtask/templates/helper-gpu.plist`      | GPU process              |
+| `Buffr Helper (Renderer).app` | `sh.kryptic.buffr.helper.renderer` | `xtask/templates/helper-renderer.plist` | renderer process         |
+| `Buffr Helper (Plugin).app`   | `sh.kryptic.buffr.helper.plugin`   | `xtask/templates/helper-plugin.plist`   | plugin (PPAPI / WASM)    |
 
 Apple requires every nested `.app`'s Mach-O have a **distinct** file name; each
-bundle's `Contents/MacOS/buffr Helper (Flavor)` is a `fs::copy` of the same
+bundle's `Contents/MacOS/Buffr Helper (Flavor)` is a `fs::copy` of the same
 `buffr-helper` binary (notarisation rejects symlinks for executables).
 
 cef-rs 147 only resolves a single `browser_subprocess_path`, so today every
-subprocess type is launched out of the unbranded `buffr Helper.app`. The other
+subprocess type is launched out of the unbranded `Buffr Helper.app`. The other
 three bundles are still shipped (~80 MiB extra) so future signing only needs
 per-flavor entitlements + a path-resolver hook — when cef-rs grows
 `on_browser_process_handler_path` (or equivalent) we point each subprocess at
@@ -84,7 +84,7 @@ its branded helper, no bundle layout migration required.
 `x86_64` on Intel). Implementation:
 
 1. The bundle from `bundle-macos` is copied into
-   `target/<profile>/dmg-staging/buffr.app/`.
+   `target/<profile>/dmg-staging/Buffr.app/`.
 2. A relative `Applications -> /Applications` symlink is created next to it as
    the drag-target.
 3. `hdiutil create -volname buffr -srcfolder dmg-staging -ov -format UDZO` runs
@@ -100,7 +100,7 @@ The DMG is **unsigned** in this round. After download, first-run users must
 clear the quarantine xattr that Gatekeeper attaches to web-downloaded files:
 
 ```sh
-xattr -d com.apple.quarantine /Applications/buffr.app
+xattr -d com.apple.quarantine /Applications/Buffr.app
 ```
 
 Once Developer-ID signing + notarization land (next section), Gatekeeper will
@@ -110,7 +110,7 @@ accept the bundle without manual intervention.
 
 ```sh
 # zip the bundle
-ditto -c -k --keepParent target/release/buffr.app buffr.zip
+ditto -c -k --keepParent target/release/Buffr.app buffr.zip
 
 # submit
 xcrun notarytool submit buffr.zip \
@@ -118,7 +118,7 @@ xcrun notarytool submit buffr.zip \
     --wait
 
 # staple
-xcrun stapler staple target/release/buffr.app
+xcrun stapler staple target/release/Buffr.app
 ```
 
 CI integration (GitHub Actions secrets, ephemeral keychain via

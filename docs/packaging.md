@@ -238,7 +238,7 @@ proper artifact retention.
 
 ## macOS
 
-`cargo xtask bundle-macos --release` assembles `buffr.app` (with the four-helper
+`cargo xtask bundle-macos --release` assembles `Buffr.app` (with the four-helper
 layout — see [`macos-signing.md`](./macos-signing.md)).
 `cargo xtask package-macos-dmg --release` then wraps it into
 `target/dist/macos/buffr-<ver>-<arch>.dmg` via `hdiutil create … -format UDZO`
@@ -246,14 +246,14 @@ layout — see [`macos-signing.md`](./macos-signing.md)).
 
 The DMG embeds:
 
-- `buffr.app/` (full bundle, including all four helpers + CEF framework)
+- `Buffr.app/` (full bundle, including all four helpers + CEF framework)
 - `Applications -> /Applications` symlink (drag-target)
 
 Unsigned in this round. After download, first-run users must clear the
 quarantine xattr Gatekeeper attaches:
 
 ```sh
-xattr -d com.apple.quarantine /Applications/buffr.app
+xattr -d com.apple.quarantine /Applications/Buffr.app
 ```
 
 The CI `macos-package` job runs the full pipeline on a `macos-latest` runner and

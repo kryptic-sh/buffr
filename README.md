@@ -68,6 +68,18 @@ Not yet published to crates.io — consume via path or git dep.
 
 ## Install
 
+**macOS (Homebrew)**
+
+```bash
+brew install --cask kryptic-sh/tap/buffr
+```
+
+**Arch Linux (AUR)**
+
+```bash
+paru -S buffr-bin
+```
+
 Pre-built packages on every tag, on the
 [releases page](https://github.com/kryptic-sh/buffr/releases):
 

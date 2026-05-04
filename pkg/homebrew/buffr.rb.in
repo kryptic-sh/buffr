@@ -9,7 +9,7 @@ cask "buffr" do
 
   depends_on macos: ">= :ventura", arch: :arm64
 
-  app "buffr.app"
+  app "Buffr.app"
 
   zap trash: [
     "~/.cache/buffr",

@@ -14,15 +14,33 @@ This site is the user-facing docs surface. The chapter list on the left covers:
   vim-flavoured action grammar.
 - **Multi-tab** — multi-tab `BrowserHost`, session restore, pinned tabs.
 - **Hint mode** — `f`/`F` follow-by-letter overlay.
-- **Updates** — the once-a-day GitHub release check, opt-out, and the
-  manual `--check-for-updates` CLI.
+- **Updates** — the once-a-day GitHub release check, opt-out, and the manual
+  `--check-for-updates` CLI.
 - **Privacy** — what buffr stores, what it never does, and the one network
   request it makes by default.
 - **Accessibility** — CEF renderer accessibility, keyboard-first chrome,
   high-contrast theme.
-- **Packaging** — Linux AppImage / `.deb` / AUR; macOS `.app` + `.dmg`;
-  Windows MSI.
+- **Packaging** — Linux AppImage / `.deb` / AUR; macOS `.app` + `.dmg`; Windows
+  MSI.
 - **macOS signing** — Developer-ID + notarization plan.
 - **UI stack ADR** — why winit + softbuffer for chrome instead of full OSR.
 
 Source repo: <https://github.com/kryptic-sh/buffr>.
+
+## Install
+
+**macOS (Homebrew)**
+
+```bash
+brew install --cask kryptic-sh/tap/buffr
+```
+
+**Arch Linux (AUR)**
+
+```bash
+paru -S buffr-bin
+```
+
+Pre-built binaries for Windows (MSI), Debian/Ubuntu (deb), Fedora/RHEL (rpm),
+Snap, and Flatpak are available on the
+[releases page](https://github.com/kryptic-sh/buffr/releases).

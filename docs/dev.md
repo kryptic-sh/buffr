@@ -107,7 +107,7 @@ winit-owned Wayland surface via wgpu.
 CEF on macOS requires a strict app-bundle layout: the libcef framework must live
 at `Contents/Frameworks/Chromium Embedded Framework.framework/`, and CEF's
 helper subprocesses must be launched out of a nested
-`Contents/Frameworks/buffr Helper.app/`. The main binary loads the framework at
+`Contents/Frameworks/Buffr Helper.app/`. The main binary loads the framework at
 startup via `cef-rs`'s `LibraryLoader` (`helper=false`); the helper does the
 same with `helper=true` so the framework path resolves relative to its own
 deeper bundle position (`../../..` vs `../Frameworks`).
@@ -118,22 +118,22 @@ The `xtask bundle-macos` subcommand assembles all of this:
 # Vendor a macOS CEF distribution (cross-fetch from a Linux dev box is fine).
 cargo xtask fetch-cef --platform macosarm64
 
-# Build + assemble buffr.app under target/release/.
+# Build + assemble Buffr.app under target/release/.
 cargo xtask bundle-macos --release
 
 # Optional ad-hoc signing (gatekeeper-bypassed local runs only).
-codesign --force --deep --sign - target/release/buffr.app
+codesign --force --deep --sign - target/release/Buffr.app
 
 # Run.
-open target/release/buffr.app
+open target/release/Buffr.app
 ```
 
 Notes:
 
 - The compiled helper binary is `buffr-helper` (with hyphen) but the bundle
-  convention renames it to `buffr Helper` (space-separated) during the copy. No
+  convention renames it to `Buffr Helper` (space-separated) during the copy. No
   Cargo changes needed.
-- This round ships a single `buffr Helper.app` used for all subprocess types.
+- This round ships a single `Buffr Helper.app` used for all subprocess types.
   macOS's full sandbox model wants `Helper`, `Helper (GPU)`,
   `Helper (Renderer)`, and `Helper (Plugin)` — that split is deferred to Phase 6
   when proper signing + sandbox entitlements land.
@@ -197,10 +197,10 @@ cargo test --workspace
 
 Phase 3 chrome (statusline today; tab strip / command bar / hint mode later)
 lives in `crates/buffr-ui`. Rendering decisions are in
-[`docs/ui-stack.md`](./ui-stack.md): the page and chrome are composited into
-the buffr `winit` window on Linux/macOS, while Windows uses a native CEF child
-window for the page area. The 24-pixel statusline draws via a hand-rolled 6x10 bitmap font in
-`crates/buffr-ui/src/font.rs`. Find-in-page is wired through
+[`docs/ui-stack.md`](./ui-stack.md): the page and chrome are composited into the
+buffr `winit` window on Linux/macOS, while Windows uses a native CEF child
+window for the page area. The 24-pixel statusline draws via a hand-rolled 6x10
+bitmap font in `crates/buffr-ui/src/font.rs`. Find-in-page is wired through
 `BrowserHost::start_find` / `stop_find`; a `--find <query>` CLI flag on
 `apps/buffr` exercises the round trip without a command bar (the Phase 3b
 dependency that blocks `Find { forward }` action UI).

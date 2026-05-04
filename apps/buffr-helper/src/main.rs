@@ -14,7 +14,7 @@ use buffr_core::{BuffrApp, init_cef_api};
 fn main() {
     // macOS only: load `Chromium Embedded Framework.framework` via the
     // cef-rs `LibraryLoader` before any CEF call. The helper binary
-    // lives at `buffr.app/Contents/Frameworks/buffr Helper.app/Contents/MacOS/`,
+    // lives at `Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/MacOS/`,
     // so the loader resolves the framework via `../../..`. Linux/Windows
     // builds link CEF dynamically through `build.rs` and skip this.
     #[cfg(target_os = "macos")]

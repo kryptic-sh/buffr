@@ -217,14 +217,14 @@ jobs:
       - name: validate bundle layout
         run: |
           set -e
-          test -f target/debug/buffr.app/Contents/Info.plist
-          test -f target/debug/buffr.app/Contents/PkgInfo
-          test -f target/debug/buffr.app/Contents/MacOS/buffr
-          test -d "target/debug/buffr.app/Contents/Frameworks/Chromium Embedded Framework.framework"
-          test -f "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/Info.plist"
-          test -f "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/MacOS/buffr Helper"
-          xmllint --noout target/debug/buffr.app/Contents/Info.plist
-          xmllint --noout "target/debug/buffr.app/Contents/Frameworks/buffr Helper.app/Contents/Info.plist"
+          test -f target/debug/Buffr.app/Contents/Info.plist
+          test -f target/debug/Buffr.app/Contents/PkgInfo
+          test -f target/debug/Buffr.app/Contents/MacOS/buffr
+          test -d "target/debug/Buffr.app/Contents/Frameworks/Chromium Embedded Framework.framework"
+          test -f "target/debug/Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/Info.plist"
+          test -f "target/debug/Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/MacOS/Buffr Helper"
+          xmllint --noout target/debug/Buffr.app/Contents/Info.plist
+          xmllint --noout "target/debug/Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/Info.plist"
 
   linux-package:
     # Cross-build the .deb / .rpm / AUR PKGBUILD on a Linux runner. No

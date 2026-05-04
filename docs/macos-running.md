@@ -65,7 +65,7 @@ RUST_LOG=buffr=debug,buffr_core=debug cargo run
 # Validate config without starting CEF.
 cargo run -- --check-config
 
-# Build the macOS app bundle under target/release/buffr.app.
+# Build the macOS app bundle under target/release/Buffr.app.
 cargo xtask bundle-macos --release
 ```
 

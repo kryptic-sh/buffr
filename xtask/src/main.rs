@@ -7,7 +7,7 @@
 //!   crate version (147 by default) and extracts it into
 //!   `vendor/cef/<platform>/`.
 //! - `bundle-macos [--release] [--target <triple>]` assembles a macOS `.app`
-//!   bundle (with a nested `buffr Helper.app`) under `target/<profile>/`. Runs
+//!   bundle (with a nested `Buffr Helper.app`) under `target/<profile>/`. Runs
 //!   on Linux too; the actual runtime needs macOS, but bundle assembly is
 //!   purely filesystem work and is exercised by CI on a Linux runner.
 //! - `package-linux [--release] [--variant {deb,rpm,tarball,aur,all}]` produces
@@ -44,9 +44,9 @@ const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
 /// we pick the newest entry whose version starts with this prefix.
 const CEF_VERSION_PREFIX: &str = "147.";
 
-/// Embedded `Info.plist` template for the main `buffr.app` bundle.
+/// Embedded `Info.plist` template for the main `Buffr.app` bundle.
 const MAIN_PLIST_TEMPLATE: &str = include_str!("../templates/main.plist");
-/// Embedded `Info.plist` template for the nested `buffr Helper.app` bundle
+/// Embedded `Info.plist` template for the nested `Buffr Helper.app` bundle
 /// (catch-all / unbranded helper used by cef-rs 147 today).
 const HELPER_PLIST_TEMPLATE: &str = include_str!("../templates/helper.plist");
 /// Per-flavor helper plists. Apple's signing model wants each subprocess
@@ -63,7 +63,11 @@ const HELPER_PLUGIN_PLIST_TEMPLATE: &str = include_str!("../templates/helper-plu
 const WIX_TEMPLATE: &str = include_str!("../templates/buffr.wxs");
 
 /// Bundle identifiers + display name used by the macOS bundle templates.
-const NAME: &str = "buffr";
+///
+/// `DISPLAY_NAME` is the TitleCase bundle name (`Buffr.app`, plist
+/// `CFBundleName`/`CFBundleDisplayName`). The binary inside the bundle keeps
+/// the lowercase name `buffr` (CFBundleExecutable), matching the Cargo output.
+const DISPLAY_NAME: &str = "Buffr";
 const BUNDLE_ID_MAIN: &str = "sh.kryptic.buffr";
 const BUNDLE_ID_HELPER: &str = "sh.kryptic.buffr.helper";
 const COPYRIGHT: &str = "MIT — kryptic.sh";
@@ -151,7 +155,7 @@ fn print_help() {
     println!("        PREFIX:   version prefix to match (default: {CEF_VERSION_PREFIX}).");
     println!();
     println!("    bundle-macos [--release] [--target TRIPLE]");
-    println!("        Assemble buffr.app (with nested buffr Helper.app) under");
+    println!("        Assemble Buffr.app (with nested Buffr Helper.app) under");
     println!("        target/<profile>/. Runs on Linux too (cross-bundle).");
     println!();
     println!("    package-linux [--release] [--variant VARIANT]");
@@ -160,7 +164,7 @@ fn print_help() {
     println!();
     println!("    package-macos-dmg [--release]");
     println!(
-        "        Wrap target/<profile>/buffr.app into target/dist/macos/buffr-<ver>-<arch>.dmg."
+        "        Wrap target/<profile>/Buffr.app into target/dist/macos/buffr-<ver>-<arch>.dmg."
     );
     println!("        Requires hdiutil (macOS) or genisoimage (Linux fallback).");
     println!();
@@ -537,7 +541,7 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     let framework_dir = resolve_framework_dir(&workspace, parsed.platform.as_deref())?;
 
     // 3. Stage bundle (idempotent — wipe + rebuild).
-    let app_dir = target_dir.join("buffr.app");
+    let app_dir = target_dir.join("Buffr.app");
     if app_dir.exists() {
         fs::remove_dir_all(&app_dir)
             .with_context(|| format!("removing existing {}", app_dir.display()))?;
@@ -553,7 +557,7 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     )?;
 
     eprintln!();
-    eprintln!("xtask: buffr.app staged at {}", app_dir.display());
+    eprintln!("xtask: Buffr.app staged at {}", app_dir.display());
     eprintln!("xtask: For ad-hoc local signing:");
     eprintln!(
         "           codesign --force --deep --sign - {}",
@@ -681,8 +685,8 @@ fn stage_bundle(
     // executable is a `fs::copy` of the same `buffr-helper` binary
     // (notarisation rejects symlinks for executables).
     for flavor in HELPER_FLAVORS {
-        let bundle_name = format!("{} Helper{}.app", NAME, flavor.suffix);
-        let exec_name = format!("{} Helper{}", NAME, flavor.suffix);
+        let bundle_name = format!("{} Helper{}.app", DISPLAY_NAME, flavor.suffix);
+        let exec_name = format!("{} Helper{}", DISPLAY_NAME, flavor.suffix);
         let helper_app = frameworks.join(&bundle_name);
         let helper_contents = helper_app.join("Contents");
         let helper_macos = helper_contents.join("MacOS");
@@ -702,11 +706,11 @@ fn stage_bundle(
     Ok(())
 }
 
-/// Helper-bundle flavors shipped inside `buffr.app/Contents/Frameworks/`.
+/// Helper-bundle flavors shipped inside `Buffr.app/Contents/Frameworks/`.
 ///
-/// `suffix` is appended to `"buffr Helper"` for the bundle + executable
-/// names — `""` is the catch-all helper (`buffr Helper.app`), `" (GPU)"`
-/// becomes `buffr Helper (GPU).app`, etc. Apple requires every nested
+/// `suffix` is appended to `"Buffr Helper"` for the bundle + executable
+/// names — `""` is the catch-all helper (`Buffr Helper.app`), `" (GPU)"`
+/// becomes `Buffr Helper (GPU).app`, etc. Apple requires every nested
 /// `.app`'s Mach-O have a *distinct* file name; `fs::copy` is used for
 /// each (notarisation rejects symlinks for executables).
 #[derive(Debug, Clone, Copy)]
@@ -738,7 +742,7 @@ const HELPER_FLAVORS: &[HelperFlavor] = &[
 
 fn render_main_plist(version: &str) -> String {
     MAIN_PLIST_TEMPLATE
-        .replace("{NAME}", NAME)
+        .replace("{NAME}", DISPLAY_NAME)
         .replace("{VERSION}", version)
         .replace("{BUNDLE_ID_MAIN}", BUNDLE_ID_MAIN)
         .replace("{EXECUTABLE}", "buffr")
@@ -748,7 +752,7 @@ fn render_main_plist(version: &str) -> String {
 fn render_helper_plist(flavor: &HelperFlavor, version: &str, executable: &str) -> String {
     flavor
         .plist_template
-        .replace("{NAME}", &format!("{NAME} Helper{}", flavor.suffix))
+        .replace("{NAME}", &format!("{DISPLAY_NAME} Helper{}", flavor.suffix))
         .replace("{VERSION}", version)
         .replace("{BUNDLE_ID_HELPER}", BUNDLE_ID_HELPER)
         .replace("{EXECUTABLE}", executable)
@@ -1296,10 +1300,10 @@ fn package_macos_dmg(args: Vec<String>) -> Result<()> {
     let version = workspace_version(&workspace)?;
     let target_dir = workspace.join("target").join(profile);
 
-    let app_dir = parsed.app.unwrap_or_else(|| target_dir.join("buffr.app"));
+    let app_dir = parsed.app.unwrap_or_else(|| target_dir.join("Buffr.app"));
     if !app_dir.exists() {
         bail!(
-            "no buffr.app at {} — run `cargo xtask bundle-macos{}` first",
+            "no Buffr.app at {} — run `cargo xtask bundle-macos{}` first",
             app_dir.display(),
             if parsed.release { " --release" } else { "" }
         );
@@ -1383,7 +1387,7 @@ fn package_macos_dmg(args: Vec<String>) -> Result<()> {
     eprintln!("xtask: package-macos-dmg complete");
     eprintln!("       artifact: {}", dmg_path.display());
     eprintln!("       NOTE: unsigned. First-run users must clear the quarantine xattr:");
-    eprintln!("           xattr -d com.apple.quarantine /Applications/buffr.app");
+    eprintln!("           xattr -d com.apple.quarantine /Applications/Buffr.app");
     eprintln!("       Signing + notarization land alongside docs/macos-signing.md.");
     Ok(())
 }
@@ -1409,7 +1413,7 @@ fn resolve_dmg_tool() -> DmgTool {
 ///
 /// ```text
 /// dmg-staging/
-///   buffr.app/                  (copy of the bundle)
+///   Buffr.app/                  (copy of the bundle)
 ///   Applications -> /Applications  (symlink, drag-target)
 /// ```
 ///
@@ -1420,9 +1424,9 @@ fn resolve_dmg_tool() -> DmgTool {
 fn stage_dmg(staging: &Path, app_dir: &Path) -> Result<()> {
     fs::create_dir_all(staging).with_context(|| format!("creating {}", staging.display()))?;
 
-    // Copy buffr.app into the staging tree. We copy rather than symlink
+    // Copy Buffr.app into the staging tree. We copy rather than symlink
     // so hdiutil sees a self-contained directory.
-    let dest_app = staging.join("buffr.app");
+    let dest_app = staging.join("Buffr.app");
     copy_dir_recursive(app_dir, &dest_app)
         .with_context(|| format!("copying bundle into {}", dest_app.display()))?;
 
@@ -1835,6 +1839,9 @@ mod tests {
         let s = render_main_plist("1.2.3");
         assert!(s.contains("<string>1.2.3</string>"));
         assert!(s.contains("<string>sh.kryptic.buffr</string>"));
+        // CFBundleDisplayName / CFBundleName use the TitleCase display name.
+        assert!(s.contains("<string>Buffr</string>"));
+        // CFBundleExecutable keeps the lowercase binary name.
         assert!(s.contains("<string>buffr</string>"));
         assert!(!s.contains("{VERSION}"));
         assert!(!s.contains("{BUNDLE_ID_MAIN}"));
@@ -1849,9 +1856,9 @@ mod tests {
             suffix: "",
             plist_template: HELPER_PLIST_TEMPLATE,
         };
-        let s = render_helper_plist(&base, "1.2.3", "buffr Helper");
+        let s = render_helper_plist(&base, "1.2.3", "Buffr Helper");
         assert!(s.contains("<string>sh.kryptic.buffr.helper</string>"));
-        assert!(s.contains("<string>buffr Helper</string>"));
+        assert!(s.contains("<string>Buffr Helper</string>"));
         // Helper plist drops the icon + category.
         assert!(!s.contains("CFBundleIconFile"));
         assert!(!s.contains("LSApplicationCategoryType"));
@@ -1876,7 +1883,7 @@ mod tests {
                 suffix,
                 plist_template: template,
             };
-            let exec = format!("buffr Helper{suffix}");
+            let exec = format!("Buffr Helper{suffix}");
             let s = render_helper_plist(&flavor, "1.2.3", &exec);
             let expected_id = format!("sh.kryptic.buffr.helper{want}");
             assert!(
@@ -1908,7 +1915,7 @@ mod tests {
         fs::write(&buffr_bin, b"#!/bin/sh\necho buffr\n").unwrap();
         fs::write(&helper_bin, b"#!/bin/sh\necho helper\n").unwrap();
 
-        let app_dir = tmp.path().join("buffr.app");
+        let app_dir = tmp.path().join("Buffr.app");
         stage_bundle(&app_dir, &buffr_bin, &helper_bin, &fw, "9.9.9").unwrap();
 
         assert!(app_dir.join("Contents/Info.plist").exists());
@@ -1926,20 +1933,20 @@ mod tests {
             (" (Renderer)", " (Renderer)"),
             (" (Plugin)", " (Plugin)"),
         ] {
-            let helper_app = app_dir.join(format!("Contents/Frameworks/buffr Helper{suffix}.app"));
+            let helper_app = app_dir.join(format!("Contents/Frameworks/Buffr Helper{suffix}.app"));
             assert!(
                 helper_app.join("Contents/Info.plist").exists(),
-                "missing Info.plist for buffr Helper{suffix}.app"
+                "missing Info.plist for Buffr Helper{suffix}.app"
             );
             assert!(
                 helper_app.join("Contents/PkgInfo").exists(),
-                "missing PkgInfo for buffr Helper{suffix}.app"
+                "missing PkgInfo for Buffr Helper{suffix}.app"
             );
             assert!(
                 helper_app
-                    .join(format!("Contents/MacOS/buffr Helper{exec_suffix}"))
+                    .join(format!("Contents/MacOS/Buffr Helper{exec_suffix}"))
                     .exists(),
-                "missing executable for buffr Helper{suffix}.app"
+                "missing executable for Buffr Helper{suffix}.app"
             );
         }
 
@@ -2185,7 +2192,7 @@ mod tests {
     #[test]
     fn stage_dmg_creates_app_copy_and_applications_symlink() {
         let tmp = tempdir();
-        let app = tmp.path().join("buffr.app");
+        let app = tmp.path().join("Buffr.app");
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
         fs::write(app.join("Contents/Info.plist"), "<plist/>").unwrap();
         fs::write(app.join("Contents/MacOS/buffr"), b"\x7fELF").unwrap();
@@ -2193,8 +2200,8 @@ mod tests {
         let staging = tmp.path().join("dmg-staging");
         stage_dmg(&staging, &app).unwrap();
 
-        assert!(staging.join("buffr.app/Contents/Info.plist").exists());
-        assert!(staging.join("buffr.app/Contents/MacOS/buffr").exists());
+        assert!(staging.join("Buffr.app/Contents/Info.plist").exists());
+        assert!(staging.join("Buffr.app/Contents/MacOS/buffr").exists());
         #[cfg(unix)]
         {
             let link = staging.join("Applications");
