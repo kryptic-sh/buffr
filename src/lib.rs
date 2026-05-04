@@ -61,7 +61,10 @@ pub struct Config {
 }
 
 impl AppConfig for Config {
+    #[cfg(not(debug_assertions))]
     const APPLICATION: &'static str = "buffr";
+    #[cfg(debug_assertions)]
+    const APPLICATION: &'static str = "buffr-debug";
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
