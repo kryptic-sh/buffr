@@ -6801,8 +6801,11 @@ fn physical_wheel_to_dip(dx_phys: i32, dy_phys: i32, scale: f32) -> (i32, i32) {
 /// All callers must route through this function; no inline duplication of
 /// the predicate is allowed.  Tests pin the semantics so future refactors
 /// can't silently change the rule.
-fn decide_paint_policy(occluded: bool, media_active: bool) -> PaintPolicy {
-    if !occluded || media_active {
+fn decide_paint_policy(occluded: bool, _media_active: bool) -> PaintPolicy {
+    // TEST OVERRIDE: ignore media_active so we can verify whether CEF
+    // was_hidden(1) keeps audio alive while the paint policy is Sleeping.
+    // Revert before merging.
+    if !occluded {
         PaintPolicy::Active
     } else {
         PaintPolicy::Sleeping
@@ -7202,8 +7205,8 @@ mod tests {
 
     #[test]
     fn paint_policy_occluded_with_media() {
-        // Occluded but media playing → Active (media keeps window awake).
-        assert_eq!(decide_paint_policy(true, true), PaintPolicy::Active);
+        // TEST OVERRIDE: media flag ignored — occlusion always sleeps.
+        assert_eq!(decide_paint_policy(true, true), PaintPolicy::Sleeping);
     }
 
     #[test]
