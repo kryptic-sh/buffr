@@ -510,6 +510,8 @@ wrap_client! {
         }
 
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            eprintln!("BUFFR DIAG: context_menu_handler() factory called");
+            tracing::warn!(target: "buffr_core::context_menu", "factory called");
             Some(BuffrContextMenuHandler::new())
         }
     }
@@ -1416,6 +1418,8 @@ wrap_context_menu_handler! {
             _params: Option<&mut ContextMenuParams>,
             model: Option<&mut MenuModel>,
         ) {
+            eprintln!("BUFFR DIAG: on_before_context_menu fired");
+            tracing::warn!(target: "buffr_core::context_menu", "on_before_context_menu fired");
             // Wipe CEF's default 50-item menu so nothing renders
             // accidentally. Future slices will repopulate selectively.
             if let Some(model) = model {
@@ -1431,6 +1435,8 @@ wrap_context_menu_handler! {
             _model: Option<&mut MenuModel>,
             callback: Option<&mut RunContextMenuCallback>,
         ) -> ::std::os::raw::c_int {
+            eprintln!("BUFFR DIAG: run_context_menu fired");
+            tracing::warn!(target: "buffr_core::context_menu", "run_context_menu fired");
             // Log every ContextMenuParams field at debug level.
             // Return 1 (handled) + cancel so CEF never renders its own
             // menu; slice 1 has no UI to show.
