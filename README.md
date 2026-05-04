@@ -66,6 +66,24 @@ is just absent from the release pipeline, not from the code.
 
 Not yet published to crates.io — consume via path or git dep.
 
+## Install
+
+Pre-built packages on every tag, on the
+[releases page](https://github.com/kryptic-sh/buffr/releases):
+
+| Platform            | Asset      | Arches          |
+| ------------------- | ---------- | --------------- |
+| **macOS**           | `.dmg`     | arm64           |
+| **Windows**         | `.msi`     | x64, arm64      |
+| **Debian / Ubuntu** | `.deb`     | amd64, arm64    |
+| **Fedora / RHEL**   | `.rpm`     | x86_64, aarch64 |
+| **Linux (generic)** | `.tar.gz`  | x86_64, aarch64 |
+| **Snap**            | `.snap`    | amd64, arm64    |
+| **Flatpak**         | `.flatpak` | amd64, arm64    |
+
+> **Heads-up:** `cargo install buffr` is **not** a supported install path — see
+> the note in [Build](#build) below.
+
 ## Build
 
 ```bash
