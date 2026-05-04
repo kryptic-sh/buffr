@@ -49,6 +49,13 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ### Fixed
 
+- **Media context-menu actions no-op on overlay-heavy sites (YouTube, etc.).**
+  `media_play_pause`, `media_toggle_mute`, `media_toggle_loop`,
+  `media_toggle_controls`, and `media_picture_in_picture` now fall back to
+  `document.querySelector('video, audio')` (or `'video'` for PiP) when the
+  `elementFromPoint` → `parentElement` walk fails to find the media element. CEF
+  only emits these menu items when it already knows the right-click target is a
+  video/audio, so picking the document's first match is the correct fallback.
 - **`view-source:` prefix lost from `Tab.url` on first address-change.** Was
   causing the omnibar to pre-fill with the underlying URL when the user opened
   it on a view-source page; now subsumed into the `buffr-src:` rename above via

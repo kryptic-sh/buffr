@@ -2614,6 +2614,7 @@ impl BrowserHost {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                if(el.paused)el.play();else el.pause();\
              }})({x},{y});"
@@ -2629,6 +2630,7 @@ impl BrowserHost {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                el.muted=!el.muted;\
              }})({x},{y});"
@@ -2644,6 +2646,7 @@ impl BrowserHost {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                el.loop=!el.loop;\
              }})({x},{y});"
@@ -2659,6 +2662,7 @@ impl BrowserHost {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                el.controls=!el.controls;\
              }})({x},{y});"
@@ -2677,6 +2681,7 @@ impl BrowserHost {
                try{{\
                  var el=document.elementFromPoint(x,y);\
                  while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
+                 if(!el)el=document.querySelector('video');\
                  if(!el)return;\
                  if(document.pictureInPictureElement===el){{\
                    document.exitPictureInPicture();\
@@ -2884,6 +2889,7 @@ mod tests {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                if(el.paused)el.play();else el.pause();\
              }})({x},{y});"
@@ -2897,6 +2903,7 @@ mod tests {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                el.muted=!el.muted;\
              }})({x},{y});"
@@ -2910,6 +2917,7 @@ mod tests {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                el.loop=!el.loop;\
              }})({x},{y});"
@@ -2923,6 +2931,7 @@ mod tests {
             "(function(x,y){{\
                var el=document.elementFromPoint(x,y);\
                while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
                if(!el)return;\
                el.controls=!el.controls;\
              }})({x},{y});"
@@ -2937,6 +2946,7 @@ mod tests {
                try{{\
                  var el=document.elementFromPoint(x,y);\
                  while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
+                 if(!el)el=document.querySelector('video');\
                  if(!el)return;\
                  if(document.pictureInPictureElement===el){{\
                    document.exitPictureInPicture();\
@@ -2975,6 +2985,10 @@ mod tests {
         assert!(js.contains("el.play()"), "play() call missing");
         assert!(js.contains("el.pause()"), "pause() call missing");
         assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+        assert!(
+            js.contains("querySelector('video, audio')"),
+            "overlay-sibling fallback missing"
+        );
     }
 
     #[test]
@@ -2984,6 +2998,10 @@ mod tests {
         assert!(js.contains("20"), "y coord missing");
         assert!(js.contains("el.muted=!el.muted"), "mute toggle missing");
         assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+        assert!(
+            js.contains("querySelector('video, audio')"),
+            "overlay-sibling fallback missing"
+        );
     }
 
     #[test]
@@ -2991,6 +3009,10 @@ mod tests {
         let js = build_media_loop_js(0, 0);
         assert!(js.contains("el.loop=!el.loop"), "loop toggle missing");
         assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+        assert!(
+            js.contains("querySelector('video, audio')"),
+            "overlay-sibling fallback missing"
+        );
     }
 
     #[test]
@@ -3001,6 +3023,10 @@ mod tests {
             "controls toggle missing"
         );
         assert!(js.contains("HTMLMediaElement"), "media type guard missing");
+        assert!(
+            js.contains("querySelector('video, audio')"),
+            "overlay-sibling fallback missing"
+        );
     }
 
     #[test]
@@ -3011,6 +3037,10 @@ mod tests {
         assert!(js.contains("exitPictureInPicture"), "exitPiP missing");
         assert!(js.contains("try{"), "try/catch missing");
         assert!(js.contains("HTMLVideoElement"), "video type guard missing");
+        assert!(
+            js.contains("querySelector('video')"),
+            "overlay-sibling fallback missing"
+        );
     }
 
     #[test]
