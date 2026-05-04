@@ -180,6 +180,12 @@ enum BuffrUserEvent {
     /// Chromium owns the clipboard — its wl_data_source.send callback
     /// runs on CEF's UI thread, which is the main thread).
     ClipboardPasteText(Option<String>),
+    /// SIGINT (Ctrl+C) caught by the ctrlc handler. Posted via
+    /// EventLoopProxy so the winit loop wakes from `WaitUntil` even when
+    /// occluded — `about_to_wait` would otherwise sit on a multi-second
+    /// deadline (probe interval, media probe) and the shutdown_flag
+    /// poll wouldn't fire until the next reveal/probe.
+    Shutdown,
 }
 
 /// Per-popup-window state. Owns the winit window, wgpu renderer, and the
@@ -909,16 +915,24 @@ fn main() -> Result<()> {
 
     let download_notice_queue = new_download_notice_queue();
 
+    // Create the proxy before AppState so we can clone it for the IPC accept
+    // thread and the Ctrl+C handler. The proxy is cheap to clone (internally an Arc).
+    let event_proxy = event_loop.create_proxy();
+
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     {
         let flag = Arc::clone(&shutdown_flag);
-        if let Err(err) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+        let proxy = event_proxy.clone();
+        if let Err(err) = ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+            // Wake the winit loop so the shutdown_flag check in
+            // about_to_wait fires immediately, not at the next probe /
+            // media-poll deadline (could be 2 s out while occluded).
+            let _ = proxy.send_event(BuffrUserEvent::Shutdown);
+        }) {
             warn!(error = %err, "ctrlc handler already installed — using existing");
         }
     }
-    // Create the proxy before AppState so we can clone it for the IPC accept
-    // thread. The proxy is cheap to clone (internally an Arc).
-    let event_proxy = event_loop.create_proxy();
 
     // Spawn the singleton accept thread now that we have a proxy. The handle
     // is moved in so the Listener stays alive for the whole process lifetime.
@@ -5300,6 +5314,12 @@ fn mode_label(mode: PageMode) -> &'static str {
 impl ApplicationHandler<BuffrUserEvent> for AppState {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
         match event {
+            BuffrUserEvent::Shutdown => {
+                // ctrl+c handler set shutdown_flag and posted this event.
+                // Just need to wake the loop — about_to_wait runs after
+                // user_event returns and picks up the flag from there.
+                tracing::debug!("user_event: Shutdown");
+            }
             BuffrUserEvent::OsrFrame => {
                 tracing::trace!("user_event: OsrFrame -> request_redraw");
                 self.request_redraw();
