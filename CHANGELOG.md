@@ -21,6 +21,11 @@ All notable changes to `buffr-core` are documented here. Format follows
 - **`BrowserHost::show_dev_tools_at`** — open DevTools for the active tab with
   an optional element-inspect hit-point (`cef::Point`). Wraps
   `CefBrowserHost::ShowDevTools`.
+- **`image_copy` module + `BrowserHost::copy_image_url_to_clipboard`** — fetch
+  an image URL off-thread (or decode a `data:` URL inline), transcode to PNG,
+  and write to the system clipboard via `hjkl-clipboard` `MimeType::Png`. Falls
+  back to copying the URL as text on backends that don't carry image MIME (OSC52
+  over SSH). Adds `image` (PNG/JPEG/WebP/GIF only) and `base64` deps.
 
 ## [0.4.0] — 2026-05-04
 

@@ -2290,6 +2290,14 @@ impl BrowserHost {
         }
     }
 
+    /// Spawn an off-thread worker that fetches `url`, decodes the
+    /// image, re-encodes it as PNG, and writes it to the system
+    /// clipboard. Used by the right-click "Copy Image" item. Returns
+    /// immediately; outcome surfaces via `tracing` (see [`image_copy`]).
+    pub fn copy_image_url_to_clipboard(&self, url: &str) {
+        crate::image_copy::copy_image_to_clipboard(url.to_string());
+    }
+
     pub fn run_edit_cycle(&self, forward: bool) {
         let arg = if forward { "true" } else { "false" };
         self.run_main_frame_js(
