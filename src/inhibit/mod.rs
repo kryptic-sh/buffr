@@ -10,8 +10,8 @@
 //!
 //! | Platform | Backend | Status |
 //! |---|---|---|
-//! | Linux (Wayland) | `xdg-session-inhibit` / D-Bus | stub (phase-2) |
-//! | Linux (X11)     | `XSS_SUSPEND_SCREENSAVER`     | stub (phase-2) |
+//! | Linux (Wayland) | `xdg-session-inhibit` / D-Bus | implemented |
+//! | Linux (X11)     | `org.freedesktop.ScreenSaver` D-Bus | implemented |
 //! | macOS           | `IOPMAssertionCreateWithName`  | stub (phase-2) |
 //! | Windows         | `SetThreadExecutionState`      | stub (phase-2) |
 //! | Other           | no-op fallback                 | returns Ok     |
@@ -109,13 +109,14 @@ impl IdleInhibitor for NoopInhibitor {
 ///
 /// Detects the session type at runtime and routes to the correct backend:
 ///   - Wayland: `zwp_idle_inhibit_manager_v1` via `wayland-client`.
-///   - X11: stub (to be filled by a sibling agent in `linux/x11.rs`).
+///   - X11: `org.freedesktop.ScreenSaver` D-Bus via `zbus::blocking`.
 ///   - Unknown / fallback: `NoopInhibitor`.
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux {
     use super::*;
 
     mod wayland;
+    mod x11;
 
     /// Returns true when the running session is Wayland.
     fn is_wayland() -> bool {
@@ -127,11 +128,21 @@ pub mod linux {
         std::env::var("WAYLAND_DISPLAY").is_ok()
     }
 
+    /// Returns true when the running session is X11 (and not Wayland).
+    fn is_x11() -> bool {
+        std::env::var("XDG_SESSION_TYPE")
+            .map(|s| s.eq_ignore_ascii_case("x11"))
+            .unwrap_or(false)
+            || (std::env::var("DISPLAY").is_ok() && std::env::var("WAYLAND_DISPLAY").is_err())
+    }
+
     pub fn new(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
         if is_wayland() {
             return wayland::new(window);
         }
-        // X11 agent will add: if is_x11() { return x11::new(window); }
+        if is_x11() {
+            return x11::new(window);
+        }
         Ok(Box::new(NoopInhibitor))
     }
 }
