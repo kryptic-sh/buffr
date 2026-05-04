@@ -93,15 +93,17 @@ impl Drop for X11Inhibitor {
         let _ = self.tx.send(InhibitCmd::Release);
         let _ = self.tx.send(InhibitCmd::Shutdown);
 
-        // Join the worker, but give it at most 100 ms so we don't stall
-        // application shutdown.
+        // Wait for the worker to exit, but give it at most 100 ms so we
+        // don't stall application shutdown. Returns as soon as the
+        // worker finishes — only sleeps the full window if it's stuck.
         if let Some(handle) = self.worker.take() {
-            let join_thread = thread::spawn(move || {
+            let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+            thread::spawn(move || {
                 let _ = handle.join();
+                let _ = done_tx.send(());
             });
-            // Sleep the calling thread just long enough for the worker to flush.
-            thread::sleep(Duration::from_millis(100));
-            drop(join_thread); // if still alive, let it leak — process exiting
+            let _ = done_rx.recv_timeout(Duration::from_millis(100));
+            // On timeout the watcher detaches naturally; process exit reaps it.
         }
     }
 }
