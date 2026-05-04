@@ -4185,19 +4185,72 @@ impl AppState {
                 }
             }
 
-            // ── Media — deferred to slice 4b ─────────────────────────────────
-            I::MediaPlayPause { .. }
-            | I::MediaMute { .. }
-            | I::MediaLoop { .. }
-            | I::MediaShowControls
-            | I::MediaSaveAs
-            | I::CopyMediaAddress
-            | I::PictureInPicture => {
-                tracing::info!(
-                    target: "buffr::context_menu",
-                    ?item,
-                    "media action deferred (slice 4b)"
-                );
+            // ── Media ────────────────────────────────────────────────────────
+            I::MediaPlayPause { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "media_play_pause", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.media_play_pause(request.x, request.y);
+                }
+            }
+            I::MediaMute { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "media_mute", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.media_toggle_mute(request.x, request.y);
+                }
+            }
+            I::MediaLoop { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "media_loop", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.media_toggle_loop(request.x, request.y);
+                }
+            }
+            I::MediaShowControls => {
+                tracing::info!(target: "buffr::context_menu", action = "media_show_controls", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.media_toggle_controls(request.x, request.y);
+                }
+            }
+            I::PictureInPicture => {
+                tracing::info!(target: "buffr::context_menu", action = "picture_in_picture", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.media_picture_in_picture(request.x, request.y);
+                }
+            }
+            I::MediaSaveAs => {
+                tracing::info!(target: "buffr::context_menu", action = "media_save_as", "dispatch");
+                let url = request.source_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(host) = self.host.as_ref() {
+                    host.start_download(&url);
+                }
+            }
+            I::CopyMediaAddress => {
+                tracing::info!(target: "buffr::context_menu", action = "copy_media_address", "dispatch");
+                let url = request.source_url.clone();
+                if let Some(host) = self.host.as_ref()
+                    && !host.clipboard_set_text(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        "copy_media_address: clipboard write failed"
+                    );
+                }
+            }
+
+            // ── Image rotate ─────────────────────────────────────────────────
+            I::RotateClockwise => {
+                tracing::info!(target: "buffr::context_menu", action = "rotate_clockwise", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.image_rotate(request.x, request.y, 90);
+                }
+            }
+            I::RotateCounterclockwise => {
+                tracing::info!(target: "buffr::context_menu", action = "rotate_counterclockwise", "dispatch");
+                if let Some(host) = self.host.as_ref() {
+                    host.image_rotate(request.x, request.y, -90);
+                }
             }
 
             I::Separator => {
