@@ -105,24 +105,33 @@ impl IdleInhibitor for NoopInhibitor {
 
 // ── Platform stubs ────────────────────────────────────────────────────────────
 
-/// Linux idle-inhibit stub.
+/// Linux idle-inhibit dispatcher.
 ///
-/// TODO (phase-2): Detect session type at runtime and pick the right backend:
-///   - Check `WAYLAND_DISPLAY` (or `XDG_SESSION_TYPE == "wayland"`) first.
-///   - If Wayland: use the `org.freedesktop.ScreenSaver.Inhibit` D-Bus method
-///     (or the zwp_idle_inhibit_manager_v1 Wayland protocol if the compositor
-///     exposes it).
-///   - Fallback to X11: use `XSS_SUSPEND_SCREENSAVER` via `XScreenSaverSuspend`
-///     (requires `libXss`).
-///
-/// For now returns `NoopInhibitor` on both Wayland and X11 sessions.
+/// Detects the session type at runtime and routes to the correct backend:
+///   - Wayland: `zwp_idle_inhibit_manager_v1` via `wayland-client`.
+///   - X11: stub (to be filled by a sibling agent in `linux/x11.rs`).
+///   - Unknown / fallback: `NoopInhibitor`.
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux {
     use super::*;
 
-    pub fn new(_window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
-        // TODO: check XDG_SESSION_TYPE / WAYLAND_DISPLAY and dispatch to
-        // wayland::new() or x11::new() once those sub-backends land.
+    mod wayland;
+
+    /// Returns true when the running session is Wayland.
+    fn is_wayland() -> bool {
+        if let Ok(t) = std::env::var("XDG_SESSION_TYPE")
+            && t.eq_ignore_ascii_case("wayland")
+        {
+            return true;
+        }
+        std::env::var("WAYLAND_DISPLAY").is_ok()
+    }
+
+    pub fn new(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
+        if is_wayland() {
+            return wayland::new(window);
+        }
+        // X11 agent will add: if is_x11() { return x11::new(window); }
         Ok(Box::new(NoopInhibitor))
     }
 }
