@@ -6,6 +6,51 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-04
+
+### Added
+
+- **OSR sleep API** (`BrowserHost::osr_sleep`, `osr_invalidate_view`,
+  `force_repaint_active`) — pauses CEF's paint scheduler via `was_hidden(true)`
+  when the embedder decides the surface is occluded.
+- **Audio detection** — new `audio` module with `BuffrAudioHandler` wired into
+  the CEF client, plus `BrowserHost::any_audio_active()` and
+  `drain_audio_events()` for embedder polling.
+- **JS media-activity probe with patched-constructor signals** for silent video,
+  WebRTC, and Screen Wake Lock. New asset files `media_probe_init.js` (page-load
+  patches) and `media_probe_poll.js` (per-tick read).
+  `BrowserHost::run_media_probe()` fires the poll; `any_video_active()` is wired
+  but currently a stub pending the console-log sentinel reader.
+- **`inhibit` module** — `IdleInhibitor` trait + `new_inhibitor()` factory +
+  four platform backends:
+  - Linux Wayland: `zwp_idle_inhibit_manager_v1` via raw `wayland-client` on a
+    guest backend that shares winit's `wl_display`.
+  - Linux X11: `org.freedesktop.ScreenSaver.Inhibit` D-Bus via `zbus::blocking`.
+  - macOS: `IOPMAssertionCreateWithName`/`IOPMAssertionRelease` via direct IOKit
+    FFI.
+  - Windows: `SetThreadExecutionState(ES_DISPLAY_REQUIRED|ES_CONTINUOUS)` on a
+    dedicated worker thread to preserve thread affinity.
+- `winit = "0.30"` added as a dep — `new_inhibitor` takes
+  `Arc<winit::window::Window>`.
+
+### Changed
+
+- `profile_paths()` now reads `<buffr_config::Config as AppConfig>::APPLICATION`
+  instead of hard-coding `"buffr"`, so debug builds get a separate
+  `~/.cache/buffr-debug/` and `~/.local/share/buffr-debug/`.
+- `buffr-config` dep bumped from `"0.2"` to `"0.3"` for `IdleInhibitConfig`.
+
+### Fixed
+
+- `loading_busy` now cleared on `LoadHandler::on_loading_state_change` so the
+  loading animation deactivates promptly when CEF reports done.
+- `RTCPeerConnection` patched-constructor in `media_probe_init.js` aliases
+  `.prototype` directly so `pc instanceof RTCPeerConnection` still works on the
+  page (was breaking due to a `setPrototypeOf` mismatch).
+- Idle-inhibit Drop uses `recv_timeout(100ms)` instead of an unconditional
+  `thread::sleep(100ms)`, so shutdown returns the moment the worker exits
+  cleanly.
+
 ## [0.3.1] — 2026-05-03
 
 ### Fixed
@@ -100,7 +145,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.2.0
