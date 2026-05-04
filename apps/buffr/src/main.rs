@@ -5930,12 +5930,41 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .as_ref()
                         .map(|w| w.inner_size())
                         .unwrap_or_default();
-                    let (_cx, cef_y, _cw, _ch) =
-                        self.cef_child_rect(size.width.max(1), size.height.max(1));
+                    let win_w = size.width.max(1);
+                    let win_h = size.height.max(1);
+                    let (_cx, cef_y, _cw, _ch) = self.cef_child_rect(win_w, win_h);
                     // Physical coords for chrome hit-tests.
                     let phys_bx = position.x as i32;
                     let phys_by = (position.y as i32).saturating_sub(cef_y as i32);
                     self.osr_cursor = (phys_bx, phys_by);
+
+                    // Context-menu hover: when the cursor is inside the
+                    // menu panel, force the default arrow cursor, update
+                    // the hovered row, and DON'T forward mouse-move to
+                    // CEF — otherwise the page sees hover events and
+                    // changes its cursor (text I-beam over text, link
+                    // pointer over links, etc).
+                    let abs_x = position.x as i32;
+                    let abs_y = position.y as i32;
+                    if let Some(cm) = self.context_menu.as_ref() {
+                        let overlay = cm.to_overlay(win_w, win_h);
+                        if overlay.contains(win_w as usize, win_h as usize, abs_x, abs_y) {
+                            if let Some(window) = self.window.as_ref() {
+                                window.set_cursor(winit::window::CursorIcon::Default);
+                            }
+                            if let Some(row) =
+                                overlay.row_at(win_w as usize, win_h as usize, abs_x, abs_y)
+                                && let Some(cm_mut) = self.context_menu.as_mut()
+                                && cm_mut.selected != row
+                            {
+                                cm_mut.selected = row;
+                                self.mark_chrome_dirty();
+                                self.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+
                     // Logical (DIP) coords for CEF — route through helper.
                     let scale = self.current_scale();
                     let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, scale);
@@ -6038,35 +6067,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let abs_y = py + cef_y_offset;
                     if let Some(cm) = self.context_menu.as_ref() {
                         let overlay = cm.to_overlay(win_w, win_h);
-                        let panel_w = overlay.preferred_width() as i32;
-                        let panel_h = overlay.preferred_height() as i32;
-                        let panel_x = overlay.x.clamp(0, (win_w as i32 - panel_w).max(0));
-                        let panel_y = overlay.y.clamp(0, (win_h as i32 - panel_h).max(0));
-                        // Hit-test: is the click inside the panel?
-                        if abs_x >= panel_x
-                            && abs_x < panel_x + panel_w
-                            && abs_y >= panel_y
-                            && abs_y < panel_y + panel_h
-                        {
-                            // Find which row was clicked.
-                            use buffr_ui::{CONTEXT_MENU_ROW_HEIGHT, CONTEXT_MENU_SEP_HEIGHT};
-                            let mut row_y = panel_y + 1; // skip border pixel
-                            let mut clicked_row: Option<usize> = None;
-                            for (row_idx, entry) in overlay.entries.iter().enumerate() {
-                                let row_h = if entry.is_separator {
-                                    CONTEXT_MENU_SEP_HEIGHT as i32
-                                } else {
-                                    CONTEXT_MENU_ROW_HEIGHT as i32
-                                };
-                                if abs_y >= row_y && abs_y < row_y + row_h {
-                                    if !entry.is_separator {
-                                        clicked_row = Some(row_idx);
-                                    }
-                                    break;
-                                }
-                                row_y += row_h;
-                            }
-                            if let Some(row) = clicked_row {
+                        if overlay.contains(win_w as usize, win_h as usize, abs_x, abs_y) {
+                            if let Some(row) =
+                                overlay.row_at(win_w as usize, win_h as usize, abs_x, abs_y)
+                            {
                                 // Activate by clicking — same as Enter.
                                 let cm = self.context_menu.take().unwrap();
                                 let item = &cm.request.items[row];
@@ -6076,10 +6080,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                                     "activated"
                                 );
                             } else {
+                                // Click on separator / disabled row — dismiss.
                                 self.dismiss_context_menu();
                             }
                         } else {
-                            // Clicked outside — dismiss.
+                            // Clicked outside the panel — dismiss.
                             self.dismiss_context_menu();
                         }
                     }
