@@ -1492,9 +1492,15 @@ wrap_context_menu_handler! {
             // ContextMenuTypeFlags and ContextMenuMediaStateFlags have private
             // tuple fields; use AsRef to reach the inner sys types whose fields
             // are pub.  ContextMenuMediaType exposes get_raw() directly.
-            let type_flags_raw = type_flags.as_ref().0;
-            let media_type_raw = media_type.get_raw();
-            let media_flags_raw = media_flags.as_ref().0;
+            // Cast to u32: cef-rs sys types use c_int (i32 on Windows MSVC,
+            // u32 on Linux/macOS gcc/clang). Bit-pattern reinterpret is safe
+            // for flag fields.
+            #[allow(clippy::unnecessary_cast)]
+            let type_flags_raw = type_flags.as_ref().0 as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let media_type_raw = media_type.get_raw() as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let media_flags_raw = media_flags.as_ref().0 as u32;
 
             let has_link_url = !link_url.is_empty();
             let has_selection = !selection.is_empty();
