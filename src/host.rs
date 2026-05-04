@@ -891,6 +891,11 @@ impl BrowserHost {
         };
         for t in tabs.iter() {
             if let Some(host) = t.browser.host() {
+                // Close devtools first so CEF's devtools-close callback fires
+                // while the parent browser is still alive.
+                if host.has_dev_tools() != 0 {
+                    host.close_dev_tools();
+                }
                 host.close_browser(1);
             }
         }
@@ -899,11 +904,17 @@ impl BrowserHost {
         if let Ok(stack) = self.closed_stack.lock() {
             for c in stack.iter() {
                 if let Some(host) = c.tab.browser.host() {
+                    if host.has_dev_tools() != 0 {
+                        host.close_dev_tools();
+                    }
                     host.close_browser(1);
                 }
             }
         }
-        // Popup browsers.
+        // Popup browsers. Popups are tracked in popup_browsers so close_browser(1)
+        // suffices. Note: if OnBeforePopup ever creates a child that bypasses the
+        // popup_browsers map, it would also be missed here — tracked as a separate
+        // issue, not fixed in this changeset.
         if let Ok(browsers) = self.popup_browsers.lock() {
             for b in browsers.values() {
                 if let Some(host) = b.host() {
