@@ -1065,20 +1065,31 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Close the channel first so the worker's recv() loop exits.
-        // We must drop the SyncSender BEFORE joining the thread; otherwise
-        // the join would block forever waiting for the worker to notice
-        // a channel that is still open.
+        // Close the channel so the worker's recv() loop exits when it
+        // returns from whatever GPU call it's currently in.
         //
-        // Safety: we can't move out of `self` in Drop, so we replace the
-        // sender with a dummy by constructing a fresh disconnected one and
-        // swapping it in, then dropping the original.
+        // We can't move out of `self` in Drop, so swap the sender with
+        // a fresh disconnected one and drop the original.
         let (dummy_tx, _dummy_rx) = std::sync::mpsc::sync_channel(0);
         let real_tx = std::mem::replace(&mut self.render_chan.tx_cmd, dummy_tx);
-        drop(real_tx); // closes the channel → worker loop exits
+        drop(real_tx);
 
+        // Do NOT join. The worker may be stuck inside a multi-second
+        // `present()` call when the Wayland compositor backpressures the
+        // surface (workspace switch on Hyprland). Joining there would
+        // block shutdown — exactly the hang we observed before.
+        //
+        // Instead, drop the JoinHandle (auto-detaches the thread) and
+        // let the worker exit on its own time. The process is shutting
+        // down anyway; OS reaps the thread on exit. wgpu Device + Surface
+        // are internally Arc'd, so the worker's outstanding references
+        // keep them alive until present returns.
         if let Some(h) = self.render_chan.handle.take() {
-            let _ = h.join();
+            tracing::debug!(
+                in_flight = self.frames_in_flight,
+                "renderer drop: detaching wgpu-render worker (no join)"
+            );
+            drop(h);
         }
     }
 }
