@@ -515,6 +515,13 @@ pub struct Renderer {
     /// `FrameStats` arrives from the worker (one stats per presented frame).
     /// `frame()` skips acquire entirely when this is non-zero.
     frames_in_flight: u32,
+    /// Resize requested while the worker still owned a SurfaceTexture.
+    /// `surface.configure()` cannot be called with an outstanding
+    /// SurfaceTexture (wgpu panics: "SurfaceOutput must be dropped
+    /// before a new Surface is made"), so resize() defers the
+    /// reconfigure into this slot. `frame()` applies it as soon as
+    /// `frames_in_flight == 0`.
+    pending_resize: Option<(u32, u32)>,
 }
 
 impl Renderer {
@@ -788,11 +795,18 @@ impl Renderer {
             render_chan,
             last_present_stats: FrameStats::default(),
             frames_in_flight: 0,
+            pending_resize: None,
         })
     }
 
     /// Reconfigure the surface + chrome dims for the new physical window size.
     /// Idempotent when dims are unchanged.
+    ///
+    /// If the render worker still owns a SurfaceTexture from a previous
+    /// frame, the actual `surface.configure()` call is deferred — wgpu
+    /// panics if you reconfigure with an outstanding SurfaceTexture. The
+    /// next `frame()` call applies the deferred resize once the worker
+    /// has presented and `frames_in_flight` drops to zero.
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == self.width && h == self.height {
             return;
@@ -802,15 +816,24 @@ impl Renderer {
             old_h = self.height,
             new_w = w,
             new_h = h,
+            in_flight = self.frames_in_flight,
             "renderer.resize"
         );
+        // Update tracked dims immediately so the next RenderCommand carries
+        // them, but defer the surface.configure() call if the worker is busy.
         self.width = w;
         self.height = h;
         self.config.width = w;
         self.config.height = h;
-        self.surface.configure(&self.device, &self.config);
-        // Keep chrome_lw/chrome_lh proportional until set_logical_size is called.
-        // The next RenderCommand will carry the new dims; the worker reconciles lazily.
+        if self.frames_in_flight == 0 {
+            self.surface.configure(&self.device, &self.config);
+        } else {
+            tracing::debug!(
+                in_flight = self.frames_in_flight,
+                "renderer.resize: deferring surface.configure (worker mid-present)"
+            );
+            self.pending_resize = Some((w, h));
+        }
         self.chrome_lw = w;
         self.chrome_lh = h;
     }
@@ -894,6 +917,17 @@ impl Renderer {
         // Drain stats from the previous frame before doing any work.
         // This also decrements `frames_in_flight` for each presented frame.
         self.poll_present_stats();
+
+        // Apply any deferred resize now that the worker has drained.
+        // resize() defers surface.configure when frames_in_flight > 0
+        // (wgpu panics on reconfigure with an outstanding SurfaceTexture).
+        if let Some((w, h)) = self.pending_resize
+            && self.frames_in_flight == 0
+        {
+            tracing::debug!(w, h, "renderer.frame: applying deferred resize");
+            self.surface.configure(&self.device, &self.config);
+            self.pending_resize = None;
+        }
 
         // Skip frame entirely if the worker hasn't presented the previous one.
         // wgpu's swapchain (with desired_maximum_frame_latency = 1) panics on
