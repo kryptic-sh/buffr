@@ -6802,9 +6802,12 @@ fn physical_wheel_to_dip(dx_phys: i32, dy_phys: i32, scale: f32) -> (i32, i32) {
 /// the predicate is allowed.  Tests pin the semantics so future refactors
 /// can't silently change the rule.
 fn decide_paint_policy(occluded: bool, _media_active: bool) -> PaintPolicy {
-    // TEST OVERRIDE: ignore media_active so we can verify whether CEF
-    // was_hidden(1) keeps audio alive while the paint policy is Sleeping.
-    // Revert before merging.
+    // Media flag is intentionally not consulted: empirical testing
+    // confirmed CEF was_hidden(1) keeps the audio thread alive on Linux,
+    // so a YouTube tab on a hidden workspace continues playing audio
+    // while we skip wgpu present.  Detection of media activity stays
+    // wired up for #22 idle-inhibit (keep screen awake) but no longer
+    // gates the sleep policy.
     if !occluded {
         PaintPolicy::Active
     } else {
@@ -7205,13 +7208,14 @@ mod tests {
 
     #[test]
     fn paint_policy_occluded_with_media() {
-        // TEST OVERRIDE: media flag ignored — occlusion always sleeps.
+        // Media flag is ignored: was_hidden(1) keeps audio alive, so
+        // occluded windows sleep regardless of media state.
         assert_eq!(decide_paint_policy(true, true), PaintPolicy::Sleeping);
     }
 
     #[test]
     fn paint_policy_visible_with_media() {
-        // Visible and media playing → Active.
+        // Visible always paints, with or without media.
         assert_eq!(decide_paint_policy(false, true), PaintPolicy::Active);
     }
 
