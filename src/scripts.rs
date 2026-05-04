@@ -35,22 +35,27 @@ pub const EXIT_INSERT: &str = include_str!("../assets/exit_insert.js");
 /// does not affect the others.
 pub const MEDIA_PROBE_INIT_JS: &str = include_str!("../assets/media_probe_init.js");
 
-/// Media-activity probe — poll script (v1.5).
+/// Media-activity probe — poll script (v1.6).
 ///
 /// Executed every ~2 s by [`crate::host::BrowserHost::run_media_probe`].
-/// Recomputes `window.__buffr_media_active` from all five signal sources and
-/// writes a boolean result that the Rust side reads on the next tick via
-/// [`crate::host::BrowserHost::read_media_probe_result`].
+/// Recomputes `window.__buffr_media_active` and `window.__buffr_video_active`
+/// from all five signal sources and writes boolean results.
 ///
-/// Signal sources (combined with `||`):
-/// 1. `navigator.mediaSession.playbackState === 'playing'`  (YouTube, Spotify)
-/// 2. `document.fullscreenElement instanceof HTMLVideoElement`  (fullscreen video)
-/// 3. Any `<video>` / `<audio>` tracked by `__buffr_media_state.playingMedia`
-///    that is currently un-paused  (silent / muted video, non-mediaSession audio)
-/// 4. Any `RTCPeerConnection` in `__buffr_media_state.peerConnections` with
-///    `connectionState !== 'closed'`  (WebRTC calls)
-/// 5. Any `WakeLockSentinel` in `__buffr_media_state.wakeLocks` with
-///    `released === false`  (Screen Wake Lock API)
+/// **`__buffr_media_active`** — true when any media (audio OR video) is active.
+/// Used to keep the OSR paint pipeline alive while the window is occluded.
+///
+/// **`__buffr_video_active`** — true when a *video* signal is present (not
+/// audio-only). Used by the idle-inhibit policy (issue #22) to decide whether
+/// to acquire the platform screen-lock inhibitor.
+///
+/// Signal → flag mapping:
+/// 1. `navigator.mediaSession.playbackState === 'playing'` → both flags (YES)
+/// 2. `document.fullscreenElement instanceof HTMLVideoElement` → both flags (YES)
+/// 3. Playing `<video>` tracked by `__buffr_media_state.playingMedia` → both (YES)
+/// 3. Playing `<audio>` tracked by `__buffr_media_state.playingMedia` → media only
+/// 4. `RTCPeerConnection` with a video track → both (YES)
+/// 4. `RTCPeerConnection` audio-only → media only
+/// 5. `WakeLockSentinel` with `released === false` → both flags (YES)
 ///
 /// A return-value path (e.g. V8 context eval) is not exposed by
 /// cef-rs's `Frame::execute_java_script`; using the `window` property

@@ -23,6 +23,7 @@ pub mod find;
 pub mod handlers;
 pub mod hint;
 pub mod host;
+pub mod inhibit;
 pub mod new_tab;
 pub mod open_finder;
 pub mod permissions;
@@ -71,6 +72,7 @@ pub use hint::{
     new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use host::{BrowserHost, ClipboardReader, HintStatus, Tab, TabId, TabSession, TabSummary};
+pub use inhibit::{IdleInhibitor, InhibitError, new_inhibitor};
 
 /// URLs queued by `LifeSpanHandler::on_before_popup` for dispositions
 /// that should open as a new tab (`NEW_FOREGROUND_TAB`,

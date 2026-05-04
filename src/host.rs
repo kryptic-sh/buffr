@@ -1418,6 +1418,28 @@ impl BrowserHost {
         audio_any_active(&self.audio_sink)
     }
 
+    /// `true` when the last JS media probe reported a *video* signal active
+    /// (`window.__buffr_video_active === true`).
+    ///
+    /// Unlike [`Self::any_audio_active`] (which is driven by CEF's
+    /// `AudioHandler`), the video flag is purely JS-side: the probe script
+    /// writes `window.__buffr_video_active` and the console-log IPC path
+    /// (issue #22 phase-2) will eventually read it back.  For now this is a
+    /// **no-op placeholder** that always returns `false` — the idle-inhibit
+    /// policy in `apps/buffr` will call this once the IPC reader lands.
+    ///
+    /// Phase-2 implementation note: run a tiny inline JS snippet that reads
+    /// `window.__buffr_video_active` and pushes the result via a console.log
+    /// sentinel (matching the pattern used by `edit.rs` / `hint.rs`).  Wire
+    /// the parse into `drain_audio_events` or a dedicated queue.  For the
+    /// scaffold phase the no-op is intentional — video_active starts false and
+    /// the inhibitor is never acquired until the reader is filled in.
+    pub fn any_video_active(&self) -> bool {
+        // Phase-1 stub: always false.
+        // Phase-2: read window.__buffr_video_active via console.log sentinel.
+        false
+    }
+
     /// Drain all pending [`AudioEvent`]s that [`BuffrAudioHandler`] pushed
     /// since the last call.  Returns an empty `Vec` on mutex poison.
     pub fn drain_audio_events(&self) -> Vec<crate::audio::AudioEvent> {
