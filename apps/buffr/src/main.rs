@@ -4136,26 +4136,13 @@ impl AppState {
             }
             I::CopyImage => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_image", "dispatch");
-                // TODO(slice-4b): off-thread fetch source_url → decode →
-                // PNG-encode → cb.set(MimeType::Png, png_bytes). Requires
-                // `image` crate dep + Capabilities::IMAGE check.
-                // For now: fall back to copying the image URL as text.
                 let url = request.source_url.clone();
                 if url.is_empty() {
                     return;
                 }
                 if let Some(host) = self.host.as_ref() {
-                    if host.clipboard_set_text(&url) {
-                        tracing::info!(
-                            target: "buffr::context_menu",
-                            "copy_image: IMAGE capability absent — copied URL as text fallback"
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: "buffr::context_menu",
-                            "copy_image: clipboard write failed"
-                        );
-                    }
+                    // Spawns a worker; logs success / fallback / failure.
+                    host.copy_image_url_to_clipboard(&url);
                 }
             }
             I::SaveImageAs => {
