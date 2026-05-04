@@ -1405,6 +1405,22 @@ wrap_permission_handler! {
     }
 }
 
+/// Convert a `CefStringUserfreeUtf16` to `String`, returning empty for
+/// null pointers (i.e. CEF reported "no value").
+///
+/// `CefStringUtf16::from(&userfree)` unconditionally `eprintln!`s
+/// "Invalid UTF-16 string" on null — noisy when context-menu params
+/// (link_url, selection, etc.) are legitimately empty for most clicks.
+/// Gating on the `Into<Option<&_cef_string_utf16_t>>` impl skips that
+/// path entirely.
+fn userfree_to_string(s: &CefStringUserfreeUtf16) -> String {
+    let opt: Option<&cef::sys::_cef_string_utf16_t> = s.into();
+    if opt.is_none() {
+        return String::new();
+    }
+    CefStringUtf16::from(s).to_string()
+}
+
 wrap_context_menu_handler! {
     pub struct BuffrContextMenuHandler;
 
@@ -1442,9 +1458,9 @@ wrap_context_menu_handler! {
                 return 1;
             };
             let type_flags = params.type_flags();
-            let link_url = CefStringUtf16::from(&params.link_url()).to_string();
-            let source_url = CefStringUtf16::from(&params.source_url()).to_string();
-            let selection = CefStringUtf16::from(&params.selection_text()).to_string();
+            let link_url = userfree_to_string(&params.link_url());
+            let source_url = userfree_to_string(&params.source_url());
+            let selection = userfree_to_string(&params.selection_text());
             let media_type = params.media_type();
             let media_flags = params.media_state_flags();
             let editable = params.is_editable() != 0;
@@ -1479,7 +1495,7 @@ wrap_context_menu_handler! {
         ) -> ::std::os::raw::c_int {
             // No commands to dispatch in slice 1; log for traceability.
             let selection = params
-                .map(|p| CefStringUtf16::from(&p.selection_text()).to_string())
+                .map(|p| userfree_to_string(&p.selection_text()))
                 .unwrap_or_default();
             tracing::debug!(
                 target: "buffr_core::context_menu",
