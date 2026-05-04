@@ -616,6 +616,25 @@ impl Renderer {
             .resize((self.chrome_lw * self.chrome_lh) as usize, 0u32);
     }
 
+    /// Drain present-worker stats messages and update `last_present_stats`.
+    /// Returns `Some(stats)` only when at least one new sample arrived
+    /// since the previous call — callers use this to gate occlusion-heuristic
+    /// updates so the same `present_us` isn't observed twice.
+    ///
+    /// Must be called BEFORE any wgpu work this frame.  Once a present has
+    /// blocked, subsequent `queue.write_texture` / `queue.submit` calls
+    /// inherit the same compositor backpressure and block too — so the
+    /// embedder needs the latest stats early enough to decide whether to
+    /// skip the wgpu work entirely.
+    pub fn poll_present_stats(&mut self) -> Option<FrameStats> {
+        let mut latest = None;
+        while let Ok(s) = self.present_chan.rx_stats.try_recv() {
+            self.last_present_stats = s;
+            latest = Some(s);
+        }
+        latest
+    }
+
     /// Composite one frame.
     ///
     /// - `chrome_dirty`: when true, `paint_chrome` is called and the chrome
@@ -857,11 +876,10 @@ impl Renderer {
         let t_submit = t0.elapsed();
         let submit_at = Instant::now();
 
-        // Drain any stats the worker has sent since last frame (non-blocking).
-        // Keep only the most recent; we don't need the whole history here.
-        while let Ok(s) = self.present_chan.rx_stats.try_recv() {
-            self.last_present_stats = s;
-        }
+        // Stats are drained by the embedder via `poll_present_stats` BEFORE
+        // calling frame() — see that method's doc.  Don't drain here too or
+        // the same `present_us` sample gets observed twice (once by the
+        // embedder's pre-frame poll, once via the value returned below).
 
         // Hand the surface texture to the worker.  Capacity-1 SyncSender:
         // if the worker is still busy with the previous present (occluded

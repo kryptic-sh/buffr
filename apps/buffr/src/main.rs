@@ -2987,6 +2987,22 @@ impl AppState {
     /// the moment `WindowEvent::Resized` fires; passing the event's
     /// `new_size` directly avoids painting at stale width/height.
     fn paint_chrome_with(&mut self, override_size: Option<(u32, u32)>) {
+        // Drain async-present stats from the worker thread BEFORE doing any
+        // wgpu work this frame.  Once a present has blocked on compositor
+        // backpressure, subsequent queue.write_texture / queue.submit calls
+        // inherit the same backpressure and block too — observed osr_us=6.27s
+        // on the frame following a 6.29s present.  Polling here means the
+        // occlusion heuristic trips before we touch the GPU, so the sleep
+        // guard below catches us instead.
+        let new_stats = self
+            .renderer
+            .as_mut()
+            .and_then(|r| r.poll_present_stats());
+        if let Some(stats) = new_stats {
+            let was_probe = self.probe_pending;
+            self.observe_present_us(stats.present_us, was_probe);
+        }
+
         // OSR sleep guard: skip the wgpu present while the policy is
         // Sleeping.  Bypass exceptions:
         //
@@ -3368,15 +3384,13 @@ impl AppState {
             );
         }
 
-        let probe_was_pending = self.probe_pending;
+        // Probe-pending is cleared here regardless of the present outcome.
+        // The actual heuristic decision happens in the next frame's
+        // top-of-paint `poll_present_stats` once the worker reports the
+        // probe present's `present_us`.
         self.probe_pending = false;
-        match res {
-            Ok(stats) => {
-                self.observe_present_us(stats.present_us, probe_was_pending);
-            }
-            Err(err) => {
-                warn!(error = %err, "wgpu frame failed");
-            }
+        if let Err(err) = res {
+            warn!(error = %err, "wgpu frame failed");
         }
 
         // Surface-drift detection. We just presented a buffer at
