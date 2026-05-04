@@ -1,0 +1,60 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_target_keybind
+          - fuzz_target_keys
+          - fuzz_target_config_toml
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: cache cargo registry + fuzz target dir
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'fuzz/fuzz_targets/*.rs') }}
+          restore-keys: fuzz-${{ matrix.target }}-
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: run fuzzer
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- -max_total_time=600 -timeout=25 -rss_limit_mb=2048
+
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 30

@@ -19,7 +19,7 @@ members = [
 # bin output filename collides with `apps/buffr` (the real binary). Keep
 # it out of `cargo build --workspace` paths and publish it independently:
 #   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
-exclude = ["apps/buffr-stub"]
+exclude = ["apps/buffr-stub", "fuzz"]
 default-members = ["apps/buffr"]
 
 [workspace.package]
