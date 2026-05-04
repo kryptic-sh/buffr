@@ -573,3 +573,74 @@ jobs:
           fi
           git commit -m "buffr-bin ${{ steps.tag.outputs.version }}-1"
           git push origin master
+
+  # Homebrew Cask auto-publish to kryptic-sh/homebrew-tap. Fetches the
+  # arm64 dmg sha256 sidecar off the release, renders pkg/homebrew/buffr.rb.in,
+  # and pushes to the tap repo over SSH. Runs after `macos` so the dmg +
+  # sidecar are guaranteed to be uploaded before we fetch.
+  #
+  # Required org/repo secret (SELECTED-scope — must be granted to this repo):
+  #   BREW_SSH_KEY  — ed25519 private key whose public half is a deploy key
+  #                   with write access on kryptic-sh/homebrew-tap.
+  brew-tap:
+    name: Publish buffr cask to homebrew-tap
+    needs: [macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch dmg sha256 sidecar
+        id: sha
+        run: |
+          set -euo pipefail
+          V="${{ steps.tag.outputs.version }}"
+          BASE="https://github.com/kryptic-sh/buffr/releases/download/v${V}"
+          curl -fsSL "$BASE/buffr-${V}-arm64.dmg.sha256" -o sha.aarch64-darwin
+          echo "aarch64=$(awk '{print $1}' sha.aarch64-darwin)" >> "$GITHUB_OUTPUT"
+
+      - name: Render cask
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          sed \
+            -e "s|{VERSION}|${{ steps.tag.outputs.version }}|g" \
+            -e "s|{SHA256_AARCH64_DARWIN}|${{ steps.sha.outputs.aarch64 }}|g" \
+            pkg/homebrew/buffr.rb.in > out/buffr.rb
+          echo "--- rendered cask ---"
+          cat out/buffr.rb
+
+      - name: Configure SSH for homebrew-tap
+        env:
+          BREW_SSH_KEY: ${{ secrets.BREW_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -dm700 ~/.ssh
+          printf '%s\n' "$BREW_SSH_KEY" > ~/.ssh/brew
+          chmod 600 ~/.ssh/brew
+
+      - name: Push cask to homebrew-tap
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/brew -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+        run: |
+          set -euo pipefail
+          git config --global user.name  "buffr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone git@github.com:kryptic-sh/homebrew-tap.git tap
+          mkdir -p tap/Casks
+          cp out/buffr.rb tap/Casks/buffr.rb
+          cd tap
+          git add Casks/buffr.rb
+          if git diff --cached --quiet; then
+            echo "no changes vs current tap head; nothing to push"
+            exit 0
+          fi
+          git commit -m "buffr ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main
