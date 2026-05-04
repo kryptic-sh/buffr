@@ -1245,6 +1245,13 @@ impl BrowserHost {
         // current builds cap at 60.
         let hz = self.osr_view.frame_rate_hz.load(Ordering::Relaxed);
         settings.windowless_frame_rate = hz.max(1) as i32;
+        // Opaque white background. Default (0) is treated as "fully
+        // transparent" for windowless browsers, which leaves pages
+        // without a CSS body background (notably `view-source:`)
+        // showing the wgpu clear colour through the OSR quad. Match
+        // standard browser behaviour and let CEF fill un-painted
+        // areas with white.
+        settings.background_color = 0xFFFFFFFF;
 
         let render_handler = Some(make_osr_paint_handler(
             self.osr_frame.clone(),

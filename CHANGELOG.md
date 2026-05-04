@@ -53,6 +53,12 @@ All notable changes to `buffr-core` are documented here. Format follows
   causing the omnibar to pre-fill with the underlying URL when the user opened
   it on a view-source page; now subsumed into the `buffr-src:` rename above via
   `merge_navigation_url`.
+- **Transparent OSR background on pages without a CSS body bg.**
+  `BrowserSettings.background_color` was unset (= 0), which CEF treats as
+  fully-transparent painting for windowless browsers; pages like `buffr-src:` /
+  `view-source:` then showed the wgpu clear colour (`0x1a1b26`) through the OSR
+  quad. Now set to opaque white (`0xFFFFFFFF`) so CEF fills un-painted regions,
+  matching standard browser behaviour.
 
 ## [0.4.0] — 2026-05-04
 
