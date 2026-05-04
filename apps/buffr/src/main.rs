@@ -16,7 +16,7 @@
 //! Phase 4 additions: clap CLI, TOML config loader, hot-reload watcher
 //! that swaps the live keymap on file changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,38 @@ const CEF_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 /// (occluded then immediately revealed) without emitting spurious
 /// sleep/wake cycles that would produce a flickery on_paint burst.
 const OCCLUDE_SLEEP_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// `present_us` threshold above which we suspect the compositor is
+/// throttling our surface (window occluded, on a hidden workspace,
+/// minimized).  Healthy presents are sub-16 ms; compositor-throttled
+/// invisible surfaces routinely block 100 ms – 1.5 s.  Used as a
+/// fallback occlusion signal on platforms (Hyprland today) where winit
+/// `WindowEvent::Occluded` doesn't fire.
+const SLOW_PRESENT_THRESHOLD_US: u64 = 100_000;
+
+/// `present_us` below which we consider the surface to be visible again
+/// (compositor is releasing buffers promptly).  A single fast probe
+/// frame undoes a heuristic-occluded belief.
+const FAST_PRESENT_THRESHOLD_US: u64 = 30_000;
+
+/// Number of recent `present_us` samples retained for the occlusion
+/// heuristic.  Keeping the window small lets the heuristic react
+/// quickly to a workspace switch (3 of 5 slow → occlude after ~3
+/// frames, well under a second at 60 Hz).
+const PRESENT_HISTORY_SIZE: usize = 5;
+
+/// Number of slow frames within [`PRESENT_HISTORY_SIZE`] required to
+/// flip the heuristic to "occluded".  3-of-5 is conservative enough
+/// to ride out a one-off compositor stutter without burning the user
+/// with a false sleep, and aggressive enough that a workspace switch
+/// trips it within ~50 ms at 60 Hz.
+const SLOW_FRAMES_TO_OCCLUDE: usize = 3;
+
+/// How often, while heuristically sleeping, to attempt a probe present
+/// to test whether the compositor is releasing buffers again.  Two
+/// seconds balances wake latency against the cost of the probe (one
+/// full present cycle that may itself block 100+ ms if still occluded).
+const OCCLUSION_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often the media-activity probe JS is fired while the window is
 /// occluded.  Two seconds balances detection latency against JS-execution
@@ -1982,6 +2014,21 @@ struct AppState {
     /// Current paint policy.  Transitions trigger `osr_sleep` / `osr_sleep(false)`
     /// on the host.  Starts `Active` so the window paints immediately on launch.
     paint_policy: PaintPolicy,
+    /// Recent `present_us` samples (most recent at the back).  Capped at
+    /// [`PRESENT_HISTORY_SIZE`].  Drives the present-time occlusion
+    /// heuristic for compositors where winit `Occluded` is unreliable
+    /// (Hyprland workspace switch, etc.).
+    present_us_history: VecDeque<u64>,
+    /// Deadline for the next occlusion probe present while the policy
+    /// is `Sleeping` due to the heuristic.  `None` when not sleeping or
+    /// when the next probe is implicit (any chrome-dirty paint also
+    /// serves as a probe via the sleep-guard bypass).
+    next_probe_at: Option<Instant>,
+    /// Set true by `about_to_wait` immediately before requesting a
+    /// wake-probe redraw; cleared at the bottom of `paint_chrome_with`
+    /// after the probe paints.  Bypasses the sleep guard for exactly
+    /// one paint so we can measure `present_us` and decide stay/wake.
+    probe_pending: bool,
 }
 
 /// OSR paint policy for the window.
@@ -2177,6 +2224,9 @@ impl AppState {
             media_active: false,
             media_probe_next: None,
             paint_policy: PaintPolicy::Active,
+            present_us_history: VecDeque::with_capacity(PRESENT_HISTORY_SIZE),
+            next_probe_at: None,
+            probe_pending: false,
         }
     }
 
@@ -2201,6 +2251,68 @@ impl AppState {
     /// Mark the chrome texture as needing a repaint.
     fn mark_chrome_dirty(&mut self) {
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
+    }
+
+    /// Push a new `present_us` sample into the rolling history and run
+    /// the occlusion heuristic.
+    ///
+    /// Two transitions:
+    /// - Active → heuristic-occluded: at least
+    ///   [`SLOW_FRAMES_TO_OCCLUDE`]-of-[`PRESENT_HISTORY_SIZE`] frames
+    ///   exceeded [`SLOW_PRESENT_THRESHOLD_US`].  Sets `occluded=true`,
+    ///   schedules the first wake-probe, recomputes the policy.
+    /// - Sleeping (probe) → Active: this paint was a wake-probe and
+    ///   `present_us` came back below [`FAST_PRESENT_THRESHOLD_US`].
+    ///   Compositor is releasing buffers again; clear `occluded` and
+    ///   wipe history so the next slow-streak starts fresh.
+    ///
+    /// While Sleeping with the probe still slow, schedule the next
+    /// probe for [`OCCLUSION_PROBE_INTERVAL`] from now.
+    fn observe_present_us(&mut self, present_us: u64, was_probe: bool) {
+        record_present_us(&mut self.present_us_history, present_us);
+
+        if self.paint_policy == PaintPolicy::Sleeping {
+            // Any successful present while Sleeping is treated as a probe
+            // result (chrome-dirty bypass paints are also informative).
+            if present_us < FAST_PRESENT_THRESHOLD_US {
+                tracing::debug!(
+                    present_us,
+                    was_probe,
+                    "occlusion: probe fast → wake"
+                );
+                self.occluded = false;
+                self.present_us_history.clear();
+                self.next_probe_at = None;
+                self.recompute_paint_policy();
+            } else {
+                self.next_probe_at = Some(Instant::now() + OCCLUSION_PROBE_INTERVAL);
+                if let Some(host) = self.host.as_ref() {
+                    // Probe woke CEF via osr_sleep(false); re-hide so we
+                    // don't burn renderer CPU until the next probe.
+                    host.osr_sleep(true);
+                }
+            }
+            return;
+        }
+
+        // Active: occlude if the rolling history shows sustained slow
+        // presents.  Single bad frames are absorbed by SLOW_FRAMES_TO_OCCLUDE.
+        if !self.occluded
+            && detect_occluded_from_history(
+                &self.present_us_history,
+                SLOW_PRESENT_THRESHOLD_US,
+                SLOW_FRAMES_TO_OCCLUDE,
+            )
+        {
+            tracing::debug!(
+                present_us,
+                history = ?self.present_us_history,
+                "occlusion: heuristic-occluded → sleep"
+            );
+            self.occluded = true;
+            self.next_probe_at = Some(Instant::now() + OCCLUSION_PROBE_INTERVAL);
+            self.recompute_paint_policy();
+        }
     }
 
     /// Recompute the paint policy from current `occluded` + `media_active`
@@ -2851,15 +2963,25 @@ impl AppState {
     /// the moment `WindowEvent::Resized` fires; passing the event's
     /// `new_size` directly avoids painting at stale width/height.
     fn paint_chrome_with(&mut self, override_size: Option<(u32, u32)>) {
-        // OSR sleep guard: skip the wgpu present while CEF is paused.
+        // OSR sleep guard: skip the wgpu present while the policy is
+        // Sleeping.  Bypass exceptions:
         //
-        // The `surface_drifted` exception is CRITICAL for #17 integration:
-        // if Hyprland sends a configure while we are sleeping, the stale
-        // buffer has the wrong dims and the compositor letterboxes it.
-        // Letting the resize self-heal paint through (surface_drifted=true
-        // is set by the Resized handler) keeps the surface dimensions
-        // consistent even while the paint loop is otherwise paused.
-        if self.paint_policy == PaintPolicy::Sleeping && !self.surface_drifted {
+        // - `surface_drifted`: CRITICAL for #17 — if Hyprland sends a
+        //   configure while sleeping, the stale buffer has the wrong dims
+        //   and the compositor letterboxes it.  The resize self-heal must
+        //   present at the new dims.
+        // - `probe_pending`: a wake-probe was scheduled by `about_to_wait`
+        //   to test whether the compositor is now showing our surface
+        //   (heuristic-occlusion case where winit Occluded is unreliable).
+        // - chrome dirty: input / mode change bumped chrome_generation; we
+        //   must honour it even while heuristically sleeping or the user's
+        //   keystroke is silently dropped.
+        let chrome_might_be_dirty = self.chrome_generation != self.last_painted_chrome_gen;
+        if self.paint_policy == PaintPolicy::Sleeping
+            && !self.surface_drifted
+            && !self.probe_pending
+            && !chrome_might_be_dirty
+        {
             return;
         }
         let Some(window) = self.window.as_ref() else {
@@ -3220,8 +3342,15 @@ impl AppState {
             );
         }
 
-        if let Err(err) = res {
-            warn!(error = %err, "wgpu frame failed");
+        let probe_was_pending = self.probe_pending;
+        self.probe_pending = false;
+        match res {
+            Ok(stats) => {
+                self.observe_present_us(stats.present_us, probe_was_pending);
+            }
+            Err(err) => {
+                warn!(error = %err, "wgpu frame failed");
+            }
         }
 
         // Surface-drift detection. We just presented a buffer at
@@ -6039,6 +6168,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
             // 4. Recompute paint policy and apply transitions.
             self.recompute_paint_policy();
+
+            // 5. Heuristic-occlusion wake probe: while Sleeping with a
+            //    next_probe_at set, do a one-shot present to test whether
+            //    the compositor is releasing buffers again.  The probe
+            //    bypasses the sleep guard via probe_pending; the post-paint
+            //    observe_present_us either wakes us (fast) or re-sleeps
+            //    and reschedules (still slow).
+            if self.paint_policy == PaintPolicy::Sleeping
+                && self
+                    .next_probe_at
+                    .is_some_and(|t| Instant::now() >= t)
+            {
+                self.probe_pending = true;
+                self.next_probe_at = None;
+                if let Some(host) = self.host.as_ref() {
+                    host.osr_sleep(false);
+                    host.osr_invalidate_view();
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
         }
 
         // Engine ambiguity timeout: if a single-chord prefix is
@@ -6525,6 +6676,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
+        // Occlusion wake probe: while heuristically sleeping, wake up at
+        // the scheduled probe time so we can present once and check whether
+        // the compositor is releasing buffers again.
+        let deadline = match self.next_probe_at {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
@@ -6649,6 +6807,28 @@ fn decide_paint_policy(occluded: bool, media_active: bool) -> PaintPolicy {
     } else {
         PaintPolicy::Sleeping
     }
+}
+
+/// Push a present-time sample into the rolling history, evicting the
+/// oldest if at capacity.  Pure to keep the heuristic testable.
+fn record_present_us(history: &mut VecDeque<u64>, present_us: u64) {
+    history.push_back(present_us);
+    while history.len() > PRESENT_HISTORY_SIZE {
+        history.pop_front();
+    }
+}
+
+/// Decide whether the rolling `present_us` history indicates the
+/// surface is currently occluded by the compositor.  At least
+/// `min_slow` samples must exceed `slow_threshold_us`.  Pure for
+/// testability — callers pass thresholds explicitly so unit tests
+/// don't depend on the production constants.
+fn detect_occluded_from_history(
+    history: &VecDeque<u64>,
+    slow_threshold_us: u64,
+    min_slow: usize,
+) -> bool {
+    history.iter().filter(|&&us| us > slow_threshold_us).count() >= min_slow
 }
 
 /// Pure paint-path decision. All callers must route through this function;
@@ -7030,6 +7210,44 @@ mod tests {
     fn paint_policy_visible_with_media() {
         // Visible and media playing → Active.
         assert_eq!(decide_paint_policy(false, true), PaintPolicy::Active);
+    }
+
+    // ---- Occlusion heuristic tests -----------------------------------------
+
+    #[test]
+    fn record_present_us_caps_history() {
+        let mut h: VecDeque<u64> = VecDeque::new();
+        for i in 0..(PRESENT_HISTORY_SIZE as u64 + 3) {
+            record_present_us(&mut h, i);
+        }
+        assert_eq!(h.len(), PRESENT_HISTORY_SIZE);
+        // Oldest evicted; most recent at the back.
+        assert_eq!(*h.back().unwrap(), PRESENT_HISTORY_SIZE as u64 + 2);
+    }
+
+    #[test]
+    fn occlusion_triggers_on_3_of_5_slow() {
+        // 3 slow + 2 fast → occluded.
+        let h: VecDeque<u64> = [200_000, 5_000, 200_000, 5_000, 200_000]
+            .into_iter()
+            .collect();
+        assert!(detect_occluded_from_history(&h, 100_000, 3));
+    }
+
+    #[test]
+    fn occlusion_holds_on_2_of_5_slow() {
+        // 2 slow + 3 fast → not occluded (single stutter absorbed).
+        let h: VecDeque<u64> = [200_000, 5_000, 200_000, 5_000, 5_000]
+            .into_iter()
+            .collect();
+        assert!(!detect_occluded_from_history(&h, 100_000, 3));
+    }
+
+    #[test]
+    fn occlusion_short_history_safe() {
+        // Fewer samples than the threshold can never trip the heuristic.
+        let h: VecDeque<u64> = [200_000, 200_000].into_iter().collect();
+        assert!(!detect_occluded_from_history(&h, 100_000, 3));
     }
 
     #[test]

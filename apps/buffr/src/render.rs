@@ -556,7 +556,7 @@ impl Renderer {
         chrome_dirty: bool,
         paint_chrome: F,
         osr: Option<OsrUpload<'_>>,
-    ) -> Result<()>
+    ) -> Result<FrameStats>
     where
         F: FnOnce(&mut [u32], usize, usize),
     {
@@ -705,7 +705,7 @@ impl Renderer {
                         tracing::warn!(
                             "wgpu surface: get_current_texture timed out, skipping frame"
                         );
-                        return Ok(());
+                        return Ok(FrameStats { present_us: 0 });
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
                         return Err(anyhow::anyhow!("wgpu surface OOM"));
@@ -723,11 +723,11 @@ impl Renderer {
                             actual_h = actual.1,
                             "wgpu surface: still mismatched after retry — skipping frame"
                         );
-                        return Ok(());
+                        return Ok(FrameStats { present_us: 0 });
                     }
                     f
                 }
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(FrameStats { present_us: 0 }),
             }
         };
 
@@ -808,8 +808,23 @@ impl Renderer {
             );
         }
 
-        Ok(())
+        Ok(FrameStats { present_us })
     }
+}
+
+/// Per-frame timing stats returned by [`Renderer::frame`].
+///
+/// Used by the embedder's occlusion heuristic: a sustained jump in
+/// `present_us` is the most reliable signal we have that the
+/// compositor stopped showing our surface (Wayland workspace switch,
+/// minimize, fully covered window) on platforms where winit doesn't
+/// fire `WindowEvent::Occluded` reliably.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameStats {
+    /// Microseconds spent inside `wgpu::SurfaceTexture::present()`.
+    /// Healthy: <16 ms.  Compositor-throttled invisible surface:
+    /// 100 ms – 1.5 s.
+    pub present_us: u64,
 }
 
 fn make_texture(
