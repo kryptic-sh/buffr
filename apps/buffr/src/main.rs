@@ -1693,7 +1693,15 @@ struct AppState {
     // device first leaves CEF dereferencing freed memory during its
     // own teardown. Rust drops struct fields in declaration order, so
     // host comes first.
+    //
+    // `idle_inhibitor` MUST also drop before `window`. The Wayland
+    // backend's worker thread holds a `Connection` built via
+    // `Backend::from_foreign_display` against winit's `wl_display`
+    // pointer; dropping `window` first frees that display and the
+    // inhibitor's Drop (which sends Release + Shutdown then calls
+    // `inh.destroy()` + `conn.flush()`) would touch a dead fd.
     host: Option<buffr_core::BrowserHost>,
+    idle_inhibitor: Option<Box<dyn IdleInhibitor>>,
     window: Option<Arc<Window>>,
     engine: Arc<Mutex<Engine>>,
     history: Arc<buffr_history::History>,
@@ -2057,10 +2065,8 @@ struct AppState {
     /// can swap it without restarting. Mirrors the pattern used by
     /// `downloads_config`.
     idle_inhibit_config: Arc<buffr_config::IdleInhibitConfig>,
-    /// Platform idle-inhibitor. Created once in `resumed` alongside the
-    /// window. `None` until the window exists; also `None` if construction
-    /// failed (logged at warn level; feature degrades gracefully).
-    idle_inhibitor: Option<Box<dyn IdleInhibitor>>,
+    // `idle_inhibitor` lives at the top of the struct (next to `host`)
+    // for drop-order reasons — see the comment there.
     /// True when the last JS media probe (or future console-log IPC reader)
     /// reported `window.__buffr_video_active === true`. Updated each
     /// `about_to_wait` tick alongside `media_active`.
