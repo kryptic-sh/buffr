@@ -497,6 +497,18 @@ pub struct Renderer {
     /// Most-recent `FrameStats` received from the render worker.
     /// Lags one frame behind.
     last_present_stats: FrameStats,
+    /// Count of `SurfaceTexture` acquisitions that have been sent to the
+    /// worker but not yet `present()`-ed.
+    ///
+    /// `desired_maximum_frame_latency = 1` means wgpu allows AT MOST ONE
+    /// outstanding acquired texture at a time. Calling
+    /// `surface.get_current_texture()` while a previous frame is still
+    /// in flight panics with "Surface image is already acquired".
+    ///
+    /// Incremented on successful `try_send` to the worker. Decremented when
+    /// `FrameStats` arrives from the worker (one stats per presented frame).
+    /// `frame()` skips acquire entirely when this is non-zero.
+    frames_in_flight: u32,
 }
 
 impl Renderer {
@@ -769,6 +781,7 @@ impl Renderer {
             chrome_lh,
             render_chan,
             last_present_stats: FrameStats::default(),
+            frames_in_flight: 0,
         })
     }
 
@@ -831,6 +844,7 @@ impl Renderer {
         let mut latest = None;
         while let Ok(s) = self.render_chan.rx_stats.try_recv() {
             self.last_present_stats = s;
+            self.frames_in_flight = self.frames_in_flight.saturating_sub(1);
             latest = Some(s);
         }
         latest
@@ -872,7 +886,21 @@ impl Renderer {
         let t0 = Instant::now();
 
         // Drain stats from the previous frame before doing any work.
+        // This also decrements `frames_in_flight` for each presented frame.
         self.poll_present_stats();
+
+        // Skip frame entirely if the worker hasn't presented the previous one.
+        // wgpu's swapchain (with desired_maximum_frame_latency = 1) panics on
+        // the second `get_current_texture()` if the first hasn't been
+        // presented. Mailbox semantics: the embedder will request another
+        // paint when state changes; dropping a frame here is harmless.
+        if self.frames_in_flight > 0 {
+            tracing::trace!(
+                in_flight = self.frames_in_flight,
+                "renderer.frame: worker still busy with previous frame, skipping"
+            );
+            return Ok(self.last_present_stats);
+        }
 
         // Chrome CPU paint — only when dirty. The closure runs on the UI
         // thread because it captures AppState data that can't be sent to
@@ -980,8 +1008,15 @@ impl Renderer {
         };
 
         match self.render_chan.tx_cmd.try_send(cmd) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Track outstanding frame so the next call to `frame()` won't
+                // try to acquire another swapchain texture before this one is
+                // presented.
+                self.frames_in_flight += 1;
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // Should be unreachable now that we gate acquire on
+                // frames_in_flight, but stays defensive.
                 tracing::trace!("renderer.frame: render worker busy, dropping frame");
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
