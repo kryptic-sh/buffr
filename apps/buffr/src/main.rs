@@ -2295,11 +2295,7 @@ impl AppState {
             // Any successful present while Sleeping is treated as a probe
             // result (chrome-dirty bypass paints are also informative).
             if present_us < FAST_PRESENT_THRESHOLD_US {
-                tracing::debug!(
-                    present_us,
-                    was_probe,
-                    "occlusion: probe fast → wake"
-                );
+                tracing::debug!(present_us, was_probe, "occlusion: probe fast → wake");
                 self.occluded = false;
                 self.present_us_history.clear();
                 self.next_probe_at = None;
@@ -2994,10 +2990,7 @@ impl AppState {
         // on the frame following a 6.29s present.  Polling here means the
         // occlusion heuristic trips before we touch the GPU, so the sleep
         // guard below catches us instead.
-        let new_stats = self
-            .renderer
-            .as_mut()
-            .and_then(|r| r.poll_present_stats());
+        let new_stats = self.renderer.as_mut().and_then(|r| r.poll_present_stats());
         if let Some(stats) = new_stats {
             let was_probe = self.probe_pending;
             self.observe_present_us(stats.present_us, was_probe);
@@ -6231,9 +6224,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             //    observe_present_us either wakes us (fast) or re-sleeps
             //    and reschedules (still slow).
             if self.paint_policy == PaintPolicy::Sleeping
-                && self
-                    .next_probe_at
-                    .is_some_and(|t| Instant::now() >= t)
+                && self.next_probe_at.is_some_and(|t| Instant::now() >= t)
             {
                 self.probe_pending = true;
                 self.next_probe_at = None;

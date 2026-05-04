@@ -23,7 +23,18 @@
 //! Texture format: `Bgra8Unorm`. Chrome u32 layout: `0xFF_RR_GG_BB` for
 //! opaque chrome pixels, `0x00_00_00_00` for transparent (CEF region).
 //! OSR pixels arrive from CEF already as BGRA bytes — cast directly.
+//!
+//! Threading model:
+//!
+//! The UI thread performs ONLY `surface.get_current_texture()` (fast: 89-300 µs).
+//! All other wgpu work — `queue.write_texture` for chrome and OSR,
+//! encoder building, `queue.submit`, and `frame.present()` — runs on a
+//! dedicated "wgpu-render" worker thread. This prevents Wayland compositor
+//! backpressure from blocking the UI thread when `PresentMode::Fifo` is the
+//! only available mode (observed 4.6 s blocks on `write_texture` when the
+//! compositor holds the buffer for an occluded surface).
 
+use std::iter::once;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -105,6 +116,55 @@ pub struct OsrUpload<'a> {
     pub dst_rect: (u32, u32, u32, u32),
 }
 
+/// Owned variant of `OsrUpload` — created inside `frame()` by cloning the
+/// pixel slice. The clone cost (~220 µs at 30 GB/s for a 6.6 MB buffer)
+/// is the price for moving the GPU work off the UI thread.
+struct OsrUploadOwned {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    generation: u64,
+    dst_rect: (u32, u32, u32, u32),
+}
+
+impl<'a> From<&OsrUpload<'a>> for OsrUploadOwned {
+    fn from(u: &OsrUpload<'a>) -> Self {
+        Self {
+            pixels: u.pixels.to_vec(),
+            width: u.width,
+            height: u.height,
+            generation: u.generation,
+            dst_rect: u.dst_rect,
+        }
+    }
+}
+
+/// Command sent from the UI thread to the render worker per frame.
+struct RenderCommand {
+    /// Surface texture acquired on the UI thread.
+    surface_texture: wgpu::SurfaceTexture,
+    /// Physical surface dims at acquire time.
+    width: u32,
+    height: u32,
+    /// Logical chrome dims at acquire time.
+    chrome_lw: u32,
+    chrome_lh: u32,
+    /// Owned chrome pixels. `Some` only when `chrome_dirty` was true;
+    /// `None` means the worker reuses its existing chrome texture.
+    chrome_pixels: Option<Vec<u32>>,
+    /// Owned OSR upload. `None` in windowed/no-OSR mode.
+    osr: Option<OsrUploadOwned>,
+}
+
+/// Channel pair owned by `Renderer` on the UI side.
+struct RenderChannel {
+    /// Capacity-1 SyncSender → mailbox semantics: drop the incoming frame
+    /// when the worker is still busy with the previous one (occluded surface).
+    tx_cmd: std::sync::mpsc::SyncSender<RenderCommand>,
+    rx_stats: std::sync::mpsc::Receiver<FrameStats>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
 /// OSR GPU state: a single texture sized to whatever CEF most recently
 /// emitted. The renderer GPU-stretches it (linear sampler) to fill the
 /// live browser_rect, so when CEF's buffer dims lag the window dims the
@@ -142,9 +202,9 @@ impl OsrTexture {
         }
     }
 
-    /// Upload new pixels if generation changed or dims differ. On a dim
-    /// change the texture is reallocated. Returns true on dim change so
-    /// the caller can refresh its uniform.
+    /// Upload new pixels if generation changed or dims differ.
+    /// On a dim change the texture is reallocated.
+    /// Returns true on dim change so the caller can refresh its uniform.
     #[allow(clippy::too_many_arguments)]
     fn maybe_upload(
         &mut self,
@@ -154,7 +214,7 @@ impl OsrTexture {
         sampler: &wgpu::Sampler,
         uniform_buf: &wgpu::Buffer,
         format: wgpu::TextureFormat,
-        upload: &OsrUpload<'_>,
+        upload: &OsrUploadOwned,
     ) -> bool {
         let dims_changed = upload.width != self.width || upload.height != self.height;
         if dims_changed {
@@ -174,7 +234,7 @@ impl OsrTexture {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                upload.pixels,
+                &upload.pixels,
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * upload.width),
@@ -192,93 +252,250 @@ impl OsrTexture {
     }
 }
 
-/// A surface texture plus the instant submit completed, sent to the present
-/// worker thread.
-struct PresentRequest {
-    texture: wgpu::SurfaceTexture,
-    /// Recorded immediately after `queue.submit()`. Reserved for future
-    /// GPU-submission-to-display latency tracking.
-    #[allow(dead_code)]
-    submit_at: Instant,
-}
-
-/// Worker-owned channel pair that moves `frame.present()` off the UI thread.
-///
-/// Capacity-1 `SyncSender` gives mailbox semantics: if the worker is still
-/// blocked on a previous present (occluded surface), `try_send` returns
-/// `TrySendError::Full` and the caller drops the frame instead of blocking.
-struct PresentChannel {
-    tx_present: std::sync::mpsc::SyncSender<PresentRequest>,
-    rx_stats: std::sync::mpsc::Receiver<FrameStats>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-/// Loop executed on the "wgpu-present" worker thread.
-fn present_worker(
-    rx: std::sync::mpsc::Receiver<PresentRequest>,
-    tx: std::sync::mpsc::Sender<FrameStats>,
-) {
-    while let Ok(req) = rx.recv() {
-        let t_present_start = Instant::now();
-        req.texture.present();
-        let present_us = t_present_start.elapsed().as_micros() as u64;
-        // Ignore send errors — the UI thread may have dropped its receiver
-        // during shutdown.
-        let _ = tx.send(FrameStats { present_us, submit_done_us: 0 });
-    }
-}
-
-pub struct Renderer {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
+/// All wgpu state that lives on the render worker thread.
+struct RenderState {
+    device: Arc<wgpu::Device>,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    surface_format: wgpu::TextureFormat,
-
-    /// Pipeline for the OSR quad — no blending (opaque).
     pipeline_osr: wgpu::RenderPipeline,
-    /// Pipeline for the chrome quad — alpha blending.
     pipeline_chrome: wgpu::RenderPipeline,
-
     bind_group_layout: wgpu::BindGroupLayout,
-
-    /// Linear-filter sampler — used for both OSR and chrome textures.
-    /// OSR benefits from bilinear during transient resize stretch (softens
-    /// the stale-frame upscale so the fresh-frame transition isn't a pop);
-    /// chrome at logical size bilinear-stretches to physical — at integer
-    /// scales glyph pixel boundaries align exactly and the result is crisp.
     sampler_linear: wgpu::Sampler,
 
-    /// OSR texture + state.
+    /// OSR texture + state — `None` until the first OSR frame arrives.
     osr: Option<OsrTexture>,
-    /// Uniform buffer for the OSR quad rect. Written before each draw.
     osr_uniform_buf: wgpu::Buffer,
 
-    /// Chrome texture — logical-pixel sized (physical / scale, rounded).
-    /// The chrome quad NDC rect is always fullscreen (-1..+1), so the GPU
-    /// bilinear-stretches the logical texture to fill the physical surface.
+    /// Chrome texture on the GPU — sized at logical (chrome_lw × chrome_lh).
     chrome_texture: wgpu::Texture,
     chrome_view: wgpu::TextureView,
     chrome_bind_group: wgpu::BindGroup,
-    /// Uniform buffer for the chrome quad (always fullscreen).
     chrome_uniform_buf: wgpu::Buffer,
-    /// CPU-side chrome buffer — sized at logical (chrome_lw × chrome_lh).
-    chrome_cpu: Vec<u32>,
+
+    /// Logical chrome dims as last seen by the worker.
+    chrome_lw: u32,
+    chrome_lh: u32,
+    /// Physical surface dims as last seen by the worker.
+    width: u32,
+    height: u32,
+
+    surface_format: wgpu::TextureFormat,
+}
+
+impl RenderState {
+    /// Reallocate chrome texture + bind group for new logical dims.
+    /// Called when the worker sees dims that differ from its cached state.
+    fn reallocate_chrome(&mut self, chrome_lw: u32, chrome_lh: u32) {
+        let (texture, view) = make_texture(&self.device, chrome_lw, chrome_lh, self.surface_format);
+        self.chrome_bind_group = make_bind_group(
+            &self.device,
+            &self.bind_group_layout,
+            &self.chrome_uniform_buf,
+            &view,
+            &self.sampler_linear,
+        );
+        self.chrome_texture = texture;
+        self.chrome_view = view;
+        self.chrome_lw = chrome_lw;
+        self.chrome_lh = chrome_lh;
+    }
+
+    /// Write chrome pixels to the GPU texture.
+    fn write_chrome(&self, pixels: &[u32]) {
+        let bytes: &[u8] = bytemuck::cast_slice(pixels);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.chrome_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * self.chrome_lw),
+                rows_per_image: Some(self.chrome_lh),
+            },
+            wgpu::Extent3d {
+                width: self.chrome_lw,
+                height: self.chrome_lh,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Upload OSR pixels and update the OSR uniform (dst_rect → NDC).
+    fn write_osr(&mut self, osr: &OsrUploadOwned) {
+        let osr_entry = self.osr.get_or_insert_with(|| {
+            OsrTexture::new(
+                &self.device,
+                &self.bind_group_layout,
+                &self.sampler_linear,
+                &self.osr_uniform_buf,
+                self.surface_format,
+                osr.width,
+                osr.height,
+            )
+        });
+        osr_entry.maybe_upload(
+            &self.device,
+            &self.queue,
+            &self.bind_group_layout,
+            &self.sampler_linear,
+            &self.osr_uniform_buf,
+            self.surface_format,
+            osr,
+        );
+        // Update the OSR quad uniform to match dst_rect.
+        let (dx, dy, dw, dh) = osr.dst_rect;
+        let win_w = self.width as f32;
+        let win_h = self.height as f32;
+        let ndc_x0 = (dx as f32 / win_w) * 2.0 - 1.0;
+        let ndc_x1 = ((dx as f32 + dw as f32) / win_w) * 2.0 - 1.0;
+        let ndc_y1 = 1.0 - (dy as f32 / win_h) * 2.0;
+        let ndc_y0 = 1.0 - ((dy as f32 + dh as f32) / win_h) * 2.0;
+        let uni = QuadUniforms {
+            ndc: [ndc_x0, ndc_y1, ndc_x1, ndc_y0],
+            uv: [0.0, 0.0, 1.0, 1.0],
+        };
+        self.queue
+            .write_buffer(&self.osr_uniform_buf, 0, bytemuck::bytes_of(&uni));
+    }
+}
+
+/// Loop executed on the "wgpu-render" worker thread.
+///
+/// Blocks on `rx_cmd.recv()`. Each received `RenderCommand` contains the
+/// already-acquired `SurfaceTexture` plus all pixel data needed for the
+/// frame. The worker handles every blocking wgpu call:
+/// `queue.write_texture`, `queue.submit`, and `surface_texture.present()`.
+fn render_worker(
+    mut state: RenderState,
+    rx_cmd: std::sync::mpsc::Receiver<RenderCommand>,
+    tx_stats: std::sync::mpsc::Sender<FrameStats>,
+) {
+    while let Ok(cmd) = rx_cmd.recv() {
+        let render_start = Instant::now();
+
+        // Reconcile worker's cached dims with what the UI thread sent.
+        // The UI thread drives resize (surface.configure) and mirrors the
+        // new dims into every RenderCommand. The worker updates its GPU
+        // state lazily here rather than via a separate channel message.
+        if cmd.chrome_lw != state.chrome_lw || cmd.chrome_lh != state.chrome_lh {
+            tracing::debug!(
+                old_lw = state.chrome_lw,
+                old_lh = state.chrome_lh,
+                new_lw = cmd.chrome_lw,
+                new_lh = cmd.chrome_lh,
+                "render_worker: chrome dims changed, reallocating"
+            );
+            state.reallocate_chrome(cmd.chrome_lw, cmd.chrome_lh);
+        }
+        // Mirror physical dims so OSR NDC calculations use the right surface size.
+        state.width = cmd.width;
+        state.height = cmd.height;
+
+        // Write chrome texture if the UI thread sent new pixels.
+        if let Some(ref pixels) = cmd.chrome_pixels {
+            state.write_chrome(pixels);
+        }
+
+        // Write OSR texture if provided.
+        let has_osr = if let Some(ref osr) = cmd.osr {
+            if osr.width == 0 || osr.height == 0 {
+                false
+            } else {
+                state.write_osr(osr);
+                true
+            }
+        } else {
+            false
+        };
+
+        // Build encoder + render passes.
+        let frame_view = cmd
+            .surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("buffr-frame"),
+            });
+
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("buffr-rpass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0x1a as f64 / 255.0,
+                            g: 0x1b as f64 / 255.0,
+                            b: 0x26 as f64 / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // OSR quad — opaque, underneath chrome.
+            if has_osr && let Some(ref osr_tex) = state.osr {
+                rpass.set_pipeline(&state.pipeline_osr);
+                rpass.set_bind_group(0, &osr_tex.bind_group, &[]);
+                rpass.draw(0..6, 0..1);
+            }
+
+            // Chrome quad — alpha blended on top.
+            rpass.set_pipeline(&state.pipeline_chrome);
+            rpass.set_bind_group(0, &state.chrome_bind_group, &[]);
+            rpass.draw(0..6, 0..1);
+        }
+
+        state.queue.submit(once(encoder.finish()));
+        let submit_done_us = render_start.elapsed().as_micros() as u64;
+
+        cmd.surface_texture.present();
+        let present_us = (render_start.elapsed().as_micros() as u64).saturating_sub(submit_done_us);
+
+        tracing::trace!(submit_done_us, present_us, "render_worker: frame done");
+        if submit_done_us > 16_000 || present_us > 16_000 {
+            tracing::debug!(submit_done_us, present_us, "render_worker: slow frame");
+        }
+
+        // Ignore send errors — UI thread may be shutting down.
+        let _ = tx_stats.send(FrameStats {
+            present_us,
+            submit_done_us,
+        });
+    }
+}
+
+/// UI-side renderer. Owns the `wgpu::Surface` and all sizing state.
+/// All heavy GPU work is delegated to the render worker thread via
+/// `RenderChannel`.
+pub struct Renderer {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    // Arc-shared device: UI thread uses it for surface.configure() on resize;
+    // the worker thread holds the same Arc for all GPU operations.
+    device: Arc<wgpu::Device>,
 
     /// Physical surface width/height (wgpu swap-chain size).
     width: u32,
     height: u32,
     /// Logical chrome width/height (physical / scale, rounded up to ≥1).
-    /// The chrome texture and CPU buffer are allocated at this size.
     chrome_lw: u32,
     chrome_lh: u32,
 
-    /// Worker thread that calls `SurfaceTexture::present()` so the UI thread
-    /// never blocks on Wayland compositor backpressure.
-    present_chan: PresentChannel,
-    /// Most-recent `FrameStats` received from the present worker.
-    /// Lags one frame behind: `frame()` drains the stats channel *before*
-    /// sending the current texture, then returns this cached value.
+    render_chan: RenderChannel,
+    /// Most-recent `FrameStats` received from the render worker.
+    /// Lags one frame behind.
     last_present_stats: FrameStats,
 }
 
@@ -300,7 +517,7 @@ impl Renderer {
         }))
         .context("no suitable wgpu adapter")?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
+        let (device_raw, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("buffr-device"),
                 required_features: wgpu::Features::empty(),
@@ -310,6 +527,9 @@ impl Renderer {
             None,
         ))
         .context("wgpu request_device failed")?;
+        // Wrap in Arc so UI thread (surface.configure) and worker thread
+        // (texture/buffer operations) can both hold a reference without clone.
+        let device = Arc::new(device_raw);
 
         let size = window.inner_size();
         let width = size.width.max(1);
@@ -339,11 +559,8 @@ impl Renderer {
         // Mailbox lets the swap chain advance without stalling.  Immediate
         // is the same plus tearing — acceptable fallback when the GPU stack
         // doesn't expose Mailbox (e.g. Vulkan unavailable → GL backend).
-        // Fifo last resort.
-        //
-        // The earlier subsurface flicker that prompted a Fifo experiment
-        // turned out to be SharedOsrFrame mutex contention (since fixed
-        // with mem::swap), not the present mode's fault.
+        // Fifo last resort — write_texture/submit/present on backpressure now
+        // block only the render worker, never the UI thread.
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -505,30 +722,15 @@ impl Renderer {
         // Write the chrome uniform once — it is always a fullscreen quad.
         write_fullscreen_uniform(&queue, &chrome_uniform_buf);
 
-        let chrome_cpu = vec![0u32; (chrome_lw * chrome_lh) as usize];
-
-        // Capacity-1 sync channel: gives mailbox semantics (drop the incoming
-        // frame if the worker is still busy presenting the previous one).
-        let (tx_present, rx_present) = std::sync::mpsc::sync_channel::<PresentRequest>(1);
+        // Capacity-1 sync channel → mailbox semantics (drop the incoming
+        // frame if the worker is still busy with the previous one).
+        let (tx_cmd, rx_cmd) = std::sync::mpsc::sync_channel::<RenderCommand>(1);
         // Unbounded response channel: UI thread drains lazily via try_recv.
         let (tx_stats, rx_stats) = std::sync::mpsc::channel::<FrameStats>();
-        let handle = std::thread::Builder::new()
-            .name("wgpu-present".to_owned())
-            .spawn(move || present_worker(rx_present, tx_stats))
-            .context("spawn wgpu-present thread")?;
 
-        let present_chan = PresentChannel {
-            tx_present,
-            rx_stats,
-            handle: Some(handle),
-        };
-
-        Ok(Self {
-            surface,
-            device,
+        let worker_state = RenderState {
+            device: device.clone(),
             queue,
-            config,
-            surface_format,
             pipeline_osr,
             pipeline_chrome,
             bind_group_layout,
@@ -539,17 +741,38 @@ impl Renderer {
             chrome_view,
             chrome_bind_group,
             chrome_uniform_buf,
-            chrome_cpu,
+            chrome_lw,
+            chrome_lh,
+            width,
+            height,
+            surface_format,
+        };
+
+        let handle = std::thread::Builder::new()
+            .name("wgpu-render".to_owned())
+            .spawn(move || render_worker(worker_state, rx_cmd, tx_stats))
+            .context("spawn wgpu-render thread")?;
+
+        let render_chan = RenderChannel {
+            tx_cmd,
+            rx_stats,
+            handle: Some(handle),
+        };
+
+        Ok(Self {
+            surface,
+            config,
+            device,
             width,
             height,
             chrome_lw,
             chrome_lh,
-            present_chan,
+            render_chan,
             last_present_stats: FrameStats::default(),
         })
     }
 
-    /// Reconfigure the surface + chrome texture for the new physical window size.
+    /// Reconfigure the surface + chrome dims for the new physical window size.
     /// Idempotent when dims are unchanged.
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == self.width && h == self.height {
@@ -567,17 +790,17 @@ impl Renderer {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        // Keep chrome logical size proportional: scale it to the same ratio
-        // as the physical resize (covers startup before set_logical_size is called).
-        // The caller should call set_logical_size separately when the scale changes.
-        self.reallocate_chrome();
+        // Keep chrome_lw/chrome_lh proportional until set_logical_size is called.
+        // The next RenderCommand will carry the new dims; the worker reconciles lazily.
+        self.chrome_lw = w;
+        self.chrome_lh = h;
     }
 
     /// Update the logical chrome dimensions (physical / scale, rounded).
     ///
-    /// Called whenever the window scale factor changes so the chrome CPU buffer
-    /// and texture are sized at logical pixels; the GPU bilinear-stretches the
-    /// smaller texture to fill the physical surface. Idempotent when unchanged.
+    /// Called whenever the window scale factor changes. The worker reconciles
+    /// its chrome texture lazily when it processes the next RenderCommand
+    /// that carries the new dims. Idempotent when unchanged.
     pub fn set_logical_size(&mut self, lw: u32, lh: u32) {
         let lw = lw.max(1);
         let lh = lh.max(1);
@@ -593,42 +816,20 @@ impl Renderer {
         );
         self.chrome_lw = lw;
         self.chrome_lh = lh;
-        self.reallocate_chrome();
     }
 
-    fn reallocate_chrome(&mut self) {
-        let (texture, view) = make_texture(
-            &self.device,
-            self.chrome_lw,
-            self.chrome_lh,
-            self.surface_format,
-        );
-        self.chrome_bind_group = make_bind_group(
-            &self.device,
-            &self.bind_group_layout,
-            &self.chrome_uniform_buf,
-            &view,
-            &self.sampler_linear,
-        );
-        self.chrome_texture = texture;
-        self.chrome_view = view;
-        self.chrome_cpu
-            .resize((self.chrome_lw * self.chrome_lh) as usize, 0u32);
-    }
-
-    /// Drain present-worker stats messages and update `last_present_stats`.
+    /// Drain render-worker stats messages and update `last_present_stats`.
     /// Returns `Some(stats)` only when at least one new sample arrived
     /// since the previous call — callers use this to gate occlusion-heuristic
-    /// updates so the same `present_us` isn't observed twice.
+    /// updates so the same stats aren't observed twice.
     ///
-    /// Must be called BEFORE any wgpu work this frame.  Once a present has
-    /// blocked, subsequent `queue.write_texture` / `queue.submit` calls
-    /// inherit the same compositor backpressure and block too — so the
-    /// embedder needs the latest stats early enough to decide whether to
-    /// skip the wgpu work entirely.
+    /// Must be called BEFORE any wgpu work this frame. After this refactor
+    /// the UI thread does no GPU work itself (only `get_current_texture`),
+    /// but draining early still gives the embedder the latest timing signal
+    /// before the paint-policy guard decides whether to skip the frame.
     pub fn poll_present_stats(&mut self) -> Option<FrameStats> {
         let mut latest = None;
-        while let Ok(s) = self.present_chan.rx_stats.try_recv() {
+        while let Ok(s) = self.render_chan.rx_stats.try_recv() {
             self.last_present_stats = s;
             latest = Some(s);
         }
@@ -637,16 +838,28 @@ impl Renderer {
 
     /// Composite one frame.
     ///
-    /// - `chrome_dirty`: when true, `paint_chrome` is called and the chrome
-    ///   texture is re-uploaded. When false, the existing chrome texture is
-    ///   reused without any CPU work.
+    /// UI thread responsibilities:
+    ///   1. Acquire `surface.get_current_texture()` (fast: ~89-300 µs).
+    ///   2. Invoke `paint_chrome` closure when `chrome_dirty` (CPU-only).
+    ///   3. Clone OSR pixel slice into an owned `Vec<u8>`.
+    ///   4. Send `RenderCommand` to the worker via capacity-1 channel.
+    ///
+    /// The worker handles all blocking wgpu calls: `write_texture` (chrome
+    /// and OSR), encoder building, `queue.submit`, and `present()`.
+    ///
+    /// On channel Full (worker still busy), the frame is dropped — mailbox
+    /// semantics, UI thread never blocks.
+    ///
+    /// - `chrome_dirty`: when true, `paint_chrome` is called and chrome
+    ///   pixels are sent to the worker for GPU upload. When false, the
+    ///   worker reuses its existing chrome texture.
     /// - `paint_chrome`: closure that paints the chrome strips into the
-    ///   provided buffer (full window size, row-major BGRA u32). Only the
-    ///   chrome rows should write opaque pixels (`0xFF_RR_GG_BB`); the CEF
-    ///   region must be left at `0x00_00_00_00` so the OSR shows through.
-    /// - `osr`: when `Some`, the OSR texture is conditionally uploaded (only
-    ///   when `generation` changed or dimensions differ) and drawn as a quad
-    ///   at `dst_rect`. When `None` (Windowed mode), only the chrome pass runs.
+    ///   provided buffer (logical chrome size, row-major BGRA u32). Only
+    ///   the chrome rows should write opaque pixels (`0xFF_RR_GG_BB`); the
+    ///   CEF region must be left at `0x00_00_00_00` so the OSR shows through.
+    /// - `osr`: when `Some`, pixels are cloned and sent to the worker which
+    ///   conditionally uploads to the OSR texture (only when generation
+    ///   changed or dims differ). When `None`, only the chrome pass runs.
     pub fn frame<F>(
         &mut self,
         chrome_dirty: bool,
@@ -656,106 +869,33 @@ impl Renderer {
     where
         F: FnOnce(&mut [u32], usize, usize),
     {
-        let w = self.chrome_lw as usize;
-        let h = self.chrome_lh as usize;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
 
-        // Chrome paint + upload at logical (DIP) size.
-        // The chrome quad NDC is always fullscreen; the GPU bilinear-stretches
-        // the logical texture to fill the physical surface.
-        if chrome_dirty {
+        // Drain stats from the previous frame before doing any work.
+        self.poll_present_stats();
+
+        // Chrome CPU paint — only when dirty. The closure runs on the UI
+        // thread because it captures AppState data that can't be sent to
+        // the worker. The resulting Vec<u32> is sent to the worker which
+        // uploads it to the GPU chrome texture.
+        let chrome_pixels = if chrome_dirty {
+            let lw = self.chrome_lw as usize;
+            let lh = self.chrome_lh as usize;
             // Zero the buffer first so previous chrome state doesn't bleed
             // into rows that are now transparent (e.g. after CEF rect shrinks).
-            self.chrome_cpu.fill(0);
-            paint_chrome(&mut self.chrome_cpu, w, h);
-            let bytes: &[u8] = bytemuck::cast_slice(&self.chrome_cpu);
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &self.chrome_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytes,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * self.chrome_lw),
-                    rows_per_image: Some(self.chrome_lh),
-                },
-                wgpu::Extent3d {
-                    width: self.chrome_lw,
-                    height: self.chrome_lh,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+            let mut buf = vec![0u32; lw * lh];
+            paint_chrome(&mut buf, lw, lh);
+            Some(buf)
+        } else {
+            None
+        };
 
         let t_chrome = t0.elapsed();
 
-        // OSR upload + uniform update.
-        let has_osr = if let Some(ref upload) = osr {
-            if upload.width == 0 || upload.height == 0 {
-                false
-            } else {
-                // Linear sampler for the OSR texture: when the stale CEF
-                // frame is stretched to fill a larger browser_rect during
-                // a resize, bilinear filtering produces a softened image
-                // that's visually close to what the fresh frame will look
-                // like — the moment CEF catches up the transition is a
-                // gentle re-sharpening rather than a sudden pop from
-                // blocky nearest-neighbour upscaling. At steady state
-                // (OSR dims match browser_rect 1:1) bilinear is a no-op.
-                let osr_entry = self.osr.get_or_insert_with(|| {
-                    OsrTexture::new(
-                        &self.device,
-                        &self.bind_group_layout,
-                        &self.sampler_linear,
-                        &self.osr_uniform_buf,
-                        self.surface_format,
-                        upload.width,
-                        upload.height,
-                    )
-                });
-                osr_entry.maybe_upload(
-                    &self.device,
-                    &self.queue,
-                    &self.bind_group_layout,
-                    &self.sampler_linear,
-                    &self.osr_uniform_buf,
-                    self.surface_format,
-                    upload,
-                );
-                // Update the OSR quad uniform to match dst_rect.
-                // The quad always covers the full dst_rect and samples the
-                // entire OSR texture (UV 0..1). When CEF's buffer lags the
-                // window dims (during a live-resize the new buffer hasn't
-                // arrived yet), the GPU sampler stretches the stale frame
-                // to fill the whole CEF region — no letterbox at the edge.
-                // Once CEF catches up (was_resized → new on_paint), the
-                // upload dims match dst and the stretch becomes 1:1.
-                let (dx, dy, dw, dh) = upload.dst_rect;
-                let win_w = self.width as f32;
-                let win_h = self.height as f32;
-                // NDC: x left→right = -1→+1, y bottom→top = -1→+1.
-                // Window pixels: row 0 = top, col 0 = left.
-                let ndc_x0 = (dx as f32 / win_w) * 2.0 - 1.0;
-                let ndc_x1 = ((dx as f32 + dw as f32) / win_w) * 2.0 - 1.0;
-                // y=top in NDC is +1, pixel row dy=0 means top of window.
-                let ndc_y1 = 1.0 - (dy as f32 / win_h) * 2.0;
-                let ndc_y0 = 1.0 - ((dy as f32 + dh as f32) / win_h) * 2.0;
-                let uni = QuadUniforms {
-                    ndc: [ndc_x0, ndc_y1, ndc_x1, ndc_y0],
-                    uv: [0.0, 0.0, 1.0, 1.0],
-                };
-                self.queue
-                    .write_buffer(&self.osr_uniform_buf, 0, bytemuck::bytes_of(&uni));
-                true
-            }
-        } else {
-            false
-        };
+        // Clone OSR pixels into an owned buffer.
+        let osr_owned = osr.as_ref().map(OsrUploadOwned::from);
 
-        let t_osr = t0.elapsed();
+        let t_osr_clone = t0.elapsed();
 
         // Acquire the swapchain texture.
         //
@@ -828,101 +968,53 @@ impl Renderer {
         };
 
         let t_acquire = t0.elapsed();
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("buffr-frame"),
-            });
+        let cmd = RenderCommand {
+            surface_texture: frame,
+            width: self.width,
+            height: self.height,
+            chrome_lw: self.chrome_lw,
+            chrome_lh: self.chrome_lh,
+            chrome_pixels,
+            osr: osr_owned,
+        };
 
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("buffr-rpass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0x1a as f64 / 255.0,
-                            g: 0x1b as f64 / 255.0,
-                            b: 0x26 as f64 / 255.0,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            // OSR quad — opaque, underneath chrome.
-            if has_osr && let Some(ref osr_tex) = self.osr {
-                rpass.set_pipeline(&self.pipeline_osr);
-                rpass.set_bind_group(0, &osr_tex.bind_group, &[]);
-                rpass.draw(0..6, 0..1);
-            }
-
-            // Chrome quad — alpha blended on top.
-            rpass.set_pipeline(&self.pipeline_chrome);
-            rpass.set_bind_group(0, &self.chrome_bind_group, &[]);
-            rpass.draw(0..6, 0..1);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        let t_submit = t0.elapsed();
-        let submit_at = Instant::now();
-
-        // Stats are drained by the embedder via `poll_present_stats` BEFORE
-        // calling frame() — see that method's doc.  Don't drain here too or
-        // the same `present_us` sample gets observed twice (once by the
-        // embedder's pre-frame poll, once via the value returned below).
-
-        // Hand the surface texture to the worker.  Capacity-1 SyncSender:
-        // if the worker is still busy with the previous present (occluded
-        // Wayland surface), try_send returns Full and we drop this frame —
-        // mailbox semantics, never blocks the UI thread.
-        match self
-            .present_chan
-            .tx_present
-            .try_send(PresentRequest { texture: frame, submit_at })
-        {
+        match self.render_chan.tx_cmd.try_send(cmd) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                tracing::trace!("renderer.frame: present worker busy, dropping frame");
+                tracing::trace!("renderer.frame: render worker busy, dropping frame");
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                tracing::warn!("renderer.frame: present worker thread exited unexpectedly");
+                tracing::warn!("renderer.frame: render worker thread exited unexpectedly");
             }
         }
 
-        let submit_done_us = t_submit.as_micros() as u64;
         let chrome_us = t_chrome.as_micros() as u64;
-        let osr_us = (t_osr - t_chrome).as_micros() as u64;
-        let acquire_us = (t_acquire - t_osr).as_micros() as u64;
-        let submit_us = (t_submit - t_acquire).as_micros() as u64;
-        // present_us_prev reflects the previously completed present (one frame
-        // lag because the worker sends stats after present() returns, and we
-        // drain before sending the next texture).
+        let osr_clone_us = (t_osr_clone - t_chrome).as_micros() as u64;
+        let acquire_us = (t_acquire - t_osr_clone).as_micros() as u64;
+        // submit_done_us now reflects the WORKER-thread time (from the previous
+        // frame's stats). This is the correct occlusion signal: when the
+        // worker's submit blocks on compositor backpressure, submit_done_us
+        // is large and the heuristic in main.rs trips correctly.
+        let submit_done_us = self.last_present_stats.submit_done_us;
         let present_us_prev = self.last_present_stats.present_us;
         tracing::trace!(
             chrome_us,
-            osr_us,
+            osr_clone_us,
             acquire_us,
-            submit_us,
             submit_done_us,
             present_us_prev,
             "renderer.frame",
         );
-        if submit_done_us > 16_000 || present_us_prev > 16_000 {
+        if chrome_us > 16_000
+            || acquire_us > 16_000
+            || submit_done_us > 16_000
+            || present_us_prev > 16_000
+        {
             tracing::debug!(
                 chrome_us,
-                osr_us,
+                osr_clone_us,
                 acquire_us,
-                submit_us,
                 submit_done_us,
                 present_us_prev,
                 "renderer.frame: slow",
@@ -947,10 +1039,10 @@ impl Drop for Renderer {
         // sender with a dummy by constructing a fresh disconnected one and
         // swapping it in, then dropping the original.
         let (dummy_tx, _dummy_rx) = std::sync::mpsc::sync_channel(0);
-        let real_tx = std::mem::replace(&mut self.present_chan.tx_present, dummy_tx);
+        let real_tx = std::mem::replace(&mut self.render_chan.tx_cmd, dummy_tx);
         drop(real_tx); // closes the channel → worker loop exits
 
-        if let Some(h) = self.present_chan.handle.take() {
+        if let Some(h) = self.render_chan.handle.take() {
             let _ = h.join();
         }
     }
@@ -959,24 +1051,25 @@ impl Drop for Renderer {
 /// Per-frame timing stats returned by [`Renderer::frame`].
 ///
 /// Used by the embedder's occlusion heuristic: a sustained jump in
-/// `present_us` is the most reliable signal we have that the
+/// `present_us` or `submit_done_us` is the most reliable signal that the
 /// compositor stopped showing our surface (Wayland workspace switch,
 /// minimize, fully covered window) on platforms where winit doesn't
 /// fire `WindowEvent::Occluded` reliably.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameStats {
-    /// Microseconds spent inside `wgpu::SurfaceTexture::present()`.
-    /// Healthy: <16 ms.  Compositor-throttled invisible surface:
-    /// 100 ms – 1.5 s.  Carries the PREVIOUS frame's present time
-    /// (one-frame lag because present is async on the worker thread).
+    /// Microseconds spent inside `wgpu::SurfaceTexture::present()` on the
+    /// render worker thread. Healthy: <16 ms. Compositor-throttled
+    /// invisible surface: 100 ms – 1.5 s. Carries the PREVIOUS frame's
+    /// present time (one-frame lag because the worker sends stats after
+    /// present() returns, and we drain before sending the next texture).
     pub present_us: u64,
-    /// Microseconds spent on the UI thread inside `frame()` doing the
-    /// chrome paint, OSR upload, surface acquire, and command-buffer
-    /// submit — everything before the texture is handed to the worker.
-    /// Healthy: <16 ms.  When the compositor backpressures the GPU
-    /// queue, `queue.write_texture` and friends inherit the same block
-    /// and `submit_done_us` balloons to seconds — a SAME-frame signal
-    /// that complements the lagged `present_us`.
+    /// Microseconds spent on the render worker thread from receiving the
+    /// `RenderCommand` until `queue.submit()` returned — includes all
+    /// `write_texture` calls. Healthy: <16 ms. When the compositor
+    /// backpressures the GPU queue, `queue.write_texture` and `queue.submit`
+    /// block on the WORKER thread (not the UI thread) and `submit_done_us`
+    /// balloons to seconds — a SAME-frame signal that complements the
+    /// lagged `present_us`.
     pub submit_done_us: u64,
 }
 
