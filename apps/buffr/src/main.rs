@@ -29,14 +29,14 @@ use std::time::{Duration, Instant};
 /// the window, so there is no visual regression.
 const CEF_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Grace period after a `WindowEvent::Focused(false)` before the OSR paint
-/// pipeline is put to sleep.  Absorbs alt-tab thrash (focus lost then
-/// immediately regained) without emitting spurious sleep/wake cycles that
-/// would produce a flickery on_paint burst on every fast alt-tab.
-const FOCUS_BLUR_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Grace period after a `WindowEvent::Occluded(true)` before the OSR paint
+/// pipeline is put to sleep.  Absorbs workspace-switch / overlay thrash
+/// (occluded then immediately revealed) without emitting spurious
+/// sleep/wake cycles that would produce a flickery on_paint burst.
+const OCCLUDE_SLEEP_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// How often the media-activity probe JS is fired while the window is
-/// unfocused.  Two seconds balances detection latency against JS-execution
+/// occluded.  Two seconds balances detection latency against JS-execution
 /// overhead.  The CEF AudioHandler fires immediately on stream start/stop,
 /// so the probe is only needed for `navigator.mediaSession` and fullscreen
 /// video — both of which rarely change state at sub-second granularity.
@@ -1959,22 +1959,25 @@ struct AppState {
     // ── OSR sleep policy (phase 1 — single window) ───────────────────────────
     //
     // When #18 (multi-window) lands these fields move into a per-WindowState.
-    /// True while the OS reports the window has focus.  Updated by the
-    /// `WindowEvent::Focused` handler (immediately on focus-in; via
-    /// `focus_deadline` debounce on focus-out).
-    focused: bool,
-    /// Non-None while a focus-loss is pending debounce.  Set to
-    /// `Instant::now() + FOCUS_BLUR_DEBOUNCE` on `Focused(false)`;
-    /// cleared immediately on `Focused(true)` or when `about_to_wait`
+    /// True while the compositor reports the window is occluded
+    /// (off-screen, fully covered, on a hidden workspace, minimized).
+    /// Updated by `WindowEvent::Occluded` (immediately on reveal; via
+    /// `sleep_deadline` debounce on occlude).  OS focus is intentionally
+    /// NOT used: a side-by-side, visible-but-unfocused window must keep
+    /// painting.
+    occluded: bool,
+    /// Non-None while an occlude → sleep transition is pending debounce.
+    /// Set to `Instant::now() + OCCLUDE_SLEEP_DEBOUNCE` on `Occluded(true)`;
+    /// cleared immediately on `Occluded(false)` or when `about_to_wait`
     /// sees the deadline elapse.
-    focus_deadline: Option<Instant>,
+    sleep_deadline: Option<Instant>,
     /// True when the CEF audio handler has at least one active stream in
     /// any browser, OR when the last JS media probe returned `true`.
-    /// Keeps the paint pipeline alive while the window is unfocused.
+    /// Keeps the paint pipeline alive while the window is occluded.
     media_active: bool,
     /// Deadline for the next media-probe JS fire.  `None` until the first
     /// probe is scheduled; reset to `now + MEDIA_PROBE_INTERVAL` after
-    /// each fire so the probe runs at steady cadence while unfocused.
+    /// each fire so the probe runs at steady cadence while occluded.
     media_probe_next: Option<Instant>,
     /// Current paint policy.  Transitions trigger `osr_sleep` / `osr_sleep(false)`
     /// on the host.  Starts `Active` so the window paints immediately on launch.
@@ -2169,8 +2172,8 @@ impl AppState {
             loading_anim_next_wake: None,
             resize_paint_watchdog: ResizePaintWatchdog::default(),
             surface_drifted: false,
-            focused: true,
-            focus_deadline: None,
+            occluded: false,
+            sleep_deadline: None,
             media_active: false,
             media_probe_next: None,
             paint_policy: PaintPolicy::Active,
@@ -2200,23 +2203,23 @@ impl AppState {
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
     }
 
-    /// Recompute the paint policy from current `focused` + `media_active`
+    /// Recompute the paint policy from current `occluded` + `media_active`
     /// state and apply a transition if needed.
     ///
     /// Called from:
-    /// - `about_to_wait` after draining audio events and checking focus deadline.
-    /// - `WindowEvent::Focused(true)` (immediate wake).
+    /// - `about_to_wait` after draining audio events and checking sleep deadline.
+    /// - `WindowEvent::Occluded(false)` (immediate wake on reveal).
     ///
     /// On Active→Sleeping: calls `host.osr_sleep(true)`.
     /// On Sleeping→Active: calls `host.osr_sleep(false)` + `host.osr_invalidate_view()`
     ///   + `window.request_redraw()`.
     fn recompute_paint_policy(&mut self) {
-        let new_policy = decide_paint_policy(self.focused, self.media_active);
+        let new_policy = decide_paint_policy(self.occluded, self.media_active);
         if new_policy == self.paint_policy {
             return;
         }
         tracing::debug!(
-            focused = self.focused,
+            occluded = self.occluded,
             media_active = self.media_active,
             old = ?self.paint_policy,
             new = ?new_policy,
@@ -5448,26 +5451,32 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
-            WindowEvent::Focused(focused) => {
+            WindowEvent::Focused(_) => {
                 // OS-level window focus is intentionally NOT forwarded
                 // to CEF. CEF focus tracks buffr's modal state instead
                 // (Insert = focused, Normal = unfocused). This stops
                 // pages losing input state when the user alt-tabs or
                 // brings up another window.
                 //
-                // OSR sleep policy: focus-in wakes immediately; focus-out
-                // starts a 200 ms debounce so alt-tab thrash (lose+regain
-                // within the grace window) does not produce a sleep/wake
-                // cycle and the associated on_paint burst.
-                if focused {
-                    self.focused = true;
-                    self.focus_deadline = None;
+                // Sleep policy is driven by Occluded, not Focused: a
+                // visible-but-unfocused window (side-by-side) must keep
+                // painting for the user to see updates.
+            }
+            WindowEvent::Occluded(occluded) => {
+                // OSR sleep policy: reveal wakes immediately; occlude
+                // starts a 200 ms debounce so workspace-switch / overlay
+                // thrash (occlude + reveal within the grace window) does
+                // not produce a sleep/wake cycle and the associated
+                // on_paint burst.
+                if occluded {
+                    self.sleep_deadline = Some(Instant::now() + OCCLUDE_SLEEP_DEBOUNCE);
+                } else {
+                    self.occluded = false;
+                    self.sleep_deadline = None;
                     self.recompute_paint_policy();
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
-                } else {
-                    self.focus_deadline = Some(Instant::now() + FOCUS_BLUR_DEBOUNCE);
                 }
             }
             WindowEvent::CursorLeft { .. } => {
@@ -5969,14 +5978,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // OSR sleep policy: process focus-blur debounce and audio events.
         // Must run before policy changes affect the rest of the tick.
         {
-            // 1. Expire focus debounce: if the grace window after Focused(false)
-            //    elapsed without a Focused(true) arriving, commit focus=false.
+            // 1. Expire occlude debounce: if the grace window after Occluded(true)
+            //    elapsed without an Occluded(false) arriving, commit occluded=true.
             if self
-                .focus_deadline
+                .sleep_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                self.focused = false;
-                self.focus_deadline = None;
+                self.occluded = true;
+                self.sleep_deadline = None;
             }
 
             // 2. Drain audio events from BuffrAudioHandler.
@@ -5992,7 +6001,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     );
                 }
 
-                // 3. Fire the JS media probe while unfocused so navigator.mediaSession
+                // 3. Fire the JS media probe while occluded so navigator.mediaSession
                 //    and fullscreen-video changes are detected at ~2 s cadence.
                 //    Phase-1: relies on AudioHandler for audio; probe covers
                 //    mediaSession/fullscreen.  The result is written to
@@ -6000,7 +6009,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 //    synchronously (execute_java_script is fire-and-forget in
                 //    cef-rs).  The probe is still fired so it primes the property
                 //    for a future phase-2 reader.
-                if !self.focused {
+                if self.occluded {
                     let now = Instant::now();
                     let due = self.media_probe_next.map(|t| now >= t).unwrap_or(true);
                     if due {
@@ -6486,10 +6495,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
-        // Focus-blur debounce: if a debounce is pending, wake up no later
+        // Occlude debounce: if a debounce is pending, wake up no later
         // than its deadline so the sleep transition fires promptly after
-        // the grace window expires (alt-tab detection without busy-wait).
-        let deadline = match self.focus_deadline {
+        // the grace window expires (occlude detection without busy-wait).
+        let deadline = match self.sleep_deadline {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
@@ -6606,14 +6615,18 @@ fn physical_wheel_to_dip(dx_phys: i32, dy_phys: i32, scale: f32) -> (i32, i32) {
 
 /// Pure policy decision: should the window's OSR paint pipeline be active?
 ///
-/// `Active` when the window has OS-level focus OR media is playing.
-/// `Sleeping` only when both are false — no focus and no media.
+/// `Active` when the window is visible (not occluded) OR media is playing.
+/// `Sleeping` only when occluded AND no media — invisible to the user and
+/// nothing audible to maintain.
+///
+/// Driven by `WindowEvent::Occluded`, not `Focused`: a side-by-side window
+/// that is visible but unfocused must keep painting.
 ///
 /// All callers must route through this function; no inline duplication of
 /// the predicate is allowed.  Tests pin the semantics so future refactors
 /// can't silently change the rule.
-fn decide_paint_policy(focused: bool, media_active: bool) -> PaintPolicy {
-    if focused || media_active {
+fn decide_paint_policy(occluded: bool, media_active: bool) -> PaintPolicy {
+    if !occluded || media_active {
         PaintPolicy::Active
     } else {
         PaintPolicy::Sleeping
@@ -6978,27 +6991,27 @@ mod tests {
     // ---- OSR sleep policy tests --------------------------------------------
 
     #[test]
-    fn paint_policy_focused_no_media() {
-        // Focused with no media → Active.
-        assert_eq!(decide_paint_policy(true, false), PaintPolicy::Active);
+    fn paint_policy_visible_no_media() {
+        // Visible (not occluded) with no media → Active.
+        assert_eq!(decide_paint_policy(false, false), PaintPolicy::Active);
     }
 
     #[test]
-    fn paint_policy_unfocused_no_media() {
-        // Unfocused with no media → Sleeping.
-        assert_eq!(decide_paint_policy(false, false), PaintPolicy::Sleeping);
+    fn paint_policy_occluded_no_media() {
+        // Occluded with no media → Sleeping.
+        assert_eq!(decide_paint_policy(true, false), PaintPolicy::Sleeping);
     }
 
     #[test]
-    fn paint_policy_unfocused_with_media() {
-        // Unfocused but media playing → Active (media keeps window awake).
-        assert_eq!(decide_paint_policy(false, true), PaintPolicy::Active);
-    }
-
-    #[test]
-    fn paint_policy_focused_with_media() {
-        // Focused and media playing → Active.
+    fn paint_policy_occluded_with_media() {
+        // Occluded but media playing → Active (media keeps window awake).
         assert_eq!(decide_paint_policy(true, true), PaintPolicy::Active);
+    }
+
+    #[test]
+    fn paint_policy_visible_with_media() {
+        // Visible and media playing → Active.
+        assert_eq!(decide_paint_policy(false, true), PaintPolicy::Active);
     }
 
     #[test]
