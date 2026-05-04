@@ -2581,8 +2581,14 @@ impl AppState {
             A::TabClose => {
                 self.close_active_tab_or_exit();
             }
-            A::TabNext => host.next_tab(),
-            A::TabPrev => host.prev_tab(),
+            A::TabNext => {
+                host.next_tab();
+                self.close_overlay();
+            }
+            A::TabPrev => {
+                host.prev_tab();
+                self.close_overlay();
+            }
             A::PinTab => {
                 host.toggle_pin_active();
                 self.refresh_tab_strip();
@@ -4167,7 +4173,7 @@ impl AppState {
                 if current_url.is_empty() {
                     return;
                 }
-                let view_src_url = format!("view-source:{current_url}");
+                let view_src_url = format!("buffr-src:{current_url}");
                 if let Some(host) = self.host.as_ref()
                     && let Err(err) = host.open_tab(&view_src_url)
                 {
@@ -6469,6 +6475,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     if let Some(host) = self.host.as_ref() {
                         host.select_tab(self.tab_ids[idx]);
                     }
+                    // Tab switch implies the user moved focus away from
+                    // whatever they were typing in the overlay (omnibar /
+                    // find / cmdline) — dismiss it.
+                    self.close_overlay();
                     self.tab_drag_src = Some(idx);
                     return;
                 }
