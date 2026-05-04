@@ -6,6 +6,8 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-05
+
 ### Added
 
 - **Per-frame edit ops** (`BrowserHost::frame_undo`, `frame_redo`, `frame_cut`,
@@ -206,7 +208,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.3.0
