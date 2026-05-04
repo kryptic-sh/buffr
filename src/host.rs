@@ -36,6 +36,7 @@ use crate::audio::{
     AudioEventQueue, AudioStateSink, any_audio_active as audio_any_active,
     drain_audio_events as audio_drain_events, new_audio_event_queue, new_audio_state_sink,
 };
+use crate::context_menu::{ContextMenuRequest, ContextMenuSink, new_context_menu_sink};
 use crate::cursor::{CursorState, SharedCursorState};
 use crate::download_notice::DownloadNoticeQueue;
 use crate::edit::EditEventSink;
@@ -277,6 +278,10 @@ pub struct BrowserHost {
     /// [`Self::any_video_active`] which the apps-layer idle-inhibit policy
     /// consults each tick.
     video_active: Arc<AtomicBool>,
+    /// Queue of right-click events translated into [`ContextMenuRequest`]s
+    /// by `BuffrContextMenuHandler::run_context_menu`. The apps layer
+    /// drains these each tick via [`Self::drain_context_menu_requests`].
+    context_menu_sink: ContextMenuSink,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -449,6 +454,7 @@ impl BrowserHost {
             audio_sink: new_audio_state_sink(),
             audio_queue: new_audio_event_queue(),
             video_active: Arc::new(AtomicBool::new(false)),
+            context_menu_sink: new_context_menu_sink(),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -1213,6 +1219,7 @@ impl BrowserHost {
             self.audio_sink.clone(),
             self.audio_queue.clone(),
             self.video_active.clone(),
+            self.context_menu_sink.clone(),
         );
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -1458,6 +1465,17 @@ impl BrowserHost {
     /// since the last call.  Returns an empty `Vec` on mutex poison.
     pub fn drain_audio_events(&self) -> Vec<crate::audio::AudioEvent> {
         audio_drain_events(&self.audio_queue)
+    }
+
+    /// Drain all pending [`ContextMenuRequest`]s built by
+    /// `BuffrContextMenuHandler::run_context_menu` since the last call.
+    /// Returns an empty `Vec` on mutex poison.
+    pub fn drain_context_menu_requests(&self) -> Vec<ContextMenuRequest> {
+        if let Ok(mut q) = self.context_menu_sink.lock() {
+            q.drain(..).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn summarize(&self, t: &Tab) -> TabSummary {

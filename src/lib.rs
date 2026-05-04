@@ -14,6 +14,7 @@ use thiserror::Error;
 pub mod app;
 pub mod audio;
 pub mod cmdline;
+pub mod context_menu;
 pub mod crash;
 pub mod cursor;
 pub mod download_notice;
@@ -45,6 +46,10 @@ pub use app::{
 pub use audio::{
     AudioEvent, AudioEventQueue, AudioState, AudioStateSink, any_audio_active, drain_audio_events,
     new_audio_event_queue, new_audio_state_sink,
+};
+pub use context_menu::{
+    CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuItem, ContextMenuRequest, ContextMenuSink,
+    build_model as build_context_menu_model, new_context_menu_sink,
 };
 pub use crash::{CrashError, CrashReport, CrashReporter};
 pub use cursor::{CursorState, SharedCursorState};

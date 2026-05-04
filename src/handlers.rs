@@ -35,6 +35,9 @@ use buffr_permissions::{Decision, Permissions};
 use buffr_zoom::ZoomStore;
 
 use crate::audio::{AudioEventQueue, AudioStateSink, BuffrAudioHandler};
+use crate::context_menu::{
+    CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuRequest, ContextMenuSink, build_model,
+};
 use crate::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue, push};
 use crate::edit::{EditEventSink, build_inject_script as build_edit_inject_script};
 use crate::find::{FindResult, FindResultSink};
@@ -109,6 +112,7 @@ pub fn make_client(
     audio_sink: AudioStateSink,
     audio_queue: AudioEventQueue,
     video_active: Arc<AtomicBool>,
+    context_menu_sink: ContextMenuSink,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -138,6 +142,7 @@ pub fn make_client(
         audio_sink,
         audio_queue,
         video_active,
+        context_menu_sink,
     )
 }
 
@@ -435,6 +440,7 @@ wrap_client! {
         // `__buffr_media__:` console-log sentinels emitted by
         // `media_probe_poll.js` and stores the latest video flag here.
         video_active: Arc<AtomicBool>,
+        context_menu_sink: ContextMenuSink,
     }
 
     impl Client {
@@ -510,7 +516,7 @@ wrap_client! {
         }
 
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
-            Some(BuffrContextMenuHandler::new())
+            Some(BuffrContextMenuHandler::new(self.context_menu_sink.clone()))
         }
     }
 }
@@ -1422,7 +1428,9 @@ fn userfree_to_string(s: &CefStringUserfreeUtf16) -> String {
 }
 
 wrap_context_menu_handler! {
-    pub struct BuffrContextMenuHandler;
+    pub struct BuffrContextMenuHandler {
+        sink: ContextMenuSink,
+    }
 
     impl ContextMenuHandler {
         fn on_before_context_menu(
@@ -1442,7 +1450,7 @@ wrap_context_menu_handler! {
 
         fn run_context_menu(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             params: Option<&mut ContextMenuParams>,
             _model: Option<&mut MenuModel>,
@@ -1450,7 +1458,7 @@ wrap_context_menu_handler! {
         ) -> ::std::os::raw::c_int {
             // Log every ContextMenuParams field at debug level.
             // Return 1 (handled) + cancel so CEF never renders its own
-            // menu; slice 1 has no UI to show.
+            // menu; slice 3 will render our own overlay.
             let Some(params) = params else {
                 if let Some(cb) = callback {
                     cb.cancel();
@@ -1479,6 +1487,66 @@ wrap_context_menu_handler! {
                 y,
                 "context_menu params"
             );
+
+            // Extract raw flag integers for the pure builder.
+            // ContextMenuTypeFlags and ContextMenuMediaStateFlags have private
+            // tuple fields; use AsRef to reach the inner sys types whose fields
+            // are pub.  ContextMenuMediaType exposes get_raw() directly.
+            let type_flags_raw = type_flags.as_ref().0;
+            let media_type_raw = media_type.get_raw();
+            let media_flags_raw = media_flags.as_ref().0;
+
+            let has_link_url = !link_url.is_empty();
+            let has_selection = !selection.is_empty();
+
+            let (can_go_back, can_go_forward, is_loading_now, browser_id) =
+                if let Some(ref b) = browser {
+                    (
+                        b.can_go_back() != 0,
+                        b.can_go_forward() != 0,
+                        b.is_loading() != 0,
+                        b.identifier(),
+                    )
+                } else {
+                    (false, false, false, 0)
+                };
+
+            let items = build_model(
+                type_flags_raw,
+                media_type_raw,
+                media_flags_raw,
+                editable,
+                has_link_url,
+                has_selection,
+                can_go_back,
+                can_go_forward,
+                is_loading_now,
+            );
+
+            let request = ContextMenuRequest {
+                x,
+                y,
+                browser_id,
+                items,
+                link_url,
+                source_url,
+                selection_text: selection,
+            };
+
+            tracing::debug!(
+                target: "buffr_core::context_menu",
+                browser_id,
+                items_count = request.items.len(),
+                "context_menu request built"
+            );
+
+            if let Ok(mut q) = self.sink.lock() {
+                if q.len() >= CONTEXT_MENU_REQUEST_QUEUE_CAP {
+                    q.pop_front();
+                }
+                q.push_back(request);
+            }
+
             if let Some(cb) = callback {
                 cb.cancel();
             }
