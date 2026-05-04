@@ -2204,23 +2204,28 @@ impl ActiveContextMenu {
         }
     }
 
+    /// Whether the item at `idx` should accept activation. Mirrors the
+    /// `enabled` derivation in [`Self::to_overlay`].
+    fn is_enabled(&self, idx: usize) -> bool {
+        match self.request.items.get(idx) {
+            Some(ContextMenuItem::HistoryBack { enabled }) => *enabled,
+            Some(ContextMenuItem::HistoryForward { enabled }) => *enabled,
+            Some(item) => !item.is_separator(),
+            None => false,
+        }
+    }
+
     /// Build the `ContextMenuOverlay` snapshot for the renderer.
     fn to_overlay(&self, _win_w: u32, win_h: u32) -> ContextMenuOverlay {
         let entries: Vec<ContextMenuEntry> = self
             .request
             .items
             .iter()
-            .map(|item| {
-                let enabled = match item {
-                    ContextMenuItem::HistoryBack { enabled } => *enabled,
-                    ContextMenuItem::HistoryForward { enabled } => *enabled,
-                    _ => !item.is_separator(),
-                };
-                ContextMenuEntry {
-                    label: item.label().to_string(),
-                    is_separator: item.is_separator(),
-                    enabled,
-                }
+            .enumerate()
+            .map(|(idx, item)| ContextMenuEntry {
+                label: item.label().to_string(),
+                is_separator: item.is_separator(),
+                enabled: self.is_enabled(idx),
             })
             .collect();
 
@@ -3951,7 +3956,10 @@ impl AppState {
                 true
             }
             Key::Named(NamedKey::CR) => {
-                if let Some(cm) = self.context_menu.take() {
+                if let Some(cm) = self.context_menu.as_ref()
+                    && cm.is_enabled(cm.selected)
+                {
+                    let cm = self.context_menu.take().unwrap();
                     let item = &cm.request.items[cm.selected];
                     tracing::info!(
                         target: "buffr::context_menu",
@@ -3961,6 +3969,7 @@ impl AppState {
                     self.mark_chrome_dirty();
                     self.request_redraw();
                 }
+                // Disabled-on-Enter: keep the menu open, ignore the key.
                 true
             }
             _ => {
@@ -6068,20 +6077,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     if let Some(cm) = self.context_menu.as_ref() {
                         let overlay = cm.to_overlay(win_w, win_h);
                         if overlay.contains(win_w as usize, win_h as usize, abs_x, abs_y) {
-                            if let Some(row) =
-                                overlay.row_at(win_w as usize, win_h as usize, abs_x, abs_y)
-                            {
-                                // Activate by clicking — same as Enter.
-                                let cm = self.context_menu.take().unwrap();
-                                let item = &cm.request.items[row];
-                                tracing::info!(
-                                    target: "buffr::context_menu",
-                                    ?item,
-                                    "activated"
-                                );
-                            } else {
-                                // Click on separator / disabled row — dismiss.
-                                self.dismiss_context_menu();
+                            match overlay.row_at(win_w as usize, win_h as usize, abs_x, abs_y) {
+                                Some(row) if overlay.entries[row].enabled => {
+                                    // Activate by clicking — same as Enter.
+                                    let cm = self.context_menu.take().unwrap();
+                                    let item = &cm.request.items[row];
+                                    tracing::info!(
+                                        target: "buffr::context_menu",
+                                        ?item,
+                                        "activated"
+                                    );
+                                }
+                                _ => {
+                                    // Click on separator or disabled row —
+                                    // dismiss without firing.
+                                    self.dismiss_context_menu();
+                                }
                             }
                         } else {
                             // Clicked outside the panel — dismiss.
