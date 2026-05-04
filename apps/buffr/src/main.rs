@@ -132,12 +132,13 @@ use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, DownloadNoticeQueue, EditConsoleEvent, EditEventSink, FindResultSink, HintAction,
-    HintAlphabet, HintEventSink, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
-    SharedOsrFrame, SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer,
-    drain_popup_closes, drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
-    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
-    new_permissions_queue, peek_download_notice, peek_permission_front, permissions_queue_len,
-    pop_permission_front, profile_paths, register_buffr_handler_factory,
+    HintAlphabet, HintEventSink, IdleInhibitor, PermissionsQueue, PopupCloseSink, PopupCreateSink,
+    PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, drain_edit_events,
+    drain_permissions_with_defer, drain_popup_closes, drain_popup_creates, drain_popup_urls,
+    expire_stale_notices, init_cef_api, new_download_notice_queue, new_edit_event_sink,
+    new_find_sink, new_hint_event_sink, new_inhibitor, new_permissions_queue, peek_download_notice,
+    peek_permission_front, permissions_queue_len, pop_permission_front, profile_paths,
+    register_buffr_handler_factory,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -979,6 +980,7 @@ fn main() -> Result<()> {
         initial_update_status,
         build_palette(&config.theme),
         config.general.show_favicons,
+        Arc::new(config.idle_inhibit.clone()),
         shutdown_flag,
         event_proxy,
     );
@@ -2049,6 +2051,24 @@ struct AppState {
     /// after the probe paints.  Bypasses the sleep guard for exactly
     /// one paint so we can measure `present_us` and decide stay/wake.
     probe_pending: bool,
+
+    // ── Idle-inhibit (issue #22) ─────────────────────────────────────────────
+    /// Idle-inhibit config snapshot. Shared so hot-reload (if added later)
+    /// can swap it without restarting. Mirrors the pattern used by
+    /// `downloads_config`.
+    idle_inhibit_config: Arc<buffr_config::IdleInhibitConfig>,
+    /// Platform idle-inhibitor. Created once in `resumed` alongside the
+    /// window. `None` until the window exists; also `None` if construction
+    /// failed (logged at warn level; feature degrades gracefully).
+    idle_inhibitor: Option<Box<dyn IdleInhibitor>>,
+    /// True when the last JS media probe (or future console-log IPC reader)
+    /// reported `window.__buffr_video_active === true`. Updated each
+    /// `about_to_wait` tick alongside `media_active`.
+    video_active: bool,
+    /// True while the main buffr window has OS-level focus (winit
+    /// `WindowEvent::Focused`). Used by the idle-inhibit policy when
+    /// `config.idle_inhibit.require_focus = true`.
+    window_focused: bool,
 }
 
 /// OSR paint policy for the window.
@@ -2136,6 +2156,7 @@ impl AppState {
         initial_update_status: buffr_core::UpdateStatus,
         palette: Palette,
         show_favicons: bool,
+        idle_inhibit_config: Arc<buffr_config::IdleInhibitConfig>,
         shutdown_flag: Arc<AtomicBool>,
         event_proxy: EventLoopProxy<BuffrUserEvent>,
     ) -> Self {
@@ -2247,6 +2268,10 @@ impl AppState {
             present_us_history: VecDeque::with_capacity(PRESENT_HISTORY_SIZE),
             next_probe_at: None,
             probe_pending: false,
+            idle_inhibit_config,
+            idle_inhibitor: None,
+            video_active: false,
+            window_focused: false,
         }
     }
 
@@ -5520,6 +5545,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         self.open_pending_tabs();
         self.refresh_tab_strip();
 
+        // Construct the platform idle-inhibitor now that the window exists.
+        // On unsupported platforms new_inhibitor() returns a no-op Ok variant —
+        // errors are logged but the feature degrades gracefully.
+        match new_inhibitor(window.clone()) {
+            Ok(inhibitor) => {
+                tracing::debug!("idle_inhibit: inhibitor constructed");
+                self.idle_inhibitor = Some(inhibitor);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "idle_inhibit: failed to construct inhibitor");
+            }
+        }
+
         self.window = Some(window);
     }
 
@@ -5646,7 +5684,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
-            WindowEvent::Focused(_) => {
+            WindowEvent::Focused(focused) => {
                 // OS-level window focus is intentionally NOT forwarded
                 // to CEF. CEF focus tracks buffr's modal state instead
                 // (Insert = focused, Normal = unfocused). This stops
@@ -5656,6 +5694,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // Sleep policy is driven by Occluded, not Focused: a
                 // visible-but-unfocused window (side-by-side) must keep
                 // painting for the user to see updates.
+                //
+                // However, idle-inhibit (issue #22) can be gated on focus so
+                // that music in a background tab doesn't prevent screen lock.
+                self.window_focused = focused;
             }
             WindowEvent::Occluded(occluded) => {
                 // OSR sleep policy: reveal wakes immediately; occlude
@@ -6194,6 +6236,33 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         event_count = events.len(),
                         "audio events drained"
                     );
+                }
+
+                // Recompute video_active from the JS probe result. Phase-1
+                // stub always returns false; phase-2 wires the console.log
+                // sentinel reader so this reflects window.__buffr_video_active.
+                self.video_active = host.any_video_active();
+
+                // Evaluate idle-inhibit policy and acquire/release as needed.
+                {
+                    let cfg = &*self.idle_inhibit_config;
+                    let want_inhibit = cfg.enabled
+                        && (self.video_active || (cfg.inhibit_audio_only && self.media_active))
+                        && (!cfg.require_focus || self.window_focused);
+                    if let Some(ref inhibitor) = self.idle_inhibitor {
+                        let is_active = inhibitor.is_active();
+                        if want_inhibit && !is_active {
+                            tracing::debug!("idle_inhibit: acquiring");
+                            if let Err(e) = inhibitor.acquire() {
+                                tracing::warn!(error = %e, "idle_inhibit: acquire failed");
+                            }
+                        } else if !want_inhibit && is_active {
+                            tracing::debug!("idle_inhibit: releasing");
+                            if let Err(e) = inhibitor.release() {
+                                tracing::warn!(error = %e, "idle_inhibit: release failed");
+                            }
+                        }
+                    }
                 }
 
                 // 3. Fire the JS media probe while occluded so navigator.mediaSession
