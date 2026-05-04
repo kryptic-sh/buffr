@@ -12,8 +12,8 @@
 //! |---|---|---|
 //! | Linux (Wayland) | `xdg-session-inhibit` / D-Bus | implemented |
 //! | Linux (X11)     | `org.freedesktop.ScreenSaver` D-Bus | implemented |
-//! | macOS           | `IOPMAssertionCreateWithName`  | stub (phase-2) |
-//! | Windows         | `SetThreadExecutionState`      | stub (phase-2) |
+//! | macOS           | `IOPMAssertionCreateWithName` (IOKit) | implemented |
+//! | Windows         | `SetThreadExecutionState`      | stub (phase-3) |
 //! | Other           | no-op fallback                 | returns Ok     |
 
 use std::sync::Arc;
@@ -147,19 +147,14 @@ pub mod linux {
     }
 }
 
-/// macOS idle-inhibit stub.
+/// macOS idle-inhibit backend.
 ///
-/// TODO (phase-2): Use `IOPMAssertionCreateWithName` /
-/// `IOPMAssertionRelease` from the `IOKit` framework to prevent display
-/// sleep while video is playing.
+/// Uses `IOPMAssertionCreateWithName` / `IOPMAssertionRelease` from the
+/// `IOKit` framework to prevent display sleep while video is playing.
+/// The assertion is process-wide (not per-window); IOKit calls are
+/// thread-safe so no worker thread is required.
 #[cfg(target_os = "macos")]
-pub mod macos {
-    use super::*;
-
-    pub fn new(_window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
-        Ok(Box::new(NoopInhibitor))
-    }
-}
+pub mod macos;
 
 /// Windows idle-inhibit stub.
 ///
