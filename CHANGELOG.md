@@ -6,6 +6,22 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Per-frame edit ops** (`BrowserHost::frame_undo`, `frame_redo`, `frame_cut`,
+  `frame_copy`, `frame_paste`, `frame_paste_plain`, `frame_del`,
+  `frame_select_all`) — dispatch CEF `cef_frame_t` edit commands to the active
+  tab's focused frame, falling back to `main_frame()`.
+- **`BrowserHost::reload_ignore_cache_active`** — hard-reload the active tab
+  without the cache.
+- **`BrowserHost::print_active`** — open the system print dialog for the active
+  tab via `CefBrowserHost::Print`.
+- **`BrowserHost::start_download`** — trigger a file download for an arbitrary
+  URL via `CefBrowserHost::StartDownload`.
+- **`BrowserHost::show_dev_tools_at`** — open DevTools for the active tab with
+  an optional element-inspect hit-point (`cef::Point`). Wraps
+  `CefBrowserHost::ShowDevTools`.
+
 ## [0.4.0] — 2026-05-04
 
 ### Added

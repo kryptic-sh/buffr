@@ -2319,6 +2319,125 @@ impl BrowserHost {
         });
     }
 
+    // ── Per-frame edit ops (context-menu slice 4) ─────────────────────────────
+    //
+    // CEF's `cef_frame_t` edit methods operate on the focused frame.
+    // We use `browser.focused_frame()` with a fallback to `main_frame()`.
+    // Each helper is named after the CEF method it wraps.
+
+    fn with_focused_frame<R>(&self, f: impl FnOnce(cef::Frame) -> R) -> Option<R> {
+        self.with_active(|t| {
+            let frame = t
+                .browser
+                .focused_frame()
+                .or_else(|| t.browser.main_frame())?;
+            Some(f(frame))
+        })?
+    }
+
+    /// Send Undo to the active tab's focused frame.
+    pub fn frame_undo(&self) {
+        if self.with_focused_frame(|f| f.undo()).is_none() {
+            warn!("frame_undo: no focused frame");
+        }
+    }
+
+    /// Send Redo to the active tab's focused frame.
+    pub fn frame_redo(&self) {
+        if self.with_focused_frame(|f| f.redo()).is_none() {
+            warn!("frame_redo: no focused frame");
+        }
+    }
+
+    /// Send Cut to the active tab's focused frame.
+    pub fn frame_cut(&self) {
+        if self.with_focused_frame(|f| f.cut()).is_none() {
+            warn!("frame_cut: no focused frame");
+        }
+    }
+
+    /// Send Copy to the active tab's focused frame.
+    pub fn frame_copy(&self) {
+        if self.with_focused_frame(|f| f.copy()).is_none() {
+            warn!("frame_copy: no focused frame");
+        }
+    }
+
+    /// Send Paste to the active tab's focused frame.
+    pub fn frame_paste(&self) {
+        if self.with_focused_frame(|f| f.paste()).is_none() {
+            warn!("frame_paste: no focused frame");
+        }
+    }
+
+    /// Send Paste-as-plain-text to the active tab's focused frame.
+    pub fn frame_paste_plain(&self) {
+        if self
+            .with_focused_frame(|f| f.paste_and_match_style())
+            .is_none()
+        {
+            warn!("frame_paste_plain: no focused frame");
+        }
+    }
+
+    /// Send Delete to the active tab's focused frame.
+    pub fn frame_del(&self) {
+        if self.with_focused_frame(|f| f.del()).is_none() {
+            warn!("frame_del: no focused frame");
+        }
+    }
+
+    /// Send SelectAll to the active tab's focused frame.
+    pub fn frame_select_all(&self) {
+        if self.with_focused_frame(|f| f.select_all()).is_none() {
+            warn!("frame_select_all: no focused frame");
+        }
+    }
+
+    /// Reload the active tab ignoring cache.
+    pub fn reload_ignore_cache_active(&self) {
+        self.with_active(|t| t.browser.reload_ignore_cache());
+    }
+
+    /// Print the active tab (opens system print dialog).
+    pub fn print_active(&self) {
+        self.with_active(|t| {
+            if let Some(host) = t.browser.host() {
+                host.print();
+            } else {
+                warn!("print_active: browser.host() returned None");
+            }
+        });
+    }
+
+    /// Trigger a file-as-download for `url` via CEF's download manager.
+    pub fn start_download(&self, url: &str) {
+        self.with_active(|t| {
+            if let Some(host) = t.browser.host() {
+                let cef_url = CefString::from(url);
+                host.start_download(Some(&cef_url));
+            } else {
+                warn!("start_download: browser.host() returned None");
+            }
+        });
+    }
+
+    /// Open DevTools for the active tab, with an optional inspect-element
+    /// hit-point in browser-local pixel coords. Pass `None` to open without
+    /// a specific element.
+    pub fn show_dev_tools_at(&self, x: Option<i32>, y: Option<i32>) {
+        self.with_active(|t| {
+            let Some(host) = t.browser.host() else {
+                warn!("show_dev_tools_at: browser.host() returned None");
+                return;
+            };
+            let window_info = WindowInfo::default();
+            let settings = BrowserSettings::default();
+            let point = x.zip(y).map(|(px, py)| cef::Point { x: px, y: py });
+            host.show_dev_tools(Some(&window_info), None, Some(&settings), point.as_ref());
+        });
+    }
+
     /// Fire the JS media-activity poll against the active tab's main frame.
     ///
     /// The poll script (see [`crate::scripts::MEDIA_PROBE_POLL_JS`]) reads all
