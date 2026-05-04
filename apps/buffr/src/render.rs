@@ -25,6 +25,7 @@
 //! OSR pixels arrive from CEF already as BGRA bytes — cast directly.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -191,6 +192,42 @@ impl OsrTexture {
     }
 }
 
+/// A surface texture plus the instant submit completed, sent to the present
+/// worker thread.
+struct PresentRequest {
+    texture: wgpu::SurfaceTexture,
+    /// Recorded immediately after `queue.submit()`. Reserved for future
+    /// GPU-submission-to-display latency tracking.
+    #[allow(dead_code)]
+    submit_at: Instant,
+}
+
+/// Worker-owned channel pair that moves `frame.present()` off the UI thread.
+///
+/// Capacity-1 `SyncSender` gives mailbox semantics: if the worker is still
+/// blocked on a previous present (occluded surface), `try_send` returns
+/// `TrySendError::Full` and the caller drops the frame instead of blocking.
+struct PresentChannel {
+    tx_present: std::sync::mpsc::SyncSender<PresentRequest>,
+    rx_stats: std::sync::mpsc::Receiver<FrameStats>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Loop executed on the "wgpu-present" worker thread.
+fn present_worker(
+    rx: std::sync::mpsc::Receiver<PresentRequest>,
+    tx: std::sync::mpsc::Sender<FrameStats>,
+) {
+    while let Ok(req) = rx.recv() {
+        let t_present_start = Instant::now();
+        req.texture.present();
+        let present_us = t_present_start.elapsed().as_micros() as u64;
+        // Ignore send errors — the UI thread may have dropped its receiver
+        // during shutdown.
+        let _ = tx.send(FrameStats { present_us });
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -235,6 +272,14 @@ pub struct Renderer {
     /// The chrome texture and CPU buffer are allocated at this size.
     chrome_lw: u32,
     chrome_lh: u32,
+
+    /// Worker thread that calls `SurfaceTexture::present()` so the UI thread
+    /// never blocks on Wayland compositor backpressure.
+    present_chan: PresentChannel,
+    /// Most-recent `FrameStats` received from the present worker.
+    /// Lags one frame behind: `frame()` drains the stats channel *before*
+    /// sending the current texture, then returns this cached value.
+    last_present_stats: FrameStats,
 }
 
 impl Renderer {
@@ -462,6 +507,22 @@ impl Renderer {
 
         let chrome_cpu = vec![0u32; (chrome_lw * chrome_lh) as usize];
 
+        // Capacity-1 sync channel: gives mailbox semantics (drop the incoming
+        // frame if the worker is still busy presenting the previous one).
+        let (tx_present, rx_present) = std::sync::mpsc::sync_channel::<PresentRequest>(1);
+        // Unbounded response channel: UI thread drains lazily via try_recv.
+        let (tx_stats, rx_stats) = std::sync::mpsc::channel::<FrameStats>();
+        let handle = std::thread::Builder::new()
+            .name("wgpu-present".to_owned())
+            .spawn(move || present_worker(rx_present, tx_stats))
+            .context("spawn wgpu-present thread")?;
+
+        let present_chan = PresentChannel {
+            tx_present,
+            rx_stats,
+            handle: Some(handle),
+        };
+
         Ok(Self {
             surface,
             device,
@@ -483,6 +544,8 @@ impl Renderer {
             height,
             chrome_lw,
             chrome_lh,
+            present_chan,
+            last_present_stats: FrameStats { present_us: 0 },
         })
     }
 
@@ -792,37 +855,83 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         let t_submit = t0.elapsed();
-        frame.present();
-        let t_present = t0.elapsed();
+        let submit_at = Instant::now();
 
+        // Drain any stats the worker has sent since last frame (non-blocking).
+        // Keep only the most recent; we don't need the whole history here.
+        while let Ok(s) = self.present_chan.rx_stats.try_recv() {
+            self.last_present_stats = s;
+        }
+
+        // Hand the surface texture to the worker.  Capacity-1 SyncSender:
+        // if the worker is still busy with the previous present (occluded
+        // Wayland surface), try_send returns Full and we drop this frame —
+        // mailbox semantics, never blocks the UI thread.
+        match self
+            .present_chan
+            .tx_present
+            .try_send(PresentRequest { texture: frame, submit_at })
+        {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                tracing::trace!("renderer.frame: present worker busy, dropping frame");
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("renderer.frame: present worker thread exited unexpectedly");
+            }
+        }
+
+        let submit_done_us = t_submit.as_micros() as u64;
         let chrome_us = t_chrome.as_micros() as u64;
         let osr_us = (t_osr - t_chrome).as_micros() as u64;
         let acquire_us = (t_acquire - t_osr).as_micros() as u64;
         let submit_us = (t_submit - t_acquire).as_micros() as u64;
-        let present_us = (t_present - t_submit).as_micros() as u64;
-        let total_us = t_present.as_micros() as u64;
+        // present_us_prev reflects the previously completed present (one frame
+        // lag because the worker sends stats after present() returns, and we
+        // drain before sending the next texture).
+        let present_us_prev = self.last_present_stats.present_us;
         tracing::trace!(
             chrome_us,
             osr_us,
             acquire_us,
             submit_us,
-            present_us,
-            total_us,
+            submit_done_us,
+            present_us_prev,
             "renderer.frame",
         );
-        if total_us > 16_000 {
+        if submit_done_us > 16_000 || present_us_prev > 16_000 {
             tracing::debug!(
                 chrome_us,
                 osr_us,
                 acquire_us,
                 submit_us,
-                present_us,
-                total_us,
+                submit_done_us,
+                present_us_prev,
                 "renderer.frame: slow",
             );
         }
 
-        Ok(FrameStats { present_us })
+        Ok(self.last_present_stats)
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Close the channel first so the worker's recv() loop exits.
+        // We must drop the SyncSender BEFORE joining the thread; otherwise
+        // the join would block forever waiting for the worker to notice
+        // a channel that is still open.
+        //
+        // Safety: we can't move out of `self` in Drop, so we replace the
+        // sender with a dummy by constructing a fresh disconnected one and
+        // swapping it in, then dropping the original.
+        let (dummy_tx, _dummy_rx) = std::sync::mpsc::sync_channel(0);
+        let real_tx = std::mem::replace(&mut self.present_chan.tx_present, dummy_tx);
+        drop(real_tx); // closes the channel → worker loop exits
+
+        if let Some(h) = self.present_chan.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
