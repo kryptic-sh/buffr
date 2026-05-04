@@ -187,6 +187,49 @@ impl ContextMenuOverlay {
             cursor_y += row_h;
         }
     }
+
+    /// Compute the clamped panel rect `(x, y, w, h)` for a buffer of size
+    /// `(buf_w, buf_h)`. Mirrors the clamp logic in [`Self::paint`] so
+    /// callers can hit-test the same pixels that render.
+    pub fn panel_rect(&self, buf_w: usize, buf_h: usize) -> (i32, i32, i32, i32) {
+        let panel_w = self.preferred_width() as i32;
+        let panel_h = self.preferred_height() as i32;
+        let px = self.x.clamp(0, (buf_w as i32 - panel_w).max(0));
+        let py = self.y.clamp(0, (buf_h as i32 - panel_h).max(0));
+        (px, py, panel_w, panel_h)
+    }
+
+    /// True if pixel `(x, y)` (in chrome-buffer coords) falls inside the
+    /// clamped panel rect.
+    pub fn contains(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> bool {
+        let (px, py, pw, ph) = self.panel_rect(buf_w, buf_h);
+        x >= px && x < px + pw && y >= py && y < py + ph
+    }
+
+    /// Resolve pixel `(x, y)` to a selectable row index, or `None` if the
+    /// hit lands on a separator, on the border, or outside the panel.
+    pub fn row_at(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> Option<usize> {
+        if !self.contains(buf_w, buf_h, x, y) {
+            return None;
+        }
+        let (_px, py, _pw, _ph) = self.panel_rect(buf_w, buf_h);
+        let mut row_y = py + 1; // skip top border pixel
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let row_h = if entry.is_separator {
+                CONTEXT_MENU_SEP_HEIGHT as i32
+            } else {
+                CONTEXT_MENU_ROW_HEIGHT as i32
+            };
+            if y >= row_y && y < row_y + row_h {
+                if entry.is_separator || !entry.enabled {
+                    return None;
+                }
+                return Some(idx);
+            }
+            row_y += row_h;
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +309,37 @@ mod tests {
         let expected =
             2 + CONTEXT_MENU_ROW_HEIGHT + CONTEXT_MENU_SEP_HEIGHT + CONTEXT_MENU_ROW_HEIGHT;
         assert_eq!(m.preferred_height(), expected);
+    }
+
+    #[test]
+    fn contains_inside_and_outside() {
+        let m = simple_menu(50, 60);
+        let (x, y, w, h) = m.panel_rect(800, 600);
+        assert!(m.contains(800, 600, x, y));
+        assert!(m.contains(800, 600, x + w - 1, y + h - 1));
+        assert!(!m.contains(800, 600, x - 1, y));
+        assert!(!m.contains(800, 600, x, y - 1));
+        assert!(!m.contains(800, 600, x + w, y));
+    }
+
+    #[test]
+    fn row_at_resolves_selectable_rows() {
+        let m = simple_menu(50, 60);
+        let (px, py, _, _) = m.panel_rect(800, 600);
+        // First row centre.
+        let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
+        assert_eq!(m.row_at(800, 600, px + 10, row0_y), Some(0));
+        // Separator row centre — non-selectable.
+        let sep_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 + CONTEXT_MENU_SEP_HEIGHT as i32 / 2;
+        assert_eq!(m.row_at(800, 600, px + 10, sep_y), None);
+        // Third (Reload) row centre.
+        let row2_y = py
+            + 1
+            + CONTEXT_MENU_ROW_HEIGHT as i32
+            + CONTEXT_MENU_SEP_HEIGHT as i32
+            + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
+        assert_eq!(m.row_at(800, 600, px + 10, row2_y), Some(2));
+        // Outside panel.
+        assert_eq!(m.row_at(800, 600, 0, 0), None);
     }
 }
