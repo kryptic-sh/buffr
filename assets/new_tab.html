@@ -32,16 +32,19 @@
     .splash-wrap { text-align: center; margin: 0 0 2.5rem; }
     .splash-stack {
       display: inline-block; position: relative;
-      /* Force a monospace font that ships `█` (U+2588) with full
-         cell-width metrics. ui-monospace + the system fallback chain
-         can pull `█` from a symbol font with a different advance,
-         drifting the wordmark even with letter-spacing: 0. */
-      font-family: "DejaVu Sans Mono", "Liberation Mono", "Consolas",
-                   "Menlo", "Courier New", monospace;
+      /* `monospace` keyword maps through the OS's monospace
+         configuration — on Linux that's whatever fontconfig points
+         `monospace` at (typically DejaVu Sans Mono / Liberation Mono),
+         which has matching advance widths for `█` (U+2588) and space.
+         Listing specific families first risked falling through to a
+         fallback font where `█` has a different advance and rows of
+         box glyphs visibly drifted relative to rows of ASCII gaps. */
+      font-family: monospace;
       line-height: 1; letter-spacing: 0;
       font-variant-ligatures: none;
-      font-feature-settings: "liga" 0, "calt" 0, "kern" 0;
+      font-feature-settings: "liga" 0, "calt" 0, "kern" 0, "dlig" 0;
       font-kerning: none;
+      text-rendering: optimizeSpeed;
     }
     .splash-stack > pre {
       margin: 0; padding: 0;
@@ -92,7 +95,7 @@
 ██   ██ ██    ██ ██      ██      ██   ██
 ██████  ██    ██ █████   █████   ██████
 ██   ██ ██    ██ ██      ██      ██   ██
-██████   ██████  ██      ██      ██   ██</pre><pre id="buffr-splash"></pre></div></div>
+██████   ██████  ██      ██      ██   ██ </pre><pre id="buffr-splash"></pre></div></div>
     <header>
       <p>Press <kbd>e</kbd> to open the omnibar.</p>
     </header>
