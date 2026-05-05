@@ -76,12 +76,13 @@ pub fn paint(
     }
     let layout = Layout::centered(viewport_cols, viewport_rows, ROWS, COLS);
 
-    // 3. Splash state at this tick. `cursor_idx = tick % path_len`, so
-    //    advancing more than path_len times is wasted work.
-    let mut splash = Splash::new(ART, PATH);
-    for _ in 0..(frame_idx % PATH.len()) {
-        splash.advance();
-    }
+    // 3. Splash state at this tick. v0.2 owns its time source; `fixed_tick`
+    //    pins the tick to our host-driven frame counter so paint() stays a
+    //    pure function of (frame_idx, rect) — wall-clock mode would tie
+    //    output to real-time elapsed since first paint, which breaks the
+    //    snapshot tests below and would couple animation cadence to wgpu
+    //    redraw rate instead of `loading_anim_next_wake`.
+    let splash = Splash::fixed_tick(ART, PATH, frame_idx as u64);
 
     // 4. Blit cells.
     for cell in splash.cells(layout) {
