@@ -13,7 +13,7 @@ fn supervisor_bin() -> std::path::PathBuf {
     p.pop();
     p.push("target");
     p.push("debug");
-    p.push("buffr-supervisor");
+    p.push("buffr");
     p
 }
 
@@ -45,7 +45,7 @@ fn no_connect_triggers_crash_restart_then_halt() {
         .arg("--heartbeat-timeout")
         .arg("2")
         .output()
-        .expect("failed to run buffr-supervisor");
+        .expect("failed to run buffr");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 

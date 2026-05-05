@@ -9,11 +9,11 @@ use tempfile::tempdir;
 
 fn supervisor_bin() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // apps/buffr-supervisor → apps
+    p.pop(); // apps/buffr → apps
     p.pop(); // apps → workspace root
     p.push("target");
     p.push("debug");
-    p.push("buffr-supervisor");
+    p.push("buffr");
     p
 }
 
@@ -69,7 +69,7 @@ fn supervisor_does_not_kill_pinging_child() {
         .arg("--heartbeat-timeout")
         .arg("8")
         .status()
-        .expect("failed to run buffr-supervisor");
+        .expect("failed to run buffr");
 
     assert!(
         status.success(),

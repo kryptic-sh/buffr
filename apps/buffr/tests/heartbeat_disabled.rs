@@ -16,7 +16,7 @@ fn supervisor_bin() -> std::path::PathBuf {
     p.pop();
     p.push("target");
     p.push("debug");
-    p.push("buffr-supervisor");
+    p.push("buffr");
     p
 }
 
@@ -51,7 +51,7 @@ fn heartbeat_disable_does_not_pass_sock_env_to_child() {
         .env("RUST_LOG", "info")
         .arg("--heartbeat-disable")
         .output()
-        .expect("failed to run buffr-supervisor");
+        .expect("failed to run buffr");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -83,7 +83,7 @@ fn heartbeat_disable_preserves_crash_restart_backoff() {
         .env("RUST_LOG", "info")
         .arg("--heartbeat-disable")
         .output()
-        .expect("failed to run buffr-supervisor");
+        .expect("failed to run buffr");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 

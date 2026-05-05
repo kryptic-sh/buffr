@@ -4,14 +4,14 @@
 use std::process::Command;
 
 fn supervisor_bin() -> std::path::PathBuf {
-    // Built by `cargo test --test clean_exit -p buffr-supervisor`.
+    // Built by `cargo test --test clean_exit -p buffr`.
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // Walk up to workspace root, then into target.
-    p.pop(); // apps/buffr-supervisor → apps
+    p.pop(); // apps/buffr → apps
     p.pop(); // apps → workspace root
     p.push("target");
     p.push("debug");
-    p.push("buffr-supervisor");
+    p.push("buffr");
     p
 }
 
@@ -23,7 +23,7 @@ fn child_exit_zero_causes_supervisor_exit_zero() {
         .env("BUFFR_CHILD_BIN", "/bin/true")
         .env("RUST_LOG", "info")
         .status()
-        .expect("failed to run buffr-supervisor");
+        .expect("failed to run buffr");
 
     assert!(
         status.success(),
