@@ -46,11 +46,13 @@ pub fn new_splash() -> Splash<'static> {
     Splash::new(ART, PATH)
 }
 
-/// Render the current splash frame as HTML for the new-tab page's
-/// `<pre id="buffr-splash">` element. Cursor/trail cells get wrapped in
-/// `<span class="hl">…</span>`; the surrounding art is plain text the page
-/// CSS dims. Only `█` and spaces appear in the output, so no HTML escaping
-/// is required.
+/// Render the current splash frame's cursor layer as plain text for the
+/// new-tab page's `<pre id="buffr-splash">` overlay. The art layer is
+/// static and lives in the page HTML; this layer is mostly spaces with
+/// `█` at cursor/trail positions, painted in the accent color. Two
+/// stacked `<pre>` blocks (no inline spans) avoid the cross-span font
+/// fallback that breaks monospace alignment when `█` and ASCII share
+/// glyphs from different fonts in the fallback chain.
 pub fn splash_frame_html(splash: &Splash<'_>) -> String {
     const W: usize = COLS as usize;
     const H: usize = ROWS as usize;
@@ -60,35 +62,24 @@ pub fn splash_frame_html(splash: &Splash<'_>) -> String {
         rows: ROWS,
         cols: COLS,
     };
-    let mut grid = [[(' ', false); W]; H];
+    let mut grid = [[' '; W]; H];
     for cell in splash.cells(layout) {
         let (cx, cy) = (cell.x as usize, cell.y as usize);
         if cx >= W || cy >= H {
             continue;
         }
-        let hl = matches!(cell.kind, CellKind::Cursor | CellKind::Trail { .. });
-        grid[cy][cx] = (cell.ch, hl);
-    }
-    let mut out = String::with_capacity(W * H * 4);
-    for row in &grid {
-        let mut col = 0;
-        while col < W {
-            if row[col].1 {
-                let start = col;
-                while col < W && row[col].1 {
-                    col += 1;
-                }
-                out.push_str("<span class=\"hl\">");
-                for &(ch, _) in &row[start..col] {
-                    out.push(ch);
-                }
-                out.push_str("</span>");
-            } else {
-                out.push(row[col].0);
-                col += 1;
-            }
+        if matches!(cell.kind, CellKind::Cursor | CellKind::Trail { .. }) {
+            grid[cy][cx] = cell.ch;
         }
-        out.push('\n');
+    }
+    let mut out = String::with_capacity((W + 1) * H);
+    for (i, row) in grid.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        for &ch in row {
+            out.push(ch);
+        }
     }
     out
 }
@@ -232,18 +223,38 @@ mod tests {
     fn splash_frame_html_emits_5_lines() {
         let splash = Splash::fixed_tick(ART, PATH, 0);
         let html = splash_frame_html(&splash);
-        assert_eq!(html.matches('\n').count(), ROWS as usize);
+        // Newlines separate rows — 5 rows => 4 separators, no trailing.
+        assert_eq!(html.matches('\n').count(), ROWS as usize - 1);
+        assert_eq!(html.lines().count(), ROWS as usize);
     }
 
     #[test]
-    fn splash_frame_html_includes_highlight_span() {
+    fn splash_frame_html_emits_cursor_block() {
         // Tick 0 lights up the first cell of the B spine.
         let splash = Splash::fixed_tick(ART, PATH, 0);
         let html = splash_frame_html(&splash);
         assert!(
-            html.contains("<span class=\"hl\">"),
-            "frame should contain at least one cursor/trail span: {html}"
+            html.contains('█'),
+            "frame should contain at least one cursor cell: {html:?}"
         );
+        // No inline spans — alignment relies on stacked layers, not span
+        // wrapping.
+        assert!(
+            !html.contains("<span"),
+            "frame must not emit inline spans: {html:?}"
+        );
+    }
+
+    #[test]
+    fn splash_frame_html_rows_have_fixed_width() {
+        let html = splash_frame_html(&Splash::fixed_tick(ART, PATH, 3));
+        for line in html.lines() {
+            assert_eq!(
+                line.chars().count(),
+                COLS as usize,
+                "row width must equal COLS: {line:?}"
+            );
+        }
     }
 
     #[test]
