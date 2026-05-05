@@ -164,9 +164,9 @@ mod inner {
         /// output but never abort the child.
         pub fn try_connect() -> Option<Self> {
             use std::os::windows::io::FromRawHandle;
-            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
             use windows_sys::Win32::Storage::FileSystem::{
-                CreateFileW, FILE_SHARE_NONE, GENERIC_WRITE, OPEN_EXISTING,
+                CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING,
             };
 
             let path = match std::env::var(SUPERVISOR_PIPE_ENV) {
@@ -186,11 +186,11 @@ mod inner {
                     std::ptr::null(),
                     OPEN_EXISTING,
                     0,
-                    0,
+                    std::ptr::null_mut(),
                 )
             };
 
-            if handle == INVALID_HANDLE_VALUE || handle == 0 {
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
                 tracing::warn!(
                     path = %path,
                     "heartbeat: CreateFileW failed ({}); running unsupervised",
