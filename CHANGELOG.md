@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-05
+
 ### Added
 
 - **Crash + hang watchdog** (closes #28). Linux/macOS/Windows: a new `buffr`
@@ -19,6 +21,27 @@ and this project adheres to
   the supervisor as `CFBundleExecutable` inside `Buffr.app`; Windows uses Job
   Objects with `KILL_ON_JOB_CLOSE` and `SetConsoleCtrlHandler` for
   Ctrl+C/Break/close. The previous `buffr` binary is now `buffr-app`.
+- **`buffr-view-source` renderer crate** (rounds 1–2 of #30) — bonsai-rendered
+  `buffr-src:` scheme handler scaffolded in a dedicated crate and wired into the
+  CEF resource handler. Tokyonight palette + line numbers (round 3) tracked in
+  #30.
+
+### Fixed
+
+- **Hang on cross-app paste after copying from Facebook Messenger / other
+  Wayland sites** (closes #34). Picked up `hjkl-clipboard` 0.5.3 with the
+  self-paste self-pipe deadlock fix: when the buffr process owns the active
+  data_source, `do_get` short-circuits to the cached payload instead of going
+  through `offer.receive` + `read_fd_to_end`, which would deadlock the bg
+  Wayland thread against its own `data_source.send` event.
+- **Windows MSVC build** of the heartbeat client: `HANDLE` is `*mut c_void` (not
+  `usize`); `GENERIC_WRITE` moved to `Win32::Foundation`; `hTemplateFile` takes
+  `null_mut()`, not `0`.
+- **Supervisor binary missing from Windows MSI** — CI was building only
+  `buffr-app -p buffr-helper`; xtask `collect_windows_payload` requires all
+  three exes. Added `-p buffr` to the Windows package step in `ci.yml` and
+  `release.yml`; release.yml also dropped the dead `-p buffr-bin` package id
+  left over from the pre-rename split.
 
 ### Changed
 
@@ -27,6 +50,12 @@ and this project adheres to
   Linux `.desktop` `Exec=buffr` continues to work (now invokes supervisor).
   Windows MSI shortcuts and `Start Menu` entry target `buffr.exe` (supervisor).
   `cargo run` from the workspace root launches the supervisor by default.
+- `hjkl-clipboard` 0.4 → 0.5 (drops `Clone` from `Clipboard`; consumers wrap in
+  `Arc` for cross-thread share). Bumped to 0.5.3 with the self-paste fix.
+- Supervisor integration tests renamed `buffr-supervisor` → `buffr` to match the
+  new binary name.
+- CI gates `main` on macOS + Windows package jobs; `continue-on-error: true`
+  removed from both, so Windows/macOS regressions now turn the pipeline red.
 
 ## [0.4.0] - 2026-05-05
 
@@ -606,7 +635,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.2.1
