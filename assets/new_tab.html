@@ -32,12 +32,22 @@
     .splash-wrap { text-align: center; margin: 0 0 2.5rem; }
     .splash-stack {
       display: inline-block; position: relative;
-      font-family: ui-monospace, monospace;
+      /* Force a monospace font that ships `█` (U+2588) with full
+         cell-width metrics. ui-monospace + the system fallback chain
+         can pull `█` from a symbol font with a different advance,
+         drifting the wordmark even with letter-spacing: 0. */
+      font-family: "DejaVu Sans Mono", "Liberation Mono", "Consolas",
+                   "Menlo", "Courier New", monospace;
       line-height: 1; letter-spacing: 0;
+      font-variant-ligatures: none;
+      font-feature-settings: "liga" 0, "calt" 0, "kern" 0;
+      font-kerning: none;
     }
     .splash-stack > pre {
       margin: 0; padding: 0;
       font: inherit; line-height: inherit; letter-spacing: inherit;
+      font-feature-settings: inherit; font-kerning: inherit;
+      font-variant-ligatures: inherit;
     }
     .splash-art { color: rgba(192, 202, 245, 0.35); }
     #buffr-splash {
