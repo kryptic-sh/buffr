@@ -450,7 +450,7 @@ jobs:
         run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: cargo build (release)
-        run: cargo build --release -p buffr-app -p buffr-helper
+        run: cargo build --release -p buffr -p buffr-app -p buffr-helper
 
       - name: cargo xtask package-windows-msi
         run: cargo xtask package-windows-msi --release

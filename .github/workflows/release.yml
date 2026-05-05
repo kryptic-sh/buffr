@@ -248,7 +248,7 @@ jobs:
         run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: Build binaries (release)
-        run: cargo build --release -p buffr-bin -p buffr-helper
+        run: cargo build --release -p buffr -p buffr-app -p buffr-helper
 
       - name: Package Windows MSI
         run: cargo xtask package-windows-msi --release
