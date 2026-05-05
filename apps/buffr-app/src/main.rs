@@ -133,7 +133,7 @@ use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
     BuffrApp, ContextMenuItem, ContextMenuRequest, DownloadNoticeQueue, EditConsoleEvent,
     EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink, IdleInhibitor,
-    PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome, SharedOsrFrame,
+    NEW_TAB_URL, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome, SharedOsrFrame,
     SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer, drain_popup_closes,
     drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
     new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
@@ -3325,6 +3325,19 @@ impl AppState {
             || self.surface_drifted
             || host_is_loading;
 
+        // Splash overlay: when the active tab is the buffr://new page and
+        // we're past the loading-anim phase (OSR has painted), draw the
+        // animated wordmark on top of the page. The chrome buffer is
+        // transparent in the browser region so the OSR shows through and
+        // the splash glyphs alpha-blend over it.
+        let active_url = self
+            .host
+            .as_ref()
+            .map(|h| h.active_tab_live_url())
+            .unwrap_or_default();
+        let want_splash_overlay =
+            !want_anim && (active_url == NEW_TAB_URL || active_url.starts_with(NEW_TAB_URL));
+
         // Idle short-circuit. If nothing has changed since the last paint —
         // chrome buffer up to date, no fresh CEF paint queued, no animation
         // pending, and the loading-anim flag is already in sync (so we won't
@@ -3338,6 +3351,7 @@ impl AppState {
         if !chrome_dirty
             && osr_meta.is_none()
             && !want_anim
+            && !want_splash_overlay
             && want_anim == self.loading_anim_active
         {
             return;
@@ -3379,7 +3393,8 @@ impl AppState {
         // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
         let chrome_dirty_effective =
-            should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated);
+            should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated)
+                || want_splash_overlay;
         let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
         let res = match paint_path {
             PaintPath::Animation => {
@@ -3433,7 +3448,7 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, _h| {
+                    |buf, w, h| {
                         paint_chrome_strips(
                             buf,
                             w,
@@ -3448,6 +3463,16 @@ impl AppState {
                             overlay_data.as_ref(),
                             context_menu_overlay.as_ref(),
                         );
+                        if want_splash_overlay {
+                            crate::loading_anim::paint_overlay(
+                                buf,
+                                w,
+                                h,
+                                (0, l_browser_y, l_browser_w, l_browser_h),
+                                anim_frame as usize,
+                                anim_fg,
+                            );
+                        }
                     },
                     Some(osr_upload),
                 )
@@ -3477,7 +3502,7 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, _h| {
+                    |buf, w, h| {
                         paint_chrome_strips(
                             buf,
                             w,
@@ -3492,6 +3517,16 @@ impl AppState {
                             overlay_data.as_ref(),
                             context_menu_overlay.as_ref(),
                         );
+                        if want_splash_overlay {
+                            crate::loading_anim::paint_overlay(
+                                buf,
+                                w,
+                                h,
+                                (0, l_browser_y, l_browser_w, l_browser_h),
+                                anim_frame as usize,
+                                anim_fg,
+                            );
+                        }
                     },
                     Some(osr_upload),
                 )
@@ -3528,8 +3563,11 @@ impl AppState {
             self.last_painted_chrome_gen = self.chrome_generation;
         }
 
-        // Advance the animation counter and schedule the next wake when active.
-        if want_anim {
+        // Advance the animation counter and schedule the next wake when
+        // either the loading-anim path or the new-tab splash overlay is
+        // active. Both ride the same 12 fps tick so the wordmark moves at
+        // a single canonical cadence regardless of which mode rendered it.
+        if want_anim || want_splash_overlay {
             self.loading_anim_frame = self.loading_anim_frame.wrapping_add(1);
             self.loading_anim_next_wake = Some(Instant::now() + Duration::from_millis(83)); // ~12 fps
         } else {

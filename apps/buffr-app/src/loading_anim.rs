@@ -49,18 +49,47 @@ pub fn paint(
     fg: u32,
     bg: u32,
 ) {
+    paint_inner(buf, buf_w, buf_h, rect, frame_idx, fg, Some(bg));
+}
+
+/// Paint just the animated glyphs without filling the background. Used to
+/// overlay the splash on top of an OSR page (e.g. the new-tab page) where
+/// the chrome buffer is already transparent in the browser region — leaving
+/// the page visible behind the wordmark.
+pub fn paint_overlay(
+    buf: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    rect: (u32, u32, u32, u32),
+    frame_idx: usize,
+    fg: u32,
+) {
+    paint_inner(buf, buf_w, buf_h, rect, frame_idx, fg, None);
+}
+
+fn paint_inner(
+    buf: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    rect: (u32, u32, u32, u32),
+    frame_idx: usize,
+    fg: u32,
+    bg: Option<u32>,
+) {
     let (rx, ry, rw, rh) = rect;
     let (rx, ry, rw, rh) = (rx as usize, ry as usize, rw as usize, rh as usize);
 
-    // 1. Background fill.
-    let x1 = (rx + rw).min(buf_w);
-    let y1 = (ry + rh).min(buf_h);
-    for row in ry..y1 {
-        let base = row * buf_w;
-        if base + x1 > buf.len() {
-            break;
+    // 1. Optional background fill.
+    if let Some(bg) = bg {
+        let x1 = (rx + rw).min(buf_w);
+        let y1 = (ry + rh).min(buf_h);
+        for row in ry..y1 {
+            let base = row * buf_w;
+            if base + x1 > buf.len() {
+                break;
+            }
+            buf[base + rx..base + x1].fill(bg);
         }
-        buf[base + rx..base + x1].fill(bg);
     }
     if rw == 0 || rh == 0 {
         return;
@@ -142,6 +171,25 @@ mod tests {
             0,
         );
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn paint_overlay_leaves_unwritten_pixels_at_zero() {
+        // The wordmark + cursor cells touch only a fraction of the rect.
+        // paint_overlay must not fill the rest with anything (callers rely
+        // on the chrome buffer's background-region alpha staying 0 so the
+        // OSR page shows through).
+        let w = 800;
+        let h = 200;
+        let mut buf = vec![0u32; w * h];
+        paint_overlay(&mut buf, w, h, (0, 0, w as u32, h as u32), 0, 0xff_ff_ff_ff);
+        let written = buf.iter().filter(|&&p| p != 0).count();
+        let zeroed = buf.iter().filter(|&&p| p == 0).count();
+        assert!(written > 0, "overlay should still paint glyph pixels");
+        assert!(
+            zeroed > written,
+            "overlay must leave most of the rect untouched: written={written}, zeroed={zeroed}"
+        );
     }
 
     #[test]
