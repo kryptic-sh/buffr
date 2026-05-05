@@ -141,7 +141,7 @@ mod inner {
 #[cfg(windows)]
 mod inner {
     use std::io::Write;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::HEARTBEAT_INTERVAL;
 
