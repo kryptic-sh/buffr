@@ -1,5 +1,5 @@
 //! Integration test: child crashes 3 times in window → supervisor halts non-zero.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

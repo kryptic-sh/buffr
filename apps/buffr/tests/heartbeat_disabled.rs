@@ -3,7 +3,7 @@
 //! When the flag is present:
 //!   - No socket is bound (BUFFR_SUPERVISOR_SOCK must NOT be set in child env).
 //!   - Round-1 crash-only behaviour is preserved.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

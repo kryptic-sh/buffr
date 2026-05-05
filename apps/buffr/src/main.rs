@@ -1,8 +1,15 @@
 //! buffr — crash-restart + hang watchdog supervisor for the buffr browser.
 //!
-//! **Linux only** in Round 3. On other platforms the supervisor prints a
-//! notice and execs the child binary directly without any watchdog loop.
+//! **Linux and macOS** as of Round 4. On other platforms the supervisor prints
+//! a notice and execs the child binary directly without any watchdog loop.
 //! This keeps `cargo build --workspace` green on every platform's CI.
+//!
+//! ## macOS socket path
+//!
+//! Filesystem UDS only (abstract sockets do not exist on Darwin).
+//! `XDG_RUNTIME_DIR` is typically unset on macOS so the socket lands in
+//! `/tmp/buffr-<pid>.sock` — well within macOS's stricter `sun_path` limit
+//! (~104 bytes; `/tmp/buffr-99999.sock` is 23 bytes).
 //!
 //! ## Usage
 //!
@@ -27,7 +34,7 @@ use clap::Parser;
 ///
 /// Spawns `buffr-app` (the browser binary) and automatically restarts it
 /// on crash or UI hang. Stops after 3 crashes/hangs in 30 seconds and
-/// points at the crash log directory. Linux only in this release.
+/// points at the crash log directory. Linux and macOS in this release.
 #[derive(Debug, Parser)]
 #[command(
     name = "buffr",
@@ -115,27 +122,27 @@ fn main() -> anyhow::Result<()> {
         "buffr supervisor starting"
     );
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        linux::run_supervisor(child_bin, child_args, heartbeat_timeout, heartbeat_disable)?;
+        unix::run_supervisor(child_bin, child_args, heartbeat_timeout, heartbeat_disable)?;
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         // Runtime fallback: no supervision — just exec the child directly.
-        // This keeps `cargo build --workspace` green on macOS/Windows CI.
+        // This keeps `cargo build --workspace` green on Windows CI.
         eprintln!(
             "buffr: watchdog not yet supported on this platform — \
              running buffr-app directly without supervision."
         );
-        non_linux::exec_child(child_bin, child_args)?;
+        non_unix::exec_child(child_bin, child_args)?;
     }
 
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(unix)]
+mod unix {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -662,8 +669,8 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-mod non_linux {
+#[cfg(not(unix))]
+mod non_unix {
     use std::ffi::OsString;
     use std::path::PathBuf;
 

@@ -1,6 +1,6 @@
 //! Integration test: fake child never connects to the heartbeat socket.
 //! Supervisor must time out after 5 s and restart (3× → halt non-zero).
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

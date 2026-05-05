@@ -6,7 +6,7 @@
 //!
 //! - `three_hangs_trigger_backoff_halt`: same scenario fires 3 times,
 //!   supervisor exits non-zero after the third hang.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

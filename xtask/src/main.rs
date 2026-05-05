@@ -65,9 +65,9 @@ const WIX_TEMPLATE: &str = include_str!("../templates/buffr.wxs");
 /// Bundle identifiers + display name used by the macOS bundle templates.
 ///
 /// `DISPLAY_NAME` is the TitleCase bundle name (`Buffr.app`, plist
-/// `CFBundleName`/`CFBundleDisplayName`). The browser binary inside the
-/// bundle is `buffr-app` (CFBundleExecutable). The supervisor is not
-/// included in the macOS bundle in this round (Round 4 wires that up).
+/// `CFBundleName`/`CFBundleDisplayName`). `CFBundleExecutable` is `buffr`
+/// (the supervisor — the entry point Launch Services starts). The browser
+/// binary `buffr-app` lives alongside it in `Contents/MacOS/`.
 const DISPLAY_NAME: &str = "Buffr";
 const BUNDLE_ID_MAIN: &str = "sh.kryptic.buffr";
 const BUNDLE_ID_HELPER: &str = "sh.kryptic.buffr.helper";
@@ -504,10 +504,14 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     let profile = if parsed.release { "release" } else { "debug" };
 
     // 1. Build the binaries.
-    eprintln!("xtask: building buffr-app + buffr-helper ({profile})");
+    eprintln!(
+        "xtask: building buffr (supervisor) + buffr-app (browser) + buffr-helper ({profile})"
+    );
     let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(&workspace)
         .arg("build")
+        .arg("-p")
+        .arg("buffr")
         .arg("-p")
         .arg("buffr-app")
         .arg("-p")
@@ -529,10 +533,14 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
         None => workspace.join("target").join(profile),
     };
 
-    let buffr_bin = target_dir.join("buffr-app");
+    let supervisor_bin = target_dir.join("buffr");
+    let buffr_app_bin = target_dir.join("buffr-app");
     let helper_bin = target_dir.join("buffr-helper");
-    if !buffr_bin.exists() {
-        bail!("expected `{}` after build", buffr_bin.display());
+    if !supervisor_bin.exists() {
+        bail!("expected `{}` after build", supervisor_bin.display());
+    }
+    if !buffr_app_bin.exists() {
+        bail!("expected `{}` after build", buffr_app_bin.display());
     }
     if !helper_bin.exists() {
         bail!("expected `{}` after build", helper_bin.display());
@@ -551,7 +559,8 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     let version = workspace_version(&workspace)?;
     stage_bundle(
         &app_dir,
-        &buffr_bin,
+        &supervisor_bin,
+        &buffr_app_bin,
         &helper_bin,
         &framework_dir,
         version.as_str(),
@@ -648,9 +657,16 @@ fn workspace_version(workspace: &Path) -> Result<String> {
 }
 
 /// Build the bundle layout. See module docs for the tree.
+///
+/// `supervisor_bin` is the `buffr` watchdog — it becomes `CFBundleExecutable`
+/// (the entry point Launch Services starts). `buffr_app_bin` is the browser
+/// binary and lives as a sibling in `Contents/MacOS/`. The supervisor's
+/// child-resolution logic (`current_exe → parent → "buffr-app"`) finds it
+/// automatically because both live in the same directory.
 fn stage_bundle(
     app_dir: &Path,
-    buffr_bin: &Path,
+    supervisor_bin: &Path,
+    buffr_app_bin: &Path,
     helper_bin: &Path,
     framework_dir: &Path,
     version: &str,
@@ -669,11 +685,15 @@ fn stage_bundle(
     fs::write(contents.join("PkgInfo"), b"APPL????")
         .with_context(|| format!("writing {}/PkgInfo", contents.display()))?;
 
-    // Main executable (browser binary). CFBundleExecutable = "buffr-app".
-    // The supervisor (buffr) is not included in the macOS bundle in Round 3;
-    // that wiring lands in Round 4.
-    let main_exec = macos.join("buffr-app");
-    copy_file_executable(buffr_bin, &main_exec)?;
+    // Supervisor (CFBundleExecutable = "buffr") — the entrypoint Launch Services
+    // starts. It spawns buffr-app as its supervised child.
+    let main_exec = macos.join("buffr");
+    copy_file_executable(supervisor_bin, &main_exec)?;
+
+    // Browser binary. The supervisor finds it via current_exe() → parent() →
+    // "buffr-app", which resolves to Contents/MacOS/buffr-app alongside itself.
+    let browser_exec = macos.join("buffr-app");
+    copy_file_executable(buffr_app_bin, &browser_exec)?;
 
     // Framework — always present in a real build, but we still copy via
     // recursive walk so the bundle works on Linux runners pointing at a
@@ -748,7 +768,8 @@ fn render_main_plist(version: &str) -> String {
         .replace("{NAME}", DISPLAY_NAME)
         .replace("{VERSION}", version)
         .replace("{BUNDLE_ID_MAIN}", BUNDLE_ID_MAIN)
-        .replace("{EXECUTABLE}", "buffr-app")
+        // CFBundleExecutable is the supervisor; it spawns buffr-app as its child.
+        .replace("{EXECUTABLE}", "buffr")
         .replace("{COPYRIGHT}", COPYRIGHT)
 }
 
@@ -1860,8 +1881,9 @@ mod tests {
         assert!(s.contains("<string>sh.kryptic.buffr</string>"));
         // CFBundleDisplayName / CFBundleName use the TitleCase display name.
         assert!(s.contains("<string>Buffr</string>"));
-        // CFBundleExecutable is the browser binary name.
-        assert!(s.contains("<string>buffr-app</string>"));
+        // CFBundleExecutable is the supervisor binary name (the entrypoint
+        // Launch Services starts; it spawns buffr-app as its child).
+        assert!(s.contains("<string>buffr</string>"));
         assert!(!s.contains("{VERSION}"));
         assert!(!s.contains("{BUNDLE_ID_MAIN}"));
         assert!(!s.contains("{EXECUTABLE}"));
@@ -1929,16 +1951,29 @@ mod tests {
         fs::create_dir_all(fw.join("Versions/A/Resources")).unwrap();
         fs::write(fw.join("Versions/A/Chromium Embedded Framework"), b"stub").unwrap();
 
-        let buffr_bin = tmp.path().join("buffr-app");
+        let supervisor_bin = tmp.path().join("buffr");
+        let buffr_app_bin = tmp.path().join("buffr-app");
         let helper_bin = tmp.path().join("buffr-helper");
-        fs::write(&buffr_bin, b"#!/bin/sh\necho buffr-app\n").unwrap();
+        fs::write(&supervisor_bin, b"#!/bin/sh\necho buffr\n").unwrap();
+        fs::write(&buffr_app_bin, b"#!/bin/sh\necho buffr-app\n").unwrap();
         fs::write(&helper_bin, b"#!/bin/sh\necho helper\n").unwrap();
 
         let app_dir = tmp.path().join("Buffr.app");
-        stage_bundle(&app_dir, &buffr_bin, &helper_bin, &fw, "9.9.9").unwrap();
+        stage_bundle(
+            &app_dir,
+            &supervisor_bin,
+            &buffr_app_bin,
+            &helper_bin,
+            &fw,
+            "9.9.9",
+        )
+        .unwrap();
 
         assert!(app_dir.join("Contents/Info.plist").exists());
         assert!(app_dir.join("Contents/PkgInfo").exists());
+        // Supervisor is CFBundleExecutable — the entrypoint Launch Services starts.
+        assert!(app_dir.join("Contents/MacOS/buffr").exists());
+        // Browser binary lives alongside the supervisor.
         assert!(app_dir.join("Contents/MacOS/buffr-app").exists());
         assert!(
             app_dir

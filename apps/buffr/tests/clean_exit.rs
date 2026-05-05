@@ -1,5 +1,5 @@
 //! Integration test: child exits 0 → supervisor exits 0, no restart.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::process::Command;
 

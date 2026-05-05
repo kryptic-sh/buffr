@@ -1,6 +1,6 @@
 //! Integration test: fake child connects + pings every 500 ms for 12 s.
 //! Supervisor must NOT kill it (i.e. it must exit 0 at the end).
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

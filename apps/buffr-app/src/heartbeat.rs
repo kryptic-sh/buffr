@@ -10,15 +10,22 @@
 //! (unsupervised run) or the connect fails.  Either way, the caller
 //! continues normally — running without a supervisor is never fatal.
 //!
-//! **Linux only.** Non-Linux targets get an empty stub so the workspace
-//! builds everywhere.
+//! **Unix (Linux + macOS).** Non-Unix targets get an empty stub so the
+//! workspace builds everywhere.
+//!
+//! ## macOS notes
+//!
+//! Filesystem UDS only — abstract sockets do not exist on Darwin.
+//! The socket path is supplied by the supervisor via `BUFFR_SUPERVISOR_SOCK`
+//! (`/tmp/buffr-<pid>.sock` on macOS when `XDG_RUNTIME_DIR` is unset),
+//! well within macOS's `sun_path` limit (~104 bytes).
 
 /// 1 Hz heartbeat — write one byte every second the UI thread is live.
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-// ── Linux implementation ──────────────────────────────────────────────────────
+// ── Unix implementation (Linux + macOS) ──────────────────────────────────────
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod inner {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -128,11 +135,11 @@ mod inner {
     }
 }
 
-// ── Non-Linux stub ────────────────────────────────────────────────────────────
+// ── Non-Unix stub ────────────────────────────────────────────────────────────
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 mod inner {
-    /// No-op stub on non-Linux platforms.
+    /// No-op stub on non-Unix platforms (e.g. Windows).
     pub struct Heartbeat {
         _private: (),
     }
