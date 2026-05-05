@@ -1,6 +1,6 @@
-//! buffr-supervisor — crash-restart watchdog for the buffr browser binary.
+//! buffr-supervisor — crash-restart + hang watchdog for the buffr browser binary.
 //!
-//! **Linux only** in Round 1. On other platforms the supervisor prints a
+//! **Linux only** in Round 2. On other platforms the supervisor prints a
 //! notice and execs the child binary directly without any watchdog loop.
 //! This keeps `cargo build --workspace` green on every platform's CI.
 //!
@@ -23,21 +23,32 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Crash-restart watchdog for the buffr browser binary.
+/// Crash-restart + hang watchdog for the buffr browser binary.
 ///
 /// Forwards all arguments to the buffr child process and automatically
-/// restarts it on crash. Stops after 3 crashes in 30 seconds and
-/// points at the crash log directory.
+/// restarts it on crash or UI hang. Stops after 3 crashes/hangs in
+/// 30 seconds and points at the crash log directory.
 #[derive(Debug, Parser)]
 #[command(
     name = "buffr-supervisor",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Crash-restart watchdog for buffr. Forwards args to the buffr browser \
-             binary and restarts on crash. Linux only in this release.",
+    about = "Crash-restart + hang watchdog for buffr. Forwards args to the buffr browser \
+             binary and restarts on crash or hang. Linux only in this release.",
     // Allow unknown args so everything after the supervisor flags is forwarded.
     allow_hyphen_values = true,
 )]
 struct Cli {
+    /// How many seconds of silence from the child's heartbeat before treating
+    /// it as a hang and killing the process tree (default: 8).
+    #[arg(long, default_value_t = 8, value_name = "SEC")]
+    heartbeat_timeout: u64,
+
+    /// Disable the UDS heartbeat entirely. The supervisor only watches exit
+    /// codes (Round-1 behaviour). Useful when attaching a debugger or
+    /// deliberately stopping the child with SIGSTOP for testing.
+    #[arg(long)]
+    heartbeat_disable: bool,
+
     /// Arguments forwarded verbatim to the buffr child process.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     child_args: Vec<OsString>,
@@ -92,15 +103,19 @@ fn main() -> anyhow::Result<()> {
 
     let child_bin = resolve_child_bin()?;
     let child_args = cli.child_args;
+    let heartbeat_timeout = std::time::Duration::from_secs(cli.heartbeat_timeout);
+    let heartbeat_disable = cli.heartbeat_disable;
 
     tracing::info!(
         child = %child_bin.display(),
+        heartbeat_timeout_s = cli.heartbeat_timeout,
+        heartbeat_disable,
         "buffr-supervisor starting"
     );
 
     #[cfg(target_os = "linux")]
     {
-        linux::run_supervisor(child_bin, child_args)?;
+        linux::run_supervisor(child_bin, child_args, heartbeat_timeout, heartbeat_disable)?;
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -120,6 +135,8 @@ fn main() -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,9 +152,31 @@ mod linux {
     const RESTART_COOLDOWN: Duration = Duration::from_millis(250);
     /// How long to wait for graceful termination before SIGKILL.
     const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
+    /// How long to wait for the child to connect to the heartbeat socket.
+    const CONNECT_GRACE: Duration = Duration::from_secs(5);
+    /// Additional grace after the child connects before enforcing heartbeat.
+    const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
 
-    pub fn run_supervisor(child_bin: PathBuf, child_args: Vec<OsString>) -> anyhow::Result<()> {
-        // Timestamps of the last CRASH_LIMIT crashes (rolling window).
+    /// Env var name written into the child's environment with the UDS path.
+    pub const SUPERVISOR_SOCK_ENV: &str = "BUFFR_SUPERVISOR_SOCK";
+
+    /// Events the heartbeat listener thread sends back to the main loop.
+    pub enum HeartbeatEvent {
+        /// Child successfully connected.
+        Connected,
+        /// A ping byte arrived from the child.
+        Ping,
+        /// The connection was closed (EOF or error).
+        Disconnected,
+    }
+
+    pub fn run_supervisor(
+        child_bin: PathBuf,
+        child_args: Vec<OsString>,
+        heartbeat_timeout: Duration,
+        heartbeat_disable: bool,
+    ) -> anyhow::Result<()> {
+        // Timestamps of the last CRASH_LIMIT crashes/hangs (rolling window).
         let mut crash_times: Vec<Instant> = Vec::new();
         let mut restart_count: u32 = 0;
 
@@ -145,10 +184,32 @@ mod linux {
         // a forwarded-signal exit from the child is intentional.
         let shutdown_requested = Arc::new(AtomicBool::new(false));
 
+        // Our own PID used for the socket path.
+        let supervisor_pid = std::process::id();
+
         loop {
-            // --- spawn child ---
+            // ── bind socket for this spawn ─────────────────────────────────
+            let (sock_path, listener, hb_rx) = if heartbeat_disable {
+                (None, None, None)
+            } else {
+                match setup_heartbeat_socket(supervisor_pid) {
+                    Ok((path, listener)) => {
+                        let (tx, rx) = std::sync::mpsc::channel::<HeartbeatEvent>();
+                        (Some(path), Some(listener), Some((tx, rx)))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "heartbeat: failed to bind socket; running without hang detection"
+                        );
+                        (None, None, None)
+                    }
+                }
+            };
+
+            // ── spawn child ───────────────────────────────────────────────
             let spawn_time = Instant::now();
-            let mut cmd = build_command(&child_bin, &child_args);
+            let mut cmd = build_command(&child_bin, &child_args, sock_path.as_deref());
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
@@ -159,17 +220,91 @@ mod linux {
             let child_pid = Pid::from_raw(child.id() as i32);
             tracing::info!(pid = %child_pid, "child spawned");
 
-            // Install signal forwarding for this child.
-            let sr = Arc::clone(&shutdown_requested);
-            let _guard = install_signal_forwarding(child_pid, sr);
+            // ── start heartbeat listener thread ───────────────────────────
+            let hb_rx = hb_rx.map(|(tx, rx)| {
+                let listener = listener.expect("listener present when hb_rx present");
+                std::thread::spawn(move || heartbeat_accept_loop(listener, tx));
+                rx
+            });
 
-            // --- wait for child ---
-            let status = child.wait()?;
+            // ── install signal forwarding ─────────────────────────────────
+            let sr = Arc::clone(&shutdown_requested);
+            let _signal_guard = install_signal_forwarding(child_pid, sr);
+
+            // ── wait for heartbeat connect within grace window ────────────
+            //
+            // While waiting we also poll child.try_wait() so a fast-exiting
+            // child (e.g. /bin/true, --help, short subcommand) is detected
+            // before the 5 s grace window expires and is NOT treated as a
+            // connect-timeout "crash".
+            enum WatchResult {
+                HangDetected,
+                ChildExited(Option<std::process::ExitStatus>),
+            }
+
+            let watch_result = if let Some(ref rx) = hb_rx {
+                match wait_for_connect(rx, &mut child, CONNECT_GRACE) {
+                    ConnectResult::Connected => {
+                        tracing::info!(pid = %child_pid, "child connected to heartbeat socket");
+                        // Post-connect grace: give CEF time to initialise.
+                        let post_connect_deadline =
+                            Instant::now() + POST_CONNECT_GRACE + heartbeat_timeout;
+                        // Now run the main ping-watch loop alongside the child.
+                        if watch_heartbeat(rx, &mut child, post_connect_deadline, heartbeat_timeout)
+                        {
+                            WatchResult::HangDetected
+                        } else {
+                            WatchResult::ChildExited(child.try_wait().ok().flatten())
+                        }
+                    }
+                    ConnectResult::TimedOut => {
+                        // Child didn't connect within 5 s — treat as crash.
+                        tracing::warn!(
+                            pid = %child_pid,
+                            "child did not connect to heartbeat socket within 5s; \
+                             treating as crash"
+                        );
+                        // Kill the child so child.wait() below doesn't block.
+                        let _ = signal::killpg(child_pid, Signal::SIGKILL);
+                        let _ = child.wait();
+                        WatchResult::HangDetected
+                    }
+                    ConnectResult::ChildExited(s) => WatchResult::ChildExited(s),
+                }
+            } else {
+                // Heartbeat disabled or socket setup failed — just wait.
+                WatchResult::ChildExited(None)
+            };
+
+            // ── reap if still running ─────────────────────────────────────
+            let (hang_detected, status) = match watch_result {
+                WatchResult::HangDetected => (true, None),
+                WatchResult::ChildExited(s) => {
+                    // Reap if we haven't already.
+                    let status = if s.is_some() {
+                        s
+                    } else {
+                        match child.wait() {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "child.wait() failed");
+                                None
+                            }
+                        }
+                    };
+                    (false, status)
+                }
+            };
+
             let elapsed = spawn_time.elapsed();
 
-            // Was this a clean exit?
-            let exit_code = status.code();
-            let is_clean = exit_code == Some(0);
+            // ── clean up socket ───────────────────────────────────────────
+            if let Some(ref path) = sock_path {
+                let _ = std::fs::remove_file(path);
+            }
+
+            // ── decide whether to restart ─────────────────────────────────
+            let is_clean = status.as_ref().and_then(|s| s.code()) == Some(0) && !hang_detected;
 
             if is_clean {
                 tracing::info!(
@@ -180,19 +315,16 @@ mod linux {
                 return Ok(());
             }
 
-            // If the supervisor itself was asked to shut down, a non-zero
-            // exit from the child is the result of our own SIGTERM forward
-            // — don't restart.
+            // If the supervisor itself was asked to shut down, don't restart.
             if shutdown_requested.load(Ordering::SeqCst) {
                 tracing::info!(
                     pid = %child_pid,
-                    status = ?status,
                     "child exited after supervisor shutdown signal; not restarting"
                 );
                 return Ok(());
             }
 
-            // Crash path.
+            // Crash / hang path.
             restart_count += 1;
             let now = Instant::now();
             crash_times.push(now);
@@ -201,18 +333,29 @@ mod linux {
             let window_start = now - Duration::from_secs(WINDOW_SECS);
             crash_times.retain(|t| *t >= window_start);
 
-            tracing::info!(
-                pid = %child_pid,
-                exit_status = ?status,
-                restart_count = restart_count,
-                crashes_in_window = crash_times.len(),
-                elapsed_ms = elapsed.as_millis(),
-                "child crashed; considering restart"
-            );
+            if hang_detected {
+                tracing::info!(
+                    pid = %child_pid,
+                    restart_count,
+                    crashes_in_window = crash_times.len(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "child hang detected; considering restart"
+                );
+            } else {
+                tracing::info!(
+                    pid = %child_pid,
+                    exit_status = ?status,
+                    restart_count,
+                    crashes_in_window = crash_times.len(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "child crashed; considering restart"
+                );
+            }
 
             if crash_times.len() >= CRASH_LIMIT {
                 tracing::error!(
-                    "watchdog: {CRASH_LIMIT} crashes in {WINDOW_SECS}s, refusing to restart. \
+                    "watchdog: {CRASH_LIMIT} crashes/hangs in {WINDOW_SECS}s, \
+                     refusing to restart. \
                      Check crash logs at ~/.local/share/buffr/crashes/"
                 );
                 std::process::exit(1);
@@ -226,11 +369,225 @@ mod linux {
         }
     }
 
-    fn build_command(bin: &PathBuf, args: &[OsString]) -> std::process::Command {
+    /// Bind a Unix-domain socket the child will connect to.
+    ///
+    /// Path: `${XDG_RUNTIME_DIR}/buffr-supervisor-<pid>.sock`
+    /// Fallback: `/tmp/buffr-supervisor-<pid>.sock`
+    ///
+    /// Unlinks any stale socket at that path before binding.
+    /// Sets permissions to 0600 (owner-only).
+    pub fn setup_heartbeat_socket(pid: u32) -> anyhow::Result<(PathBuf, UnixListener)> {
+        let filename = format!("buffr-supervisor-{pid}.sock");
+        let path = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            PathBuf::from(xdg).join(&filename)
+        } else {
+            PathBuf::from("/tmp").join(&filename)
+        };
+
+        // Remove stale socket from a prior crash.
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        let listener = UnixListener::bind(&path)?;
+        // Owner-only: the child runs as the same user; world-read is unnecessary.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        // Set non-blocking so our accept() call can time out.
+        listener.set_nonblocking(true)?;
+
+        tracing::debug!(path = %path.display(), "heartbeat socket bound");
+        Ok((path, listener))
+    }
+
+    /// Accept exactly one connection; send events to `tx` until disconnected.
+    fn heartbeat_accept_loop(listener: UnixListener, tx: std::sync::mpsc::Sender<HeartbeatEvent>) {
+        use std::io::Read;
+
+        // Block until a client connects (we set non-blocking above; poll manually).
+        // The main thread uses wait_for_connect with its own timeout, so we just
+        // loop with short sleeps here.
+        let stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "heartbeat: accept failed");
+                    return;
+                }
+            }
+        };
+
+        // Notify main thread that a connection arrived.
+        if tx.send(HeartbeatEvent::Connected).is_err() {
+            return;
+        }
+
+        // Read bytes; each byte is a ping.
+        let mut stream = stream;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
+        let mut buf = [0u8; 64];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    // EOF — child closed the socket.
+                    let _ = tx.send(HeartbeatEvent::Disconnected);
+                    return;
+                }
+                Ok(n) => {
+                    for _ in 0..n {
+                        if tx.send(HeartbeatEvent::Ping).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // Timeout — no ping yet; loop back so the main thread
+                    // can detect a hang without us blocking forever.
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "heartbeat: read error");
+                    let _ = tx.send(HeartbeatEvent::Disconnected);
+                    return;
+                }
+            }
+        }
+    }
+
+    enum ConnectResult {
+        /// Child successfully connected to the heartbeat socket.
+        Connected,
+        /// Grace window elapsed with no connection.
+        TimedOut,
+        /// Child exited before connecting (may be a clean exit).
+        ChildExited(Option<std::process::ExitStatus>),
+    }
+
+    /// Wait up to `grace` for the child to connect.
+    ///
+    /// Also polls `child.try_wait()` so a fast-exiting child (clean exit,
+    /// short subcommand, --help flag) is not misclassified as a hang.
+    fn wait_for_connect(
+        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
+        child: &mut std::process::Child,
+        grace: Duration,
+    ) -> ConnectResult {
+        let deadline = Instant::now() + grace;
+        loop {
+            // Check if child already exited before the grace window ends.
+            match child.try_wait() {
+                Ok(Some(s)) => return ConnectResult::ChildExited(Some(s)),
+                Ok(None) => {}
+                Err(_) => return ConnectResult::ChildExited(None),
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ConnectResult::TimedOut;
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(HeartbeatEvent::Connected) => return ConnectResult::Connected,
+                Ok(_) => continue, // ping before Connected — shouldn't happen but fine
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        return ConnectResult::TimedOut;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return ConnectResult::TimedOut;
+                }
+            }
+        }
+    }
+
+    /// Watch heartbeat pings; kill child on hang. Returns true if a hang was
+    /// detected (child was killed by us); false if the child exited normally.
+    fn watch_heartbeat(
+        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
+        child: &mut std::process::Child,
+        first_deadline: Instant,
+        timeout: Duration,
+    ) -> bool {
+        let child_pid = Pid::from_raw(child.id() as i32);
+        let mut last_ping = Instant::now();
+        let mut deadline = first_deadline;
+
+        loop {
+            // Check if child already exited (non-blocking).
+            match child.try_wait() {
+                Ok(Some(_)) => return false, // exited on its own
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Hang detected.
+                tracing::error!(
+                    "watchdog: ui hang detected (no heartbeat for {}s); \
+                     killing child pgid={}",
+                    timeout.as_secs(),
+                    child_pid
+                );
+                let _ = signal::killpg(child_pid, Signal::SIGKILL);
+                let _ = child.wait();
+                return true;
+            }
+
+            match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
+                Ok(HeartbeatEvent::Ping) => {
+                    let now = Instant::now();
+                    tracing::debug!(
+                        lag_ms = now.duration_since(last_ping).as_millis(),
+                        "heartbeat: ping received"
+                    );
+                    last_ping = now;
+                    deadline = now + timeout;
+                }
+                Ok(HeartbeatEvent::Connected) => {
+                    // Shouldn't arrive here (already connected) but reset.
+                    last_ping = Instant::now();
+                    deadline = last_ping + timeout;
+                }
+                Ok(HeartbeatEvent::Disconnected) => {
+                    tracing::warn!("heartbeat: child disconnected socket");
+                    // Child closed the socket — treat as crash/exit, let
+                    // child.wait() handle it.
+                    return false;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No event in this slice — loop back and check deadline.
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Listener thread gone — child probably exited.
+                    return false;
+                }
+            }
+        }
+    }
+
+    fn build_command(
+        bin: &PathBuf,
+        args: &[OsString],
+        sock_path: Option<&std::path::Path>,
+    ) -> std::process::Command {
         use std::os::unix::process::CommandExt;
 
         let mut cmd = std::process::Command::new(bin);
         cmd.args(args);
+
+        // Pass the socket path to the child via env var (if heartbeat active).
+        if let Some(path) = sock_path {
+            cmd.env(SUPERVISOR_SOCK_ENV, path);
+        }
 
         // setsid: child becomes session leader + new process group.
         // This isolates the child's pgrp from the supervisor's so we can

@@ -152,6 +152,7 @@ use buffr_ui::{
     TabStrip, TabView,
 };
 
+mod heartbeat;
 mod loading_anim;
 mod render;
 mod session;
@@ -948,6 +949,11 @@ fn main() -> Result<()> {
         single_instance::spawn_accept_thread(handle, event_proxy.clone());
     }
 
+    // Connect to the supervisor's heartbeat socket before window creation so
+    // the supervisor's 5 s grace timer starts as early as possible. Returns
+    // None when BUFFR_SUPERVISOR_SOCK is unset (unsupervised run).
+    let initial_heartbeat = heartbeat::Heartbeat::try_connect();
+
     let mut app_state = AppState::new(
         homepage,
         engine,
@@ -985,6 +991,7 @@ fn main() -> Result<()> {
         shutdown_flag,
         event_proxy,
     );
+    app_state.heartbeat = initial_heartbeat;
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
     }
@@ -2080,6 +2087,11 @@ struct AppState {
     /// visible. Set from `host.drain_context_menu_requests()` each tick;
     /// cleared on Esc, Enter (activation), or click-outside.
     context_menu: Option<ActiveContextMenu>,
+    /// UDS heartbeat liveness probe for the buffr-supervisor watchdog.
+    /// `None` when running unsupervised (no `BUFFR_SUPERVISOR_SOCK` env var
+    /// or connect failed). Ticked every `about_to_wait`; on write error the
+    /// field is set back to `None` (supervisor detects the silence and kills).
+    heartbeat: Option<heartbeat::Heartbeat>,
 }
 
 /// OSR paint policy for the window.
@@ -2391,6 +2403,7 @@ impl AppState {
             video_active: false,
             window_focused: false,
             context_menu: None,
+            heartbeat: None,
         }
     }
 
@@ -7448,6 +7461,20 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // the compositor is releasing buffers again.
         let deadline = match self.next_probe_at {
             Some(at) if at < deadline => at,
+            _ => deadline,
+        };
+        // Heartbeat liveness probe: tick the supervisor ping and clamp the
+        // wakeup deadline to the next due time. Does NOT request a redraw —
+        // this is a pure liveness signal to the supervisor, not a paint loop.
+        let deadline = match self.heartbeat.as_mut().and_then(|h| h.tick()) {
+            Some(next_due) if next_due < deadline => next_due,
+            None if self.heartbeat.is_some() => {
+                // tick() returned None → broken pipe; supervisor will notice
+                // the silence and restart us. Drop the handle so we don't
+                // keep trying on a dead socket.
+                self.heartbeat = None;
+                deadline
+            }
             _ => deadline,
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
