@@ -12,15 +12,28 @@
     }
     main {
       max-width: 56rem; margin: 0 auto;
-      /* Top padding leaves headroom for the splash animation that the
-         host paints into the chrome buffer over this page. The 9rem
-         value reserves the splash's ~5-row × 16px vertical extent (top-
-         anchored with 1 row of breathing room), plus a small gap before
-         page content begins. */
-      padding: 9rem 2rem 6rem;
+      padding: 4rem 2rem 6rem;
     }
-    header { text-align: center; margin-bottom: 2rem; }
+    header { text-align: center; margin-bottom: 3rem; }
     header p { font-size: 1rem; opacity: 0.6; margin: 0; }
+    /* Splash wordmark. The buffr host pushes the current animation
+       frame's HTML into `#buffr-splash` on every splash tick (~8 Hz)
+       via execute_javascript; we just need the cell to exist and be
+       styled. Plain art chars inherit the dim color; cursor/trail
+       cells are wrapped in `<span class="hl">…</span>` and lit up
+       with the accent. Initial textContent below shows frame 0 so
+       the wordmark is visible before the first JS push lands. */
+    /* Reserve splash height (5 monospace rows × line-height: 1) so the
+       wrap doesn't reflow when the host's first JS push lands. */
+    .splash-wrap { text-align: center; margin: 0 0 2.5rem; min-height: 5em; }
+    #buffr-splash {
+      display: inline-block; text-align: left;
+      margin: 0; padding: 0;
+      font-family: ui-monospace, monospace;
+      line-height: 1; letter-spacing: 0;
+      color: rgba(192, 202, 245, 0.35);
+    }
+    #buffr-splash .hl { color: #7dcfff; }
     section h2 {
       font-size: 0.85rem; text-transform: uppercase;
       letter-spacing: 0.1em; opacity: 0.55;
@@ -55,6 +68,7 @@
 </head>
 <body>
   <main>
+    <div class="splash-wrap"><pre id="buffr-splash"></pre></div>
     <header>
       <p>Press <kbd>e</kbd> to open the omnibar.</p>
     </header>
