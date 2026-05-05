@@ -136,6 +136,21 @@ wrap_app! {
                  AcceleratedVideoDecodeLinuxGL,VaapiVideoEncoder,\
                  CanvasOopRasterization",
             );
+            // Disable autofill / password-manager features that rewrite
+            // input fields mid-typing. Symptom: `wtype` (or any virtual
+            // keyboard) typing an email like `sitemaster16@gmail.com`
+            // gets the field reverted on a subsequent keystroke after
+            // autofill matches a saved partial credential, and focus
+            // jumps to the password field. See buffr#36.
+            append_switch_with_value(
+                command_line,
+                "disable-features",
+                "AutofillServerCommunication,\
+                 AutofillEnableAccountWalletStorage,\
+                 PasswordManagerOnboarding,\
+                 AutofillAddressProfileSavePromptNicknameSupport",
+            );
+            append_switch(command_line, "disable-save-password-bubble");
             // GPU compositing: turn on the page compositor on the GPU even in
             // OSR mode. Without these, chrome://gpu reports "Software only"
             // for canvas, WebGL, and video decode. CEF's OSR mode does NOT
