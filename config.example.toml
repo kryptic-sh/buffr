@@ -24,9 +24,13 @@ default_engine = "duckduckgo"
 
 [search.engines.duckduckgo]
 url = "https://duckduckgo.com/?q={query}"
+# Optional shortcut keyword. `<prefix> <query>` in the omnibar routes to
+# this engine instead of `default_engine` (e.g. `ddg vim folding`).
+prefix = "ddg"
 
 [search.engines.google]
 url = "https://www.google.com/search?q={query}"
+prefix = "g"
 
 [theme]
 # Hex accent. Status line, omnibar caret, hint label background.

@@ -56,9 +56,21 @@ so they're safe to run on a headless host.
 ```toml
 [search.engines.duckduckgo]
 url = "https://duckduckgo.com/?q={query}"
+prefix = "ddg"  # optional
+
+[search.engines.github]
+url = "https://github.com/search?q={query}"
+prefix = "gh"
 ```
 
 `{query}` is replaced with the URL-encoded omnibar input.
+
+`prefix` is an optional shortcut keyword. When set, an omnibar input of
+`<prefix> <query>` routes to that engine instead of `default_engine` — e.g.
+`gh tokio` searches GitHub, `g rust closures` searches Google, plain `cats`
+falls through to the default. Bare prefix words with no query (e.g. `g`) fall
+through to the default so they still produce a useful result. Prefix collisions
+across engines are rejected at config validation time.
 
 ### `[theme]`
 
@@ -144,6 +156,8 @@ config stays live.
 - `general.leader` must be exactly one character.
 - `search.default_engine` must reference an existing `[search.engines.<name>]`
   block.
+- `search.engines.<name>.prefix` (when set) must be non-empty and unique across
+  all engines.
 - Every keymap binding's key sequence must parse via the engine's `parse_keys`,
   and its action notation must match the table above.
 - Unknown top-level keys, unknown nested keys, and unknown enum variants all
