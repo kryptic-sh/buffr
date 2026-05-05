@@ -8,6 +8,26 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Crash + hang watchdog** (closes #28). Linux/macOS/Windows: a new `buffr`
+  supervisor binary spawns the browser as a child and restarts it on crash or
+  UI-thread hang. UI thread sends a 1 Hz heartbeat to the supervisor over UDS
+  (Linux/macOS) or named pipe (Windows); supervisor kills + restarts after 8 s
+  of no heartbeat (with 1.5 s post-connect grace) or non-zero exit. Backoff
+  halts at 3 restarts within 30 s. Linux uses `setsid` + `killpg`; macOS bundles
+  the supervisor as `CFBundleExecutable` inside `Buffr.app`; Windows uses Job
+  Objects with `KILL_ON_JOB_CLOSE` and `SetConsoleCtrlHandler` for
+  Ctrl+C/Break/close. The previous `buffr` binary is now `buffr-app`.
+
+### Changed
+
+- **Binary layout: `buffr` is now the supervisor entrypoint, `buffr-app` is the
+  browser.** PKGBUILD, deb/rpm, MSI, and macOS bundle install both binaries.
+  Linux `.desktop` `Exec=buffr` continues to work (now invokes supervisor).
+  Windows MSI shortcuts and `Start Menu` entry target `buffr.exe` (supervisor).
+  `cargo run` from the workspace root launches the supervisor by default.
+
 ## [0.4.0] - 2026-05-05
 
 ### Added

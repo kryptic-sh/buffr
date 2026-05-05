@@ -1689,6 +1689,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
 
 #[derive(Debug)]
 struct WindowsPayload {
+    supervisor_exe: PathBuf,
     buffr_exe: PathBuf,
     helper_exe: PathBuf,
     /// Every .dll under target/<profile>/. Includes libcef.dll plus the
@@ -1718,10 +1719,15 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
     ];
 
     for dir in &candidates {
+        let supervisor_exe = dir.join("buffr.exe");
         let buffr_exe = dir.join("buffr-app.exe");
         let helper_exe = dir.join("buffr-helper.exe");
         let libcef_dll = dir.join("libcef.dll");
-        if buffr_exe.exists() && helper_exe.exists() && libcef_dll.exists() {
+        if supervisor_exe.exists()
+            && buffr_exe.exists()
+            && helper_exe.exists()
+            && libcef_dll.exists()
+        {
             return collect_windows_payload_from(dir.as_path());
         }
     }
@@ -1740,6 +1746,7 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
 }
 
 fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
+    let supervisor_exe = dir.join("buffr.exe");
     let buffr_exe = dir.join("buffr-app.exe");
     let helper_exe = dir.join("buffr-helper.exe");
     let icudtl = dir.join("icudtl.dat");
@@ -1767,9 +1774,9 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
         }
         let name_os = entry.file_name();
         let name = name_os.to_string_lossy();
-        // buffr-app.exe + buffr-helper.exe are tracked separately so the
-        // Shortcut Target can reference them by id.
-        if name == "buffr-app.exe" || name == "buffr-helper.exe" {
+        // buffr.exe (supervisor) + buffr-app.exe + buffr-helper.exe are
+        // tracked separately so the Shortcut Target can reference them by id.
+        if name == "buffr.exe" || name == "buffr-app.exe" || name == "buffr-helper.exe" {
             continue;
         }
         if name.ends_with(".dll") {
@@ -1798,6 +1805,7 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
     }
 
     Ok(WindowsPayload {
+        supervisor_exe,
         buffr_exe,
         helper_exe,
         dlls,
@@ -1809,12 +1817,13 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
     })
 }
 
-/// Two-dir staging: buffr-app.exe / buffr-helper.exe go to `bin_dest` (the
-/// hand-rolled wxs Components reference these explicitly so the
-/// Shortcut Target=`[#filBuffrExe]` resolves), everything else goes to
-/// `cef_dest` (heat.exe harvests it into a generated ComponentGroup).
+/// Two-dir staging: buffr.exe (supervisor) + buffr-app.exe + buffr-helper.exe
+/// go to `bin_dest` (the hand-rolled wxs Components reference these explicitly
+/// so the Shortcut Target=`[#filSupervisorExe]` resolves), everything else
+/// goes to `cef_dest` (heat.exe harvests it into a generated ComponentGroup).
 fn stage_windows_payload(bin_dest: &Path, cef_dest: &Path, p: &WindowsPayload) -> Result<()> {
     fs::create_dir_all(bin_dest)?;
+    copy_into_dir(&p.supervisor_exe, bin_dest)?;
     copy_into_dir(&p.buffr_exe, bin_dest)?;
     copy_into_dir(&p.helper_exe, bin_dest)?;
 
@@ -2200,11 +2209,12 @@ mod tests {
 
     #[test]
     fn wix_template_lists_msi_payload() {
-        // The hand-rolled .wxs lists buffr-app.exe + buffr-helper.exe;
-        // everything else (libcef.dll, paks, locales, ...) is harvested
-        // by heat.exe at build time and referenced via
+        // The hand-rolled .wxs lists buffr.exe (supervisor) + buffr-app.exe
+        // + buffr-helper.exe; everything else (libcef.dll, paks, locales, ...)
+        // is harvested by heat.exe at build time and referenced via
         // <ComponentGroupRef Id="CefRuntime" />.
-        // NOTE: supervisor (buffr.exe) is not in the Windows MSI in Round 3.
+        // Round 5: supervisor (buffr.exe) is included so the watchdog ships.
+        assert!(WIX_TEMPLATE.contains("buffr.exe"));
         assert!(WIX_TEMPLATE.contains("buffr-app.exe"));
         assert!(WIX_TEMPLATE.contains("buffr-helper.exe"));
         assert!(WIX_TEMPLATE.contains("ComponentGroupRef Id=\"CefRuntime\""));
@@ -2215,6 +2225,8 @@ mod tests {
         let tmp = tempdir();
         let target = tmp.path().join("target-release");
         fs::create_dir_all(target.join("locales")).unwrap();
+        // Round 5: supervisor (buffr.exe) is now required alongside the app.
+        fs::write(target.join("buffr.exe"), b"MZ").unwrap();
         fs::write(target.join("buffr-app.exe"), b"MZ").unwrap();
         fs::write(target.join("buffr-helper.exe"), b"MZ").unwrap();
         fs::write(target.join("libcef.dll"), b"MZ").unwrap();
@@ -2234,7 +2246,11 @@ mod tests {
         let bin_dest = tmp.path().join("staged-bin");
         let cef_dest = tmp.path().join("staged-cef");
         stage_windows_payload(&bin_dest, &cef_dest, &payload).unwrap();
-        // Bin dir holds only the two executables.
+        // Bin dir holds supervisor + browser + helper.
+        assert!(
+            bin_dest.join("buffr.exe").exists(),
+            "supervisor must be staged"
+        );
         assert!(bin_dest.join("buffr-app.exe").exists());
         assert!(bin_dest.join("buffr-helper.exe").exists());
         assert!(!bin_dest.join("libcef.dll").exists());

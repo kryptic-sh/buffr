@@ -68,17 +68,22 @@
       <Directory Id="DesktopFolder" Name="Desktop" />
     </Directory>
 
-    <!-- buffr-app.exe + buffr-helper.exe stay hand-rolled so the
-         Shortcut Target=`[#filBuffrExe]` reference resolves
-         deterministically. The rest of the runtime tree (CEF DLLs,
-         paks, locales, ...) is harvested by heat.exe at xtask time
-         into a separate fragment that defines `<ComponentGroup
-         Id="CefRuntime">`.
-         NOTE: The supervisor (buffr.exe) is not shipped on Windows in
-         Round 3; Windows supervision via Job Objects lands in Round 5. -->
+    <!-- buffr.exe (supervisor) + buffr-app.exe + buffr-helper.exe stay
+         hand-rolled so the Shortcut Target=`[#filSupervisorExe]` reference
+         resolves deterministically. The rest of the runtime tree (CEF DLLs,
+         paks, locales, ...) is harvested by heat.exe at xtask time into a
+         separate fragment that defines `<ComponentGroup Id="CefRuntime">`.
+         Round 5: supervisor (buffr.exe) ships alongside buffr-app.exe so
+         users get the Job-Object crash watchdog by default. Shortcuts now
+         target buffr.exe (the supervisor) for the same UX as Linux. -->
     <ComponentGroup Id="MainPayload" Directory="INSTALLFOLDER">
-      <Component Id="cmpBuffrExe" Guid="*">
-        <File Id="filBuffrExe"
+      <Component Id="cmpSupervisorExe" Guid="*">
+        <File Id="filSupervisorExe"
+              Source="payload-bin\buffr.exe"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="cmpBuffrAppExe" Guid="*">
+        <File Id="filBuffrAppExe"
               Source="payload-bin\buffr-app.exe"
               KeyPath="yes" />
       </Component>
@@ -108,13 +113,14 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Start-menu shortcut + desktop shortcut. -->
+    <!-- Start-menu shortcut + desktop shortcut.
+         Target is buffr.exe (supervisor) so users always get the watchdog. -->
     <DirectoryRef Id="ApplicationProgramsFolder">
       <Component Id="cmpStartShortcut" Guid="*">
         <Shortcut Id="ShortcutStartMenu"
                   Name="buffr"
                   Description="buffr - modal browser"
-                  Target="[#filBuffrExe]"
+                  Target="[#filSupervisorExe]"
                   WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="rmStartMenu"
                       Directory="ApplicationProgramsFolder"
@@ -133,7 +139,7 @@
         <Shortcut Id="ShortcutDesktop"
                   Name="buffr"
                   Description="buffr - modal browser"
-                  Target="[#filBuffrExe]"
+                  Target="[#filSupervisorExe]"
                   WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue Root="HKCU"
                        Key="Software\kryptic\buffr"

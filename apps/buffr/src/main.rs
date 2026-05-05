@@ -1,7 +1,9 @@
 //! buffr — crash-restart + hang watchdog supervisor for the buffr browser.
 //!
-//! **Linux and macOS** as of Round 4. On other platforms the supervisor prints
-//! a notice and execs the child binary directly without any watchdog loop.
+//! **Linux and macOS** use Unix-domain-socket heartbeats + `setsid`/`killpg`.
+//! **Windows** (Round 5) uses Job Objects with `KILL_ON_JOB_CLOSE` and a
+//! named-pipe heartbeat.  On all other platforms the supervisor prints a
+//! notice and execs the child binary directly without a watchdog loop.
 //! This keeps `cargo build --workspace` green on every platform's CI.
 //!
 //! ## macOS socket path
@@ -127,15 +129,20 @@ fn main() -> anyhow::Result<()> {
         unix::run_supervisor(child_bin, child_args, heartbeat_timeout, heartbeat_disable)?;
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::run_supervisor(child_bin, child_args, heartbeat_timeout, heartbeat_disable)?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         // Runtime fallback: no supervision — just exec the child directly.
-        // This keeps `cargo build --workspace` green on Windows CI.
+        // This keeps `cargo build --workspace` green on exotic CI targets.
         eprintln!(
-            "buffr: watchdog not yet supported on this platform — \
+            "buffr: watchdog not supported on this platform — \
              running buffr-app directly without supervision."
         );
-        non_unix::exec_child(child_bin, child_args)?;
+        other::exec_child(child_bin, child_args)?;
     }
 
     Ok(())
@@ -669,8 +676,664 @@ mod unix {
     }
 }
 
-#[cfg(not(unix))]
-mod non_unix {
+// ── Windows supervisor (Job Objects + named-pipe heartbeat) ─────────────────
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, INFINITE,
+        PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
+
+    /// Rolling window for crash backoff detection.
+    const WINDOW_SECS: u64 = 30;
+    const CRASH_LIMIT: usize = 3;
+    /// Restart cooldown between attempts.
+    const RESTART_COOLDOWN: Duration = Duration::from_millis(250);
+    /// How long to wait for the child to connect to the named pipe.
+    const CONNECT_GRACE: Duration = Duration::from_secs(5);
+    /// Additional grace after the child connects before enforcing heartbeat.
+    const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
+
+    /// Env var passed to the child with the named-pipe path.
+    pub const SUPERVISOR_PIPE_ENV: &str = "BUFFR_SUPERVISOR_PIPE";
+
+    /// Named pipe path: `\\.\pipe\buffr-supervisor-<pid>`.
+    fn pipe_name(pid: u32) -> Vec<u16> {
+        let name = format!("\\\\.\\pipe\\buffr-supervisor-{pid}\0");
+        name.encode_utf16().collect()
+    }
+
+    /// HANDLE → usize for comparisons that work on both MSVC and GNU ABIs.
+    ///
+    /// On MSVC, HANDLE is isize; on GNU, HANDLE is *mut c_void.  Casting
+    /// through usize is safe for pointer-sized values on both.
+    fn handle_as_usize(h: HANDLE) -> usize {
+        h as usize
+    }
+
+    fn null_handle() -> usize {
+        0usize
+    }
+
+    /// A raw Win32 HANDLE wrapper that closes on drop.
+    struct OwnedHandle(HANDLE);
+
+    impl OwnedHandle {
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            let h = handle_as_usize(self.0);
+            let inv = handle_as_usize(INVALID_HANDLE_VALUE);
+            if h != null_handle() && h != inv {
+                // SAFETY: handle is valid and owned exclusively by this struct.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    // SAFETY: HANDLE is a pointer-sized kernel object reference; we never
+    // share ownership of the underlying object across threads without
+    // synchronisation.
+    unsafe impl Send for OwnedHandle {}
+
+    /// Events the named-pipe reader thread sends back to the main loop.
+    pub enum HeartbeatEvent {
+        Connected,
+        Ping,
+        Disconnected,
+    }
+
+    pub fn run_supervisor(
+        child_bin: PathBuf,
+        child_args: Vec<OsString>,
+        heartbeat_timeout: Duration,
+        heartbeat_disable: bool,
+    ) -> anyhow::Result<()> {
+        let mut crash_times: Vec<Instant> = Vec::new();
+        let mut restart_count: u32 = 0;
+
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let supervisor_pid = std::process::id();
+
+        // ── Global Job Object ─────────────────────────────────────────────────
+        // One job per supervisor lifetime. All child spawns are assigned to
+        // this job so KILL_ON_JOB_CLOSE terminates the entire tree when the
+        // supervisor exits.
+        let job = create_job_object()?;
+
+        // Install Ctrl+C / Ctrl+Break / close handler.
+        install_ctrl_handler(Arc::clone(&shutdown_requested), job.raw());
+
+        loop {
+            // ── bind named pipe for this spawn ────────────────────────────────
+            let (pipe_path_str, pipe_handle, hb_rx) = if heartbeat_disable {
+                (None, None, None)
+            } else {
+                match create_heartbeat_pipe(supervisor_pid) {
+                    Ok((path, handle)) => {
+                        let (tx, rx) = std::sync::mpsc::channel::<HeartbeatEvent>();
+                        (Some(path), Some(handle), Some((tx, rx)))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "heartbeat: failed to create named pipe; running without hang detection"
+                        );
+                        (None, None, None)
+                    }
+                }
+            };
+
+            // ── spawn child (suspended) + assign to job ───────────────────────
+            let spawn_time = Instant::now();
+            let proc_info =
+                match spawn_child_suspended(&child_bin, &child_args, pipe_path_str.as_deref()) {
+                    Ok(pi) => pi,
+                    Err(e) => {
+                        anyhow::bail!("failed to spawn child {}: {e}", child_bin.display());
+                    }
+                };
+
+            let child_pid = proc_info.dwProcessId;
+            tracing::info!(pid = child_pid, "child spawned (suspended)");
+
+            // ── assign-before-resume (critical ordering) ──────────────────────
+            // SAFETY: job and process handles are valid. Assign before
+            // ResumeThread so any descendants the child spawns after resume
+            // also land in the job automatically.
+            let assign_ok = unsafe { AssignProcessToJobObject(job.raw(), proc_info.hProcess) != 0 };
+            if !assign_ok {
+                let err = std::io::Error::last_os_error();
+                // Non-fatal if the process is already in a job (Windows 8+
+                // allows nested jobs). Log and continue.
+                tracing::warn!(error = %err, "AssignProcessToJobObject failed; continuing");
+            }
+
+            // ── resume main thread ────────────────────────────────────────────
+            // SAFETY: thread handle is valid; we are the only caller of
+            // ResumeThread for this handle.
+            let prev = unsafe { ResumeThread(proc_info.hThread) };
+            if prev == u32::MAX {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!(error = %err, "ResumeThread failed");
+            }
+            // SAFETY: thread handle is valid; drop it now — we no longer need it.
+            unsafe { CloseHandle(proc_info.hThread) };
+
+            // ── start heartbeat listener thread ───────────────────────────────
+            let hb_rx = if let (Some(ph), Some((tx, rx))) = (pipe_handle, hb_rx) {
+                std::thread::spawn(move || heartbeat_pipe_loop(ph, tx));
+                Some(rx)
+            } else {
+                None
+            };
+
+            // ── wait for child + heartbeat ────────────────────────────────────
+            enum WatchResult {
+                HangDetected,
+                ChildExited(Option<u32>),
+            }
+
+            let watch_result = if let Some(ref rx) = hb_rx {
+                match wait_for_connect(rx, proc_info.hProcess, CONNECT_GRACE) {
+                    ConnectResult::Connected => {
+                        tracing::info!(pid = child_pid, "child connected to heartbeat pipe");
+                        let post_connect_deadline =
+                            Instant::now() + POST_CONNECT_GRACE + heartbeat_timeout;
+                        if watch_heartbeat(
+                            rx,
+                            proc_info.hProcess,
+                            post_connect_deadline,
+                            heartbeat_timeout,
+                        ) {
+                            WatchResult::HangDetected
+                        } else {
+                            WatchResult::ChildExited(get_exit_code(proc_info.hProcess))
+                        }
+                    }
+                    ConnectResult::TimedOut => {
+                        tracing::warn!(
+                            pid = child_pid,
+                            "child did not connect to heartbeat pipe within 5s; treating as crash"
+                        );
+                        kill_process(proc_info.hProcess);
+                        WatchResult::HangDetected
+                    }
+                    ConnectResult::ChildExited(code) => WatchResult::ChildExited(code),
+                }
+            } else {
+                // Heartbeat disabled — block until child exits.
+                // SAFETY: process handle is valid; INFINITE is a safe sentinel.
+                unsafe { WaitForSingleObject(proc_info.hProcess, INFINITE) };
+                WatchResult::ChildExited(get_exit_code(proc_info.hProcess))
+            };
+
+            // SAFETY: process handle is valid and owned.
+            unsafe { CloseHandle(proc_info.hProcess) };
+
+            let elapsed = spawn_time.elapsed();
+
+            // ── decide whether to restart ─────────────────────────────────────
+            let is_clean = matches!(&watch_result, WatchResult::ChildExited(Some(0)));
+
+            if is_clean {
+                tracing::info!(
+                    pid = child_pid,
+                    elapsed_ms = elapsed.as_millis(),
+                    "child exited cleanly (exit 0); supervisor done"
+                );
+                return Ok(());
+            }
+
+            if shutdown_requested.load(Ordering::SeqCst) {
+                tracing::info!(
+                    pid = child_pid,
+                    "child exited after shutdown signal; not restarting"
+                );
+                return Ok(());
+            }
+
+            // Crash / hang path.
+            restart_count += 1;
+            let now = Instant::now();
+            crash_times.push(now);
+            let window_start = now - Duration::from_secs(WINDOW_SECS);
+            crash_times.retain(|t| *t >= window_start);
+
+            let hang_detected = matches!(watch_result, WatchResult::HangDetected);
+            if hang_detected {
+                tracing::info!(
+                    pid = child_pid,
+                    restart_count,
+                    crashes_in_window = crash_times.len(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "child hang detected; considering restart"
+                );
+            } else {
+                tracing::info!(
+                    pid = child_pid,
+                    restart_count,
+                    crashes_in_window = crash_times.len(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "child crashed; considering restart"
+                );
+            }
+
+            if crash_times.len() >= CRASH_LIMIT {
+                tracing::error!(
+                    "watchdog: {CRASH_LIMIT} crashes/hangs in {WINDOW_SECS}s, \
+                     refusing to restart. \
+                     Check crash logs at %APPDATA%\\buffr\\crashes\\"
+                );
+                std::process::exit(1);
+            }
+
+            tracing::info!(
+                cooldown_ms = RESTART_COOLDOWN.as_millis(),
+                "waiting before restart"
+            );
+            std::thread::sleep(RESTART_COOLDOWN);
+        }
+    }
+
+    // ── Job Object ────────────────────────────────────────────────────────────
+
+    fn create_job_object() -> anyhow::Result<OwnedHandle> {
+        // SAFETY: NULL name → anonymous job; NULL security attributes → defaults.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle_as_usize(job) == null_handle() {
+            anyhow::bail!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Enable KILL_ON_JOB_CLOSE so the entire child tree is terminated when
+        // the job handle is closed (i.e. when the supervisor exits for any reason).
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            // SAFETY: zero-initialising a POD struct.
+            unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        // SAFETY: job handle is valid; info is a correctly-sized struct for
+        // JobObjectExtendedLimitInformation.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: job handle is valid; we're bailing so the handle leaks,
+            // but the process is about to exit.
+            unsafe { CloseHandle(job) };
+            anyhow::bail!(
+                "SetInformationJobObject failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        Ok(OwnedHandle(job))
+    }
+
+    // ── Ctrl handler ─────────────────────────────────────────────────────────
+
+    /// Per-process singleton for the Ctrl handler callback.
+    ///
+    /// Stored as `usize` so the atomic works on both MSVC (HANDLE = isize)
+    /// and GNU (HANDLE = *mut c_void) ABIs without mismatched-type errors.
+    static JOB_HANDLE_FOR_CTRL: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static SHUTDOWN_FLAG_FOR_CTRL: std::sync::OnceLock<Arc<AtomicBool>> =
+        std::sync::OnceLock::new();
+
+    fn install_ctrl_handler(shutdown: Arc<AtomicBool>, job: HANDLE) {
+        // Store the job handle and flag in the statics so the callback can
+        // reach them (Win32 ctrl handlers are bare fn pointers).
+        JOB_HANDLE_FOR_CTRL.store(handle_as_usize(job), Ordering::SeqCst);
+        let _ = SHUTDOWN_FLAG_FOR_CTRL.set(shutdown);
+
+        // SAFETY: ctrl_handler satisfies the PHANDLER_ROUTINE signature;
+        // TRUE (1) → we are adding (not removing) the handler.
+        unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) };
+    }
+
+    /// Called by Windows on Ctrl+C, Ctrl+Break, or console window close.
+    ///
+    /// Terminates the entire job (killing all child processes) then returns
+    /// FALSE so the default handler also runs (which exits the process).
+    ///
+    /// # Safety
+    /// Called from a dedicated Windows console-event thread. The only
+    /// shared state accessed is the atomic job handle (usize) and the
+    /// OnceLock flag, both of which are safe to read from any thread.
+    unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
+        if matches!(
+            ctrl_type,
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT
+        ) {
+            if let Some(flag) = SHUTDOWN_FLAG_FOR_CTRL.get() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let raw = JOB_HANDLE_FOR_CTRL.load(Ordering::SeqCst);
+            let inv = handle_as_usize(INVALID_HANDLE_VALUE);
+            if raw != null_handle() && raw != inv {
+                // Cast back to HANDLE for the Win32 call.
+                // SAFETY: raw was stored from a valid HANDLE cast through usize;
+                // the round-trip is lossless on all Windows pointer-sized types.
+                let job = raw as HANDLE;
+                // SAFETY: job handle is valid; exit code 0 signals a clean stop.
+                unsafe { TerminateJobObject(job, 0) };
+            }
+        }
+        // Return FALSE (0) → default handler (ExitProcess) runs next.
+        0
+    }
+
+    // ── Named pipe setup ──────────────────────────────────────────────────────
+
+    /// Create the inbound named pipe the child will connect to.
+    /// Returns the pipe path string (UTF-8) and the pipe handle.
+    fn create_heartbeat_pipe(pid: u32) -> anyhow::Result<(String, OwnedHandle)> {
+        let path_str = format!("\\\\.\\pipe\\buffr-supervisor-{pid}");
+        let path_wide = pipe_name(pid);
+
+        // SAFETY: path_wide is NUL-terminated wide string; other args are
+        // documented constant values for a byte-mode inbound pipe.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                path_wide.as_ptr(),
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                0,    // out buf (not used — inbound only)
+                4096, // in buf
+                0,    // default timeout
+                std::ptr::null(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!(
+                "CreateNamedPipeW failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        tracing::debug!(path = %path_str, "heartbeat named pipe created");
+        Ok((path_str, OwnedHandle(handle)))
+    }
+
+    // ── Child spawn ───────────────────────────────────────────────────────────
+
+    fn spawn_child_suspended(
+        bin: &PathBuf,
+        args: &[OsString],
+        pipe_path: Option<&str>,
+    ) -> anyhow::Result<PROCESS_INFORMATION> {
+        // Build a Windows command line: `"bin" arg1 arg2 ...`
+        let mut cmdline = format!("\"{}\"", bin.display());
+        for a in args {
+            cmdline.push(' ');
+            cmdline.push_str(&a.to_string_lossy());
+        }
+        let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
+
+        // Pass the pipe path to the child via env var.
+        // We set it on the process env so it applies only to the child.
+        if let Some(path) = pipe_path {
+            // SAFETY: setting env var in a single-threaded context before spawn.
+            unsafe { std::env::set_var(SUPERVISOR_PIPE_ENV, path) };
+        }
+
+        let mut si: STARTUPINFOW =
+            // SAFETY: zero-initialising a POD struct.
+            unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION =
+            // SAFETY: zero-initialising a POD struct.
+            unsafe { std::mem::zeroed() };
+
+        // CREATE_SUSPENDED: child is created but not started — lets us assign
+        // to the job before any code runs (including spawning CEF helpers).
+        // CREATE_BREAKAWAY_FROM_JOB: needed if the supervisor is itself inside
+        // a job (e.g. under VS Test runner or some CI systems) so the child
+        // can then be placed into *our* job without nesting conflicts.
+        let flags = CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB;
+
+        // SAFETY: cmdline_wide is NUL-terminated; si/pi point to valid zeroed
+        // structs; NULL for application name uses the cmdline parsing path.
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmdline_wide.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // bInheritHandles = FALSE
+                flags,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::addr_of!(si),
+                std::ptr::addr_of_mut!(pi),
+            )
+        };
+
+        // Clear the env var so it doesn't leak into subsequent spawns in case
+        // of restarts (each restart re-sets it with the current pipe path).
+        if pipe_path.is_some() {
+            // SAFETY: single-threaded context here.
+            unsafe { std::env::remove_var(SUPERVISOR_PIPE_ENV) };
+        }
+
+        if ok == 0 {
+            anyhow::bail!("CreateProcessW failed: {}", std::io::Error::last_os_error());
+        }
+
+        Ok(pi)
+    }
+
+    // ── Heartbeat pipe I/O ────────────────────────────────────────────────────
+
+    /// Wait for the client to connect, then read ping bytes.
+    fn heartbeat_pipe_loop(pipe: OwnedHandle, tx: std::sync::mpsc::Sender<HeartbeatEvent>) {
+        // Block until the client connects.
+        // SAFETY: pipe handle is valid and exclusively owned by this thread.
+        // NULL overlapped → synchronous (blocking) ConnectNamedPipe.
+        let connected = unsafe {
+            ConnectNamedPipe(
+                pipe.raw(),
+                std::ptr::null_mut::<windows_sys::Win32::System::IO::OVERLAPPED>(),
+            )
+        };
+        // ConnectNamedPipe returns 0 on error, non-zero on success.
+        // ERROR_PIPE_CONNECTED (535) means client already connected before we called — also OK.
+        if connected == 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(535) {
+                tracing::warn!(error = %err, "heartbeat: ConnectNamedPipe failed");
+                return;
+            }
+        }
+
+        if tx.send(HeartbeatEvent::Connected).is_err() {
+            return;
+        }
+
+        // Read bytes in a loop; each byte is a ping.
+        let mut buf = [0u8; 64];
+        loop {
+            let mut bytes_read: u32 = 0;
+            // SAFETY: pipe handle is valid; buf is a valid mutable slice;
+            // NULL overlapped → synchronous read.
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
+                    pipe.raw(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len() as u32,
+                    std::ptr::addr_of_mut!(bytes_read),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || bytes_read == 0 {
+                let _ = tx.send(HeartbeatEvent::Disconnected);
+                // SAFETY: pipe handle is valid; we're done with it.
+                unsafe { DisconnectNamedPipe(pipe.raw()) };
+                return;
+            }
+            for _ in 0..bytes_read {
+                if tx.send(HeartbeatEvent::Ping).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Process helpers ───────────────────────────────────────────────────────
+
+    fn get_exit_code(handle: HANDLE) -> Option<u32> {
+        let mut code: u32 = 0;
+        // SAFETY: handle is valid; code is initialised.
+        let ok = unsafe { GetExitCodeProcess(handle, std::ptr::addr_of_mut!(code)) };
+        if ok != 0 { Some(code) } else { None }
+    }
+
+    fn kill_process(handle: HANDLE) {
+        // SAFETY: handle is valid; exit code 1 signals abnormal termination.
+        unsafe { TerminateProcess(handle, 1) };
+    }
+
+    fn process_exited(handle: HANDLE) -> Option<u32> {
+        // SAFETY: handle is valid; 0 timeout → non-blocking poll.
+        let r = unsafe { WaitForSingleObject(handle, 0) };
+        if r == WAIT_OBJECT_0 {
+            get_exit_code(handle)
+        } else {
+            None
+        }
+    }
+
+    // ── Connect + heartbeat watch ─────────────────────────────────────────────
+
+    enum ConnectResult {
+        Connected,
+        TimedOut,
+        ChildExited(Option<u32>),
+    }
+
+    fn wait_for_connect(
+        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
+        proc_handle: HANDLE,
+        grace: Duration,
+    ) -> ConnectResult {
+        let deadline = Instant::now() + grace;
+        loop {
+            if let Some(code) = process_exited(proc_handle) {
+                return ConnectResult::ChildExited(Some(code));
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ConnectResult::TimedOut;
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(HeartbeatEvent::Connected) => return ConnectResult::Connected,
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        return ConnectResult::TimedOut;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return ConnectResult::TimedOut;
+                }
+            }
+        }
+    }
+
+    fn watch_heartbeat(
+        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
+        proc_handle: HANDLE,
+        first_deadline: Instant,
+        timeout: Duration,
+    ) -> bool {
+        let mut last_ping = Instant::now();
+        let mut deadline = first_deadline;
+
+        loop {
+            if let Some(_code) = process_exited(proc_handle) {
+                return false; // exited on its own
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::error!(
+                    "watchdog: ui hang detected (no heartbeat for {}s); killing child",
+                    timeout.as_secs(),
+                );
+                kill_process(proc_handle);
+                // SAFETY: INFINITE wait; we just killed the process so it will exit.
+                unsafe { WaitForSingleObject(proc_handle, INFINITE) };
+                return true;
+            }
+
+            match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
+                Ok(HeartbeatEvent::Ping) => {
+                    let now = Instant::now();
+                    tracing::debug!(
+                        lag_ms = now.duration_since(last_ping).as_millis(),
+                        "heartbeat: ping received"
+                    );
+                    last_ping = now;
+                    deadline = now + timeout;
+                }
+                Ok(HeartbeatEvent::Connected) => {
+                    last_ping = Instant::now();
+                    deadline = last_ping + timeout;
+                }
+                Ok(HeartbeatEvent::Disconnected) => {
+                    tracing::warn!("heartbeat: child disconnected pipe");
+                    return false;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+// ── Non-Unix/non-Windows fallback ────────────────────────────────────────────
+#[cfg(not(any(unix, windows)))]
+mod other {
     use std::ffi::OsString;
     use std::path::PathBuf;
 

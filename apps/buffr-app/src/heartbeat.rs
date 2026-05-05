@@ -1,17 +1,18 @@
-//! UDS heartbeat liveness probe for the buffr-supervisor watchdog.
+//! Heartbeat liveness probe for the buffr-supervisor watchdog.
 //!
 //! The UI thread calls [`Heartbeat::tick`] on every `about_to_wait`.
 //! If at least 1 s has elapsed since the last ping, a single byte
-//! (`0x01`) is written to the supervisor's Unix-domain socket.  The
-//! supervisor kills + restarts the child if no ping arrives for
+//! (`0x01`) is written to the supervisor transport:
+//!
+//! - **Unix (Linux + macOS)**: Unix-domain socket (`BUFFR_SUPERVISOR_SOCK`).
+//! - **Windows**: named pipe (`BUFFR_SUPERVISOR_PIPE`).
+//!
+//! The supervisor kills + restarts the child if no ping arrives for
 //! `--heartbeat-timeout` seconds (default 8).
 //!
-//! `try_connect` returns `None` when `BUFFR_SUPERVISOR_SOCK` is unset
-//! (unsupervised run) or the connect fails.  Either way, the caller
-//! continues normally — running without a supervisor is never fatal.
-//!
-//! **Unix (Linux + macOS).** Non-Unix targets get an empty stub so the
-//! workspace builds everywhere.
+//! `try_connect` returns `None` when the env var is unset (unsupervised
+//! run) or the connect fails.  Either way, the caller continues normally
+//! — running without a supervisor is never fatal.
 //!
 //! ## macOS notes
 //!
@@ -135,11 +136,106 @@ mod inner {
     }
 }
 
-// ── Non-Unix stub ────────────────────────────────────────────────────────────
+// ── Windows implementation (named pipe) ─────────────────────────────────────
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 mod inner {
-    /// No-op stub on non-Unix platforms (e.g. Windows).
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    use super::HEARTBEAT_INTERVAL;
+
+    /// Env var the supervisor passes to the child with the named-pipe path.
+    pub const SUPERVISOR_PIPE_ENV: &str = "BUFFR_SUPERVISOR_PIPE";
+
+    /// Active heartbeat connection to the supervisor via named pipe.
+    pub struct Heartbeat {
+        /// The pipe file handle wrapped as a `std::fs::File` for `Write`.
+        file: std::fs::File,
+        last_sent: Instant,
+    }
+
+    impl Heartbeat {
+        /// Try to connect to the supervisor's named pipe.
+        ///
+        /// Reads `BUFFR_SUPERVISOR_PIPE`; returns `None` if the env var is
+        /// absent (unsupervised run), the path is invalid, or the connect
+        /// fails.  Errors are logged at `warn!` so they appear in RUST_LOG
+        /// output but never abort the child.
+        pub fn try_connect() -> Option<Self> {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_SHARE_NONE, GENERIC_WRITE, OPEN_EXISTING,
+            };
+
+            let path = match std::env::var(SUPERVISOR_PIPE_ENV) {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+
+            let path_wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+
+            // SAFETY: path_wide is NUL-terminated; constants are correct for
+            // opening an existing named pipe for writing only.
+            let handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_NONE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                )
+            };
+
+            if handle == INVALID_HANDLE_VALUE || handle == 0 {
+                tracing::warn!(
+                    path = %path,
+                    "heartbeat: CreateFileW failed ({}); running unsupervised",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+
+            // SAFETY: handle is a valid, owned Win32 file handle.
+            let file = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
+            tracing::info!(path = %path, "heartbeat: connected to supervisor named pipe");
+            Some(Self {
+                file,
+                last_sent: Instant::now() - HEARTBEAT_INTERVAL,
+            })
+        }
+
+        /// Send a ping if due; return the next deadline while healthy.
+        ///
+        /// Returns `None` on broken-pipe or IO error so the caller can drop
+        /// the `Heartbeat` — the supervisor will detect silence and restart.
+        pub fn tick(&mut self) -> Option<std::time::Instant> {
+            let now = Instant::now();
+            if now.duration_since(self.last_sent) >= HEARTBEAT_INTERVAL {
+                match self.file.write_all(b"\x01") {
+                    Ok(()) => {
+                        tracing::debug!("heartbeat: ping sent");
+                        self.last_sent = now;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "heartbeat: write failed; dropping connection");
+                        return None;
+                    }
+                }
+            }
+            Some(self.last_sent + HEARTBEAT_INTERVAL)
+        }
+    }
+}
+
+// ── Non-Unix/non-Windows stub ─────────────────────────────────────────────────
+
+#[cfg(not(any(unix, windows)))]
+mod inner {
+    /// No-op stub on platforms with no supervisor support.
     pub struct Heartbeat {
         _private: (),
     }
