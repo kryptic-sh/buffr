@@ -519,6 +519,7 @@ dependencies = [
  "buffr-history",
  "buffr-modal",
  "buffr-permissions",
+ "buffr-view-source",
  "buffr-zoom",
  "cef",
  "chrono",

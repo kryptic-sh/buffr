@@ -120,6 +120,7 @@ buffr-history = { path = "crates/buffr-history" }
 buffr-modal = { path = "crates/buffr-modal" }
 buffr-permissions = { path = "crates/buffr-permissions" }
 buffr-ui = { path = "crates/buffr-ui" }
+buffr-view-source = { path = "crates/buffr-view-source" }
 buffr-zoom = { path = "crates/buffr-zoom" }
 
 [profile.release]

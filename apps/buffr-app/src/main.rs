@@ -139,6 +139,7 @@ use buffr_core::{
     new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
     new_inhibitor, new_permissions_queue, peek_download_notice, peek_permission_front,
     permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
+    register_buffr_src_handler_factory,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -835,6 +836,11 @@ fn main() -> Result<()> {
             Arc::new(move || render_new_tab_html(&engine_for_newtab));
         register_buffr_handler_factory(provider);
     }
+
+    // Register the `buffr-src:` scheme handler factory. Fetches the
+    // underlying URL on a worker thread and renders it with bonsai
+    // syntax highlighting (Round 2 of #30).
+    register_buffr_src_handler_factory();
 
     // -------- spawn config watcher (keymap-only hot reload) ------------
     //
