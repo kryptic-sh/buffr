@@ -46,39 +46,57 @@ pub fn new_splash() -> Splash<'static> {
     Splash::new(ART, PATH)
 }
 
-/// Render the current splash frame's cursor layer as plain text for the
-/// new-tab page's `<pre id="buffr-splash">` overlay. The art layer is
-/// static and lives in the page HTML; this layer is mostly spaces with
-/// `█` at cursor/trail positions, painted in the accent color. Two
-/// stacked `<pre>` blocks (no inline spans) avoid the cross-span font
-/// fallback that breaks monospace alignment when `█` and ASCII share
-/// glyphs from different fonts in the fallback chain.
+/// Render the static splash wordmark as a row-major grid of spans,
+/// where filled cells get `class="b"` and empty cells stay empty. The
+/// page CSS draws filled cells as rectangles via `background: currentColor`,
+/// so the wordmark renders without depending on the font's `█` glyph
+/// having the same advance as a space — fixing the row drift caused by
+/// monospace fonts that shape consecutive `█` differently from short
+/// runs (top crossbars of `f`/`F` were visibly mis-aligned with the
+/// vertical spines below).
+pub fn splash_art_html() -> String {
+    let mut grid = [[false; COLS as usize]; ROWS as usize];
+    for (row_idx, line) in ART.lines().take(ROWS as usize).enumerate() {
+        for (col_idx, ch) in line.chars().take(COLS as usize).enumerate() {
+            grid[row_idx][col_idx] = ch == '█';
+        }
+    }
+    render_grid_html(&grid)
+}
+
+/// Render the current splash frame's cursor layer as a row-major grid
+/// of spans (same shape as [`splash_art_html`]). Mostly empty cells; only
+/// cursor/trail positions get `class="b"`. Pushed into the page's
+/// `#buffr-splash` overlay container per tick via execute_javascript.
 pub fn splash_frame_html(splash: &Splash<'_>) -> String {
-    const W: usize = COLS as usize;
-    const H: usize = ROWS as usize;
     let layout = Layout {
         origin_x: 0,
         origin_y: 0,
         rows: ROWS,
         cols: COLS,
     };
-    let mut grid = [[' '; W]; H];
+    let mut grid = [[false; COLS as usize]; ROWS as usize];
     for cell in splash.cells(layout) {
         let (cx, cy) = (cell.x as usize, cell.y as usize);
-        if cx >= W || cy >= H {
+        if cx >= COLS as usize || cy >= ROWS as usize {
             continue;
         }
         if matches!(cell.kind, CellKind::Cursor | CellKind::Trail { .. }) {
-            grid[cy][cx] = cell.ch;
+            grid[cy][cx] = true;
         }
     }
-    let mut out = String::with_capacity((W + 1) * H);
-    for (i, row) in grid.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        for &ch in row {
-            out.push(ch);
+    render_grid_html(&grid)
+}
+
+fn render_grid_html(grid: &[[bool; COLS as usize]; ROWS as usize]) -> String {
+    let mut out = String::with_capacity(ROWS as usize * COLS as usize * 18);
+    for row in grid {
+        for &filled in row {
+            if filled {
+                out.push_str("<span class=\"b\"></span>");
+            } else {
+                out.push_str("<span></span>");
+            }
         }
     }
     out
@@ -220,41 +238,19 @@ mod tests {
     }
 
     #[test]
-    fn splash_frame_html_emits_5_lines() {
-        let splash = Splash::fixed_tick(ART, PATH, 0);
-        let html = splash_frame_html(&splash);
-        // Newlines separate rows — 5 rows => 4 separators, no trailing.
-        assert_eq!(html.matches('\n').count(), ROWS as usize - 1);
-        assert_eq!(html.lines().count(), ROWS as usize);
+    fn splash_frame_html_emits_one_span_per_cell() {
+        let html = splash_frame_html(&Splash::fixed_tick(ART, PATH, 0));
+        let total_spans = html.matches("<span").count();
+        assert_eq!(total_spans, ROWS as usize * COLS as usize);
     }
 
     #[test]
-    fn splash_frame_html_emits_cursor_block() {
-        // Tick 0 lights up the first cell of the B spine.
-        let splash = Splash::fixed_tick(ART, PATH, 0);
-        let html = splash_frame_html(&splash);
+    fn splash_frame_html_emits_filled_class_for_cursor_cells() {
+        let html = splash_frame_html(&Splash::fixed_tick(ART, PATH, 0));
         assert!(
-            html.contains('█'),
-            "frame should contain at least one cursor cell: {html:?}"
+            html.contains("class=\"b\""),
+            "frame should mark at least one cursor cell as filled: {html:?}"
         );
-        // No inline spans — alignment relies on stacked layers, not span
-        // wrapping.
-        assert!(
-            !html.contains("<span"),
-            "frame must not emit inline spans: {html:?}"
-        );
-    }
-
-    #[test]
-    fn splash_frame_html_rows_have_fixed_width() {
-        let html = splash_frame_html(&Splash::fixed_tick(ART, PATH, 3));
-        for line in html.lines() {
-            assert_eq!(
-                line.chars().count(),
-                COLS as usize,
-                "row width must equal COLS: {line:?}"
-            );
-        }
     }
 
     #[test]
@@ -262,6 +258,15 @@ mod tests {
         let a = splash_frame_html(&Splash::fixed_tick(ART, PATH, 0));
         let b = splash_frame_html(&Splash::fixed_tick(ART, PATH, 5));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn splash_art_html_includes_letterforms() {
+        let html = splash_art_html();
+        let total_spans = html.matches("<span").count();
+        assert_eq!(total_spans, ROWS as usize * COLS as usize);
+        // The static art has filled cells (the B/u/f/f/r letterforms).
+        assert!(html.contains("class=\"b\""));
     }
 
     #[test]

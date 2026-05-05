@@ -1444,6 +1444,11 @@ fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
     };
     buffr_core::NEW_TAB_HTML_TEMPLATE
         .replacen(buffr_core::NEW_TAB_KEYBINDS_MARKER, &body, 1)
+        .replacen(
+            buffr_core::NEW_TAB_SPLASH_ART_MARKER,
+            &crate::loading_anim::splash_art_html(),
+            1,
+        )
         .into_bytes()
 }
 
