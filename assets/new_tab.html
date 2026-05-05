@@ -12,11 +12,15 @@
     }
     main {
       max-width: 56rem; margin: 0 auto;
-      padding: 4rem 2rem 6rem;
+      /* Top padding leaves headroom for the splash animation that the
+         host paints into the chrome buffer over this page. The 9rem
+         value reserves the splash's ~5-row × 16px vertical extent (top-
+         anchored with 1 row of breathing room), plus a small gap before
+         page content begins. */
+      padding: 9rem 2rem 6rem;
     }
-    header { text-align: center; margin-bottom: 3rem; }
-    h1 { font-size: 4rem; margin: 0; letter-spacing: -0.05em; }
-    header p { font-size: 1rem; opacity: 0.6; margin: 1rem 0 0; }
+    header { text-align: center; margin-bottom: 2rem; }
+    header p { font-size: 1rem; opacity: 0.6; margin: 0; }
     section h2 {
       font-size: 0.85rem; text-transform: uppercase;
       letter-spacing: 0.1em; opacity: 0.55;
@@ -52,7 +56,6 @@
 <body>
   <main>
     <header>
-      <h1>buffr</h1>
       <p>Press <kbd>e</kbd> to open the omnibar.</p>
     </header>
     <section>
