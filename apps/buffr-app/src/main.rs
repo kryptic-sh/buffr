@@ -2121,6 +2121,7 @@ enum PaintPolicy {
 ///   `None` → (JS focusin event) → `Editing`
 ///   `Editing` → (Esc) → `None`
 ///   `Editing` → (JS Blur event for same field) → `None`
+#[derive(Debug)]
 enum EditFocus {
     /// No editable field is focused.
     None,
@@ -4696,7 +4697,12 @@ impl AppState {
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Insert);
                         }
-                        tracing::debug!(%field_id, is_transfer, "edit-mode entered");
+                        tracing::info!(
+                            %field_id,
+                            is_transfer,
+                            user_intent,
+                            "edit-mode entered (engine=Insert, edit_focus=Editing)"
+                        );
                         // Remember the last field that received user-driven
                         // focus so `i` can re-focus it on the next press.
                         self.last_focused_field = Some(field_id.clone());
@@ -4711,6 +4717,12 @@ impl AppState {
                         EditFocus::Editing { field_id: f } => *f == field_id,
                         EditFocus::None => false,
                     };
+                    tracing::info!(
+                        %field_id,
+                        matches_current,
+                        prev = ?self.edit_focus,
+                        "EditConsoleEvent::Blur"
+                    );
                     if matches_current {
                         // Defer the engine-mode flip: a Tab/Shift+Tab
                         // transfer fires Focus on a sibling field within
@@ -4774,6 +4786,7 @@ impl AppState {
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(buffr_modal::PageMode::Normal);
             }
+            tracing::info!("expire_pending_blur: engine flipped Insert → Normal");
             self.refresh_title();
         }
     }
@@ -4854,14 +4867,26 @@ impl AppState {
     fn edit_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         let planned = Self::winit_key_to_planned(event, self.modifiers);
         let is_esc_pressed = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
+        let mode = self.engine.lock().ok().map(|e| e.mode());
         tracing::debug!(
             state = ?event.state,
             logical = ?event.logical_key,
+            physical = ?event.physical_key,
+            text = ?event.text.as_deref(),
             is_esc_pressed,
+            mods = ?(self.modifiers.shift_key(), self.modifiers.control_key(), self.modifiers.alt_key(), self.modifiers.super_key()),
+            edit_focus = ?self.edit_focus,
+            mode = ?mode,
+            window_focused = self.window_focused,
             "edit_mode_handle_key"
         );
 
         let EditFocus::Editing { field_id, .. } = &self.edit_focus else {
+            tracing::warn!(
+                state = ?event.state,
+                logical = ?event.logical_key,
+                "edit_mode_handle_key: no EditFocus — key will fall through to chord engine"
+            );
             return false;
         };
 
@@ -4949,7 +4974,21 @@ impl AppState {
         // natively — no Rust-side editor model.
         if let Some(host) = self.host.as_ref() {
             let mods = winit_mods_to_cef(&self.modifiers);
-            for ev in winit_key_to_cef_events(event, mods) {
+            // edit_mode_handle_key only runs when EditFocus::Editing is
+            // active, so a text input is always focused here.
+            let cef_events = winit_key_to_cef_events(event, mods, true);
+            for ev in &cef_events {
+                tracing::debug!(
+                    type_ = ?ev.type_,
+                    vk = ev.windows_key_code,
+                    ch = ev.character,
+                    unmod = ev.unmodified_character,
+                    mods = ev.modifiers,
+                    editable = ev.focus_on_editable_field,
+                    "osr_key_event dispatched"
+                );
+            }
+            for ev in cef_events {
                 host.osr_key_event(ev);
             }
         }
@@ -5414,7 +5453,11 @@ impl AppState {
                     return;
                 };
                 let mods = winit_mods_to_cef(&popup.modifiers);
-                let events = winit_key_to_cef_events(&key_ev, mods);
+                // Popup windows (DevTools, target=_blank for OAuth flows etc.)
+                // don't track focus state in buffr — assume editable so
+                // typing into popup forms gets the same dispatch as the
+                // main window's edit-mode path.
+                let events = winit_key_to_cef_events(&key_ev, mods, true);
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -5679,14 +5722,74 @@ fn resolve_char_unit(text: Option<&str>, logical: &winit::keyboard::Key) -> u16 
         .unwrap_or(0)
 }
 
+/// Map a printable ASCII character to its Windows VK code.
+///
+/// Used when the typed character disagrees with the physical scancode —
+/// the wtype / xdotool / accessibility-tool case. Those tools build a
+/// synthetic xkb keymap that assigns each character to whichever scancode
+/// is convenient (`Escape`, `Digit1`, `Tab`, …); blindly translating the
+/// scancode would make Chromium fire keydown with `code=Escape` /
+/// `code=Tab` / `code=Backspace` while the character is actually `s` /
+/// `o` / `c`. Effects: Escape blurs the input, Tab jumps focus, Backspace
+/// deletes the previous character. Match by character instead so virtual
+/// keyboards send the VK that lines up with the text.
+///
+/// Returns `None` for characters with no direct VK (shifted punctuation
+/// like `@` `#` `$`, non-ASCII), letting the caller keep the
+/// scancode-derived VK as a fallback.
+fn char_to_vk(ch: u16) -> Option<i32> {
+    let c = char::from_u32(ch as u32)?;
+    Some(match c {
+        'a'..='z' => (c as u32 - 'a' as u32 + 0x41) as i32, // VK_A..VK_Z
+        'A'..='Z' => c as i32,                              // VK_A..VK_Z
+        '0'..='9' => c as i32,                              // VK_0..VK_9
+        ' ' => 0x20,                                        // VK_SPACE
+        '\r' => 0x0D,                                       // VK_RETURN
+        '\n' => 0x0D,
+        '\t' => 0x09,     // VK_TAB
+        '\x08' => 0x08,   // VK_BACK
+        '\x1b' => 0x1B,   // VK_ESCAPE
+        '.' => 0xBE,      // VK_OEM_PERIOD
+        ',' => 0xBC,      // VK_OEM_COMMA
+        '-' => 0xBD,      // VK_OEM_MINUS
+        '=' => 0xBB,      // VK_OEM_PLUS
+        ';' => 0xBA,      // VK_OEM_1
+        '/' => 0xBF,      // VK_OEM_2
+        '`' => 0xC0,      // VK_OEM_3
+        '[' => 0xDB,      // VK_OEM_4
+        '\\' => 0xDC,     // VK_OEM_5
+        ']' => 0xDD,      // VK_OEM_6
+        '\'' => 0xDE,     // VK_OEM_7
+        _ => return None, // shifted symbols (@ # $ % …), non-ASCII
+    })
+}
+
 /// Build a CEF `KeyEvent` from a winit keyboard event.
 ///
+/// `focus_on_editable_field` reports whether a text input is currently
+/// focused — Chromium routes editable-field shortcuts and composition
+/// state differently when this flag is set, and some virtual-keyboard
+/// pathways need it to dispatch keystrokes through the same DOM event
+/// flow as real-keyboard typing.
+///
 /// Returns `None` for modifier-only presses (no VK code, no character).
-fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Vec<KeyEvent> {
+fn winit_key_to_cef_events(
+    event: &winit::event::KeyEvent,
+    modifiers: u32,
+    focus_on_editable_field: bool,
+) -> Vec<KeyEvent> {
     use winit::event::ElementState;
 
-    let vk = physical_key_to_vk(&event.physical_key);
+    let vk_from_phys = physical_key_to_vk(&event.physical_key);
     let ch = resolve_char_unit(event.text.as_deref(), &event.logical_key);
+    // Prefer a VK derived from the resolved character when one is
+    // available — virtual_keyboard sources (wtype etc.) put characters
+    // on arbitrary scancodes, so the physical mapping would otherwise
+    // deliver e.g. `VK_BACK` with character `'c'`. Fall through to the
+    // scancode-derived VK for shifted symbols / non-ASCII / no-text
+    // events (real-keyboard typing matches both, so this is a no-op).
+    let vk = char_to_vk(ch).unwrap_or(vk_from_phys);
+    let editable_flag = if focus_on_editable_field { 1 } else { 0 };
 
     // Skip pure modifier keys (no VK, no character text).
     if vk == 0 && ch == 0 {
@@ -5703,7 +5806,7 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
                 is_system_key: 0,
                 character: ch,
                 unmodified_character: ch,
-                focus_on_editable_field: 0,
+                focus_on_editable_field: editable_flag,
                 ..KeyEvent::default()
             };
             if ch != 0 {
@@ -5715,7 +5818,7 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
                     is_system_key: 0,
                     character: ch,
                     unmodified_character: ch,
-                    focus_on_editable_field: 0,
+                    focus_on_editable_field: editable_flag,
                     ..KeyEvent::default()
                 };
                 vec![raw, char_ev]
@@ -5732,7 +5835,7 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
                 is_system_key: 0,
                 character: ch,
                 unmodified_character: ch,
-                focus_on_editable_field: 0,
+                focus_on_editable_field: editable_flag,
                 ..KeyEvent::default()
             }]
         }
@@ -6296,6 +6399,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 //
                 // However, idle-inhibit (issue #22) can be gated on focus so
                 // that music in a background tab doesn't prevent screen lock.
+                let mode = self.engine.lock().ok().map(|e| e.mode());
+                tracing::info!(
+                    focused,
+                    edit_focus = ?self.edit_focus,
+                    mode = ?mode,
+                    "WindowEvent::Focused"
+                );
                 self.window_focused = focused;
             }
             WindowEvent::Occluded(occluded) => {
@@ -6839,7 +6949,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         if pass_through {
                             if let Some(host) = self.host.as_ref() {
                                 let mods = winit_mods_to_cef(&self.modifiers);
-                                for ev in winit_key_to_cef_events(&event, mods) {
+                                // Reject path: in Insert/Command modes a
+                                // text input may or may not be focused.
+                                // Use `edit_focus` to set the flag.
+                                let editable = matches!(self.edit_focus, EditFocus::Editing { .. });
+                                tracing::warn!(
+                                    state = ?event.state,
+                                    logical = ?event.logical_key,
+                                    post_mode = ?post_mode,
+                                    edit_focus = ?self.edit_focus,
+                                    editable,
+                                    "page-mode Reject pass-through (key bypassed edit_mode_handle_key)"
+                                );
+                                for ev in winit_key_to_cef_events(&event, mods, editable) {
                                     host.osr_key_event(ev);
                                 }
                             }
@@ -9244,6 +9366,9 @@ mod tests {
     /// - punctuation `KeyCode::*` must map to `VK_OEM_*` (non-zero)
     /// - `resolve_char_unit` must fall back to `logical_key.to_text()` when
     ///   `event.text` is `None` (the virtual_keyboard case).
+    /// - `char_to_vk` must return the character-derived VK so wtype's
+    ///   "character on arbitrary scancode" keymap doesn't deliver
+    ///   `VK_ESCAPE`/`VK_BACK`/`VK_TAB` with the typed letter.
     mod virtual_keyboard_tests {
         use super::*;
         use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey, SmolStr};
@@ -9301,6 +9426,93 @@ mod tests {
                     "fallback for {c:?}"
                 );
             }
+        }
+
+        // ---- char_to_vk tests --------------------------------------------
+
+        #[test]
+        fn char_to_vk_letters_lowercase() {
+            assert_eq!(char_to_vk(b'a' as u16), Some(0x41)); // VK_A
+            assert_eq!(char_to_vk(b's' as u16), Some(0x53)); // VK_S
+            assert_eq!(char_to_vk(b'z' as u16), Some(0x5A)); // VK_Z
+        }
+
+        #[test]
+        fn char_to_vk_letters_uppercase() {
+            assert_eq!(char_to_vk(b'A' as u16), Some(0x41)); // VK_A
+            assert_eq!(char_to_vk(b'Z' as u16), Some(0x5A)); // VK_Z
+        }
+
+        #[test]
+        fn char_to_vk_digits() {
+            assert_eq!(char_to_vk(b'0' as u16), Some(0x30));
+            assert_eq!(char_to_vk(b'5' as u16), Some(0x35));
+            assert_eq!(char_to_vk(b'9' as u16), Some(0x39));
+        }
+
+        #[test]
+        fn char_to_vk_punctuation() {
+            assert_eq!(char_to_vk(b'.' as u16), Some(0xBE));
+            assert_eq!(char_to_vk(b',' as u16), Some(0xBC));
+            assert_eq!(char_to_vk(b'-' as u16), Some(0xBD));
+            assert_eq!(char_to_vk(b'/' as u16), Some(0xBF));
+            assert_eq!(char_to_vk(b'\'' as u16), Some(0xDE));
+        }
+
+        #[test]
+        fn char_to_vk_control_chars() {
+            assert_eq!(char_to_vk(b' ' as u16), Some(0x20)); // VK_SPACE
+            assert_eq!(char_to_vk(b'\r' as u16), Some(0x0D)); // VK_RETURN
+            assert_eq!(char_to_vk(b'\t' as u16), Some(0x09)); // VK_TAB
+            assert_eq!(char_to_vk(0x08), Some(0x08)); // VK_BACK
+            assert_eq!(char_to_vk(0x1B), Some(0x1B)); // VK_ESCAPE
+        }
+
+        #[test]
+        fn char_to_vk_shifted_symbols_have_no_direct_vk() {
+            // These need shift+key on a US layout — caller falls back to
+            // the scancode-derived VK.
+            for c in [
+                '@', '#', '$', '%', '^', '&', '*', '(', ')', '!', '~', '_', '+',
+            ] {
+                assert_eq!(char_to_vk(c as u16), None, "no direct VK for {c:?}");
+            }
+        }
+
+        #[test]
+        fn char_to_vk_non_ascii_returns_none() {
+            assert_eq!(char_to_vk(0x00E9), None); // é
+            assert_eq!(char_to_vk(0x4E2D), None); // 中
+        }
+
+        #[test]
+        fn uppercase_letters_resolve_to_vk_a_through_z() {
+            // wtype types 'S' as Character("S") (uppercase), not as
+            // Shift+s. char_to_vk maps directly to VK_S — same VK as
+            // lowercase, since Windows uses one VK per letter regardless
+            // of case. The CHAR event carries the uppercase character.
+            assert_eq!(char_to_vk(b'S' as u16), Some(0x53));
+            assert_eq!(char_to_vk(b's' as u16), Some(0x53));
+            assert_eq!(char_to_vk(b'A' as u16), char_to_vk(b'a' as u16));
+            assert_eq!(char_to_vk(b'Z' as u16), char_to_vk(b'z' as u16));
+        }
+
+        #[test]
+        fn wtype_scancode_mismatch_resolves_to_letter_vk() {
+            // wtype: each char is on the next free scancode in a synthetic
+            // keymap. Our key dispatcher must use char_to_vk to land the
+            // correct Windows VK regardless of physical position.
+            //
+            // Repro from the field log: 's' was delivered with
+            // physical=Code(Escape). Without char_to_vk, vk=27 (VK_ESCAPE)
+            // → Chromium fires keydown with code='Escape' → input handler
+            // suppresses; with char_to_vk, vk=83 (VK_S) → keydown
+            // code='KeyS' → text inserts.
+            assert_eq!(char_to_vk(b's' as u16), Some(0x53));
+            // Likewise for 'c' (would have been VK_BACK = 0x08) and 'o'
+            // (would have been VK_TAB = 0x09) which deleted/jumped focus.
+            assert_eq!(char_to_vk(b'c' as u16), Some(0x43));
+            assert_eq!(char_to_vk(b'o' as u16), Some(0x4F));
         }
     }
 }
