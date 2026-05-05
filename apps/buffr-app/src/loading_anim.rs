@@ -49,13 +49,23 @@ pub fn paint(
     fg: u32,
     bg: u32,
 ) {
-    paint_inner(buf, buf_w, buf_h, rect, frame_idx, fg, Some(bg));
+    paint_inner(
+        buf,
+        buf_w,
+        buf_h,
+        rect,
+        frame_idx,
+        fg,
+        Some(bg),
+        Anchor::Center,
+    );
 }
 
-/// Paint just the animated glyphs without filling the background. Used to
-/// overlay the splash on top of an OSR page (e.g. the new-tab page) where
-/// the chrome buffer is already transparent in the browser region — leaving
-/// the page visible behind the wordmark.
+/// Paint just the animated glyphs without filling the background, anchored
+/// near the top of `rect`. Used to overlay the splash on top of an OSR
+/// page (e.g. the new-tab page) where the chrome buffer is transparent in
+/// the browser region so the page shows through behind the wordmark, and
+/// the page is laid out to leave headroom for the splash at the top.
 pub fn paint_overlay(
     buf: &mut [u32],
     buf_w: usize,
@@ -64,9 +74,16 @@ pub fn paint_overlay(
     frame_idx: usize,
     fg: u32,
 ) {
-    paint_inner(buf, buf_w, buf_h, rect, frame_idx, fg, None);
+    paint_inner(buf, buf_w, buf_h, rect, frame_idx, fg, None, Anchor::Top);
 }
 
+#[derive(Copy, Clone)]
+enum Anchor {
+    Center,
+    Top,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_inner(
     buf: &mut [u32],
     buf_w: usize,
@@ -75,6 +92,7 @@ fn paint_inner(
     frame_idx: usize,
     fg: u32,
     bg: Option<u32>,
+    anchor: Anchor,
 ) {
     let (rx, ry, rw, rh) = rect;
     let (rx, ry, rw, rh) = (rx as usize, ry as usize, rw as usize, rh as usize);
@@ -103,7 +121,15 @@ fn paint_inner(
     if viewport_cols < COLS || viewport_rows < ROWS {
         return; // rect too small for the wordmark
     }
-    let layout = Layout::centered(viewport_cols, viewport_rows, ROWS, COLS);
+    let layout = match anchor {
+        Anchor::Center => Layout::centered(viewport_cols, viewport_rows, ROWS, COLS),
+        Anchor::Top => Layout {
+            origin_x: viewport_cols.saturating_sub(COLS) / 2,
+            origin_y: 1,
+            rows: ROWS,
+            cols: COLS,
+        },
+    };
 
     // 3. Splash state at this tick. v0.2 owns its time source; `fixed_tick`
     //    pins the tick to our host-driven frame counter so paint() stays a
