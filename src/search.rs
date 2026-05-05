@@ -96,6 +96,24 @@ pub fn resolve_input(input: &str, search: &Search) -> String {
     }
 
     // Branch 3: search-engine fallback.
+    //
+    // Check for a prefix shortcut first: `<prefix> <query>` where
+    // `<prefix>` matches one of the configured engines' `prefix` fields
+    // routes to that engine instead of the default. Empty queries fall
+    // through to the default-engine path so a bare `g` still searches
+    // for "g" instead of opening google with no query.
+    if let Some((head, tail)) = trimmed.split_once(char::is_whitespace) {
+        let tail = tail.trim_start();
+        if !tail.is_empty()
+            && let Some(engine) = search
+                .engines
+                .values()
+                .find(|e| e.prefix.as_deref() == Some(head))
+        {
+            return engine.url.replace("{query}", &url_encode(tail));
+        }
+    }
+
     let template = search
         .engines
         .get(&search.default_engine)
@@ -338,6 +356,51 @@ mod tests {
     fn whitespace_trimmed_before_resolution() {
         let s = search();
         assert_eq!(resolve_input("  example.com  ", &s), "https://example.com");
+    }
+
+    #[test]
+    fn prefix_routes_to_matching_engine() {
+        let s = search();
+        // `g <q>` → google, `ddg <q>` → duckduckgo (per defaults).
+        assert_eq!(
+            resolve_input("g rust closures", &s),
+            "https://www.google.com/search?q=rust+closures"
+        );
+        assert_eq!(
+            resolve_input("ddg vim folding", &s),
+            "https://duckduckgo.com/?q=vim+folding"
+        );
+    }
+
+    #[test]
+    fn prefix_with_no_query_falls_through_to_default() {
+        // Bare prefix word with no query is just a search for that word.
+        let s = search();
+        assert_eq!(resolve_input("g", &s), "https://duckduckgo.com/?q=g");
+        assert_eq!(resolve_input("g   ", &s), "https://duckduckgo.com/?q=g");
+    }
+
+    #[test]
+    fn unknown_prefix_falls_through_to_default() {
+        let s = search();
+        // No engine has prefix "zz" so this is a normal search.
+        assert_eq!(
+            resolve_input("zz hello world", &s),
+            "https://duckduckgo.com/?q=zz+hello+world"
+        );
+    }
+
+    #[test]
+    fn prefix_does_not_apply_to_url_inputs() {
+        // `g` matters only in the search-fallback branch — URL inputs
+        // shouldn't get reinterpreted because they happen to start with
+        // a prefix word followed by whitespace (URLs can't anyway, but
+        // the schemeless heuristic could be confused).
+        let s = search();
+        assert_eq!(
+            resolve_input("https://example.com", &s),
+            "https://example.com/"
+        );
     }
 
     #[test]

@@ -119,12 +119,14 @@ impl Default for Search {
             "duckduckgo".into(),
             SearchEngine {
                 url: "https://duckduckgo.com/?q={query}".into(),
+                prefix: Some("ddg".into()),
             },
         );
         engines.insert(
             "google".into(),
             SearchEngine {
                 url: "https://www.google.com/search?q={query}".into(),
+                prefix: Some("g".into()),
             },
         );
         Self {
@@ -134,10 +136,16 @@ impl Default for Search {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchEngine {
     pub url: String,
+    /// Optional shortcut keyword. When set, an omnibar input of
+    /// `<prefix> <query>` routes to this engine instead of
+    /// [`Search::default_engine`]. Keep these short and memorable
+    /// (`g`, `gh`, `ddg`, `wiki`). Prefix collisions across engines
+    /// are rejected by [`Config::validate`].
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,6 +634,30 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             location: Some("search.default_engine".into()),
         });
     }
+    // Reject duplicate prefixes — the omnibar dispatcher maps prefix → engine
+    // and a collision would silently pick whichever engine the HashMap iterates
+    // first. Empty-string prefix is also rejected (would match every input).
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for (name, engine) in &cfg.search.engines {
+        if let Some(prefix) = &engine.prefix {
+            if prefix.is_empty() {
+                return Err(ConfigError::Validate {
+                    message: format!(
+                        "search.engines.{name}.prefix must not be empty (omit the field instead)"
+                    ),
+                    location: Some(format!("search.engines.{name}.prefix")),
+                });
+            }
+            if let Some(other) = seen.insert(prefix.as_str(), name.as_str()) {
+                return Err(ConfigError::Validate {
+                    message: format!(
+                        "search.engines.{name}.prefix = {prefix:?} collides with search.engines.{other}.prefix"
+                    ),
+                    location: Some(format!("search.engines.{name}.prefix")),
+                });
+            }
+        }
+    }
 
     for (mode, bindings) in &cfg.keymap {
         for keys in bindings.keys() {
@@ -758,6 +790,37 @@ mod tests {
         let err = validate(&cfg).unwrap_err();
         match err {
             ConfigError::Validate { message, .. } => assert!(message.contains("ddg")),
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_search_prefixes() {
+        let mut cfg = Config::default();
+        // Both engines now claim prefix "g" — pick one explicitly.
+        if let Some(ddg) = cfg.search.engines.get_mut("duckduckgo") {
+            ddg.prefix = Some("g".into());
+        }
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("collides"), "unexpected msg: {message}");
+            }
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_search_prefix() {
+        let mut cfg = Config::default();
+        if let Some(ddg) = cfg.search.engines.get_mut("duckduckgo") {
+            ddg.prefix = Some(String::new());
+        }
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("empty"), "unexpected msg: {message}");
+            }
             _ => panic!("expected Validate error"),
         }
     }
