@@ -5638,8 +5638,45 @@ fn physical_key_to_vk(key: &winit::keyboard::PhysicalKey) -> i32 {
         KeyCode::PageUp => 0x21,
         KeyCode::PageDown => 0x22,
         KeyCode::Insert => 0x2D,
+        // Punctuation — VK_OEM_*. Required so wtype / xdotool-style virtual
+        // keyboards don't get their punctuation events dropped: those tools
+        // route through `zwp_virtual_keyboard_v1`, which bypasses winit's
+        // text-input pipeline (so `event.text == None`); without a VK code
+        // the early-return in `winit_key_to_cef_events` would discard them.
+        KeyCode::Semicolon => 0xBA,    // VK_OEM_1
+        KeyCode::Equal => 0xBB,        // VK_OEM_PLUS
+        KeyCode::Comma => 0xBC,        // VK_OEM_COMMA
+        KeyCode::Minus => 0xBD,        // VK_OEM_MINUS
+        KeyCode::Period => 0xBE,       // VK_OEM_PERIOD
+        KeyCode::Slash => 0xBF,        // VK_OEM_2
+        KeyCode::Backquote => 0xC0,    // VK_OEM_3
+        KeyCode::BracketLeft => 0xDB,  // VK_OEM_4
+        KeyCode::Backslash => 0xDC,    // VK_OEM_5
+        KeyCode::BracketRight => 0xDD, // VK_OEM_6
+        KeyCode::Quote => 0xDE,        // VK_OEM_7
         _ => 0,
     }
+}
+
+/// Resolve the CHAR-event code unit for a winit key event.
+///
+/// Prefers `event.text` (the IME-translated string). Falls back to
+/// `logical_key.to_text()` so virtual-keyboard sources (wtype,
+/// xdotool-on-XWayland, accessibility tools) still produce a CHAR event:
+/// those tools bypass winit's text-input pipeline so `event.text` is `None`,
+/// but `logical_key` is populated from the xkb keysym.
+///
+/// Returns 0 when no single-UTF-16-unit character is available (multi-unit
+/// chars, named keys, modifier-only events).
+fn resolve_char_unit(text: Option<&str>, logical: &winit::keyboard::Key) -> u16 {
+    text.or_else(|| logical.to_text())
+        .and_then(|t| t.chars().next())
+        .map(|c| {
+            let mut buf = [0u16; 2];
+            let encoded = c.encode_utf16(&mut buf);
+            if encoded.len() == 1 { encoded[0] } else { 0 }
+        })
+        .unwrap_or(0)
 }
 
 /// Build a CEF `KeyEvent` from a winit keyboard event.
@@ -5649,16 +5686,7 @@ fn winit_key_to_cef_events(event: &winit::event::KeyEvent, modifiers: u32) -> Ve
     use winit::event::ElementState;
 
     let vk = physical_key_to_vk(&event.physical_key);
-    let ch: u16 = event
-        .text
-        .as_ref()
-        .and_then(|t| t.chars().next())
-        .map(|c| {
-            let mut buf = [0u16; 2];
-            let encoded = c.encode_utf16(&mut buf);
-            if encoded.len() == 1 { encoded[0] } else { 0 }
-        })
-        .unwrap_or(0);
+    let ch = resolve_char_unit(event.text.as_deref(), &event.logical_key);
 
     // Skip pure modifier keys (no VK, no character text).
     if vk == 0 && ch == 0 {
@@ -9210,5 +9238,69 @@ mod tests {
             "unarmed watchdog must never fire"
         );
         assert!(!wd.is_armed());
+    }
+
+    /// Tests for the wtype / virtual_keyboard fix (#36):
+    /// - punctuation `KeyCode::*` must map to `VK_OEM_*` (non-zero)
+    /// - `resolve_char_unit` must fall back to `logical_key.to_text()` when
+    ///   `event.text` is `None` (the virtual_keyboard case).
+    mod virtual_keyboard_tests {
+        use super::*;
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey, SmolStr};
+
+        #[test]
+        fn punctuation_keys_have_vk_codes() {
+            let cases = [
+                (KeyCode::Period, 0xBE_i32),
+                (KeyCode::Comma, 0xBC),
+                (KeyCode::Minus, 0xBD),
+                (KeyCode::Equal, 0xBB),
+                (KeyCode::Semicolon, 0xBA),
+                (KeyCode::Slash, 0xBF),
+                (KeyCode::Backquote, 0xC0),
+                (KeyCode::BracketLeft, 0xDB),
+                (KeyCode::Backslash, 0xDC),
+                (KeyCode::BracketRight, 0xDD),
+                (KeyCode::Quote, 0xDE),
+            ];
+            for (code, want) in cases {
+                let got = physical_key_to_vk(&PhysicalKey::Code(code));
+                assert_eq!(got, want, "VK for {code:?}");
+            }
+        }
+
+        #[test]
+        fn resolve_char_prefers_event_text() {
+            let logical = Key::Character(SmolStr::new_static("x"));
+            assert_eq!(resolve_char_unit(Some("."), &logical), b'.' as u16);
+        }
+
+        #[test]
+        fn resolve_char_falls_back_to_logical_key() {
+            // Simulates the wtype path: event.text is None but logical_key
+            // is set from the xkb keysym for the virtual_keyboard event.
+            let logical = Key::Character(SmolStr::new_static("."));
+            assert_eq!(resolve_char_unit(None, &logical), b'.' as u16);
+        }
+
+        #[test]
+        fn resolve_char_returns_zero_for_named_keys_without_text() {
+            // F1 has no text representation: nothing to insert.
+            let logical = Key::Named(NamedKey::F1);
+            assert_eq!(resolve_char_unit(None, &logical), 0);
+        }
+
+        #[test]
+        fn resolve_char_handles_all_punctuation_via_logical_fallback() {
+            for c in ['.', ',', '/', ';', '\'', '\\', '-', '=', '[', ']', '`'] {
+                let s = c.to_string();
+                let logical = Key::Character(SmolStr::new(&s));
+                assert_eq!(
+                    resolve_char_unit(None, &logical),
+                    c as u16,
+                    "fallback for {c:?}"
+                );
+            }
+        }
     }
 }
