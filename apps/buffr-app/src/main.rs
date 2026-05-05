@@ -2003,10 +2003,12 @@ struct AppState {
     /// without issuing a `download_image` call. Also gates the apps-side
     /// pump so disabled-mode never populates the cache.
     show_favicons: bool,
-    /// Monotonic frame counter for the loading animation. Incremented on
-    /// each paint while the OSR buffer is unusable. Wraps via
-    /// `wrapping_add(1)` so it never overflows.
-    loading_anim_frame: u64,
+    /// Persisted splash state. `hjkl-splash` 0.2 owns its time source —
+    /// `cells()` reads the wall clock internally so animation cadence is
+    /// independent of paint rate (scrolling can't accelerate the
+    /// wordmark). Constructed once and reused across the loading-anim
+    /// path and the new-tab overlay.
+    splash: hjkl_splash::Splash<'static>,
     /// True while the last `paint_chrome_with` used the loading animation
     /// path (OSR buffer absent or wrong size). Cleared when the OSR path
     /// resumes. Used to emit the `debug!` transition log exactly once.
@@ -2392,7 +2394,7 @@ impl AppState {
             popup_close_sink: buffr_core::new_popup_close_sink(),
             favicons: HashMap::new(),
             show_favicons,
-            loading_anim_frame: 0,
+            splash: crate::loading_anim::new_splash(),
             loading_anim_active: false,
             loading_anim_next_wake: None,
             resize_paint_watchdog: ResizePaintWatchdog::default(),
@@ -3384,8 +3386,7 @@ impl AppState {
             self.loading_anim_active = want_anim;
         }
 
-        // Snapshot animation state for the closure.
-        let anim_frame = self.loading_anim_frame;
+        let splash = &self.splash;
         let anim_fg = statusline.palette.accent;
         // bg: accent darkened 92% with black, matching the strip background.
         let anim_bg = buffr_ui::Palette::from_accent(anim_fg).bg;
@@ -3426,7 +3427,7 @@ impl AppState {
                             w,
                             h,
                             (0, l_browser_y, l_browser_w, l_browser_h),
-                            anim_frame as usize,
+                            splash,
                             anim_fg,
                             anim_bg,
                         );
@@ -3469,7 +3470,7 @@ impl AppState {
                                 w,
                                 h,
                                 (0, l_browser_y, l_browser_w, l_browser_h),
-                                anim_frame as usize,
+                                splash,
                                 anim_fg,
                             );
                         }
@@ -3523,7 +3524,7 @@ impl AppState {
                                 w,
                                 h,
                                 (0, l_browser_y, l_browser_w, l_browser_h),
-                                anim_frame as usize,
+                                splash,
                                 anim_fg,
                             );
                         }
@@ -3563,13 +3564,12 @@ impl AppState {
             self.last_painted_chrome_gen = self.chrome_generation;
         }
 
-        // Advance the animation counter and schedule the next wake when
-        // either the loading-anim path or the new-tab splash overlay is
-        // active. Both ride the same 12 fps tick so the wordmark moves at
-        // a single canonical cadence regardless of which mode rendered it.
+        // Schedule the next wake when either the loading-anim path or the
+        // new-tab splash overlay is active. `Splash` reads the wall clock
+        // each `cells()` call, so we just need to fire a redraw on the
+        // splash period to surface the next tick's cell layout.
         if want_anim || want_splash_overlay {
-            self.loading_anim_frame = self.loading_anim_frame.wrapping_add(1);
-            self.loading_anim_next_wake = Some(Instant::now() + Duration::from_millis(83)); // ~12 fps
+            self.loading_anim_next_wake = Some(Instant::now() + hjkl_splash::DEFAULT_PERIOD);
         } else {
             self.loading_anim_next_wake = None;
         }

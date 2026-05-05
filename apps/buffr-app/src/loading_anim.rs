@@ -39,13 +39,22 @@ fn dim(c: u32) -> u32 {
     (c & 0xff00_0000) | ((c & 0x00fe_fefe) >> 1)
 }
 
-/// Paint the animation frame at `frame_idx` into `buf`.
+/// Build a fresh `Splash` anchored at "now". `hjkl-splash` 0.2 owns the
+/// time source — `cells()` reads the wall clock — so callers construct
+/// once at App startup and pass the same `&Splash` to every paint call.
+pub fn new_splash() -> Splash<'static> {
+    Splash::new(ART, PATH)
+}
+
+/// Paint the current animation frame into `buf`. The cells the splash
+/// emits are derived from its internal wall clock; calling more or less
+/// often does not accelerate the animation.
 pub fn paint(
     buf: &mut [u32],
     buf_w: usize,
     buf_h: usize,
     rect: (u32, u32, u32, u32),
-    frame_idx: usize,
+    splash: &Splash<'_>,
     fg: u32,
     bg: u32,
 ) {
@@ -54,7 +63,7 @@ pub fn paint(
         buf_w,
         buf_h,
         rect,
-        frame_idx,
+        splash,
         fg,
         Some(bg),
         Anchor::Center,
@@ -71,10 +80,10 @@ pub fn paint_overlay(
     buf_w: usize,
     buf_h: usize,
     rect: (u32, u32, u32, u32),
-    frame_idx: usize,
+    splash: &Splash<'_>,
     fg: u32,
 ) {
-    paint_inner(buf, buf_w, buf_h, rect, frame_idx, fg, None, Anchor::Top);
+    paint_inner(buf, buf_w, buf_h, rect, splash, fg, None, Anchor::Top);
 }
 
 #[derive(Copy, Clone)]
@@ -89,7 +98,7 @@ fn paint_inner(
     buf_w: usize,
     buf_h: usize,
     rect: (u32, u32, u32, u32),
-    frame_idx: usize,
+    splash: &Splash<'_>,
     fg: u32,
     bg: Option<u32>,
     anchor: Anchor,
@@ -131,15 +140,7 @@ fn paint_inner(
         },
     };
 
-    // 3. Splash state at this tick. v0.2 owns its time source; `fixed_tick`
-    //    pins the tick to our host-driven frame counter so paint() stays a
-    //    pure function of (frame_idx, rect) — wall-clock mode would tie
-    //    output to real-time elapsed since first paint, which breaks the
-    //    snapshot tests below and would couple animation cadence to wgpu
-    //    redraw rate instead of `loading_anim_next_wake`.
-    let splash = Splash::fixed_tick(ART, PATH, frame_idx as u64);
-
-    // 4. Blit cells.
+    // 3. Blit cells (splash drives its own clock).
     for cell in splash.cells(layout) {
         let color = match cell.kind {
             CellKind::Art => dim(fg),
@@ -160,12 +161,13 @@ mod tests {
         let w = 800;
         let h = 200;
         let mut buf = vec![0u32; w * h];
+        let splash = Splash::fixed_tick(ART, PATH, 0);
         paint(
             &mut buf,
             w,
             h,
             (0, 0, w as u32, h as u32),
-            0,
+            &splash,
             0xff_ff_ff_ff,
             0,
         );
@@ -173,17 +175,19 @@ mod tests {
     }
 
     #[test]
-    fn paint_advances_with_frame_idx() {
+    fn paint_advances_with_tick() {
         let w = 800;
         let h = 200;
         let mut a = vec![0u32; w * h];
         let mut b = vec![0u32; w * h];
+        let s0 = Splash::fixed_tick(ART, PATH, 0);
+        let s1 = Splash::fixed_tick(ART, PATH, 1);
         paint(
             &mut a,
             w,
             h,
             (0, 0, w as u32, h as u32),
-            0,
+            &s0,
             0xff_ff_ff_ff,
             0,
         );
@@ -192,7 +196,7 @@ mod tests {
             w,
             h,
             (0, 0, w as u32, h as u32),
-            1,
+            &s1,
             0xff_ff_ff_ff,
             0,
         );
@@ -208,7 +212,15 @@ mod tests {
         let w = 800;
         let h = 200;
         let mut buf = vec![0u32; w * h];
-        paint_overlay(&mut buf, w, h, (0, 0, w as u32, h as u32), 0, 0xff_ff_ff_ff);
+        let splash = Splash::fixed_tick(ART, PATH, 0);
+        paint_overlay(
+            &mut buf,
+            w,
+            h,
+            (0, 0, w as u32, h as u32),
+            &splash,
+            0xff_ff_ff_ff,
+        );
         let written = buf.iter().filter(|&&p| p != 0).count();
         let zeroed = buf.iter().filter(|&&p| p == 0).count();
         assert!(written > 0, "overlay should still paint glyph pixels");
@@ -216,6 +228,39 @@ mod tests {
             zeroed > written,
             "overlay must leave most of the rect untouched: written={written}, zeroed={zeroed}"
         );
+    }
+
+    #[test]
+    fn paint_idempotent_within_same_tick() {
+        // Splash::cells emits the same cells repeatedly within a tick window,
+        // so calling paint() multiple times with the same fixed-tick splash
+        // produces the same buffer — i.e. paint rate cannot accelerate the
+        // animation. This is the core guarantee that fixes scroll-induced
+        // speed-up.
+        let w = 800;
+        let h = 200;
+        let mut a = vec![0u32; w * h];
+        let mut b = vec![0u32; w * h];
+        let splash = Splash::fixed_tick(ART, PATH, 7);
+        paint(
+            &mut a,
+            w,
+            h,
+            (0, 0, w as u32, h as u32),
+            &splash,
+            0xff_ff_ff_ff,
+            0,
+        );
+        paint(
+            &mut b,
+            w,
+            h,
+            (0, 0, w as u32, h as u32),
+            &splash,
+            0xff_ff_ff_ff,
+            0,
+        );
+        assert_eq!(a, b);
     }
 
     #[test]
