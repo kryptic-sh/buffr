@@ -33,6 +33,7 @@ pub mod permissions;
 pub mod scripts;
 pub mod telemetry;
 pub mod updates;
+pub mod view_source_scheme;
 
 /// Off-screen rendering support. Linux and macOS use OSR; Windows uses
 /// native windowed embedding.
@@ -181,6 +182,7 @@ pub use updates::{
     DEFAULT_CHANNEL, DEFAULT_CHECK_INTERVAL_HOURS, DEFAULT_GITHUB_REPO, HttpClient, ReleaseInfo,
     UpdateChecker, UpdateConfig, UpdateError, UpdateStatus, UreqClient,
 };
+pub use view_source_scheme::{register_buffr_src_handler_factory, register_buffr_src_scheme};
 
 #[derive(Debug, Error)]
 pub enum CoreError {

@@ -35,6 +35,7 @@ buffr-downloads = "0.1"
 buffr-config = "0.3"
 buffr-zoom = "0.1"
 buffr-permissions = "0.1"
+buffr-view-source = "0.1"
 hjkl-clipboard = "0.4"
 winit = "0.30"
 # Image decode / re-encode for context-menu "Copy Image" — fetched bytes

@@ -82,31 +82,32 @@ pub struct TabSession {
     pub hint_session: Option<HintSession>,
 }
 
-/// User-facing prefix for "view source" navigations. Mapped to CEF's
-/// built-in `view-source:` scheme at the navigation boundary so the
-/// underlying renderer still gets a real Chromium view-source page,
-/// while the omnibar / tab strip / session file see the buffr-flavored
-/// prefix.
+/// User-facing prefix for "view source" navigations. `buffr-src:` URLs
+/// are now served by the custom CEF scheme handler in
+/// `view_source_scheme.rs` — no rewrite to `view-source:` at the
+/// navigation boundary. This const is kept public because
+/// `apps/buffr-app/src/main.rs` constructs `buffr-src:<url>` literals
+/// when dispatching "view page source" from the context menu.
 pub const BUFFR_SRC_PREFIX: &str = "buffr-src:";
-const CEF_VIEW_SOURCE_PREFIX: &str = "view-source:";
 
 /// Translate a user-facing URL into the form CEF should actually
-/// navigate to. Currently rewrites the `buffr-src:` prefix to
-/// `view-source:`; identity for all other URLs.
+/// navigate to. `buffr-src:` URLs reach CEF unmodified — the custom
+/// scheme handler registered in `view_source_scheme.rs` intercepts
+/// them. Identity for all URLs.
 fn to_cef_navigation_url(url: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = url.strip_prefix(BUFFR_SRC_PREFIX) {
-        std::borrow::Cow::Owned(format!("{CEF_VIEW_SOURCE_PREFIX}{rest}"))
-    } else {
-        std::borrow::Cow::Borrowed(url)
-    }
+    std::borrow::Cow::Borrowed(url)
 }
 
-/// Translate a CEF-emitted URL back into the user-facing form. Rewrites
-/// `view-source:` → `buffr-src:` so chrome surfaces show the buffr
-/// prefix uniformly regardless of whether navigation came from the
-/// context menu, an omnibar paste, or a session restore.
+/// Translate a CEF-emitted URL back into the user-facing form.
+///
+/// Rewrites `view-source:` → `buffr-src:` as a safety net for the rare
+/// case where a `view-source:` URL leaks into a chrome surface (e.g.
+/// via the context menu, a session restore from an old session file, or
+/// a Chromium-internal redirect). Normal navigation through our custom
+/// scheme never produces a `view-source:` address-change event, so this
+/// fires only in defensive edge cases.
 fn to_display_url(url: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = url.strip_prefix(CEF_VIEW_SOURCE_PREFIX) {
+    if let Some(rest) = url.strip_prefix("view-source:") {
         std::borrow::Cow::Owned(format!("{BUFFR_SRC_PREFIX}{rest}"))
     } else {
         std::borrow::Cow::Borrowed(url)
@@ -114,23 +115,19 @@ fn to_display_url(url: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Apply an incoming navigation URL (typically from CEF's
-/// `on_address_change` or `on_load_end`) to `current`, preserving the
-/// `buffr-src:` prefix when CEF strips it. Returns `Some(new_url)` if
-/// the value should change, `None` to leave it untouched.
+/// `on_address_change` or `on_load_end`) to `current`. Returns
+/// `Some(new_url)` if the value should change, `None` to leave it
+/// untouched.
+///
+/// With the `buffr-src:` custom scheme handler wired up, CEF emits
+/// address-change events with the `buffr-src:` URL intact — the old
+/// suffix-preservation heuristic (needed when we translated to
+/// `view-source:` at the navigation boundary) is no longer required.
+///
+/// The incoming URL is still normalized through [`to_display_url`] as a
+/// safety net for sessions restored from old session files or any other
+/// code path that leaks a raw `view-source:` URL into the address bar.
 fn merge_navigation_url(current: &str, incoming: &str) -> Option<String> {
-    // Preserve `buffr-src:` prefix. CEF's address-change strips
-    // `view-source:` from the URL — but the user's navigation target
-    // (and what the omnibar expects to show on focus) is the prefixed
-    // form. If our current url has the prefix and the incoming
-    // matches the unprefixed suffix, keep ours.
-    if let Some(suffix) = current.strip_prefix(BUFFR_SRC_PREFIX)
-        && suffix == incoming
-    {
-        return None;
-    }
-    // Otherwise the incoming is authoritative — but normalize a raw
-    // `view-source:` (rare; only fires if CEF *doesn't* strip the
-    // prefix) into the buffr-flavored form.
     let normalized = to_display_url(incoming);
     if normalized == current {
         None
@@ -2790,10 +2787,12 @@ mod tests {
     }
 
     #[test]
-    fn cef_navigation_translates_buffr_src_prefix() {
+    fn cef_navigation_is_identity() {
+        // `buffr-src:` URLs now reach CEF unmodified — the custom scheme
+        // handler intercepts them. `to_cef_navigation_url` is a pass-through.
         assert_eq!(
             to_cef_navigation_url("buffr-src:https://example.com").as_ref(),
-            "view-source:https://example.com"
+            "buffr-src:https://example.com"
         );
         assert_eq!(
             to_cef_navigation_url("https://example.com").as_ref(),
@@ -2804,6 +2803,8 @@ mod tests {
 
     #[test]
     fn display_url_translates_view_source_prefix() {
+        // Safety-net normalization: old session files or context-menu paths
+        // may produce `view-source:` URLs; rewrite them to `buffr-src:`.
         assert_eq!(
             to_display_url("view-source:https://example.com").as_ref(),
             "buffr-src:https://example.com"
@@ -2812,21 +2813,30 @@ mod tests {
             to_display_url("https://example.com").as_ref(),
             "https://example.com"
         );
-    }
-
-    #[test]
-    fn merge_keeps_buffr_src_when_incoming_matches_suffix() {
+        // `buffr-src:` URLs are already in user-facing form — pass through.
         assert_eq!(
-            merge_navigation_url("buffr-src:https://x.com", "https://x.com"),
-            None
+            to_display_url("buffr-src:https://example.com").as_ref(),
+            "buffr-src:https://example.com"
         );
     }
 
     #[test]
     fn merge_normalizes_view_source_to_buffr_src() {
+        // Defensive: raw `view-source:` leaking in from old session or
+        // context-menu → normalize to `buffr-src:`.
         assert_eq!(
             merge_navigation_url("https://old.com", "view-source:https://new.com"),
             Some("buffr-src:https://new.com".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_buffr_src_address_change_no_op() {
+        // CEF now emits the `buffr-src:` URL unchanged in address-change
+        // events (the custom scheme handler owns the URL end-to-end).
+        assert_eq!(
+            merge_navigation_url("buffr-src:https://x.com", "buffr-src:https://x.com"),
+            None
         );
     }
 

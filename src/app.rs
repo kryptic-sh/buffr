@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use cef::*;
 
 use crate::new_tab::register_buffr_scheme;
+use crate::view_source_scheme::register_buffr_src_scheme;
 
 /// Process-wide flag toggling the `--force-renderer-accessibility`
 /// switch in `on_before_command_line_processing`. Set via
@@ -103,6 +104,7 @@ wrap_app! {
         fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
             if let Some(r) = registrar {
                 register_buffr_scheme(r);
+                register_buffr_src_scheme(r);
             }
         }
 
