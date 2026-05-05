@@ -46,6 +46,53 @@ pub fn new_splash() -> Splash<'static> {
     Splash::new(ART, PATH)
 }
 
+/// Render the current splash frame as HTML for the new-tab page's
+/// `<pre id="buffr-splash">` element. Cursor/trail cells get wrapped in
+/// `<span class="hl">…</span>`; the surrounding art is plain text the page
+/// CSS dims. Only `█` and spaces appear in the output, so no HTML escaping
+/// is required.
+pub fn splash_frame_html(splash: &Splash<'_>) -> String {
+    const W: usize = COLS as usize;
+    const H: usize = ROWS as usize;
+    let layout = Layout {
+        origin_x: 0,
+        origin_y: 0,
+        rows: ROWS,
+        cols: COLS,
+    };
+    let mut grid = [[(' ', false); W]; H];
+    for cell in splash.cells(layout) {
+        let (cx, cy) = (cell.x as usize, cell.y as usize);
+        if cx >= W || cy >= H {
+            continue;
+        }
+        let hl = matches!(cell.kind, CellKind::Cursor | CellKind::Trail { .. });
+        grid[cy][cx] = (cell.ch, hl);
+    }
+    let mut out = String::with_capacity(W * H * 4);
+    for row in &grid {
+        let mut col = 0;
+        while col < W {
+            if row[col].1 {
+                let start = col;
+                while col < W && row[col].1 {
+                    col += 1;
+                }
+                out.push_str("<span class=\"hl\">");
+                for &(ch, _) in &row[start..col] {
+                    out.push(ch);
+                }
+                out.push_str("</span>");
+            } else {
+                out.push(row[col].0);
+                col += 1;
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Paint the current animation frame into `buf`. The cells the splash
 /// emits are derived from its internal wall clock; calling more or less
 /// often does not accelerate the animation.
@@ -58,65 +105,18 @@ pub fn paint(
     fg: u32,
     bg: u32,
 ) {
-    paint_inner(
-        buf,
-        buf_w,
-        buf_h,
-        rect,
-        splash,
-        fg,
-        Some(bg),
-        Anchor::Center,
-    );
-}
-
-/// Paint just the animated glyphs without filling the background, anchored
-/// near the top of `rect`. Used to overlay the splash on top of an OSR
-/// page (e.g. the new-tab page) where the chrome buffer is transparent in
-/// the browser region so the page shows through behind the wordmark, and
-/// the page is laid out to leave headroom for the splash at the top.
-pub fn paint_overlay(
-    buf: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
-    rect: (u32, u32, u32, u32),
-    splash: &Splash<'_>,
-    fg: u32,
-) {
-    paint_inner(buf, buf_w, buf_h, rect, splash, fg, None, Anchor::Top);
-}
-
-#[derive(Copy, Clone)]
-enum Anchor {
-    Center,
-    Top,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_inner(
-    buf: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
-    rect: (u32, u32, u32, u32),
-    splash: &Splash<'_>,
-    fg: u32,
-    bg: Option<u32>,
-    anchor: Anchor,
-) {
     let (rx, ry, rw, rh) = rect;
     let (rx, ry, rw, rh) = (rx as usize, ry as usize, rw as usize, rh as usize);
 
-    // 1. Optional background fill.
-    if let Some(bg) = bg {
-        let x1 = (rx + rw).min(buf_w);
-        let y1 = (ry + rh).min(buf_h);
-        for row in ry..y1 {
-            let base = row * buf_w;
-            if base + x1 > buf.len() {
-                break;
-            }
-            buf[base + rx..base + x1].fill(bg);
+    // 1. Background fill.
+    let x1 = (rx + rw).min(buf_w);
+    let y1 = (ry + rh).min(buf_h);
+    for row in ry..y1 {
+        let base = row * buf_w;
+        if base + x1 > buf.len() {
+            break;
         }
+        buf[base + rx..base + x1].fill(bg);
     }
     if rw == 0 || rh == 0 {
         return;
@@ -130,15 +130,7 @@ fn paint_inner(
     if viewport_cols < COLS || viewport_rows < ROWS {
         return; // rect too small for the wordmark
     }
-    let layout = match anchor {
-        Anchor::Center => Layout::centered(viewport_cols, viewport_rows, ROWS, COLS),
-        Anchor::Top => Layout {
-            origin_x: viewport_cols.saturating_sub(COLS) / 2,
-            origin_y: 1,
-            rows: ROWS,
-            cols: COLS,
-        },
-    };
+    let layout = Layout::centered(viewport_cols, viewport_rows, ROWS, COLS);
 
     // 3. Blit cells (splash drives its own clock).
     for cell in splash.cells(layout) {
@@ -204,33 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn paint_overlay_leaves_unwritten_pixels_at_zero() {
-        // The wordmark + cursor cells touch only a fraction of the rect.
-        // paint_overlay must not fill the rest with anything (callers rely
-        // on the chrome buffer's background-region alpha staying 0 so the
-        // OSR page shows through).
-        let w = 800;
-        let h = 200;
-        let mut buf = vec![0u32; w * h];
-        let splash = Splash::fixed_tick(ART, PATH, 0);
-        paint_overlay(
-            &mut buf,
-            w,
-            h,
-            (0, 0, w as u32, h as u32),
-            &splash,
-            0xff_ff_ff_ff,
-        );
-        let written = buf.iter().filter(|&&p| p != 0).count();
-        let zeroed = buf.iter().filter(|&&p| p == 0).count();
-        assert!(written > 0, "overlay should still paint glyph pixels");
-        assert!(
-            zeroed > written,
-            "overlay must leave most of the rect untouched: written={written}, zeroed={zeroed}"
-        );
-    }
-
-    #[test]
     fn paint_idempotent_within_same_tick() {
         // Splash::cells emits the same cells repeatedly within a tick window,
         // so calling paint() multiple times with the same fixed-tick splash
@@ -261,6 +226,31 @@ mod tests {
             0,
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn splash_frame_html_emits_5_lines() {
+        let splash = Splash::fixed_tick(ART, PATH, 0);
+        let html = splash_frame_html(&splash);
+        assert_eq!(html.matches('\n').count(), ROWS as usize);
+    }
+
+    #[test]
+    fn splash_frame_html_includes_highlight_span() {
+        // Tick 0 lights up the first cell of the B spine.
+        let splash = Splash::fixed_tick(ART, PATH, 0);
+        let html = splash_frame_html(&splash);
+        assert!(
+            html.contains("<span class=\"hl\">"),
+            "frame should contain at least one cursor/trail span: {html}"
+        );
+    }
+
+    #[test]
+    fn splash_frame_html_changes_with_tick() {
+        let a = splash_frame_html(&Splash::fixed_tick(ART, PATH, 0));
+        let b = splash_frame_html(&Splash::fixed_tick(ART, PATH, 5));
+        assert_ne!(a, b);
     }
 
     #[test]

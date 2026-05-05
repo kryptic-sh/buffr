@@ -2006,9 +2006,17 @@ struct AppState {
     /// Persisted splash state. `hjkl-splash` 0.2 owns its time source —
     /// `cells()` reads the wall clock internally so animation cadence is
     /// independent of paint rate (scrolling can't accelerate the
-    /// wordmark). Constructed once and reused across the loading-anim
-    /// path and the new-tab overlay.
+    /// wordmark). Used for the loading-anim Rust paint path, and to
+    /// generate per-tick HTML for the new-tab page's splash element.
     splash: hjkl_splash::Splash<'static>,
+    /// Last splash tick value pushed to the new-tab page. `None` when no
+    /// new-tab tab is active. Compared against `splash.tick()` on every
+    /// `about_to_wait` to dedupe redundant `execute_javascript` calls.
+    last_splash_tick: Option<u64>,
+    /// Wake deadline for the next new-tab splash JS push. `Some` while a
+    /// new-tab tab is active so the event loop wakes on the splash
+    /// period and pushes the next frame. `None` clears the wake.
+    splash_js_next_push: Option<Instant>,
     /// True while the last `paint_chrome_with` used the loading animation
     /// path (OSR buffer absent or wrong size). Cleared when the OSR path
     /// resumes. Used to emit the `debug!` transition log exactly once.
@@ -2395,6 +2403,8 @@ impl AppState {
             favicons: HashMap::new(),
             show_favicons,
             splash: crate::loading_anim::new_splash(),
+            last_splash_tick: None,
+            splash_js_next_push: None,
             loading_anim_active: false,
             loading_anim_next_wake: None,
             resize_paint_watchdog: ResizePaintWatchdog::default(),
@@ -3327,19 +3337,6 @@ impl AppState {
             || self.surface_drifted
             || host_is_loading;
 
-        // Splash overlay: when the active tab is the buffr://new page and
-        // we're past the loading-anim phase (OSR has painted), draw the
-        // animated wordmark on top of the page. The chrome buffer is
-        // transparent in the browser region so the OSR shows through and
-        // the splash glyphs alpha-blend over it.
-        let active_url = self
-            .host
-            .as_ref()
-            .map(|h| h.active_tab_live_url())
-            .unwrap_or_default();
-        let want_splash_overlay =
-            !want_anim && (active_url == NEW_TAB_URL || active_url.starts_with(NEW_TAB_URL));
-
         // Idle short-circuit. If nothing has changed since the last paint —
         // chrome buffer up to date, no fresh CEF paint queued, no animation
         // pending, and the loading-anim flag is already in sync (so we won't
@@ -3353,7 +3350,6 @@ impl AppState {
         if !chrome_dirty
             && osr_meta.is_none()
             && !want_anim
-            && !want_splash_overlay
             && want_anim == self.loading_anim_active
         {
             return;
@@ -3394,8 +3390,7 @@ impl AppState {
         // Build the OsrUpload from our just-swapped scratch buffer.
         let new_osr_generation;
         let chrome_dirty_effective =
-            should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated)
-                || want_splash_overlay;
+            should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated);
         let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
         let res = match paint_path {
             PaintPath::Animation => {
@@ -3449,7 +3444,7 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, h| {
+                    |buf, w, _h| {
                         paint_chrome_strips(
                             buf,
                             w,
@@ -3464,16 +3459,6 @@ impl AppState {
                             overlay_data.as_ref(),
                             context_menu_overlay.as_ref(),
                         );
-                        if want_splash_overlay {
-                            crate::loading_anim::paint_overlay(
-                                buf,
-                                w,
-                                h,
-                                (0, l_browser_y, l_browser_w, l_browser_h),
-                                splash,
-                                anim_fg,
-                            );
-                        }
                     },
                     Some(osr_upload),
                 )
@@ -3503,7 +3488,7 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, h| {
+                    |buf, w, _h| {
                         paint_chrome_strips(
                             buf,
                             w,
@@ -3518,16 +3503,6 @@ impl AppState {
                             overlay_data.as_ref(),
                             context_menu_overlay.as_ref(),
                         );
-                        if want_splash_overlay {
-                            crate::loading_anim::paint_overlay(
-                                buf,
-                                w,
-                                h,
-                                (0, l_browser_y, l_browser_w, l_browser_h),
-                                splash,
-                                anim_fg,
-                            );
-                        }
                     },
                     Some(osr_upload),
                 )
@@ -3564,11 +3539,11 @@ impl AppState {
             self.last_painted_chrome_gen = self.chrome_generation;
         }
 
-        // Schedule the next wake when either the loading-anim path or the
-        // new-tab splash overlay is active. `Splash` reads the wall clock
-        // each `cells()` call, so we just need to fire a redraw on the
-        // splash period to surface the next tick's cell layout.
-        if want_anim || want_splash_overlay {
+        // Schedule the next wake while the loading-anim path is active.
+        // `Splash` reads the wall clock each `cells()` call, so we just
+        // need to fire a redraw on the splash period to surface the next
+        // tick's cell layout.
+        if want_anim {
             self.loading_anim_next_wake = Some(Instant::now() + hjkl_splash::DEFAULT_PERIOD);
         } else {
             self.loading_anim_next_wake = None;
@@ -6104,6 +6079,41 @@ fn mode_label(mode: PageMode) -> &'static str {
     }
 }
 
+impl AppState {
+    /// Push the current splash frame's HTML into the new-tab page when
+    /// the active tab is `buffr://new` and the splash tick has changed
+    /// since the last push. Arms `splash_js_next_push` for the next
+    /// period boundary so the event-loop deadline keeps advancing the
+    /// animation without input. Clears state when the user navigates
+    /// away from the new-tab page.
+    fn tick_splash_js_push(&mut self) {
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        let url = host.active_tab_live_url();
+        let on_new_tab = url == NEW_TAB_URL || url.starts_with(NEW_TAB_URL);
+        if !on_new_tab {
+            self.last_splash_tick = None;
+            self.splash_js_next_push = None;
+            return;
+        }
+        let tick = self.splash.tick();
+        if Some(tick) != self.last_splash_tick {
+            let html = crate::loading_anim::splash_frame_html(&self.splash);
+            let escaped = serde_json::to_string(&html).unwrap_or_else(|_| "\"\"".to_string());
+            host.run_main_frame_js(
+                &format!(
+                    "(()=>{{const e=document.getElementById('buffr-splash');\
+                     if(e)e.innerHTML={escaped};}})()"
+                ),
+                "buffr://splash",
+            );
+            self.last_splash_tick = Some(tick);
+        }
+        self.splash_js_next_push = Some(Instant::now() + hjkl_splash::DEFAULT_PERIOD);
+    }
+}
+
 impl ApplicationHandler<BuffrUserEvent> for AppState {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
         match event {
@@ -7499,6 +7509,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             self.request_redraw();
         }
 
+        // New-tab splash JS push: when the active tab is `buffr://new`,
+        // push the current splash frame's HTML into the page's
+        // `<pre id="buffr-splash">` element via execute_javascript. Tick-
+        // deduped so a busy loop iteration doesn't spam the renderer; the
+        // wake schedule arms the next push at the splash period boundary.
+        self.tick_splash_js_push();
+
         // CEF resize debounce: fire the pending osr_resize once the drag
         // has been quiet for CEF_RESIZE_DEBOUNCE. Each Resized event refreshes
         // the deadline; we only call host.osr_resize once per drag gesture.
@@ -7654,6 +7671,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // the scheduled probe time so we can present once and check whether
         // the compositor is releasing buffers again.
         let deadline = match self.next_probe_at {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        };
+        // New-tab splash JS push: clamp wake to the next splash period so
+        // the animation advances without input.
+        let deadline = match self.splash_js_next_push {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
