@@ -1,0 +1,55 @@
+[package]
+name = "buffr-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
+# Browser binary. `buffr` (supervisor) spawns this as its child process.
+# The on-crates.io `buffr` package is the stub at apps/buffr-stub.
+publish = false
+
+[[bin]]
+name = "buffr-app"
+path = "src/main.rs"
+
+
+[dependencies]
+buffr-core.workspace = true
+buffr-history.workspace = true
+buffr-bookmarks.workspace = true
+buffr-downloads.workspace = true
+buffr-zoom.workspace = true
+buffr-permissions.workspace = true
+# Enable the `winit` feature so we can pull in
+# `buffr_modal::key_event_to_chord` to translate winit key events into
+# our internal chord type without re-implementing the mapping.
+buffr-modal = { workspace = true, features = ["winit"] }
+buffr-ui.workspace = true
+buffr-config.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+cef.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true
+clap.workspace = true
+tempfile.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ctrlc = "3.5.2"
+interprocess = "2"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

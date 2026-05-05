@@ -89,7 +89,8 @@ chmod +x target/dist/linux/buffr-*-x86_64.AppImage
 
 The AppImage embeds:
 
-- `usr/bin/buffr` + `usr/bin/buffr-helper`
+- `usr/bin/buffr` (supervisor) + `usr/bin/buffr-app` (browser) +
+  `usr/bin/buffr-helper`
 - `usr/lib/libcef.so` + `*.pak` + `icudtl.dat` + `v8_context_snapshot.bin`
 - `usr/lib/locales/<lang>.pak`
 - `AppRun` launcher (sets `LD_LIBRARY_PATH` and execs `usr/bin/buffr`)
@@ -124,21 +125,24 @@ Layout on disk:
 
 ```
 /opt/buffr/                          (binaries + CEF runtime payload)
-├── buffr                            (main exe; rpath=$ORIGIN finds libcef.so)
-├── buffr-helper
+├── buffr                            (supervisor — Linux entrypoint)
+├── buffr-app                        (browser; rpath=$ORIGIN finds libcef.so)
+├── buffr-helper                     (CEF subprocess helper)
 ├── libcef.so
 ├── *.pak / icudtl.dat / v8_context_snapshot.bin
 ├── locales/
 └── icon.png
 /usr/share/applications/buffr.desktop
 /usr/share/icons/hicolor/512x512/apps/buffr.png
-/usr/local/bin/buffr -> /opt/buffr/buffr   (postinst symlink)
+/usr/local/bin/buffr     -> /opt/buffr/buffr      (postinst symlinks)
+/usr/local/bin/buffr-app -> /opt/buffr/buffr-app
+/usr/local/bin/buffr-helper -> /opt/buffr/buffr-helper
 ```
 
 The `postinst` hook also refreshes `gtk-update-icon-cache` and
 `update-desktop-database` best-effort — missing tooling is not an error. The
-`prerm` hook removes the `/usr/local/bin/buffr` symlink if (and only if) it
-still points back at `/opt/buffr/buffr`.
+`prerm` hook removes the `/usr/local/bin/buffr*` symlinks if (and only if) they
+still point back at `/opt/buffr/`.
 
 ### Apt depends
 

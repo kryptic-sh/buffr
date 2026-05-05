@@ -47,9 +47,11 @@ if [ -f %{_sourcedir}/buffr.png ]; then
 fi
 
 %post
-# /usr/local/bin/buffr -> /opt/buffr/buffr symlink. Mirrors deb postinst.
+# /usr/local/bin symlinks for all buffr binaries. Mirrors deb postinst.
 mkdir -p /usr/local/bin
 ln -sf /opt/buffr/buffr /usr/local/bin/buffr
+ln -sf /opt/buffr/buffr-app /usr/local/bin/buffr-app
+ln -sf /opt/buffr/buffr-helper /usr/local/bin/buffr-helper
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q -t %{_datadir}/icons/hicolor || true
@@ -61,12 +63,16 @@ fi
 exit 0
 
 %postun
-# Only unlink if still pointing at /opt/buffr/buffr.
-if [ "$1" = 0 ] && [ -L /usr/local/bin/buffr ]; then
-    target="$(readlink /usr/local/bin/buffr 2>/dev/null || true)"
-    if [ "$target" = "/opt/buffr/buffr" ]; then
-        rm -f /usr/local/bin/buffr
-    fi
+# Remove symlinks only if still pointing at /opt/buffr.
+if [ "$1" = 0 ]; then
+    for bin in buffr buffr-app buffr-helper; do
+        if [ -L "/usr/local/bin/$bin" ]; then
+            target="$(readlink "/usr/local/bin/$bin" 2>/dev/null || true)"
+            if [ "$target" = "/opt/buffr/$bin" ]; then
+                rm -f "/usr/local/bin/$bin"
+            fi
+        fi
+    done
 fi
 
 exit 0

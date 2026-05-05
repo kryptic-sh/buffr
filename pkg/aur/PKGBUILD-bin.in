@@ -35,12 +35,14 @@ package() {
 
     # Whole runtime tree drops into /opt/buffr (libcef.so resolves via
     # rpath/$ORIGIN, and the CEF paks/locales must sit beside the
-    # binary). /usr/bin/buffr is a thin symlink for $PATH.
+    # binaries). /usr/bin symlinks expose all three binaries to $PATH.
     cd "$srcdir/buffr-${pkgver}-${_arch}"
     install -dm755 "$pkgdir/opt/buffr"
     cp -a . "$pkgdir/opt/buffr/"
     install -dm755 "$pkgdir/usr/bin"
     ln -sf /opt/buffr/buffr "$pkgdir/usr/bin/buffr"
+    ln -sf /opt/buffr/buffr-app "$pkgdir/usr/bin/buffr-app"
+    ln -sf /opt/buffr/buffr-helper "$pkgdir/usr/bin/buffr-helper"
 
     # `.desktop` + icon ship inside the runtime tarball (xtask
     # `build_tarball`). Hoist them out of /opt/buffr/ into the standard

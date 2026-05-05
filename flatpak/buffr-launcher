@@ -7,5 +7,8 @@
 # LD_LIBRARY_PATH is set here (not in finish-args) so it lives in
 # the user's process tree and survives `flatpak run` argv passing —
 # the Flathub guidance discourages env in finish-args.
+#
+# Execs buffr-app (the browser binary) directly — the supervisor is not
+# included in the flatpak bundle (bubblewrap provides isolation instead).
 export LD_LIBRARY_PATH="/app/buffr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec /app/buffr/buffr "$@"
+exec /app/buffr/buffr-app "$@"

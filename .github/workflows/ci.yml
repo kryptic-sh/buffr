@@ -219,7 +219,7 @@ jobs:
           set -e
           test -f target/debug/Buffr.app/Contents/Info.plist
           test -f target/debug/Buffr.app/Contents/PkgInfo
-          test -f target/debug/Buffr.app/Contents/MacOS/buffr
+          test -f target/debug/Buffr.app/Contents/MacOS/buffr-app
           test -d "target/debug/Buffr.app/Contents/Frameworks/Chromium Embedded Framework.framework"
           test -f "target/debug/Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/Info.plist"
           test -f "target/debug/Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/MacOS/Buffr Helper"
@@ -326,6 +326,7 @@ jobs:
           fi
           tar tzf "${tarballs[0]}" | head -10
           tar tzf "${tarballs[0]}" | grep -q '/buffr$'
+          tar tzf "${tarballs[0]}" | grep -q '/buffr-app$'
           tar tzf "${tarballs[0]}" | grep -q '/libcef.so$'
           echo "tarball OK: ${tarballs[0]}"
 
@@ -453,7 +454,7 @@ jobs:
         run: cargo xtask fetch-cef --target ${{ matrix.platform }}
 
       - name: cargo build (release)
-        run: cargo build --release -p buffr-bin -p buffr-helper
+        run: cargo build --release -p buffr-app -p buffr-helper
 
       - name: cargo xtask package-windows-msi
         run: cargo xtask package-windows-msi --release

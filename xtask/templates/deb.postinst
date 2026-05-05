@@ -1,9 +1,11 @@
 #!/bin/sh
 set -e
 
-# Install /usr/local/bin/buffr -> /opt/buffr/buffr symlink. Idempotent.
+# Install /usr/local/bin symlinks for all buffr binaries. Idempotent.
 mkdir -p /usr/local/bin
 ln -sf /opt/buffr/buffr /usr/local/bin/buffr
+ln -sf /opt/buffr/buffr-app /usr/local/bin/buffr-app
+ln -sf /opt/buffr/buffr-helper /usr/local/bin/buffr-helper
 
 # Refresh icon cache best-effort. Missing tooling is not an error.
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then

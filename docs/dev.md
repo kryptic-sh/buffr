@@ -28,8 +28,8 @@ cargo xtask fetch-cef
 # Build the workspace.
 cargo build
 
-# Run.
-cargo run -p buffr-bin
+# Run (supervisor spawns buffr-app automatically on Linux).
+cargo run
 ```
 
 `cargo xtask fetch-cef` accepts:
@@ -60,7 +60,8 @@ the `cef` crate version.
 ```
 buffr/
 ├── apps/
-│   ├── buffr/         # main binary (browser process)
+│   ├── buffr/         # supervisor binary (Linux default entrypoint)
+│   ├── buffr-app/     # browser binary (spawned by supervisor on Linux)
 │   └── buffr-helper/  # CEF subprocess helper (macOS Helper.app)
 ├── crates/
 │   ├── buffr-core/    # CEF lifecycle + browser host + build.rs
@@ -76,7 +77,13 @@ buffr/
 ## Running
 
 ```sh
-RUST_LOG=buffr=debug,buffr_core=debug cargo run -p buffr-bin
+RUST_LOG=buffr=debug,buffr_core=debug cargo run
+```
+
+To run the browser directly (without supervision):
+
+```sh
+RUST_LOG=buffr_app=debug,buffr_core=debug cargo run -p buffr-app
 ```
 
 ### Wayland
@@ -96,7 +103,7 @@ feature:
 
 ```sh
 # Currently panics at runtime — only compiles. Tracking issue: PLAN.md Phase 3.
-cargo run -p buffr-bin --features osr
+cargo run -p buffr-app --features osr
 ```
 
 The OSR path will run CEF in windowless mode, blitting paint events onto a
@@ -168,12 +175,21 @@ Full guide (layout, depends, glibc, sandbox caveats, signing TODO):
 
 ## Crash-restart supervisor
 
-Run `buffr-supervisor` instead of `buffr` for automatic crash-restart. The
-supervisor spawns `buffr` as a child process group, detects non-zero exit, and
-relaunches it with a 250 ms cooldown; after 3 crashes in 30 seconds it halts and
-points at `~/.local/share/buffr/crashes/`. Linux only in this release; future
-releases will integrate it transparently so `buffr` itself becomes the
-supervisor. Set `BUFFR_CHILD_BIN` to override the child binary path for testing.
+`buffr` IS the supervisor — it spawns `buffr-app` (the browser binary) as a
+child process group, detects non-zero exit, and relaunches it with a 250 ms
+cooldown. After 3 crashes in 30 seconds it halts and points at
+`~/.local/share/buffr/crashes/`. Linux only in this release (Round 3/5 of #28).
+
+```sh
+# Default: supervisor auto-spawns buffr-app.
+./buffr
+
+# Smoke-test the supervisor without a real browser binary:
+BUFFR_CHILD_BIN=/bin/true ./buffr
+```
+
+macOS and Windows still run `buffr-app` directly (supervision wires up in Rounds
+4-5).
 
 ## Useful commands
 
@@ -187,7 +203,7 @@ cargo test --workspace
 
 | Concern                   | File                                |
 | ------------------------- | ----------------------------------- |
-| Subprocess dispatch       | `apps/buffr/src/main.rs::main`      |
+| Subprocess dispatch       | `apps/buffr-app/src/main.rs::main`  |
 | `cef::App` impl           | `crates/buffr-core/src/app.rs`      |
 | Browser creation          | `crates/buffr-core/src/host.rs`     |
 | CEF callback handlers     | `crates/buffr-core/src/handlers.rs` |

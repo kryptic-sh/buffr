@@ -1,5 +1,5 @@
 [package]
-name = "buffr-bin"
+name = "buffr"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,51 +7,22 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
-# Real binary lives here; the on-crates.io `buffr` is a stub at
-# apps/buffr-stub that points users at GitHub releases. Two workspace
-# members can't share a package name — this one had to be renamed, but
-# the produced binary is still `target/<profile>/buffr`.
+description = "Crash-restart + hang watchdog supervisor for the buffr browser. Linux default entrypoint (Round 3/5 of #28)."
 publish = false
 
 [[bin]]
 name = "buffr"
 path = "src/main.rs"
 
-
 [dependencies]
-buffr-core.workspace = true
-buffr-history.workspace = true
-buffr-bookmarks.workspace = true
-buffr-downloads.workspace = true
-buffr-zoom.workspace = true
-buffr-permissions.workspace = true
-# Enable the `winit` feature so we can pull in
-# `buffr_modal::key_event_to_chord` to translate winit key events into
-# our internal chord type without re-implementing the mapping.
-buffr-modal = { workspace = true, features = ["winit"] }
-buffr-ui.workspace = true
-buffr-config.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-cef.workspace = true
-winit.workspace = true
-raw-window-handle.workspace = true
 clap.workspace = true
-tempfile.workspace = true
-wgpu.workspace = true
-pollster.workspace = true
-bytemuck.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-ctrlc = "3.5.2"
-interprocess = "2"
-sha2 = "0.10"
-hex = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["process", "signal"] }
+signal-hook = "0.3"
 
 [dev-dependencies]
-proptest = "1"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+tempfile.workspace = true

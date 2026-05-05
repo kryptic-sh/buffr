@@ -11,16 +11,18 @@ members = [
     "crates/buffr-zoom",
     "crates/buffr-permissions",
     "apps/buffr",
+    "apps/buffr-app",
     "apps/buffr-helper",
-    "apps/buffr-supervisor",
     "xtask",
 ]
 # `apps/buffr-stub` is intentionally *not* a workspace member. It's the
-# crates.io-published stub that owns the `buffr` package name, and its
-# bin output filename collides with `apps/buffr` (the real binary). Keep
-# it out of `cargo build --workspace` paths and publish it independently:
+# crates.io-published stub that owns the `buffr` name on crates.io.
+# Publish it independently:
 #   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
 exclude = ["apps/buffr-stub", "fuzz"]
+# `cargo run` / `cargo build` (no -p) defaults to the supervisor, which is
+# the user-facing entrypoint on Linux. macOS/Windows bypass supervision
+# until rounds 4-5.
 default-members = ["apps/buffr"]
 
 [workspace.package]

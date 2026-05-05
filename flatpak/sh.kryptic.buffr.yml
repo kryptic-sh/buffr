@@ -37,6 +37,13 @@
 # /app/buffr/buffr-helper — no flatpak-spawn workaround needed. CEF's
 # `--no-sandbox` is set programmatically already; flatpak's own
 # bubblewrap layer provides the isolation.
+#
+# Round 3 binary rename note: the browser binary is now `buffr-app`
+# (inside /app/buffr/buffr-app). The supervisor (`buffr`) is intentionally
+# NOT included in the flatpak — bubblewrap already provides the sandboxed
+# isolation layer that makes supervision less critical, and the supervisor's
+# process-group / UDS patterns interact poorly with flatpak's PID namespace.
+# The launcher script (/app/bin/buffr) execs buffr-app directly for now.
 app-id: sh.kryptic.buffr
 runtime: org.gnome.Platform
 runtime-version: '47'
@@ -75,6 +82,8 @@ modules:
     buildsystem: simple
     build-commands:
       # Layout: /app/buffr/<runtime tree>, /app/bin/buffr (launcher).
+      # The launcher execs /app/buffr/buffr-app (the browser binary) directly.
+      # The supervisor binary is not included in the flatpak (see note above).
       - install -d /app/buffr
       - cp -r payload/. /app/buffr/
       # Launcher script. LD_LIBRARY_PATH must point at /app/buffr so

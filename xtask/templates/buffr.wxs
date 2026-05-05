@@ -68,16 +68,18 @@
       <Directory Id="DesktopFolder" Name="Desktop" />
     </Directory>
 
-    <!-- buffr.exe + buffr-helper.exe stay hand-rolled so the
+    <!-- buffr-app.exe + buffr-helper.exe stay hand-rolled so the
          Shortcut Target=`[#filBuffrExe]` reference resolves
          deterministically. The rest of the runtime tree (CEF DLLs,
          paks, locales, ...) is harvested by heat.exe at xtask time
          into a separate fragment that defines `<ComponentGroup
-         Id="CefRuntime">`. -->
+         Id="CefRuntime">`.
+         NOTE: The supervisor (buffr.exe) is not shipped on Windows in
+         Round 3; Windows supervision via Job Objects lands in Round 5. -->
     <ComponentGroup Id="MainPayload" Directory="INSTALLFOLDER">
       <Component Id="cmpBuffrExe" Guid="*">
         <File Id="filBuffrExe"
-              Source="payload-bin\buffr.exe"
+              Source="payload-bin\buffr-app.exe"
               KeyPath="yes" />
       </Component>
       <Component Id="cmpHelperExe" Guid="*">

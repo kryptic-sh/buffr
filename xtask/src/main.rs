@@ -65,8 +65,9 @@ const WIX_TEMPLATE: &str = include_str!("../templates/buffr.wxs");
 /// Bundle identifiers + display name used by the macOS bundle templates.
 ///
 /// `DISPLAY_NAME` is the TitleCase bundle name (`Buffr.app`, plist
-/// `CFBundleName`/`CFBundleDisplayName`). The binary inside the bundle keeps
-/// the lowercase name `buffr` (CFBundleExecutable), matching the Cargo output.
+/// `CFBundleName`/`CFBundleDisplayName`). The browser binary inside the
+/// bundle is `buffr-app` (CFBundleExecutable). The supervisor is not
+/// included in the macOS bundle in this round (Round 4 wires that up).
 const DISPLAY_NAME: &str = "Buffr";
 const BUNDLE_ID_MAIN: &str = "sh.kryptic.buffr";
 const BUNDLE_ID_HELPER: &str = "sh.kryptic.buffr.helper";
@@ -503,12 +504,12 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     let profile = if parsed.release { "release" } else { "debug" };
 
     // 1. Build the binaries.
-    eprintln!("xtask: building buffr + buffr-helper ({profile})");
+    eprintln!("xtask: building buffr-app + buffr-helper ({profile})");
     let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(&workspace)
         .arg("build")
         .arg("-p")
-        .arg("buffr-bin")
+        .arg("buffr-app")
         .arg("-p")
         .arg("buffr-helper");
     if parsed.release {
@@ -528,7 +529,7 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
         None => workspace.join("target").join(profile),
     };
 
-    let buffr_bin = target_dir.join("buffr");
+    let buffr_bin = target_dir.join("buffr-app");
     let helper_bin = target_dir.join("buffr-helper");
     if !buffr_bin.exists() {
         bail!("expected `{}` after build", buffr_bin.display());
@@ -668,8 +669,10 @@ fn stage_bundle(
     fs::write(contents.join("PkgInfo"), b"APPL????")
         .with_context(|| format!("writing {}/PkgInfo", contents.display()))?;
 
-    // Main executable.
-    let main_exec = macos.join("buffr");
+    // Main executable (browser binary). CFBundleExecutable = "buffr-app".
+    // The supervisor (buffr) is not included in the macOS bundle in Round 3;
+    // that wiring lands in Round 4.
+    let main_exec = macos.join("buffr-app");
     copy_file_executable(buffr_bin, &main_exec)?;
 
     // Framework — always present in a real build, but we still copy via
@@ -745,7 +748,7 @@ fn render_main_plist(version: &str) -> String {
         .replace("{NAME}", DISPLAY_NAME)
         .replace("{VERSION}", version)
         .replace("{BUNDLE_ID_MAIN}", BUNDLE_ID_MAIN)
-        .replace("{EXECUTABLE}", "buffr")
+        .replace("{EXECUTABLE}", "buffr-app")
         .replace("{COPYRIGHT}", COPYRIGHT)
 }
 
@@ -860,12 +863,16 @@ fn package_linux(args: Vec<String>) -> Result<()> {
 
     // 1. Build the workspace binaries. The buffr-core build.rs will stage
     //    libcef.so, *.pak, locales/, icudtl.dat next to the binaries.
-    eprintln!("xtask: building buffr + buffr-helper ({profile})");
+    eprintln!(
+        "xtask: building buffr (supervisor) + buffr-app (browser) + buffr-helper ({profile})"
+    );
     let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(&workspace)
         .arg("build")
         .arg("-p")
-        .arg("buffr-bin")
+        .arg("buffr")
+        .arg("-p")
+        .arg("buffr-app")
         .arg("-p")
         .arg("buffr-helper");
     if parsed.release {
@@ -910,8 +917,10 @@ fn package_linux(args: Vec<String>) -> Result<()> {
 /// resulting package would be unusable.
 #[derive(Debug)]
 struct RuntimePayload {
-    /// Absolute path to the `buffr` binary.
+    /// Absolute path to the `buffr` supervisor binary.
     buffr: PathBuf,
+    /// Absolute path to the `buffr-app` browser binary.
+    buffr_app: PathBuf,
     /// Absolute path to the `buffr-helper` binary.
     helper: PathBuf,
     /// Absolute path to `libcef.so` (Linux dist).
@@ -926,12 +935,16 @@ struct RuntimePayload {
 
 fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
     let buffr = target_dir.join("buffr");
+    let buffr_app = target_dir.join("buffr-app");
     let helper = target_dir.join("buffr-helper");
     let libcef = target_dir.join("libcef.so");
     let locales = target_dir.join("locales");
 
     if !buffr.exists() {
         bail!("expected `{}` after build", buffr.display());
+    }
+    if !buffr_app.exists() {
+        bail!("expected `{}` after build", buffr_app.display());
     }
     if !helper.exists() {
         bail!("expected `{}` after build", helper.display());
@@ -974,6 +987,7 @@ fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
 
     Ok(RuntimePayload {
         buffr,
+        buffr_app,
         helper,
         libcef,
         paks,
@@ -984,9 +998,13 @@ fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
 
 /// Stage the runtime payload (binaries + CEF runtime tree) inside
 /// `dest`. Used by the Debian package builder (`/opt/buffr/`).
+///
+/// Both `buffr` (supervisor, the Linux entrypoint) and `buffr-app`
+/// (browser binary) are installed. `buffr-helper` handles CEF subprocesses.
 fn stage_payload(dest: &Path, payload: &RuntimePayload) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     copy_file_executable(&payload.buffr, &dest.join("buffr"))?;
+    copy_file_executable(&payload.buffr_app, &dest.join("buffr-app"))?;
     copy_file_executable(&payload.helper, &dest.join("buffr-helper"))?;
     copy_into_dir(&payload.libcef, dest)?;
     for pak in &payload.paks {
@@ -1194,8 +1212,9 @@ fn build_rpm(
 ///
 /// ```text
 /// buffr-<ver>-<arch>/
-///   buffr               (executable)
-///   buffr-helper        (executable)
+///   buffr               (supervisor — Linux default entrypoint)
+///   buffr-app           (browser binary)
+///   buffr-helper        (CEF subprocess helper)
 ///   libcef.so
 ///   *.pak / *.dat / *.bin
 ///   locales/...
@@ -1678,7 +1697,7 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
     ];
 
     for dir in &candidates {
-        let buffr_exe = dir.join("buffr.exe");
+        let buffr_exe = dir.join("buffr-app.exe");
         let helper_exe = dir.join("buffr-helper.exe");
         let libcef_dll = dir.join("libcef.dll");
         if buffr_exe.exists() && helper_exe.exists() && libcef_dll.exists() {
@@ -1700,7 +1719,7 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
 }
 
 fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
-    let buffr_exe = dir.join("buffr.exe");
+    let buffr_exe = dir.join("buffr-app.exe");
     let helper_exe = dir.join("buffr-helper.exe");
     let icudtl = dir.join("icudtl.dat");
     let locales = dir.join("locales");
@@ -1727,9 +1746,9 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
         }
         let name_os = entry.file_name();
         let name = name_os.to_string_lossy();
-        // buffr.exe + helper.exe are tracked separately so the
+        // buffr-app.exe + buffr-helper.exe are tracked separately so the
         // Shortcut Target can reference them by id.
-        if name == "buffr.exe" || name == "buffr-helper.exe" {
+        if name == "buffr-app.exe" || name == "buffr-helper.exe" {
             continue;
         }
         if name.ends_with(".dll") {
@@ -1769,7 +1788,7 @@ fn collect_windows_payload_from(dir: &Path) -> Result<WindowsPayload> {
     })
 }
 
-/// Two-dir staging: buffr.exe / buffr-helper.exe go to `bin_dest` (the
+/// Two-dir staging: buffr-app.exe / buffr-helper.exe go to `bin_dest` (the
 /// hand-rolled wxs Components reference these explicitly so the
 /// Shortcut Target=`[#filBuffrExe]` resolves), everything else goes to
 /// `cef_dest` (heat.exe harvests it into a generated ComponentGroup).
@@ -1841,8 +1860,8 @@ mod tests {
         assert!(s.contains("<string>sh.kryptic.buffr</string>"));
         // CFBundleDisplayName / CFBundleName use the TitleCase display name.
         assert!(s.contains("<string>Buffr</string>"));
-        // CFBundleExecutable keeps the lowercase binary name.
-        assert!(s.contains("<string>buffr</string>"));
+        // CFBundleExecutable is the browser binary name.
+        assert!(s.contains("<string>buffr-app</string>"));
         assert!(!s.contains("{VERSION}"));
         assert!(!s.contains("{BUNDLE_ID_MAIN}"));
         assert!(!s.contains("{EXECUTABLE}"));
@@ -1910,9 +1929,9 @@ mod tests {
         fs::create_dir_all(fw.join("Versions/A/Resources")).unwrap();
         fs::write(fw.join("Versions/A/Chromium Embedded Framework"), b"stub").unwrap();
 
-        let buffr_bin = tmp.path().join("buffr");
+        let buffr_bin = tmp.path().join("buffr-app");
         let helper_bin = tmp.path().join("buffr-helper");
-        fs::write(&buffr_bin, b"#!/bin/sh\necho buffr\n").unwrap();
+        fs::write(&buffr_bin, b"#!/bin/sh\necho buffr-app\n").unwrap();
         fs::write(&helper_bin, b"#!/bin/sh\necho helper\n").unwrap();
 
         let app_dir = tmp.path().join("Buffr.app");
@@ -1920,7 +1939,7 @@ mod tests {
 
         assert!(app_dir.join("Contents/Info.plist").exists());
         assert!(app_dir.join("Contents/PkgInfo").exists());
-        assert!(app_dir.join("Contents/MacOS/buffr").exists());
+        assert!(app_dir.join("Contents/MacOS/buffr-app").exists());
         assert!(
             app_dir
                 .join("Contents/Frameworks/Chromium Embedded Framework.framework")
@@ -1984,8 +2003,9 @@ mod tests {
         assert!(rendered.contains("ExclusiveArch:  x86_64"));
         assert!(!rendered.contains("{VERSION}"));
         assert!(!rendered.contains("{ARCH}"));
-        // post-install symlink mirroring deb postinst.
+        // post-install symlinks for all buffr binaries.
         assert!(rendered.contains("ln -sf /opt/buffr/buffr /usr/local/bin/buffr"));
+        assert!(rendered.contains("ln -sf /opt/buffr/buffr-app /usr/local/bin/buffr-app"));
     }
 
     #[test]
@@ -2046,6 +2066,7 @@ mod tests {
         let target = tmp.path().join("target-release");
         fs::create_dir_all(target.join("locales")).unwrap();
         fs::write(target.join("buffr"), b"#!/bin/sh\n").unwrap();
+        fs::write(target.join("buffr-app"), b"#!/bin/sh\n").unwrap();
         fs::write(target.join("buffr-helper"), b"#!/bin/sh\n").unwrap();
         fs::write(target.join("libcef.so"), b"\x7fELF").unwrap();
         fs::write(target.join("chrome_100_percent.pak"), b"pak").unwrap();
@@ -2061,6 +2082,7 @@ mod tests {
         let dest = tmp.path().join("opt-buffr");
         stage_payload(&dest, &payload).unwrap();
         assert!(dest.join("buffr").exists());
+        assert!(dest.join("buffr-app").exists());
         assert!(dest.join("buffr-helper").exists());
         assert!(dest.join("libcef.so").exists());
         assert!(dest.join("chrome_100_percent.pak").exists());
@@ -2076,6 +2098,7 @@ mod tests {
         let target = tmp.path().join("target-release");
         fs::create_dir_all(target.join("locales")).unwrap();
         fs::write(target.join("buffr"), b"#!/bin/sh\n").unwrap();
+        fs::write(target.join("buffr-app"), b"#!/bin/sh\n").unwrap();
         fs::write(target.join("buffr-helper"), b"#!/bin/sh\n").unwrap();
         // No libcef.so on purpose.
 
@@ -2142,11 +2165,12 @@ mod tests {
 
     #[test]
     fn wix_template_lists_msi_payload() {
-        // The hand-rolled .wxs lists buffr.exe + buffr-helper.exe;
+        // The hand-rolled .wxs lists buffr-app.exe + buffr-helper.exe;
         // everything else (libcef.dll, paks, locales, ...) is harvested
         // by heat.exe at build time and referenced via
         // <ComponentGroupRef Id="CefRuntime" />.
-        assert!(WIX_TEMPLATE.contains("buffr.exe"));
+        // NOTE: supervisor (buffr.exe) is not in the Windows MSI in Round 3.
+        assert!(WIX_TEMPLATE.contains("buffr-app.exe"));
         assert!(WIX_TEMPLATE.contains("buffr-helper.exe"));
         assert!(WIX_TEMPLATE.contains("ComponentGroupRef Id=\"CefRuntime\""));
     }
@@ -2156,7 +2180,7 @@ mod tests {
         let tmp = tempdir();
         let target = tmp.path().join("target-release");
         fs::create_dir_all(target.join("locales")).unwrap();
-        fs::write(target.join("buffr.exe"), b"MZ").unwrap();
+        fs::write(target.join("buffr-app.exe"), b"MZ").unwrap();
         fs::write(target.join("buffr-helper.exe"), b"MZ").unwrap();
         fs::write(target.join("libcef.dll"), b"MZ").unwrap();
         fs::write(target.join("chrome_elf.dll"), b"MZ").unwrap();
@@ -2176,7 +2200,7 @@ mod tests {
         let cef_dest = tmp.path().join("staged-cef");
         stage_windows_payload(&bin_dest, &cef_dest, &payload).unwrap();
         // Bin dir holds only the two executables.
-        assert!(bin_dest.join("buffr.exe").exists());
+        assert!(bin_dest.join("buffr-app.exe").exists());
         assert!(bin_dest.join("buffr-helper.exe").exists());
         assert!(!bin_dest.join("libcef.dll").exists());
         // CEF dir holds the runtime tree.

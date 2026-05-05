@@ -18,8 +18,8 @@ Internally:
 
 1. Render `xtask/templates/buffr.wxs` with `{VERSION}` / `{INSTALL_DIR}` /
    `{ARCH}` substituted and write to `target/dist/windows/buffr.wxs`.
-2. Locate `buffr.exe`, `buffr-helper.exe`, `libcef.dll`, `icudtl.dat`, `*.pak`,
-   and `locales/` from one of:
+2. Locate `buffr-app.exe`, `buffr-helper.exe`, `libcef.dll`, `icudtl.dat`,
+   `*.pak`, and `locales/` from one of:
    - `target/<profile>/` (native Windows host),
    - `target/x86_64-pc-windows-msvc/<profile>/` (cross from Windows),
    - `target/x86_64-pc-windows-gnu/<profile>/` (Linux cross — see below).
@@ -40,7 +40,7 @@ identical MSIs for our needs (no per-user install, no MSIX, no bundle).
 
 ```
 C:\Program Files\buffr\
-├── buffr.exe
+├── buffr-app.exe
 ├── buffr-helper.exe
 ├── libcef.dll
 ├── icudtl.dat
@@ -77,7 +77,7 @@ If you want to produce the MSI from a Linux dev box without a Windows VM:
 2. Install MinGW: `pacman -S mingw-w64-gcc` (Arch) /
    `apt-get install gcc-mingw-w64-x86-64` (Debian).
 3. Cross-build:
-   `cargo build --target x86_64-pc-windows-gnu --release -p buffr -p buffr-helper`.
+   `cargo build --target x86_64-pc-windows-gnu --release -p buffr-app -p buffr-helper`.
 4. Run `cargo xtask package-windows-msi --release` — it will pick up the
    cross-target output automatically.
 
