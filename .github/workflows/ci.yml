@@ -401,13 +401,11 @@ jobs:
   windows-package:
     # Build the Windows MSI on a real Windows runner. WiX 3 toolset
     # ships preinstalled on `windows-latest`; we still install
-    # explicitly via choco to lock the version. Independent of the
-    # linux job — a CEF download failure here does not gate main.
-    # Unsigned this round; Authenticode signing lives in release.yml.
+    # explicitly via choco to lock the version. Unsigned this round;
+    # Authenticode signing lives in release.yml.
     name: Windows package (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
