@@ -5,6 +5,17 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # release.yml calls this workflow as a gate so a tag-push runs the
+  # full CI suite before packaging starts.
+  workflow_call:
+
+# When BCTP pushes a `chore: bump version` commit to main, the same SHA is
+# tag-pushed moments later — release.yml fires and invokes this workflow as
+# a reusable gate. Skip the standalone main-push run for that exact commit
+# subject so CI doesn't execute twice on the same SHA. Disambiguation:
+#   - main-push of bump commit  → ref=refs/heads/main, msg=chore: bump… → SKIP
+#   - tag-push via release.yml  → workflow_call (no head_commit gate)   → RUN
+#   - PR / direct main push     → other event, or different msg          → RUN
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,6 +29,7 @@ concurrency:
 jobs:
   linux:
     name: linux build + lint + smoke
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump version')) }}"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -106,6 +118,7 @@ jobs:
 
   linux-osr:
     name: linux build + lint (osr feature)
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump version')) }}"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -163,6 +176,7 @@ jobs:
     # the binaries inside are Linux ELFs and won't run on Darwin. Real
     # macOS smoke testing is deferred to Phase 6.
     name: macOS bundle (cross)
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump version')) }}"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -232,6 +246,7 @@ jobs:
     # The job verifies the bundle scripts produce installable artifacts
     # and that `dpkg-deb -I` / `rpm -qpi` parse the resulting metadata.
     name: linux package (${{ matrix.platform }})
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump version')) }}"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -345,6 +360,7 @@ jobs:
     # workflow. Apple Silicon only — see release.yml for why Intel Mac
     # was dropped.
     name: macOS package (macosarm64)
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump version')) }}"
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -402,6 +418,7 @@ jobs:
     # explicitly via choco to lock the version. Unsigned this round;
     # Authenticode signing lives in release.yml.
     name: Windows package (${{ matrix.platform }})
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump version')) }}"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:

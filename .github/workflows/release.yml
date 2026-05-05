@@ -18,8 +18,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Gate the release pipeline on the full CI suite (lint + tests + smoke
+  # + per-platform package smoke). The tag-push commit is independent of
+  # any main-push run — nothing prevents tagging a commit that wasn't
+  # pushed to main, or a CI failure on one stream while release proceeds
+  # on the other. Calling ci.yml here makes the gate explicit. The
+  # bump-commit main push itself is suppressed by the skip conditions in
+  # ci.yml so we don't double-run on the same SHA.
+  gate:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
   linux:
     name: linux package (${{ matrix.platform }})
+    needs: [gate]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
@@ -117,6 +129,7 @@ jobs:
     # in 0.1.14 — see README "Why no Intel Mac?" — the GitHub runner
     # pool was queueing 1-2h per leg and blocking the publish pipeline.
     name: macOS package (macosarm64)
+    needs: [gate]
     runs-on: macos-latest
     timeout-minutes: 90
     permissions:
@@ -190,6 +203,7 @@ jobs:
 
   windows:
     name: Windows package (${{ matrix.platform }})
+    needs: [gate]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
