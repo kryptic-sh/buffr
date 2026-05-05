@@ -255,11 +255,12 @@ pub struct BrowserHost {
     /// the UI thread via [`Self::osr_resize`]; read by the CEF IO
     /// thread inside `OsrPaintHandler::view_rect`.
     osr_view: SharedOsrViewState,
-    /// Clipboard sink. `hjkl_clipboard::Clipboard` (0.4+) is
-    /// `Clone + Send + Sync` with `&self` methods, so no interior
-    /// mutability is required. `Clipboard::new` may fail (no display,
+    /// Clipboard sink. `hjkl_clipboard::Clipboard` (0.5+) is
+    /// `Send + Sync` with `&self` methods but no longer `Clone`, so we
+    /// wrap in `Arc` to hand cheap reference clones to worker threads
+    /// via `clipboard_handle`. `Clipboard::new` may fail (no display,
     /// missing libs); `None` disables clipboard ops gracefully.
-    clipboard: Option<hjkl_clipboard::Clipboard>,
+    clipboard: Option<Arc<hjkl_clipboard::Clipboard>>,
     /// Set by `BuffrLoadHandler::on_load_start` (main frame), cleared
     /// by `OsrPaintHandler::on_paint`. Apps layer reads via
     /// [`Self::is_loading`] to keep the loading anim playing across
@@ -358,10 +359,10 @@ const CLOSED_STACK_CAP: usize = 8;
 ///
 /// Wraps the underlying `hjkl-clipboard` handle so embedders can read
 /// the system clipboard from a worker thread without depending on the
-/// crate directly. The handle is `Clone + Send + Sync`, so the wrapper
-/// is too — clone it freely, move it across threads.
+/// crate directly. The handle is shared via `Arc`, so the wrapper is
+/// `Clone + Send + Sync` — clone it freely, move it across threads.
 #[derive(Clone)]
-pub struct ClipboardReader(hjkl_clipboard::Clipboard);
+pub struct ClipboardReader(Arc<hjkl_clipboard::Clipboard>);
 
 impl ClipboardReader {
     /// Block until the system clipboard yields a non-empty UTF-8 text
@@ -485,7 +486,7 @@ impl BrowserHost {
             osr_frame,
             osr_view,
             clipboard: match hjkl_clipboard::Clipboard::new() {
-                Ok(cb) => Some(cb),
+                Ok(cb) => Some(Arc::new(cb)),
                 Err(err) => {
                     tracing::warn!(error = %err, "clipboard: init failed; yank/paste disabled");
                     None
