@@ -32,6 +32,12 @@ pub static NEW_TAB_HTML_TEMPLATE: &str =
 /// The marker the apps layer replaces with rendered keybinding rows.
 pub const NEW_TAB_KEYBINDS_MARKER: &str = "<!--KEYBINDS-->";
 
+/// Marker the apps layer replaces with the static splash wordmark
+/// (per-cell HTML grid). Substituted once per page request alongside
+/// the keybindings; the splash overlay (`#buffr-splash`) is updated
+/// per tick by the host via execute_javascript.
+pub const NEW_TAB_SPLASH_ART_MARKER: &str = "<!--SPLASH-ART-->";
+
 /// Closure invoked on each `buffr://new` request to produce the page
 /// bytes. Returning a fresh `Vec<u8>` each call lets the apps layer
 /// re-render the dynamic keybinding section without restarting CEF.

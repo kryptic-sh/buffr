@@ -23,40 +23,35 @@
        cells are wrapped in `<span class="hl">…</span>` and lit up
        with the accent. Initial textContent below shows frame 0 so
        the wordmark is visible before the first JS push lands. */
-    /* Splash wordmark. Two `<pre>` layers stacked at the same position:
-       the static art layer (dim) and a cursor overlay (accent) that the
-       host overwrites with mostly-spaces + `█` at the active cells on
-       every splash tick. Stacking avoids inline spans, which break
-       monospace alignment when `█` and ASCII share glyphs from
-       different fonts in the browser's fallback chain. */
+    /* Splash wordmark. Two stacked grid layers — static art (dim) and
+       a cursor overlay (accent) that the host updates per tick via
+       execute_javascript. Each layer is a 5×41 grid where filled cells
+       are CSS-painted rectangles (`background: currentColor`); empty
+       cells are bare spans. This sidesteps font shaping entirely —
+       earlier `<pre>`-based layouts had the `█` (U+2588) glyph render
+       with cumulative width drift across long runs, mis-aligning the
+       top/middle crossbars of `f`/`F` letters from their spines. */
     .splash-wrap { text-align: center; margin: 0 0 2.5rem; }
     .splash-stack {
       display: inline-block; position: relative;
-      /* `monospace` keyword maps through the OS's monospace
-         configuration — on Linux that's whatever fontconfig points
-         `monospace` at (typically DejaVu Sans Mono / Liberation Mono),
-         which has matching advance widths for `█` (U+2588) and space.
-         Listing specific families first risked falling through to a
-         fallback font where `█` has a different advance and rows of
-         box glyphs visibly drifted relative to rows of ASCII gaps. */
-      font-family: monospace;
-      line-height: 1; letter-spacing: 0;
-      font-variant-ligatures: none;
-      font-feature-settings: "liga" 0, "calt" 0, "kern" 0, "dlig" 0;
-      font-kerning: none;
-      text-rendering: optimizeSpeed;
+      --splash-cell-w: 0.55em;
+      --splash-cell-h: 1em;
+      font-size: 1.5rem; line-height: 1;
     }
-    .splash-stack > pre {
-      margin: 0; padding: 0;
-      font: inherit; line-height: inherit; letter-spacing: inherit;
-      font-feature-settings: inherit; font-kerning: inherit;
-      font-variant-ligatures: inherit;
+    .splash-art, .splash-overlay {
+      display: grid;
+      grid-template-columns: repeat(41, var(--splash-cell-w));
+      grid-template-rows: repeat(5, var(--splash-cell-h));
+    }
+    .splash-overlay {
+      position: absolute; inset: 0; pointer-events: none;
+    }
+    .splash-art > span, .splash-overlay > span { display: block; }
+    .splash-art > span.b, .splash-overlay > span.b {
+      background: currentColor;
     }
     .splash-art { color: rgba(192, 202, 245, 0.35); }
-    #buffr-splash {
-      position: absolute; inset: 0;
-      color: #7dcfff; pointer-events: none;
-    }
+    .splash-overlay { color: #7dcfff; }
     section h2 {
       font-size: 0.85rem; text-transform: uppercase;
       letter-spacing: 0.1em; opacity: 0.55;
@@ -91,11 +86,7 @@
 </head>
 <body>
   <main>
-    <div class="splash-wrap"><div class="splash-stack"><pre class="splash-art">██████  ██    ██ ███████ ███████ ██████
-██   ██ ██    ██ ██      ██      ██   ██
-██████  ██    ██ █████   █████   ██████
-██   ██ ██    ██ ██      ██      ██   ██
-██████   ██████  ██      ██      ██   ██ </pre><pre id="buffr-splash"></pre></div></div>
+    <div class="splash-wrap"><div class="splash-stack"><div class="splash-art"><!--SPLASH-ART--></div><div class="splash-overlay" id="buffr-splash"></div></div></div>
     <header>
       <p>Press <kbd>e</kbd> to open the omnibar.</p>
     </header>

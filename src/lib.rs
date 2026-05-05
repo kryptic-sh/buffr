@@ -164,8 +164,9 @@ pub fn drain_popup_closes(sink: &PopupCloseSink) -> Vec<i32> {
 }
 
 pub use new_tab::{
-    NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_URL, NewTabHtmlProvider,
-    register_buffr_handler_factory, register_buffr_handler_factory_static, register_buffr_scheme,
+    NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
+    NewTabHtmlProvider, register_buffr_handler_factory, register_buffr_handler_factory_static,
+    register_buffr_scheme,
 };
 pub use permissions::{
     PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
