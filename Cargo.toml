@@ -10,6 +10,7 @@ members = [
     "crates/buffr-downloads",
     "crates/buffr-zoom",
     "crates/buffr-permissions",
+    "crates/buffr-view-source",
     "apps/buffr",
     "apps/buffr-app",
     "apps/buffr-helper",
@@ -95,6 +96,7 @@ buffr-bookmarks = "0.1"
 buffr-downloads = "0.1"
 buffr-zoom = "0.1"
 buffr-permissions = "0.1"
+buffr-view-source = "0.1"
 
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
 # at 0.1 / 0.3 — patch bumps roll in automatically via workspace member
