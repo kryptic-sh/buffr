@@ -8,6 +8,43 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-06
+
+### Added
+
+- **Animated splash on the new-tab page and during the loading window** (closes
+  #35). Integrates `hjkl-splash` 0.2 to drive a cursor that traces each letter's
+  spine of the `buffr` wordmark. The loading-anim path (when CEF hasn't painted
+  yet) paints the wordmark into the chrome buffer; the new-tab page
+  (`buffr://new`) renders it as a per-cell CSS grid (rectangles via
+  `background: currentColor`) and the host pushes the cursor frame's HTML into
+  `#buffr-splash` per tick via `execute_javascript`. Animation cadence is driven
+  by `hjkl-splash`'s wall clock so paint rate (scrolling, etc.) cannot
+  accelerate the wordmark.
+
+### Fixed
+
+- **wtype / Wayland virtual-keyboard typing into web fields** (closes #36).
+  `wtype` and similar virtual-keyboard tools synthesize an xkb keymap that
+  places characters on arbitrary scancodes (Escape, Backspace, Tab); the apps
+  layer was forwarding those scancodes to CEF as `VK_ESCAPE` / `VK_BACK` /
+  `VK_TAB`, dropping characters mid-string (a typed email address would lose its
+  `.` and the password manager would jump fields). Forward via the _character_
+  the text-input layer reports when it disagrees with the physical scancode;
+  punctuation (`. , ; / ' [`, etc.) also now maps to the expected `VK_OEM_*`
+  codes.
+
+### Changed
+
+- **Workspace `default-members` expanded** to all three app binaries
+  (`apps/buffr`, `apps/buffr-app`, `apps/buffr-helper`). A bare `cargo build`
+  now produces the full launchable set so the supervisor's sibling-binary lookup
+  finds the dev `buffr-app` instead of falling through to `$PATH` and silently
+  picking up the installed release binary. `cargo run` requires `-b <bin>` since
+  the workspace now has multiple bins.
+- `hjkl-splash` 0.1 → 0.2 (wall-clock-owned timing; consumers no longer call
+  `Splash::advance` per paint).
+
 ## [0.5.0] - 2026-05-05
 
 ### Added
@@ -635,7 +672,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.1
 [0.5.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.3.0
