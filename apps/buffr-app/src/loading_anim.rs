@@ -1,46 +1,45 @@
 //! ASCII-art loading animation drawn into the CEF browser region while the
 //! OSR buffer is not yet usable (no paint received, or dimensions mismatch).
 //!
-//! Design: a horizontal dot-cascade with the "buffr" wordmark centred below.
-//! All frames have the same fixed character dimensions so centering math is
-//! computed once at call time via `buffr_ui::font::{glyph_w, glyph_h}`.
+//! Mirrors `hjkl_splash::presets::hjkl`: the static `art.txt` letterform is
+//! the splash background and `PATH` traces the cursor down each letter's
+//! vertical spine. The crate's `Splash` emits cells; we blit each as a single
+//! glyph via `buffr_ui::font::draw_text`, mapping `Cursor`/`Trail` to `fg`
+//! and `Art` to a half-bright dim so the wordmark sits behind the moving
+//! highlight.
+//!
+//! `art.txt` is shared with the `buffr-app --help` figlet header.
 
-/// Number of dot-cascade animation frames.
-const FRAME_COUNT: usize = 8;
+use hjkl_splash::{CellKind, Layout, Splash};
 
-/// ASCII-art frames.  Each frame is a multi-line string; every frame has
-/// exactly the same number of lines and the same width in characters.
-///
-/// Layout (3 rows):
-///   row 0 – spinner dots (width = FRAME_COLS chars)
-///   row 1 – blank separator
-///   row 2 – "buffr" wordmark (centred inside FRAME_COLS cols by padding)
-pub const FRAMES: &[&str] = &[
-    ".  .  .  .  .  .  .\n \n      buffr      ",
-    "*  .  .  .  .  .  .\n \n      buffr      ",
-    ".  *  .  .  .  .  .\n \n      buffr      ",
-    ".  .  *  .  .  .  .\n \n      buffr      ",
-    ".  .  .  *  .  .  .\n \n      buffr      ",
-    ".  .  .  .  *  .  .\n \n      buffr      ",
-    ".  .  .  .  .  *  .\n \n      buffr      ",
-    ".  .  .  .  .  .  *\n \n      buffr      ",
+const ART: &str = include_str!("art.txt");
+const ROWS: u16 = 5;
+const COLS: u16 = 41;
+
+/// Cursor traces each letter's left vertical spine top→bottom, jumps to the
+/// next letter, repeats. Cycle length = 25 ticks (~2 s at 12 fps).
+#[rustfmt::skip]
+const PATH: &[(u8, u8, char)] = &[
+    // B spine
+    (0, 0, '█'), (1, 0, '█'), (2, 0, '█'), (3, 0, '█'), (4, 0, '█'),
+    // u left vertical
+    (0, 8, '█'), (1, 8, '█'), (2, 8, '█'), (3, 8, '█'), (4, 8, '█'),
+    // f1 spine
+    (0, 17, '█'), (1, 17, '█'), (2, 17, '█'), (3, 17, '█'), (4, 17, '█'),
+    // f2 spine
+    (0, 25, '█'), (1, 25, '█'), (2, 25, '█'), (3, 25, '█'), (4, 25, '█'),
+    // r spine
+    (0, 33, '█'), (1, 33, '█'), (2, 33, '█'), (3, 33, '█'), (4, 33, '█'),
 ];
 
-/// Total number of animation frames.
+/// Half-bright `fg` for static art cells. Bit-shifts each RGB channel by 1
+/// while preserving alpha.
 #[inline]
-pub fn frame_count() -> usize {
-    FRAME_COUNT
+fn dim(c: u32) -> u32 {
+    (c & 0xff00_0000) | ((c & 0x00fe_fefe) >> 1)
 }
 
 /// Paint the animation frame at `frame_idx` into `buf`.
-///
-/// Steps:
-/// 1. Fill `rect` (x, y, w, h) with `bg`.
-/// 2. Render `FRAMES[frame_idx % frame_count()]` centred inside `rect`,
-///    one line per `draw_text` call, using `fg` as the foreground colour.
-///
-/// The buffer uses the same row-major BGRA-u32 layout as the chrome CPU
-/// buffer — `0xFF_RR_GG_BB` for opaque pixels.
 pub fn paint(
     buf: &mut [u32],
     buf_w: usize,
@@ -51,12 +50,9 @@ pub fn paint(
     bg: u32,
 ) {
     let (rx, ry, rw, rh) = rect;
-    let rx = rx as usize;
-    let ry = ry as usize;
-    let rw = rw as usize;
-    let rh = rh as usize;
+    let (rx, ry, rw, rh) = (rx as usize, ry as usize, rw as usize, rh as usize);
 
-    // --- 1. Background fill ---
+    // 1. Background fill.
     let x1 = (rx + rw).min(buf_w);
     let y1 = (ry + rh).min(buf_h);
     for row in ry..y1 {
@@ -66,36 +62,90 @@ pub fn paint(
         }
         buf[base + rx..base + x1].fill(bg);
     }
-
-    // --- 2. Render frame text ---
-    let frame_str = FRAMES[frame_idx % frame_count()];
-    let lines: Vec<&str> = frame_str.split('\n').collect();
-
-    let gw = buffr_ui::font::glyph_w();
-    let gh = buffr_ui::font::glyph_h();
-    let advance = gw + 1; // draw_text uses glyph_w + 1 spacing
-
-    // Total text block dimensions in pixels.
-    let block_h_px = lines.len() * gh;
-    // Width = widest line in chars × advance − 1 trailing gap.
-    let max_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let block_w_px = if max_cols > 0 {
-        max_cols * advance - 1
-    } else {
-        0
-    };
-
-    // Clamp to rect so we don't paint outside when the region is tiny.
-    if block_w_px == 0 || block_h_px == 0 || rw == 0 || rh == 0 {
+    if rw == 0 || rh == 0 {
         return;
     }
 
-    // Centre the block inside the rect.
-    let text_x = rx as i32 + ((rw as i32 - block_w_px as i32) / 2).max(0);
-    let text_y = ry as i32 + ((rh as i32 - block_h_px as i32) / 2).max(0);
+    // 2. Cell → pixel layout.
+    let advance = buffr_ui::font::glyph_w() + 1;
+    let gh = buffr_ui::font::glyph_h();
+    let viewport_cols = (rw / advance) as u16;
+    let viewport_rows = (rh / gh) as u16;
+    if viewport_cols < COLS || viewport_rows < ROWS {
+        return; // rect too small for the wordmark
+    }
+    let layout = Layout::centered(viewport_cols, viewport_rows, ROWS, COLS);
 
-    for (i, line) in lines.iter().enumerate() {
-        let line_y = text_y + (i * gh) as i32;
-        buffr_ui::font::draw_text(buf, buf_w, buf_h, text_x, line_y, line, fg);
+    // 3. Splash state at this tick. `cursor_idx = tick % path_len`, so
+    //    advancing more than path_len times is wasted work.
+    let mut splash = Splash::new(ART, PATH);
+    for _ in 0..(frame_idx % PATH.len()) {
+        splash.advance();
+    }
+
+    // 4. Blit cells.
+    for cell in splash.cells(layout) {
+        let color = match cell.kind {
+            CellKind::Art => dim(fg),
+            CellKind::Trail { .. } | CellKind::Cursor => fg,
+        };
+        let px = rx as i32 + cell.x as i32 * advance as i32;
+        let py = ry as i32 + cell.y as i32 * gh as i32;
+        buffr_ui::font::draw_text(buf, buf_w, buf_h, px, py, &cell.ch.to_string(), color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paint_writes_into_buffer() {
+        let w = 800;
+        let h = 200;
+        let mut buf = vec![0u32; w * h];
+        paint(
+            &mut buf,
+            w,
+            h,
+            (0, 0, w as u32, h as u32),
+            0,
+            0xff_ff_ff_ff,
+            0,
+        );
+        assert!(buf.iter().any(|&p| p != 0));
+    }
+
+    #[test]
+    fn paint_advances_with_frame_idx() {
+        let w = 800;
+        let h = 200;
+        let mut a = vec![0u32; w * h];
+        let mut b = vec![0u32; w * h];
+        paint(
+            &mut a,
+            w,
+            h,
+            (0, 0, w as u32, h as u32),
+            0,
+            0xff_ff_ff_ff,
+            0,
+        );
+        paint(
+            &mut b,
+            w,
+            h,
+            (0, 0, w as u32, h as u32),
+            1,
+            0xff_ff_ff_ff,
+            0,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn dim_halves_channels_preserves_alpha() {
+        assert_eq!(dim(0xff_ff_ff_ff), 0xff_7f_7f_7f);
+        assert_eq!(dim(0xff_00_00_00), 0xff_00_00_00);
     }
 }

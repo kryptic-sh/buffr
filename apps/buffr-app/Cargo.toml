@@ -30,6 +30,7 @@ buffr-permissions.workspace = true
 buffr-modal = { workspace = true, features = ["winit"] }
 buffr-ui.workspace = true
 buffr-config.workspace = true
+hjkl-splash.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -104,6 +104,7 @@ buffr-view-source = "0.1"
 hjkl-engine = "0.1"
 hjkl-buffer = "0.1"
 hjkl-clipboard = "0.5"
+hjkl-splash = "0.1"
 
 # Force every transitive crates.io reference to a buffr-* crate to
 # resolve to the workspace member at crates/<name>/ (a submodule). The

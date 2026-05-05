@@ -463,6 +463,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "hex",
+ "hjkl-splash",
  "interprocess",
  "libc",
  "pollster",
@@ -2044,6 +2045,12 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "hjkl-splash"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd7c4e1b3c731219d07f0bf3cfff65eff9193c070fc25b83f83a535f7c2d04ac"
 
 [[package]]
 name = "http"
