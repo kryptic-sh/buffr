@@ -166,6 +166,15 @@ version on every run.
 Full guide (layout, depends, glibc, sandbox caveats, signing TODO):
 [`docs/packaging.md`](./packaging.md).
 
+## Crash-restart supervisor
+
+Run `buffr-supervisor` instead of `buffr` for automatic crash-restart. The
+supervisor spawns `buffr` as a child process group, detects non-zero exit, and
+relaunches it with a 250 ms cooldown; after 3 crashes in 30 seconds it halts and
+points at `~/.local/share/buffr/crashes/`. Linux only in this release; future
+releases will integrate it transparently so `buffr` itself becomes the
+supervisor. Set `BUFFR_CHILD_BIN` to override the child binary path for testing.
+
 ## Useful commands
 
 ```sh

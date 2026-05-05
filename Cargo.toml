@@ -12,6 +12,7 @@ members = [
     "crates/buffr-permissions",
     "apps/buffr",
     "apps/buffr-helper",
+    "apps/buffr-supervisor",
     "xtask",
 ]
 # `apps/buffr-stub` is intentionally *not* a workspace member. It's the
