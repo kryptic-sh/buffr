@@ -8,6 +8,21 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-05-06
+
+### Changed
+
+- **CI pipeline collapsed back into a single `ci.yml`.** The 3-stage
+  `workflow_run` chain (`ci.yml` → `build.yml` → `release.yml`) had a
+  fundamental flaw: `workflow_run`-triggered runs reset `head_branch` to the
+  default branch, so a tag-push's ref does not propagate past the first hop.
+  v0.5.2's release was skipped three times in a row before being shipped via
+  manual `workflow_dispatch`. The new layout uses one workflow with job-level
+  `needs:` + `if:` gates: PRs run lint+test only, pushes to `main` add the build
+  matrix, and tag pushes add publish/AUR/brew. Cross-workflow
+  `dawidd6/action-download-artifact@v6` was swapped for stock
+  `actions/download-artifact@v4` since artifacts now live in the same run.
+
 ## [0.5.2] - 2026-05-06
 
 ### Added
@@ -694,7 +709,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.3
 [0.5.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.2
 [0.5.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.1
 [0.5.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.0
