@@ -1,4 +1,4 @@
-name: fuzz
+name: Fuzz
 
 on:
   schedule:
