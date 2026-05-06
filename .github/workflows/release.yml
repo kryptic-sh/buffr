@@ -1,9 +1,9 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_run:
+    workflows: [build]
+    types: [completed]
   # Manual re-runs are safe: xtask packaging is idempotent and
   # softprops/action-gh-release skips files already attached to the release.
   workflow_dispatch:
@@ -13,465 +13,102 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
 
+# Don't cancel in-progress releases — a partial publish is worse than
+# letting the old run finish.
 concurrency:
-  group: release-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # Gate the release pipeline on the full CI suite (lint + tests + smoke
-  # + per-platform package smoke). The tag-push commit is independent of
-  # any main-push run — nothing prevents tagging a commit that wasn't
-  # pushed to main, or a CI failure on one stream while release proceeds
-  # on the other. Calling ci.yml here makes the gate explicit. The
-  # bump-commit main push itself is suppressed by the skip conditions in
-  # ci.yml so we don't double-run on the same SHA.
-  gate:
-    name: CI gate
-    uses: ./.github/workflows/ci.yml
-
-  linux:
-    name: linux package (${{ matrix.platform }})
-    needs: [gate]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+  # Download all artifacts produced by build.yml and attach them to the
+  # GitHub release in one shot. Only fires when build.yml completed
+  # successfully on a tag push (head_branch matches vX.Y.Z pattern).
+  publish-github-release:
+    name: Publish GitHub release
+    # workflow_run chains lose the original push event after the second
+    # hop — by the time we fire from build.yml (which itself fired from
+    # ci.yml's workflow_run), `workflow_run.event` is "workflow_run", not
+    # "push". `head_branch` does propagate through the chain though, so
+    # we filter on the semver-tag pattern (vX.Y… with a dot) instead.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       contains(github.event.workflow_run.head_branch, '.'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            platform: linux64
-          - runner: ubuntu-24.04-arm
-            platform: linuxarm64
-    env:
-      CEF_PATH: ${{ github.workspace }}/vendor/cef/${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           submodules: recursive
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
         run: |
+          set -euo pipefail
+          # On workflow_run the tag name comes from head_branch; on
+          # workflow_dispatch use GITHUB_REF_NAME.
+          TAG="${{ github.event.workflow_run.head_branch || github.ref_name }}"
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match workspace.package version v$CARGO_VER"
+          if [ "v$CARGO_VER" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match workspace.package version v$CARGO_VER"
             exit 1
           fi
 
-      - name: Install CEF runtime + packaging deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
-            libgtk-3-dev libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-            libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
-            libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
-            libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
-            libgl1 libegl1 libgles2 \
-            dpkg dpkg-dev fakeroot file libxml2-utils \
-            rpm
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+      - name: Download all artifacts from build.yml
+        uses: dawidd6/action-download-artifact@v6
         with:
-          shared-key: linux-release-${{ matrix.platform }}
+          workflow: build.yml
+          commit: ${{ github.event.workflow_run.head_sha || github.sha }}
+          path: release-artifacts/
+          # Download every artifact produced by the matching build run.
+          # Glob wildcard picks up:
+          #   buffr-linux-linux64, buffr-linux-linuxarm64
+          #   buffr-macos-dmg-macosarm64
+          #   buffr-windows-msi-windows64, buffr-windows-msi-windowsarm64
+          #   buffr-flatpak-amd64, buffr-flatpak-arm64
+          #   buffr-snap-amd64, buffr-snap-arm64
+          name_is_regexp: true
+          name: "^buffr-.*"
+          if_no_artifact_found: fail
 
-      - name: Cache CEF binary distribution
-        uses: actions/cache@v5
-        with:
-          path: vendor/cef
-          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
-
-      - name: Fetch CEF
-        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
-
-      - name: Package Linux (deb + rpm)
-        run: cargo xtask package-linux --release --variant all
-
-      - name: List artifacts
-        run: ls -la target/dist/linux/
-
-      - name: Compute sha256 checksums
-        shell: bash
+      - name: Flatten artifact tree
+        # dawidd6/action-download-artifact nests each artifact under its
+        # own subdirectory. Flatten into a single `dist/` dir so the
+        # glob patterns below stay simple.
         run: |
           set -euo pipefail
-          cd target/dist/linux
-          for f in buffr-*.deb buffr-*.rpm buffr-*.tar.gz; do
-            [ -e "$f" ] || continue
-            sha256sum "$f" > "$f.sha256"
-            echo "sha256: $(cat "$f.sha256")"
+          mkdir -p dist
+          find release-artifacts/ -type f | while read -r f; do
+            cp "$f" dist/
           done
+          ls -la dist/
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           files: |
-            target/dist/linux/buffr-*.deb
-            target/dist/linux/buffr-*.deb.sha256
-            target/dist/linux/buffr-*.rpm
-            target/dist/linux/buffr-*.rpm.sha256
-            target/dist/linux/buffr-*.tar.gz
-            target/dist/linux/buffr-*.tar.gz.sha256
+            dist/buffr-*.deb
+            dist/buffr-*.deb.sha256
+            dist/buffr-*.rpm
+            dist/buffr-*.rpm.sha256
+            dist/buffr-*.tar.gz
+            dist/buffr-*.tar.gz.sha256
+            dist/buffr-*.dmg
+            dist/buffr-*.dmg.sha256
+            dist/buffr-*.msi
+            dist/buffr-*.msi.sha256
+            dist/buffr-*.flatpak
+            dist/buffr-*.flatpak.sha256
+            dist/buffr-*.snap
+            dist/buffr-*.snap.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  macos:
-    # Apple Silicon only. Intel Mac (macos-13 / macosx64) was dropped
-    # in 0.1.14 — see README "Why no Intel Mac?" — the GitHub runner
-    # pool was queueing 1-2h per leg and blocking the publish pipeline.
-    name: macOS package (macosarm64)
-    needs: [gate]
-    runs-on: macos-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Verify tag matches Cargo.toml version
-        shell: bash
-        run: |
-          CARGO_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match workspace.package version v$CARGO_VER"
-            exit 1
-          fi
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos-release-macosarm64
-
-      - name: Cache CEF binary distribution
-        uses: actions/cache@v5
-        with:
-          path: vendor/cef
-          key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
-
-      - name: Fetch CEF (macosarm64)
-        run: cargo xtask fetch-cef --target macosarm64
-
-      - name: Bundle macOS .app
-        run: cargo xtask bundle-macos --release
-
-      - name: Package macOS .dmg
-        run: cargo xtask package-macos-dmg --release
-
-      - name: List artifacts
-        run: ls -la target/dist/macos/
-
-      - name: Compute sha256 checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd target/dist/macos
-          for f in buffr-*.dmg; do
-            [ -e "$f" ] || continue
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$f" > "$f.sha256"
-            else
-              shasum -a 256 "$f" > "$f.sha256"
-            fi
-            echo "sha256: $(cat "$f.sha256")"
-          done
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            target/dist/macos/buffr-*.dmg
-            target/dist/macos/buffr-*.dmg.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  windows:
-    name: Windows package (${{ matrix.platform }})
-    needs: [gate]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-latest
-            platform: windows64
-            rust_target: x86_64-pc-windows-msvc
-          - runner: windows-11-arm
-            platform: windowsarm64
-            rust_target: aarch64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Verify tag matches Cargo.toml version
-        shell: bash
-        run: |
-          CARGO_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match workspace.package version v$CARGO_VER"
-            exit 1
-          fi
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-release-${{ matrix.platform }}
-
-      - name: Install WiX 3 toolset
-        run: choco install -y wixtoolset
-        shell: powershell
-
-      - name: Add WiX to PATH
-        run:
-          echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" | Out-File
-          -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: powershell
-
-      - name: Cache CEF binary distribution
-        uses: actions/cache@v5
-        with:
-          path: vendor/cef
-          key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
-
-      - name: Fetch CEF (${{ matrix.platform }})
-        run: cargo xtask fetch-cef --target ${{ matrix.platform }}
-
-      - name: Build binaries (release)
-        run: cargo build --release -p buffr -p buffr-app -p buffr-helper
-
-      - name: Package Windows MSI
-        run: cargo xtask package-windows-msi --release
-
-      - name: List artifacts
-        run: dir target\dist\windows\
-        shell: cmd
-
-      - name: Compute sha256 checksums
-        shell: pwsh
-        run: |
-          Get-ChildItem target\dist\windows\buffr-*.msi | ForEach-Object {
-            $f = $_.FullName
-            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
-            $name = $_.Name
-            "$hash  $name" | Out-File -Encoding ASCII "$f.sha256"
-            Write-Host "sha256: $hash  $name"
-          }
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            target/dist/windows/buffr-*.msi
-            target/dist/windows/buffr-*.msi.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  flatpak:
-    name: Flatpak bundle (${{ matrix.arch }})
-    needs: [linux]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-            tar_arch: x86_64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-            tar_arch: aarch64
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install flatpak + flatpak-builder
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            flatpak flatpak-builder
-
-      - name: Add flathub remote + install runtime
-        run: |
-          flatpak remote-add --if-not-exists --user flathub \
-            https://flathub.org/repo/flathub.flatpakrepo
-          flatpak install -y --user flathub \
-            org.gnome.Platform//47 org.gnome.Sdk//47
-
-      - name: Download buffr tarball from release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release download "v$VERSION" \
-            -p "buffr-${VERSION}-${{ matrix.tar_arch }}.tar.gz" \
-            -D flatpak/
-
-      - name: Stage tarball payload
-        run: |
-          set -euo pipefail
-          cd flatpak
-          # Extract straight into `payload/` so the manifest's source
-          # `path: payload` resolves. `--strip-components=1` drops the
-          # tarball's top-level `buffr-<ver>-<arch>/` wrapper. Avoids
-          # the `mv buffr-*-*` glob, which also matched the .tar.gz
-          # itself and produced a "target 'payload': No such file" mv
-          # error when given two sources.
-          mkdir payload
-          tar xzf buffr-*.tar.gz -C payload --strip-components=1
-
-      - name: Stage icon
-        run: |
-          # Manifest expects sh.kryptic.buffr.png next to it; canonical
-          # icon lives at pkg/buffr.png. flatpak-builder rejects sources
-          # outside the manifest dir, so copy it in.
-          cp pkg/buffr.png flatpak/sh.kryptic.buffr.png
-
-      - name: Stage desktop entry
-        run: |
-          # The unified .desktop source is `pkg/buffr.desktop`. Flatpak
-          # AppStream rules require the .desktop filename + AppStream id
-          # to match (`sh.kryptic.buffr`), and the icon name inside the
-          # flatpak sandbox is the prefixed form. Rename + rewrite Icon=
-          # in one step here so the canonical file stays single-source.
-          sed 's|^Icon=buffr$|Icon=sh.kryptic.buffr|' \
-            pkg/buffr.desktop > flatpak/sh.kryptic.buffr.desktop
-
-      - name: Build flatpak bundle
-        run: |
-          set -euo pipefail
-          cd flatpak
-          flatpak-builder --user --force-clean --repo=repo build sh.kryptic.buffr.yml
-          VERSION="${GITHUB_REF_NAME#v}"
-          flatpak build-bundle repo \
-            "buffr-${VERSION}-${{ matrix.arch }}.flatpak" sh.kryptic.buffr
-
-      - name: Compute sha256 checksum
-        run: |
-          cd flatpak
-          for f in buffr-*.flatpak; do
-            sha256sum "$f" > "$f.sha256"
-            echo "sha256: $(cat "$f.sha256")"
-          done
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            flatpak/buffr-*.flatpak
-            flatpak/buffr-*.flatpak.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  snap:
-    name: Snap bundle (${{ matrix.arch }})
-    needs: [linux]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-            tar_arch: x86_64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-            tar_arch: aarch64
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download buffr tarball from release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release download "v$VERSION" \
-            -p "buffr-${VERSION}-${{ matrix.tar_arch }}.tar.gz" \
-            -D snap/
-
-      - name: Stage tarball payload
-        run: |
-          set -euo pipefail
-          # snapcraft resolves `source: payload` relative to the
-          # project root (the dir containing snap/snapcraft.yaml's
-          # parent), not the `snap/` dir, so stage at repo root.
-          mkdir payload
-          tar xzf snap/buffr-*.tar.gz -C payload --strip-components=1
-
-      - name: Pin snap version to tag
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          # snapcraft.yaml ships `version: "0.1.0"` as a placeholder so
-          # local builds work; rewrite to the live tag before snapcraft
-          # consumes it.
-          sed -i "s/^version: .*/version: \"${VERSION}\"/" snap/snapcraft.yaml
-
-      - name: Build snap
-        uses: snapcore/action-build@v1
-        id: snapcraft
-        with:
-          path: .
-
-      - name: Rename snap to versioned filename
-        run: |
-          set -euo pipefail
-          mv "${{ steps.snapcraft.outputs.snap }}" \
-             "buffr-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.snap"
-
-      - name: Compute sha256 checksum
-        run: |
-          for f in buffr-*.snap; do
-            sha256sum "$f" > "$f.sha256"
-            echo "sha256: $(cat "$f.sha256")"
-          done
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            buffr-*.snap
-            buffr-*.snap.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.event.workflow_run.head_branch || github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -480,14 +117,19 @@ jobs:
   # generates .SRCINFO, and pushes to the AUR repo over SSH. Lives in
   # release.yml (not a separate workflow) because GITHUB_TOKEN-created
   # releases don't fire downstream `on: release` triggers; running as a
-  # `needs: [linux]` job sidesteps the cascade entirely.
+  # `needs: [publish-github-release]` job sidesteps the cascade entirely.
   #
   # Required org/repo secret:
   #   AUR_SSH_KEY  — ed25519 private key whose public half is registered
   #                  on the AUR account that owns the `buffr-bin` package.
   aur-bin:
     name: Publish buffr-bin to AUR
-    needs: [linux]
+    needs: [publish-github-release]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       contains(github.event.workflow_run.head_branch, '.'))
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
@@ -500,12 +142,14 @@ jobs:
           pacman -Sy --noconfirm --needed base-devel git openssh curl
 
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Resolve version
         id: tag
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ github.event.workflow_run.head_branch || github.ref_name }}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "release tag: $TAG (pkgver=$VERSION)"
@@ -516,8 +160,9 @@ jobs:
           set -euo pipefail
           V="${{ steps.tag.outputs.version }}"
           BASE="https://github.com/kryptic-sh/buffr/releases/download/v${V}"
-          # The linux matrix uploaded both arches before this job ran
-          # (we `needs: [linux]`), so the sidecars are guaranteed to exist.
+          # publish-github-release uploaded both arches before this job
+          # ran (we `needs: [publish-github-release]`), so the sidecars
+          # are guaranteed to exist.
           for arch in x86_64 aarch64; do
             curl -fsSL "$BASE/buffr-${V}-${arch}.tar.gz.sha256" -o "sha.${arch}"
           done
@@ -590,24 +235,31 @@ jobs:
 
   # Homebrew Cask auto-publish to kryptic-sh/homebrew-tap. Fetches the
   # arm64 dmg sha256 sidecar off the release, renders pkg/homebrew/buffr.rb.in,
-  # and pushes to the tap repo over SSH. Runs after `macos` so the dmg +
-  # sidecar are guaranteed to be uploaded before we fetch.
+  # and pushes to the tap repo over SSH. Runs after `publish-github-release`
+  # so the dmg + sidecar are guaranteed to be uploaded before we fetch.
   #
   # Required org/repo secret (SELECTED-scope — must be granted to this repo):
   #   BREW_SSH_KEY  — ed25519 private key whose public half is a deploy key
   #                   with write access on kryptic-sh/homebrew-tap.
   brew-tap:
     name: Publish buffr cask to homebrew-tap
-    needs: [macos]
+    needs: [publish-github-release]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       contains(github.event.workflow_run.head_branch, '.'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Resolve version
         id: tag
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ github.event.workflow_run.head_branch || github.ref_name }}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
