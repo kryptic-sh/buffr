@@ -8,6 +8,28 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-06
+
+### Added
+
+- **Custom search-engine prefix dispatch in the omnibar** (closes #47).
+  `[search.engines.<name>]` blocks accept an optional `prefix` shortcut. An
+  omnibar input of `<prefix> <query>` routes to that engine instead of
+  `default_engine` — `g rust closures` searches Google, `ddg vim folding`
+  searches DuckDuckGo, plain `cats` falls through. Bare prefix words with no
+  query fall through. Prefix collisions across engines are rejected at config
+  validation time.
+
+### Changed
+
+- **CI split into a 3-stage pipeline** (`ci.yml` → `build.yml` → `release.yml`).
+  `ci.yml` runs lint + test + smoke on every push/PR. `build.yml` fires via
+  `workflow_run` after `ci.yml` succeeds on a push and produces every platform
+  artifact. `release.yml` fires via `workflow_run` after `build.yml` succeeds
+  and only proceeds when `head_branch` matches a `v*.*.*` semver tag, publishing
+  the GitHub Release, AUR-bin, and Homebrew tap. PRs are filtered out of the
+  build/release stages so untagged main pushes never publish.
+
 ## [0.5.1] - 2026-05-06
 
 ### Added
@@ -672,7 +694,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.2
 [0.5.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.1
 [0.5.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.4.0
