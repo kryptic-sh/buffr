@@ -413,6 +413,22 @@
         color: var(--fg);
         font-family: var(--mono);
       }
+      .install-note {
+        color: var(--fg-muted);
+        margin: 0 0 20px;
+      }
+      .install-sample {
+        margin-top: 20px;
+      }
+      .install-code {
+        margin: 0;
+        padding: 14px 16px;
+        font-size: 13px;
+        line-height: 1.6;
+        overflow-x: auto;
+        color: var(--fg);
+        font-family: var(--mono);
+      }
       .terminal pre .ok {
         color: var(--accent);
       }
@@ -906,7 +922,7 @@
       <section id="install">
         <h2>install</h2>
         <h3>Prebuilt binaries on every tagged release.</h3>
-        <p style="color: var(--fg-muted); margin: 0 0 20px">
+        <p class="install-note">
           Linux (x86_64, aarch64) — .deb / .rpm / .tar.gz / Flatpak / Snap /
           AUR. macOS (Apple Silicon) — .dmg. Windows (x64, arm64) — .msi.
           SHA-256 sidecars on every artifact.
@@ -927,23 +943,29 @@
             >all releases ↗</a
           >
         </div>
-        <div class="terminal" style="margin-top: 20px">
+        <div class="terminal install-sample">
           <div class="bar">
             <span class="dot r"></span><span class="dot y"></span
             ><span class="dot g"></span>
             <span class="title">buffr — Arch Linux (AUR)</span>
           </div>
-          <pre><span class="ok">$</span> yay -S buffr-bin</pre>
-          <pre><span class="cm"># or </span></pre>
-          <pre><span class="ok">$</span> paru -S buffr-bin</pre>
+          <pre
+            class="install-code"
+          ><span class="ok">$</span> yay -S buffr-bin</pre>
+          <pre class="install-code"><span class="cm"># or </span></pre>
+          <pre
+            class="install-code"
+          ><span class="ok">$</span> paru -S buffr-bin</pre>
         </div>
-        <div class="terminal" style="margin-top: 20px">
+        <div class="terminal install-sample">
           <div class="bar">
             <span class="dot r"></span><span class="dot y"></span
             ><span class="dot g"></span>
             <span class="title">buffr — from source</span>
           </div>
-          <pre><span class="ok">$</span> git clone https://github.com/kryptic-sh/buffr
+          <pre
+            class="install-code"
+          ><span class="ok">$</span> git clone https://github.com/kryptic-sh/buffr
 <span class="ok">$</span> cd buffr
 <span class="ok">$</span> cargo xtask fetch-cef    <span class="cm"># vendor CEF runtime (~500 MB extracted)</span>
 <span class="ok">$</span> cargo build --release</pre>
