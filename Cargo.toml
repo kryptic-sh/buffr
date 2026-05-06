@@ -76,7 +76,7 @@ softbuffer = "0.4"
 # triangle. No platform branching: Vulkan on Linux, Metal on macOS, DX12.
 wgpu = "22"
 # block_on for async adapter / device request
-pollster = "0.3"
+pollster = "0.4"
 # safe cast from &[u32] to &[u8] for texture upload
 bytemuck = { version = "1", features = ["derive"] }
 # Phase 6 update channel: `UpdateChecker` compares the running version
