@@ -6,6 +6,14 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-05-12
+
+### Changed
+
+- `buffr-config` dep bumped from `"0.3"` to `"0.4"` to pick up
+  `SearchEngine::prefix` (omnibar prefix dispatch). No public API change in
+  `buffr-core` itself.
+
 ## [0.6.0] — 2026-05-12
 
 ### Added
@@ -248,7 +256,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.4.0
