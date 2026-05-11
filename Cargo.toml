@@ -11,6 +11,6 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 readme = "README.md"
 
 [dependencies]
-anyhow = { workspace = true }
-tracing = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
 hjkl-bonsai = "0.6"
