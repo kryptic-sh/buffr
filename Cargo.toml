@@ -74,7 +74,7 @@ softbuffer = "0.4"
 # wgpu present layer — replaces softbuffer in apps/buffr. CPU-composite
 # buffer is uploaded to a single GPU texture and drawn as a fullscreen
 # triangle. No platform branching: Vulkan on Linux, Metal on macOS, DX12.
-wgpu = "22"
+wgpu = "29"
 # block_on for async adapter / device request
 pollster = "0.4"
 # safe cast from &[u32] to &[u8] for texture upload
