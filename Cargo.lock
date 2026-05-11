@@ -2026,16 +2026,19 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hjkl-bonsai"
-version = "0.3.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81fa522b28f6ee2e9bccc1f0e910e1299b5068bb9a5d904522f0e9ac8d1a0854"
+checksum = "908041907d7f641e54b094e3c86febd9b485df253b92508dfe523ef60223605f"
 dependencies = [
  "anyhow",
  "dirs",
- "libloading 0.8.9",
+ "hjkl-xdg",
+ "libloading 0.9.0",
  "ratatui 0.30.0",
  "serde",
+ "thiserror 2.0.18",
  "toml",
+ "tracing",
  "tree-sitter",
  "tree-sitter-language",
 ]
