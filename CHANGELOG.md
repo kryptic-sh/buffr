@@ -6,6 +6,46 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-12
+
+### Added
+
+- **`buffr-src:` is now a real CEF custom scheme** (round 2/3 of #30).
+  `BuffrSrcSchemeHandlerFactory` fetches the underlying URL on a worker thread,
+  renders via `buffr_view_source::render`, and serves the bonsai-highlighted
+  HTML back to CEF. The old navigation-boundary `view-source:` rewrite is
+  dropped; `merge_navigation_url` and `to_cef_navigation_url` are now
+  pass-through. New module `view_source_scheme`.
+- **New-tab splash overlay.** Host pushes the splash frame's HTML into
+  `#buffr-splash` via `execute_javascript` every splash tick instead of painting
+  an overlay into the chrome buffer. `assets/new_tab.html` reserves vertical
+  space (`min-height: 5em`) so the page doesn't reflow on the first push; `.hl`
+  styles cursor/trail spans with the accent.
+
+### Changed
+
+- **Chromium autofill server + password-manager UI disabled.** buffr will ship
+  its own autofill surface on top; Chromium's built-in mid-typing field rewrites
+  and password-manager onboarding popups are silenced.
+- **`hjkl-clipboard` bumped 0.4 → 0.5; `Clipboard` wrapped in `Arc`.** Aligns
+  with the upstream API and lets multiple subsystems share one clipboard handle.
+- CI maintenance: collapsed two-stage CI (ci.yml + release.yml) into a single
+  tag-driven `ci.yml`, added Dependabot config (cargo + github-actions, weekly),
+  and renamed the workflow to PascalCase.
+
+### Fixed
+
+- **New-tab splash now renders with consistent monospace metrics.** Stack two
+  `<pre>` layers so cursor and trail glyphs line up; pin the splash font to one
+  with consistent `█` metrics; opt out of all shaping with bare `monospace`;
+  render via a per-cell CSS grid instead of a single `<pre>` to eliminate
+  sub-pixel drift between rows.
+
+### Documentation
+
+- macOS comment: rename `buffr.app` → `Buffr.app` to match the actual bundle
+  name.
+
 ## [0.5.0] — 2026-05-05
 
 ### Added
@@ -208,7 +248,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.3.1
