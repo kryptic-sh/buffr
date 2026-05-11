@@ -6,6 +6,14 @@ All notable changes to `buffr-ui` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-12
+
+### Changed
+
+- CI maintenance: collapsed two-stage CI (ci.yml + release.yml) into a single
+  tag-driven `ci.yml`, added Dependabot config (cargo + github-actions, weekly),
+  and renamed the workflow to PascalCase. No code changes.
+
 ## [0.2.0] — 2026-05-05
 
 ### Added
@@ -43,7 +51,8 @@ All notable changes to `buffr-ui` are documented here. Format follows
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-ui/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-ui/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.2.0
 [0.1.2]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.1.1
