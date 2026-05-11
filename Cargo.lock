@@ -1982,16 +1982,19 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hjkl-bonsai"
-version = "0.3.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81fa522b28f6ee2e9bccc1f0e910e1299b5068bb9a5d904522f0e9ac8d1a0854"
+checksum = "908041907d7f641e54b094e3c86febd9b485df253b92508dfe523ef60223605f"
 dependencies = [
  "anyhow",
  "dirs",
- "libloading 0.8.9",
+ "hjkl-xdg",
+ "libloading 0.9.0",
  "ratatui 0.30.0",
  "serde",
+ "thiserror 2.0.18",
  "toml",
+ "tracing",
  "tree-sitter",
  "tree-sitter-language",
 ]
@@ -2051,6 +2054,16 @@ name = "hjkl-splash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e38f603523defba5c303f13b8c4d2a998f77c0d656296f1a79efd4a3ac73707a"
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a9818d4389b1cc9d8ea54f57f388f3a58d3f80315e0ceb66903813a26c3fa1f"
+dependencies = [
+ "dirs",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "http"

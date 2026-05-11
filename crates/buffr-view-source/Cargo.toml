@@ -13,4 +13,4 @@ readme = "README.md"
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
-hjkl-bonsai = "0.3"
+hjkl-bonsai = "0.6"
