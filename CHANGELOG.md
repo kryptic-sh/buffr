@@ -8,6 +8,57 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-12
+
+### Changed
+
+- **wgpu bumped 22.1.0 → 29.0.3** (#25). API churn across 7 major versions
+  required `render.rs` rewrites: `ImageCopyTexture` → `TexelCopyTextureInfo`,
+  `ImageDataLayout` → `TexelCopyBufferLayout`, new required fields on
+  `RenderPassDescriptor` (`multiview_mask`), `RenderPassColorAttachment`
+  (`depth_slice`), and `DeviceDescriptor` (`experimental_features`, `trace`).
+  `adapter.request_device` lost its trace-path arg (folded into
+  `DeviceDescriptor::trace`). `InstanceDescriptor` lost `Default` —
+  `InstanceDescriptor::new_without_display_handle()` instead.
+  `surface.get_current_texture()` now returns a `CurrentSurfaceTexture` enum
+  with explicit `Occluded` / `Suboptimal` / `Outdated` / `Lost` / `Validation`
+  variants — `OutOfMemory` is folded into `Lost`. All wgpu mutating calls remain
+  on the async render worker thread.
+- **hjkl-bonsai bumped 0.3.0 → 0.6.1** (#69) — picks up predicate/directive
+  dispatcher (helix + nvim-treesitter parity over stock tree-sitter) and the new
+  `XDG` resolver via `hjkl-xdg`. Consumer code passes `&ManifestMeta` to
+  `GrammarLoader::user_default` and `Grammar::load`.
+- **sha2 0.10.9 → 0.11.0** (#26).
+- **signal-hook 0.3.18 → 0.4.4** (#68).
+- **hjkl-config 0.2.0 → 0.2.1; nix 0.31.2 → 0.31.3** (#67 patch group).
+- **`actions/download-artifact` 4 → 8** in CI (#66).
+- **Workflow names switched to PascalCase.**
+
+### Submodules
+
+- **`buffr-view-source` extracted to its own repo + crates.io publication**
+  (`buffr-view-source = "0.1"`). Previously an in-tree workspace member; now
+  lives at `crates/buffr-view-source/` as a git submodule, matching the pattern
+  of the other nine `buffr-*` crates.
+- **All nine pre-existing `buffr-*` submodules bumped** to their latest tags +
+  published to crates.io. The umbrella binary's behavior is unchanged from
+  v0.5.3 (path-patched the whole time); this catches the published versions up
+  to the code that's been shipping. Notable submodule bumps:
+  - `buffr-core` 0.5.0 → 0.6.1 (`buffr-src:` CEF scheme handler, splash overlay,
+    Chromium autofill / password-manager UI disabled, `hjkl-clipboard` 0.4 → 0.5
+    wrapped in `Arc`)
+  - `buffr-config` 0.3.0 → 0.4.0 (omnibar prefix dispatch — closes #47)
+  - `buffr-ui` 0.2.0 → 0.2.1 (CI maintenance)
+  - `buffr-modal` 0.1.2 → 0.1.3 (CI + CHANGELOG backfill)
+  - `buffr-{bookmarks,history,permissions,zoom}` → 0.1.2 (CI maintenance)
+  - `buffr-downloads` 0.1.1 → 0.1.3 (CI maintenance; 0.1.2 was a botched
+    CHANGELOG cut)
+
+### Documentation
+
+- Web install page (`web/index.html`): removed install gaps, unified install
+  styles, normalized sibling rails.
+
 ## [0.5.3] - 2026-05-06
 
 ### Changed
@@ -709,7 +760,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.0
 [0.5.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.3
 [0.5.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.2
 [0.5.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.1
