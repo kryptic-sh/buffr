@@ -78,8 +78,9 @@ fn try_highlight(url: &str, source: &[u8]) -> Option<String> {
 
     let lang_name = registry.name_for_path(url_path)?;
     let spec = registry.by_name(lang_name)?;
+    let meta = registry.meta();
 
-    let loader = match GrammarLoader::user_default() {
+    let loader = match GrammarLoader::user_default(meta) {
         Ok(l) => l,
         Err(e) => {
             warn!("buffr-view-source: failed to build grammar loader: {e:#}");
@@ -87,7 +88,7 @@ fn try_highlight(url: &str, source: &[u8]) -> Option<String> {
         }
     };
 
-    let grammar = match Grammar::load(lang_name, spec, &loader) {
+    let grammar = match Grammar::load(lang_name, spec, &loader, meta) {
         Ok(g) => Arc::new(g),
         Err(e) => {
             warn!("buffr-view-source: failed to load grammar '{lang_name}': {e:#}");
