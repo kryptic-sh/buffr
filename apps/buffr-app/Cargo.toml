@@ -46,7 +46,7 @@ serde.workspace = true
 serde_json.workspace = true
 ctrlc = "3.5.2"
 interprocess = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
