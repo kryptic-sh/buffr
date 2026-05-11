@@ -229,14 +229,14 @@ impl OsrTexture {
         }
         if upload.generation != self.last_generation {
             queue.write_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 &upload.pixels,
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * upload.width),
                     rows_per_image: Some(upload.height),
@@ -304,14 +304,14 @@ impl RenderState {
     fn write_chrome(&self, pixels: &[u32]) {
         let bytes: &[u8] = bytemuck::cast_slice(pixels);
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.chrome_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * self.chrome_lw),
                 rows_per_image: Some(self.chrome_lh),
@@ -429,6 +429,7 @@ fn render_worker(
                 label: Some("buffr-rpass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &frame_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -443,6 +444,7 @@ fn render_worker(
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // OSR quad — opaque, underneath chrome.
@@ -528,7 +530,7 @@ impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance
@@ -542,16 +544,16 @@ impl Renderer {
         }))
         .context("no suitable wgpu adapter")?;
 
-        let (device_raw, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let (device_raw, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("buffr-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
-            },
-            None,
-        ))
-        .context("wgpu request_device failed")?;
+                experimental_features: Default::default(),
+                trace: wgpu::Trace::Off,
+            }))
+            .context("wgpu request_device failed")?;
         // Wrap in Arc so UI thread (surface.configure) and worker thread
         // (texture/buffer operations) can both hold a reference without clone.
         let device = Arc::new(device_raw);
@@ -647,8 +649,8 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("buffr-pl"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline_osr = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -656,13 +658,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs",
+                entry_point: Some("vs"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs",
+                entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -676,7 +678,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -685,13 +687,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs",
+                entry_point: Some("vs"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs",
+                entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState {
@@ -712,7 +714,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -976,11 +978,27 @@ impl Renderer {
         // that "lag one resize behind" because every subsequent acquire
         // also returns the previous-size buffer until the pipeline
         // drains. Reconfigure + retry once to flush the stale chain.
+        //
+        // wgpu 29: `get_current_texture()` returns `CurrentSurfaceTexture`
+        // (an enum), not `Result`. Success variants carry a `SurfaceTexture`;
+        // error variants signal what went wrong without a payload.
         let frame = {
-            let mut tex = self.surface.get_current_texture();
+            // Helper: extract SurfaceTexture from a success variant, or None.
+            fn unwrap_surface_tex(
+                cst: wgpu::CurrentSurfaceTexture,
+            ) -> Option<wgpu::SurfaceTexture> {
+                match cst {
+                    wgpu::CurrentSurfaceTexture::Success(t)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
+                    _ => None,
+                }
+            }
+
+            let mut cst = self.surface.get_current_texture();
             for retry in 0..2 {
-                match tex {
-                    Ok(ref f) => {
+                match &cst {
+                    wgpu::CurrentSurfaceTexture::Success(f)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                         let actual = (f.texture.width(), f.texture.height());
                         if actual == (self.width, self.height) {
                             break;
@@ -996,28 +1014,33 @@ impl Renderer {
                         // Drop the stale texture before reconfigure so
                         // the swapchain can rebuild without a live
                         // reference outstanding.
-                        drop(tex);
+                        drop(cst);
                         self.surface.configure(&self.device, &self.config);
-                        tex = self.surface.get_current_texture();
+                        cst = self.surface.get_current_texture();
                     }
-                    Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                    wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                         tracing::debug!(retry, "wgpu surface: outdated/lost, reconfigure + retry");
                         self.surface.configure(&self.device, &self.config);
-                        tex = self.surface.get_current_texture();
+                        cst = self.surface.get_current_texture();
                     }
-                    Err(wgpu::SurfaceError::Timeout) => {
+                    wgpu::CurrentSurfaceTexture::Timeout => {
                         tracing::warn!(
                             "wgpu surface: get_current_texture timed out, skipping frame"
                         );
                         return Ok(FrameStats::default());
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        return Err(anyhow::anyhow!("wgpu surface OOM"));
+                    wgpu::CurrentSurfaceTexture::Occluded => {
+                        tracing::debug!("wgpu surface: occluded, skipping frame");
+                        return Ok(FrameStats::default());
+                    }
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        tracing::warn!("wgpu surface: validation error, skipping frame");
+                        return Ok(FrameStats::default());
                     }
                 }
             }
-            match tex {
-                Ok(f) => {
+            match unwrap_surface_tex(cst) {
+                Some(f) => {
                     let actual = (f.texture.width(), f.texture.height());
                     if actual != (self.width, self.height) {
                         tracing::warn!(
@@ -1031,7 +1054,7 @@ impl Renderer {
                     }
                     f
                 }
-                Err(_) => return Ok(FrameStats::default()),
+                None => return Ok(FrameStats::default()),
             }
         };
 
