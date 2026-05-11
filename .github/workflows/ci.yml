@@ -569,7 +569,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: download linux tarball artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: buffr-linux-${{ matrix.linux_platform }}
           path: flatpak/
@@ -678,7 +678,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: download linux tarball artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: buffr-linux-${{ matrix.linux_platform }}
           path: snap/
@@ -772,7 +772,7 @@ jobs:
           fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: 'buffr-*'
           merge-multiple: true
