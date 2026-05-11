@@ -6,6 +6,22 @@ All notable changes to `buffr-config` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-12
+
+### Added
+
+- `SearchEngine::prefix` (optional). Omnibar input of `<prefix> <query>`
+  resolves through that engine instead of `default_engine` (`g rust closures` →
+  google, `ddg foo` → duckduckgo). Bare prefix words with no query fall through
+  to the default engine. `Config::validate` now scans the engine table for empty
+  / duplicate prefixes. Closes kryptic-sh/buffr#47.
+
+### Changed
+
+- CI maintenance: collapsed two-stage CI (ci.yml + release.yml) into a single
+  tag-driven `ci.yml`, added Dependabot config (cargo + github-actions, weekly),
+  and renamed the workflow to PascalCase.
+
 ## [0.3.0] — 2026-05-04
 
 ### Added
@@ -43,7 +59,8 @@ All notable changes to `buffr-config` are documented here. Format follows
   `directories::UserDirs::download_dir()` — same XDG resolution, fewer dep
   variants in the lock.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.2.0
