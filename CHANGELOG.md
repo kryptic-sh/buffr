@@ -6,6 +6,19 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-05-13
+
+### Added
+
+- **Tab-strip context-menu support.** New `ContextMenuTarget` enum (`Page` |
+  `Tab { index }`) and a `target` field on `ContextMenuRequest` so dispatch can
+  tell a page right-click from a tab-strip right-click. New `ContextMenuItem`
+  variants — `TabReload`, `TabDuplicate`, `TabPin { pinned }`, `TabCopyUrl`,
+  `TabClose`, `TabCloseOthers { enabled }`, `TabCloseToRight { enabled }` — with
+  labels, plus `build_tab_model(tab_count, tab_index, pinned)`, the `Tab`
+  counterpart to `build_model`. Re-exported as `ContextMenuTarget` and
+  `build_tab_context_menu_model`. (kryptic-sh/buffr#37)
+
 ## [0.6.2] — 2026-05-12
 
 ### Added
@@ -269,7 +282,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.3
 [0.6.2]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.0
