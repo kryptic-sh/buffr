@@ -8,6 +8,26 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-12
+
+### Added
+
+- **Favicon disk cache** (#71). Decoded favicon bitmaps now persist to
+  `<data_dir>/favicons.sqlite` keyed by origin (`scheme://host[:port]`).
+  Restored tabs paint their cached favicon on the first tick — before CEF's
+  asynchronous `download_image` callback fires — and so do new tabs to any
+  previously-seen origin (omnibar, hint, popup, middle-click, view-source). A
+  per-tick runtime scan compares each tab's current URL against the one last
+  cache-checked for that `browser_id`, enqueueing prefills on change without
+  per-call-site wiring. CEF-delivered bitmaps unconditionally overwrite the
+  cached entry for the tab's current origin (no staleness). Skipped under
+  `--private` and when `[general] show_favicons = false`.
+
+### Submodules
+
+- `buffr-core` bumped `0.6.1` → `0.6.2` (adds `FaviconCache`, `CachedFavicon`,
+  `origin_of`).
+
 ## [0.6.0] - 2026-05-12
 
 ### Changed
@@ -760,7 +780,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.0
 [0.5.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.3
 [0.5.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.2
