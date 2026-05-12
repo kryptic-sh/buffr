@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-05-13
+
 ### Added
 
 - **Right-click context menu on tab-strip entries** (#37). Right-clicking a tab
@@ -822,7 +824,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.3
 [0.6.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.0
