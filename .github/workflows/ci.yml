@@ -176,10 +176,13 @@ jobs:
     # the binaries inside are Linux ELFs and won't run on Darwin. Real
     # macOS smoke testing is deferred to Phase 6.
     #
-    # Runs on every push/tag/workflow_dispatch (after lint+test passes).
-    # PR-triggered runs are excluded by the if: gate below.
+    # Runs on every push/tag/workflow_dispatch in parallel with `linux`.
+    # PR-triggered runs are excluded by the if: gate below. The job
+    # builds independent code on a Linux runner, so gating it behind
+    # `needs: [linux]` only adds wait time — drop the gate and fan out
+    # from the start. If the workspace doesn't compile the bundle job
+    # surfaces its own failure.
     name: macOS bundle (cross)
-    needs: [linux]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
