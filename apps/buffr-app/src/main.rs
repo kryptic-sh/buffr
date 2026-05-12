@@ -672,6 +672,27 @@ fn main() -> Result<()> {
     }
     let downloads_config = Arc::new(downloads_config);
 
+    // -------- favicon disk cache --------
+    //
+    // SQLite-backed bitmap store keyed by origin. Lets restored tabs show
+    // their favicons immediately, before CEF fires its async callback.
+    // Skipped in `--private` mode — no state should persist.
+    let favicon_cache: Option<buffr_core::FaviconCache> =
+        if cli.private || !config.general.show_favicons {
+            None
+        } else {
+            match buffr_core::FaviconCache::open(paths.data.join("favicons.sqlite")) {
+                Ok(fc) => {
+                    debug!("favicon cache opened");
+                    Some(fc)
+                }
+                Err(err) => {
+                    warn!(error = %err, "favicon cache open failed — running without disk cache");
+                    None
+                }
+            }
+        };
+
     let keymap = buffr_config::build_keymap(&config).context("building keymap from config")?;
     let homepage = cli
         .homepage
@@ -993,6 +1014,7 @@ fn main() -> Result<()> {
         initial_update_status,
         build_palette(&config.theme),
         config.general.show_favicons,
+        favicon_cache,
         Arc::new(config.idle_inhibit.clone()),
         shutdown_flag,
         event_proxy,
@@ -2008,6 +2030,22 @@ struct AppState {
     /// without issuing a `download_image` call. Also gates the apps-side
     /// pump so disabled-mode never populates the cache.
     show_favicons: bool,
+    /// SQLite-backed favicon blob cache. `None` in `--private` mode or when
+    /// the store failed to open, or when `show_favicons` is false.
+    favicon_cache: Option<buffr_core::FaviconCache>,
+    /// Pending favicon prefill: maps `browser_id → origin` for tabs that were
+    /// created/restored before their CEF-delivered favicon arrived. Populated
+    /// when a tab is opened to a URL whose origin may have a cached bitmap;
+    /// consumed in `pump_favicon_updates` so a cache hit can be applied
+    /// immediately on the first tick before CEF fires.
+    pending_favicon_prefill: HashMap<i32, String>,
+    /// Per-browser memoization of the last URL we cache-checked. The runtime
+    /// scan in `pump_favicon_updates` walks every tab and enqueues a prefill
+    /// when the tab's current URL differs from the one recorded here. This
+    /// covers omnibar / hint / popup / middle-click opens without touching
+    /// every `host.open_tab(...)` call site, and avoids re-running point
+    /// lookups for unchanged URLs.
+    favicon_check_url: HashMap<i32, String>,
     /// Persisted splash state. `hjkl-splash` 0.2 owns its time source —
     /// `cells()` reads the wall clock internally so animation cadence is
     /// independent of paint rate (scrolling can't accelerate the
@@ -2308,6 +2346,7 @@ impl AppState {
         initial_update_status: buffr_core::UpdateStatus,
         palette: Palette,
         show_favicons: bool,
+        favicon_cache: Option<buffr_core::FaviconCache>,
         idle_inhibit_config: Arc<buffr_config::IdleInhibitConfig>,
         shutdown_flag: Arc<AtomicBool>,
         event_proxy: EventLoopProxy<BuffrUserEvent>,
@@ -2407,6 +2446,9 @@ impl AppState {
             popup_close_sink: buffr_core::new_popup_close_sink(),
             favicons: HashMap::new(),
             show_favicons,
+            favicon_cache,
+            pending_favicon_prefill: HashMap::new(),
+            favicon_check_url: HashMap::new(),
             splash: crate::loading_anim::new_splash(),
             last_splash_tick: None,
             splash_js_next_push: None,
@@ -2813,53 +2855,92 @@ impl AppState {
     /// Open any extra `--new-tab` URLs after the homepage / session
     /// has been initialised. Drained once per `resumed` tick.
     fn open_pending_tabs(&mut self) {
-        let Some(host) = self.host.as_ref() else {
-            return;
-        };
-        // Restored session first — these were saved in the previous
-        // run's tab order. The first one is already loaded as the
-        // initial tab via `BrowserHost::new`; the rest open in the
-        // background so the user lands on tab 0.
-        let session = std::mem::take(&mut self.pending_session_tabs);
-        for (i, (url, pinned)) in session.iter().enumerate() {
-            if i == 0 {
-                // The initial `BrowserHost::new` already loaded tab 0
-                // with `homepage`. Navigate the active tab there
-                // instead of opening a new one so we don't end up
-                // with a stray homepage tab.
-                if let Err(err) = host.navigate(url) {
-                    warn!(error = %err, %url, "session: navigate first tab failed");
-                }
-                if *pinned && let Some(active) = host.active_tab() {
-                    host.set_pinned(active.id, true);
-                }
-                continue;
-            }
-            match host.open_tab_background(url) {
-                Ok(id) => {
-                    if *pinned {
-                        // The new tab is in the background, so the
-                        // pin must target it by id rather than the
-                        // currently-active tab.
-                        host.set_pinned(id, true);
+        // Collect (browser_id, url) pairs to prefill from the disk cache.
+        // Built inside the host-borrow scope, applied afterwards so the
+        // borrow checker sees no aliased &mut self.
+        let mut prefill_queue: Vec<(i32, String)> = Vec::new();
+
+        {
+            let Some(host) = self.host.as_ref() else {
+                return;
+            };
+            // Restored session first — these were saved in the previous
+            // run's tab order. The first one is already loaded as the
+            // initial tab via `BrowserHost::new`; the rest open in the
+            // background so the user lands on tab 0.
+            let session = std::mem::take(&mut self.pending_session_tabs);
+            for (i, (url, pinned)) in session.iter().enumerate() {
+                if i == 0 {
+                    // The initial `BrowserHost::new` already loaded tab 0
+                    // with `homepage`. Navigate the active tab there
+                    // instead of opening a new one so we don't end up
+                    // with a stray homepage tab.
+                    if let Err(err) = host.navigate(url) {
+                        warn!(error = %err, %url, "session: navigate first tab failed");
                     }
+                    if *pinned && let Some(active) = host.active_tab() {
+                        host.set_pinned(active.id, true);
+                    }
+                    // Queue a prefill for the active tab's browser_id.
+                    if let Some(active) = host.active_tab() {
+                        prefill_queue.push((active.browser_id, url.clone()));
+                    }
+                    continue;
                 }
-                Err(err) => warn!(error = %err, %url, "session: open_tab failed"),
+                match host.open_tab_background(url) {
+                    Ok(id) => {
+                        if *pinned {
+                            // The new tab is in the background, so the
+                            // pin must target it by id rather than the
+                            // currently-active tab.
+                            host.set_pinned(id, true);
+                        }
+                        // Queue a prefill for the new browser's id. The
+                        // CEF browser is created synchronously so the last
+                        // entry in tabs_summary() is the tab we just opened.
+                        if let Some(last) = host.tabs_summary().last() {
+                            prefill_queue.push((last.browser_id, url.clone()));
+                        }
+                    }
+                    Err(err) => warn!(error = %err, %url, "session: open_tab failed"),
+                }
             }
+            // Restore the active tab from the session, if any.
+            if let Some(idx) = self.pending_session_active.take() {
+                let summaries = host.tabs_summary();
+                if let Some(tab) = summaries.get(idx) {
+                    host.select_tab(tab.id);
+                }
+            }
+            // CLI `--new-tab` URLs append after the session.
+            let cli_tabs = std::mem::take(&mut self.pending_new_tabs);
+            for url in cli_tabs {
+                match host.open_tab_background(&url) {
+                    Ok(_) => {
+                        if let Some(last) = host.tabs_summary().last() {
+                            prefill_queue.push((last.browser_id, url.clone()));
+                        }
+                    }
+                    Err(err) => warn!(error = %err, %url, "new-tab: open_tab failed"),
+                }
+            }
+        } // host borrow ends here
+
+        // Apply prefills now that the immutable host borrow has been dropped.
+        for (browser_id, url) in prefill_queue {
+            self.register_favicon_prefill(browser_id, &url);
         }
-        // Restore the active tab from the session, if any.
-        if let Some(idx) = self.pending_session_active.take() {
-            let summaries = host.tabs_summary();
-            if let Some(tab) = summaries.get(idx) {
-                host.select_tab(tab.id);
-            }
+    }
+
+    /// If `show_favicons` is on and the cache is available, register
+    /// `(browser_id, origin_of(url))` in `pending_favicon_prefill` so
+    /// `pump_favicon_updates` can apply the cached bitmap on its next tick.
+    fn register_favicon_prefill(&mut self, browser_id: i32, url: &str) {
+        if !self.show_favicons || self.favicon_cache.is_none() {
+            return;
         }
-        // CLI `--new-tab` URLs append after the session.
-        let cli_tabs = std::mem::take(&mut self.pending_new_tabs);
-        for url in cli_tabs {
-            if let Err(err) = host.open_tab_background(&url) {
-                warn!(error = %err, %url, "new-tab: open_tab failed");
-            }
+        if let Some(origin) = buffr_core::origin_of(url) {
+            self.pending_favicon_prefill.insert(browser_id, origin);
         }
     }
 
@@ -2953,6 +3034,12 @@ impl AppState {
     /// `refresh_tab_strip` reads this map to attach the bitmap to each
     /// `TabView`. Marks chrome dirty when at least one update lands so
     /// the new favicon shows up on the next paint.
+    ///
+    /// Also:
+    /// - Applies any pending disk-cache prefills registered by
+    ///   `register_favicon_prefill` (one lookup per pending entry; hits
+    ///   populate `self.favicons` before the CEF callback fires).
+    /// - Persists every fresh CEF-delivered bitmap back to the disk cache.
     fn pump_favicon_updates(&mut self) -> bool {
         let Some(host) = self.host.as_ref() else {
             return false;
@@ -2962,15 +3049,99 @@ impl AppState {
             // effect immediately on the next refresh.
             if !self.favicons.is_empty() {
                 self.favicons.clear();
+                self.pending_favicon_prefill.clear();
                 return true;
             }
             return false;
         }
+
+        let mut changed = false;
+
+        // ── Runtime scan: enqueue prefills for tabs whose URL changed ────────
+        //
+        // Catches every code path that opens a tab without going through the
+        // session-restore queue: omnibar navigates, link middle-clicks, hint
+        // mode, popup → tab, view-source, etc. We compare each tab's current
+        // URL against the one we last cache-checked for that browser_id;
+        // mismatch → enqueue a prefill. Closed browsers are dropped from the
+        // memoization map to bound memory.
+        if self.favicon_cache.is_some() {
+            let summaries = host.tabs_summary();
+            let live_ids: std::collections::HashSet<i32> =
+                summaries.iter().map(|t| t.browser_id).collect();
+            self.favicon_check_url.retain(|id, _| live_ids.contains(id));
+            for tab in &summaries {
+                let same = self
+                    .favicon_check_url
+                    .get(&tab.browser_id)
+                    .is_some_and(|prev| prev == &tab.url);
+                if same {
+                    continue;
+                }
+                self.favicon_check_url
+                    .insert(tab.browser_id, tab.url.clone());
+                // Don't overwrite an existing favicon — CEF-delivered wins.
+                if self.favicons.contains_key(&tab.browser_id) {
+                    continue;
+                }
+                if let Some(origin) = buffr_core::origin_of(&tab.url) {
+                    self.pending_favicon_prefill.insert(tab.browser_id, origin);
+                }
+            }
+        }
+
+        // ── Apply cached prefills ────────────────────────────────────────────
+        //
+        // Drain `pending_favicon_prefill` entries. For each browser that does
+        // not yet have a favicon, look up the disk cache by origin. On hit,
+        // synthesize a `TabFavicon` and stash it so the next
+        // `refresh_tab_strip` can paint it without waiting for CEF.
+        if let Some(cache) = self.favicon_cache.as_ref() {
+            let pending: Vec<(i32, String)> = self.pending_favicon_prefill.drain().collect();
+            for (browser_id, origin) in pending {
+                // Skip if CEF already delivered a fresh one this session.
+                if self.favicons.contains_key(&browser_id) {
+                    continue;
+                }
+                if let Some(cached) = cache.get(&origin) {
+                    debug!(browser_id, %origin, "favicon cache: prefill hit");
+                    let fav = buffr_ui::TabFavicon {
+                        width: cached.width,
+                        height: cached.height,
+                        pixels: std::sync::Arc::new(cached.pixels),
+                    };
+                    self.favicons.insert(browser_id, fav);
+                    changed = true;
+                }
+            }
+        } else {
+            // No cache — just discard pending entries.
+            self.pending_favicon_prefill.clear();
+        }
+
+        // ── Drain fresh CEF-delivered bitmaps ────────────────────────────────
         let updates = buffr_core::drain_favicon_updates(&host.favicon_sink());
         if updates.is_empty() {
-            return false;
+            return changed;
         }
+        // Build a browser_id → url map from the current tab list so we can
+        // resolve the origin for each incoming favicon.
+        let id_to_url: HashMap<i32, String> = host
+            .tabs_summary()
+            .into_iter()
+            .map(|t| (t.browser_id, t.url))
+            .collect();
         for u in updates {
+            // Persist to disk cache keyed by the tab's current origin.
+            if let Some(cache) = self.favicon_cache.as_ref()
+                && let Some(url) = id_to_url.get(&u.browser_id)
+                && let Some(origin) = buffr_core::origin_of(url)
+            {
+                debug!(browser_id = u.browser_id, %origin, "favicon cache: write");
+                cache.put(&origin, u.width, u.height, &u.pixels);
+            }
+            // CEF-delivered bitmap always wins — remove any prefill placeholder.
+            self.pending_favicon_prefill.remove(&u.browser_id);
             let fav = buffr_ui::TabFavicon {
                 width: u.width,
                 height: u.height,
