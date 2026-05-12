@@ -53,8 +53,8 @@ fn key_event_to_planned(key: KeyEvent) -> PlannedInput {
 /// One active edit-mode session bound to a single text field.
 ///
 /// Owns the engine [`Editor`] generic over [`BuffrHost`]. The host
-/// (clipboard / time / intent fan-out) lives inside the editor as of
-/// hjkl 0.1.0 — `Editor<hjkl_buffer::Buffer, BuffrHost>`. Pull-model:
+/// (clipboard / time / intent fan-out) lives inside the editor —
+/// `Editor<hjkl_buffer::Buffer, BuffrHost>`. Pull-model:
 /// per render frame the host calls [`EditSession::take_content_change`]
 /// and forwards any new content to the DOM.
 pub struct EditSession {
@@ -69,9 +69,9 @@ impl EditSession {
             BuffrHost::new(),
             Options::default(),
         );
-        // 0.1.0: keybinding mode is a post-construction public field on
-        // Editor. Vim is the default already, but set explicitly so the
-        // intent stays visible at the call site.
+        // Keybinding mode is a post-construction public field on Editor.
+        // Vim is the default already, but set explicitly so the intent
+        // stays visible at the call site.
         editor.keybinding_mode = KeybindingMode::Vim;
         editor.set_content(initial);
         Self { editor }

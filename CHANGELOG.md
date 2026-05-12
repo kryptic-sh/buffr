@@ -6,6 +6,20 @@ All notable changes to `buffr-modal` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-13
+
+### Changed
+
+- `hjkl-engine` `0.1` → `0.5`, `hjkl-buffer` `0.1` → `0.6`. The public API
+  surface used by edit-mode (`Editor`, `Host`, `Buffer`, `Viewport`,
+  `PlannedInput`, `SpecialKey`, `Modifiers`, `VimMode`, `CursorShape`,
+  `KeybindingMode`, `Options::default()`) is fully additive across the range —
+  no code migration. Unblocks the dependabot major-bump PRs.
+
+### Documentation
+
+- Dropped two stale `hjkl 0.1.0`-era doc comments in `edit_mode.rs`.
+
 ## [0.1.3] — 2026-05-12
 
 ### Changed
@@ -34,7 +48,8 @@ All notable changes to `buffr-modal` are documented here. Format follows
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-modal/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-modal/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.4
 [0.1.3]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.1
