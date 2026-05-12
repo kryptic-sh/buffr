@@ -20,6 +20,7 @@ pub mod cursor;
 pub mod download_notice;
 pub mod edit;
 pub mod favicon;
+pub mod favicon_cache;
 pub mod find;
 pub mod handlers;
 pub mod hint;
@@ -70,6 +71,7 @@ pub use favicon::{
     FaviconEnabled, FaviconSink, FaviconUpdate, drain_favicon_updates, favicon_is_enabled,
     new_favicon_enabled, new_favicon_sink, set_favicon_enabled,
 };
+pub use favicon_cache::{CachedFavicon, FaviconCache, FaviconCacheError, origin_of};
 pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
 };

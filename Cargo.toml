@@ -35,6 +35,8 @@ buffr-downloads = "0.1"
 buffr-config = "0.4"
 buffr-zoom = "0.1"
 buffr-permissions = "0.1"
+rusqlite = { version = "0.39", features = ["bundled"] }
+url = "2"
 buffr-view-source = "0.1"
 hjkl-clipboard = "0.5"
 winit = "0.30"
