@@ -157,6 +157,18 @@ jobs:
         run:
           cargo clippy --workspace --all-targets --features osr -- -D warnings
 
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   bundle-macos-cross:
     # Cross-bundle the macOS .app on a Linux runner. Catches
     # `xtask bundle-macos` regressions per-commit without paying for a real
