@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-13
+
 ### Added
 
 - **Crash-loop detection** (#61). `apps/buffr-app/src/crash_guard.rs` tracks
@@ -17,6 +19,20 @@ and this project adheres to
   and the new launch starts from the homepage instead of restoring the killer
   URL set. Graceful shutdown paths (last-tab-close, `:q`, window close, Ctrl+C)
   clear the tracker. Skipped under `--private`.
+
+### CI
+
+- Tag-gated the 5 heavy packaging jobs (`linux-package`, `macos-package`,
+  `windows-package`, `flatpak`, `snap`) — main-push CI now runs only
+  lint+test+smoke+deny+macos-cross (~3min) instead of the full ~17min matrix.
+  Tag pushes still get the full pipeline.
+- Added `~/.local/share/flatpak` + `flatpak/.flatpak-builder` caches to the
+  Flatpak job (GNOME runtime is ~2-3GB per arch; primes at next tag).
+- Fanned `bundle-macos-cross` out from behind `needs: [linux]` — runs in
+  parallel with the linux build instead of waiting for it.
+- Split `fmt` + `clippy` out of the `linux` job into a parallel `lint` job.
+- Swapped `cargo test` for `cargo nextest run` (workspace tests run ~3× faster
+  locally; doctests covered by a separate `cargo test --doc` pass).
 
 ## [0.6.1] - 2026-05-12
 
@@ -790,7 +806,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.0
 [0.5.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.5.3
