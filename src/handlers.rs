@@ -36,7 +36,8 @@ use buffr_zoom::ZoomStore;
 
 use crate::audio::{AudioEventQueue, AudioStateSink, BuffrAudioHandler};
 use crate::context_menu::{
-    CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuRequest, ContextMenuSink, build_model,
+    CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuRequest, ContextMenuSink, ContextMenuTarget,
+    build_model,
 };
 use crate::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue, push};
 use crate::edit::{EditEventSink, build_inject_script as build_edit_inject_script};
@@ -1534,6 +1535,7 @@ wrap_context_menu_handler! {
                 y,
                 browser_id,
                 items,
+                target: ContextMenuTarget::Page,
                 link_url,
                 source_url,
                 selection_text: selection,

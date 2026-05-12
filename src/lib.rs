@@ -52,7 +52,8 @@ pub use audio::{
 };
 pub use context_menu::{
     CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuItem, ContextMenuRequest, ContextMenuSink,
-    build_model as build_context_menu_model, new_context_menu_sink,
+    ContextMenuTarget, build_model as build_context_menu_model,
+    build_tab_model as build_tab_context_menu_model, new_context_menu_sink,
 };
 pub use crash::{CrashError, CrashReport, CrashReporter};
 pub use cursor::{CursorState, SharedCursorState};
