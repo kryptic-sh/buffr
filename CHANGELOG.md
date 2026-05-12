@@ -6,6 +6,19 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-05-12
+
+### Added
+
+- **`FaviconCache` — SQLite-backed favicon disk cache** keyed by origin
+  (`scheme://host[:port]`). WAL journal mode, forward-only schema migrations
+  matching the `buffr-zoom` / `buffr-history` pattern. UPSERT on `put`,
+  point-read on `get`; BGRA `u32` pixels stored as a raw `BLOB`. New
+  `FaviconCacheError`, `CachedFavicon` types and `origin_of(url)` helper that
+  rejects `about:`, `chrome:`, `chrome-extension:`, `file:`, `data:`,
+  `javascript:` schemes.
+- New deps: `rusqlite` (`bundled`) and `url`.
+
 ## [0.6.1] — 2026-05-12
 
 ### Changed
@@ -256,7 +269,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.5.0
