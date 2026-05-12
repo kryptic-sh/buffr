@@ -153,6 +153,7 @@ use buffr_ui::{
     TabStrip, TabView,
 };
 
+mod crash_guard;
 mod heartbeat;
 mod loading_anim;
 mod render;
@@ -922,8 +923,36 @@ fn main() -> Result<()> {
     } else {
         Some(session::default_path(&paths.data))
     };
+
+    // Crash-loop guard. Persistent profile only — `--private` runs are
+    // ephemeral and don't need (or want) the tracker file. If the
+    // recent-startup window already shows enough attempts without a
+    // clean exit, treat this launch as a crash loop: quarantine the
+    // saved session so a killer URL can't be restored again, and skip
+    // session restore for this launch.
+    let crash_guard_path = if cli.private {
+        None
+    } else {
+        Some(crash_guard::default_path(&paths.data))
+    };
+    let crash_loop_detected = if let Some(gp) = crash_guard_path.as_ref() {
+        let detected = crash_guard::record_start(gp);
+        if detected && let Some(p) = session_path.as_ref() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Err(err) = crash_guard::quarantine_session(p, now) {
+                warn!(error = %err, "crash_guard: quarantine failed");
+            }
+        }
+        detected
+    } else {
+        false
+    };
+
     let (pending_session_tabs, pending_session_active): (Vec<(String, bool)>, Option<usize>) =
-        if cli.private || cli.no_restore {
+        if cli.private || cli.no_restore || crash_loop_detected {
             (Vec::new(), None)
         } else if let Some(p) = session_path.as_ref() {
             match session::read(p) {
@@ -1009,6 +1038,7 @@ fn main() -> Result<()> {
         pending_session_tabs,
         pending_session_active,
         session_path,
+        crash_guard_path,
         counters.clone(),
         update_checker.clone(),
         initial_update_status,
@@ -1892,6 +1922,10 @@ struct AppState {
     /// Path the runtime persists the live tab list to on clean
     /// shutdown. `None` in private mode (sessions never persist).
     session_path: Option<PathBuf>,
+    /// Crash-loop tracker file. Cleared on graceful shutdown so the
+    /// next launch starts with a clean attempt history. `None` mirrors
+    /// `session_path` semantics — private mode skips the tracker.
+    crash_guard_path: Option<PathBuf>,
     /// wgpu-based present layer. Initialised in `resumed`; replaces the
     /// former softbuffer context + surface pair.
     renderer: Option<crate::render::Renderer>,
@@ -2341,6 +2375,7 @@ impl AppState {
         pending_session_tabs: Vec<(String, bool)>,
         pending_session_active: Option<usize>,
         session_path: Option<PathBuf>,
+        crash_guard_path: Option<PathBuf>,
         counters: Arc<buffr_core::UsageCounters>,
         update_checker: Arc<buffr_core::UpdateChecker>,
         initial_update_status: buffr_core::UpdateStatus,
@@ -2405,6 +2440,7 @@ impl AppState {
             pending_session_tabs,
             pending_session_active,
             session_path,
+            crash_guard_path,
             renderer: None,
             cursor_blink_at: Instant::now(),
             counters,
@@ -2763,6 +2799,7 @@ impl AppState {
             Ok(false) => {
                 info!("tab_close: last tab gone — saving session and exiting");
                 self.save_session_now();
+                self.mark_clean_shutdown();
                 std::process::exit(0);
             }
             Err(err) => {
@@ -2790,10 +2827,20 @@ impl AppState {
             if only {
                 info!("tab_close: last tab gone — saving session and exiting");
                 self.save_session_now();
+                self.mark_clean_shutdown();
                 std::process::exit(0);
             }
             self.refresh_tab_strip();
             self.mark_session_dirty();
+        }
+    }
+
+    /// Clear the crash-loop tracker. Call only at genuine graceful
+    /// shutdown sites — *not* from debounced session flushes — so the
+    /// next launch starts with a clean attempt history.
+    fn mark_clean_shutdown(&self) {
+        if let Some(path) = self.crash_guard_path.as_ref() {
+            crash_guard::record_clean_exit(path);
         }
     }
 
@@ -6502,6 +6549,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::CloseRequested => {
                 info!("close requested");
                 self.save_session_now();
+                self.mark_clean_shutdown();
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -7216,6 +7264,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // clean (session saved, CEF not left in a wedged state).
         if self.shutdown_flag.load(Ordering::SeqCst) {
             self.save_session_now();
+            self.mark_clean_shutdown();
             event_loop.exit();
             return;
         }

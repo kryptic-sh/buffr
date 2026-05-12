@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Crash-loop detection** (#61). `apps/buffr-app/src/crash_guard.rs` tracks
+  recent startup timestamps in `<data_dir>/launch.json`. Three startups inside a
+  60-second window without a clean exit between them is treated as a crash loop:
+  the saved `session.json` is moved aside to `session.json.crashed-<unix_ts>`
+  and the new launch starts from the homepage instead of restoring the killer
+  URL set. Graceful shutdown paths (last-tab-close, `:q`, window close, Ctrl+C)
+  clear the tracker. Skipped under `--private`.
+
 ## [0.6.1] - 2026-05-12
 
 ### Added
