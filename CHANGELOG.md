@@ -8,6 +8,22 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Right-click context menu on tab-strip entries** (#37). Right-clicking a tab
+  now opens a tab-specific menu — Reload Tab, Duplicate Tab, Pin/Unpin Tab, Copy
+  Tab URL, Close Tab, Close Other Tabs, Close Tabs to the Right — instead of the
+  page/selection menu. "Close Other Tabs" / "Close Tabs to the Right" are dimmed
+  when there's nothing they'd close and skip pinned tabs (Chrome behaviour);
+  closing a pinned tab routes through the existing confirmation prompt;
+  Duplicate Tab inserts the copy right after the source. Keymap (`x`, `gt`/`gT`,
+  pin toggle) stays canonical — the menu mirrors it for discoverability.
+
+### Submodules
+
+- `buffr-core` `0.6.2` → `0.6.3` (adds `ContextMenuTarget`, the tab
+  `ContextMenuItem` variants, and `build_tab_context_menu_model`).
+
 ## [0.6.2] - 2026-05-13
 
 ### Added

@@ -131,11 +131,11 @@ use anyhow::{Context, Result};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, ContextMenuItem, ContextMenuRequest, DownloadNoticeQueue, EditConsoleEvent,
-    EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink, IdleInhibitor,
-    NEW_TAB_URL, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome, SharedOsrFrame,
-    SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer, drain_popup_closes,
-    drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
+    BuffrApp, ContextMenuItem, ContextMenuRequest, ContextMenuTarget, DownloadNoticeQueue,
+    EditConsoleEvent, EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink,
+    IdleInhibitor, NEW_TAB_URL, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
+    SharedOsrFrame, SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer,
+    drain_popup_closes, drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
     new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
     new_inhibitor, new_permissions_queue, peek_download_notice, peek_permission_front,
     permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
@@ -2316,6 +2316,8 @@ impl ActiveContextMenu {
         match self.request.items.get(idx) {
             Some(ContextMenuItem::HistoryBack { enabled }) => *enabled,
             Some(ContextMenuItem::HistoryForward { enabled }) => *enabled,
+            Some(ContextMenuItem::TabCloseOthers { enabled }) => *enabled,
+            Some(ContextMenuItem::TabCloseToRight { enabled }) => *enabled,
             Some(item) => !item.is_separator(),
             None => false,
         }
@@ -4515,10 +4517,161 @@ impl AppState {
                 }
             }
 
+            // ── Tab strip ────────────────────────────────────────────────────
+            I::TabReload => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_reload", "dispatch");
+                if let Some((_, id, _, _)) = self.resolve_tab_target(request)
+                    && let Some(host) = self.host.as_ref()
+                {
+                    // Focus the tab first so the active-tab reload hits it.
+                    host.select_tab(id);
+                    self.close_overlay();
+                    self.refresh_tab_strip();
+                    self.dispatch_action(&buffr_modal::PageAction::Reload);
+                }
+            }
+            I::TabDuplicate => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_duplicate", "dispatch");
+                if let Some((index, _, url, _)) = self.resolve_tab_target(request)
+                    && !url.is_empty()
+                    && let Some(host) = self.host.as_ref()
+                {
+                    // Insert the copy right after the source tab, Chrome-style.
+                    if let Err(err) = host.open_tab_at(&url, index + 1) {
+                        tracing::warn!(
+                            target: "buffr::context_menu",
+                            error = %err,
+                            "tab_duplicate: open_tab_at failed"
+                        );
+                    }
+                    self.refresh_tab_strip();
+                    self.mark_session_dirty();
+                }
+            }
+            I::TabPin { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_pin", "dispatch");
+                if let Some((_, id, _, pinned)) = self.resolve_tab_target(request)
+                    && let Some(host) = self.host.as_ref()
+                {
+                    host.set_pinned(id, !pinned);
+                    self.refresh_tab_strip();
+                    self.mark_session_dirty();
+                }
+            }
+            I::TabCopyUrl => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_copy_url", "dispatch");
+                if let Some((_, _, url, _)) = self.resolve_tab_target(request)
+                    && let Some(host) = self.host.as_ref()
+                    && !host.clipboard_set_text(&url)
+                {
+                    tracing::warn!(
+                        target: "buffr::context_menu",
+                        "tab_copy_url: clipboard write failed"
+                    );
+                }
+            }
+            I::TabClose => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_close", "dispatch");
+                if let Some((_, id, _, pinned)) = self.resolve_tab_target(request) {
+                    if pinned && self.confirm_close_pinned.is_none() {
+                        // Mirror the middle-click guard: don't let a
+                        // pinned tab be lost from a context-menu misaim.
+                        self.confirm_close_pinned = Some(id);
+                        self.request_redraw();
+                        return;
+                    }
+                    let remaining = if let Some(host) = self.host.as_ref() {
+                        let _ = host.close_tab(id);
+                        host.tab_count()
+                    } else {
+                        0
+                    };
+                    self.refresh_tab_strip();
+                    if remaining == 0 {
+                        self.save_session_now();
+                        self.mark_clean_shutdown();
+                        std::process::exit(0);
+                    }
+                    self.mark_session_dirty();
+                }
+            }
+            I::TabCloseOthers { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_close_others", "dispatch");
+                if let Some((_, keep_id, _, _)) = self.resolve_tab_target(request) {
+                    // Snapshot (id, pinned) before closing — closing
+                    // shifts indices. Skip the kept tab and any pinned
+                    // tabs (Chrome leaves pinned tabs alone).
+                    let victims: Vec<buffr_core::TabId> = self
+                        .host
+                        .as_ref()
+                        .map(|h| {
+                            h.tabs_summary()
+                                .into_iter()
+                                .filter(|t| t.id != keep_id && !t.pinned)
+                                .map(|t| t.id)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(host) = self.host.as_ref() {
+                        for id in victims {
+                            let _ = host.close_tab(id);
+                        }
+                        host.select_tab(keep_id);
+                    }
+                    self.refresh_tab_strip();
+                    self.mark_session_dirty();
+                }
+            }
+            I::TabCloseToRight { .. } => {
+                tracing::info!(target: "buffr::context_menu", action = "tab_close_to_right", "dispatch");
+                if let Some((index, _, _, _)) = self.resolve_tab_target(request) {
+                    // Snapshot ids for slots strictly after the target,
+                    // skipping pinned tabs, before any closure shifts
+                    // indices.
+                    let victims: Vec<buffr_core::TabId> = self
+                        .host
+                        .as_ref()
+                        .map(|h| {
+                            h.tabs_summary()
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(i, t)| *i > index && !t.pinned)
+                                .map(|(_, t)| t.id)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(host) = self.host.as_ref() {
+                        for id in victims {
+                            let _ = host.close_tab(id);
+                        }
+                    }
+                    self.refresh_tab_strip();
+                    self.mark_session_dirty();
+                }
+            }
+
             I::Separator => {
                 // Separators are never activated (disabled in is_enabled).
             }
         }
+    }
+
+    /// Resolve a [`ContextMenuTarget::Tab`] request to
+    /// `(slot_index, tab_id, url, pinned)` against the *current* tab
+    /// list. Returns `None` if the request isn't a tab target or the
+    /// recorded slot no longer exists (the tab list changed since the
+    /// menu opened).
+    fn resolve_tab_target(
+        &self,
+        request: &ContextMenuRequest,
+    ) -> Option<(usize, buffr_core::TabId, String, bool)> {
+        let ContextMenuTarget::Tab { index } = request.target else {
+            return None;
+        };
+        let host = self.host.as_ref()?;
+        let summaries = host.tabs_summary();
+        let t = summaries.get(index)?;
+        Some((index, t.id, t.url.clone(), t.pinned))
     }
 
     /// Route a winit `KeyEvent` to the open context menu. Returns `true`
@@ -6892,11 +7045,52 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
 
-                // Tab-strip click: Left = focus / drag, Middle = close.
-                // Press on left selects the tab AND records a drag src;
-                // release on left finalizes the drag if the cursor moved
-                // to a different slot.
+                // Tab-strip click: Left = focus / drag, Middle = close,
+                // Right = tab context menu. Press on left selects the tab
+                // AND records a drag src; release on left finalizes the
+                // drag if the cursor moved to a different slot.
                 let tab_strip_idx = self.hit_test_tab_strip();
+                if state == Pressed
+                    && button == MouseButton::Right
+                    && let Some(idx) = tab_strip_idx
+                {
+                    // Synthesise a Tab-target context-menu request. Tab
+                    // clicks never reach CEF, so there's no
+                    // drain_context_menu_requests path for this — build
+                    // the request here and show it directly.
+                    let (pinned, url) = self
+                        .host
+                        .as_ref()
+                        .and_then(|h| h.tabs_summary().get(idx).map(|t| (t.pinned, t.url.clone())))
+                        .unwrap_or((false, String::new()));
+                    let tab_count = self.tab_ids.len().max(1);
+                    let items = buffr_core::build_tab_context_menu_model(tab_count, idx, pinned);
+                    // Cursor → chrome-buffer (physical full-window) coords,
+                    // matching the click hit-test path. osr_cursor is
+                    // browser-region-relative; add the CEF y-offset.
+                    let size = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.inner_size())
+                        .unwrap_or_default();
+                    let win_w = size.width.max(1);
+                    let win_h = size.height.max(1);
+                    let cef_y_offset = self.cef_child_rect(win_w, win_h).1 as i32;
+                    let request = ContextMenuRequest {
+                        x: self.osr_cursor.0,
+                        y: self.osr_cursor.1 + cef_y_offset,
+                        browser_id: 0,
+                        items,
+                        target: ContextMenuTarget::Tab { index: idx },
+                        link_url: url,
+                        source_url: String::new(),
+                        selection_text: String::new(),
+                    };
+                    self.context_menu = Some(ActiveContextMenu::new(request));
+                    self.mark_chrome_dirty();
+                    self.request_redraw();
+                    return;
+                }
                 if state == Pressed
                     && button == MouseButton::Left
                     && let Some(idx) = tab_strip_idx
