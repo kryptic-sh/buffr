@@ -604,12 +604,37 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             flatpak flatpak-builder
 
+      # GNOME Platform + SDK is ~2-3GB per arch and dominates cold-cache
+      # Flatpak build time. Cache the user-scope flatpak directory; on
+      # hit, `flatpak install` is a near-instant no-op. Key includes the
+      # runtime version so a bump to //48 invalidates cleanly.
+      - name: Cache flatpak GNOME runtime
+        uses: actions/cache@v5
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-runtime-gnome47-${{ matrix.arch }}-v1
+          restore-keys: |
+            flatpak-runtime-gnome47-${{ matrix.arch }}-
+
       - name: Add flathub remote + install runtime
         run: |
           flatpak remote-add --if-not-exists --user flathub \
             https://flathub.org/repo/flathub.flatpakrepo
           flatpak install -y --user flathub \
             org.gnome.Platform//47 org.gnome.Sdk//47
+
+      # flatpak-builder's per-module cache lives at .flatpak-builder/
+      # next to the manifest. Survives across runs and lets unchanged
+      # modules skip re-build. Keyed on manifest hash with a loose
+      # restore-key so a manifest tweak still warm-starts from the
+      # previous run's cache.
+      - name: Cache flatpak-builder build cache
+        uses: actions/cache@v5
+        with:
+          path: flatpak/.flatpak-builder
+          key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('flatpak/sh.kryptic.buffr.yml') }}
+          restore-keys: |
+            flatpak-builder-${{ matrix.arch }}-
 
       - name: Stage tarball payload
         run: |
