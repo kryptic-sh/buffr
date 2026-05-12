@@ -100,10 +100,10 @@ buffr-permissions = "0.1"
 buffr-view-source = "0.1"
 
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
-# at 0.1 / 0.3 — patch bumps roll in automatically via workspace member
-# resolution; major-bump breakage is gated by the leading-zero version.
-hjkl-engine = "0.1"
-hjkl-buffer = "0.1"
+# at their latest majors — patch bumps roll in automatically via workspace
+# member resolution; major-bump breakage is gated by the leading-zero version.
+hjkl-engine = "0.5"
+hjkl-buffer = "0.6"
 hjkl-clipboard = "0.5"
 hjkl-splash = "0.2"
 
