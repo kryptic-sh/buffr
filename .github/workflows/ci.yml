@@ -110,11 +110,21 @@ jobs:
       - name: fetch CEF
         run: cargo xtask fetch-cef
 
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: cargo build
         run: cargo build --workspace
 
-      - name: cargo test
-        run: cargo test --workspace -- --nocapture
+      # nextest replaces `cargo test` for unit/integration tests. Process
+      # per test binary + smart scheduling typically beats the stock
+      # runner on multi-crate workspaces. Doctests aren't covered by
+      # nextest, so they get a separate `cargo test --doc` pass.
+      - name: cargo nextest run
+        run: cargo nextest run --workspace --no-fail-fast
+
+      - name: cargo test (doctests)
+        run: cargo test --workspace --doc
 
       - name: smoke test (xvfb)
         run: |
