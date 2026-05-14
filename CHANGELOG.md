@@ -8,6 +8,93 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-15
+
+### Added
+
+- **Phase 8: blink-cdp feature parity sprint** — seven sub-phases bring the
+  blink-cdp backend up to the same baseline UX as CEF for everyday browsing.
+  After this release, blink-cdp is viable as a default engine for typical
+  workloads, not just experimental opt-in.
+  - **8a — permissions** (#88). Geolocation, Notifications, Microphone, and
+    Camera prompts now route through the same status-line prompt UI as CEF.
+    Implemented via a JS shim injected with
+    `Page.addScriptToEvaluateOnNewDocument` that wraps
+    `navigator.geolocation.getCurrentPosition`,
+    `Notification.requestPermission`, `navigator.permissions.query`, and
+    `navigator.mediaDevices.getUserMedia`. The shim posts to a
+    `Runtime.addBinding` named `__buffrPermissionRequest`; the CDP worker thread
+    receives `Runtime.bindingCalled` events and pushes a neutral
+    `PendingPermission` onto the shared `PermissionsQueue`. User answers resolve
+    back to the page via `Runtime.evaluate` calling
+    `__buffrPermissionResolve(<id>, granted|denied)`. The permission types
+    (`PendingPermission`, `PermissionsQueue`, `PromptOutcome`, `Capability`)
+    moved to `buffr-engine::permissions`; the queue is now a `BrowserEngine`
+    trait method `permissions_queue()` so apps drain from both backends
+    uniformly.
+
+  - **8b — downloads** (#84).
+    `Browser.setDownloadBehavior { behavior: "allow", downloadPath, eventsEnabled: true }`
+    is configured per engine at startup. The worker subscribes to
+    `Browser.downloadWillBegin` and `Browser.downloadProgress` events, mapping
+    `inProgress`/`completed`/ `canceled` states onto the existing
+    `buffr-downloads` SQLite store via
+    `Downloads::record_started`/`update_progress`/`record_completed`/
+    `record_canceled`. Completed downloads push to `DownloadNoticeQueue` for
+    status-line surface (same as CEF). Per-engine download directory defaults to
+    `<data_root>/blink-cdp/<id>/downloads` so each instance gets isolated
+    storage.
+
+  - **8c — find-in-page** (#83). `/`-keymap now works on blink-cdp tabs via an
+    injected TreeWalker-based shim that wraps text-node matches in
+    `<span class="__buffr-find-match">` with a current-match accent on
+    `__buffr-find-current`. `start_find` / `find_next` / `find_prev` /
+    `stop_find` on the `BrowserEngine` trait call
+    `Runtime.evaluate("__buffrFindNext('query', false)")` etc.; the JS returns
+    `{ current, total }` which the worker writes to the existing
+    `FindResultSink`. No `eval`, no `innerHTML` — pure DOM mutation.
+
+  - **8d — context-menu hit-test** (#87). Right-click on a blink-cdp tab now
+    populates the same context menu as CEF (Copy Link, Save Image, Copy Image
+    URL, Open Image In New Tab, etc.). Implemented via a capture-phase
+    `contextmenu` event listener injected on every page; the listener walks the
+    target ancestor chain for `<a href>`, `<img>`, `<video>`, `<audio>`,
+    editable nodes, plus `window.getSelection()`, then posts the result to the
+    `__buffrContextMenu` Runtime binding. The worker parses the JSON payload
+    into a neutral `ContextMenuRequest` matching CEF's shape so the apps-layer
+    menu builder is reused unchanged.
+
+  - **8e — IME composition** (#86). Three new `BrowserEngine` trait methods
+    (`ime_set_composition`, `ime_commit`, `ime_cancel`) route winit
+    `WindowEvent::Ime(Preedit|Commit|Enabled|Disabled)` events to CDP
+    `Input.imeSetComposition { text, selectionStart, selectionEnd }` and
+    `Input.insertText { text }`. International input (Japanese, Chinese, Korean
+    composition windows; dead-key combining accents) now works on blink-cdp
+    tabs.
+
+  - **8f — `buffr://` and `view-source:` schemes** (#81). Chromium's network
+    stack rejects unknown schemes before CDP `Fetch` can intercept them, so the
+    engine translates internal URLs at the navigation layer: `buffr://new` and
+    `buffr://settings` route to `data:text/html;base64,<page_html>`;
+    `view-source:<url>` sync-fetches the target via `ureq`, HTML-escapes it into
+    a dark-themed `<pre>` envelope, and navigates to a data: URL.
+    `EngineState.original_urls` stashes the human-readable URL per-tab so
+    `active_tab_live_url` / `tabs_summary` return `buffr://new` instead of the
+    opaque base64 blob. The `NewTabHtmlProvider` is now shared between CEF and
+    blink-cdp through `BlinkCdpBackend::register_new_tab_handler`.
+
+  - **8g — Picture-in-Picture** (#90, resolves #31). Picture-in-Picture now
+    works on blink-cdp tabs via `Runtime.evaluate` invoking
+    `HTMLVideoElement.requestPictureInPicture()`. The IIFE finds the most
+    relevant video (preferring currently-playing, then unmuted, then first) and
+    toggles between enter/exit. This closes #31 (the original CEF limitation)
+    for users on the blink-cdp engine — switch a domain via `:engine blink-cdp`
+    or a per-domain engine rule to get PiP on sites where CEF can't deliver it.
+
+  Test count: 887/887. Tab-strip badge `BL` (blink-cdp) tabs now have full
+  CEF-equivalent UX across permissions, downloads, find, context menu, IME,
+  internal schemes, and PiP.
+
 ## [0.8.1] - 2026-05-15
 
 ### Fixed
@@ -1103,7 +1190,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.0
 [0.7.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.1
