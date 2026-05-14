@@ -16,4 +16,5 @@ path = "src/main.rs"
 [dependencies]
 cef.workspace = true
 anyhow.workspace = true
+buffr-cef.workspace = true
 buffr-core.workspace = true

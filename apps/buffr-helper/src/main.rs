@@ -9,7 +9,7 @@
 //! In all cases the helper does the bare minimum: forwards argv to
 //! `cef::execute_process`, exits with whatever code CEF returns.
 
-use buffr_core::{BuffrApp, init_cef_api};
+use buffr_cef::{BuffrApp, init_cef_api};
 
 fn main() {
     // macOS only: load `Chromium Embedded Framework.framework` via the

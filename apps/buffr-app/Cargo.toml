@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 
 [dependencies]
+buffr-engine.workspace = true
+buffr-cef.workspace = true
 buffr-core.workspace = true
 buffr-history.workspace = true
 buffr-bookmarks.workspace = true

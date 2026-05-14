@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/buffr-engine",
+    "crates/buffr-cef",
     "crates/buffr-core",
     "crates/buffr-modal",
     "crates/buffr-ui",
@@ -88,6 +90,8 @@ semver = { version = "1", features = ["serde"] }
 # deps from submodule Cargo.tomls (which list `buffr-modal = "0.1"`
 # etc. for their standalone CI) all resolve to the same workspace
 # member, eliminating "multiple versions of buffr_<name>" errors.
+buffr-engine = "0.1"
+buffr-cef = "0.1"
 buffr-core = "0.6"
 buffr-modal = "0.1"
 buffr-ui = "0.2"
@@ -114,6 +118,8 @@ hjkl-splash = "0.2"
 # cargo would mix the registry copy with the workspace member, producing
 # `multiple different versions of crate buffr_<name>` build errors.
 [patch.crates-io]
+buffr-engine = { path = "crates/buffr-engine" }
+buffr-cef = { path = "crates/buffr-cef" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 buffr-config = { path = "crates/buffr-config" }
 buffr-core = { path = "crates/buffr-core" }

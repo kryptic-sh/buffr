@@ -7,7 +7,7 @@
 //!    its own renderer/GPU/utility subprocess (single-binary mode).
 //! 3. Initialize CEF with [`buffr_core::BuffrApp`] + per-user paths.
 //! 4. Open one winit window, hand its native handle to
-//!    [`buffr_core::BrowserHost`].
+//!    [`buffr_cef::BrowserHost`].
 //! 5. Drive winit's event loop while pumping `cef::do_message_loop_work`
 //!    each iteration. (We avoid `cef::run_message_loop` so winit owns
 //!    the main loop — required for native chrome in Phase 3.)
@@ -128,18 +128,20 @@ fn build_palette(theme: &buffr_config::Theme) -> Palette {
 }
 
 use anyhow::{Context, Result};
+use buffr_cef::{
+    BuffrApp, NEW_TAB_URL, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
+    SharedOsrFrame, SharedOsrViewState, TabId, drain_permissions_with_defer, drain_popup_closes,
+    drain_popup_creates, drain_popup_urls, init_cef_api, new_permissions_queue,
+    peek_permission_front, permissions_queue_len, pop_permission_front, profile_paths,
+    register_buffr_handler_factory, register_buffr_src_handler_factory,
+};
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
-    BuffrApp, ContextMenuItem, ContextMenuRequest, ContextMenuTarget, DownloadNoticeQueue,
-    EditConsoleEvent, EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink,
-    IdleInhibitor, NEW_TAB_URL, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
-    SharedOsrFrame, SharedOsrViewState, TabId, drain_edit_events, drain_permissions_with_defer,
-    drain_popup_closes, drain_popup_creates, drain_popup_urls, expire_stale_notices, init_cef_api,
-    new_download_notice_queue, new_edit_event_sink, new_find_sink, new_hint_event_sink,
-    new_inhibitor, new_permissions_queue, peek_download_notice, peek_permission_front,
-    permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
-    register_buffr_src_handler_factory,
+    ContextMenuItem, ContextMenuRequest, ContextMenuTarget, DownloadNoticeQueue, EditConsoleEvent,
+    EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink, IdleInhibitor,
+    drain_edit_events, expire_stale_notices, new_download_notice_queue, new_edit_event_sink,
+    new_find_sink, new_hint_event_sink, new_inhibitor, peek_download_notice,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -752,7 +754,7 @@ fn main() -> Result<()> {
     // sticky across processes. (Helper doesn't share memory; it
     // re-evaluates the env. We currently don't propagate this flag to
     // helpers via env — TODO Phase 6b.)
-    buffr_core::set_force_renderer_accessibility(config.accessibility.force_renderer_accessibility);
+    buffr_cef::set_force_renderer_accessibility(config.accessibility.force_renderer_accessibility);
 
     // -------- update channel --------
     //
@@ -788,7 +790,7 @@ fn main() -> Result<()> {
             && (scale - 1.0).abs() > 0.01
         {
             debug!(scale, "forwarding BUFFR_SCALE device scale factor to CEF");
-            buffr_core::set_device_scale_factor(scale);
+            buffr_cef::set_device_scale_factor(scale);
         }
     }
 
@@ -854,7 +856,7 @@ fn main() -> Result<()> {
     // request (hot-reloaded user overrides land on the next visit).
     {
         let engine_for_newtab = Arc::clone(&engine);
-        let provider: buffr_core::NewTabHtmlProvider =
+        let provider: buffr_cef::NewTabHtmlProvider =
             Arc::new(move || render_new_tab_html(&engine_for_newtab));
         register_buffr_handler_factory(provider);
     }
@@ -1494,10 +1496,10 @@ fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
         }
         s
     };
-    buffr_core::NEW_TAB_HTML_TEMPLATE
-        .replacen(buffr_core::NEW_TAB_KEYBINDS_MARKER, &body, 1)
+    buffr_cef::NEW_TAB_HTML_TEMPLATE
+        .replacen(buffr_cef::NEW_TAB_KEYBINDS_MARKER, &body, 1)
         .replacen(
-            buffr_core::NEW_TAB_SPLASH_ART_MARKER,
+            buffr_cef::NEW_TAB_SPLASH_ART_MARKER,
             &crate::loading_anim::splash_art_html(),
             1,
         )
@@ -1582,7 +1584,7 @@ fn run_list_session() -> Result<()> {
 }
 
 /// Resolve the (cache, data) profile paths. Returns the resolved
-/// [`buffr_core::ProfilePaths`] plus an optional [`TempDir`] that owns
+/// [`buffr_cef::ProfilePaths`] plus an optional [`TempDir`] that owns
 /// the lifetime of the `--private` tree (so the caller can drop it
 /// after CEF shuts down).
 ///
@@ -1593,7 +1595,7 @@ fn run_list_session() -> Result<()> {
 /// own root (no clobbering); the inner `cache` and `data` split
 /// matches the persistent shape so the rest of the codebase doesn't
 /// need conditionals.
-fn resolve_paths(private: bool) -> Result<(buffr_core::ProfilePaths, Option<TempDir>)> {
+fn resolve_paths(private: bool) -> Result<(buffr_cef::ProfilePaths, Option<TempDir>)> {
     if private {
         let pid = std::process::id();
         let prefix = format!("buffr-private-{pid}-");
@@ -1605,7 +1607,7 @@ fn resolve_paths(private: bool) -> Result<(buffr_core::ProfilePaths, Option<Temp
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&cache).context("creating private cache subdir")?;
         std::fs::create_dir_all(&data).context("creating private data subdir")?;
-        Ok((buffr_core::ProfilePaths { cache, data }, Some(tmp)))
+        Ok((buffr_cef::ProfilePaths { cache, data }, Some(tmp)))
     } else {
         let paths = profile_paths().context("resolving profile dirs")?;
         std::fs::create_dir_all(&paths.cache).context("creating profile cache dir")?;
@@ -1659,7 +1661,7 @@ fn configure_macos_dev_cef_settings(_settings: &mut Settings) -> Result<()> {
 /// / Downloads route through the corresponding store's `clear_all`.
 fn run_clear_on_exit(
     items: &[ClearableData],
-    paths: &buffr_core::ProfilePaths,
+    paths: &buffr_cef::ProfilePaths,
     history: &buffr_history::History,
     bookmarks: &buffr_bookmarks::Bookmarks,
     downloads: &buffr_downloads::Downloads,
@@ -1771,7 +1773,7 @@ struct AppState {
     // pointer; dropping `window` first frees that display and the
     // inhibitor's Drop (which sends Release + Shutdown then calls
     // `inh.destroy()` + `conn.flush()`) would touch a dead fd.
-    host: Option<buffr_core::BrowserHost>,
+    host: Option<buffr_cef::BrowserHost>,
     idle_inhibitor: Option<Box<dyn IdleInhibitor>>,
     window: Option<Arc<Window>>,
     engine: Arc<Mutex<Engine>>,
@@ -1791,7 +1793,7 @@ struct AppState {
     /// answer (`y` / yes-button → close; `n` / no-button / `<Esc>`
     /// → dismiss). Mutually exclusive with `permissions_prompt` for
     /// rendering — the confirmation wins the slot.
-    confirm_close_pinned: Option<buffr_core::TabId>,
+    confirm_close_pinned: Option<buffr_cef::TabId>,
     /// Passive download-notification queue. CEF's `DownloadHandler`
     /// pushes notices onto this; the render loop composites the front
     /// notice (if any) above the permissions strip. Notices self-expire
@@ -1857,7 +1859,7 @@ struct AppState {
     /// TabNewLeft), this carries the freshly-created tab's id. If the
     /// user cancels the omnibar without confirming a URL, the tab is
     /// closed (unless it's the only remaining tab).
-    cancel_closes_tab: Option<buffr_core::TabId>,
+    cancel_closes_tab: Option<buffr_cef::TabId>,
     /// Debounced live-search trigger for the find overlay. Each
     /// keystroke while a `/` or `?` overlay is open pushes this
     /// `FIND_LIVE_DEBOUNCE_MS` into the future; `about_to_wait` fires
@@ -1882,7 +1884,7 @@ struct AppState {
     last_session_active: Option<usize>,
     /// Snapshot of the tab count + ID list at the last session save —
     /// detects open / close / reorder events the moment they happen.
-    last_session_tab_ids: Vec<buffr_core::TabId>,
+    last_session_tab_ids: Vec<buffr_cef::TabId>,
     /// Wall-clock instant of the last `active_tab_live_url()` call.
     /// Throttled to ~4 Hz (250 ms) to bound the cef-rs
     /// "Invalid UTF-16 string" stderr spam during page loads.
@@ -2480,8 +2482,8 @@ impl AppState {
             popups: HashMap::new(),
             popup_window_id_by_browser: HashMap::new(),
             // Replaced in `resumed` once the host is constructed.
-            popup_create_sink: buffr_core::new_popup_create_sink(),
-            popup_close_sink: buffr_core::new_popup_close_sink(),
+            popup_create_sink: buffr_cef::new_popup_create_sink(),
+            popup_close_sink: buffr_cef::new_popup_close_sink(),
             favicons: HashMap::new(),
             show_favicons,
             favicon_cache,
@@ -2859,7 +2861,7 @@ impl AppState {
         };
         let summaries = host.tabs_summary();
         let active = host.active_index();
-        let ids: Vec<buffr_core::TabId> = summaries.iter().map(|t| t.id).collect();
+        let ids: Vec<buffr_cef::TabId> = summaries.iter().map(|t| t.id).collect();
         let url = host.active_tab_live_url();
 
         // Skip if nothing changed and no external dirty signal.
@@ -4601,7 +4603,7 @@ impl AppState {
                     // Snapshot (id, pinned) before closing — closing
                     // shifts indices. Skip the kept tab and any pinned
                     // tabs (Chrome leaves pinned tabs alone).
-                    let victims: Vec<buffr_core::TabId> = self
+                    let victims: Vec<buffr_cef::TabId> = self
                         .host
                         .as_ref()
                         .map(|h| {
@@ -4628,7 +4630,7 @@ impl AppState {
                     // Snapshot ids for slots strictly after the target,
                     // skipping pinned tabs, before any closure shifts
                     // indices.
-                    let victims: Vec<buffr_core::TabId> = self
+                    let victims: Vec<buffr_cef::TabId> = self
                         .host
                         .as_ref()
                         .map(|h| {
@@ -4664,7 +4666,7 @@ impl AppState {
     fn resolve_tab_target(
         &self,
         request: &ContextMenuRequest,
-    ) -> Option<(usize, buffr_core::TabId, String, bool)> {
+    ) -> Option<(usize, buffr_cef::TabId, String, bool)> {
         let ContextMenuTarget::Tab { index } = request.target else {
             return None;
         };
@@ -6305,7 +6307,7 @@ fn paint_chrome_strips(
     tab_y: u32,
     notice_y: u32,
     current_notice: Option<&buffr_core::DownloadNotice>,
-    confirm_close_pinned: Option<buffr_core::TabId>,
+    confirm_close_pinned: Option<buffr_cef::TabId>,
     permissions_prompt: Option<&PermissionsPrompt>,
     overlay_data: Option<&InputBar>,
     context_menu: Option<&ContextMenuOverlay>,
@@ -6576,7 +6578,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         let (_cef_x, _cef_y, cef_w, cef_h) =
             self.cef_child_rect(inner.width.max(1), inner.height.max(1));
 
-        match buffr_core::BrowserHost::new_with_options(
+        match buffr_cef::BrowserHost::new_with_options(
             &self.homepage,
             self.history.clone(),
             self.downloads.clone(),
@@ -7802,14 +7804,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // for the session dirty flag.
         // Collect the poll results outside the borrow so we can call
         // `mark_session_dirty` (which takes &mut self) afterwards.
-        let url_poll_result: Option<(String, Option<usize>, Vec<buffr_core::TabId>, f64)> =
+        let url_poll_result: Option<(String, Option<usize>, Vec<buffr_cef::TabId>, f64)> =
             if let Some(host) = self.host.as_ref() {
                 let now = Instant::now();
                 if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
                     self.last_url_poll = now;
                     let live = host.active_tab_live_url();
                     let active_idx = host.active_index();
-                    let current_ids: Vec<buffr_core::TabId> =
+                    let current_ids: Vec<buffr_cef::TabId> =
                         host.tabs_summary().iter().map(|t| t.id).collect();
                     let zoom = host.active_zoom_level();
                     Some((live, active_idx, current_ids, zoom))
@@ -8119,7 +8121,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
 #[cfg(target_os = "macos")]
 fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
-    if let Some(delay_ms) = buffr_core::take_scheduled_message_pump_delay_ms() {
+    if let Some(delay_ms) = buffr_cef::take_scheduled_message_pump_delay_ms() {
         let delay = Duration::from_millis(delay_ms.try_into().unwrap_or(0));
         let at = Instant::now() + delay;
         tracing::trace!(delay_ms, ?at, "cef: schedule next pump");

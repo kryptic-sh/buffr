@@ -453,9 +453,11 @@ version = "0.6.3"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
+ "buffr-cef",
  "buffr-config",
  "buffr-core",
  "buffr-downloads",
+ "buffr-engine",
  "buffr-history",
  "buffr-modal",
  "buffr-permissions",
@@ -497,6 +499,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffr-cef"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "buffr-config",
+ "buffr-core",
+ "buffr-downloads",
+ "buffr-engine",
+ "buffr-history",
+ "buffr-modal",
+ "buffr-permissions",
+ "buffr-view-source",
+ "buffr-zoom",
+ "cef",
+ "chrono",
+ "core-foundation 0.10.1",
+ "hjkl-clipboard",
+ "hjkl-config",
+ "image",
+ "raw-window-handle",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "ureq",
+ "url",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-sys",
+ "windows-sys 0.59.0",
+ "winit",
+ "zbus",
+]
+
+[[package]]
 name = "buffr-config"
 version = "0.4.0"
 dependencies = [
@@ -520,12 +563,12 @@ dependencies = [
  "base64",
  "buffr-config",
  "buffr-downloads",
+ "buffr-engine",
  "buffr-history",
  "buffr-modal",
  "buffr-permissions",
  "buffr-view-source",
  "buffr-zoom",
- "cef",
  "chrono",
  "core-foundation 0.10.1",
  "hjkl-clipboard",
@@ -563,10 +606,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffr-engine"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "buffr-helper"
 version = "0.6.3"
 dependencies = [
  "anyhow",
+ "buffr-cef",
  "buffr-core",
  "cef",
 ]
