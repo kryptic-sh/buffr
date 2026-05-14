@@ -1025,20 +1025,20 @@ fn main() -> Result<()> {
     // any step segfaults during the GPU process teardown on builds
     // with hardware compositing.
     info!("shutdown: closing browsers");
-    if let Some(host) = app_state.host.as_ref() {
+    for host in app_state.engines.values() {
         host.close_all_browsers();
     }
 
-    // Drop ONLY the host first. This releases every Browser ref while
+    // Drop engine hosts first. This releases every Browser ref while
     // CEF's threads are still running, so CEF can finish the close
     // callbacks instead of segfaulting on dangling refs during its
     // own shutdown. Drop the engine router at the same time — it holds
-    // an Arc<dyn BrowserEngine> that aliases the same BrowserHost, so
-    // the host would otherwise not deallocate until app_state drops
+    // `Arc<dyn BrowserEngine>` aliases to the same BrowserHost values, so
+    // the hosts would otherwise not deallocate until app_state drops
     // after cef::shutdown (which would be too late).
-    info!("shutdown: dropping host");
+    info!("shutdown: dropping engine hosts");
     drop(app_state.engine_router.take());
-    drop(app_state.host.take());
+    app_state.engines.clear();
 
     // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
     // same EGL / GL / Vulkan driver state on Linux; tearing down
@@ -1684,12 +1684,12 @@ struct AppState {
     /// `buffr://new` and is overridable via `general.homepage` and
     /// `--homepage`.
     homepage: String,
-    // Drop order matters at shutdown: `host` MUST drop before `window`
+    // Drop order matters at shutdown: engine hosts MUST drop before `window`
     // and `renderer`. CEF browsers hold raw handles tied to the window
     // surface and to the GPU process; dropping the window or wgpu
     // device first leaves CEF dereferencing freed memory during its
     // own teardown. Rust drops struct fields in declaration order, so
-    // host comes first.
+    // these come first.
     //
     // `idle_inhibitor` MUST also drop before `window`. The Wayland
     // backend's worker thread holds a `Connection` built via
@@ -1698,13 +1698,24 @@ struct AppState {
     // inhibitor's Drop (which sends Release + Shutdown then calls
     // `inh.destroy()` + `conn.flush()`) would touch a dead fd.
     //
-    // Phase 2: `host` is Arc-wrapped so the engine router can hold a
-    // `Arc<dyn BrowserEngine>` reference to the same value without
-    // requiring Clone. All existing call sites work unchanged via Deref.
-    host: Option<Arc<buffr_cef::BrowserHost>>,
-    /// Phase 2: engine router — resolves URL → registered backend.
-    /// `None` until the host is constructed in `resumed`. With only the
-    /// CEF backend registered every tab routes to `host`.
+    // Phase 3: all engine instances live in `engines`; `active_engine`
+    // names which one owns the currently-focused tab. `host` is kept as
+    // a thin accessor for the common single-engine call sites — it reads
+    // from `engines[active_engine]` at runtime so all existing paths work
+    // unchanged. Multi-engine-aware paths use `engines` directly.
+    //
+    // `host` field removed — use `self.active_host()` instead.
+    /// Phase 3: registered engine instances, keyed by [`EngineId`].
+    /// Each value is the concrete CEF host — the router holds a
+    /// `Arc<dyn BrowserEngine>` alias to the same allocation.
+    /// Populated in `resumed` (one entry per `engines.instances` config
+    /// entry, plus the synthesised default when `instances` is empty).
+    engines: std::collections::HashMap<buffr_engine::EngineId, Arc<buffr_cef::BrowserHost>>,
+    /// Which engine owns the currently-focused tab. Updated when a
+    /// cross-engine navigation opens a tab on a different engine.
+    active_engine: buffr_engine::EngineId,
+    /// Phase 3: engine router — resolves URL → registered backend.
+    /// `None` until the hosts are constructed in `resumed`.
     engine_router: Option<Arc<engine_router::EngineRouter>>,
     idle_inhibitor: Option<Box<dyn IdleInhibitor>>,
     window: Option<Arc<Window>>,
@@ -2342,7 +2353,8 @@ impl AppState {
         };
         Self {
             homepage,
-            host: None,
+            engines: std::collections::HashMap::new(),
+            active_engine: buffr_engine::EngineId::new("cef"),
             engine_router: None,
             window: None,
             engine,
@@ -2474,17 +2486,28 @@ impl AppState {
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
     }
 
-    // ── Engine routing helpers ────────────────────────────────────────────────
+    // ── Engine helpers ────────────────────────────────────────────────────────
     //
-    // Phase 2: route tab-spawn calls through the engine router so the
-    // dispatch path is exercised. With only `buffr-cef` registered, every
-    // URL resolves to the same engine and behaviour is unchanged.
+    // Phase 3: `active_host()` is the canonical single-engine accessor used
+    // by all existing code paths that only need the currently-focused engine.
+    // Multi-engine-aware paths (paint, resize, audio fan-out, cross-engine
+    // nav) use `self.engines` directly.
+
+    /// Return a clone of the active engine's `BrowserHost` handle, if any.
+    ///
+    /// Cloning the `Arc` is ~2 ns and breaks the borrow on `self`, which is
+    /// essential: callers typically mutate other `self` fields after obtaining
+    /// the handle. This is the Phase 3 replacement for the former `host` field.
+    #[inline]
+    fn active_host(&self) -> Option<Arc<buffr_cef::BrowserHost>> {
+        self.engines.get(&self.active_engine).cloned()
+    }
 
     /// Open a new foreground tab, routing through the engine router.
     fn routed_open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab(url)
-        } else if let Some(host) = &self.host {
+        } else if let Some(host) = self.active_host() {
             buffr_engine::BrowserEngine::open_tab(host.as_ref(), url)
         } else {
             Err(buffr_engine::EngineError::Other(
@@ -2497,7 +2520,7 @@ impl AppState {
     fn routed_open_tab_background(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab_background(url)
-        } else if let Some(host) = &self.host {
+        } else if let Some(host) = self.active_host() {
             buffr_engine::BrowserEngine::open_tab_background(host.as_ref(), url)
         } else {
             Err(buffr_engine::EngineError::Other(
@@ -2514,7 +2537,7 @@ impl AppState {
     ) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab_at(url, insert_idx)
-        } else if let Some(host) = &self.host {
+        } else if let Some(host) = self.active_host() {
             buffr_engine::BrowserEngine::open_tab_at(host.as_ref(), url, insert_idx)
         } else {
             Err(buffr_engine::EngineError::Other(
@@ -2552,9 +2575,9 @@ impl AppState {
                 self.recompute_paint_policy();
             } else {
                 self.next_probe_at = Some(Instant::now() + OCCLUSION_PROBE_INTERVAL);
-                if let Some(host) = self.host.as_ref() {
-                    // Probe woke CEF via osr_sleep(false); re-hide so we
-                    // don't burn renderer CPU until the next probe.
+                // Probe woke CEF via osr_sleep(false); re-hide all engines so
+                // we don't burn renderer CPU until the next probe.
+                for host in self.engines.values() {
                     host.osr_sleep(true);
                 }
             }
@@ -2608,7 +2631,9 @@ impl AppState {
             "paint_policy transition"
         );
         self.paint_policy = new_policy;
-        if let Some(host) = self.host.as_ref() {
+        // Fan sleep/wake to all engines so inactive engines don't keep
+        // consuming GPU resources while the window is occluded.
+        for host in self.engines.values() {
             match new_policy {
                 PaintPolicy::Sleeping => {
                     host.osr_sleep(true);
@@ -2616,12 +2641,82 @@ impl AppState {
                 PaintPolicy::Active => {
                     host.osr_sleep(false);
                     host.osr_invalidate_view();
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
-                    }
                 }
             }
         }
+        if new_policy == PaintPolicy::Active
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
+    }
+
+    // ── Cross-engine navigation (Phase 3) ────────────────────────────────────
+
+    /// Check whether the active tab's current URL routes to a different engine
+    /// than the one that hosts it. If so, open a new tab on the target engine
+    /// and close the in-flight tab on the source. Called after each
+    /// `pump_address_changes` cycle.
+    ///
+    /// Cross-engine nav loses navigation history on the source tab (expected —
+    /// separate process/engine). The tab is closed immediately so the user does
+    /// not see a dangling in-flight tab.
+    fn check_cross_engine_nav(&mut self) {
+        let Some(router) = self.engine_router.as_ref() else {
+            return;
+        };
+        let Some(active_host) = self.engines.get(&self.active_engine) else {
+            return;
+        };
+        let url = active_host.active_tab_live_url();
+        if url.is_empty() {
+            return;
+        }
+        // Use the pure classify_navigation helper so this logic is unit-testable.
+        let verdict = engine_router::classify_navigation(router, &self.active_engine, &url);
+        let target_id = match verdict {
+            engine_router::NavigationVerdict::SameEngine => return,
+            engine_router::NavigationVerdict::CrossEngine { target } => target,
+        };
+        tracing::debug!(
+            url = %url,
+            source = %self.active_engine,
+            target = %target_id,
+            "cross-engine nav detected — opening new tab on target engine"
+        );
+        let Some(target_host) = self.engines.get(&target_id) else {
+            tracing::warn!(target = %target_id, "target engine not registered — ignoring cross-engine nav");
+            return;
+        };
+        // Open a new tab on the target engine.
+        match buffr_engine::BrowserEngine::open_tab(target_host.as_ref(), &url) {
+            Ok(_new_tab_id) => {
+                tracing::debug!(target = %target_id, "cross-engine nav: new tab opened on target");
+            }
+            Err(err) => {
+                tracing::warn!(target = %target_id, error = %err, "cross-engine nav: open_tab on target failed");
+                return;
+            }
+        }
+        // Close the in-flight tab on the source. Use close_active so we
+        // don't need to know the exact tab id — the navigating tab IS active.
+        let source_host = self
+            .engines
+            .get(&self.active_engine)
+            .expect("source still registered");
+        match buffr_engine::BrowserEngine::close_active(source_host.as_ref()) {
+            Ok(_) => {
+                tracing::debug!(source = %self.active_engine, "cross-engine nav: source tab closed");
+            }
+            Err(err) => {
+                tracing::warn!(source = %self.active_engine, error = %err, "cross-engine nav: close_active on source failed");
+            }
+        }
+        // Switch to the target engine.
+        self.active_engine = target_id;
+        self.mark_chrome_dirty();
+        self.mark_session_dirty();
+        self.request_redraw();
     }
 
     /// Current device scale factor. Reads winit's `scale_factor()` when the
@@ -2640,7 +2735,7 @@ impl AppState {
         // (open_omnibar). Handle them before the shared host borrow so the
         // borrow checker sees two disjoint borrows.
         if matches!(action, A::TabNewRight | A::TabNewLeft) {
-            let Some(host) = self.host.as_ref() else {
+            let Some(host) = self.active_host() else {
                 warn!(?action, "no browser host yet — dropping action");
                 return;
             };
@@ -2673,7 +2768,7 @@ impl AppState {
             return;
         }
 
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             warn!(?action, "no browser host yet — dropping action");
             return;
         };
@@ -2777,7 +2872,7 @@ impl AppState {
     /// the Yes button) reaches `confirm_close_now` which calls this
     /// path again with the confirmation already cleared.
     fn close_active_tab_or_exit(&mut self) -> bool {
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return false;
         };
         if self.confirm_close_pinned.is_none()
@@ -2790,12 +2885,16 @@ impl AppState {
             return true;
         }
         match host.close_active() {
-            Ok(true) => true,
-            Ok(false) => {
-                info!("tab_close: last tab gone — saving session and exiting");
-                self.save_session_now();
-                self.mark_clean_shutdown();
-                std::process::exit(0);
+            Ok(still_open) => {
+                // Phase 3: "last tab" exit must check across ALL engines.
+                let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
+                if !still_open || total_tabs == 0 {
+                    info!("tab_close: last tab gone (all engines) — saving session and exiting");
+                    self.save_session_now();
+                    self.mark_clean_shutdown();
+                    std::process::exit(0);
+                }
+                true
             }
             Err(err) => {
                 warn!(error = %err, "tab_close: failed");
@@ -2816,11 +2915,12 @@ impl AppState {
             return;
         }
         // Close the recorded tab even if focus shifted in between.
-        if let Some(host) = self.host.as_ref() {
-            let only = host.tab_count() <= 1;
+        if let Some(host) = self.active_host() {
             let _ = host.close_tab(target);
-            if only {
-                info!("tab_close: last tab gone — saving session and exiting");
+            // Phase 3: count across ALL engines for the exit decision.
+            let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
+            if total_tabs == 0 {
+                info!("tab_close: last tab gone (all engines) — saving session and exiting");
                 self.save_session_now();
                 self.mark_clean_shutdown();
                 std::process::exit(0);
@@ -2847,7 +2947,7 @@ impl AppState {
         let Some(path) = self.session_path.as_ref() else {
             return;
         };
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return;
         };
         let summaries = host.tabs_summary();
@@ -2903,7 +3003,7 @@ impl AppState {
         let mut prefill_queue: Vec<(i32, String)> = Vec::new();
 
         {
-            let Some(host) = self.host.as_ref() else {
+            let Some(host) = self.active_host() else {
                 return;
             };
             // Restored session first — these were saved in the previous
@@ -2990,7 +3090,7 @@ impl AppState {
     /// Refresh the tab-strip render input from the host's current
     /// tab list. Cheap; runs every `about_to_wait` tick.
     fn refresh_tab_strip(&mut self) {
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return;
         };
         let summaries = host.tabs_summary();
@@ -3051,7 +3151,7 @@ impl AppState {
         let leaving_visual = self.statusline.mode == PageMode::Visual && mode != PageMode::Visual;
         self.statusline.mode = mode;
         self.statusline.count_buffer = count;
-        if leaving_visual && let Some(host) = self.host.as_ref() {
+        if leaving_visual && let Some(host) = self.active_host() {
             // Drop the page's DOM selection so the highlight goes with
             // Visual mode. Any prior YankSelection JS has already been
             // queued in the renderer and runs first; this just collapses
@@ -3084,7 +3184,7 @@ impl AppState {
     ///   populate `self.favicons` before the CEF callback fires).
     /// - Persists every fresh CEF-delivered bitmap back to the disk cache.
     fn pump_favicon_updates(&mut self) -> bool {
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return false;
         };
         if !self.show_favicons {
@@ -3203,7 +3303,7 @@ impl AppState {
     /// wins — coalescing is desirable since CEF can fire many times per
     /// frame as the cursor moves.
     fn pump_cursor_changes(&self) {
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return;
         };
         let Some((browser_id, raw)) = host.cursor_state().take() else {
@@ -3267,7 +3367,7 @@ impl AppState {
             return;
         }
         self.find_smoke_at = None;
-        if let (Some(host), Some(query)) = (self.host.as_ref(), self.pending_find.take()) {
+        if let (Some(host), Some(query)) = (self.active_host(), self.pending_find.take()) {
             tracing::debug!(%query, "find smoke: start_find");
             self.statusline.find_query = Some(FindStatus {
                 query: query.clone(),
@@ -3367,7 +3467,7 @@ impl AppState {
             self.osr_wheel_last_at = None;
             return;
         }
-        if let Some(host) = self.host.as_ref() {
+        if let Some(host) = self.active_host() {
             let mods = winit_mods_to_cef(&self.modifiers);
             // osr_cursor is physical (browser-region-relative); CEF OSR takes DIPs.
             let (phys_bx, phys_by) = self.osr_cursor;
@@ -3473,7 +3573,7 @@ impl AppState {
         //
         // Generation tracking guarantees the swap only fires when CEF
         // has actually written fresh pixels since our last swap.
-        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.host.as_ref() {
+        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.active_host() {
             // Read the dims we asked CEF for (osr_view atomics) so the
             // gate can reject in-flight stale-dim paints. Reading both
             // atomics under the frame lock matches CEF's IO-thread
@@ -3510,6 +3610,11 @@ impl AppState {
         } else {
             None
         };
+
+        // Query the active host's loading state before taking the mutable
+        // renderer borrow — `active_host()` clones the Arc so this doesn't
+        // keep a borrow on `self`, allowing `renderer.as_mut()` below.
+        let host_is_loading = self.active_host().map(|h| h.is_loading()).unwrap_or(false);
 
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -3551,7 +3656,6 @@ impl AppState {
         // flag is set at the end of the previous paint when we detected the
         // condition; the animation overlays the wrong-sized OSR until the
         // reconcile redraw lands.
-        let host_is_loading = self.host.as_ref().map(|h| h.is_loading()).unwrap_or(false);
         let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
             || self.surface_drifted
             || host_is_loading;
@@ -3944,10 +4048,14 @@ impl AppState {
         };
         let size = window.inner_size();
         let (_x, _y, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
-        if let Some(host) = self.host.as_ref() {
+        // Fan the resize out to all engines; only arm the watchdog on the
+        // active engine (it's the one whose frame we'll present).
+        for (id, host) in &self.engines {
             host.osr_resize(w, h);
-            self.resize_paint_watchdog
-                .arm(w, h, Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
+            if id == &self.active_engine {
+                self.resize_paint_watchdog
+                    .arm(w, h, Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
+            }
         }
     }
 
@@ -3969,8 +4077,7 @@ impl AppState {
         // 250ms-throttled poll, so it can lag a tab switch and pre-fill
         // the omnibar with the previous tab's URL.
         let url = self
-            .host
-            .as_ref()
+            .active_host()
             .map(|h| h.active_tab_live_url())
             .unwrap_or_default();
         if !url.starts_with("buffr:") {
@@ -4004,7 +4111,7 @@ impl AppState {
         let was_find = matches!(self.overlay, Some(OverlayState::Find { .. }));
         self.find_live_due = None;
         if was_find {
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.active_host() {
                 host.stop_find();
             }
             self.statusline.find_query = None;
@@ -4019,7 +4126,7 @@ impl AppState {
         // tab (`o` / `O`), close that tab on cancel — but only if
         // there'd be at least one tab left.
         if let Some(tab_id) = self.cancel_closes_tab.take()
-            && let Some(host) = self.host.as_ref()
+            && let Some(host) = self.active_host()
             && host.tab_count() > 1
         {
             let _ = host.close_tab(tab_id);
@@ -4074,7 +4181,7 @@ impl AppState {
         };
         let forward = *forward;
         let query = bar.current_value().trim().to_string();
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return;
         };
         if query.is_empty() {
@@ -4204,43 +4311,43 @@ impl AppState {
             // ── Edit (frame ops) ─────────────────────────────────────────────
             I::Undo => {
                 tracing::info!(target: "buffr::context_menu", action = "undo", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_undo();
                 }
             }
             I::Redo => {
                 tracing::info!(target: "buffr::context_menu", action = "redo", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_redo();
                 }
             }
             I::Cut => {
                 tracing::info!(target: "buffr::context_menu", action = "cut", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_cut();
                 }
             }
             I::Copy => {
                 tracing::info!(target: "buffr::context_menu", action = "copy", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_copy();
                 }
             }
             I::Paste => {
                 tracing::info!(target: "buffr::context_menu", action = "paste", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_paste();
                 }
             }
             I::PasteAsPlainText => {
                 tracing::info!(target: "buffr::context_menu", action = "paste_plain", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_paste_plain();
                 }
             }
             I::SelectAll => {
                 tracing::info!(target: "buffr::context_menu", action = "select_all", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.frame_select_all();
                 }
             }
@@ -4250,7 +4357,7 @@ impl AppState {
                 tracing::info!(target: "buffr::context_menu", action = "copy_selection", "dispatch");
                 // selection_text is already extracted by CEF into the request.
                 let text = request.selection_text.clone();
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     if !text.is_empty() {
                         if !host.clipboard_set_text(&text) {
                             tracing::warn!(
@@ -4275,7 +4382,7 @@ impl AppState {
                     return;
                 }
                 let url = buffr_config::search::resolve_input(&query, &self.search_config);
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab(&url)
                 {
                     tracing::warn!(
@@ -4293,7 +4400,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab(&url)
                 {
                     tracing::warn!(
@@ -4309,7 +4416,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab_background(&url)
                 {
                     tracing::warn!(
@@ -4330,7 +4437,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab(&url)
                 {
                     tracing::warn!(
@@ -4343,7 +4450,7 @@ impl AppState {
             I::CopyLinkAddress => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_link_address", "dispatch");
                 let url = request.link_url.clone();
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && !host.clipboard_set_text(&url)
                 {
                     tracing::warn!(
@@ -4358,7 +4465,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.start_download(&url);
                 }
             }
@@ -4370,7 +4477,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab(&url)
                 {
                     tracing::warn!(
@@ -4383,7 +4490,7 @@ impl AppState {
             I::CopyImageAddress => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_image_address", "dispatch");
                 let url = request.source_url.clone();
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && !host.clipboard_set_text(&url)
                 {
                     tracing::warn!(
@@ -4398,7 +4505,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     // Spawns a worker; logs success / fallback / failure.
                     host.copy_image_url_to_clipboard(&url);
                 }
@@ -4409,7 +4516,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.start_download(&url);
                 }
             }
@@ -4418,15 +4525,14 @@ impl AppState {
             I::ViewPageSource => {
                 tracing::info!(target: "buffr::context_menu", action = "view_page_source", "dispatch");
                 let current_url = self
-                    .host
-                    .as_ref()
+                    .active_host()
                     .map(|h| h.active_tab_live_url())
                     .unwrap_or_default();
                 if current_url.is_empty() {
                     return;
                 }
                 let view_src_url = format!("buffr-src:{current_url}");
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab(&view_src_url)
                 {
                     tracing::warn!(
@@ -4438,7 +4544,7 @@ impl AppState {
             }
             I::InspectElement => {
                 tracing::info!(target: "buffr::context_menu", action = "inspect_element", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.show_dev_tools_at(Some(request.x), Some(request.y));
                 }
             }
@@ -4446,31 +4552,31 @@ impl AppState {
             // ── Media ────────────────────────────────────────────────────────
             I::MediaPlayPause { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "media_play_pause", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.media_play_pause(request.x, request.y);
                 }
             }
             I::MediaMute { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "media_mute", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.media_toggle_mute(request.x, request.y);
                 }
             }
             I::MediaLoop { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "media_loop", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.media_toggle_loop(request.x, request.y);
                 }
             }
             I::MediaShowControls => {
                 tracing::info!(target: "buffr::context_menu", action = "media_show_controls", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.media_toggle_controls(request.x, request.y);
                 }
             }
             I::PictureInPicture => {
                 tracing::info!(target: "buffr::context_menu", action = "picture_in_picture", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.media_picture_in_picture(request.x, request.y);
                 }
             }
@@ -4480,14 +4586,14 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.start_download(&url);
                 }
             }
             I::CopyMediaAddress => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_media_address", "dispatch");
                 let url = request.source_url.clone();
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && !host.clipboard_set_text(&url)
                 {
                     tracing::warn!(
@@ -4500,13 +4606,13 @@ impl AppState {
             // ── Image rotate ─────────────────────────────────────────────────
             I::RotateClockwise => {
                 tracing::info!(target: "buffr::context_menu", action = "rotate_clockwise", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.image_rotate(request.x, request.y, 90);
                 }
             }
             I::RotateCounterclockwise => {
                 tracing::info!(target: "buffr::context_menu", action = "rotate_counterclockwise", "dispatch");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.image_rotate(request.x, request.y, -90);
                 }
             }
@@ -4515,7 +4621,7 @@ impl AppState {
             I::TabReload => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_reload", "dispatch");
                 if let Some((_, id, _, _)) = self.resolve_tab_target(request)
-                    && let Some(host) = self.host.as_ref()
+                    && let Some(host) = self.active_host()
                 {
                     // Focus the tab first so the active-tab reload hits it.
                     host.select_tab(id);
@@ -4528,7 +4634,7 @@ impl AppState {
                 tracing::info!(target: "buffr::context_menu", action = "tab_duplicate", "dispatch");
                 if let Some((index, _, url, _)) = self.resolve_tab_target(request)
                     && !url.is_empty()
-                    && let Some(host) = self.host.as_ref()
+                    && let Some(host) = self.active_host()
                 {
                     // Insert the copy right after the source tab, Chrome-style.
                     if let Err(err) = host.open_tab_at(&url, index + 1) {
@@ -4545,7 +4651,7 @@ impl AppState {
             I::TabPin { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_pin", "dispatch");
                 if let Some((_, id, _, pinned)) = self.resolve_tab_target(request)
-                    && let Some(host) = self.host.as_ref()
+                    && let Some(host) = self.active_host()
                 {
                     host.set_pinned(id, !pinned);
                     self.refresh_tab_strip();
@@ -4555,7 +4661,7 @@ impl AppState {
             I::TabCopyUrl => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_copy_url", "dispatch");
                 if let Some((_, _, url, _)) = self.resolve_tab_target(request)
-                    && let Some(host) = self.host.as_ref()
+                    && let Some(host) = self.active_host()
                     && !host.clipboard_set_text(&url)
                 {
                     tracing::warn!(
@@ -4574,7 +4680,7 @@ impl AppState {
                         self.request_redraw();
                         return;
                     }
-                    let remaining = if let Some(host) = self.host.as_ref() {
+                    let remaining = if let Some(host) = self.active_host() {
                         let _ = host.close_tab(id);
                         host.tab_count()
                     } else {
@@ -4596,8 +4702,7 @@ impl AppState {
                     // shifts indices. Skip the kept tab and any pinned
                     // tabs (Chrome leaves pinned tabs alone).
                     let victims: Vec<buffr_cef::TabId> = self
-                        .host
-                        .as_ref()
+                        .active_host()
                         .map(|h| {
                             h.tabs_summary()
                                 .into_iter()
@@ -4606,7 +4711,7 @@ impl AppState {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if let Some(host) = self.host.as_ref() {
+                    if let Some(host) = self.active_host() {
                         for id in victims {
                             let _ = host.close_tab(id);
                         }
@@ -4623,8 +4728,7 @@ impl AppState {
                     // skipping pinned tabs, before any closure shifts
                     // indices.
                     let victims: Vec<buffr_cef::TabId> = self
-                        .host
-                        .as_ref()
+                        .active_host()
                         .map(|h| {
                             h.tabs_summary()
                                 .into_iter()
@@ -4634,7 +4738,7 @@ impl AppState {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if let Some(host) = self.host.as_ref() {
+                    if let Some(host) = self.active_host() {
                         for id in victims {
                             let _ = host.close_tab(id);
                         }
@@ -4662,7 +4766,7 @@ impl AppState {
         let ContextMenuTarget::Tab { index } = request.target else {
             return None;
         };
-        let host = self.host.as_ref()?;
+        let host = self.active_host()?;
         let summaries = host.tabs_summary();
         let t = summaries.get(index)?;
         Some((index, t.id, t.url.clone(), t.pinned))
@@ -4770,7 +4874,7 @@ impl AppState {
                 // Paste clipboard text into the overlay input. Drop CR/LF
                 // so a multiline clipboard doesn't leak past the single
                 // input row.
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Some(text) = host.clipboard_text()
                     && let Some(o) = self.overlay.as_mut()
                 {
@@ -4890,7 +4994,7 @@ impl AppState {
                 self.dispatch_action(&buffr_modal::PageAction::HistoryForward);
             }
             Command::Open(url) => {
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     if let Err(err) = host.navigate(&url) {
                         warn!(error = %err, %url, "open: navigate failed");
                     }
@@ -4900,7 +5004,7 @@ impl AppState {
             }
             Command::TabNew => {
                 let url = self.homepage.clone();
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Err(err) = host.open_tab(&url)
                 {
                     warn!(error = %err, %url, "cmdline :tabnew failed");
@@ -4910,7 +5014,7 @@ impl AppState {
                 self.apply_set(&key, &value);
             }
             Command::Find(query) => {
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     self.statusline.find_query = Some(FindStatus {
                         query: query.clone(),
                         current: 0,
@@ -4969,7 +5073,7 @@ impl AppState {
     /// other chord is silently swallowed so the modal trie can't fire
     /// on `j` / `k` etc. while a session is live.
     fn hint_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return false;
         };
         if !host.is_hint_mode() {
@@ -5074,7 +5178,7 @@ impl AppState {
                     if !already_editing && (user_intent || is_transfer) {
                         self.insert_intent_at = None;
                         self.pending_blur_at = None;
-                        if let Some(host) = self.host.as_ref() {
+                        if let Some(host) = self.active_host() {
                             host.run_edit_attach(&field_id);
                         }
                         if let Ok(mut e) = self.engine.lock() {
@@ -5129,7 +5233,7 @@ impl AppState {
                 EditConsoleEvent::Selection { value } => {
                     if value.is_empty() {
                         tracing::debug!("yank: selection event with empty value — nothing copied");
-                    } else if let Some(host) = self.host.as_ref() {
+                    } else if let Some(host) = self.active_host() {
                         let ok = host.clipboard_set_text(&value);
                         tracing::debug!(
                             len = value.len(),
@@ -5276,7 +5380,7 @@ impl AppState {
         if is_esc_pressed {
             let fid = field_id.clone();
             self.edit_focus = EditFocus::None;
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.active_host() {
                 host.run_edit_detach(&fid);
                 // Blur the field so further typing doesn't go to it.
                 host.run_js(buffr_core::scripts::EXIT_INSERT);
@@ -5297,7 +5401,7 @@ impl AppState {
         if event.state == winit::event::ElementState::Pressed
             && matches!(planned, Some(PlannedInput::Key(SpecialKey::Tab, _)))
         {
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.active_host() {
                 host.run_edit_cycle(!self.modifiers.shift_key());
             }
             return true;
@@ -5341,7 +5445,7 @@ impl AppState {
             // EventLoopProxy as `ClipboardPasteText`.
             if lower == 'v'
                 && !self.modifiers.shift_key()
-                && let Some(host) = self.host.as_ref()
+                && let Some(host) = self.active_host()
                 && let Some(cb) = host.clipboard_handle()
             {
                 let proxy = self.event_proxy.clone();
@@ -5355,7 +5459,7 @@ impl AppState {
 
         // Forward every other key directly to CEF. The page handles it
         // natively — no Rust-side editor model.
-        if let Some(host) = self.host.as_ref() {
+        if let Some(host) = self.active_host() {
             let mods = winit_mods_to_cef(&self.modifiers);
             // edit_mode_handle_key only runs when EditFocus::Editing is
             // active, so a text input is always focused here.
@@ -5518,7 +5622,7 @@ impl AppState {
         if target.is_empty() {
             return;
         }
-        if let Some(host) = self.host.as_ref()
+        if let Some(host) = self.active_host()
             && let Err(err) = host.navigate(&target)
         {
             warn!(error = %err, target = %target, "omnibar: navigate failed");
@@ -5535,7 +5639,7 @@ impl AppState {
             current: 0,
             total: 0,
         });
-        if let Some(host) = self.host.as_ref() {
+        if let Some(host) = self.active_host() {
             host.start_find(&query, forward);
         }
     }
@@ -5653,7 +5757,7 @@ impl AppState {
         match event {
             WindowEvent::CloseRequested => {
                 debug!(browser_id, "popup: CloseRequested");
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     host.popup_close(browser_id);
@@ -5686,7 +5790,7 @@ impl AppState {
                 }
             }
             WindowEvent::Focused(focused) => {
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     host.popup_osr_focus(browser_id, focused);
@@ -5698,7 +5802,7 @@ impl AppState {
                     .get(&window_id)
                     .map(|p| winit_mods_to_cef(&p.modifiers))
                     .unwrap_or(0);
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     // Simulate mouse leave by moving to (0,0) outside the
@@ -5720,7 +5824,7 @@ impl AppState {
                 let pop_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_scale);
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     host.popup_osr_mouse_move(browser_id, bx, by, mods);
@@ -5768,7 +5872,7 @@ impl AppState {
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_click_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_click_scale);
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     // Pressed inside the OSR content (below the address bar)
@@ -5796,7 +5900,7 @@ impl AppState {
                 // as the main window, routed to the popup's own history.
                 if let MouseScrollDelta::PixelDelta(px) = delta {
                     if let Some(action) = self.detect_swipe(px.x as f32, px.y as f32) {
-                        if let Some(host) = self.host.as_ref()
+                        if let Some(host) = self.active_host()
                             && browser_id >= 0
                         {
                             match action {
@@ -5825,7 +5929,7 @@ impl AppState {
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_wheel_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_wheel_scale);
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     host.popup_osr_mouse_wheel(browser_id, bx, by, dx, dy, mods);
@@ -5841,7 +5945,7 @@ impl AppState {
                 // typing into popup forms gets the same dispatch as the
                 // main window's edit-mode path.
                 let events = winit_key_to_neutral_events(&key_ev, mods, true);
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && browser_id >= 0
                 {
                     for ev in events {
@@ -6498,7 +6602,7 @@ impl AppState {
     /// animation without input. Clears state when the user navigates
     /// away from the new-tab page.
     fn tick_splash_js_push(&mut self) {
-        let Some(host) = self.host.as_ref() else {
+        let Some(host) = self.active_host() else {
             return;
         };
         let url = host.active_tab_live_url();
@@ -6548,7 +6652,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             BuffrUserEvent::OpenUrls(urls) => {
                 debug!(count = urls.len(), "single_instance: opened forwarded URLs");
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     for url in &urls {
                         if let Err(err) = host.open_tab_background(url) {
                             warn!(error = %err, %url, "single_instance: open_tab_background failed");
@@ -6569,7 +6673,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 if text.is_empty() {
                     return;
                 }
-                let Some(host) = self.host.as_ref() else {
+                let Some(host) = self.active_host() else {
                     return;
                 };
                 let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
@@ -6611,96 +6715,128 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         let (_cef_x, _cef_y, cef_w, cef_h) =
             self.cef_child_rect(inner.width.max(1), inner.height.max(1));
 
-        match buffr_cef::BrowserHost::new_with_options(
-            &self.homepage,
-            self.history.clone(),
-            self.downloads.clone(),
-            self.downloads_config.clone(),
-            self.zoom.clone(),
-            self.permissions.clone(),
-            self.permissions_queue.clone(),
-            self.download_notice_queue.clone(),
-            self.find_sink.clone(),
-            self.hint_sink.clone(),
-            self.edit_sink.clone(),
-            self.hint_alphabet.clone(),
-            (cef_w, cef_h),
-            self.private,
-            Some(self.counters.clone()),
-            self.show_favicons,
-        ) {
-            Ok(host) => {
-                info!("browser host created (OSR)");
-                debug!(url = %self.homepage, "browser host created — initial url");
-                // CEF stays focused for the lifetime of the browser
-                // so DOM clicks deliver focus to inputs. We do NOT
-                // forward OS-level Focused(false) (alt-tab) so pages
-                // retain state. Insert mode transitions are tracked
-                // independently via the modal engine.
-                host.osr_focus(true);
-                // Store the popup event sinks so `about_to_wait` can drain them.
-                self.popup_create_sink = host.popup_create_sink();
-                self.popup_close_sink = host.popup_close_sink();
-                // Wire OSR on_paint → winit redraw via EventLoopProxy.
-                // Wayland's frame-callback model means request_redraw on
-                // an idle surface never fires; this wakeup is what
-                // delivers freshly-painted CEF frames to softbuffer.
-                let proxy = self.event_proxy.clone();
-                host.set_osr_wake(Arc::new(move || {
-                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                }));
-                // Match CEF's OSR frame rate to the display refresh
-                // rate so scrolling / video / animations don't stutter
-                // at CEF's 30 fps default. CEF clamps internally
-                // (147.x caps at 60). Falls back to 60 when the
-                // monitor doesn't report a rate.
-                let display_hz = window
-                    .current_monitor()
-                    .and_then(|m| m.refresh_rate_millihertz())
-                    .map(|mhz| (mhz / 1000).max(1))
-                    .unwrap_or(60);
-                host.set_frame_rate(display_hz);
-                tracing::debug!(display_hz, "OSR frame rate set");
-                // Apply the OS-reported scale factor from winit now that the
-                // window exists. BUFFR_SCALE (if set) overrides the OS value
-                // as a debugging knob.
-                let os_scale = window.scale_factor() as f32;
-                let effective_scale = std::env::var("BUFFR_SCALE")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(os_scale);
-                host.set_device_scale(effective_scale);
-                tracing::debug!(
-                    os_scale,
-                    effective_scale,
-                    "initial device scale applied to host",
-                );
-                let host = Arc::new(host);
-                // Build the engine router with the CEF backend registered.
-                // With only one backend in Phase 2, every URL resolves to
-                // "cef" — behaviour is identical to the pre-router path.
-                let cef_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::clone(&host) as _;
-                let mut router_builder = engine_router::EngineRouter::builder()
-                    .register(buffr_engine::EngineId::new("cef"), cef_engine)
-                    .default_engine(buffr_engine::EngineId::new(&self.engines_config.default));
-                for rule in &self.engines_config.rules {
-                    router_builder = router_builder.rule(rule.pattern.clone(), rule.engine.clone());
-                }
-                match router_builder.build() {
-                    Ok(router) => {
-                        tracing::debug!("engine router built ({} engine(s))", {
-                            router.engine_ids().count()
-                        });
-                        self.engine_router = Some(Arc::new(router));
+        // ── Phase 3: multi-engine registry ───────────────────────────────────
+        //
+        // Iterate over `engines_config.effective_instances()` and construct
+        // one `BrowserHost` per instance. All instances share the same CEF
+        // process init (`cef::initialize` is once-per-process) and the same
+        // on-disk cache (per-engine cache isolation via `RequestContext` is
+        // Phase 5+). The first successful instance becomes the active engine.
+        let display_hz = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| (mhz / 1000).max(1))
+            .unwrap_or(60);
+        let os_scale = window.scale_factor() as f32;
+        let effective_scale = std::env::var("BUFFR_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(os_scale);
+        let instances = self.engines_config.effective_instances().into_owned();
+        let mut router_builder = engine_router::EngineRouter::builder()
+            .default_engine(buffr_engine::EngineId::new(&self.engines_config.default));
+        let mut first_instance = true;
+        for inst in &instances {
+            match inst.backend.as_str() {
+                "cef" => {
+                    if let Some(ref dir) = inst.data_dir {
+                        tracing::warn!(
+                            engine_id = %inst.id,
+                            data_dir = %dir,
+                            "per-engine data_dir is advisory only in Phase 3 \
+                             (CEF cache is process-global; real isolation via \
+                             RequestContext is Phase 5+)"
+                        );
                     }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "engine router build failed — tab-spawn will fall back to host directly");
+                    // Only the first (active) engine gets the full sinks wired up.
+                    // Additional instances share the same sinks so that hint/find/
+                    // edit events route correctly regardless of which instance
+                    // raised them. The popup sinks are also shared — `resumed` sets
+                    // them once from the active host.
+                    let counters_opt = if first_instance {
+                        Some(self.counters.clone())
+                    } else {
+                        None
+                    };
+                    match buffr_cef::BrowserHost::new_with_options(
+                        &self.homepage,
+                        self.history.clone(),
+                        self.downloads.clone(),
+                        self.downloads_config.clone(),
+                        self.zoom.clone(),
+                        self.permissions.clone(),
+                        self.permissions_queue.clone(),
+                        self.download_notice_queue.clone(),
+                        self.find_sink.clone(),
+                        self.hint_sink.clone(),
+                        self.edit_sink.clone(),
+                        self.hint_alphabet.clone(),
+                        (cef_w, cef_h),
+                        self.private,
+                        counters_opt,
+                        self.show_favicons,
+                    ) {
+                        Ok(host) => {
+                            info!(engine_id = %inst.id, "browser host created (OSR)");
+                            host.osr_focus(true);
+                            if first_instance {
+                                // Wire popup sinks and OSR wake on the active engine.
+                                self.popup_create_sink = host.popup_create_sink();
+                                self.popup_close_sink = host.popup_close_sink();
+                            }
+                            // Every engine gets its own OSR wake — a single closure
+                            // that calls `request_redraw`. The paint pass reads the
+                            // active engine's frame, so wakes from inactive engines
+                            // may overdraw slightly but are always correct.
+                            let proxy = self.event_proxy.clone();
+                            host.set_osr_wake(Arc::new(move || {
+                                let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                            }));
+                            host.set_frame_rate(display_hz);
+                            host.set_device_scale(effective_scale);
+                            let host = Arc::new(host);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let cef_engine: Arc<dyn buffr_engine::BrowserEngine> =
+                                Arc::clone(&host) as _;
+                            router_builder = router_builder.register(engine_id.clone(), cef_engine);
+                            self.engines.insert(engine_id.clone(), host);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                                tracing::debug!(
+                                    os_scale,
+                                    effective_scale,
+                                    display_hz,
+                                    "initial device scale + frame rate applied to active engine",
+                                );
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create browser host");
+                        }
                     }
                 }
-                self.host = Some(host);
+                other => {
+                    warn!(backend = %other, engine_id = %inst.id, "unknown engine backend — skipping");
+                }
+            }
+        }
+        if self.engines.is_empty() {
+            warn!("no engine instances constructed — browser will not function");
+        }
+        // Add routing rules and build the router.
+        for rule in &self.engines_config.rules {
+            router_builder = router_builder.rule(rule.pattern.clone(), rule.engine.clone());
+        }
+        match router_builder.build() {
+            Ok(router) => {
+                tracing::debug!("engine router built ({} engine(s))", {
+                    router.engine_ids().count()
+                });
+                self.engine_router = Some(Arc::new(router));
             }
             Err(err) => {
-                warn!(error = %err, "failed to create browser host");
+                tracing::warn!(error = %err, "engine router build failed — tab-spawn will fall back to active engine directly");
             }
         }
 
@@ -6787,7 +6923,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     scale,
                     cef_w,
                     cef_h,
-                    has_host = self.host.is_some(),
+                    has_host = !self.engines.is_empty(),
                     "winit: Resized",
                 );
                 // Debounce CEF resize: arm/refresh the pending deadline rather
@@ -6843,13 +6979,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 debug!(scale_factor, "winit: ScaleFactorChanged");
-                if let Some(host) = self.host.as_ref() {
-                    // BUFFR_SCALE override wins if set; otherwise use winit's value.
+                {
+                    // Fan out scale change to ALL registered engines so that
+                    // inactive engines stay in sync when they become active.
                     let s = std::env::var("BUFFR_SCALE")
                         .ok()
                         .and_then(|v| v.parse::<f32>().ok())
                         .unwrap_or(scale_factor as f32);
-                    host.set_device_scale(s);
+                    for host in self.engines.values() {
+                        host.set_device_scale(s);
+                    }
                 }
                 // chrome_heights_physical now uses the new scale, so
                 // browser_w/h on the next paint will differ from what
@@ -6908,13 +7047,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     let mods = winit_mods_to_cef(&self.modifiers);
                     host.osr_mouse_leave(mods);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     // Convert from window coords to browser-region coords.
                     // osr_cursor tracks physical pixels for chrome hit-tests.
                     // CEF OSR consumes DIPs (logical pixels), so we divide by
@@ -7116,8 +7255,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // drain_context_menu_requests path for this — build
                     // the request here and show it directly.
                     let (pinned, url) = self
-                        .host
-                        .as_ref()
+                        .active_host()
                         .and_then(|h| h.tabs_summary().get(idx).map(|t| (t.pinned, t.url.clone())))
                         .unwrap_or((false, String::new()));
                     let tab_count = self.tab_ids.len().max(1);
@@ -7152,7 +7290,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && button == MouseButton::Left
                     && let Some(idx) = tab_strip_idx
                 {
-                    if let Some(host) = self.host.as_ref() {
+                    if let Some(host) = self.active_host() {
                         host.select_tab(self.tab_ids[idx]);
                     }
                     // Tab switch implies the user moved focus away from
@@ -7167,7 +7305,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && let Some(src) = self.tab_drag_src.take()
                     && let Some(dst) = tab_strip_idx
                     && dst != src
-                    && let Some(host) = self.host.as_ref()
+                    && let Some(host) = self.active_host()
                 {
                     host.move_tab(src, dst);
                     self.mark_session_dirty();
@@ -7184,8 +7322,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // the confirmation overlay so the user can't lose
                     // a pinned tab by misaiming.
                     let pinned = self
-                        .host
-                        .as_ref()
+                        .active_host()
                         .and_then(|h| h.tabs_summary().get(idx).map(|t| t.pinned))
                         .unwrap_or(false);
                     if pinned && self.confirm_close_pinned.is_none() {
@@ -7193,14 +7330,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         self.request_redraw();
                         return;
                     }
-                    let remaining = if let Some(host) = self.host.as_ref() {
+                    if let Some(host) = self.active_host() {
                         let _ = host.close_tab(id);
-                        host.tab_count()
-                    } else {
-                        0
-                    };
+                    }
+                    // Phase 3: check across all engines for the exit decision.
+                    let total_remaining: usize = self.engines.values().map(|e| e.tab_count()).sum();
                     self.refresh_tab_strip();
-                    if remaining == 0 {
+                    if total_remaining == 0 {
                         event_loop.exit();
                     }
                     return;
@@ -7208,7 +7344,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
                 let mut enter_visual = false;
                 let mut exit_visual = false;
-                if let Some(host) = self.host.as_ref()
+                if let Some(host) = self.active_host()
                     && let Some(cef_button) = winit_button_to_neutral(&button)
                 {
                     let mouse_up = state == winit::event::ElementState::Released;
@@ -7320,7 +7456,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 use winit::event::MouseScrollDelta;
-                if self.host.is_none() {
+                if self.engines.is_empty() {
                     return;
                 }
 
@@ -7338,7 +7474,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
 
-                let host = self.host.as_ref().unwrap();
+                let host = self.active_host().unwrap();
                 let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
                 if is_pixel {
                     // Track velocity only for high-res input; discrete
@@ -7470,7 +7606,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         let pass_through =
                             matches!(post_mode, PageMode::Insert | PageMode::Command);
                         if pass_through {
-                            if let Some(host) = self.host.as_ref() {
+                            if let Some(host) = self.active_host() {
                                 let mods = winit_mods_to_cef(&self.modifiers);
                                 // Reject path: in Insert/Command modes a
                                 // text input may or may not be focused.
@@ -7553,61 +7689,60 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.sleep_deadline = None;
             }
 
-            // 2. Drain audio events from BuffrAudioHandler.
-            if let Some(host) = self.host.as_ref() {
-                let events = host.drain_audio_events();
-                if !events.is_empty() {
-                    // Recompute media_active from the authoritative snapshot.
-                    self.media_active = host.any_audio_active();
+            // 2. Drain audio events from all engines (fan-out).
+            //    media_active / video_active are true if ANY engine is active.
+            {
+                let mut any_audio_events = false;
+                for host in self.engines.values() {
+                    let events = host.drain_audio_events();
+                    if !events.is_empty() {
+                        any_audio_events = true;
+                    }
+                }
+                if any_audio_events {
+                    // Recompute media_active across all engines.
+                    self.media_active = self.engines.values().any(|h| h.any_audio_active());
                     tracing::debug!(
                         media_active = self.media_active,
-                        event_count = events.len(),
-                        "audio events drained"
+                        "audio events drained (multi-engine fan-out)"
                     );
                 }
+                self.video_active = self.engines.values().any(|h| h.any_video_active());
+            }
 
-                // Recompute video_active from the JS probe result. Phase-1
-                // stub always returns false; phase-2 wires the console.log
-                // sentinel reader so this reflects window.__buffr_video_active.
-                self.video_active = host.any_video_active();
-
-                // Evaluate idle-inhibit policy and acquire/release as needed.
-                {
-                    let cfg = &*self.idle_inhibit_config;
-                    let want_inhibit = cfg.enabled
-                        && (self.video_active || (cfg.inhibit_audio_only && self.media_active))
-                        && (!cfg.require_focus || self.window_focused);
-                    if let Some(ref inhibitor) = self.idle_inhibitor {
-                        let is_active = inhibitor.is_active();
-                        if want_inhibit && !is_active {
-                            tracing::debug!("idle_inhibit: acquiring");
-                            if let Err(e) = inhibitor.acquire() {
-                                tracing::warn!(error = %e, "idle_inhibit: acquire failed");
-                            }
-                        } else if !want_inhibit && is_active {
-                            tracing::debug!("idle_inhibit: releasing");
-                            if let Err(e) = inhibitor.release() {
-                                tracing::warn!(error = %e, "idle_inhibit: release failed");
-                            }
+            // Evaluate idle-inhibit policy and acquire/release as needed.
+            {
+                let cfg = &*self.idle_inhibit_config;
+                let want_inhibit = cfg.enabled
+                    && (self.video_active || (cfg.inhibit_audio_only && self.media_active))
+                    && (!cfg.require_focus || self.window_focused);
+                if let Some(ref inhibitor) = self.idle_inhibitor {
+                    let is_active = inhibitor.is_active();
+                    if want_inhibit && !is_active {
+                        tracing::debug!("idle_inhibit: acquiring");
+                        if let Err(e) = inhibitor.acquire() {
+                            tracing::warn!(error = %e, "idle_inhibit: acquire failed");
+                        }
+                    } else if !want_inhibit && is_active {
+                        tracing::debug!("idle_inhibit: releasing");
+                        if let Err(e) = inhibitor.release() {
+                            tracing::warn!(error = %e, "idle_inhibit: release failed");
                         }
                     }
                 }
+            }
 
-                // 3. Fire the JS media probe while occluded so navigator.mediaSession
-                //    and fullscreen-video changes are detected at ~2 s cadence.
-                //    Phase-1: relies on AudioHandler for audio; probe covers
-                //    mediaSession/fullscreen.  The result is written to
-                //    window.__buffr_media_active but we cannot read it back
-                //    synchronously (execute_java_script is fire-and-forget in
-                //    cef-rs).  The probe is still fired so it primes the property
-                //    for a future phase-2 reader.
-                if self.occluded {
-                    let now = Instant::now();
-                    let due = self.media_probe_next.map(|t| now >= t).unwrap_or(true);
-                    if due {
-                        host.run_media_probe();
-                        self.media_probe_next = Some(now + MEDIA_PROBE_INTERVAL);
-                    }
+            // 3. Fire the JS media probe while occluded so navigator.mediaSession
+            //    and fullscreen-video changes are detected at ~2 s cadence.
+            //    Probe runs on the active engine only — it's the one presenting.
+            if self.occluded
+                && let Some(host) = self.active_host()
+            {
+                let now = Instant::now();
+                let due = self.media_probe_next.map(|t| now >= t).unwrap_or(true);
+                if due {
+                    host.run_media_probe();
+                    self.media_probe_next = Some(now + MEDIA_PROBE_INTERVAL);
                 }
             }
 
@@ -7625,7 +7760,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             {
                 self.probe_pending = true;
                 self.next_probe_at = None;
-                if let Some(host) = self.host.as_ref() {
+                if let Some(host) = self.active_host() {
                     host.osr_sleep(false);
                     host.osr_invalidate_view();
                 }
@@ -7651,7 +7786,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Address-change events: drain URL updates pushed by
         // on_address_change. No CEF call; purely reads from the shared
         // VecDeque. Fires before find so Tab.url is current.
-        if let Some(host) = self.host.as_ref()
+        if let Some(host) = self.active_host()
             && host.pump_address_changes()
         {
             self.mark_session_dirty();
@@ -7659,6 +7794,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             // reassigns all field IDs from f1. Any saved ID is stale.
             self.last_focused_field = None;
             self.request_redraw();
+
+            // Cross-engine navigation check (Phase 3): if the active tab's
+            // new URL routes to a different engine, open a new tab on the
+            // target and close the in-flight tab on the source.
+            self.check_cross_engine_nav();
         }
 
         // Forward any pending CEF cursor change to winit. Reads the
@@ -7681,7 +7821,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Drain any hint event (Ready / Error from the renderer) and
         // refresh the statusline indicator off the live session.
-        if let Some(host) = self.host.as_ref() {
+        if let Some(host) = self.active_host() {
             if host.pump_hint_events() {
                 self.request_redraw();
             }
@@ -7700,7 +7840,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Context-menu: drain any right-click requests. Only the most
         // recent is shown (earlier ones are dropped — only one menu visible
         // at a time). Mark chrome dirty so the overlay appears immediately.
-        if let Some(host) = self.host.as_ref() {
+        if let Some(host) = self.active_host() {
             let requests = host.drain_context_menu_requests();
             if let Some(req) = requests.into_iter().last() {
                 tracing::debug!(
@@ -7718,7 +7858,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // NEW_FOREGROUND_TAB / NEW_BACKGROUND_TAB dispositions and open
         // each as a tab. Popup-window dispositions (OAuth, etc) are not
         // queued — CEF handles those natively.
-        if let Some(host) = self.host.as_ref() {
+        if let Some(host) = self.active_host() {
             for url in drain_popup_urls(&host.popup_queue()) {
                 if let Err(err) = host.open_tab(&url) {
                     warn!(error = %err, %url, "popup -> open_tab failed");
@@ -7757,7 +7897,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             let inner = popup_win.inner_size();
             let pw = inner.width.max(1);
             let ph = inner.height.max(1);
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.active_host() {
                 host.popup_resize(created.browser_id, pw, ph);
             }
             // Wire OSR on_paint → popup window redraw via EventLoopProxy.
@@ -7810,7 +7950,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Popup URL updates: drain address-change events for popup browsers
         // and update the corresponding popup window's URL bar.
-        let popup_addr_changes: Vec<(i32, String)> = if let Some(host) = self.host.as_ref() {
+        let popup_addr_changes: Vec<(i32, String)> = if let Some(host) = self.active_host() {
             host.popup_drain_address_changes()
         } else {
             Vec::new()
@@ -7829,7 +7969,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Popup title updates: drain title-change events for popup browsers
         // and update the winit window title.
-        let popup_title_changes: Vec<(i32, String)> = if let Some(host) = self.host.as_ref() {
+        let popup_title_changes: Vec<(i32, String)> = if let Some(host) = self.active_host() {
             host.popup_drain_title_changes()
         } else {
             Vec::new()
@@ -7860,7 +8000,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Collect the poll results outside the borrow so we can call
         // `mark_session_dirty` (which takes &mut self) afterwards.
         let url_poll_result: Option<(String, Option<usize>, Vec<buffr_cef::TabId>, f64)> =
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.active_host() {
                 let now = Instant::now();
                 if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
                     self.last_url_poll = now;
@@ -8005,19 +8145,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // painting at the wrong size and `last_osr_dims != browser_w/h`
         // forever — the loading animation would stay stuck.
         if self.pending_cef_resize.should_fire(Instant::now()) {
-            if let Some(host) = self.host.as_ref()
-                && let Some(window) = self.window.as_ref()
-            {
+            if let Some(window) = self.window.as_ref() {
                 let size = window.inner_size();
                 let (_, _, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
-                host.osr_resize(w, h);
-                self.resize_paint_watchdog
-                    .arm(w, h, Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
-                tracing::debug!(
-                    w,
-                    h,
-                    "winit: pending Resized debounce elapsed -> osr_resize"
-                );
+                // Fan out resize to all engines; watchdog tracks active engine.
+                for (id, host) in &self.engines {
+                    host.osr_resize(w, h);
+                    if id == &self.active_engine {
+                        self.resize_paint_watchdog.arm(
+                            w,
+                            h,
+                            Instant::now(),
+                            RESIZE_PAINT_WATCHDOG_TIMEOUT,
+                        );
+                    }
+                }
+                if !self.engines.is_empty() {
+                    tracing::debug!(
+                        w,
+                        h,
+                        "winit: pending Resized debounce elapsed -> osr_resize"
+                    );
+                }
             }
             self.pending_cef_resize.clear();
             self.request_redraw();
@@ -8032,7 +8181,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             {
                 let browser_id = self.popups.get(&wid).map(|p| p.browser_id).unwrap_or(-1);
                 if browser_id >= 0
-                    && let Some(host) = self.host.as_ref()
+                    && let Some(host) = self.active_host()
                 {
                     host.popup_resize(browser_id, w, h);
                     tracing::debug!(
@@ -8065,7 +8214,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 .resize_paint_watchdog
                 .should_force_repaint(Instant::now())
         {
-            if let Some(host) = self.host.as_ref() {
+            if let Some(host) = self.active_host() {
                 let r = self.resize_paint_watchdog.retry_count();
                 tracing::debug!(retry = r, "watchdog: forcing repaint");
                 host.force_repaint_active();

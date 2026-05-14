@@ -127,10 +127,53 @@ impl EngineRouter {
     }
 
     /// Direct lookup by id (e.g. for issuing engine-wide commands like
-    /// resize-all or close-all). Reserved for Phase 3 multi-engine use.
+    /// resize-all or close-all). Used by Phase 3 multi-engine fan-out paths
+    /// in `main.rs`; suppressed here because `main.rs` accesses engines via
+    /// `AppState::engines` directly for the concrete `BrowserHost` type.
     #[allow(dead_code)]
     pub fn get(&self, id: &EngineId) -> Option<&Arc<dyn BrowserEngine>> {
         self.engines.get(id)
+    }
+}
+
+// ── Cross-engine navigation verdict ──────────────────────────────────────────
+
+/// Result of [`classify_navigation`]: describes whether a URL stays on the
+/// current engine or crosses to a different one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavigationVerdict {
+    /// URL resolves to the same engine — no action needed.
+    SameEngine,
+    /// URL resolves to a different engine. Open a new tab on `target` and
+    /// close the source tab.
+    CrossEngine {
+        /// The engine that should host this URL.
+        target: EngineId,
+    },
+}
+
+/// Classify whether navigating `url` from `active_engine` requires a
+/// cross-engine handoff.
+///
+/// Returns [`NavigationVerdict::SameEngine`] when the resolved engine matches
+/// `active_engine`; otherwise [`NavigationVerdict::CrossEngine`].
+///
+/// This is a pure function — no side effects — which makes it trivially
+/// unit-testable with stub engines. The `check_cross_engine_nav` method in
+/// `AppState` uses this in the hot `about_to_wait` path; the unit-testable
+/// extraction keeps that logic verifiable without running a live CEF process.
+pub fn classify_navigation(
+    router: &EngineRouter,
+    active_engine: &EngineId,
+    url: &str,
+) -> NavigationVerdict {
+    let target = router.resolve(url);
+    if target == active_engine {
+        NavigationVerdict::SameEngine
+    } else {
+        NavigationVerdict::CrossEngine {
+            target: target.clone(),
+        }
     }
 }
 
@@ -497,5 +540,62 @@ mod tests {
             .unwrap();
         // Should not panic.
         let _engine = router.engine_for("https://example.com");
+    }
+
+    // ── classify_navigation tests (Phase 3) ───────────────────────────────────
+
+    fn two_engine_router() -> EngineRouter {
+        EngineRouter::builder()
+            .register(EngineId::new("cef-a"), stub_arc())
+            .register(EngineId::new("cef-b"), stub_arc())
+            .default_engine(EngineId::new("cef-a"))
+            .rule("*.example.com", "cef-b")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn cross_engine_nav_opens_new_tab_on_target() {
+        let router = two_engine_router();
+        let active = EngineId::new("cef-a");
+        let verdict = super::classify_navigation(&router, &active, "https://www.example.com/page");
+        assert_eq!(
+            verdict,
+            super::NavigationVerdict::CrossEngine {
+                target: EngineId::new("cef-b")
+            },
+            "example.com rule should route to cef-b"
+        );
+    }
+
+    #[test]
+    fn cross_engine_nav_no_op_when_same_engine() {
+        let router = two_engine_router();
+        let active = EngineId::new("cef-a");
+        // URL with no matching rule → default engine = cef-a = active engine.
+        let verdict = super::classify_navigation(&router, &active, "https://other.com");
+        assert_eq!(
+            verdict,
+            super::NavigationVerdict::SameEngine,
+            "other.com should stay on cef-a"
+        );
+    }
+
+    #[test]
+    fn cross_engine_nav_same_when_active_is_target() {
+        let router = two_engine_router();
+        // Active engine IS cef-b — URL routes to cef-b → same engine.
+        let active = EngineId::new("cef-b");
+        let verdict = super::classify_navigation(&router, &active, "https://www.example.com/page");
+        assert_eq!(verdict, super::NavigationVerdict::SameEngine);
+    }
+
+    #[test]
+    fn cross_engine_nav_no_host_returns_default() {
+        let router = two_engine_router();
+        let active = EngineId::new("cef-a");
+        // about:blank has no host → default engine (cef-a) = active → SameEngine.
+        let verdict = super::classify_navigation(&router, &active, "about:blank");
+        assert_eq!(verdict, super::NavigationVerdict::SameEngine);
     }
 }
