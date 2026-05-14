@@ -7075,6 +7075,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         download_dir: None,
                         downloads: None,
                         notice_queue: None,
+                        find_sink: None,
                         sinks: Box::new(CefEngineSinks {
                             history: self.history.clone(),
                             downloads: self.downloads.clone(),
