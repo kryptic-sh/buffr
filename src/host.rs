@@ -66,17 +66,6 @@ use buffr_core::telemetry::{KEY_TABS_OPENED, UsageCounters};
 // migrated to OSR so platform behavior is uniform (cursor sync, IME
 // integration, scale-factor changes, MSI footprint).
 
-/// Monotonic tab identifier minted by [`BrowserHost`]. Distinct from
-/// CEF's `Browser::identifier()` (which can collide on close+reopen).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TabId(pub u64);
-
-impl std::fmt::Display for TabId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "tab#{}", self.0)
-    }
-}
-
 /// Per-tab UI state preserved across tab switches. Find query and hint
 /// session restore on focus.
 #[derive(Debug, Default, Clone)]
@@ -84,6 +73,10 @@ pub struct TabSession {
     pub find_query: Option<String>,
     pub hint_session: Option<HintSession>,
 }
+
+// Bring neutral TabId + TabSummary into scope. These replace the
+// previously-local definitions; all host.rs code uses them via this import.
+use buffr_engine::{TabId, TabSummary};
 
 /// User-facing prefix for "view source" navigations. `buffr-src:` URLs
 /// are now served by the custom CEF scheme handler in
@@ -170,22 +163,6 @@ impl Tab {
         }
         format!("{}", self.id)
     }
-}
-
-/// Copy-friendly snapshot of a tab. Used by chrome / UI threads that
-/// don't want to hold the manager mutex.
-#[derive(Debug, Clone)]
-pub struct TabSummary {
-    pub id: TabId,
-    /// CEF `Browser::identifier()`. Lets the apps layer correlate this
-    /// tab with browser-id-keyed sinks (favicon downloads, cursor state).
-    pub browser_id: i32,
-    pub title: String,
-    pub url: String,
-    pub progress: f32,
-    pub is_loading: bool,
-    pub pinned: bool,
-    pub private: bool,
 }
 
 /// Thread-safe queue of `(cef_browser_id, url)` pairs pushed by
@@ -779,7 +756,7 @@ impl BrowserHost {
         browser_id: i32,
         x: i32,
         y: i32,
-        button: cef::MouseButtonType,
+        button: buffr_engine::MouseButton,
         mouse_up: bool,
         click_count: i32,
         modifiers: u32,
@@ -788,8 +765,9 @@ impl BrowserHost {
             && let Some(b) = browsers.get(&browser_id)
             && let Some(host) = b.host()
         {
+            let cef_button = crate::convert::neutral_to_cef_button(button);
             let event = cef::MouseEvent { x, y, modifiers };
-            host.send_mouse_click_event(Some(&event), button, mouse_up as i32, click_count);
+            host.send_mouse_click_event(Some(&event), cef_button, mouse_up as i32, click_count);
         }
     }
 
@@ -813,12 +791,13 @@ impl BrowserHost {
     }
 
     /// Forward a keyboard event to a popup browser.
-    pub fn popup_osr_key_event(&self, browser_id: i32, event: cef::KeyEvent) {
+    pub fn popup_osr_key_event(&self, browser_id: i32, event: buffr_engine::NeutralKeyEvent) {
         if let Ok(browsers) = self.popup_browsers.lock()
             && let Some(b) = browsers.get(&browser_id)
             && let Some(host) = b.host()
         {
-            host.send_key_event(Some(&event));
+            let cef_ev = crate::convert::neutral_to_cef_key(event);
+            host.send_key_event(Some(&cef_ev));
         }
     }
 
@@ -856,14 +835,15 @@ impl BrowserHost {
         &self,
         x: i32,
         y: i32,
-        button: cef::MouseButtonType,
+        button: buffr_engine::MouseButton,
         mouse_up: bool,
         click_count: i32,
         modifiers: u32,
     ) {
+        let cef_button = crate::convert::neutral_to_cef_button(button);
         tracing::debug!(
             target: "buffr_core::host",
-            x, y, ?button, mouse_up, click_count, modifiers,
+            x, y, ?cef_button, mouse_up, click_count, modifiers,
             "osr_mouse_click"
         );
         let Ok(tabs) = self.tabs.lock() else { return };
@@ -873,7 +853,7 @@ impl BrowserHost {
             && let Some(host) = t.browser.host()
         {
             let event = cef::MouseEvent { x, y, modifiers };
-            host.send_mouse_click_event(Some(&event), button, mouse_up as i32, click_count);
+            host.send_mouse_click_event(Some(&event), cef_button, mouse_up as i32, click_count);
         } else {
             warn!(target: "buffr_core::host", "osr_mouse_click: no active browser host — click dropped");
         }
@@ -1009,14 +989,15 @@ impl BrowserHost {
     /// Forward a keyboard event to the active tab's browser host.
     ///
     /// No-op when the host is in `Windowed` mode.
-    pub fn osr_key_event(&self, event: cef::KeyEvent) {
+    pub fn osr_key_event(&self, event: buffr_engine::NeutralKeyEvent) {
+        let cef_ev = crate::convert::neutral_to_cef_key(event);
         let Ok(tabs) = self.tabs.lock() else { return };
         let active_idx = self.active.lock().ok().and_then(|g| *g);
         if let Some(idx) = active_idx
             && let Some(t) = tabs.get(idx)
             && let Some(host) = t.browser.host()
         {
-            host.send_key_event(Some(&event));
+            host.send_key_event(Some(&cef_ev));
         }
     }
 
@@ -2773,6 +2754,233 @@ fn _hint_used(_: Hint) {}
 /// `j` feel laggy. Half/full-page scrolls go through their own
 /// `window.innerHeight`-relative path so they're DPI-independent.
 const STEP_PX: i64 = 40;
+
+// ── BrowserEngine impl ────────────────────────────────────────────────────────
+//
+// Delegates every trait method to the matching inherent method. The inherent
+// block continues to carry the full implementation; this impl is a thin shim
+// that exposes it behind the neutral trait surface.
+//
+// Methods that still use CEF types internally (e.g. `CoreError` return values)
+// convert at the boundary via `EngineError::Other(err.to_string())`.
+
+impl buffr_engine::BrowserEngine for BrowserHost {
+    // ── Lifecycle ────────────────────────────────────────────────────────────
+
+    fn close_all_browsers(&self) {
+        self.close_all_browsers()
+    }
+
+    // ── Tabs ─────────────────────────────────────────────────────────────────
+
+    fn open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
+        self.open_tab(url)
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn open_tab_background(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
+        self.open_tab_background(url)
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn open_tab_at(
+        &self,
+        url: &str,
+        insert_idx: usize,
+    ) -> Result<TabId, buffr_engine::EngineError> {
+        self.open_tab_at(url, insert_idx)
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn close_tab(&self, id: TabId) -> Result<bool, buffr_engine::EngineError> {
+        self.close_tab(id)
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn close_active(&self) -> Result<bool, buffr_engine::EngineError> {
+        self.close_active()
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn select_tab(&self, id: TabId) {
+        self.select_tab(id)
+    }
+
+    fn next_tab(&self) {
+        self.next_tab()
+    }
+
+    fn prev_tab(&self) {
+        self.prev_tab()
+    }
+
+    fn move_tab(&self, from: usize, to: usize) {
+        self.move_tab(from, to)
+    }
+
+    fn duplicate_active(&self) -> Result<TabId, buffr_engine::EngineError> {
+        self.duplicate_active()
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn toggle_pin_active(&self) {
+        self.toggle_pin_active()
+    }
+
+    fn set_pinned(&self, id: TabId, pinned: bool) {
+        self.set_pinned(id, pinned)
+    }
+
+    fn reopen_closed_tab(&self) -> Result<Option<TabId>, buffr_engine::EngineError> {
+        self.reopen_closed_tab()
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn closed_stack_len(&self) -> usize {
+        self.closed_stack_len()
+    }
+
+    fn active_tab(&self) -> Option<TabSummary> {
+        self.active_tab()
+    }
+
+    fn tabs_summary(&self) -> Vec<TabSummary> {
+        self.tabs_summary()
+    }
+
+    fn tab_count(&self) -> usize {
+        self.tab_count()
+    }
+
+    fn pinned_count(&self) -> usize {
+        self.pinned_count()
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        self.active_index()
+    }
+
+    // ── Navigation ───────────────────────────────────────────────────────────
+
+    fn navigate(&self, url: &str) -> Result<(), buffr_engine::EngineError> {
+        self.navigate(url)
+            .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn active_tab_live_url(&self) -> String {
+        self.active_tab_live_url()
+    }
+
+    fn pump_address_changes(&self) -> bool {
+        self.pump_address_changes()
+    }
+
+    // ── Viewport ─────────────────────────────────────────────────────────────
+
+    fn resize(&self, width: u32, height: u32) {
+        self.resize(width, height)
+    }
+
+    fn set_device_scale(&self, scale: f32) {
+        self.set_device_scale(scale)
+    }
+
+    fn set_frame_rate(&self, hz: u32) {
+        self.set_frame_rate(hz)
+    }
+
+    fn notify_screen_info_changed(&self) {
+        self.notify_screen_info_changed()
+    }
+
+    fn osr_resize(&self, width: u32, height: u32) {
+        self.osr_resize(width, height)
+    }
+
+    // ── Input — neutral types ────────────────────────────────────────────────
+
+    fn osr_key_event(&self, event: buffr_engine::NeutralKeyEvent) {
+        self.osr_key_event(event)
+    }
+
+    fn osr_mouse_move(&self, x: i32, y: i32, modifiers: u32) {
+        self.osr_mouse_move(x, y, modifiers)
+    }
+
+    fn osr_mouse_click(
+        &self,
+        x: i32,
+        y: i32,
+        button: buffr_engine::MouseButton,
+        mouse_up: bool,
+        click_count: i32,
+        modifiers: u32,
+    ) {
+        self.osr_mouse_click(x, y, button, mouse_up, click_count, modifiers)
+    }
+
+    fn osr_mouse_leave(&self, modifiers: u32) {
+        self.osr_mouse_leave(modifiers)
+    }
+
+    fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
+        self.osr_mouse_wheel(x, y, delta_x, delta_y, modifiers)
+    }
+
+    fn osr_focus(&self, focused: bool) {
+        self.osr_focus(focused)
+    }
+
+    // ── OSR state ────────────────────────────────────────────────────────────
+
+    fn osr_frame(&self) -> buffr_engine::SharedOsrFrame {
+        self.osr_frame()
+    }
+
+    fn osr_view(&self) -> buffr_engine::SharedOsrViewState {
+        self.osr_view()
+    }
+
+    fn force_repaint_active(&self) {
+        self.force_repaint_active()
+    }
+
+    fn osr_sleep(&self, sleep: bool) {
+        self.osr_sleep(sleep)
+    }
+
+    fn osr_invalidate_view(&self) {
+        self.osr_invalidate_view()
+    }
+
+    fn set_osr_wake(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.set_osr_wake(wake)
+    }
+
+    // ── Find / zoom ──────────────────────────────────────────────────────────
+
+    fn start_find(&self, query: &str, forward: bool) {
+        self.start_find(query, forward)
+    }
+
+    fn stop_find(&self) {
+        self.stop_find()
+    }
+
+    fn active_zoom_level(&self) -> f64 {
+        self.active_zoom_level()
+    }
+
+    // ── Audio / video ────────────────────────────────────────────────────────
+
+    fn any_audio_active(&self) -> bool {
+        self.any_audio_active()
+    }
+
+    fn any_video_active(&self) -> bool {
+        self.any_video_active()
+    }
+}
 
 #[cfg(test)]
 mod tests {
