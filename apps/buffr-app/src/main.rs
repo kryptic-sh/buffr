@@ -1072,6 +1072,7 @@ fn main() -> Result<()> {
         search_config,
         engines_config,
         cli.private,
+        paths.data.clone(),
         find_sink,
         hint_sink,
         edit_sink,
@@ -1856,6 +1857,13 @@ struct AppState {
     /// stamp and is purely informational — the storage layer already
     /// captured the choice at construction time.
     private: bool,
+    /// Root of the user-data directory for this session. In normal mode
+    /// this is `<XDG_DATA_HOME>/buffr` (or equivalent); in `--private`
+    /// mode it is `$TMPDIR/buffr-private-<pid>/data` (deleted on Drop
+    /// by the TempDir held in main). All per-engine default profile
+    /// directories are derived from this root so `--private` mode truly
+    /// isolates every engine's storage to the throwaway tempdir.
+    data_root: PathBuf,
     modifiers: ModifiersState,
     startup: Instant,
     current_mode_label: &'static str,
@@ -2410,6 +2418,7 @@ impl AppState {
         search_config: Arc<buffr_config::Search>,
         engines_config: Arc<buffr_config::Engines>,
         private: bool,
+        data_root: PathBuf,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         edit_sink: EditEventSink,
@@ -2466,6 +2475,7 @@ impl AppState {
             engines_config,
             overlay: None,
             private,
+            data_root,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
             current_mode_label: mode_label(PageMode::Normal),
@@ -7021,15 +7031,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .as_deref()
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| {
-                            // Default to <XDG_DATA_HOME>/buffr/blink-cdp/<instance-id> so
-                            // each instance gets its own profile that persists across
-                            // reboot. Falls back to /tmp if the XDG lookup fails.
-                            profile_paths()
-                                .map(|p| p.data.join("blink-cdp").join(&inst.id))
-                                .unwrap_or_else(|_| {
-                                    std::path::PathBuf::from("/tmp/buffr/blink-cdp").join(&inst.id)
-                                })
+                            // Default to <data_root>/blink-cdp/<instance-id> so each
+                            // instance gets its own isolated profile. In normal mode
+                            // data_root is the XDG data dir; in --private mode it is
+                            // the throwaway TempDir, so cookies/storage are deleted on
+                            // process exit without any extra teardown code.
+                            self.data_root.join("blink-cdp").join(&inst.id)
                         });
+                    tracing::debug!(?data_dir, "blink-cdp profile dir");
                     match buffr_blink_cdp::BlinkCdpEngine::new(&data_dir) {
                         Ok(engine) => {
                             info!(engine_id = %inst.id, "blink-cdp engine created");
