@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/buffr-engine",
     "crates/buffr-cef",
+    "crates/buffr-blink-cdp",
     "crates/buffr-core",
     "crates/buffr-modal",
     "crates/buffr-ui",
@@ -92,6 +93,7 @@ semver = { version = "1", features = ["serde"] }
 # member, eliminating "multiple versions of buffr_<name>" errors.
 buffr-engine = "0.1"
 buffr-cef = "0.1"
+buffr-blink-cdp = "0.1"
 buffr-core = "0.6"
 buffr-modal = "0.1"
 buffr-ui = "0.2"
@@ -120,6 +122,7 @@ hjkl-splash = "0.2"
 [patch.crates-io]
 buffr-engine = { path = "crates/buffr-engine" }
 buffr-cef = { path = "crates/buffr-cef" }
+buffr-blink-cdp = { path = "crates/buffr-blink-cdp" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 buffr-config = { path = "crates/buffr-config" }
 buffr-core = { path = "crates/buffr-core" }
