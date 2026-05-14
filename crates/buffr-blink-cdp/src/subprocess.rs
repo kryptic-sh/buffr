@@ -187,4 +187,38 @@ mod tests {
         // already proves both binds succeeded, which is the meaningful check.
         let _ = p1 != p2; // suppress unused-comparison lint
     }
+
+    #[test]
+    fn pick_free_port_within_ephemeral_range() {
+        let port = pick_free_port().expect("OS should provide an ephemeral port");
+        // OS ephemeral ports are always > 1024 (typically 32768–60999 on Linux).
+        assert!(port >= 1024, "expected ephemeral port >= 1024, got {port}");
+    }
+
+    #[test]
+    fn find_chromium_returns_none_when_path_empty() {
+        // Override PATH to an empty value so which_binary finds nothing.
+        // macOS absolute candidates still exist, so we only assert None on
+        // non-macOS where all candidates go through PATH.
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Save the original PATH so we can reason about the test environment.
+            // We deliberately do NOT restore it — each test process is isolated.
+            // SAFETY: test-only; no other thread reads PATH concurrently here.
+            unsafe { std::env::set_var("PATH", "") };
+            let result = find_chromium();
+            // With an empty PATH none of the relative candidates resolve.
+            // (Absolute paths like /Applications/... don't apply on non-macOS.)
+            assert!(
+                result.is_none(),
+                "expected None with empty PATH, got {result:?}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS the absolute /Applications path may exist; just verify
+            // no panic occurs.
+            let _ = find_chromium();
+        }
+    }
 }

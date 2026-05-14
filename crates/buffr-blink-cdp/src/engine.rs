@@ -1048,4 +1048,83 @@ mod tests {
             Ok(_) => panic!("expected error when Chromium is missing"),
         }
     }
+
+    // ── Zoom boundary tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn clamp_zoom_min_boundary() {
+        assert!(
+            (clamp_zoom(ZOOM_MIN) - ZOOM_MIN).abs() < f64::EPSILON,
+            "clamp(MIN) should equal MIN"
+        );
+        assert!(
+            (clamp_zoom(ZOOM_MIN - 0.01) - ZOOM_MIN).abs() < f64::EPSILON,
+            "below MIN should clamp to MIN"
+        );
+    }
+
+    #[test]
+    fn clamp_zoom_max_boundary() {
+        assert!(
+            (clamp_zoom(ZOOM_MAX) - ZOOM_MAX).abs() < f64::EPSILON,
+            "clamp(MAX) should equal MAX"
+        );
+        assert!(
+            (clamp_zoom(ZOOM_MAX + 0.01) - ZOOM_MAX).abs() < f64::EPSILON,
+            "above MAX should clamp to MAX"
+        );
+    }
+
+    // ── EngineState helper tests ──────────────────────────────────────────────
+
+    #[test]
+    fn engine_state_mint_tab_id_monotonic() {
+        let mut state = EngineState::new(9999);
+        let id1 = state.mint_tab_id();
+        let id2 = state.mint_tab_id();
+        let id3 = state.mint_tab_id();
+        assert!(id1.0 < id2.0 && id2.0 < id3.0, "tab ids must increase");
+    }
+
+    #[test]
+    fn engine_state_tab_by_id_found_and_not_found() {
+        let mut state = EngineState::new(9999);
+        let id = state.mint_tab_id();
+        state.tabs.push(CdpTab {
+            id,
+            target_id: "t1".into(),
+            session_id: "s1".into(),
+            url: "about:blank".into(),
+            title: "about:blank".into(),
+            zoom_level: 1.0,
+        });
+        assert!(state.tab_by_id(id).is_some());
+        assert!(state.tab_by_id(TabId(999)).is_none());
+    }
+
+    #[test]
+    fn engine_state_tracks_active_target_id() {
+        let mut state = EngineState::new(8080);
+        let id = state.mint_tab_id();
+        state.tabs.push(CdpTab {
+            id,
+            target_id: "target-xyz".into(),
+            session_id: "sess-xyz".into(),
+            url: "https://example.com".into(),
+            title: "Example".into(),
+            zoom_level: 1.25,
+        });
+        state.active = Some(id);
+
+        let tab = state.active_tab().expect("active tab should be present");
+        assert_eq!(tab.target_id, "target-xyz");
+        assert_eq!(tab.session_id, "sess-xyz");
+        assert!((tab.zoom_level - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn engine_state_no_active_tab_when_none() {
+        let state = EngineState::new(9999);
+        assert!(state.active_tab().is_none());
+    }
 }

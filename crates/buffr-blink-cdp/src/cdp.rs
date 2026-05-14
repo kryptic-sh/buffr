@@ -231,4 +231,120 @@ mod tests {
         // id must be a positive integer
         assert!(v["id"].as_u64().unwrap_or(0) > 0);
     }
+
+    #[test]
+    fn parse_unsolicited_event() {
+        // Minimal Page.frameNavigated event — the params shape doesn't matter
+        // for the parser; we only need the method field decoded correctly.
+        let json = r#"{
+            "method": "Page.frameNavigated",
+            "params": { "frame": { "url": "https://example.com" } },
+            "sessionId": "s42"
+        }"#;
+        let msg: CdpMessage = serde_json::from_str(json).expect("parse");
+        assert!(msg.id.is_none());
+        assert_eq!(msg.method.as_deref(), Some("Page.frameNavigated"));
+        assert_eq!(msg.session_id.as_deref(), Some("s42"));
+        let frame_url = msg
+            .params
+            .as_ref()
+            .and_then(|p| p.get("frame"))
+            .and_then(|f| f.get("url"))
+            .and_then(|u| u.as_str());
+        assert_eq!(frame_url, Some("https://example.com"));
+    }
+
+    #[test]
+    fn parse_error_response() {
+        let json = r#"{"id": 5, "error": {"code": -32601, "message": "method not found"}}"#;
+        let msg: CdpMessage = serde_json::from_str(json).expect("parse");
+        assert_eq!(msg.id, Some(5));
+        let err = msg.error.expect("error field present");
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "method not found");
+    }
+
+    #[test]
+    fn serialize_dispatch_mouse_event_includes_button() {
+        let params = DispatchMouseEventParams {
+            event_type: "mousePressed",
+            x: 100,
+            y: 200,
+            button: "left",
+            click_count: 1,
+            modifiers: 0,
+            delta_x: None,
+            delta_y: None,
+        };
+        let cmd =
+            CdpCommand::new("Input.dispatchMouseEvent", params).with_session("sess".to_owned());
+        let v: serde_json::Value = serde_json::from_str(&cmd.serialize()).unwrap();
+        assert_eq!(v["params"]["button"], "left");
+        assert_eq!(v["params"]["type"], "mousePressed");
+        assert_eq!(v["params"]["x"], 100);
+        assert_eq!(v["params"]["y"], 200);
+        // delta fields should be absent (skip_serializing_if = None)
+        assert!(v["params"].get("deltaX").is_none() || v["params"]["deltaX"].is_null());
+    }
+
+    #[test]
+    fn serialize_dispatch_key_event_includes_text() {
+        let params = DispatchKeyEventParams {
+            event_type: "char",
+            windows_virtual_key_code: 65,
+            native_virtual_key_code: 65,
+            text: "a".to_string(),
+            unmodified_text: "a".to_string(),
+            modifiers: 0,
+            is_system_key: false,
+        };
+        let cmd = CdpCommand::new("Input.dispatchKeyEvent", params).with_session("sess".to_owned());
+        let v: serde_json::Value = serde_json::from_str(&cmd.serialize()).unwrap();
+        assert_eq!(v["params"]["text"], "a");
+        assert_eq!(v["params"]["type"], "char");
+        assert_eq!(v["params"]["windowsVirtualKeyCode"], 65);
+    }
+
+    #[test]
+    fn serialize_set_device_metrics_override() {
+        let params = SetDeviceMetricsParams {
+            width: 1920,
+            height: 1080,
+            device_scale_factor: 2.0,
+            mobile: false,
+        };
+        let cmd = CdpCommand::new("Page.setDeviceMetricsOverride", params);
+        let v: serde_json::Value = serde_json::from_str(&cmd.serialize()).unwrap();
+        assert_eq!(v["method"], "Page.setDeviceMetricsOverride");
+        assert_eq!(v["params"]["width"], 1920);
+        assert_eq!(v["params"]["height"], 1080);
+        assert_eq!(v["params"]["deviceScaleFactor"], 2.0);
+        assert_eq!(v["params"]["mobile"], false);
+    }
+
+    #[test]
+    fn mouse_button_str_mapping() {
+        use buffr_engine::MouseButton;
+        assert_eq!(mouse_button_str(MouseButton::Left), "left");
+        assert_eq!(mouse_button_str(MouseButton::Middle), "middle");
+        assert_eq!(mouse_button_str(MouseButton::Right), "right");
+        // Other falls back to "left".
+        assert_eq!(mouse_button_str(MouseButton::Other(7)), "left");
+    }
+
+    #[test]
+    fn key_event_type_mapping() {
+        use buffr_engine::KeyEventKind;
+        assert_eq!(key_event_type(KeyEventKind::RawDown), "rawKeyDown");
+        assert_eq!(key_event_type(KeyEventKind::Char), "char");
+        assert_eq!(key_event_type(KeyEventKind::Up), "keyUp");
+    }
+
+    #[test]
+    fn new_bare_command_has_no_params() {
+        let cmd = CdpCommand::new_bare("Page.stopScreencast");
+        let v: serde_json::Value = serde_json::from_str(&cmd.serialize()).unwrap();
+        assert_eq!(v["method"], "Page.stopScreencast");
+        assert!(v.get("params").is_none() || v["params"].is_null());
+    }
 }
