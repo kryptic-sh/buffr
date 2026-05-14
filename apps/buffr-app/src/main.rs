@@ -129,10 +129,10 @@ fn build_palette(theme: &buffr_config::Theme) -> Palette {
 
 use anyhow::{Context, Result};
 use buffr_cef::{
-    CefBackend, CefEngineSinks, PermissionsQueue, PromptOutcome, drain_permissions_with_defer,
-    new_permissions_queue, peek_permission_front, permissions_queue_len, pop_permission_front,
-    profile_paths,
+    CefBackend, CefEngineSinks, drain_permissions_with_defer, new_permissions_queue, profile_paths,
 };
+// Neutral permission types — Phase 8a (#88). Apps layer now uses the
+// engine-agnostic queue so both CEF and blink-cdp share the same prompt path.
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
 use buffr_core::{
@@ -150,6 +150,9 @@ use buffr_engine::{
 use buffr_engine::{
     PopupCloseSink, PopupCreateSink, SharedOsrFrame, SharedOsrViewState, drain_popup_closes,
     drain_popup_creates, drain_popup_urls,
+};
+use buffr_engine::{
+    PromptOutcome, peek_permission_front, permissions_queue_len, pop_permission_front,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -1114,6 +1117,23 @@ fn main() -> Result<()> {
         host.close_all_browsers();
     }
 
+    // Defer-dismiss any permission requests still queued at shutdown.
+    // Must happen BEFORE engines are dropped — the CEF backend fires the
+    // C++ callback from inside `resolve_permission`; the engine must still
+    // be alive. Phase 8a (#88): drain each engine's neutral queue and call
+    // the trait method so both CEF and blink-cdp clean up correctly.
+    info!("shutdown: draining permission queues");
+    for engine in app_state.engines.values() {
+        let queue = engine.permissions_queue();
+        let drained = buffr_engine::drain_permissions_queue(&queue);
+        for p in drained {
+            engine.resolve_permission(p.resolve_id.as_deref(), PromptOutcome::Defer);
+        }
+    }
+    // Also drain any residual entries in the legacy CEF queue (for
+    // callbacks that arrived before Phase 8a wiring was active).
+    drain_permissions_with_defer(&permissions_queue, &permissions);
+
     // Drop engine hosts first. This releases every Browser ref while
     // CEF's threads are still running, so CEF can finish the close
     // callbacks instead of segfaulting on dangling refs during its
@@ -1133,12 +1153,6 @@ fn main() -> Result<()> {
     // Drop all popup renderers for the same reason.
     info!("shutdown: dropping popup renderers");
     app_state.popups.clear();
-
-    // Defer-dismiss any permission requests still queued at shutdown.
-    // Dropping a CEF callback without invoking it would wedge the
-    // renderer; resolving with `Defer` fires the right "DISMISS"
-    // outcome on each.
-    drain_permissions_with_defer(&permissions_queue, &permissions);
 
     // -------- clear-on-exit --------
     //
@@ -1819,10 +1833,13 @@ struct AppState {
     downloads_config: Arc<buffr_config::DownloadsConfig>,
     zoom: Arc<buffr_zoom::ZoomStore>,
     permissions: Arc<Permissions>,
-    permissions_queue: PermissionsQueue,
+    /// Legacy CEF permissions queue kept for the shutdown drain path.
+    /// Phase 8a (#88): the UI thread now reads per-engine neutral queues
+    /// via `BrowserEngine::permissions_queue()` instead of this field.
+    permissions_queue: buffr_cef::PermissionsQueue,
     /// Active permission prompt (if any). `Some` while the front of
-    /// `permissions_queue` is being shown. Keystrokes route to the
-    /// prompt resolution path while this is set.
+    /// the active engine's permissions queue is being shown. Keystrokes
+    /// route to the prompt resolution path while this is set.
     permissions_prompt: Option<PermissionsPrompt>,
     /// Pending close-pinned-tab confirmation. When `Some(id)`, a
     /// yes/no banner is shown and the close is gated on the user's
@@ -2413,7 +2430,7 @@ impl AppState {
         downloads_config: Arc<buffr_config::DownloadsConfig>,
         zoom: Arc<buffr_zoom::ZoomStore>,
         permissions: Arc<Permissions>,
-        permissions_queue: PermissionsQueue,
+        permissions_queue: buffr_cef::PermissionsQueue,
         download_notice_queue: DownloadNoticeQueue,
         search_config: Arc<buffr_config::Search>,
         engines_config: Arc<buffr_config::Engines>,
@@ -5697,20 +5714,28 @@ impl AppState {
     /// [`PermissionsPrompt`] if no prompt is currently shown. Returns
     /// `true` when the prompt state changed (so the caller knows to
     /// resync the CEF rect + redraw).
+    ///
+    /// Phase 8a (#88): queue is fetched from the active engine via the
+    /// neutral `BrowserEngine::permissions_queue()` trait method so both
+    /// CEF and blink-cdp share the same prompt path.
     fn sync_permissions_prompt(&mut self) -> bool {
         // Already showing a prompt — nothing to do until the user
         // resolves it.
         if self.permissions_prompt.is_some() {
             return false;
         }
-        let queue_total = permissions_queue_len(&self.permissions_queue);
+        let queue = match self.active_engine_dyn() {
+            Some(engine) => engine.permissions_queue(),
+            None => return false,
+        };
+        let queue_total = permissions_queue_len(&queue);
         if queue_total == 0 {
             return false;
         }
         // queue_total includes the front entry; "more pending after
         // this one" is queue_total - 1.
         let queue_after = queue_total.saturating_sub(1) as u32;
-        let Some((origin, caps)) = peek_permission_front(&self.permissions_queue) else {
+        let Some((origin, caps)) = peek_permission_front(&queue) else {
             return false;
         };
         let labels: Vec<String> = caps.iter().map(|c| c.human_label()).collect();
@@ -5726,16 +5751,47 @@ impl AppState {
     /// Resolve the front-of-queue permission with `outcome`. The
     /// callback fires exactly once; the next prompt (if any) is
     /// drawn on the following tick via [`Self::sync_permissions_prompt`].
+    ///
+    /// Phase 8a (#88): delegates to `BrowserEngine::resolve_permission`
+    /// so both CEF and blink-cdp can handle the outcome correctly.
     fn resolve_permission(&mut self, outcome: PromptOutcome) {
-        let Some(pending) = pop_permission_front(&self.permissions_queue) else {
+        let Some(engine) = self.active_engine_dyn() else {
+            warn!("permissions: resolve called with no active engine");
+            self.permissions_prompt = None;
+            self.mark_chrome_dirty();
+            return;
+        };
+        let queue = engine.permissions_queue();
+        let Some(pending) = pop_permission_front(&queue) else {
             warn!("permissions: resolve called with empty queue");
             self.permissions_prompt = None;
             self.mark_chrome_dirty();
             return;
         };
-        if let Err(err) = pending.resolve(outcome, &self.permissions) {
-            warn!(error = %err, "permissions: resolve failed");
+        // Store persistent decisions before delegating to the backend.
+        let store = self.permissions.clone();
+        match outcome {
+            PromptOutcome::Allow { remember: true } => {
+                for cap in &pending.capabilities {
+                    if let Err(err) =
+                        store.set(&pending.origin, *cap, buffr_permissions::Decision::Allow)
+                    {
+                        warn!(error = %err, "permissions: store Allow failed");
+                    }
+                }
+            }
+            PromptOutcome::Deny { remember: true } => {
+                for cap in &pending.capabilities {
+                    if let Err(err) =
+                        store.set(&pending.origin, *cap, buffr_permissions::Decision::Deny)
+                    {
+                        warn!(error = %err, "permissions: store Deny failed");
+                    }
+                }
+            }
+            _ => {}
         }
+        engine.resolve_permission(pending.resolve_id.as_deref(), outcome);
         self.permissions_prompt = None;
         // Pull the next prompt immediately so the chrome shows it
         // without waiting for the next tick.

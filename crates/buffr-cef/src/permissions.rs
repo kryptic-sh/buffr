@@ -21,15 +21,26 @@
 //! 2. Walks the [`Permissions`] store. If **every** capability has a
 //!    stored decision and they all agree (all-allow → `Accept`,
 //!    otherwise `Deny`), the callback fires synchronously.
-//! 3. Otherwise the request + callback land on a
-//!    `Mutex<VecDeque<PendingPermission>>` and the UI thread drains
-//!    one per `about_to_wait` tick.
+//! 3. Otherwise the request + callback land on both:
+//!    a. The CEF-internal [`CefPermissionsQueue`] (for callback resolution)
+//!    b. The neutral [`buffr_engine::PermissionsQueue`] (for the apps UI)
 //!
-//! The UI thread invokes [`PendingPermission::resolve`] with a
-//! [`PromptOutcome`] which fires the C++ callback exactly once and
-//! optionally records a sticky decision in the store.
+//! The UI thread calls [`BrowserEngine::resolve_permission`] which pops
+//! from the callback registry and fires the C++ callback exactly once,
+//! optionally recording a sticky decision in the store.
+//!
+//! # Phase 8a (#88) changes
+//!
+//! - [`PromptOutcome`] is now re-exported from `buffr_engine::permissions`.
+//!   The type alias below keeps existing `buffr_cef::PromptOutcome` imports
+//!   working.
+//! - [`CefPermissionsQueue`] is the CEF-internal queue (C++ callbacks).
+//! - The neutral `buffr_engine::PermissionsQueue` is populated in parallel.
+//! - [`CefCallbackRegistry`] maps `resolve_id → PendingPermission` for
+//!   async resolution from the UI thread.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_permissions::{Capability, Decision, PermError, Permissions};
@@ -38,6 +49,24 @@ use cef::{
     PermissionPromptCallback, PermissionRequestResult,
 };
 use tracing::{trace, warn};
+
+// Re-export PromptOutcome from buffr-engine so existing
+// `buffr_cef::PromptOutcome` callers keep working without modification.
+pub use buffr_engine::permissions::PromptOutcome;
+
+/// Atomic counter for generating unique resolve IDs for each permission
+/// request. The ID is formatted as `"cef-<n>"`.
+static CEF_RESOLVE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique resolve ID for a new CEF permission request.
+pub fn next_resolve_id() -> String {
+    format!("cef-{}", CEF_RESOLVE_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Registry mapping `resolve_id` → CEF [`PendingPermission`] (with C++
+/// callbacks). Held by `BrowserHost`; written on the CEF IO thread,
+/// drained by the UI thread via [`BrowserEngine::resolve_permission`].
+pub type CefCallbackRegistry = Arc<Mutex<std::collections::HashMap<String, PendingPermission>>>;
 
 // CEF media-access permission bits — mirror
 // `cef_media_access_permission_types_t` from the cef-dll-sys bindings.
@@ -57,23 +86,6 @@ const PERM_GEOLOCATION: u32 = 256;
 const PERM_MIC_STREAM: u32 = 4096;
 const PERM_MIDI_SYSEX: u32 = 8192;
 const PERM_NOTIFICATIONS: u32 = 32768;
-
-/// Decision the UI thread reports back when resolving a queued
-/// request. Carried out of band so the queue draining code stays
-/// CEF-callback-agnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptOutcome {
-    /// Allow this request; remember the decision for this origin
-    /// (`remember = true`) or only honour it once.
-    Allow { remember: bool },
-    /// Deny this request; remember the decision (`remember = true`)
-    /// or only honour it once.
-    Deny { remember: bool },
-    /// Defer — synonymous with deny-once. The C++ callback receives
-    /// `Dismiss` (for the prompt path) or `cancel()` (for the media
-    /// path); nothing is persisted.
-    Defer,
-}
 
 /// One pending permission request. The two variants correspond to the
 /// two CEF callback paths. Construction wraps the callback in a
@@ -204,7 +216,51 @@ impl PendingPermission {
     }
 }
 
+/// Push `pending` onto both the CEF callback registry and the neutral
+/// engine queue.
+///
+/// - `registry`: the `CefCallbackRegistry` owned by `BrowserHost`; the
+///   CEF-specific `pending` is stored keyed by `resolve_id`.
+/// - `engine_queue`: the neutral [`buffr_engine::PermissionsQueue`]
+///   that the apps layer drains to show the prompt strip.
+/// - `resolve_id`: opaque string returned to the UI thread via the
+///   neutral `PendingPermission::resolve_id` field.
+pub fn enqueue_to_both(
+    pending: PendingPermission,
+    registry: &CefCallbackRegistry,
+    engine_queue: &buffr_engine::PermissionsQueue,
+    resolve_id: String,
+) {
+    let neutral = buffr_engine::permissions::PendingPermission {
+        origin: pending.origin().to_string(),
+        capabilities: pending.capabilities().to_vec(),
+        resolve_id: Some(resolve_id.clone()),
+    };
+    // Push to callback registry first (IO thread).
+    match registry.lock() {
+        Ok(mut reg) => {
+            reg.insert(resolve_id, pending);
+        }
+        Err(_) => {
+            warn!("permissions: callback registry mutex poisoned");
+            return;
+        }
+    }
+    // Push neutral entry to the engine queue.
+    match engine_queue.lock() {
+        Ok(mut q) => q.push_back(neutral),
+        Err(_) => {
+            warn!("permissions: engine queue mutex poisoned");
+        }
+    }
+}
+
 /// Shared queue between the CEF IO/UI callbacks and the UI thread.
+///
+/// **Phase 8a (#88)**: this CEF-internal queue is kept for backward
+/// compatibility with the `drain_with_defer` shutdown path. The apps
+/// layer now uses the neutral `buffr_engine::PermissionsQueue` via the
+/// `BrowserEngine::permissions_queue()` trait method.
 pub type PermissionsQueue = Arc<Mutex<VecDeque<PendingPermission>>>;
 
 /// Build a fresh empty permissions queue.
@@ -244,6 +300,24 @@ pub fn drain_with_defer(queue: &PermissionsQueue, store: &Permissions) {
     for p in drained {
         if let Err(err) = p.resolve(PromptOutcome::Defer, store) {
             warn!(error = %err, "permissions: defer dispatch on drain failed");
+        }
+    }
+}
+
+/// Drain the [`CefCallbackRegistry`] at shutdown, firing `Defer` for
+/// each pending callback so the renderer doesn't wedge.
+///
+/// Phase 8a (#88): replaces `drain_with_defer` for the new registry-based
+/// path. After migration, the old `PermissionsQueue` shutdown drain in
+/// `main.rs` delegates here.
+pub fn drain_registry_with_defer(registry: &CefCallbackRegistry, store: &Permissions) {
+    let drained: Vec<PendingPermission> = match registry.lock() {
+        Ok(mut reg) => reg.drain().map(|(_, v)| v).collect(),
+        Err(_) => return,
+    };
+    for p in drained {
+        if let Err(err) = p.resolve(PromptOutcome::Defer, store) {
+            warn!(error = %err, "permissions: defer dispatch on registry drain failed");
         }
     }
 }

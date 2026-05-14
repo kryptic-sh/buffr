@@ -16,12 +16,14 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as B64Engine;
 use serde_json::Value;
 
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
+use buffr_engine::{PermissionsQueue, SharedOsrFrame, SharedOsrViewState};
+use buffr_permissions::Capability;
 
 use crate::cdp::{
     CdpCommand, CdpMessage, DispatchKeyEventParams, DispatchMouseEventParams, NavigateParams,
@@ -96,6 +98,8 @@ pub fn run(
     cmd_rx: Receiver<Command>,
     osr_frame: SharedOsrFrame,
     osr_view: SharedOsrViewState,
+    permissions_queue: PermissionsQueue,
+    perm_session_map: Arc<Mutex<HashMap<String, String>>>,
 ) {
     // Map from CDP message-id → reply sender.
     let mut pending: HashMap<u64, Sender<Result<Value, BlinkError>>> = HashMap::new();
@@ -258,6 +262,8 @@ pub fn run(
                         &mut ws,
                         &osr_frame,
                         &osr_view,
+                        &permissions_queue,
+                        &perm_session_map,
                     );
                 }
             },
@@ -291,6 +297,7 @@ fn send_stop_screencast(ws: &mut WsClient, session_id: &str) {
 
 // ── Message dispatch ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_message(
     msg: CdpMessage,
     pending: &mut HashMap<u64, Sender<Result<Value, BlinkError>>>,
@@ -298,6 +305,8 @@ fn dispatch_message(
     ws: &mut WsClient,
     osr_frame: &SharedOsrFrame,
     _osr_view: &SharedOsrViewState,
+    permissions_queue: &PermissionsQueue,
+    perm_session_map: &Arc<Mutex<HashMap<String, String>>>,
 ) {
     // Command response.
     if let Some(id) = msg.id {
@@ -339,7 +348,84 @@ fn dispatch_message(
                 let _ = ws.send_text(cmd.serialize());
             }
         }
+        "Runtime.bindingCalled" => {
+            // Phase 8a (#88): handle permission binding calls from the JS shim.
+            if let Some(ref params) = msg.params {
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name == "__buffrPermissionRequest" {
+                    let payload = params.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                    handle_permission_binding(
+                        payload,
+                        msg.session_id.as_deref(),
+                        permissions_queue,
+                        perm_session_map,
+                    );
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Handle a `Runtime.bindingCalled` event for `__buffrPermissionRequest`.
+///
+/// Parses the JSON payload from the JS shim, maps the capability string to a
+/// [`Capability`], pushes a neutral [`buffr_engine::permissions::PendingPermission`]
+/// onto the queue, and records the `resolve_id → session_id` mapping so
+/// `resolve_permission` can target the right tab.
+fn handle_permission_binding(
+    payload: &str,
+    session_id: Option<&str>,
+    permissions_queue: &PermissionsQueue,
+    perm_session_map: &Arc<Mutex<HashMap<String, String>>>,
+) {
+    let v: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, payload, "blink-cdp: invalid permission binding payload");
+            return;
+        }
+    };
+
+    let id = match v.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => {
+            tracing::debug!("blink-cdp: permission binding payload missing 'id'");
+            return;
+        }
+    };
+    let cap_str = v.get("capability").and_then(|v| v.as_str()).unwrap_or("");
+    let origin = v
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    let cap: Capability =
+        crate::permissions::capability_from_str(cap_str).unwrap_or(Capability::Other(0));
+
+    tracing::debug!(
+        id,
+        cap_str,
+        origin,
+        "blink-cdp: permission request from JS shim"
+    );
+
+    // Record resolve_id → session_id.
+    if let Some(sess) = session_id
+        && let Ok(mut map) = perm_session_map.lock()
+    {
+        map.insert(id.clone(), sess.to_owned());
+    }
+
+    // Push neutral entry to the queue.
+    let perm = buffr_engine::permissions::PendingPermission {
+        origin,
+        capabilities: vec![cap],
+        resolve_id: Some(id),
+    };
+    if let Ok(mut q) = permissions_queue.lock() {
+        q.push_back(perm);
     }
 }
 

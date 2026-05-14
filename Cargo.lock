@@ -505,6 +505,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "buffr-engine",
+ "buffr-permissions",
  "image",
  "open",
  "serde",
@@ -641,6 +642,7 @@ name = "buffr-engine"
 version = "0.1.0"
 dependencies = [
  "buffr-modal",
+ "buffr-permissions",
  "serde",
  "thiserror 2.0.18",
  "tracing",

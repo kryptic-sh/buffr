@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use buffr_engine::{
     BrowserEngine, EngineError, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState,
-    SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    PermissionsQueue, PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
 };
 use serde_json::Value;
 
@@ -156,6 +156,13 @@ pub struct BlinkCdpEngine {
     _worker: JoinHandle<()>,
     /// Handle to the chromium subprocess.  Killed in `close_all_browsers`.
     subprocess: Arc<Mutex<Option<std::process::Child>>>,
+    /// Neutral permissions queue — Phase 8a (#88). The worker pushes
+    /// entries when the JS shim fires a `Runtime.bindingCalled` event for
+    /// `__buffrPermissionRequest`. The UI thread drains via the trait.
+    permissions_queue: PermissionsQueue,
+    /// Maps `resolve_id → session_id` so `resolve_permission` can evaluate
+    /// `__buffrPermissionResolve` on the correct CDP session.
+    perm_session_map: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl BlinkCdpEngine {
@@ -191,13 +198,29 @@ impl BlinkCdpEngine {
         let osr_frame = Arc::new(Mutex::new(OsrFrame::new(1280, 800)));
         let osr_view = Arc::new(OsrViewState::new());
 
+        // Permissions queue and session map (Phase 8a, #88).
+        let permissions_queue = buffr_engine::permissions::new_queue();
+        let perm_session_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+
         // Spawn worker thread.
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(256);
         let worker_frame = Arc::clone(&osr_frame);
         let worker_view = Arc::clone(&osr_view);
+        let worker_perm_queue = Arc::clone(&permissions_queue);
+        let worker_perm_session = Arc::clone(&perm_session_map);
         let worker = std::thread::Builder::new()
             .name("blink-cdp-worker".to_owned())
-            .spawn(move || run(ws, cmd_rx, worker_frame, worker_view))
+            .spawn(move || {
+                run(
+                    ws,
+                    cmd_rx,
+                    worker_frame,
+                    worker_view,
+                    worker_perm_queue,
+                    worker_perm_session,
+                )
+            })
             .map_err(BlinkError::SpawnFailed)?;
 
         Ok(Self {
@@ -207,6 +230,8 @@ impl BlinkCdpEngine {
             osr_view,
             _worker: worker,
             subprocess: Arc::new(Mutex::new(Some(child))),
+            permissions_queue,
+            perm_session_map,
         })
     }
 
@@ -353,6 +378,23 @@ impl BlinkCdpEngine {
                 device_scale_factor: 1.0,
                 mobile: false,
             },
+        );
+
+        // Register the permission binding so the JS shim can post requests
+        // (Phase 8a, #88). `Runtime.addBinding` makes `window.__buffrPermissionRequest`
+        // available in the page's JS context.
+        let _ = self.session_cmd(
+            &session_id,
+            "Runtime.addBinding",
+            serde_json::json!({ "name": "__buffrPermissionRequest" }),
+        );
+
+        // Inject the permission shim for all future documents on this session.
+        let shim_js = crate::permissions::permission_shim_js();
+        let _ = self.session_cmd(
+            &session_id,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": shim_js }),
         );
 
         let mut state = self.state.lock().unwrap();
@@ -981,6 +1023,50 @@ impl BrowserEngine for BlinkCdpEngine {
         _delta_y: i32,
         _modifiers: u32,
     ) {
+    }
+
+    // ── Permissions (Phase 8a, #88) ───────────────────────────────────────────
+
+    fn permissions_queue(&self) -> PermissionsQueue {
+        Arc::clone(&self.permissions_queue)
+    }
+
+    fn resolve_permission(&self, resolve_id: Option<&str>, outcome: PromptOutcome) {
+        let Some(id) = resolve_id else {
+            tracing::debug!("blink-cdp: resolve_permission called with no id (no-op)");
+            return;
+        };
+        let session_id = match self.perm_session_map.lock() {
+            Ok(mut map) => map.remove(id),
+            Err(_) => {
+                tracing::warn!(id, "blink-cdp: perm_session_map poisoned");
+                return;
+            }
+        };
+        let Some(session_id) = session_id else {
+            tracing::debug!(
+                id,
+                "blink-cdp: resolve_id not in session map (already resolved?)"
+            );
+            return;
+        };
+        let outcome_str = match outcome {
+            PromptOutcome::Allow { .. } => "granted",
+            PromptOutcome::Deny { .. } | PromptOutcome::Defer => "denied",
+        };
+        let expr = format!(
+            "if (window.__buffrPermissionResolve) {{ window.__buffrPermissionResolve({id:?}, {outcome_str:?}); }}"
+        );
+        tracing::debug!(
+            id,
+            outcome_str,
+            "blink-cdp: resolve_permission → Runtime.evaluate"
+        );
+        let _ = self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": expr }),
+        );
     }
 
     // ── Hint mode (Phase 6b, #95) ─────────────────────────────────────────────

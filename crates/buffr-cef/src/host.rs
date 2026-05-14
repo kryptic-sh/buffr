@@ -329,6 +329,14 @@ pub struct BrowserHost {
     /// `Option<&mut RequestContext>` and `create_browser` is called via
     /// `&self` (the `BrowserEngine` trait does not grant `&mut self`).
     request_context: Mutex<Option<cef::RequestContext>>,
+    /// Neutral permissions queue (Phase 8a, #88). Mirrors the CEF-internal
+    /// `permissions_queue` entries in backend-neutral form so the apps layer
+    /// can use `BrowserEngine::permissions_queue()` without touching CEF types.
+    neutral_permissions_queue: buffr_engine::PermissionsQueue,
+    /// Registry mapping `resolve_id → CefPendingPermission` (Phase 8a, #88).
+    /// Written on the CEF IO thread when a permission request arrives;
+    /// read + drained by `BrowserEngine::resolve_permission` on the UI thread.
+    cef_callback_registry: crate::permissions::CefCallbackRegistry,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -543,6 +551,8 @@ impl BrowserHost {
             video_active: Arc::new(AtomicBool::new(false)),
             context_menu_sink: new_context_menu_sink(),
             request_context: Mutex::new(request_context),
+            neutral_permissions_queue: buffr_engine::permissions::new_queue(),
+            cef_callback_registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -1302,6 +1312,8 @@ impl BrowserHost {
             self.zoom.clone(),
             self.permissions.clone(),
             self.permissions_queue.clone(),
+            self.neutral_permissions_queue.clone(),
+            self.cef_callback_registry.clone(),
             self.find_sink.clone(),
             self.hint_sink.clone(),
             self.edit_sink.clone(),
@@ -3397,6 +3409,36 @@ impl buffr_engine::BrowserEngine for BrowserHost {
 
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         self.dispatch(action)
+    }
+
+    // ── Permissions (Phase 8a, #88) ───────────────────────────────────────────
+
+    fn permissions_queue(&self) -> buffr_engine::PermissionsQueue {
+        self.neutral_permissions_queue.clone()
+    }
+
+    fn resolve_permission(&self, resolve_id: Option<&str>, outcome: buffr_engine::PromptOutcome) {
+        let Some(id) = resolve_id else {
+            tracing::debug!("permissions: resolve_permission called with no resolve_id (no-op)");
+            return;
+        };
+        let pending = match self.cef_callback_registry.lock() {
+            Ok(mut reg) => reg.remove(id),
+            Err(_) => {
+                tracing::warn!(id, "permissions: callback registry mutex poisoned");
+                return;
+            }
+        };
+        let Some(pending) = pending else {
+            tracing::debug!(
+                id,
+                "permissions: resolve_id not found in registry (already resolved?)"
+            );
+            return;
+        };
+        if let Err(err) = pending.resolve(outcome, &self.permissions) {
+            tracing::warn!(error = %err, id, "permissions: resolve failed");
+        }
     }
 }
 

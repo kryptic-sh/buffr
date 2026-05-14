@@ -9,6 +9,7 @@ description = "Headless Chromium CDP backend for buffr-engine (Phase 4 spike)"
 
 [dependencies]
 buffr-engine = { version = "0.1", path = "../buffr-engine" }
+buffr-permissions = "0.1"
 tungstenite = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
