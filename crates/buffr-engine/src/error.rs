@@ -30,3 +30,53 @@ pub enum EngineError {
     #[error("not implemented: {method}")]
     Unimplemented { method: &'static str },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn engine_error_send_sync() {
+        assert_send_sync::<EngineError>();
+    }
+
+    #[test]
+    fn engine_error_unimplemented_display_includes_method() {
+        let err = EngineError::Unimplemented { method: "zoom_in" };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zoom_in"),
+            "Display should include method name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn engine_error_other_carries_string() {
+        let err = EngineError::Other("channel full".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("channel full"), "got: {msg}");
+    }
+
+    #[test]
+    fn engine_error_tab_not_found_includes_id() {
+        let err = EngineError::TabNotFound(crate::TabId(42));
+        let msg = err.to_string();
+        assert!(msg.contains("42"), "got: {msg}");
+    }
+
+    #[test]
+    fn engine_error_init_failed_carries_message() {
+        let err = EngineError::InitFailed("bad flags".into());
+        let msg = err.to_string();
+        assert!(msg.contains("bad flags"), "got: {msg}");
+    }
+
+    #[test]
+    fn engine_error_invalid_url_carries_url() {
+        let err = EngineError::InvalidUrl("not-a-url".into());
+        let msg = err.to_string();
+        assert!(msg.contains("not-a-url"), "got: {msg}");
+    }
+}

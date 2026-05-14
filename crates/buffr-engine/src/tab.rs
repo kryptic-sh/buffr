@@ -47,6 +47,79 @@ pub struct TabSummary {
     pub private: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn tab_id_display() {
+        assert_eq!(format!("{}", TabId(42)), "tab#42");
+        assert_eq!(format!("{}", TabId(0)), "tab#0");
+    }
+
+    #[test]
+    fn tab_id_ordering() {
+        assert!(TabId(1) < TabId(2));
+        assert!(TabId(100) > TabId(99));
+        assert_eq!(TabId(5), TabId(5));
+    }
+
+    #[test]
+    fn tab_id_hash_eq() {
+        let mut set = HashSet::new();
+        set.insert(TabId(10));
+        assert!(set.contains(&TabId(10)));
+        assert!(!set.contains(&TabId(11)));
+    }
+
+    #[test]
+    fn tab_id_clone_copy() {
+        let a = TabId(7);
+        let b = a; // Copy
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn tab_options_default_safe() {
+        let opts = TabOptions::default();
+        assert!(!opts.background);
+        assert!(opts.insert_idx.is_none());
+        assert!(!opts.pinned);
+    }
+
+    #[test]
+    fn tab_session_default_find_query_is_none() {
+        let sess = TabSession::default();
+        assert!(sess.find_query.is_none());
+    }
+
+    #[test]
+    fn tab_summary_fields_accessible() {
+        let summary = TabSummary {
+            id: TabId(1),
+            browser_id: 42,
+            title: "Test".to_string(),
+            url: "https://example.com".to_string(),
+            progress: 0.5,
+            is_loading: true,
+            pinned: false,
+            private: false,
+        };
+        assert_eq!(summary.id, TabId(1));
+        assert_eq!(summary.browser_id, 42);
+        assert_eq!(summary.title, "Test");
+        assert_eq!(summary.url, "https://example.com");
+        assert!((summary.progress - 0.5).abs() < f32::EPSILON);
+        assert!(summary.is_loading);
+        assert!(!summary.pinned);
+        assert!(!summary.private);
+    }
+}
+
 /// A popup browser window that has been created and is ready to render.
 ///
 /// Emitted by the engine's lifespan handler when a popup browser
