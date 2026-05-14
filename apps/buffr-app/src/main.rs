@@ -2921,6 +2921,17 @@ impl AppState {
                 self.mark_session_dirty();
                 self.request_redraw();
             }
+            // DevTools: route through the active engine's trait surface so
+            // blink-cdp opens the Chromium remote-debug inspector URL in the
+            // system browser rather than falling into host.dispatch (CEF only).
+            buffr_modal::PageAction::OpenDevTools => {
+                if let Some(engine) = self.engines.get(&self.active_engine)
+                    && let Some(tab) = engine.active_tab().map(|s| s.id)
+                    && let Err(err) = engine.open_devtools(tab)
+                {
+                    tracing::warn!(error = %err, "open_devtools failed");
+                }
+            }
             // Zoom actions: route through the active engine's trait
             // surface so non-CEF backends (blink-cdp etc.) receive
             // them. CEF's BrowserHost implements the same trait
