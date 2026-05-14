@@ -8,6 +8,37 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-15
+
+### Fixed
+
+- **blink-cdp audit Phase 10 — 23 bugs fixed** (P0-1 through P2-8). All
+  blink-cdp backend behaviors that should match CEF now do. Highlights:
+  - Address bar updates after in-page navigation (was frozen)
+  - History back/forward, reload, hard reload, stop, and all scroll keybinds
+    work (were silent no-ops)
+  - Permissions/find/context-menu shims fire on the initial page load (were
+    registered too late)
+  - Download notices carry the right filename and path
+  - `view-source:` no longer freezes the UI thread
+  - Permission prompts show readable origin for `data:` URLs
+  - `getUserMedia` requesting both audio + video now prompts for both
+  - Tab strip loading indicator reflects real loading state
+  - `open_tab_at` honors the insert index
+  - Graceful engine shutdown via Drop impl (subprocess cleanup)
+
+### Changed
+
+- `BackendOpenOptions.find_sink` field added (buffr-engine 0.1.1).
+- `BlinkCdpEngine::open_tab_internal` uses `about:blank` then explicit
+  `Page.navigate` so all shims are registered before page content loads.
+- Live tab title via `Target.targetInfoChanged` subscription.
+
+### Dependencies
+
+- `buffr-engine` 0.1.0 → 0.1.1
+- `buffr-blink-cdp` 0.1.1 → 0.1.2
+
 ## [0.9.1] - 2026-05-15
 
 ### Changed
@@ -1219,7 +1250,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.10.0
 [0.9.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.1
