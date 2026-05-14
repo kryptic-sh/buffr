@@ -2869,6 +2869,58 @@ impl AppState {
                 self.refresh_title();
                 self.request_redraw();
             }
+            A::Engine(id) => {
+                // Rebind the active tab to a different engine — same URL,
+                // new engine. Mirrors the cross-engine nav pattern:
+                // snapshot URL → open on target → close on source → switch.
+                let target_engine_id = buffr_engine::EngineId::new(id);
+                if !self.engines.contains_key(&target_engine_id) {
+                    tracing::warn!(id = %id, ":engine — unknown engine id");
+                    return;
+                }
+                if target_engine_id == self.active_engine {
+                    tracing::debug!(id = %id, ":engine — already on this engine, no-op");
+                    return;
+                }
+                // Snapshot the current URL before we touch anything.
+                let url = host.active_tab_live_url();
+                let url = if url.is_empty() {
+                    self.homepage.clone()
+                } else {
+                    url
+                };
+                // Open on the target engine.
+                let Some(target_host) = self.engines.get(&target_engine_id) else {
+                    tracing::warn!(id = %id, ":engine — target engine vanished");
+                    return;
+                };
+                match buffr_engine::BrowserEngine::open_tab(target_host.as_ref(), &url) {
+                    Ok(_) => {
+                        tracing::debug!(target = %target_engine_id, url = %url, ":engine swap: opened on target");
+                    }
+                    Err(err) => {
+                        tracing::warn!(target = %target_engine_id, error = %err, ":engine swap: open_tab on target failed");
+                        return;
+                    }
+                }
+                // Close the active tab on the source engine.
+                // `host` borrow is already active; re-acquire through engines map
+                // since we released it above.
+                let source_host = self
+                    .engines
+                    .get(&self.active_engine)
+                    .expect("source engine still registered")
+                    .clone();
+                if let Err(err) = buffr_engine::BrowserEngine::close_active(source_host.as_ref()) {
+                    tracing::warn!(error = %err, ":engine swap: close_active on source failed (tab may linger)");
+                }
+                // Switch to the target engine.
+                self.active_engine = target_engine_id;
+                self.refresh_tab_strip();
+                self.mark_chrome_dirty();
+                self.mark_session_dirty();
+                self.request_redraw();
+            }
             _ => host.dispatch(action),
         }
     }
@@ -3110,6 +3162,15 @@ impl AppState {
         let live_ids: std::collections::HashSet<i32> =
             summaries.iter().map(|s| s.browser_id).collect();
         self.favicons.retain(|id, _| live_ids.contains(id));
+        // Determine the engine badge colour for the currently-active engine.
+        // All tabs in the strip belong to `active_engine`; the badge is the
+        // same colour on every tab. `None` when there's only one engine or
+        // when `active_engine` is the primary `"cef"` engine.
+        let active_engine_id = self.active_engine.clone();
+        let engine_badge = self
+            .engine_router
+            .as_ref()
+            .and_then(|r| r.badge_color_for(&active_engine_id));
         let mut ids = Vec::with_capacity(summaries.len());
         let tabs = summaries
             .into_iter()
@@ -3122,6 +3183,7 @@ impl AppState {
                     pinned: t.pinned,
                     private: t.private,
                     favicon,
+                    engine_badge,
                 }
             })
             .collect();
@@ -5056,6 +5118,9 @@ impl AppState {
             }
             Command::DevTools => {
                 self.dispatch_action(&buffr_modal::PageAction::OpenDevTools);
+            }
+            Command::Engine(id) => {
+                self.dispatch_action(&buffr_modal::PageAction::Engine(id.clone()));
             }
             Command::Unknown(s) => {
                 tracing::warn!(input = %s, "cmdline: unknown command");
