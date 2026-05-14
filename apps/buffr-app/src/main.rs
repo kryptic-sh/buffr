@@ -7988,6 +7988,47 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
                 self.refresh_title();
             }
+            // ── IME composition (#86) ─────────────────────────────────────────
+            //
+            // Route winit IME lifecycle events through the active engine's
+            // neutral IME trait methods:
+            //
+            //   Preedit("")  with cursor None → cancel (empty preedit = dismiss)
+            //   Preedit(s)   with cursor      → set_composition
+            //   Commit(s)                     → commit
+            //   Enabled / Disabled            → cancel any in-progress preedit
+            //
+            // Both the CEF backend (via `BrowserHost::ime_*`) and the blink-cdp
+            // backend (via CDP `Input.imeSetComposition` / `Input.insertText`)
+            // implement these methods; the default no-op handles future backends.
+            WindowEvent::Ime(ime_event) => {
+                use winit::event::Ime;
+                if let Some(engine) = self.active_engine_dyn() {
+                    match ime_event {
+                        Ime::Enabled => {
+                            // IME activated — cancel any stale preedit from a
+                            // previous session so the engine starts clean.
+                            engine.ime_cancel();
+                        }
+                        Ime::Disabled => {
+                            // IME deactivated — cancel any in-progress composition.
+                            engine.ime_cancel();
+                        }
+                        Ime::Preedit(text, cursor) => {
+                            if text.is_empty() {
+                                // Empty preedit signals the OS is cancelling the
+                                // composition (e.g. Esc pressed in the IME window).
+                                engine.ime_cancel();
+                            } else {
+                                engine.ime_set_composition(&text, cursor);
+                            }
+                        }
+                        Ime::Commit(text) => {
+                            engine.ime_commit(&text);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

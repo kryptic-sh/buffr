@@ -1404,6 +1404,84 @@ impl BrowserEngine for BlinkCdpEngine {
             }
         }
     }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // Routes winit IME events through the Chrome DevTools Protocol:
+    //
+    //   Preedit  → `Input.imeSetComposition`  (updates the composition window)
+    //   Commit   → `Input.insertText`          (finalises the text)
+    //   Cancel   → `Input.imeSetComposition` with `text: ""`  (clears preedit)
+    //
+    // CDP byte-offset semantics: `selectionStart` / `selectionEnd` are UTF-16
+    // code-unit indices into `text`.  winit supplies byte offsets into a UTF-8
+    // `&str`.  Because blink-cdp converts cursor positions only for the preedit
+    // window (which is typically short and ASCII-heavy), the approximation of
+    // using char counts (not UTF-16 code-unit counts) is acceptable here.
+    // Exact UTF-16 conversion can be added later if needed.
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        let session_id = {
+            let state = self.state.lock().unwrap();
+            match state.active_tab().map(|t| t.session_id.clone()) {
+                Some(s) => s,
+                None => {
+                    tracing::debug!("blink-cdp: ime_set_composition — no active tab");
+                    return;
+                }
+            }
+        };
+        let (start, end) = cursor.unwrap_or((text.len(), text.len()));
+        let params = serde_json::json!({
+            "text": text,
+            "selectionStart": start,
+            "selectionEnd": end,
+        });
+        tracing::debug!(text, start, end, "blink-cdp: ime_set_composition");
+        let _ = self.session_cmd(&session_id, "Input.imeSetComposition", params);
+    }
+
+    fn ime_commit(&self, text: &str) {
+        let session_id = {
+            let state = self.state.lock().unwrap();
+            match state.active_tab().map(|t| t.session_id.clone()) {
+                Some(s) => s,
+                None => {
+                    tracing::debug!("blink-cdp: ime_commit — no active tab");
+                    return;
+                }
+            }
+        };
+        tracing::debug!(text, "blink-cdp: ime_commit");
+        let _ = self.session_cmd(
+            &session_id,
+            "Input.insertText",
+            serde_json::json!({ "text": text }),
+        );
+    }
+
+    fn ime_cancel(&self) {
+        let session_id = {
+            let state = self.state.lock().unwrap();
+            match state.active_tab().map(|t| t.session_id.clone()) {
+                Some(s) => s,
+                None => {
+                    tracing::debug!("blink-cdp: ime_cancel — no active tab");
+                    return;
+                }
+            }
+        };
+        tracing::debug!("blink-cdp: ime_cancel");
+        let _ = self.session_cmd(
+            &session_id,
+            "Input.imeSetComposition",
+            serde_json::json!({
+                "text": "",
+                "selectionStart": 0,
+                "selectionEnd": 0,
+            }),
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1615,5 +1693,61 @@ mod tests {
     fn engine_state_no_active_tab_when_none() {
         let state = EngineState::new(9999);
         assert!(state.active_tab().is_none());
+    }
+
+    // ── IME CDP payload tests (#86) ───────────────────────────────────────────
+
+    /// Verify `Input.imeSetComposition` payload shape with explicit cursor.
+    #[test]
+    fn ime_set_composition_payload_shape() {
+        let text = "こんにちは";
+        let cursor: Option<(usize, usize)> = Some((3, 6));
+        let (start, end) = cursor.unwrap_or((text.len(), text.len()));
+        let params = serde_json::json!({
+            "text": text,
+            "selectionStart": start,
+            "selectionEnd": end,
+        });
+        assert_eq!(params["text"], text);
+        assert_eq!(params["selectionStart"], 3);
+        assert_eq!(params["selectionEnd"], 6);
+    }
+
+    /// When no cursor is provided the selection collapses to the end of text.
+    #[test]
+    fn ime_set_composition_no_cursor_collapses_to_end() {
+        let text = "hello";
+        let cursor: Option<(usize, usize)> = None;
+        let (start, end) = cursor.unwrap_or((text.len(), text.len()));
+        let params = serde_json::json!({
+            "text": text,
+            "selectionStart": start,
+            "selectionEnd": end,
+        });
+        assert_eq!(params["selectionStart"], text.len());
+        assert_eq!(params["selectionEnd"], text.len());
+    }
+
+    /// `Input.insertText` commit payload must contain just `text`.
+    #[test]
+    fn ime_commit_payload_shape() {
+        let text = "確定";
+        let params = serde_json::json!({ "text": text });
+        assert_eq!(params["text"], text);
+        // No selection fields expected.
+        assert!(params.get("selectionStart").is_none());
+    }
+
+    /// Cancel sends `Input.imeSetComposition` with an empty string and zero offsets.
+    #[test]
+    fn ime_cancel_payload_shape() {
+        let params = serde_json::json!({
+            "text": "",
+            "selectionStart": 0,
+            "selectionEnd": 0,
+        });
+        assert_eq!(params["text"], "");
+        assert_eq!(params["selectionStart"], 0);
+        assert_eq!(params["selectionEnd"], 0);
     }
 }

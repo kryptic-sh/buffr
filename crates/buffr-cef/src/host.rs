@@ -2577,6 +2577,69 @@ impl BrowserHost {
         });
     }
 
+    // ── IME composition (#86) ─────────────────────────────────────────────────
+    //
+    // Thin wrappers around CEF's `BrowserHost` IME methods. The cef-rs bindings
+    // expose:
+    //   - `BrowserHost::ime_set_composition(text, underlines, replacement_range,
+    //       selection_range)` — sets the preedit string.
+    //   - `BrowserHost::ime_commit_text(text, replacement_range, relative_cursor_pos)`
+    //     — commits text directly.
+    //   - `BrowserHost::ime_cancel_composition()` — cancels composition.
+    //
+    // `underlines` and replacement ranges are left empty / None here; the OS IME
+    // framework has already decided the underline styling and we have no
+    // per-character metadata from winit.
+
+    /// Update the active browser's IME preedit string.
+    ///
+    /// `cursor` is `(start, end)` as byte offsets within `text` for CEF's
+    /// `selection_range`.  `None` collapses the selection to the end of `text`.
+    pub fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        self.with_active(|t| {
+            let Some(host) = t.browser.host() else {
+                warn!("ime_set_composition: browser.host() returned None");
+                return;
+            };
+            let cef_text = cef::CefString::from(text);
+            let (sel_from, sel_to) =
+                cursor
+                    .map(|(s, e)| (s as u32, e as u32))
+                    .unwrap_or_else(|| {
+                        let end = text.len() as u32;
+                        (end, end)
+                    });
+            let selection_range = cef::Range {
+                from: sel_from,
+                to: sel_to,
+            };
+            host.ime_set_composition(Some(&cef_text), Some(&[]), None, Some(&selection_range));
+        });
+    }
+
+    /// Commit `text` directly to the active browser's focused editable.
+    pub fn ime_commit(&self, text: &str) {
+        self.with_active(|t| {
+            let Some(host) = t.browser.host() else {
+                warn!("ime_commit: browser.host() returned None");
+                return;
+            };
+            let cef_text = cef::CefString::from(text);
+            host.ime_commit_text(Some(&cef_text), None, 0);
+        });
+    }
+
+    /// Cancel any in-progress IME composition on the active browser.
+    pub fn ime_cancel(&self) {
+        self.with_active(|t| {
+            let Some(host) = t.browser.host() else {
+                warn!("ime_cancel: browser.host() returned None");
+                return;
+            };
+            host.ime_cancel_composition();
+        });
+    }
+
     /// Fire the JS media-activity poll against the active tab's main frame.
     ///
     /// The poll script (see [`buffr_core::scripts::MEDIA_PROBE_POLL_JS`]) reads all
@@ -3409,6 +3472,20 @@ impl buffr_engine::BrowserEngine for BrowserHost {
 
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         self.dispatch(action)
+    }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        self.ime_set_composition(text, cursor)
+    }
+
+    fn ime_commit(&self, text: &str) {
+        self.ime_commit(text)
+    }
+
+    fn ime_cancel(&self) {
+        self.ime_cancel()
     }
 
     // ── Permissions (Phase 8a, #88) ───────────────────────────────────────────
