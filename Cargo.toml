@@ -13,3 +13,4 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+buffr-modal = "0.1"

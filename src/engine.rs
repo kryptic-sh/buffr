@@ -664,6 +664,53 @@ pub trait BrowserEngine: Send + Sync {
     fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
         Vec::new()
     }
+
+    // ── Loading state / navigation capability (Phase 6f, #95) ───────────────
+
+    /// `true` when the active tab is currently loading a document.
+    ///
+    /// CEF overrides this with an atomic set by `on_load_start` / `on_paint`
+    /// for tighter accuracy. The default impl delegates to `active_tab()` so
+    /// non-CEF backends get a reasonable answer without overriding.
+    fn is_loading(&self) -> bool {
+        self.active_tab().is_some_and(|t| t.is_loading)
+    }
+
+    /// `true` when the active tab can navigate backwards.
+    ///
+    /// Used to drive the enabled state of back-navigation UI (e.g.
+    /// context-menu `HistoryBack { enabled }`).
+    ///
+    /// Default: `true` (conservative — shows the item as enabled; backends
+    /// that track history accurately override this). CEF overrides via
+    /// `CefBrowser::CanGoBack`.
+    fn can_go_back(&self) -> bool {
+        true
+    }
+
+    /// `true` when the active tab can navigate forwards.
+    ///
+    /// Default: `true` (same conservative default as [`Self::can_go_back`]).
+    fn can_go_forward(&self) -> bool {
+        true
+    }
+
+    // ── Action dispatch (Phase 6f, #95) ──────────────────────────────────────
+    //
+    // Forward a [`buffr_modal::PageAction`] to the engine.
+    //
+    // CEF's `BrowserHost::dispatch` handles the full action surface.
+    // Non-CEF backends override only the arms they support; the default
+    // no-op means unhandled actions are silently swallowed (matching the
+    // prior behaviour when the CEF-only path was gated by a downcast).
+
+    /// Dispatch `action` to the engine.
+    ///
+    /// Default: debug-log and no-op (CEF backend overrides with the full
+    /// `BrowserHost::dispatch` implementation).
+    fn dispatch(&self, _action: &buffr_modal::PageAction) {
+        tracing::debug!("BrowserEngine::dispatch: not implemented by this backend");
+    }
 }
 
 #[cfg(test)]
