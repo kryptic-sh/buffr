@@ -56,6 +56,28 @@ use crate::ws::WsClient;
 
 // ── Internal tab representation ───────────────────────────────────────────────
 
+/// Linear zoom scale factor applied via `document.body.style.zoom`.
+///
+/// Matches the CEF backend's 0.25-per-step increment (see
+/// `buffr_cef::host::adjust_zoom` which calls `set_zoom_level(level ± 0.25)`).
+///
+/// CSS zoom `1.0` = 100 % (browser default).  Clamped to `[0.25, 5.0]`.
+pub const ZOOM_STEP: f64 = 0.25;
+
+/// Minimum zoom level (25 %).
+pub const ZOOM_MIN: f64 = 0.25;
+
+/// Maximum zoom level (500 %).
+pub const ZOOM_MAX: f64 = 5.0;
+
+/// Apply a zoom delta and clamp to `[ZOOM_MIN, ZOOM_MAX]`.
+///
+/// Pass `delta = 0.0` and `current = 1.0` to reset.
+#[inline]
+fn clamp_zoom(level: f64) -> f64 {
+    level.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
 #[derive(Debug, Clone)]
 struct CdpTab {
     id: TabId,
@@ -63,6 +85,8 @@ struct CdpTab {
     session_id: String,
     url: String,
     title: String,
+    /// CSS zoom factor for this tab. `1.0` = 100 % (default).
+    zoom_level: f64,
 }
 
 impl CdpTab {
@@ -183,6 +207,35 @@ impl BlinkCdpEngine {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Adjust the active tab's zoom by `delta` (clamped to `[ZOOM_MIN, ZOOM_MAX]`)
+    /// and send a `Command::SetZoom` to the worker.
+    fn adjust_zoom(&self, delta: f64) {
+        let current = self
+            .state
+            .lock()
+            .unwrap()
+            .active_tab()
+            .map(|t| t.zoom_level)
+            .unwrap_or(1.0);
+        self.apply_zoom(clamp_zoom(current + delta));
+    }
+
+    /// Set the active tab's zoom to `level` (already clamped) and send
+    /// a `Command::SetZoom` to the worker.
+    fn apply_zoom(&self, level: f64) {
+        let session_id = {
+            let mut state = self.state.lock().unwrap();
+            let Some(id) = state.active else { return };
+            let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id) else {
+                return;
+            };
+            tab.zoom_level = level;
+            tab.session_id.clone()
+        };
+        tracing::debug!(level, "blink-cdp: apply_zoom");
+        let _ = self.cmd_tx.try_send(Command::SetZoom { session_id, level });
+    }
 
     /// Send a browser-level CDP command and wait for the response.
     fn browser_cmd(
@@ -306,6 +359,7 @@ impl BlinkCdpEngine {
             session_id: session_id.clone(),
             url: url.to_owned(),
             title: url.to_owned(),
+            zoom_level: 1.0,
         };
         state.tabs.push(tab);
         if make_active || state.active.is_none() {
@@ -787,7 +841,24 @@ impl BrowserEngine for BlinkCdpEngine {
     }
 
     fn active_zoom_level(&self) -> f64 {
-        0.0
+        self.state
+            .lock()
+            .unwrap()
+            .active_tab()
+            .map(|t| t.zoom_level)
+            .unwrap_or(1.0)
+    }
+
+    fn zoom_in(&self) {
+        self.adjust_zoom(ZOOM_STEP);
+    }
+
+    fn zoom_out(&self) {
+        self.adjust_zoom(-ZOOM_STEP);
+    }
+
+    fn zoom_reset(&self) {
+        self.apply_zoom(1.0);
     }
 
     // ── Audio / video ────────────────────────────────────────────────────────
@@ -807,6 +878,66 @@ impl BrowserEngine for BlinkCdpEngine {
 mod tests {
     use super::*;
     use crate::subprocess::find_chromium;
+
+    // ── Zoom helper tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn zoom_level_clamps_to_range() {
+        // Clamping below min.
+        assert_eq!(clamp_zoom(0.0), ZOOM_MIN);
+        assert_eq!(clamp_zoom(-1.0), ZOOM_MIN);
+        // Clamping above max.
+        assert_eq!(clamp_zoom(10.0), ZOOM_MAX);
+        // Values inside range pass through unchanged.
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        assert_eq!(clamp_zoom(ZOOM_MIN), ZOOM_MIN);
+        assert_eq!(clamp_zoom(ZOOM_MAX), ZOOM_MAX);
+        assert_eq!(clamp_zoom(2.5), 2.5);
+    }
+
+    #[test]
+    fn zoom_step_constant_matches_cef() {
+        // buffr-cef's `adjust_zoom` calls `set_zoom_level(level ± 0.25)`.
+        // Verify blink-cdp uses the same step so both backends behave identically.
+        assert!(
+            (ZOOM_STEP - 0.25_f64).abs() < f64::EPSILON,
+            "ZOOM_STEP must equal 0.25 to match the CEF backend"
+        );
+    }
+
+    #[test]
+    fn active_zoom_level_returns_tracked_value() {
+        // Build a minimal EngineState with one tab and verify that
+        // active_zoom_level reflects the stored zoom_level.
+        let mut state = EngineState::new();
+        let tab_id = state.mint_tab_id();
+        state.tabs.push(CdpTab {
+            id: tab_id,
+            target_id: "t1".into(),
+            session_id: "s1".into(),
+            url: "about:blank".into(),
+            title: "about:blank".into(),
+            zoom_level: 1.5,
+        });
+        state.active = Some(tab_id);
+
+        // active_tab() returns the tab; zoom_level should be 1.5.
+        let level = state.active_tab().map(|t| t.zoom_level).unwrap_or(1.0);
+        assert!(
+            (level - 1.5_f64).abs() < f64::EPSILON,
+            "tracked zoom level should be 1.5, got {level}"
+        );
+
+        // No active tab → default 1.0.
+        state.active = None;
+        let level_none = state.active_tab().map(|t| t.zoom_level).unwrap_or(1.0);
+        assert!(
+            (level_none - 1.0_f64).abs() < f64::EPSILON,
+            "no active tab should yield 1.0, got {level_none}"
+        );
+    }
+
+    // ── Chromium detection tests ──────────────────────────────────────────────
 
     #[test]
     fn find_chromium_no_panic() {

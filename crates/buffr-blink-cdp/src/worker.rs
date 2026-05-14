@@ -63,6 +63,10 @@ pub enum Command {
         session_id: String,
         params: DispatchKeyEventParams,
     },
+    /// Apply a CSS zoom level to the given tab session via `Runtime.evaluate`.
+    ///
+    /// `level` is the linear scale factor (e.g. `1.25` = 125 %).
+    SetZoom { session_id: String, level: f64 },
     /// Update which session is "active" for OSR screenshot polling.
     SetActiveSession { session_id: Option<String> },
     /// Shutdown the worker cleanly.
@@ -88,6 +92,8 @@ pub fn run(
     let mut pending: HashMap<u64, Sender<Result<Value, BlinkError>>> = HashMap::new();
     // Current active session for OSR polling.
     let mut active_session: Option<String> = None;
+    // Per-session zoom levels (re-applied after each navigation).
+    let mut session_zoom: HashMap<String, f64> = HashMap::new();
     // Next screenshot capture time.
     let mut next_screenshot = Instant::now() + SCREENSHOT_INTERVAL;
     // A one-shot pending screenshot id so we can route the response.
@@ -162,6 +168,23 @@ pub fn run(
                     let cmd =
                         CdpCommand::new("Input.dispatchKeyEvent", params).with_session(session_id);
                     let _ = ws.send_text(cmd.serialize());
+                }
+                Ok(Command::SetZoom { session_id, level }) => {
+                    // Inject CSS zoom via Runtime.evaluate — simplest cross-page approach.
+                    let expr = format!("document.body.style.zoom = '{level}'");
+                    let cmd = CdpCommand::new(
+                        "Runtime.evaluate",
+                        serde_json::json!({ "expression": expr }),
+                    )
+                    .with_session(session_id.clone());
+                    let _ = ws.send_text(cmd.serialize());
+                    // Track so we can re-apply after Page.frameNavigated.
+                    if (level - 1.0_f64).abs() < f64::EPSILON {
+                        session_zoom.remove(&session_id);
+                    } else {
+                        session_zoom.insert(session_id, level);
+                    }
+                    // Fire-and-forget; no reply expected.
                 }
                 Ok(Command::BrowserCmd { cmd, reply }) => {
                     let id = cmd.id;
@@ -238,6 +261,8 @@ pub fn run(
                             msg,
                             &mut pending,
                             &mut screenshot_pending_id,
+                            &session_zoom,
+                            &mut ws,
                             &osr_frame,
                             &osr_view,
                         );
@@ -252,6 +277,8 @@ fn dispatch_message(
     msg: CdpMessage,
     pending: &mut HashMap<u64, Sender<Result<Value, BlinkError>>>,
     screenshot_pending_id: &mut Option<u64>,
+    session_zoom: &HashMap<String, f64>,
+    ws: &mut WsClient,
     osr_frame: &SharedOsrFrame,
     _osr_view: &SharedOsrViewState,
 ) {
@@ -285,7 +312,21 @@ fn dispatch_message(
     // Unsolicited event.
     if let Some(ref method) = msg.method {
         tracing::debug!(method, "CDP event");
-        // Could handle Page.frameNavigated etc. here in the future.
+
+        // Re-apply zoom after each navigation: a new page resets
+        // `document.body.style.zoom` to its default, so we re-inject.
+        if method == "Page.frameNavigated"
+            && let Some(ref session_id) = msg.session_id
+            && let Some(&level) = session_zoom.get(session_id)
+        {
+            let expr = format!("document.body.style.zoom = '{level}'");
+            let cmd = CdpCommand::new(
+                "Runtime.evaluate",
+                serde_json::json!({ "expression": expr }),
+            )
+            .with_session(session_id.clone());
+            let _ = ws.send_text(cmd.serialize());
+        }
     }
 }
 
