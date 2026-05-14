@@ -2994,6 +2994,81 @@ impl buffr_engine::BrowserEngine for BrowserHost {
     fn any_video_active(&self) -> bool {
         self.any_video_active()
     }
+
+    // ── Popup sinks (Phase 6a, #95) ──────────────────────────────────────────
+
+    fn popup_queue(&self) -> buffr_engine::popup::PopupQueue {
+        self.popup_queue()
+    }
+
+    fn popup_create_sink(&self) -> buffr_engine::popup::PopupCreateSink {
+        self.popup_create_sink()
+    }
+
+    fn popup_close_sink(&self) -> buffr_engine::popup::PopupCloseSink {
+        self.popup_close_sink()
+    }
+
+    fn popup_resize(&self, browser_id: i32, width: u32, height: u32) {
+        self.popup_resize(browser_id, width, height)
+    }
+
+    fn popup_close(&self, browser_id: i32) {
+        self.popup_close(browser_id)
+    }
+
+    fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
+        self.popup_drain_address_changes()
+    }
+
+    fn popup_drain_title_changes(&self) -> Vec<(i32, String)> {
+        self.popup_drain_title_changes()
+    }
+
+    fn popup_history_back(&self, browser_id: i32) {
+        self.popup_history_back(browser_id)
+    }
+
+    fn popup_history_forward(&self, browser_id: i32) {
+        self.popup_history_forward(browser_id)
+    }
+
+    fn popup_osr_focus(&self, browser_id: i32, focused: bool) {
+        self.popup_osr_focus(browser_id, focused)
+    }
+
+    fn popup_osr_key_event(&self, browser_id: i32, event: buffr_engine::NeutralKeyEvent) {
+        self.popup_osr_key_event(browser_id, event)
+    }
+
+    fn popup_osr_mouse_click(
+        &self,
+        browser_id: i32,
+        x: i32,
+        y: i32,
+        button: buffr_engine::MouseButton,
+        mouse_up: bool,
+        click_count: i32,
+        modifiers: u32,
+    ) {
+        self.popup_osr_mouse_click(browser_id, x, y, button, mouse_up, click_count, modifiers)
+    }
+
+    fn popup_osr_mouse_move(&self, browser_id: i32, x: i32, y: i32, modifiers: u32) {
+        self.popup_osr_mouse_move(browser_id, x, y, modifiers)
+    }
+
+    fn popup_osr_mouse_wheel(
+        &self,
+        browser_id: i32,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: u32,
+    ) {
+        self.popup_osr_mouse_wheel(browser_id, x, y, delta_x, delta_y, modifiers)
+    }
 }
 
 #[cfg(test)]
