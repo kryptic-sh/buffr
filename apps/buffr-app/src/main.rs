@@ -129,10 +129,9 @@ fn build_palette(theme: &buffr_config::Theme) -> Palette {
 
 use anyhow::{Context, Result};
 use buffr_cef::{
-    CefBackend, CefEngineSinks, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
-    SharedOsrFrame, SharedOsrViewState, drain_permissions_with_defer, drain_popup_closes,
-    drain_popup_creates, drain_popup_urls, new_permissions_queue, peek_permission_front,
-    permissions_queue_len, pop_permission_front, profile_paths,
+    CefBackend, CefEngineSinks, PermissionsQueue, PromptOutcome, drain_permissions_with_defer,
+    new_permissions_queue, peek_permission_front, permissions_queue_len, pop_permission_front,
+    profile_paths,
 };
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -147,6 +146,10 @@ use buffr_engine::{
     newtab::{
         NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
     },
+};
+use buffr_engine::{
+    PopupCloseSink, PopupCreateSink, SharedOsrFrame, SharedOsrViewState, drain_popup_closes,
+    drain_popup_creates, drain_popup_urls,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
