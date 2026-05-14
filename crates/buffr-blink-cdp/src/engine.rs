@@ -1400,6 +1400,37 @@ impl BrowserEngine for BlinkCdpEngine {
         }
     }
 
+    // ── Media (Phase 8g, #90) ────────────────────────────────────────────────────
+    //
+    // `media_picture_in_picture` is the only media method implemented by the
+    // blink-cdp backend. The `(x, y)` coordinates from the trait (used by CEF
+    // to identify the element under the context-menu cursor) are ignored here:
+    // the IIFE in `pip::pip_toggle_js` selects the most relevant video via its
+    // own heuristic (playing > unmuted > first). This matches the behaviour
+    // expected from a keyboard shortcut rather than a right-click context-menu.
+
+    fn media_picture_in_picture(&self, _x: i32, _y: i32) {
+        let session_id = {
+            let state = self.state.lock().unwrap();
+            match state.active_tab().map(|t| t.session_id.clone()) {
+                Some(s) => s,
+                None => {
+                    tracing::debug!("blink-cdp: media_picture_in_picture — no active tab");
+                    return;
+                }
+            }
+        };
+        tracing::debug!("blink-cdp: media_picture_in_picture → Runtime.evaluate");
+        let _ = self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": crate::pip::pip_toggle_js(),
+                "returnByValue": true,
+            }),
+        );
+    }
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {

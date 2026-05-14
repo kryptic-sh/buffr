@@ -31,6 +31,7 @@ pub mod engine;
 pub mod error;
 pub mod find;
 pub mod permissions;
+pub mod pip;
 pub mod subprocess;
 pub mod worker;
 pub mod ws;
