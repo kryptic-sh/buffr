@@ -1,7 +1,8 @@
 //! CDP wire protocol types and message serialisation.
 //!
-//! Only covers the subset needed for Phase 4: Page.navigate,
-//! Input.dispatch{MouseEvent,KeyEvent}, Page.captureScreenshot,
+//! Only covers the subset needed for Phase 4+: Page.navigate,
+//! Input.dispatch{MouseEvent,KeyEvent}, Page.startScreencast,
+//! Page.stopScreencast, Page.screencastFrameAck,
 //! Page.setDeviceMetricsOverride, Target.createTarget,
 //! Target.attachToTarget, Target.closeTarget.
 
@@ -117,11 +118,24 @@ pub struct NavigateParams<'a> {
     pub url: &'a str,
 }
 
-/// `Page.captureScreenshot` params.
+/// `Page.startScreencast` params.
 #[derive(Serialize)]
-pub struct CaptureScreenshotParams {
+pub struct StartScreencastParams {
     pub format: &'static str,
     pub quality: u8,
+    #[serde(rename = "maxWidth")]
+    pub max_width: u32,
+    #[serde(rename = "maxHeight")]
+    pub max_height: u32,
+    #[serde(rename = "everyNthFrame")]
+    pub every_nth_frame: u32,
+}
+
+/// `Page.screencastFrameAck` params.
+#[derive(Serialize)]
+pub struct ScreencastFrameAckParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: i64,
 }
 
 /// `Page.setDeviceMetricsOverride` params.
