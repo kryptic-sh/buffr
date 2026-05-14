@@ -12,3 +12,4 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }

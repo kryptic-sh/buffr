@@ -4,6 +4,7 @@
 //! this interface; `buffr-cef` is the concrete backend.
 
 pub mod engine;
+pub mod engine_id;
 pub mod error;
 pub mod event;
 pub mod input;
@@ -12,6 +13,7 @@ pub mod tab;
 pub mod types;
 
 pub use engine::BrowserEngine;
+pub use engine_id::EngineId;
 pub use error::EngineError;
 pub use event::EngineEvent;
 pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
