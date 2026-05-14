@@ -26,9 +26,12 @@ use buffr_downloads::Downloads;
 use buffr_history::History;
 use buffr_permissions::Permissions;
 use buffr_zoom::ZoomStore;
+use std::path::Path;
+
 use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
-    WindowInfo, browser_host_create_browser_sync,
+    RequestContextSettings, WindowInfo, browser_host_create_browser_sync,
+    request_context_create_context,
 };
 use tracing::{info, warn};
 
@@ -317,6 +320,15 @@ pub struct BrowserHost {
     /// by `BuffrContextMenuHandler::run_context_menu`. The apps layer
     /// drains these each tick via [`Self::drain_context_menu_requests`].
     context_menu_sink: ContextMenuSink,
+    /// Per-engine CEF request context. `Some` when this engine was opened
+    /// with a `data_dir` — CEF isolates cookies, cache, local-storage,
+    /// and IndexedDB per context. `None` uses CEF's process-global default
+    /// (backward-compatible for single-engine configs with no `data_dir`).
+    ///
+    /// Wrapped in `Mutex` because `browser_host_create_browser_sync` takes
+    /// `Option<&mut RequestContext>` and `create_browser` is called via
+    /// `&self` (the `BrowserEngine` trait does not grant `&mut self`).
+    request_context: Mutex<Option<cef::RequestContext>>,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -408,6 +420,7 @@ impl BrowserHost {
             false,
             None,
             true,
+            None,
         )
     }
 
@@ -433,6 +446,7 @@ impl BrowserHost {
         private: bool,
         counters: Option<Arc<UsageCounters>>,
         show_favicons: bool,
+        data_dir: Option<&Path>,
     ) -> Result<Self, CoreError> {
         // All platforms run OSR. CEF paints into a shared bitmap; the
         // wgpu present layer composites it under buffr's chrome strips.
@@ -447,6 +461,35 @@ impl BrowserHost {
             .height
             .store(osr_h, std::sync::atomic::Ordering::Relaxed);
         let osr_frame = Arc::new(Mutex::new(OsrFrame::new(osr_w, osr_h)));
+
+        // Build a per-engine RequestContext when the caller supplied a
+        // data_dir. CEF will isolate cookies, cache, local-storage, and
+        // IndexedDB under that path — distinct instances will not share
+        // any persistent state even within the same process.
+        let request_context: Option<cef::RequestContext> = if let Some(dir) = data_dir {
+            let cache_path_str = dir.to_string_lossy();
+            let ctx_settings = RequestContextSettings {
+                cache_path: CefString::from(cache_path_str.as_ref()),
+                ..RequestContextSettings::default()
+            };
+            tracing::info!(
+                cache_path = %cache_path_str,
+                "creating per-engine CEF RequestContext"
+            );
+            match request_context_create_context(Some(&ctx_settings), None) {
+                Some(ctx) => Some(ctx),
+                None => {
+                    tracing::warn!(
+                        cache_path = %cache_path_str,
+                        "request_context_create_context returned None; \
+                         falling back to global context"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let popup_queue = new_popup_queue();
         let address_sink: AddressSink = Arc::new(Mutex::new(VecDeque::new()));
@@ -499,6 +542,7 @@ impl BrowserHost {
             audio_queue: new_audio_event_queue(),
             video_active: Arc::new(AtomicBool::new(false)),
             context_menu_sink: new_context_menu_sink(),
+            request_context: Mutex::new(request_context),
         };
         host.open_tab(url)?;
         Ok(host)
@@ -1281,15 +1325,20 @@ impl BrowserHost {
             self.video_active.clone(),
             self.context_menu_sink.clone(),
         );
+        let mut rc_guard = self
+            .request_context
+            .lock()
+            .map_err(|_| CoreError::CreateBrowserFailed)?;
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
             Some(&cef_url),
             Some(&settings),
             None,
-            None,
+            rc_guard.as_mut(),
         )
         .ok_or(CoreError::CreateBrowserFailed)?;
+        drop(rc_guard);
 
         let id = self.mint_id();
         let tab = Tab {
