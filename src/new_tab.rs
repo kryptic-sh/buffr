@@ -25,27 +25,12 @@ use cef::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// The URL opened when the user presses `t` (TabNew).
-pub const NEW_TAB_URL: &str = "buffr://new";
-
-/// The URL for the engine-routing settings scaffold.
-pub const SETTINGS_URL: &str = "buffr://settings";
-
-/// Embedded new-tab HTML template. Contains a `<!--KEYBINDS-->` marker
-/// that the apps layer fills in with rendered keybindings each time
-/// the page is requested, so a config hot-reload is reflected on the
-/// next visit without a binary rebuild.
-pub static NEW_TAB_HTML_TEMPLATE: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/new_tab.html"));
-
-/// The marker the apps layer replaces with rendered keybinding rows.
-pub const NEW_TAB_KEYBINDS_MARKER: &str = "<!--KEYBINDS-->";
-
-/// Marker the apps layer replaces with the static splash wordmark
-/// (per-cell HTML grid). Substituted once per page request alongside
-/// the keybindings; the splash overlay (`#buffr-splash`) is updated
-/// per tick by the host via execute_javascript.
-pub const NEW_TAB_SPLASH_ART_MARKER: &str = "<!--SPLASH-ART-->";
+// Constants moved to buffr-engine::newtab (Phase 6e, #95).
+// Re-exported here so existing `buffr_cef::NEW_TAB_*` imports keep resolving.
+pub use buffr_engine::newtab::{
+    NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
+    SETTINGS_URL,
+};
 
 /// Closure invoked on each `buffr://new` request to produce the page
 /// bytes. Returning a fresh `Vec<u8>` each call lets the apps layer

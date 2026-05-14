@@ -14,7 +14,6 @@
 //!   future phases can hook into context-init events without further
 //!   plumbing.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 // `wrap_app!` / `wrap_browser_process_handler!` expand to references
@@ -86,14 +85,8 @@ pub fn take_scheduled_message_pump_delay_ms() -> Option<i64> {
     (delay >= 0).then_some(delay)
 }
 
-/// Resolved on-disk paths buffr uses for cache + profile data.
-///
-/// Populated by [`crate::profile_paths`].
-#[derive(Debug, Clone)]
-pub struct ProfilePaths {
-    pub cache: PathBuf,
-    pub data: PathBuf,
-}
+// ProfilePaths is defined in buffr-engine::profile and re-exported by buffr-cef.
+use buffr_engine::ProfilePaths;
 
 wrap_app! {
     // buffr's `cef::App` implementation.
