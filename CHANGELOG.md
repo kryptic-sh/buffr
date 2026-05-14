@@ -8,6 +8,32 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-15
+
+### Fixed
+
+- **CEF: per-engine on-disk cache isolation via `RequestContext`** (#79).
+  `BrowserHost::new_with_options` now takes `data_dir: Option<&Path>`. When
+  `Some`, builds a `cef::RequestContextSettings` with `cache_path = data_dir`,
+  calls `cef::request_context_create_context`, and passes the resulting
+  `RequestContext` to `browser_host_create_browser_sync` (the 6th arg slot that
+  was previously `None`). The host holds the context in a `Mutex` so the
+  `&self`-method `create_browser` can lock-borrow `as_mut()`. When `None`, CEF
+  falls back to its global default cache. The apps-layer "advisory only in Phase
+  3" warning is deleted — `data_dir` is now real. Two CEF engine instances
+  configured with distinct `data_dir` no longer share cookies, cache,
+  local-storage, or IndexedDB.
+
+- **blink-cdp: default `--user-data-dir` lives under XDG data, not `/tmp`**
+  (#89). The fallback when an `[[engines.instances]]` block has no explicit
+  `data_dir` was `/tmp/buffr/blink-cdp/<instance-id>`, which was cleared on
+  reboot and did not respect `--private` mode. It now resolves to
+  `<AppState.data_root>/blink-cdp/<instance-id>`. `data_root` is captured at
+  startup from `resolve_paths(cli.private)`, so in normal mode it's the XDG data
+  dir and in `--private` mode it's the per-pid `TempDir` that gets dropped at
+  exit. Private-mode blink-cdp profiles are now torn down with the rest of the
+  temp tree; persistent-mode profiles survive across reboot.
+
 ## [0.8.0] - 2026-05-15
 
 ### Changed
@@ -1077,7 +1103,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.0
 [0.7.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.1
 [0.7.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.0
