@@ -7021,9 +7021,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .as_deref()
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| {
-                            // Default to /tmp/buffr/blink-cdp/<instance-id> so
-                            // multiple instances get separate profiles.
-                            std::path::PathBuf::from("/tmp/buffr/blink-cdp").join(&inst.id)
+                            // Default to <XDG_DATA_HOME>/buffr/blink-cdp/<instance-id> so
+                            // each instance gets its own profile that persists across
+                            // reboot. Falls back to /tmp if the XDG lookup fails.
+                            profile_paths()
+                                .map(|p| p.data.join("blink-cdp").join(&inst.id))
+                                .unwrap_or_else(|_| {
+                                    std::path::PathBuf::from("/tmp/buffr/blink-cdp").join(&inst.id)
+                                })
                         });
                     match buffr_blink_cdp::BlinkCdpEngine::new(&data_dir) {
                         Ok(engine) => {
