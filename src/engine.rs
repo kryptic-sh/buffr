@@ -186,8 +186,24 @@ pub trait BrowserEngine: Send + Sync {
     /// Cancel the active tab's find session.
     fn stop_find(&self);
 
-    /// Active tab's CEF zoom level. 0.0 = default.
+    /// Active tab's zoom level. Returns `1.0` (100 %) when no active tab or
+    /// zoom has not been changed from the default.
     fn active_zoom_level(&self) -> f64;
+
+    /// Increase zoom by one step on the active tab.
+    ///
+    /// Default no-op — backends that support zoom override this.
+    fn zoom_in(&self) {}
+
+    /// Decrease zoom by one step on the active tab.
+    ///
+    /// Default no-op — backends that support zoom override this.
+    fn zoom_out(&self) {}
+
+    /// Reset zoom to 100 % on the active tab.
+    ///
+    /// Default no-op — backends that support zoom override this.
+    fn zoom_reset(&self) {}
 
     // ── Audio / video ────────────────────────────────────────────────────────
 
