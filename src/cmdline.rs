@@ -39,6 +39,9 @@ pub enum Command {
     Bookmark { tags: Vec<String> },
     /// `:devtools` — open DevTools.
     DevTools,
+    /// `:engine <id>` — rebind the active tab to the named engine backend.
+    /// Produces [`Command::Unknown`] when `<id>` is empty.
+    Engine(String),
     /// Anything we can't classify. Carries the trimmed original input
     /// for error display ("E: not an editor command: foo").
     Unknown(String),
@@ -93,6 +96,13 @@ pub fn parse(input: &str) -> Command {
         "bookmark" => Command::Bookmark {
             tags: rest.iter().map(|s| s.to_string()).collect(),
         },
+        "engine" => {
+            if rest.is_empty() {
+                Command::Unknown(trimmed.to_string())
+            } else {
+                Command::Engine(rest[0].to_string())
+            }
+        }
         _ => Command::Unknown(trimmed.to_string()),
     }
 }
@@ -100,8 +110,8 @@ pub fn parse(input: &str) -> Command {
 /// Static list of `:` command names for omnibar-style completion.
 /// Sorted alphabetically so the dropdown looks deterministic.
 pub const COMMAND_NAMES: &[&str] = &[
-    "back", "bookmark", "devtools", "find", "forward", "open", "q", "quit", "reload", "set",
-    "tabnew",
+    "back", "bookmark", "devtools", "engine", "find", "forward", "open", "q", "quit", "reload",
+    "set", "tabnew",
 ];
 
 #[cfg(test)]
@@ -223,5 +233,20 @@ mod tests {
             parse("open   https://x.example"),
             Command::Open("https://x.example".into())
         );
+    }
+
+    #[test]
+    fn parse_engine_command() {
+        assert_eq!(
+            parse("engine blink-cdp"),
+            Command::Engine("blink-cdp".into())
+        );
+        assert_eq!(parse("engine cef"), Command::Engine("cef".into()));
+    }
+
+    #[test]
+    fn engine_command_rejects_empty_id() {
+        // `:engine` without an argument is unknown.
+        assert_eq!(parse("engine"), Command::Unknown("engine".into()));
     }
 }
