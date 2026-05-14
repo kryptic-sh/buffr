@@ -129,11 +129,10 @@ fn build_palette(theme: &buffr_config::Theme) -> Palette {
 
 use anyhow::{Context, Result};
 use buffr_cef::{
-    BuffrApp, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome, SharedOsrFrame,
-    SharedOsrViewState, drain_permissions_with_defer, drain_popup_closes, drain_popup_creates,
-    drain_popup_urls, init_cef_api, new_permissions_queue, peek_permission_front,
-    permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
-    register_buffr_src_handler_factory,
+    CefBackend, CefEngineSinks, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
+    SharedOsrFrame, SharedOsrViewState, drain_permissions_with_defer, drain_popup_closes,
+    drain_popup_creates, drain_popup_urls, new_permissions_queue, peek_permission_front,
+    permissions_queue_len, pop_permission_front, profile_paths,
 };
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -144,7 +143,7 @@ use buffr_core::{
     new_find_sink, new_hint_event_sink, new_inhibitor, peek_download_notice,
 };
 use buffr_engine::{
-    ProfilePaths, TabId,
+    Backend, BackendOpenOptions, NewTabHtmlProvider, ProfilePaths, TabId,
     newtab::{
         NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
     },
@@ -460,6 +459,12 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    // -------- backend construction ------------------------------------
+    //
+    // CefBackend is the only concrete buffr_cef type used in main.
+    // All lifecycle calls go through `Arc<dyn Backend>`.
+    let cef_backend = CefBackend::new();
+
     // -------- macOS framework loader ---------------------------------
     //
     // On macOS the libcef framework is bundled inside the .app and
@@ -469,9 +474,12 @@ fn main() -> Result<()> {
     // in single-binary mode, but in macOS bundles the helper is a
     // separate executable that loads the framework with `helper=true`
     // (path-resolved via `../../..` instead of `../Frameworks`).
+    // `load_library` also calls `init_cef_api` to pin the API version.
     {
         let exe = std::env::current_exe().context("resolving current_exe for CEF library load")?;
-        buffr_cef::load_cef_library(&exe, false).map_err(|e| anyhow::anyhow!(e))?;
+        cef_backend
+            .load_library(&exe, false)
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
 
     // -------- subprocess dispatch (single-binary mode) ----------------
@@ -481,15 +489,16 @@ fn main() -> Result<()> {
     // before parsing the user-facing CLI. `cef::execute_process`
     // returns >= 0 inside a child process and we exit with that code.
     //
-    // `init_cef_api` MUST run before any other CEF call: cef-rs 147
-    // wraps libcef's API-version negotiation, and skipping it triggers
-    // `CefApp_0_CToCpp called with invalid version -1` the moment a
-    // wrapped trait object (our `BuffrApp`) is handed to CEF.
+    // `init_cef_api` already ran inside `load_library` above; the
+    // subprocess call site also calls it internally for safety.
     let is_subprocess = std::env::args().any(|a| a.starts_with("--type="));
     if is_subprocess {
-        let exit_code = buffr_cef::execute_process_for_subprocess();
+        let exit_code = cef_backend.execute_subprocess();
         std::process::exit(exit_code.max(0));
     }
+
+    // Wrap in Arc<dyn Backend> now that subprocess is handled.
+    let backend: Arc<dyn Backend> = Arc::new(cef_backend);
 
     let cli = Cli::parse();
 
@@ -573,7 +582,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    init_cef_api();
+    // init_cef_api already called inside backend.load_library above.
 
     info!("buffr v{} starting", env!("CARGO_PKG_VERSION"));
     info!("buffr-core v{}", buffr_core::version());
@@ -808,7 +817,7 @@ fn main() -> Result<()> {
     // sticky across processes. (Helper doesn't share memory; it
     // re-evaluates the env. We currently don't propagate this flag to
     // helpers via env — TODO Phase 6b.)
-    buffr_cef::set_force_renderer_accessibility(config.accessibility.force_renderer_accessibility);
+    backend.set_force_renderer_accessibility(config.accessibility.force_renderer_accessibility);
 
     // -------- update channel --------
     //
@@ -844,14 +853,15 @@ fn main() -> Result<()> {
             && (scale - 1.0).abs() > 0.01
         {
             debug!(scale, "forwarding BUFFR_SCALE device scale factor to CEF");
-            buffr_cef::set_device_scale_factor(scale);
+            backend.set_device_scale(scale);
         }
     }
 
-    // -------- CEF initialize --------
+    // -------- backend initialize --------
     let cache_path = paths.cache.to_string_lossy().into_owned();
-    let mut app = BuffrApp::new();
-    buffr_cef::cef_initialize(&cache_path, &mut app).map_err(|e| anyhow::anyhow!(e))?;
+    backend
+        .initialize(&cache_path)
+        .map_err(|e| anyhow::anyhow!(e))?;
     info!("cef initialized");
 
     // Phase 6 telemetry: count the successful CEF init as one
@@ -887,15 +897,15 @@ fn main() -> Result<()> {
     // request (hot-reloaded user overrides land on the next visit).
     {
         let engine_for_newtab = Arc::clone(&engine);
-        let provider: buffr_cef::NewTabHtmlProvider =
+        let provider: NewTabHtmlProvider =
             Arc::new(move || render_new_tab_html(&engine_for_newtab));
-        register_buffr_handler_factory(provider);
+        backend.register_new_tab_handler(provider);
     }
 
     // Register the `buffr-src:` scheme handler factory. Fetches the
     // underlying URL on a worker thread and renders it with bonsai
     // syntax highlighting (Round 2 of #30).
-    register_buffr_src_handler_factory();
+    backend.register_view_source_handler();
 
     // -------- spawn config watcher (keymap-only hot reload) ------------
     //
@@ -1045,6 +1055,7 @@ fn main() -> Result<()> {
     let initial_heartbeat = heartbeat::Heartbeat::try_connect();
 
     let mut app_state = AppState::new(
+        backend,
         homepage,
         engine,
         history.clone(),
@@ -1138,6 +1149,7 @@ fn main() -> Result<()> {
             &history,
             &bookmarks,
             &downloads,
+            &*app_state.backend,
         );
     }
 
@@ -1149,9 +1161,9 @@ fn main() -> Result<()> {
     counters.flush();
 
     // -------- shutdown --------
-    info!("shutdown: cef shutting down");
-    buffr_cef::cef_shutdown();
-    info!("shutdown: cef_shutdown returned");
+    info!("shutdown: backend shutting down");
+    app_state.backend.shutdown();
+    info!("shutdown: backend shutdown returned");
     // Drop the rest of AppState now (renderer/wgpu, window, engine,
     // sinks). CEF is fully gone, so wgpu can release the GPU surface
     // without racing CEF's GPU process teardown.
@@ -1670,6 +1682,7 @@ fn run_clear_on_exit(
     history: &buffr_history::History,
     bookmarks: &buffr_bookmarks::Bookmarks,
     downloads: &buffr_downloads::Downloads,
+    backend: &dyn Backend,
 ) {
     if items.is_empty() {
         return;
@@ -1682,7 +1695,7 @@ fn run_clear_on_exit(
             continue;
         }
         match item {
-            ClearableData::Cookies => clear_cookies(),
+            ClearableData::Cookies => clear_cookies(backend),
             ClearableData::Cache => clear_dir(&paths.cache.join("Cache"), "cache"),
             ClearableData::History => match history.clear_all() {
                 Ok(n) => info!(rows = n, "clear_on_exit: history cleared"),
@@ -1728,8 +1741,8 @@ fn clear_dir(path: &std::path::Path, label: &str) {
 /// The flush_store hop afterward forces any in-memory cookie state
 /// to be persisted before we tear down — relevant for cookies that
 /// arrived just before the user closed the window.
-fn clear_cookies() {
-    buffr_cef::delete_all_cookies();
+fn clear_cookies(backend: &dyn Backend) {
+    backend.delete_all_cookies();
 }
 
 /// Minimal winit `ApplicationHandler` that owns one window + one
@@ -1749,6 +1762,11 @@ fn clear_cookies() {
 ///   only call `set_title` when this changes. winit's `set_title` is
 ///   idempotent but cheap → cheaper still to skip.
 struct AppState {
+    /// Active backend — process-model lifecycle (library load, init,
+    /// shutdown, message pump, scheme registration, engine construction).
+    /// Constructed in `main()` as `Arc<CefBackend>` wrapped in
+    /// `Arc<dyn Backend>`; all calls go through the trait.
+    backend: Arc<dyn Backend>,
     /// URL loaded into a fresh tab everywhere — cold-start tab 0,
     /// `:tabnew`, the `gh` chord, and `o`/`O`. Defaults to
     /// `buffr://new` and is overridable via `general.homepage` and
@@ -2375,6 +2393,7 @@ impl ActiveContextMenu {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        backend: Arc<dyn Backend>,
         homepage: String,
         engine: Arc<Mutex<Engine>>,
         history: Arc<buffr_history::History>,
@@ -2423,6 +2442,7 @@ impl AppState {
             ..TabStrip::default()
         };
         Self {
+            backend,
             homepage,
             engines: std::collections::HashMap::new(),
             active_engine: buffr_engine::EngineId::new("cef"),
@@ -6936,48 +6956,55 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     } else {
                         None
                     };
-                    match buffr_cef::BrowserHost::new_with_options(
-                        &self.homepage,
-                        self.history.clone(),
-                        self.downloads.clone(),
-                        self.downloads_config.clone(),
-                        self.zoom.clone(),
-                        self.permissions.clone(),
-                        self.permissions_queue.clone(),
-                        self.download_notice_queue.clone(),
-                        self.find_sink.clone(),
-                        self.hint_sink.clone(),
-                        self.edit_sink.clone(),
-                        self.hint_alphabet.clone(),
-                        (cef_w, cef_h),
-                        self.private,
-                        counters_opt,
-                        self.show_favicons,
-                    ) {
-                        Ok(host) => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        inst.data_dir.as_deref().map(std::path::PathBuf::from);
+                    let options = BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        sinks: Box::new(CefEngineSinks {
+                            history: self.history.clone(),
+                            downloads: self.downloads.clone(),
+                            downloads_config: self.downloads_config.clone(),
+                            zoom: self.zoom.clone(),
+                            permissions: self.permissions.clone(),
+                            permissions_queue: self.permissions_queue.clone(),
+                            notice_queue: self.download_notice_queue.clone(),
+                            find_sink: self.find_sink.clone(),
+                            hint_sink: self.hint_sink.clone(),
+                            edit_sink: self.edit_sink.clone(),
+                            hint_alphabet: self.hint_alphabet.clone(),
+                            counters: counters_opt,
+                            show_favicons: self.show_favicons,
+                        }),
+                    };
+                    match self.backend.open_engine(options) {
+                        Ok(host_dyn) => {
                             info!(engine_id = %inst.id, "browser host created (OSR)");
-                            host.osr_focus(true);
+                            host_dyn.osr_focus(true);
                             if first_instance {
                                 // Wire popup sinks and OSR wake on the active engine.
-                                self.popup_create_sink = host.popup_create_sink();
-                                self.popup_close_sink = host.popup_close_sink();
+                                self.popup_create_sink = host_dyn.popup_create_sink();
+                                self.popup_close_sink = host_dyn.popup_close_sink();
                             }
                             // Every engine gets its own OSR wake — a single closure
                             // that calls `request_redraw`. The paint pass reads the
                             // active engine's frame, so wakes from inactive engines
                             // may overdraw slightly but are always correct.
                             let proxy = self.event_proxy.clone();
-                            host.set_osr_wake(Arc::new(move || {
+                            host_dyn.set_osr_wake(Arc::new(move || {
                                 let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
                             }));
-                            host.set_frame_rate(display_hz);
-                            host.set_device_scale(effective_scale);
-                            let host = Arc::new(host);
+                            host_dyn.set_frame_rate(display_hz);
+                            host_dyn.set_device_scale(effective_scale);
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let cef_engine: Arc<dyn buffr_engine::BrowserEngine> = host as _;
                             router_builder =
-                                router_builder.register(engine_id.clone(), cef_engine.clone());
-                            self.engines.insert(engine_id.clone(), cef_engine);
+                                router_builder.register(engine_id.clone(), Arc::clone(&host_dyn));
+                            self.engines.insert(engine_id.clone(), host_dyn);
                             if first_instance {
                                 self.active_engine = engine_id;
                                 tracing::debug!(
@@ -7896,7 +7923,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // with AppKit; calling CefDoMessageLoopWork from inside winit's
         // AppKit event handler can re-enter winit and trip its macOS
         // reentrancy guard.
-        pump_cef_message_loop(&mut self.cef_next_pump_at);
+        pump_cef_message_loop(&*self.backend, &mut self.cef_next_pump_at);
 
         // Wheel-momentum tick: synthesize a decaying wheel event once
         // high-res input has gone quiet, mimicking native Chrome's
@@ -8588,8 +8615,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 }
 
 #[cfg(target_os = "macos")]
-fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
-    if let Some(delay_ms) = buffr_cef::take_scheduled_message_pump_delay_ms() {
+fn pump_cef_message_loop(backend: &dyn Backend, next_pump_at: &mut Option<Instant>) {
+    if let Some(delay_ms) = backend.scheduled_pump_delay_ms() {
         let delay = Duration::from_millis(delay_ms.try_into().unwrap_or(0));
         let at = Instant::now() + delay;
         tracing::trace!(delay_ms, ?at, "cef: schedule next pump");
@@ -8598,15 +8625,15 @@ fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
     if let Some(at) = *next_pump_at {
         if Instant::now() >= at {
             tracing::trace!("cef: do_message_loop_work");
-            buffr_cef::do_message_loop_work();
+            backend.pump_message_loop();
             *next_pump_at = None;
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn pump_cef_message_loop(_next_pump_at: &mut Option<Instant>) {
-    buffr_cef::do_message_loop_work();
+fn pump_cef_message_loop(backend: &dyn Backend, _next_pump_at: &mut Option<Instant>) {
+    backend.pump_message_loop();
 }
 
 // ---------------------------------------------------------------------------

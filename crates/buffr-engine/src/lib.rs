@@ -3,6 +3,7 @@
 //! Zero CEF dependency. `buffr-core` and the apps layer program against
 //! this interface; `buffr-cef` is the concrete backend.
 
+pub mod backend;
 pub mod clipboard;
 pub mod engine;
 pub mod engine_id;
@@ -18,6 +19,7 @@ pub mod profile;
 pub mod tab;
 pub mod types;
 
+pub use backend::{Backend, BackendOpenOptions, NewTabHtmlProvider};
 pub use clipboard::{ClipboardRead, ClipboardReader};
 pub use engine::BrowserEngine;
 pub use engine_id::EngineId;

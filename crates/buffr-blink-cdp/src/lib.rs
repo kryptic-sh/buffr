@@ -24,6 +24,7 @@
 //! Stubbed (return `EngineError::Unimplemented`): `duplicate_active`,
 //! `reopen_closed_tab`, and any method not listed above.
 
+pub mod backend;
 pub mod cdp;
 pub mod engine;
 pub mod error;
@@ -31,5 +32,6 @@ pub mod subprocess;
 pub mod worker;
 pub mod ws;
 
+pub use backend::BlinkCdpBackend;
 pub use engine::BlinkCdpEngine;
 pub use error::BlinkError;

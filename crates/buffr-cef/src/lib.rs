@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod audio;
+pub mod backend;
 pub(crate) mod convert;
 pub mod handlers;
 pub mod host;
@@ -24,6 +25,7 @@ pub use audio::{
     AudioEvent, AudioEventQueue, AudioState, AudioStateSink, any_audio_active, drain_audio_events,
     new_audio_event_queue, new_audio_state_sink,
 };
+pub use backend::{CefBackend, CefEngineSinks};
 pub use host::{BrowserHost, ClipboardReader, Tab, TabSession};
 // HintStatus moved to buffr-engine in Phase 6b (#95). Re-exported here so
 // existing `buffr_cef::HintStatus` imports keep resolving without modification.
