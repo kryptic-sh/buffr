@@ -8,7 +8,6 @@
 //!
 //! **Not in Phase 1** (stays as inherent methods on `BrowserHost`):
 //!   - `dispatch(action: &buffr_modal::PageAction)` — modal action routing
-//!   - hint-mode methods (`enter_hint_mode`, `feed_hint_key`, etc.)
 //!   - favicon accessors (`favicon_sink`, `favicon_enabled`, etc.)
 //!   - permissions accessors (`permissions`, `permissions_queue`)
 //!   - context-menu drain (`drain_context_menu_requests`)
@@ -19,13 +18,17 @@
 //! Phase 6a (#95): popup_* family added to the trait so `apps/buffr-app`
 //! no longer needs the `cef_engines` parallel map for popup calls.
 //!
+//! Phase 6b (#95): hint_* family added so hint-mode key routing goes
+//! through `Arc<dyn BrowserEngine>` instead of the CEF-specific
+//! `active_host()` reach-through.
+//!
 //! Phase 2 will widen the trait as the apps layer is further decoupled.
 
 use std::sync::Arc;
 
 use crate::{
-    EngineError, MouseButton, NeutralKeyEvent, SharedOsrFrame, SharedOsrViewState, TabId,
-    TabSummary,
+    EngineError, HintAction, HintStatus, MouseButton, NeutralKeyEvent, SharedOsrFrame,
+    SharedOsrViewState, TabId, TabSummary,
     popup::{PopupCloseSink, PopupCreateSink, PopupQueue},
 };
 
@@ -296,6 +299,37 @@ pub trait BrowserEngine: Send + Sync {
         delta_y: i32,
         modifiers: u32,
     );
+
+    // ── Hint mode (Phase 6b, #95) ─────────────────────────────────────────────
+    //
+    // Backends that do not support hint mode (e.g. `buffr-blink-cdp`) return
+    // no-op / idle stubs. CDP hint mode: future work, see #95.
+
+    /// Whether the active tab has a live hint session.
+    fn is_hint_mode(&self) -> bool;
+
+    /// Status snapshot of the active tab's hint session.
+    ///
+    /// Returns `None` when no session is active or no active tab exists.
+    fn hint_status(&self) -> Option<HintStatus>;
+
+    /// Drain renderer-side hint events and finalise the active tab's session.
+    ///
+    /// Returns `true` if the session state changed (Ready / Error received).
+    fn pump_hint_events(&self) -> bool;
+
+    /// Feed a printable character to the active tab's hint session.
+    ///
+    /// Returns `None` when no session is active.
+    fn feed_hint_key(&self, c: char) -> Option<HintAction>;
+
+    /// Backspace the typed buffer in the active tab's hint session.
+    ///
+    /// Returns `None` when no session is active.
+    fn backspace_hint(&self) -> Option<HintAction>;
+
+    /// Cancel the active tab's hint session and remove all overlays.
+    fn cancel_hint(&self);
 }
 
 #[cfg(test)]
@@ -304,7 +338,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::{
-        EngineError, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, TabId, TabSummary,
+        EngineError, HintAction, HintStatus, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState,
+        TabId, TabSummary,
         popup::{
             PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink,
             new_popup_create_sink, new_popup_queue,
@@ -454,6 +489,22 @@ mod tests {
             _modifiers: u32,
         ) {
         }
+        fn is_hint_mode(&self) -> bool {
+            false
+        }
+        fn hint_status(&self) -> Option<HintStatus> {
+            None
+        }
+        fn pump_hint_events(&self) -> bool {
+            false
+        }
+        fn feed_hint_key(&self, _c: char) -> Option<HintAction> {
+            None
+        }
+        fn backspace_hint(&self) -> Option<HintAction> {
+            None
+        }
+        fn cancel_hint(&self) {}
     }
 
     #[test]

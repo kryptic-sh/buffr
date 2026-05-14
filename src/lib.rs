@@ -7,6 +7,7 @@ pub mod engine;
 pub mod engine_id;
 pub mod error;
 pub mod event;
+pub mod hint;
 pub mod input;
 pub mod osr;
 pub mod popup;
@@ -17,6 +18,7 @@ pub use engine::BrowserEngine;
 pub use engine_id::EngineId;
 pub use error::EngineError;
 pub use event::EngineEvent;
+pub use hint::{HintAction, HintStatus};
 pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
 pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
 pub use popup::{
