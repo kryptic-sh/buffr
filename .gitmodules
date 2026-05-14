@@ -28,3 +28,6 @@
 [submodule "crates/buffr-view-source"]
 	path = crates/buffr-view-source
 	url = https://github.com/kryptic-sh/buffr-view-source.git
+[submodule "crates/buffr-engine"]
+	path = crates/buffr-engine
+	url = https://github.com/kryptic-sh/buffr-engine.git

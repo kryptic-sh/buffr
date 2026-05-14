@@ -49,8 +49,10 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -98,7 +100,9 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -189,8 +193,10 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -273,7 +279,9 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -360,7 +368,9 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -476,7 +486,9 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -566,8 +578,10 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           target: ${{ matrix.rust_target }}
           cache: false
+      - run: rustup update --no-self-update stable
 
       - uses: Swatinem/rust-cache@v2
         with:
