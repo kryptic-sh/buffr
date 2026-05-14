@@ -504,6 +504,8 @@ name = "buffr-blink-cdp"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "buffr-core",
+ "buffr-downloads",
  "buffr-engine",
  "buffr-permissions",
  "image",

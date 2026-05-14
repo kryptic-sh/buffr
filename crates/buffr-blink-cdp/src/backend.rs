@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use buffr_core::DownloadNoticeQueue;
+use buffr_downloads::Downloads;
 use buffr_engine::{Backend, BackendOpenOptions, BrowserEngine, NewTabHtmlProvider};
 
 use crate::BlinkCdpEngine;
@@ -62,7 +64,22 @@ impl Backend for BlinkCdpBackend {
                 std::path::PathBuf::from("/tmp/buffr/blink-cdp").join(options.engine_id.as_str())
             });
 
-        let engine = BlinkCdpEngine::new(&data_dir).map_err(|e| e.to_string())?;
+        // Downcast the type-erased download store and notice queue, if provided.
+        let downloads: Option<Arc<Downloads>> = options
+            .downloads
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<Arc<Downloads>>())
+            .cloned();
+        let notice_queue: Option<DownloadNoticeQueue> = options
+            .notice_queue
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<DownloadNoticeQueue>())
+            .cloned();
+        let download_dir = options.download_dir.map(|p| p.to_path_buf());
+
+        let engine =
+            BlinkCdpEngine::new(&data_dir, download_dir.as_deref(), downloads, notice_queue)
+                .map_err(|e| e.to_string())?;
         Ok(Arc::new(engine) as Arc<dyn BrowserEngine>)
     }
 

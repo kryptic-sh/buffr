@@ -7026,6 +7026,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         device_scale: effective_scale as f64,
                         initial_size: (cef_w, cef_h),
                         private: self.private,
+                        // CEF manages downloads via CefEngineSinks; these
+                        // fields are for blink-cdp only.
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
                         sinks: Box::new(CefEngineSinks {
                             history: self.history.clone(),
                             downloads: self.downloads.clone(),
@@ -7095,7 +7100,21 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             self.data_root.join("blink-cdp").join(&inst.id)
                         });
                     tracing::debug!(?data_dir, "blink-cdp profile dir");
-                    match buffr_blink_cdp::BlinkCdpEngine::new(&data_dir) {
+                    // Resolve download directory for this blink-cdp instance.
+                    // Prefer the user-configured `[downloads] default_dir`; fall
+                    // back to `<data_dir>/downloads` so Chromium never touches
+                    // the desktop.
+                    let blink_download_dir = self
+                        .downloads_config
+                        .default_dir
+                        .clone()
+                        .unwrap_or_else(|| data_dir.join("downloads"));
+                    match buffr_blink_cdp::BlinkCdpEngine::new(
+                        &data_dir,
+                        Some(&blink_download_dir),
+                        Some(self.downloads.clone()),
+                        Some(self.download_notice_queue.clone()),
+                    ) {
                         Ok(engine) => {
                             info!(engine_id = %inst.id, "blink-cdp engine created");
                             let proxy = self.event_proxy.clone();

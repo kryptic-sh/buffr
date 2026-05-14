@@ -39,6 +39,19 @@ pub struct BackendOpenOptions<'a> {
     pub initial_size: (u32, u32),
     /// Whether this engine runs in private (incognito) mode.
     pub private: bool,
+    /// Directory where downloads should be saved.
+    ///
+    /// Used by the blink-cdp backend to configure
+    /// `Browser.setDownloadBehavior`. CEF backends manage their own
+    /// download directory via the sinks' `DownloadsConfig`.
+    pub download_dir: Option<&'a Path>,
+    /// Shared downloads store. blink-cdp writes to this directly when
+    /// downloads start / progress / complete. CEF ignores this field
+    /// (continues using its existing `CefEngineSinks` wiring).
+    pub downloads: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Shared download-notice queue. blink-cdp pushes notices here on
+    /// `Started` / `Completed` / `Canceled`. CEF ignores this field.
+    pub notice_queue: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Backend-specific sink handles, type-erased.
     ///
     /// CEF: expects `Box<CefEngineSinks>` (defined in buffr-cef).

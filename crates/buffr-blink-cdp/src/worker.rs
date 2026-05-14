@@ -15,13 +15,16 @@
 //! The worker exits when the `cmd_rx` channel is dropped (engine shutdown).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as B64Engine;
 use serde_json::Value;
 
+use buffr_core::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue};
+use buffr_downloads::{DownloadId, Downloads};
 use buffr_engine::{PermissionsQueue, SharedOsrFrame, SharedOsrViewState};
 use buffr_permissions::Capability;
 
@@ -93,6 +96,7 @@ pub enum Command {
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run the CDP worker event loop (blocking; call from a dedicated thread).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     mut ws: WsClient,
     cmd_rx: Receiver<Command>,
@@ -100,6 +104,9 @@ pub fn run(
     osr_view: SharedOsrViewState,
     permissions_queue: PermissionsQueue,
     perm_session_map: Arc<Mutex<HashMap<String, String>>>,
+    downloads: Option<Arc<Downloads>>,
+    notice_queue: Option<DownloadNoticeQueue>,
+    download_dir: PathBuf,
 ) {
     // Map from CDP message-id → reply sender.
     let mut pending: HashMap<u64, Sender<Result<Value, BlinkError>>> = HashMap::new();
@@ -107,6 +114,8 @@ pub fn run(
     let mut active_session: Option<String> = None;
     // Per-session zoom levels (re-applied after each navigation).
     let mut session_zoom: HashMap<String, f64> = HashMap::new();
+    // Map from CDP download guid → our Downloads row id (set on willBegin).
+    let mut download_ids: HashMap<String, DownloadId> = HashMap::new();
 
     tracing::debug!("CDP worker started");
 
@@ -264,6 +273,10 @@ pub fn run(
                         &osr_view,
                         &permissions_queue,
                         &perm_session_map,
+                        downloads.as_deref(),
+                        notice_queue.as_ref(),
+                        &download_dir,
+                        &mut download_ids,
                     );
                 }
             },
@@ -307,6 +320,10 @@ fn dispatch_message(
     _osr_view: &SharedOsrViewState,
     permissions_queue: &PermissionsQueue,
     perm_session_map: &Arc<Mutex<HashMap<String, String>>>,
+    downloads: Option<&Downloads>,
+    notice_queue: Option<&DownloadNoticeQueue>,
+    download_dir: &Path,
+    download_ids: &mut HashMap<String, DownloadId>,
 ) {
     // Command response.
     if let Some(id) = msg.id {
@@ -361,6 +378,22 @@ fn dispatch_message(
                         perm_session_map,
                     );
                 }
+            }
+        }
+        "Browser.downloadWillBegin" => {
+            if let Some(ref params) = msg.params {
+                handle_download_will_begin(
+                    params,
+                    downloads,
+                    notice_queue,
+                    download_dir,
+                    download_ids,
+                );
+            }
+        }
+        "Browser.downloadProgress" => {
+            if let Some(ref params) = msg.params {
+                handle_download_progress(params, downloads, notice_queue, download_ids);
             }
         }
         _ => {}
@@ -427,6 +460,203 @@ fn handle_permission_binding(
     if let Ok(mut q) = permissions_queue.lock() {
         q.push_back(perm);
     }
+}
+
+// ── Download event handlers ───────────────────────────────────────────────────
+
+/// Handle `Browser.downloadWillBegin` — a download has started.
+///
+/// Inserts a row into the downloads store as `InFlight` and pushes a
+/// `Started` notice onto the notice queue.  The CDP guid is mapped to the
+/// store's `DownloadId` so progress events can update the right row.
+fn handle_download_will_begin(
+    params: &Value,
+    downloads: Option<&Downloads>,
+    notice_queue: Option<&DownloadNoticeQueue>,
+    download_dir: &Path,
+    download_ids: &mut HashMap<String, DownloadId>,
+) {
+    let guid = match params.get("guid").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => {
+            tracing::debug!("downloadWillBegin: missing guid");
+            return;
+        }
+    };
+    let url = params
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let filename = params
+        .get("suggestedFilename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let target_path = download_dir.join(&filename);
+
+    tracing::debug!(
+        guid,
+        url,
+        filename,
+        path = %target_path.display(),
+        "blink-cdp: downloadWillBegin"
+    );
+
+    // We use a synthetic numeric id derived from the guid hash as the
+    // `cef_id` placeholder.  The schema requires a `cef_id u32` as a
+    // unique key; for blink-cdp we use a stable hash of the guid string
+    // so that repeated calls with the same guid are idempotent (matching
+    // the `record_started` no-op guarantee).
+    let cef_id = guid_to_cef_id(&guid);
+
+    if let Some(store) = downloads {
+        match store.record_started(cef_id, &url, &filename, None, None) {
+            Ok(id) => {
+                download_ids.insert(guid.clone(), id);
+                tracing::debug!(guid, row_id = id.0, "blink-cdp: download row inserted");
+            }
+            Err(e) => {
+                tracing::warn!(guid, error = %e, "blink-cdp: record_started failed");
+            }
+        }
+    }
+
+    if let Some(queue) = notice_queue {
+        buffr_core::push_download_notice(
+            queue,
+            DownloadNotice {
+                kind: DownloadNoticeKind::Started,
+                filename,
+                path: target_path.to_string_lossy().into_owned(),
+                created_at: Instant::now(),
+            },
+        );
+    }
+}
+
+/// Handle `Browser.downloadProgress` — progress tick or terminal state.
+///
+/// Updates progress on the matching store row; on terminal states
+/// (`completed` / `canceled`) flips the row status and pushes a notice.
+fn handle_download_progress(
+    params: &Value,
+    downloads: Option<&Downloads>,
+    notice_queue: Option<&DownloadNoticeQueue>,
+    download_ids: &mut HashMap<String, DownloadId>,
+) {
+    let guid = match params.get("guid").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => {
+            tracing::debug!("downloadProgress: missing guid");
+            return;
+        }
+    };
+    let state = params
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inProgress");
+    let received = params
+        .get("receivedBytes")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as u64)
+        .unwrap_or(0);
+    let total = params
+        .get("totalBytes")
+        .and_then(|v| v.as_f64())
+        .filter(|&f| f > 0.0)
+        .map(|f| f as u64);
+
+    tracing::debug!(guid, state, received, "blink-cdp: downloadProgress");
+
+    let row_id = match download_ids.get(&guid) {
+        Some(&id) => id,
+        None => {
+            tracing::debug!(
+                guid,
+                "blink-cdp: downloadProgress — no row for guid (ignoring)"
+            );
+            return;
+        }
+    };
+
+    match state {
+        "inProgress" => {
+            if let Some(store) = downloads
+                && let Err(e) = store.update_progress(row_id, received, total)
+            {
+                tracing::warn!(guid, error = %e, "blink-cdp: update_progress failed");
+            }
+        }
+        "completed" => {
+            if let Some(store) = downloads {
+                // We don't get the final path from CDP; use the store row's
+                // suggested_name under our download_dir.  Retrieve filename
+                // from the row so we can build the expected path.
+                let full_path = match store.get(row_id) {
+                    Ok(Some(ref dl)) => {
+                        // The row was inserted with suggested_name; re-derive.
+                        std::path::Path::new(&dl.suggested_name).to_path_buf()
+                    }
+                    _ => std::path::PathBuf::new(),
+                };
+                if let Err(e) = store.record_completed(row_id, &full_path) {
+                    tracing::warn!(guid, error = %e, "blink-cdp: record_completed failed");
+                }
+            }
+            download_ids.remove(&guid);
+            if let Some(queue) = notice_queue {
+                buffr_core::push_download_notice(
+                    queue,
+                    DownloadNotice {
+                        kind: DownloadNoticeKind::Completed,
+                        filename: String::new(),
+                        path: String::new(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        "canceled" => {
+            if let Some(store) = downloads
+                && let Err(e) = store.record_canceled(row_id)
+            {
+                tracing::warn!(guid, error = %e, "blink-cdp: record_canceled failed");
+            }
+            download_ids.remove(&guid);
+            if let Some(queue) = notice_queue {
+                buffr_core::push_download_notice(
+                    queue,
+                    DownloadNotice {
+                        kind: DownloadNoticeKind::Failed,
+                        filename: String::new(),
+                        path: String::new(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        other => {
+            tracing::debug!(guid, state = other, "blink-cdp: unknown download state");
+        }
+    }
+}
+
+/// Derive a stable `u32` cef_id from a CDP download guid string.
+///
+/// The `downloads` schema requires a `cef_id` unique key of type `u32`.
+/// For blink-cdp we have a GUID string, not an integer id.  We hash the
+/// guid with FNV-1a (no dep needed — just a loop) to produce a stable u32.
+/// Collisions are theoretically possible but negligible in practice — a
+/// session will rarely have 2^32 concurrent downloads.
+fn guid_to_cef_id(guid: &str) -> u32 {
+    // FNV-1a 32-bit hash.
+    let mut hash: u32 = 2_166_136_261;
+    for byte in guid.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash
 }
 
 fn handle_screencast_frame(msg: &CdpMessage, ws: &mut WsClient, osr_frame: &SharedOsrFrame) {

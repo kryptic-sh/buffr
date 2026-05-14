@@ -39,6 +39,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use buffr_core::DownloadNoticeQueue;
+use buffr_downloads::Downloads;
 use buffr_engine::{
     BrowserEngine, EngineError, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState,
     PermissionsQueue, PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
@@ -163,6 +165,20 @@ pub struct BlinkCdpEngine {
     /// Maps `resolve_id → session_id` so `resolve_permission` can evaluate
     /// `__buffrPermissionResolve` on the correct CDP session.
     perm_session_map: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Shared downloads store. Passed in at construction from the apps
+    /// layer; the worker writes to it on CDP download events. `None` when
+    /// no store was provided (private mode or blink-cdp without wiring).
+    ///
+    /// Held here to keep the `Arc` alive for the worker thread's clone;
+    /// the engine itself does not call into the store directly.
+    #[allow(dead_code)]
+    downloads: Option<Arc<Downloads>>,
+    /// Download notice queue for surfacing start/complete banners in the
+    /// status-line chrome. `None` when not wired by the apps layer.
+    ///
+    /// Held here to keep the `Arc` alive for the worker thread's clone.
+    #[allow(dead_code)]
+    notice_queue: Option<DownloadNoticeQueue>,
 }
 
 impl BlinkCdpEngine {
@@ -178,7 +194,19 @@ impl BlinkCdpEngine {
     /// special.
     ///
     /// `data_dir` is used as the Chromium user-data directory.
-    pub fn new(data_dir: &Path) -> Result<Self, BlinkError> {
+    ///
+    /// `download_dir` — if provided — is passed to `Browser.setDownloadBehavior`
+    /// so Chromium saves files there instead of the default desktop location.
+    ///
+    /// `downloads` and `notice_queue` are the shared stores used to record
+    /// download progress and surface status-line banners. Pass `None` when
+    /// running without storage (e.g. private mode without a persistent store).
+    pub fn new(
+        data_dir: &Path,
+        download_dir: Option<&Path>,
+        downloads: Option<Arc<Downloads>>,
+        notice_queue: Option<DownloadNoticeQueue>,
+    ) -> Result<Self, BlinkError> {
         let chromium = find_chromium().ok_or(BlinkError::ChromiumNotFound)?;
 
         // Ask the OS for a free ephemeral port.
@@ -203,12 +231,30 @@ impl BlinkCdpEngine {
         let perm_session_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+        // Resolve the effective download directory.  If the caller did not
+        // supply one, fall back to `<data_dir>/downloads` so downloads always
+        // land somewhere deterministic rather than Chromium's default desktop
+        // location.
+        let effective_download_dir = download_dir
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| data_dir.join("downloads"));
+        if let Err(e) = std::fs::create_dir_all(&effective_download_dir) {
+            tracing::warn!(
+                path = %effective_download_dir.display(),
+                error = %e,
+                "blink-cdp: failed to create download directory"
+            );
+        }
+
         // Spawn worker thread.
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(256);
         let worker_frame = Arc::clone(&osr_frame);
         let worker_view = Arc::clone(&osr_view);
         let worker_perm_queue = Arc::clone(&permissions_queue);
         let worker_perm_session = Arc::clone(&perm_session_map);
+        let worker_downloads = downloads.clone();
+        let worker_notice_queue = notice_queue.clone();
+        let worker_download_dir = effective_download_dir.clone();
         let worker = std::thread::Builder::new()
             .name("blink-cdp-worker".to_owned())
             .spawn(move || {
@@ -219,9 +265,47 @@ impl BlinkCdpEngine {
                     worker_view,
                     worker_perm_queue,
                     worker_perm_session,
+                    worker_downloads,
+                    worker_notice_queue,
+                    worker_download_dir,
                 )
             })
             .map_err(BlinkError::SpawnFailed)?;
+
+        // Configure Browser.setDownloadBehavior so downloads land in our
+        // directory and the worker receives Browser.downloadWillBegin /
+        // Browser.downloadProgress events.  This must be sent AFTER the
+        // worker is started (it owns the WebSocket) via a BrowserCmd round-trip.
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let download_behavior_cmd = crate::cdp::CdpCommand {
+            id: crate::cdp::next_id(),
+            method: "Browser.setDownloadBehavior",
+            params: Some(serde_json::json!({
+                "behavior": "allow",
+                "downloadPath": effective_download_dir.to_string_lossy().as_ref(),
+                "eventsEnabled": true,
+            })),
+            session_id: None,
+        };
+        let _ = cmd_tx.try_send(Command::BrowserCmd {
+            cmd: download_behavior_cmd,
+            reply: reply_tx,
+        });
+        // Best-effort: don't block startup on a timing failure.
+        match reply_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(_)) => {
+                tracing::debug!(
+                    path = %effective_download_dir.display(),
+                    "blink-cdp: Browser.setDownloadBehavior configured"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "blink-cdp: Browser.setDownloadBehavior failed");
+            }
+            Err(_) => {
+                tracing::warn!("blink-cdp: Browser.setDownloadBehavior timed out");
+            }
+        }
 
         Ok(Self {
             state: Arc::new(Mutex::new(EngineState::new(port))),
@@ -232,6 +316,8 @@ impl BlinkCdpEngine {
             subprocess: Arc::new(Mutex::new(Some(child))),
             permissions_queue,
             perm_session_map,
+            downloads,
+            notice_queue,
         })
     }
 
@@ -1268,7 +1354,7 @@ mod tests {
             // Chromium present — skip spawning; would be an integration test.
             return;
         }
-        let result = BlinkCdpEngine::new(Path::new("/tmp/buffr-blink-cdp-test"));
+        let result = BlinkCdpEngine::new(Path::new("/tmp/buffr-blink-cdp-test"), None, None, None);
         match result {
             Err(BlinkError::ChromiumNotFound) => {} // expected
             Err(other) => panic!("unexpected error: {other}"),
