@@ -7,50 +7,27 @@
 //! on macOS).
 //!
 //! In all cases the helper does the bare minimum: forwards argv to
-//! `cef::execute_process`, exits with whatever code CEF returns.
-
-use buffr_cef::{BuffrApp, init_cef_api};
+//! `buffr_cef::execute_subprocess`, exits with whatever code CEF returns.
 
 fn main() {
-    // macOS only: load `Chromium Embedded Framework.framework` via the
-    // cef-rs `LibraryLoader` before any CEF call. The helper binary
-    // lives at `Buffr.app/Contents/Frameworks/Buffr Helper.app/Contents/MacOS/`,
-    // so the loader resolves the framework via `../../..`. Linux/Windows
-    // builds link CEF dynamically through `build.rs` and skip this.
-    #[cfg(target_os = "macos")]
-    {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("buffr-helper: resolving current_exe failed: {err}");
-                std::process::exit(1);
-            }
-        };
-        let loader = cef::library_loader::LibraryLoader::new(&exe, true);
-        if !loader.load() {
-            eprintln!("buffr-helper: failed to load CEF framework via LibraryLoader");
+    // Load the CEF framework library before any CEF call. On macOS this
+    // resolves `Chromium Embedded Framework.framework` via `../../..`
+    // (helper = true). On Linux/Windows this is a no-op.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("buffr-helper: resolving current_exe failed: {err}");
             std::process::exit(1);
         }
-        // Keep the loader alive for the lifetime of the process —
-        // `Drop` calls `unload_library`, which we only want at exit.
-        std::mem::forget(loader);
+    };
+    if let Err(err) = buffr_cef::load_cef_library(&exe, true) {
+        eprintln!("buffr-helper: {err}");
+        std::process::exit(1);
     }
 
-    // Pin the CEF API version before touching any CEF entry — see
-    // `buffr_core::init_cef_api` for the gory details. The helper
-    // hits `execute_process` directly, so the call must happen first.
-    init_cef_api();
-
-    let args = cef::args::Args::new();
-    let mut app = BuffrApp::new();
-
-    // Returns >= 0 for child processes (renderer/GPU/utility) which
-    // exit immediately afterwards; returns -1 for the browser process,
-    // which never reaches a helper binary in practice.
-    let code = cef::execute_process(
-        Some(args.as_main_args()),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    );
-    std::process::exit(code);
+    // Returns >= 0 for child processes (renderer/GPU/utility) which exit
+    // immediately afterwards; returns -1 for the browser process, which
+    // never reaches a helper binary in practice.
+    let exit = buffr_cef::execute_subprocess();
+    std::process::exit(exit);
 }

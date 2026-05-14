@@ -161,7 +161,7 @@ mod loading_anim;
 mod render;
 mod session;
 mod single_instance;
-use cef::{ImplBrowser, KeyEvent, KeyEventType, MouseButtonType, Settings};
+use buffr_engine::MouseButton as NeutralMouseButton;
 use clap::Parser;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
@@ -228,7 +228,7 @@ struct PopupWindow {
     modifiers: ModifiersState,
     /// Click state for double-click detection.
     last_click_at: Instant,
-    last_click_button: Option<cef::MouseButtonType>,
+    last_click_button: Option<NeutralMouseButton>,
     click_count: i32,
     /// Dimensions of the most recently received OSR paint for this popup.
     /// `None` until CEF emits the first on_paint. Guards the synthetic-upload
@@ -398,16 +398,9 @@ fn main() -> Result<()> {
     // in single-binary mode, but in macOS bundles the helper is a
     // separate executable that loads the framework with `helper=true`
     // (path-resolved via `../../..` instead of `../Frameworks`).
-    #[cfg(target_os = "macos")]
     {
-        let exe = std::env::current_exe().context("resolving current_exe for LibraryLoader")?;
-        let loader = cef::library_loader::LibraryLoader::new(&exe, false);
-        if !loader.load() {
-            anyhow::bail!("failed to load CEF framework via LibraryLoader");
-        }
-        // Keep the loader alive for the lifetime of the process —
-        // `Drop` calls `unload_library`, which we only want at exit.
-        std::mem::forget(loader);
+        let exe = std::env::current_exe().context("resolving current_exe for CEF library load")?;
+        buffr_cef::load_cef_library(&exe, false).map_err(|e| anyhow::anyhow!(e))?;
     }
 
     // -------- subprocess dispatch (single-binary mode) ----------------
@@ -423,14 +416,7 @@ fn main() -> Result<()> {
     // wrapped trait object (our `BuffrApp`) is handed to CEF.
     let is_subprocess = std::env::args().any(|a| a.starts_with("--type="));
     if is_subprocess {
-        init_cef_api();
-        let args = cef::args::Args::new();
-        let mut app = BuffrApp::new();
-        let exit_code = cef::execute_process(
-            Some(args.as_main_args()),
-            Some(&mut app),
-            std::ptr::null_mut(),
-        );
+        let exit_code = buffr_cef::execute_process_for_subprocess();
         std::process::exit(exit_code.max(0));
     }
 
@@ -517,9 +503,6 @@ fn main() -> Result<()> {
         .init();
 
     init_cef_api();
-
-    let args = cef::args::Args::new();
-    let mut app = BuffrApp::new();
 
     info!("buffr v{} starting", env!("CARGO_PKG_VERSION"));
     info!("buffr-core v{}", buffr_core::version());
@@ -796,31 +779,8 @@ fn main() -> Result<()> {
 
     // -------- CEF initialize --------
     let cache_path = paths.cache.to_string_lossy().into_owned();
-    let mut settings = Settings {
-        no_sandbox: 1,
-        // Drive the loop ourselves; don't let CEF spawn its own thread.
-        multi_threaded_message_loop: 0,
-        // Plumb the per-user cache root so CEF doesn't fall back to its
-        // process working dir (and so cookies persist across runs).
-        // Field confirmed in cef-147's bindings:
-        // `Settings::root_cache_path: CefString`.
-        root_cache_path: cef::CefString::from(cache_path.as_str()),
-        // Must be set at init time for OSR to be usable. Has no effect
-        // on windowed browsers; safe to always enable.
-        windowless_rendering_enabled: 1,
-        ..Default::default()
-    };
-    configure_macos_dev_cef_settings(&mut settings)?;
-
-    let init_ok = cef::initialize(
-        Some(args.as_main_args()),
-        Some(&settings),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    );
-    if init_ok != 1 {
-        anyhow::bail!("cef::initialize returned {init_ok} (expected 1)");
-    }
+    let mut app = BuffrApp::new();
+    buffr_cef::cef_initialize(&cache_path, &mut app).map_err(|e| anyhow::anyhow!(e))?;
     info!("cef initialized");
 
     // Phase 6 telemetry: count the successful CEF init as one
@@ -1113,8 +1073,8 @@ fn main() -> Result<()> {
 
     // -------- shutdown --------
     info!("shutdown: cef shutting down");
-    cef::shutdown();
-    info!("shutdown: cef::shutdown returned");
+    buffr_cef::cef_shutdown();
+    info!("shutdown: cef_shutdown returned");
     // Drop the rest of AppState now (renderer/wgpu, window, engine,
     // sinks). CEF is fully gone, so wgpu can release the GPU surface
     // without racing CEF's GPU process teardown.
@@ -1616,38 +1576,6 @@ fn resolve_paths(private: bool) -> Result<(buffr_cef::ProfilePaths, Option<TempD
     }
 }
 
-#[cfg(target_os = "macos")]
-fn configure_macos_dev_cef_settings(settings: &mut Settings) -> Result<()> {
-    // Let CEF tell us when the browser process needs work. Blindly calling
-    // CefDoMessageLoopWork from every winit callback can re-enter AppKit
-    // while winit is already handling an event.
-    settings.external_message_pump = 1;
-
-    let exe = std::env::current_exe().context("resolving current_exe for macOS CEF settings")?;
-    if exe.components().any(|c| c.as_os_str() == "Contents") {
-        return Ok(());
-    }
-
-    let exe_dir = exe
-        .parent()
-        .context("current_exe has no parent for macOS CEF settings")?;
-    let framework_dir = exe_dir
-        .join("../Frameworks/Chromium Embedded Framework.framework")
-        .canonicalize()
-        .context("resolving staged CEF framework for cargo run")?;
-    let resources_dir = framework_dir.join("Resources");
-
-    settings.browser_subprocess_path = cef::CefString::from(exe.to_string_lossy().as_ref());
-    settings.framework_dir_path = cef::CefString::from(framework_dir.to_string_lossy().as_ref());
-    settings.resources_dir_path = cef::CefString::from(resources_dir.to_string_lossy().as_ref());
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn configure_macos_dev_cef_settings(_settings: &mut Settings) -> Result<()> {
-    Ok(())
-}
-
 /// Honour `[privacy] clear_on_exit` after the event loop returns and
 /// before `cef::shutdown()`. Each entry is processed independently —
 /// one failure doesn't skip the rest. Errors log at WARN; successes
@@ -1724,18 +1652,7 @@ fn clear_dir(path: &std::path::Path, label: &str) {
 /// to be persisted before we tear down — relevant for cookies that
 /// arrived just before the user closed the window.
 fn clear_cookies() {
-    let Some(manager) = cef::cookie_manager_get_global_manager(None) else {
-        warn!("clear_on_exit: cookie_manager_get_global_manager returned None");
-        return;
-    };
-    use cef::ImplCookieManager;
-    let submitted = manager.delete_cookies(None, None, None);
-    if submitted == 0 {
-        warn!("clear_on_exit: delete_cookies returned 0 (synchronous failure)");
-    } else {
-        info!("clear_on_exit: cookies — delete dispatched");
-    }
-    let _ = manager.flush_store(None);
+    buffr_cef::delete_all_cookies();
 }
 
 /// Minimal winit `ApplicationHandler` that owns one window + one
@@ -1973,7 +1890,7 @@ struct AppState {
     /// Timestamp of the last mouse click, used for double-click detection.
     osr_last_click_at: Instant,
     /// Button of the last click.  `None` before the first click.
-    osr_last_click_button: Option<cef::MouseButtonType>,
+    osr_last_click_button: Option<NeutralMouseButton>,
     /// Click count within the current double-click window (1 or 2).
     osr_click_count: i32,
     /// Cursor position when the left mouse button was last pressed.
@@ -5367,10 +5284,10 @@ impl AppState {
             let mods = winit_mods_to_cef(&self.modifiers);
             // edit_mode_handle_key only runs when EditFocus::Editing is
             // active, so a text input is always focused here.
-            let cef_events = winit_key_to_cef_events(event, mods, true);
+            let cef_events = winit_key_to_neutral_events(event, mods, true);
             for ev in &cef_events {
                 tracing::debug!(
-                    type_ = ?ev.type_,
+                    kind = ?ev.kind,
                     vk = ev.windows_key_code,
                     ch = ev.character,
                     unmod = ev.unmodified_character,
@@ -5739,13 +5656,13 @@ impl AppState {
                 let Some(popup) = self.popups.get_mut(&window_id) else {
                     return;
                 };
-                let Some(cef_button) = winit_button_to_cef(&button) else {
+                let Some(cef_button) = winit_button_to_neutral(&button) else {
                     return;
                 };
                 let mouse_up = state != Pressed;
-                let btn_flag: u32 = if cef_button == MouseButtonType::LEFT {
+                let btn_flag: u32 = if cef_button == NeutralMouseButton::Left {
                     16
-                } else if cef_button == MouseButtonType::MIDDLE {
+                } else if cef_button == NeutralMouseButton::Middle {
                     32
                 } else {
                     64
@@ -5848,7 +5765,7 @@ impl AppState {
                 // don't track focus state in buffr — assume editable so
                 // typing into popup forms gets the same dispatch as the
                 // main window's edit-mode path.
-                let events = winit_key_to_cef_events(&key_ev, mods, true);
+                let events = winit_key_to_neutral_events(&key_ev, mods, true);
                 if let Some(host) = self.host.as_ref()
                     && browser_id >= 0
                 {
@@ -5892,82 +5809,123 @@ fn winit_wheel_to_cef_delta(delta: &winit::event::MouseScrollDelta) -> (i32, i32
 /// `CursorType::get_raw()` — kept opaque here so buffr-core stays free of
 /// winit deps.
 ///
+/// Constants come from `cef_dll_sys::cef_cursor_type_t` (stable across
+/// CEF versions; no import needed here — we compare raw integers).
+///
 /// Unknown / unimplemented variants fall back to [`CursorIcon::Default`].
 fn cef_cursor_type_to_winit(raw: u32) -> CursorIcon {
-    use cef::sys::cef_cursor_type_t as T;
-    let v = raw as i32;
-    if v == T::CT_POINTER as i32 {
+    // Raw values from cef_dll_sys::cef_cursor_type_t (CEF 147, stable).
+    const CT_POINTER: u32 = 0;
+    const CT_CROSS: u32 = 1;
+    const CT_HAND: u32 = 2;
+    const CT_IBEAM: u32 = 3;
+    const CT_WAIT: u32 = 4;
+    const CT_HELP: u32 = 5;
+    const CT_EASTRESIZE: u32 = 6;
+    const CT_NORTHRESIZE: u32 = 7;
+    const CT_NORTHEASTRESIZE: u32 = 8;
+    const CT_NORTHWESTRESIZE: u32 = 9;
+    const CT_SOUTHRESIZE: u32 = 10;
+    const CT_SOUTHEASTRESIZE: u32 = 11;
+    const CT_SOUTHWESTRESIZE: u32 = 12;
+    const CT_WESTRESIZE: u32 = 13;
+    const CT_NORTHSOUTHRESIZE: u32 = 14;
+    const CT_EASTWESTRESIZE: u32 = 15;
+    const CT_NORTHEASTSOUTHWESTRESIZE: u32 = 16;
+    const CT_NORTHWESTSOUTHEASTRESIZE: u32 = 17;
+    const CT_COLUMNRESIZE: u32 = 18;
+    const CT_ROWRESIZE: u32 = 19;
+    const CT_MOVE: u32 = 20;
+    const CT_VERTICALTEXT: u32 = 21;
+    const CT_CELL: u32 = 22;
+    const CT_CONTEXTMENU: u32 = 23;
+    const CT_ALIAS: u32 = 24;
+    const CT_PROGRESS: u32 = 25;
+    const CT_NODROP: u32 = 26;
+    const CT_COPY: u32 = 27;
+    const CT_NONE: u32 = 28;
+    const CT_NOTALLOWED: u32 = 29;
+    const CT_ZOOMIN: u32 = 30;
+    const CT_ZOOMOUT: u32 = 31;
+    const CT_GRAB: u32 = 32;
+    const CT_GRABBING: u32 = 33;
+    const CT_DND_NONE: u32 = 34;
+    const CT_DND_MOVE: u32 = 35;
+    const CT_DND_COPY: u32 = 36;
+    const CT_DND_LINK: u32 = 37;
+
+    if raw == CT_POINTER {
         CursorIcon::Default
-    } else if v == T::CT_CROSS as i32 {
+    } else if raw == CT_CROSS {
         CursorIcon::Crosshair
-    } else if v == T::CT_HAND as i32 {
+    } else if raw == CT_HAND {
         CursorIcon::Pointer
-    } else if v == T::CT_IBEAM as i32 {
+    } else if raw == CT_IBEAM {
         CursorIcon::Text
-    } else if v == T::CT_WAIT as i32 {
+    } else if raw == CT_WAIT {
         CursorIcon::Wait
-    } else if v == T::CT_HELP as i32 {
+    } else if raw == CT_HELP {
         CursorIcon::Help
-    } else if v == T::CT_EASTRESIZE as i32 {
+    } else if raw == CT_EASTRESIZE {
         CursorIcon::EResize
-    } else if v == T::CT_NORTHRESIZE as i32 {
+    } else if raw == CT_NORTHRESIZE {
         CursorIcon::NResize
-    } else if v == T::CT_NORTHEASTRESIZE as i32 {
+    } else if raw == CT_NORTHEASTRESIZE {
         CursorIcon::NeResize
-    } else if v == T::CT_NORTHWESTRESIZE as i32 {
+    } else if raw == CT_NORTHWESTRESIZE {
         CursorIcon::NwResize
-    } else if v == T::CT_SOUTHRESIZE as i32 {
+    } else if raw == CT_SOUTHRESIZE {
         CursorIcon::SResize
-    } else if v == T::CT_SOUTHEASTRESIZE as i32 {
+    } else if raw == CT_SOUTHEASTRESIZE {
         CursorIcon::SeResize
-    } else if v == T::CT_SOUTHWESTRESIZE as i32 {
+    } else if raw == CT_SOUTHWESTRESIZE {
         CursorIcon::SwResize
-    } else if v == T::CT_WESTRESIZE as i32 {
+    } else if raw == CT_WESTRESIZE {
         CursorIcon::WResize
-    } else if v == T::CT_NORTHSOUTHRESIZE as i32 {
+    } else if raw == CT_NORTHSOUTHRESIZE {
         CursorIcon::NsResize
-    } else if v == T::CT_EASTWESTRESIZE as i32 {
+    } else if raw == CT_EASTWESTRESIZE {
         CursorIcon::EwResize
-    } else if v == T::CT_NORTHEASTSOUTHWESTRESIZE as i32 {
+    } else if raw == CT_NORTHEASTSOUTHWESTRESIZE {
         CursorIcon::NeswResize
-    } else if v == T::CT_NORTHWESTSOUTHEASTRESIZE as i32 {
+    } else if raw == CT_NORTHWESTSOUTHEASTRESIZE {
         CursorIcon::NwseResize
-    } else if v == T::CT_COLUMNRESIZE as i32 {
+    } else if raw == CT_COLUMNRESIZE {
         CursorIcon::ColResize
-    } else if v == T::CT_ROWRESIZE as i32 {
+    } else if raw == CT_ROWRESIZE {
         CursorIcon::RowResize
-    } else if v == T::CT_MOVE as i32 {
+    } else if raw == CT_MOVE {
         CursorIcon::Move
-    } else if v == T::CT_VERTICALTEXT as i32 {
+    } else if raw == CT_VERTICALTEXT {
         CursorIcon::VerticalText
-    } else if v == T::CT_CELL as i32 {
+    } else if raw == CT_CELL {
         CursorIcon::Cell
-    } else if v == T::CT_CONTEXTMENU as i32 {
+    } else if raw == CT_CONTEXTMENU {
         CursorIcon::ContextMenu
-    } else if v == T::CT_ALIAS as i32 {
+    } else if raw == CT_ALIAS {
         CursorIcon::Alias
-    } else if v == T::CT_PROGRESS as i32 {
+    } else if raw == CT_PROGRESS {
         CursorIcon::Progress
-    } else if v == T::CT_NODROP as i32 || v == T::CT_NOTALLOWED as i32 {
+    } else if raw == CT_NODROP || raw == CT_NOTALLOWED {
         CursorIcon::NotAllowed
-    } else if v == T::CT_COPY as i32 || v == T::CT_DND_COPY as i32 {
+    } else if raw == CT_COPY || raw == CT_DND_COPY {
         CursorIcon::Copy
-    } else if v == T::CT_NONE as i32 {
+    } else if raw == CT_NONE {
         // winit has no "hide cursor" CursorIcon variant; closest match.
         CursorIcon::Default
-    } else if v == T::CT_ZOOMIN as i32 {
+    } else if raw == CT_ZOOMIN {
         CursorIcon::ZoomIn
-    } else if v == T::CT_ZOOMOUT as i32 {
+    } else if raw == CT_ZOOMOUT {
         CursorIcon::ZoomOut
-    } else if v == T::CT_GRAB as i32 {
+    } else if raw == CT_GRAB {
         CursorIcon::Grab
-    } else if v == T::CT_GRABBING as i32 {
+    } else if raw == CT_GRABBING {
         CursorIcon::Grabbing
-    } else if v == T::CT_DND_NONE as i32 {
+    } else if raw == CT_DND_NONE {
         CursorIcon::NotAllowed
-    } else if v == T::CT_DND_MOVE as i32 {
+    } else if raw == CT_DND_MOVE {
         CursorIcon::Move
-    } else if v == T::CT_DND_LINK as i32 {
+    } else if raw == CT_DND_LINK {
         CursorIcon::Alias
     } else {
         CursorIcon::Default
@@ -6076,7 +6034,7 @@ fn physical_key_to_vk(key: &winit::keyboard::PhysicalKey) -> i32 {
         // keyboards don't get their punctuation events dropped: those tools
         // route through `zwp_virtual_keyboard_v1`, which bypasses winit's
         // text-input pipeline (so `event.text == None`); without a VK code
-        // the early-return in `winit_key_to_cef_events` would discard them.
+        // the early-return in `winit_key_to_neutral_events` would discard them.
         KeyCode::Semicolon => 0xBA,    // VK_OEM_1
         KeyCode::Equal => 0xBB,        // VK_OEM_PLUS
         KeyCode::Comma => 0xBC,        // VK_OEM_COMMA
@@ -6155,7 +6113,7 @@ fn char_to_vk(ch: u16) -> Option<i32> {
     })
 }
 
-/// Build a CEF `KeyEvent` from a winit keyboard event.
+/// Build neutral [`NeutralKeyEvent`]s from a winit keyboard event.
 ///
 /// `focus_on_editable_field` reports whether a text input is currently
 /// focused — Chromium routes editable-field shortcuts and composition
@@ -6163,12 +6121,13 @@ fn char_to_vk(ch: u16) -> Option<i32> {
 /// pathways need it to dispatch keystrokes through the same DOM event
 /// flow as real-keyboard typing.
 ///
-/// Returns `None` for modifier-only presses (no VK code, no character).
-fn winit_key_to_cef_events(
+/// Returns an empty vec for modifier-only presses (no VK code, no character).
+fn winit_key_to_neutral_events(
     event: &winit::event::KeyEvent,
     modifiers: u32,
     focus_on_editable_field: bool,
-) -> Vec<KeyEvent> {
+) -> Vec<buffr_engine::NeutralKeyEvent> {
+    use buffr_engine::{KeyEventKind, NeutralKeyEvent};
     use winit::event::ElementState;
 
     let vk_from_phys = physical_key_to_vk(&event.physical_key);
@@ -6180,7 +6139,6 @@ fn winit_key_to_cef_events(
     // scancode-derived VK for shifted symbols / non-ASCII / no-text
     // events (real-keyboard typing matches both, so this is a no-op).
     let vk = char_to_vk(ch).unwrap_or(vk_from_phys);
-    let editable_flag = if focus_on_editable_field { 1 } else { 0 };
 
     // Skip pure modifier keys (no VK, no character text).
     if vk == 0 && ch == 0 {
@@ -6189,28 +6147,26 @@ fn winit_key_to_cef_events(
 
     match event.state {
         ElementState::Pressed => {
-            let raw = KeyEvent {
-                type_: KeyEventType::RAWKEYDOWN,
-                modifiers,
+            let raw = NeutralKeyEvent {
+                kind: KeyEventKind::RawDown,
                 windows_key_code: vk,
                 native_key_code: 0,
-                is_system_key: 0,
                 character: ch,
                 unmodified_character: ch,
-                focus_on_editable_field: editable_flag,
-                ..KeyEvent::default()
+                modifiers,
+                is_system_key: false,
+                focus_on_editable_field,
             };
             if ch != 0 {
-                let char_ev = KeyEvent {
-                    type_: KeyEventType::CHAR,
-                    modifiers,
+                let char_ev = NeutralKeyEvent {
+                    kind: KeyEventKind::Char,
                     windows_key_code: ch as i32,
                     native_key_code: 0,
-                    is_system_key: 0,
                     character: ch,
                     unmodified_character: ch,
-                    focus_on_editable_field: editable_flag,
-                    ..KeyEvent::default()
+                    modifiers,
+                    is_system_key: false,
+                    focus_on_editable_field,
                 };
                 vec![raw, char_ev]
             } else {
@@ -6218,16 +6174,15 @@ fn winit_key_to_cef_events(
             }
         }
         ElementState::Released => {
-            vec![KeyEvent {
-                type_: KeyEventType::KEYUP,
-                modifiers,
+            vec![NeutralKeyEvent {
+                kind: KeyEventKind::Up,
                 windows_key_code: vk,
                 native_key_code: 0,
-                is_system_key: 0,
                 character: ch,
                 unmodified_character: ch,
-                focus_on_editable_field: editable_flag,
-                ..KeyEvent::default()
+                modifiers,
+                is_system_key: false,
+                focus_on_editable_field,
             }]
         }
     }
@@ -6431,14 +6386,17 @@ fn paint_chrome_strips(
 /// Double-click detection window.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
-/// Map a winit `MouseButton` to a CEF `MouseButtonType`.
-/// Returns `None` for `Other(_)` buttons.
-fn winit_button_to_cef(button: &winit::event::MouseButton) -> Option<MouseButtonType> {
+/// Map a winit `MouseButton` to a neutral [`buffr_engine::MouseButton`].
+/// Returns `None` for `Other(_)` buttons — callers that need a fallback
+/// use [`buffr_engine::MouseButton::Other`] directly.
+fn winit_button_to_neutral(
+    button: &winit::event::MouseButton,
+) -> Option<buffr_engine::MouseButton> {
     use winit::event::MouseButton;
     match button {
-        MouseButton::Left => Some(MouseButtonType::LEFT),
-        MouseButton::Right => Some(MouseButtonType::RIGHT),
-        MouseButton::Middle => Some(MouseButtonType::MIDDLE),
+        MouseButton::Left => Some(buffr_engine::MouseButton::Left),
+        MouseButton::Right => Some(buffr_engine::MouseButton::Right),
+        MouseButton::Middle => Some(buffr_engine::MouseButton::Middle),
         _ => None,
     }
 }
@@ -7154,18 +7112,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let mut enter_visual = false;
                 let mut exit_visual = false;
                 if let Some(host) = self.host.as_ref()
-                    && let Some(cef_button) = winit_button_to_cef(&button)
+                    && let Some(cef_button) = winit_button_to_neutral(&button)
                 {
                     let mouse_up = state == winit::event::ElementState::Released;
                     // Track held mouse buttons so subsequent CursorMoved
                     // events carry the *_MOUSE_BUTTON event flag — without
                     // it, Chromium's hit-test treats drag-motion as plain
                     // hover and won't extend the text selection.
-                    let btn_flag: u32 = if cef_button == MouseButtonType::LEFT {
+                    let btn_flag: u32 = if cef_button == NeutralMouseButton::Left {
                         16
-                    } else if cef_button == MouseButtonType::MIDDLE {
+                    } else if cef_button == NeutralMouseButton::Middle {
                         32
-                    } else if cef_button == MouseButtonType::RIGHT {
+                    } else if cef_button == NeutralMouseButton::Right {
                         64
                     } else {
                         0
@@ -7429,7 +7387,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                                     editable,
                                     "page-mode Reject pass-through (key bypassed edit_mode_handle_key)"
                                 );
-                                for ev in winit_key_to_cef_events(&event, mods, editable) {
+                                for ev in winit_key_to_neutral_events(&event, mods, editable) {
                                     host.osr_key_event(ev);
                                 }
                             }
@@ -8130,7 +8088,7 @@ fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
     if let Some(at) = *next_pump_at {
         if Instant::now() >= at {
             tracing::trace!("cef: do_message_loop_work");
-            cef::do_message_loop_work();
+            buffr_cef::do_message_loop_work();
             *next_pump_at = None;
         }
     }
@@ -8138,14 +8096,7 @@ fn pump_cef_message_loop(next_pump_at: &mut Option<Instant>) {
 
 #[cfg(not(target_os = "macos"))]
 fn pump_cef_message_loop(_next_pump_at: &mut Option<Instant>) {
-    cef::do_message_loop_work();
-}
-
-// Silence the "unused import" lint when no `Browser` is materialized
-// yet; the trait re-export keeps method-call syntax working in `host.rs`.
-#[allow(dead_code)]
-fn _impl_browser_used() {
-    fn _f<T: ImplBrowser>(_: &T) {}
+    buffr_cef::do_message_loop_work();
 }
 
 // ---------------------------------------------------------------------------

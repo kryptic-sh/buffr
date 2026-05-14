@@ -617,10 +617,7 @@ dependencies = [
 name = "buffr-helper"
 version = "0.6.3"
 dependencies = [
- "anyhow",
  "buffr-cef",
- "buffr-core",
- "cef",
 ]
 
 [[package]]
