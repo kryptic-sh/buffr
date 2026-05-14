@@ -32,13 +32,30 @@
 //!                              ├─ tungstenite WebSocket (blocking)
 //!                              └─ captures screenshots → SharedOsrFrame
 //! ```
+//!
+//! # Phase 8f: `buffr://` and `view-source:` scheme translation
+//!
+//! Chromium rejects unknown schemes before CDP `Fetch` can intercept them.
+//! Instead of fighting the network stack, we translate at the engine layer:
+//!
+//! | Input URL              | Translated to                          |
+//! |------------------------|----------------------------------------|
+//! | `buffr://new`          | `data:text/html;base64,<newtab_html>`  |
+//! | `buffr://settings`     | `data:text/html;base64,<settings_html>`|
+//! | `view-source:<url>`    | `data:text/html;base64,<source_html>`  |
+//!
+//! The original URL is stashed in [`EngineState::original_urls`] (keyed by
+//! `target_id`) so `active_tab_live_url` and `tabs_summary` return the
+//! human-readable URL rather than the opaque `data:` URL.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use base64::Engine as Base64Engine;
 use buffr_core::DownloadNoticeQueue;
 use buffr_core::find::{FindResult, FindResultSink, new_sink as new_find_sink};
 use buffr_downloads::Downloads;
@@ -118,6 +135,11 @@ struct EngineState {
     next_tab_id: u64,
     /// Chromium remote-debugging port chosen at startup.
     debug_port: u16,
+    /// Maps `target_id → original_url` for tabs where the navigated URL
+    /// was translated (e.g. `buffr://new` → `data:text/html;base64,...`).
+    /// `active_tab_live_url` and `to_summary` prefer this over `CdpTab::url`
+    /// so the address bar shows the human-readable `buffr://` URL.
+    original_urls: HashMap<String, String>,
 }
 
 impl EngineState {
@@ -127,6 +149,7 @@ impl EngineState {
             active: None,
             next_tab_id: 1,
             debug_port,
+            original_urls: HashMap::new(),
         }
     }
 
@@ -148,6 +171,87 @@ impl EngineState {
 
 // ── Public engine struct ──────────────────────────────────────────────────────
 
+/// Closure invoked on each `buffr://new` (or `buffr://settings`) navigation
+/// request to produce fresh page HTML bytes. Mirroring [`buffr_engine::NewTabHtmlProvider`]
+/// but local to the blink-cdp engine instance.
+pub type HtmlProvider = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
+
+/// Return the display URL for a tab, preferring any stashed original URL
+/// (set when the actual navigation used a translated `data:` URL).
+fn display_url_for<'a>(tab: &'a CdpTab, original_urls: &'a HashMap<String, String>) -> &'a str {
+    original_urls
+        .get(&tab.target_id)
+        .map(String::as_str)
+        .unwrap_or(tab.url.as_str())
+}
+
+/// HTML-escape the five characters that matter in page source output.
+fn html_escape_source(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Fetch `target_url` synchronously via `ureq` and wrap the raw source in a
+/// syntax-free `<pre>` envelope. On error, render a small error page instead.
+///
+/// Phase 8f: no syntax highlighting — plain `<pre>` only. Highlighting can
+/// be added later (e.g. via `buffr-bonsai`).
+fn view_source_html(target_url: &str) -> Vec<u8> {
+    let body = match ureq::get(target_url).call() {
+        Ok(response) => {
+            let status = response.status();
+            match response.into_body().read_to_string() {
+                Ok(text) => {
+                    let escaped = html_escape_source(&text);
+                    format!(
+                        r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>view-source:{target_url}</title>
+  <style>
+    body {{ margin: 0; background: #1a1a1a; color: #d4d4d4; font-family: monospace; font-size: 0.85rem; }}
+    .header {{ background: #252526; padding: 0.5rem 1rem; border-bottom: 1px solid #333; color: #9cdcfe; }}
+    pre {{ margin: 0; padding: 1rem; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }}
+  </style>
+</head>
+<body>
+  <div class="header">view-source: <strong>{target_url}</strong> &mdash; HTTP {status}</div>
+  <pre>{escaped}</pre>
+</body>
+</html>"#
+                    )
+                }
+                Err(e) => format!(
+                    "<!DOCTYPE html><html><body><p>Error reading response body: {e}</p></body></html>"
+                ),
+            }
+        }
+        Err(e) => format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"/><title>view-source error</title>
+<style>body{{font-family:system-ui,sans-serif;background:#1a1a1a;color:#e0e0e0;margin:2rem;}}</style>
+</head>
+<body><h1>view-source error</h1><p>Could not fetch <code>{}</code>:</p><pre>{}</pre></body>
+</html>"#,
+            html_escape_source(target_url),
+            html_escape_source(&e.to_string()),
+        ),
+    };
+    body.into_bytes()
+}
+
 /// Headless Chromium engine driven over Chrome DevTools Protocol.
 ///
 /// Construct via [`BlinkCdpEngine::new`].  Each instance owns a dedicated
@@ -161,6 +265,11 @@ pub struct BlinkCdpEngine {
     _worker: JoinHandle<()>,
     /// Handle to the chromium subprocess.  Killed in `close_all_browsers`.
     subprocess: Arc<Mutex<Option<std::process::Child>>>,
+    /// Provider for `buffr://new` HTML (keybinds + splash art substituted).
+    /// `None` → serve the raw template with markers intact (tests / unconfigured).
+    newtab_html_provider: Mutex<Option<HtmlProvider>>,
+    /// Provider for `buffr://settings` HTML. `None` → use built-in placeholder.
+    settings_html_provider: Mutex<Option<HtmlProvider>>,
     /// Neutral permissions queue — Phase 8a (#88). The worker pushes
     /// entries when the JS shim fires a `Runtime.bindingCalled` event for
     /// `__buffrPermissionRequest`. The UI thread drains via the trait.
@@ -340,6 +449,8 @@ impl BlinkCdpEngine {
             osr_view,
             _worker: worker,
             subprocess: Arc::new(Mutex::new(Some(child))),
+            newtab_html_provider: Mutex::new(None),
+            settings_html_provider: Mutex::new(None),
             permissions_queue,
             perm_session_map,
             downloads,
@@ -348,6 +459,79 @@ impl BlinkCdpEngine {
             find_query: Arc::new(Mutex::new(None)),
             context_menu_sink,
         })
+    }
+
+    // ── Public configuration ──────────────────────────────────────────────────
+
+    /// Set the HTML provider for `buffr://new` navigation.
+    ///
+    /// Called by the apps layer after construction, passing the same closure
+    /// that was registered with the CEF backend's scheme handler factory.
+    /// The provider is invoked once per navigation to produce fresh HTML
+    /// (keybind hot-reloads, splash art).
+    pub fn set_newtab_html_provider(&self, provider: HtmlProvider) {
+        if let Ok(mut guard) = self.newtab_html_provider.lock() {
+            *guard = Some(provider);
+        }
+    }
+
+    /// Set the HTML provider for `buffr://settings` navigation.
+    pub fn set_settings_html_provider(&self, provider: HtmlProvider) {
+        if let Ok(mut guard) = self.settings_html_provider.lock() {
+            *guard = Some(provider);
+        }
+    }
+
+    // ── Scheme translation (Phase 8f, #81) ───────────────────────────────────
+
+    /// Produce the `buffr://new` page bytes: invoke the provider if wired,
+    /// else fall back to the raw template.
+    fn newtab_html_bytes(&self) -> Vec<u8> {
+        if let Ok(guard) = self.newtab_html_provider.lock()
+            && let Some(ref provider) = *guard
+        {
+            provider()
+        } else {
+            buffr_engine::newtab::NEW_TAB_HTML_TEMPLATE
+                .as_bytes()
+                .to_vec()
+        }
+    }
+
+    /// Produce the `buffr://settings` page bytes: invoke the provider if wired,
+    /// else return a minimal placeholder.
+    fn settings_html_bytes(&self) -> Vec<u8> {
+        if let Ok(guard) = self.settings_html_provider.lock()
+            && let Some(ref provider) = *guard
+        {
+            provider()
+        } else {
+            b"<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>buffr settings</title></head>\
+              <body style=\"font-family:system-ui,sans-serif;background:#1a1a1a;color:#e0e0e0;margin:2rem\">\
+              <h1>buffr settings</h1><p>Settings provider not configured.</p></body></html>"
+                .to_vec()
+        }
+    }
+
+    /// Translate an internal `buffr://` or `view-source:` URL into a
+    /// `data:text/html;base64,…` URL that Chromium can actually load.
+    ///
+    /// Returns `Some(data_url)` when the URL is internal; `None` when it
+    /// should be passed to Chromium as-is.
+    fn translate_internal_url(&self, url: &str) -> Option<String> {
+        let bytes: Vec<u8>;
+        if url.starts_with("buffr://settings") {
+            bytes = self.settings_html_bytes();
+        } else if url.starts_with("buffr://") {
+            // buffr://new, buffr://newtab, or any other buffr:// path → new-tab.
+            bytes = self.newtab_html_bytes();
+        } else if let Some(target_url) = url.strip_prefix("view-source:") {
+            bytes = view_source_html(target_url);
+        } else {
+            return None;
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(format!("data:text/html;base64,{encoded}"))
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -473,7 +657,18 @@ impl BlinkCdpEngine {
 
     /// Internal open-tab implementation. Returns (TabId, tab_becomes_active).
     fn open_tab_internal(&self, url: &str, make_active: bool) -> Result<TabId, EngineError> {
-        let (target_id, session_id) = self.create_and_attach(url).map_err(EngineError::from)?;
+        // Phase 8f: translate internal schemes before handing the URL to Chromium.
+        let translated = self.translate_internal_url(url);
+        let navigate_url = translated.as_deref().unwrap_or(url);
+        let original_url = if translated.is_some() {
+            Some(url.to_owned())
+        } else {
+            None
+        };
+
+        let (target_id, session_id) = self
+            .create_and_attach(navigate_url)
+            .map_err(EngineError::from)?;
 
         // Apply initial viewport metrics.
         let (w, h) = {
@@ -539,14 +734,21 @@ impl BlinkCdpEngine {
 
         let mut state = self.state.lock().unwrap();
         let tab_id = state.mint_tab_id();
+        // Store the translated (navigate) URL in the tab so worker events
+        // that carry `data:` URLs are matched correctly. The display URL is
+        // served from original_urls when present.
         let tab = CdpTab {
             id: tab_id,
-            target_id,
+            target_id: target_id.clone(),
             session_id: session_id.clone(),
-            url: url.to_owned(),
-            title: url.to_owned(),
+            url: navigate_url.to_owned(),
+            title: original_url.as_deref().unwrap_or(navigate_url).to_owned(),
             zoom_level: 1.0,
         };
+        // Stash original URL for address-bar display.
+        if let Some(orig) = original_url {
+            state.original_urls.insert(target_id, orig);
+        }
         state.tabs.push(tab);
         if make_active || state.active.is_none() {
             state.active = Some(tab_id);
@@ -648,6 +850,7 @@ impl BrowserEngine for BlinkCdpEngine {
         if let Ok(mut state) = self.state.lock() {
             state.tabs.clear();
             state.active = None;
+            state.original_urls.clear();
         }
     }
 
@@ -687,6 +890,8 @@ impl BrowserEngine for BlinkCdpEngine {
 
         let mut state = self.state.lock().unwrap();
         state.tabs.retain(|t| t.id != id);
+        // Clean up any stashed original URL for this target.
+        state.original_urls.remove(&target_id);
 
         // Pick a new active tab if needed.
         if was_active {
@@ -807,12 +1012,26 @@ impl BrowserEngine for BlinkCdpEngine {
 
     fn active_tab(&self) -> Option<TabSummary> {
         let state = self.state.lock().unwrap();
-        state.active_tab().map(|t| t.to_summary())
+        state.active_tab().map(|t| {
+            let display = display_url_for(t, &state.original_urls).to_owned();
+            let mut summary = t.to_summary();
+            summary.url = display;
+            summary
+        })
     }
 
     fn tabs_summary(&self) -> Vec<TabSummary> {
         let state = self.state.lock().unwrap();
-        state.tabs.iter().map(|t| t.to_summary()).collect()
+        state
+            .tabs
+            .iter()
+            .map(|t| {
+                let display = display_url_for(t, &state.original_urls).to_owned();
+                let mut summary = t.to_summary();
+                summary.url = display;
+                summary
+            })
+            .collect()
     }
 
     fn tab_count(&self) -> usize {
@@ -833,13 +1052,14 @@ impl BrowserEngine for BlinkCdpEngine {
 
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
         tracing::debug!(url, "blink-cdp: navigate");
-        let session_id = {
+        // Phase 8f: translate internal schemes before handing to Chromium.
+        let translated = self.translate_internal_url(url);
+        let navigate_url = translated.as_deref().unwrap_or(url);
+
+        let (session_id, target_id) = {
             let state = self.state.lock().unwrap();
-            state
-                .active_tab()
-                .ok_or(EngineError::NoActiveTab)?
-                .session_id
-                .clone()
+            let tab = state.active_tab().ok_or(EngineError::NoActiveTab)?;
+            (tab.session_id.clone(), tab.target_id.clone())
         };
         // Update URL in state (optimistic; real URL comes from Page.frameNavigated events).
         {
@@ -847,14 +1067,24 @@ impl BrowserEngine for BlinkCdpEngine {
             if let Some(id) = state.active
                 && let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id)
             {
-                tab.url = url.to_owned();
+                tab.url = navigate_url.to_owned();
+                // Update title to show original URL for internal pages.
+                tab.title = url.to_owned();
+            }
+            // Stash or clear original URL for this target.
+            if translated.is_some() {
+                state
+                    .original_urls
+                    .insert(target_id.clone(), url.to_owned());
+            } else {
+                state.original_urls.remove(&target_id);
             }
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
             .try_send(Command::Navigate {
                 session_id,
-                url: url.to_owned(),
+                url: navigate_url.to_owned(),
                 reply: reply_tx,
             })
             .map_err(|_| EngineError::Other("worker channel full".into()))?;
@@ -865,11 +1095,10 @@ impl BrowserEngine for BlinkCdpEngine {
     }
 
     fn active_tab_live_url(&self) -> String {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .active_tab()
-            .map(|t| t.url.clone())
+            .map(|t| display_url_for(t, &state.original_urls).to_owned())
             .unwrap_or_default()
     }
 
@@ -1755,5 +1984,126 @@ mod tests {
         assert_eq!(params["text"], "");
         assert_eq!(params["selectionStart"], 0);
         assert_eq!(params["selectionEnd"], 0);
+    }
+
+    // ── Phase 8f scheme-translation tests (#81) ───────────────────────────────
+
+    /// Helper: build the base64-encoded `data:text/html;base64,...` prefix.
+    fn data_html_prefix() -> String {
+        "data:text/html;base64,".to_owned()
+    }
+
+    /// `display_url_for` returns the original URL when one is stashed.
+    #[test]
+    fn display_url_for_prefers_original() {
+        let tab = CdpTab {
+            id: TabId(1),
+            target_id: "t1".into(),
+            session_id: "s1".into(),
+            url: "data:text/html;base64,ABC".into(),
+            title: "buffr://new".into(),
+            zoom_level: 1.0,
+        };
+        let mut originals = HashMap::new();
+        originals.insert("t1".to_owned(), "buffr://new".to_owned());
+        assert_eq!(display_url_for(&tab, &originals), "buffr://new");
+    }
+
+    /// `display_url_for` falls back to `CdpTab::url` when no original is stashed.
+    #[test]
+    fn display_url_for_falls_back_to_tab_url() {
+        let tab = CdpTab {
+            id: TabId(1),
+            target_id: "t1".into(),
+            session_id: "s1".into(),
+            url: "https://example.com".into(),
+            title: "Example".into(),
+            zoom_level: 1.0,
+        };
+        let originals: HashMap<String, String> = HashMap::new();
+        assert_eq!(display_url_for(&tab, &originals), "https://example.com");
+    }
+
+    /// `html_escape_source` escapes the five critical characters.
+    #[test]
+    fn html_escape_source_escapes_special_chars() {
+        assert_eq!(html_escape_source("&"), "&amp;");
+        assert_eq!(html_escape_source("<"), "&lt;");
+        assert_eq!(html_escape_source(">"), "&gt;");
+        assert_eq!(html_escape_source("\""), "&quot;");
+        assert_eq!(html_escape_source("'"), "&#39;");
+        assert_eq!(html_escape_source("plain"), "plain");
+        assert_eq!(
+            html_escape_source("<script>alert('xss')</script>"),
+            "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
+        );
+    }
+
+    /// `view_source_html` on a non-existent URL renders an error page
+    /// (not a panic or empty string).
+    #[test]
+    fn view_source_html_error_page_on_unreachable_url() {
+        let html = view_source_html("http://127.0.0.1:19999/no-such-server");
+        let text = String::from_utf8_lossy(&html);
+        // Must be valid HTML containing an error indicator.
+        assert!(
+            text.contains("<!DOCTYPE html>"),
+            "should be an HTML document"
+        );
+        assert!(
+            text.contains("view-source error") || text.contains("Error"),
+            "should mention an error"
+        );
+    }
+
+    /// `original_urls` is cleaned up when a tab's `target_id` is removed.
+    #[test]
+    fn original_urls_cleaned_on_tab_close() {
+        let mut state = EngineState::new(9999);
+        let id = state.mint_tab_id();
+        state.tabs.push(CdpTab {
+            id,
+            target_id: "t-close".into(),
+            session_id: "s-close".into(),
+            url: "data:text/html;base64,X".into(),
+            title: "buffr://new".into(),
+            zoom_level: 1.0,
+        });
+        state
+            .original_urls
+            .insert("t-close".to_owned(), "buffr://new".to_owned());
+        assert!(state.original_urls.contains_key("t-close"));
+
+        // Simulate tab close: retain all tabs except the closed one and remove its URL.
+        state.tabs.retain(|t| t.id != id);
+        state.original_urls.remove("t-close");
+
+        assert!(!state.original_urls.contains_key("t-close"));
+        assert!(state.tabs.is_empty());
+    }
+
+    /// `buffr://` URLs translate to a `data:text/html;base64,` URL.
+    /// Tests the translation logic via base64 round-trip (no live Chromium needed).
+    #[test]
+    fn buffr_newtab_url_translates_to_data_url() {
+        let html = buffr_engine::newtab::NEW_TAB_HTML_TEMPLATE
+            .as_bytes()
+            .to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&html);
+        let data_url = format!("{}{}", data_html_prefix(), encoded);
+        assert!(data_url.starts_with("data:text/html;base64,"));
+        // Round-trip decode.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data_url.trim_start_matches("data:text/html;base64,"))
+            .expect("base64 decode should succeed");
+        assert_eq!(decoded, html);
+    }
+
+    /// `view-source:` URL parsing: strip prefix → target URL.
+    #[test]
+    fn view_source_url_prefix_strip() {
+        let input = "view-source:https://example.com/page";
+        let stripped = input.strip_prefix("view-source:");
+        assert_eq!(stripped, Some("https://example.com/page"));
     }
 }

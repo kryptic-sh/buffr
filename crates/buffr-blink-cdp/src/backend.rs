@@ -6,22 +6,32 @@
 //! blink-cdp spawns Chromium lazily on first `open_engine` call.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use buffr_core::DownloadNoticeQueue;
 use buffr_downloads::Downloads;
 use buffr_engine::{Backend, BackendOpenOptions, BrowserEngine, NewTabHtmlProvider};
 
 use crate::BlinkCdpEngine;
+use crate::engine::HtmlProvider;
 
 /// Blink-CDP process-model lifecycle backend.
 ///
 /// Construct with `BlinkCdpBackend::new()` and wrap in `Arc<dyn Backend>`.
-pub struct BlinkCdpBackend;
+///
+/// Stores `buffr://` HTML providers registered via
+/// [`Backend::register_new_tab_handler`] and wires them into each engine
+/// created by [`Backend::open_engine`].
+pub struct BlinkCdpBackend {
+    /// Stored new-tab HTML provider (set by `register_new_tab_handler`).
+    newtab_provider: Mutex<Option<HtmlProvider>>,
+}
 
 impl BlinkCdpBackend {
     pub fn new() -> Self {
-        BlinkCdpBackend
+        BlinkCdpBackend {
+            newtab_provider: Mutex::new(None),
+        }
     }
 }
 
@@ -85,6 +95,14 @@ impl Backend for BlinkCdpBackend {
             None,
         )
         .map_err(|e| e.to_string())?;
+
+        // Wire up any registered HTML providers (Phase 8f, #81).
+        if let Ok(guard) = self.newtab_provider.lock()
+            && let Some(ref provider) = *guard
+        {
+            engine.set_newtab_html_provider(Arc::clone(provider));
+        }
+
         Ok(Arc::new(engine) as Arc<dyn BrowserEngine>)
     }
 
@@ -93,11 +111,19 @@ impl Backend for BlinkCdpBackend {
         Ok(())
     }
 
-    fn register_new_tab_handler(&self, _provider: NewTabHtmlProvider) {
-        // Blink-CDP does not serve internal buffr:// pages.
+    /// Store the new-tab HTML provider for use in subsequent `open_engine` calls.
+    ///
+    /// The blink-cdp backend translates `buffr://new` navigations to
+    /// `data:text/html;base64,...` URLs at the engine layer (Phase 8f, #81).
+    /// The provider is invoked on each navigation to produce fresh HTML.
+    fn register_new_tab_handler(&self, provider: NewTabHtmlProvider) {
+        if let Ok(mut guard) = self.newtab_provider.lock() {
+            *guard = Some(provider);
+        }
     }
 
     fn register_view_source_handler(&self) {
-        // Blink-CDP does not serve buffr-src: pages.
+        // view-source: is handled at the engine layer (Phase 8f, #81);
+        // no global registration needed.
     }
 }
