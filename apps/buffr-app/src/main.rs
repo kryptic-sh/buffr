@@ -156,6 +156,7 @@ use buffr_ui::{
 };
 
 mod crash_guard;
+mod engine_router;
 mod heartbeat;
 mod loading_anim;
 mod render;
@@ -873,6 +874,7 @@ fn main() -> Result<()> {
     });
 
     let search_config = Arc::new(config.search.clone());
+    let engines_config = Arc::new(config.engines.clone());
 
     // -------- session restore -----------------------------------------
     //
@@ -984,6 +986,7 @@ fn main() -> Result<()> {
         permissions_queue.clone(),
         download_notice_queue,
         search_config,
+        engines_config,
         cli.private,
         find_sink,
         hint_sink,
@@ -1029,8 +1032,12 @@ fn main() -> Result<()> {
     // Drop ONLY the host first. This releases every Browser ref while
     // CEF's threads are still running, so CEF can finish the close
     // callbacks instead of segfaulting on dangling refs during its
-    // own shutdown.
+    // own shutdown. Drop the engine router at the same time — it holds
+    // an Arc<dyn BrowserEngine> that aliases the same BrowserHost, so
+    // the host would otherwise not deallocate until app_state drops
+    // after cef::shutdown (which would be too late).
     info!("shutdown: dropping host");
+    drop(app_state.engine_router.take());
     drop(app_state.host.take());
 
     // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
@@ -1690,7 +1697,15 @@ struct AppState {
     // pointer; dropping `window` first frees that display and the
     // inhibitor's Drop (which sends Release + Shutdown then calls
     // `inh.destroy()` + `conn.flush()`) would touch a dead fd.
-    host: Option<buffr_cef::BrowserHost>,
+    //
+    // Phase 2: `host` is Arc-wrapped so the engine router can hold a
+    // `Arc<dyn BrowserEngine>` reference to the same value without
+    // requiring Clone. All existing call sites work unchanged via Deref.
+    host: Option<Arc<buffr_cef::BrowserHost>>,
+    /// Phase 2: engine router — resolves URL → registered backend.
+    /// `None` until the host is constructed in `resumed`. With only the
+    /// CEF backend registered every tab routes to `host`.
+    engine_router: Option<Arc<engine_router::EngineRouter>>,
     idle_inhibitor: Option<Box<dyn IdleInhibitor>>,
     window: Option<Arc<Window>>,
     engine: Arc<Mutex<Engine>>,
@@ -1727,6 +1742,9 @@ struct AppState {
     /// Resolved search config used by the omnibar's URL-or-search
     /// resolver on Enter.
     search_config: Arc<buffr_config::Search>,
+    /// Engine routing config. Held so the router can be (re)built on
+    /// first window creation without needing access to the full Config.
+    engines_config: Arc<buffr_config::Engines>,
     /// Active overlay (top-of-window input bar). `None` when the
     /// engine is in any non-overlay mode; the CEF child rect uses the
     /// full vertical space minus the bottom statusline.
@@ -2286,6 +2304,7 @@ impl AppState {
         permissions_queue: PermissionsQueue,
         download_notice_queue: DownloadNoticeQueue,
         search_config: Arc<buffr_config::Search>,
+        engines_config: Arc<buffr_config::Engines>,
         private: bool,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
@@ -2324,6 +2343,7 @@ impl AppState {
         Self {
             homepage,
             host: None,
+            engine_router: None,
             window: None,
             engine,
             history,
@@ -2337,6 +2357,7 @@ impl AppState {
             confirm_close_pinned: None,
             download_notice_queue,
             search_config,
+            engines_config,
             overlay: None,
             private,
             modifiers: ModifiersState::empty(),
@@ -2451,6 +2472,55 @@ impl AppState {
     /// Mark the chrome texture as needing a repaint.
     fn mark_chrome_dirty(&mut self) {
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
+    }
+
+    // ── Engine routing helpers ────────────────────────────────────────────────
+    //
+    // Phase 2: route tab-spawn calls through the engine router so the
+    // dispatch path is exercised. With only `buffr-cef` registered, every
+    // URL resolves to the same engine and behaviour is unchanged.
+
+    /// Open a new foreground tab, routing through the engine router.
+    fn routed_open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
+        if let Some(router) = &self.engine_router {
+            router.engine_for(url).open_tab(url)
+        } else if let Some(host) = &self.host {
+            buffr_engine::BrowserEngine::open_tab(host.as_ref(), url)
+        } else {
+            Err(buffr_engine::EngineError::Other(
+                "no engine available".into(),
+            ))
+        }
+    }
+
+    /// Open a new background tab, routing through the engine router.
+    fn routed_open_tab_background(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
+        if let Some(router) = &self.engine_router {
+            router.engine_for(url).open_tab_background(url)
+        } else if let Some(host) = &self.host {
+            buffr_engine::BrowserEngine::open_tab_background(host.as_ref(), url)
+        } else {
+            Err(buffr_engine::EngineError::Other(
+                "no engine available".into(),
+            ))
+        }
+    }
+
+    /// Open a new tab at a specific index, routing through the engine router.
+    fn routed_open_tab_at(
+        &self,
+        url: &str,
+        insert_idx: usize,
+    ) -> Result<TabId, buffr_engine::EngineError> {
+        if let Some(router) = &self.engine_router {
+            router.engine_for(url).open_tab_at(url, insert_idx)
+        } else if let Some(host) = &self.host {
+            buffr_engine::BrowserEngine::open_tab_at(host.as_ref(), url, insert_idx)
+        } else {
+            Err(buffr_engine::EngineError::Other(
+                "no engine available".into(),
+            ))
+        }
     }
 
     /// Push a new `present_us` sample into the rolling history and run
@@ -2584,8 +2654,12 @@ impl AppState {
             // `O` from the first pinned tab would push the unpinned
             // entry into the pinned-only leading band.
             let insert_idx = raw_idx.max(host.pinned_count());
-            // Last use of `host` — NLL releases the shared borrow here.
-            let result = host.open_tab_at(&self.homepage, insert_idx);
+            let url = self.homepage.clone();
+            // Phase 2: route through the engine router (single-backend
+            // no-op today; ready for multi-engine Phase 3).
+            // `host` borrow ends here; `routed_open_tab_at` only borrows
+            // `self.engine_router` so there's no conflict.
+            let result = self.routed_open_tab_at(&url, insert_idx);
             match result {
                 Ok(new_id) => {
                     // If the user cancels the omnibar without typing a
@@ -2610,7 +2684,7 @@ impl AppState {
             A::TabNewRight | A::TabNewLeft => unreachable!("handled above"),
             A::TabNew => {
                 let url = self.homepage.clone();
-                if let Err(err) = host.open_tab(&url) {
+                if let Err(err) = self.routed_open_tab(&url) {
                     warn!(error = %err, %url, "tab_new: failed");
                 }
             }
@@ -2855,7 +2929,8 @@ impl AppState {
                     }
                     continue;
                 }
-                match host.open_tab_background(url) {
+                // Phase 2: route through the engine router.
+                match self.routed_open_tab_background(url) {
                     Ok(id) => {
                         if *pinned {
                             // The new tab is in the background, so the
@@ -2883,7 +2958,7 @@ impl AppState {
             // CLI `--new-tab` URLs append after the session.
             let cli_tabs = std::mem::take(&mut self.pending_new_tabs);
             for url in cli_tabs {
-                match host.open_tab_background(&url) {
+                match self.routed_open_tab_background(&url) {
                     Ok(_) => {
                         if let Some(last) = host.tabs_summary().last() {
                             prefill_queue.push((last.browser_id, url.clone()));
@@ -6600,6 +6675,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     effective_scale,
                     "initial device scale applied to host",
                 );
+                let host = Arc::new(host);
+                // Build the engine router with the CEF backend registered.
+                // With only one backend in Phase 2, every URL resolves to
+                // "cef" — behaviour is identical to the pre-router path.
+                let cef_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::clone(&host) as _;
+                let mut router_builder = engine_router::EngineRouter::builder()
+                    .register(buffr_engine::EngineId::new("cef"), cef_engine)
+                    .default_engine(buffr_engine::EngineId::new(&self.engines_config.default));
+                for rule in &self.engines_config.rules {
+                    router_builder = router_builder.rule(rule.pattern.clone(), rule.engine.clone());
+                }
+                match router_builder.build() {
+                    Ok(router) => {
+                        tracing::debug!("engine router built ({} engine(s))", {
+                            router.engine_ids().count()
+                        });
+                        self.engine_router = Some(Arc::new(router));
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "engine router build failed — tab-spawn will fall back to host directly");
+                    }
+                }
                 self.host = Some(host);
             }
             Err(err) => {
