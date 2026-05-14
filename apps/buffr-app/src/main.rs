@@ -2624,6 +2624,12 @@ impl AppState {
     }
 
     /// Open a new foreground tab, routing through the engine router.
+    ///
+    /// Currently unused — `TabNew` was changed to open on the active
+    /// engine directly (routing the placeholder homepage URL would send
+    /// the new tab to the default engine instead of the engine the user
+    /// is viewing). Kept for the future omnibar-submit cross-engine flow.
+    #[allow(dead_code)]
     fn routed_open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab(url)
@@ -2650,6 +2656,10 @@ impl AppState {
     }
 
     /// Open a new tab at a specific index, routing through the engine router.
+    ///
+    /// Currently unused for the same reason as [`Self::routed_open_tab`] —
+    /// see that method's note.
+    #[allow(dead_code)]
     fn routed_open_tab_at(
         &self,
         url: &str,
@@ -2870,10 +2880,20 @@ impl AppState {
             // entry into the pinned-only leading band.
             let insert_idx = raw_idx.max(engine.pinned_count());
             let url = self.homepage.clone();
-            // Route through the engine router (single-backend no-op when no
-            // router is configured; `engine` borrow ends here so the borrow
-            // checker sees `routed_open_tab_at` only borrows `engine_router`).
-            let result = self.routed_open_tab_at(&url, insert_idx);
+            // Open on the CURRENT engine, not via the router. The user
+            // pressed `o`/`O` while looking at this engine — they expect
+            // the tab to appear here, not on whichever engine the router's
+            // default points at. Routing kicks in only when the user
+            // navigates with a real URL (via the omnibar submit path),
+            // which calls into `routed_open_tab` / cross-engine logic.
+            //
+            // Before this fix, multi-engine configs (e.g. default=cef +
+            // blink-cdp by domain) would open a `cef` tab when the user
+            // pressed `o` on a `blink-cdp` tab, and the omnibar would
+            // pre-fill from `blink-cdp`'s still-current tab — making it
+            // look like nothing happened except an omnibar opening on
+            // the current tab.
+            let result = engine.open_tab_at(&url, insert_idx);
             match result {
                 Ok(new_id) => {
                     // If the user cancels the omnibar without typing a
@@ -2897,8 +2917,12 @@ impl AppState {
         match action {
             A::TabNewRight | A::TabNewLeft => unreachable!("handled above"),
             A::TabNew => {
+                // Same rationale as the TabNewRight/TabNewLeft branch above:
+                // open on the current engine, not via the router. The user
+                // expects the new tab on the engine they're already viewing;
+                // the router applies only on real-URL navigation.
                 let url = self.homepage.clone();
-                if let Err(err) = self.routed_open_tab(&url) {
+                if let Err(err) = host.open_tab(&url) {
                     warn!(error = %err, %url, "tab_new: failed");
                 }
             }
@@ -3211,21 +3235,41 @@ impl AppState {
             // initial tab via the engine constructor; the rest open in the
             // background so the user lands on tab 0.
             let session = std::mem::take(&mut self.pending_session_tabs);
+            // CEF auto-creates an initial homepage tab during `open_engine`,
+            // so the first restored URL navigates that existing tab.
+            // blink-cdp starts with zero tabs, so the first restored URL must
+            // be opened, not navigated. Detect by querying tab_count().
+            let has_initial_tab = host.tab_count() > 0;
             for (i, (url, pinned)) in session.iter().enumerate() {
-                if i == 0 {
-                    // The initial `BrowserHost::new` already loaded tab 0
-                    // with `homepage`. Navigate the active tab there
-                    // instead of opening a new one so we don't end up
-                    // with a stray homepage tab.
+                if i == 0 && has_initial_tab {
+                    // CEF path: navigate the auto-created tab in place so we
+                    // don't end up with a stray homepage tab.
                     if let Err(err) = host.navigate(url) {
                         warn!(error = %err, %url, "session: navigate first tab failed");
                     }
                     if *pinned && let Some(active) = host.active_tab() {
                         host.set_pinned(active.id, true);
                     }
-                    // Queue a prefill for the active tab's browser_id.
                     if let Some(active) = host.active_tab() {
                         prefill_queue.push((active.browser_id, url.clone()));
+                    }
+                    continue;
+                }
+                if i == 0 {
+                    // blink-cdp path: open tab 0 as a foreground tab so it
+                    // becomes active and matches the user's last session.
+                    match host.open_tab(url) {
+                        Ok(id) => {
+                            if *pinned {
+                                host.set_pinned(id, true);
+                            }
+                            if let Some(last) = host.tabs_summary().last() {
+                                prefill_queue.push((last.browser_id, url.clone()));
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, %url, "session: open first tab failed")
+                        }
                     }
                     continue;
                 }
