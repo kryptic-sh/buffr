@@ -172,6 +172,13 @@ pub enum PageAction {
     /// Exit insert mode unconditionally — blurs the focused DOM element
     /// and returns the engine to PageMode::Normal.
     ExitInsertMode,
+
+    // -- engine -----------------------------------------------------------
+    /// Rebind the active tab to a different rendering engine. The apps
+    /// layer snapshots the current URL, closes the tab on the source
+    /// engine, and reopens it on the target engine identified by `id`.
+    /// Emits a status-line error when `id` is not registered.
+    Engine(String),
 }
 
 impl PageAction {

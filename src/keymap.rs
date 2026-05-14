@@ -405,6 +405,7 @@ fn action_kind(a: &PageAction) -> &'static str {
         PageAction::EnterInsertMode => "EnterInsertMode",
         PageAction::FocusFirstInput => "FocusFirstInput",
         PageAction::ExitInsertMode => "ExitInsertMode",
+        PageAction::Engine(_) => "Engine",
     }
 }
 
