@@ -9,6 +9,7 @@
 //! - `[privacy]` — telemetry / clear-on-exit.
 //! - `[keymap.<mode>]` — `"j" = "scroll_down"` style entries that
 //!   parse into [`buffr_modal::PageAction`].
+//! - `[engines]` — default browser backend + per-domain routing rules.
 //!
 //! XDG path resolution via `directories::ProjectDirs::from("sh",
 //! "kryptic", "buffr")`. Loader returns `(Config, ConfigSource)` so
@@ -57,6 +58,13 @@ pub struct Config {
     pub updates: UpdateConfig,
     pub accessibility: AccessibilityConfig,
     pub idle_inhibit: IdleInhibitConfig,
+    /// `[engines]` — browser backend routing.
+    ///
+    /// `default` names the engine id used when no rule matches.
+    /// `rules` is an ordered list of `[[engines.rules]]` entries each
+    /// carrying a `match` glob and an `engine` id. Rules are tested in
+    /// declaration order; the first matching rule wins.
+    pub engines: Engines,
     #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
@@ -297,6 +305,65 @@ impl Default for IdleInhibitConfig {
             require_focus: true,
         }
     }
+}
+
+// ── Engine routing ────────────────────────────────────────────────────────
+
+fn default_engine_id() -> String {
+    "cef".to_string()
+}
+
+/// `[engines]` section — browser backend routing.
+///
+/// ```toml
+/// [engines]
+/// default = "cef"
+///
+/// [[engines.rules]]
+/// match = "*.figma.com"
+/// engine = "webkit"
+/// ```
+///
+/// The `default` engine id is used for every URL that does not match a rule.
+/// Rules are evaluated in declaration order; the first match wins. Engine ids
+/// are free-form strings that must correspond to a backend registered at
+/// runtime — the config crate does not know the set of registered engines.
+/// Validation against the registry happens in `engine_router`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Engines {
+    /// Engine id used when no rule matches. Defaults to `"cef"`.
+    #[serde(default = "default_engine_id")]
+    pub default: String,
+    /// Ordered list of per-domain routing rules. Evaluated in declaration
+    /// order; the first matching rule wins.
+    #[serde(default)]
+    pub rules: Vec<EngineRule>,
+}
+
+impl Default for Engines {
+    fn default() -> Self {
+        Self {
+            default: default_engine_id(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// One per-domain engine routing rule inside `[[engines.rules]]`.
+///
+/// `match` is a glob pattern tested against the URL's host component
+/// (case-insensitive). Examples: `"*.figma.com"`, `"figma.com"`. The field
+/// is named `pattern` in Rust (because `match` is a keyword) and serialised
+/// as `match` in TOML via `#[serde(rename = "match")]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineRule {
+    /// Glob pattern for the URL host. See [`Engines`] for examples.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Engine id to route matching URLs to.
+    pub engine: String,
 }
 
 /// Categories of locally-stored data the shutdown hook can wipe when
@@ -670,6 +737,35 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                         e
                     ),
                     location: Some(format!("keymap.{}.{:?}", mode_name(*mode), keys)),
+                });
+            }
+        }
+    }
+
+    // -- engines --------------------------------------------------------------
+    // Validate that `default` is non-empty and that every rule has a
+    // non-empty `match` pattern and `engine` id. We intentionally do NOT
+    // validate engine ids against the runtime registry here — the config
+    // crate has no knowledge of registered backends; that check belongs in
+    // `engine_router::EngineRouterBuilder::build`.
+    {
+        if cfg.engines.default.is_empty() {
+            return Err(ConfigError::Validate {
+                message: "engines.default must not be empty".into(),
+                location: Some("engines.default".into()),
+            });
+        }
+        for (i, rule) in cfg.engines.rules.iter().enumerate() {
+            if rule.pattern.is_empty() {
+                return Err(ConfigError::Validate {
+                    message: format!("engines.rules[{i}].match must not be empty"),
+                    location: Some(format!("engines.rules[{i}].match")),
+                });
+            }
+            if rule.engine.is_empty() {
+                return Err(ConfigError::Validate {
+                    message: format!("engines.rules[{i}].engine must not be empty"),
+                    location: Some(format!("engines.rules[{i}].engine")),
                 });
             }
         }
@@ -1168,5 +1264,95 @@ ask_each_time = false
         let cfg: Config = toml::from_str(toml).unwrap();
         validate(&cfg).unwrap();
         assert_eq!(cfg.general.homepage, "https://example.com");
+    }
+
+    // ── engines section ───────────────────────────────────────────────────────
+
+    #[test]
+    fn config_engines_default_is_cef_when_omitted() {
+        let cfg = Config::default();
+        assert_eq!(cfg.engines.default, "cef");
+        assert!(cfg.engines.rules.is_empty());
+    }
+
+    #[test]
+    fn config_engines_rules_parse() {
+        let toml = r#"
+[engines]
+default = "cef"
+
+[[engines.rules]]
+match = "*.figma.com"
+engine = "webkit"
+
+[[engines.rules]]
+match = "example.com"
+engine = "cef"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.engines.default, "cef");
+        assert_eq!(cfg.engines.rules.len(), 2);
+        assert_eq!(cfg.engines.rules[0].pattern, "*.figma.com");
+        assert_eq!(cfg.engines.rules[0].engine, "webkit");
+        assert_eq!(cfg.engines.rules[1].pattern, "example.com");
+        assert_eq!(cfg.engines.rules[1].engine, "cef");
+    }
+
+    #[test]
+    fn config_engines_round_trip() {
+        let mut cfg = Config::default();
+        cfg.engines.rules.push(crate::EngineRule {
+            pattern: "*.figma.com".into(),
+            engine: "webkit".into(),
+        });
+        let s = to_toml_string(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&s).unwrap();
+        assert_eq!(parsed.engines, cfg.engines);
+    }
+
+    #[test]
+    fn config_engines_load_rejects_empty_default() {
+        let mut cfg = Config::default();
+        cfg.engines.default = String::new();
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, location } => {
+                assert!(message.contains("engines.default"), "msg: {message}");
+                assert_eq!(location.as_deref(), Some("engines.default"));
+            }
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn config_engines_load_rejects_empty_rule_pattern() {
+        let mut cfg = Config::default();
+        cfg.engines.rules.push(crate::EngineRule {
+            pattern: String::new(),
+            engine: "cef".into(),
+        });
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("match"), "msg: {message}");
+            }
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn config_engines_load_rejects_empty_rule_engine() {
+        let mut cfg = Config::default();
+        cfg.engines.rules.push(crate::EngineRule {
+            pattern: "*.example.com".into(),
+            engine: String::new(),
+        });
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("engine"), "msg: {message}");
+            }
+            _ => panic!("expected Validate error"),
+        }
     }
 }
