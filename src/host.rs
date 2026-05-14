@@ -361,6 +361,15 @@ impl ClipboardReader {
     }
 }
 
+/// `ClipboardReader` satisfies the engine-agnostic [`buffr_engine::ClipboardRead`]
+/// trait so the apps layer can accept it as `Arc<dyn ClipboardRead>` without
+/// depending on `hjkl_clipboard` directly.
+impl buffr_engine::ClipboardRead for ClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        self.read_text()
+    }
+}
+
 impl BrowserHost {
     /// Create the host with a single initial tab loading `url`.
     ///
@@ -3190,6 +3199,64 @@ impl buffr_engine::BrowserEngine for BrowserHost {
 
     fn show_dev_tools_at(&self, x: i32, y: i32) {
         self.show_dev_tools_at(Some(x), Some(y))
+    }
+
+    // ── Clipboard (Phase 6d, #95) ─────────────────────────────────────────────
+
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        // `BrowserHost::clipboard_handle` returns `Option<crate::ClipboardReader>`.
+        // `crate::ClipboardReader` wraps `Arc<hjkl_clipboard::Clipboard>` and
+        // implements `buffr_engine::ClipboardRead`. Wrap it in `Arc` to match
+        // the `ClipboardReader = Arc<dyn ClipboardRead>` alias.
+        self.clipboard_handle()
+            .map(|r| -> buffr_engine::ClipboardReader { std::sync::Arc::new(r) })
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        self.clipboard_text()
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        self.clipboard_set_text(text)
+    }
+
+    fn copy_image_url_to_clipboard(&self, url: &str) {
+        self.copy_image_url_to_clipboard(url)
+    }
+
+    // ── Audio events (Phase 6d, #95) ─────────────────────────────────────────
+
+    fn drain_audio_events(&self) -> Vec<buffr_engine::AudioEvent> {
+        // `BrowserHost::drain_audio_events` returns `Vec<crate::audio::AudioEvent>`.
+        // `crate::audio::AudioEvent` and `buffr_engine::AudioEvent` are structurally
+        // identical (same field names and types); convert field-by-field.
+        self.drain_audio_events()
+            .into_iter()
+            .map(|e| buffr_engine::AudioEvent {
+                browser_id: e.browser_id,
+                active: e.active,
+            })
+            .collect()
+    }
+
+    // ── Cursor (Phase 6d, #95) ────────────────────────────────────────────────
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        self.cursor_state().take()
+    }
+
+    // ── Favicon (Phase 6d, #95) ───────────────────────────────────────────────
+
+    fn drain_favicon_updates(&self) -> Vec<buffr_engine::FaviconUpdate> {
+        buffr_core::drain_favicon_updates(&self.favicon_sink())
+            .into_iter()
+            .map(|u| buffr_engine::FaviconUpdate {
+                browser_id: u.browser_id,
+                width: u.width,
+                height: u.height,
+                pixels: u.pixels,
+            })
+            .collect()
     }
 }
 
