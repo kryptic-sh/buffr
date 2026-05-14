@@ -10,6 +10,28 @@ and this project adheres to
 
 ### Added
 
+- **Engine refactor — Phase 4: blink-cdp second backend spike** (#75, parent
+  #54). New `buffr-blink-cdp` workspace crate (`crates/buffr-blink-cdp/`)
+  implements `BrowserEngine` via headless Chromium driven over Chrome DevTools
+  Protocol. No Chromium binary bundled — system `chromium`, `google-chrome`, or
+  `chromium-browser` required at runtime. Implemented in Phase 4: tab
+  create/close (`Target.createTarget` + `Target.attachToTarget`), navigate
+  (`Page.navigate`), OSR paint via `Page.captureScreenshot` polled at ~5 FPS
+  (BGRA decode → `SharedOsrFrame`), mouse events (`Input.dispatchMouseEvent`),
+  keyboard events (`Input.dispatchKeyEvent`), viewport resize
+  (`Page.setDeviceMetricsOverride`), and tab bookkeeping. Stubbed with
+  `EngineError::Unimplemented`: `duplicate_active`, `reopen_closed_tab`, and all
+  popup/hint/find/zoom/devtools/scheme-handler/audio/video methods.
+  `AppState::engines` changed from `HashMap<EngineId, Arc<BrowserHost>>` to
+  `HashMap<EngineId, Arc<dyn BrowserEngine>>` (Phase 4 dyn-dispatch map); a
+  parallel `cef_engines: HashMap<EngineId, Arc<BrowserHost>>` provides
+  CEF-specific reach-through (popup*\*, hint*\*, drain_audio_events, etc.).
+  `EngineError::Unimplemented { method: &'static str }` variant added to
+  `buffr-engine`. Demo routing config at `examples/blink-cdp-demo-config.toml`.
+  Architecture: one `std::thread` per engine instance owns the `tungstenite`
+  WebSocket; trait methods send `Command` over an `mpsc::SyncSender` and wait on
+  a response channel (sync→async bridge, no tokio).
+
 - **Engine refactor — Phase 3: multi-engine runtime** (#74, parent #54).
   Multiple `BrowserHost` instances now live simultaneously inside one CEF
   process; each is registered under a unique `EngineId` in a
