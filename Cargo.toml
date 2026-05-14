@@ -1,6 +1,6 @@
 [package]
 name = "buffr-core"
-description = "CEF integration and browser host for buffr."
+description = "Engine-agnostic browser shell for buffr."
 version = "0.6.3"
 edition = "2024"
 rust-version = "1.95"
@@ -9,16 +9,12 @@ repository = "https://github.com/kryptic-sh/buffr-core"
 homepage = "https://buffr.kryptic.sh"
 authors = ["mxaddict <mxaddict@kryptic.sh>"]
 readme = "README.md"
-build = "build.rs"
 
 [features]
 # Off-screen rendering path (Linux default; always compiled in).
-# The feature flag exists so `--features osr` is accepted by CI
-# without cargo rejecting it as unknown.
 osr = []
 
 [dependencies]
-cef = "147"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -29,20 +25,17 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 ureq = { version = "3", features = ["json"] }
 semver = { version = "1", features = ["serde"] }
+buffr-engine = "0.1"
 buffr-modal = "0.1"
 buffr-history = "0.1"
 buffr-downloads = "0.1"
 buffr-config = "0.4"
 buffr-zoom = "0.1"
 buffr-permissions = "0.1"
-rusqlite = { version = "0.39", features = ["bundled"] }
-url = "2"
 buffr-view-source = "0.1"
 hjkl-clipboard = "0.5"
 winit = "0.30"
-# Image decode / re-encode for context-menu "Copy Image" — fetched bytes
-# get decoded then re-emitted as PNG for the clipboard. Web-format-only
-# feature set; default features pull in heavy/unused codecs (TIFF, etc).
+# Image decode / re-encode for context-menu "Copy Image"
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
@@ -50,6 +43,8 @@ image = { version = "0.25", default-features = false, features = [
     "gif",
 ] }
 base64 = "0.22"
+url = "2"
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 wayland-client = { version = "0.31", features = ["system"] }
