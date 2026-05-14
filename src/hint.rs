@@ -285,24 +285,11 @@ pub struct Hint {
     pub kind: HintKind,
 }
 
-/// What [`HintSession::feed`] returns to the host. Mirrors the result
-/// shape from [`buffr_modal::engine::Step`] but for hint-mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HintAction {
-    /// User typed a char that narrowed the candidate set but didn't
-    /// commit. UI should call `__buffrHintFilter(typed)` to dim the
-    /// non-matching overlays.
-    Filter,
-    /// One label remained and the typed string equals it. Caller
-    /// should dispatch the click + exit hint mode.
-    Click(u32),
-    /// Background variant. Today the host falls back to a regular
-    /// click + tracing breadcrumb (multi-tab is Phase 5b).
-    OpenInBackground(u32),
-    /// User typed a char that no label starts with. Caller should
-    /// cancel the hint session.
-    Cancel,
-}
+// HintAction moved to buffr-engine in Phase 6b (#95) so the BrowserEngine
+// trait can reference it without a buffr-core dependency. Re-exported here
+// so all existing `buffr_core::HintAction` / `buffr_core::hint::HintAction`
+// call sites keep compiling without modification.
+pub use buffr_engine::HintAction;
 
 /// Hint-mode runtime state.
 ///
