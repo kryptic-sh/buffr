@@ -1039,6 +1039,7 @@ fn main() -> Result<()> {
     info!("shutdown: dropping engine hosts");
     drop(app_state.engine_router.take());
     app_state.engines.clear();
+    app_state.cef_engines.clear();
 
     // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
     // same EGL / GL / Vulkan driver state on Linux; tearing down
@@ -1705,12 +1706,17 @@ struct AppState {
     // unchanged. Multi-engine-aware paths use `engines` directly.
     //
     // `host` field removed — use `self.active_host()` instead.
-    /// Phase 3: registered engine instances, keyed by [`EngineId`].
-    /// Each value is the concrete CEF host — the router holds a
-    /// `Arc<dyn BrowserEngine>` alias to the same allocation.
+    /// Phase 3+: registered engine instances, keyed by [`EngineId`].
+    /// Phase 4: changed from `Arc<BrowserHost>` to `Arc<dyn BrowserEngine>`
+    /// so blink-cdp and future non-CEF backends can live here too.
     /// Populated in `resumed` (one entry per `engines.instances` config
     /// entry, plus the synthesised default when `instances` is empty).
-    engines: std::collections::HashMap<buffr_engine::EngineId, Arc<buffr_cef::BrowserHost>>,
+    engines:
+        std::collections::HashMap<buffr_engine::EngineId, Arc<dyn buffr_engine::BrowserEngine>>,
+    /// Phase 4: CEF-specific reach-through for methods not on the trait
+    /// (popup_*, hint_*, favicon_sink, clipboard_text, etc.).
+    /// Populated only for `backend = "cef"` instances.
+    cef_engines: std::collections::HashMap<buffr_engine::EngineId, Arc<buffr_cef::BrowserHost>>,
     /// Which engine owns the currently-focused tab. Updated when a
     /// cross-engine navigation opens a tab on a different engine.
     active_engine: buffr_engine::EngineId,
@@ -2354,6 +2360,7 @@ impl AppState {
         Self {
             homepage,
             engines: std::collections::HashMap::new(),
+            cef_engines: std::collections::HashMap::new(),
             active_engine: buffr_engine::EngineId::new("cef"),
             engine_router: None,
             window: None,
@@ -2495,12 +2502,15 @@ impl AppState {
 
     /// Return a clone of the active engine's `BrowserHost` handle, if any.
     ///
+    /// Only returns `Some` when the active engine is a CEF backend.
+    /// For trait-level access to any backend, use `self.active_engine_dyn()`.
+    ///
     /// Cloning the `Arc` is ~2 ns and breaks the borrow on `self`, which is
     /// essential: callers typically mutate other `self` fields after obtaining
     /// the handle. This is the Phase 3 replacement for the former `host` field.
     #[inline]
     fn active_host(&self) -> Option<Arc<buffr_cef::BrowserHost>> {
-        self.engines.get(&self.active_engine).cloned()
+        self.cef_engines.get(&self.active_engine).cloned()
     }
 
     /// Open a new foreground tab, routing through the engine router.
@@ -6798,8 +6808,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
                             let cef_engine: Arc<dyn buffr_engine::BrowserEngine> =
                                 Arc::clone(&host) as _;
-                            router_builder = router_builder.register(engine_id.clone(), cef_engine);
-                            self.engines.insert(engine_id.clone(), host);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), cef_engine.clone());
+                            // Phase 4: populate both maps. `engines` holds the dyn
+                            // trait ref; `cef_engines` holds the concrete Arc<BrowserHost>
+                            // for CEF-only reach-through (popup_*, hint_*, etc.).
+                            self.engines.insert(engine_id.clone(), cef_engine);
+                            self.cef_engines.insert(engine_id.clone(), host);
                             if first_instance {
                                 self.active_engine = engine_id;
                                 tracing::debug!(
@@ -6813,6 +6828,44 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                         Err(err) => {
                             warn!(engine_id = %inst.id, error = %err, "failed to create browser host");
+                        }
+                    }
+                }
+                "blink-cdp" => {
+                    let data_dir = inst
+                        .data_dir
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            // Default to /tmp/buffr/blink-cdp/<instance-id> so
+                            // multiple instances get separate profiles.
+                            std::path::PathBuf::from("/tmp/buffr/blink-cdp").join(&inst.id)
+                        });
+                    match buffr_blink_cdp::BlinkCdpEngine::new(&data_dir) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "blink-cdp engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            // NOTE: blink-cdp engines are NOT inserted into `cef_engines`
+                            // (which is CEF-only). They live only in `engines`.
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create blink-cdp engine");
                         }
                     }
                 }
@@ -7689,18 +7742,20 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.sleep_deadline = None;
             }
 
-            // 2. Drain audio events from all engines (fan-out).
-            //    media_active / video_active are true if ANY engine is active.
+            // 2. Drain audio events from all CEF engines (fan-out).
+            //    Non-CEF engines (blink-cdp) don't have audio events; their
+            //    `any_audio_active()` / `any_video_active()` always return false
+            //    in Phase 4 and are read through the trait map below.
             {
                 let mut any_audio_events = false;
-                for host in self.engines.values() {
+                for host in self.cef_engines.values() {
                     let events = host.drain_audio_events();
                     if !events.is_empty() {
                         any_audio_events = true;
                     }
                 }
                 if any_audio_events {
-                    // Recompute media_active across all engines.
+                    // Recompute media_active across all engines via the trait.
                     self.media_active = self.engines.values().any(|h| h.any_audio_active());
                     tracing::debug!(
                         media_active = self.media_active,
