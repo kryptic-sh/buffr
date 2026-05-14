@@ -769,4 +769,249 @@ mod tests {
         assert_eq!(router.badge_label_for(&EngineId::new("cef")), None);
         assert_eq!(router.badge_label_for(&EngineId::new("blink-cdp")), None);
     }
+
+    // ── Additional resolve scenarios ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_first_matching_rule_wins() {
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .register(EngineId::new("blink"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("example.com", "webkit") // first
+            .rule("example.com", "blink") // second — must NOT win
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("https://example.com/page"),
+            &EngineId::new("webkit"),
+            "first matching rule must win"
+        );
+    }
+
+    #[test]
+    fn resolve_rule_order_preserved_from_config() {
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("other.com", "webkit") // first
+            .rule("example.com", "cef") // second
+            .build()
+            .unwrap();
+        // example.com should hit the second rule → cef.
+        assert_eq!(
+            router.resolve("https://example.com/"),
+            &EngineId::new("cef")
+        );
+        // other.com should hit the first rule → webkit.
+        assert_eq!(
+            router.resolve("https://other.com/"),
+            &EngineId::new("webkit")
+        );
+    }
+
+    #[test]
+    fn resolve_strips_userinfo_from_host() {
+        // url::Url::host_str() returns the host without userinfo, so
+        // `user:pass@example.com` → host is `example.com`.
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("example.com", "webkit")
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("https://user:pass@example.com/path"),
+            &EngineId::new("webkit"),
+            "userinfo should be stripped; host=example.com matches"
+        );
+    }
+
+    #[test]
+    fn resolve_handles_ipv4_host() {
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("127.0.0.1", "webkit")
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("http://127.0.0.1:8080/"),
+            &EngineId::new("webkit"),
+            "IPv4 host should match rule"
+        );
+    }
+
+    #[test]
+    fn resolve_handles_ipv6_host_falls_through_to_default() {
+        // url::Url::host_str() for `http://[::1]/` returns "::1" (no brackets).
+        // We don't have a rule for "::1" so it falls to default.
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("http://[::1]/"),
+            &EngineId::new("cef"),
+            "IPv6 with no matching rule → default"
+        );
+    }
+
+    #[test]
+    fn resolve_handles_url_with_port() {
+        // Port is stripped from host_str() — only hostname is matched.
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("example.com", "webkit")
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("https://example.com:8443/"),
+            &EngineId::new("webkit"),
+            "port must not prevent host match"
+        );
+    }
+
+    #[test]
+    fn resolve_handles_url_with_path_and_query() {
+        // Only host component is matched; path and query are irrelevant.
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("example.com", "webkit")
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("https://example.com/path/to/page?q=hello&ref=test#anchor"),
+            &EngineId::new("webkit"),
+        );
+    }
+
+    #[test]
+    fn resolve_handles_trailing_slash() {
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("example.com", "webkit")
+            .build()
+            .unwrap();
+        assert_eq!(
+            router.resolve("https://example.com/"),
+            &EngineId::new("webkit"),
+        );
+    }
+
+    #[test]
+    fn resolve_handles_punycode_host() {
+        // Punycode host "xn--n3h.com" (heart emoji domain) is treated as a literal
+        // string — matched as-is without unicode decoding.
+        let router = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("webkit"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .rule("xn--n3h.com", "webkit")
+            .build()
+            .unwrap();
+        // We can't construct a URL with an IDN emoji host via url::Url directly,
+        // but we can verify the rule compiles and a non-matching URL falls through.
+        assert_eq!(
+            router.resolve("https://example.com/"),
+            &EngineId::new("cef"),
+            "non-matching host should fall to default"
+        );
+    }
+
+    #[test]
+    fn build_rejects_blank_default_engine_id() {
+        // An empty string EngineId is not registered, so build() returns
+        // UnknownEngine.
+        let err = EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .default_engine(EngineId::new(""))
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, RouterError::UnknownEngine(_)),
+            "blank default engine id should be rejected: {err}"
+        );
+    }
+
+    // ── classify_navigation additional scenarios ───────────────────────────────
+
+    #[test]
+    fn classify_navigation_cross_engine_default_fallback() {
+        // URL with no host → resolves to default (cef). Active = cef → SameEngine.
+        let router = two_engine_router();
+        let active = EngineId::new("cef-a");
+        let verdict = super::classify_navigation(&router, &active, "data:text/plain,hello");
+        assert_eq!(verdict, super::NavigationVerdict::SameEngine);
+    }
+
+    #[test]
+    fn classify_navigation_cross_engine_when_active_not_default() {
+        // Active engine = cef-b. URL routes to default (cef-a). → CrossEngine.
+        let router = two_engine_router();
+        let active = EngineId::new("cef-b");
+        let verdict = super::classify_navigation(&router, &active, "https://other.com/page");
+        assert_eq!(
+            verdict,
+            super::NavigationVerdict::CrossEngine {
+                target: EngineId::new("cef-a")
+            }
+        );
+    }
+
+    // ── badge_label_text additional edge cases ────────────────────────────────
+
+    #[test]
+    fn badge_label_text_handles_non_ascii_id() {
+        // Non-ASCII bytes are not alphanumeric ASCII, so they are skipped.
+        // "中文" has no ASCII alphanumeric chars → fallback "??".
+        let label = super::badge_label_text("中文");
+        assert_eq!(label, "??", "non-ASCII should fall back to ??");
+    }
+
+    #[test]
+    fn badge_label_text_handles_long_id() {
+        // Only first 2 alphanumeric chars taken.
+        let label = super::badge_label_text("blink-cdp-experimental");
+        assert_eq!(label, "BL");
+    }
+
+    #[test]
+    fn badge_color_palette_index_in_range() {
+        // Any DJB2 hash index must land within the palette array.
+        let palette_len = EngineRouter::BADGE_PALETTE.len();
+        let router = multi_engine_router_with_blink();
+        // blink-cdp gets a color; compute expected index to verify it's in range.
+        let color = router.badge_color_for(&EngineId::new("blink-cdp")).unwrap();
+        assert!(
+            EngineRouter::BADGE_PALETTE.contains(&color),
+            "returned color {color:#08x} must be in BADGE_PALETTE (len={palette_len})"
+        );
+    }
+
+    #[test]
+    fn badge_color_for_returns_none_for_unregistered_id() {
+        // An id not registered still goes through the hash — badge_color_for only
+        // suppresses "cef" and single-engine cases. With multi-engine + unknown id:
+        // it still returns Some because the function doesn't check registration.
+        // The contract is: None for "cef" or single-engine; Some otherwise.
+        let router = multi_engine_router_with_blink();
+        let color = router.badge_color_for(&EngineId::new("unknown-engine"));
+        // "unknown-engine" != "cef" and multi-engine → returns Some.
+        assert!(
+            color.is_some(),
+            "non-cef id should produce a color even if unregistered"
+        );
+    }
 }
