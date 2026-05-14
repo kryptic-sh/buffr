@@ -8,6 +8,18 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **blink-cdp: zoom in/out/reset via `Runtime.evaluate` + per-tab tracking**
+  (#85). `BlinkCdpEngine` now implements `zoom_in`, `zoom_out`, and `zoom_reset`
+  (new default-no-op methods on `BrowserEngine`). Zoom is tracked per tab as a
+  linear CSS factor (`1.0` = 100 %, step `0.25`, clamped to `[0.25, 5.0]`) and
+  injected via `document.body.style.zoom` through `Runtime.evaluate`. The worker
+  thread stores per-session zoom levels and re-applies them on every
+  `Page.frameNavigated` event so navigation does not silently reset the scale.
+  `active_zoom_level()` now returns the tracked factor (was always `0.0`). The
+  step size (0.25) matches the CEF backend's `adjust_zoom` delta.
+
 ### Changed
 
 - **blink-cdp: free-port probe replaces hardcoded 9222** (#92).
