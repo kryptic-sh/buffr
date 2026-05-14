@@ -2058,6 +2058,13 @@ impl BrowserHost {
                     "buffr://yank-selection",
                 );
             }
+
+            A::Engine(_id) => {
+                // Engine-swap is handled entirely at the apps layer (dispatch_action
+                // in main.rs). The host dispatch path is a no-op so a stray
+                // fallthrough doesn't confuse CEF.
+                tracing::debug!("Engine action reached host dispatch — apps layer should handle");
+            }
         }
     }
 
