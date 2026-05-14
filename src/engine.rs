@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use crate::{
     AudioEvent, ClipboardReader, ContextMenuRequest, EngineError, FaviconUpdate, HintAction,
-    HintStatus, MouseButton, NeutralKeyEvent, SharedOsrFrame, SharedOsrViewState, TabId,
-    TabSummary,
+    HintStatus, MouseButton, NeutralKeyEvent, PermissionsQueue, PromptOutcome, SharedOsrFrame,
+    SharedOsrViewState, TabId, TabSummary,
     popup::{PopupCloseSink, PopupCreateSink, PopupQueue},
 };
 
@@ -653,6 +653,40 @@ pub trait BrowserEngine: Send + Sync {
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
         None
     }
+
+    // ── Permissions (Phase 8a, #88) ───────────────────────────────────────────
+    //
+    // Both the CEF backend and blink-cdp push neutral `PendingPermission`
+    // entries onto the shared queue.  When the user answers, apps calls
+    // `resolve_permission` so the backend can fire the appropriate callback
+    // (CEF C++ callback or CDP Runtime.evaluate promise resolution).
+    //
+    // CEF: wraps existing callback registry; blink-cdp: sends
+    // `__buffrPermissionResolve(id, outcome)` via Runtime.evaluate.
+    // Default no-op: backends that don't implement permissions return an
+    // empty queue and ignore resolve calls.
+
+    /// Clone the shared permissions queue for this engine.
+    ///
+    /// The apps layer drains one entry per tick and shows the prompt strip.
+    ///
+    /// Default: returns a fresh empty queue (backends that don't surface
+    /// permission requests return no-op here). CEF and blink-cdp override
+    /// with their respective shared queues.
+    fn permissions_queue(&self) -> PermissionsQueue {
+        crate::permissions::new_queue()
+    }
+
+    /// Resolve the pending permission identified by `resolve_id` with
+    /// `outcome`.  The backend fires the appropriate C++ callback (CEF) or
+    /// resolves the JS promise (blink-cdp).
+    ///
+    /// `resolve_id` is taken from [`PendingPermission::resolve_id`].
+    /// `None` means the entry has no async backend state to clean up
+    /// (future synchronous backends).
+    ///
+    /// Default: no-op (backends that don't implement permissions ignore this).
+    fn resolve_permission(&self, _resolve_id: Option<&str>, _outcome: PromptOutcome) {}
 
     // ── Favicon (Phase 6d, #95) ───────────────────────────────────────────────
 

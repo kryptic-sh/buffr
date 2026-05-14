@@ -14,6 +14,7 @@ pub mod hint;
 pub mod input;
 pub mod newtab;
 pub mod osr;
+pub mod permissions;
 pub mod popup;
 pub mod profile;
 pub mod tab;
@@ -29,6 +30,11 @@ pub use favicon::FaviconUpdate;
 pub use hint::{HintAction, HintStatus};
 pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
 pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
+pub use permissions::{
+    PendingPermission, PermissionsQueue, PromptOutcome, drain_queue as drain_permissions_queue,
+    new_queue as new_permissions_queue, peek_front as peek_permission_front,
+    pop_front as pop_permission_front, queue_len as permissions_queue_len,
+};
 pub use popup::{
     PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue,
     drain_popup_closes, drain_popup_creates, drain_popup_urls, new_pending_popup_alloc,
