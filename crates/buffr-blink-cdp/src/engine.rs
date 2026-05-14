@@ -1697,12 +1697,19 @@ mod tests {
 
     // ── IME CDP payload tests (#86) ───────────────────────────────────────────
 
+    /// Helper mirroring the cursor → (start, end) resolution in
+    /// `ime_set_composition`. Lifted out so tests can drive the same logic
+    /// without re-triggering clippy's `unnecessary_literal_unwrap` on inline
+    /// `Some`/`None` literals.
+    fn ime_resolve_cursor(text: &str, cursor: Option<(usize, usize)>) -> (usize, usize) {
+        cursor.unwrap_or((text.len(), text.len()))
+    }
+
     /// Verify `Input.imeSetComposition` payload shape with explicit cursor.
     #[test]
     fn ime_set_composition_payload_shape() {
         let text = "こんにちは";
-        let cursor: Option<(usize, usize)> = Some((3, 6));
-        let (start, end) = cursor.unwrap_or((text.len(), text.len()));
+        let (start, end) = ime_resolve_cursor(text, Some((3, 6)));
         let params = serde_json::json!({
             "text": text,
             "selectionStart": start,
@@ -1717,8 +1724,7 @@ mod tests {
     #[test]
     fn ime_set_composition_no_cursor_collapses_to_end() {
         let text = "hello";
-        let cursor: Option<(usize, usize)> = None;
-        let (start, end) = cursor.unwrap_or((text.len(), text.len()));
+        let (start, end) = ime_resolve_cursor(text, None);
         let params = serde_json::json!({
             "text": text,
             "selectionStart": start,
