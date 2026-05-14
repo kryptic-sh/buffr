@@ -3258,6 +3258,97 @@ impl buffr_engine::BrowserEngine for BrowserHost {
             })
             .collect()
     }
+
+    // ── Loading state / navigation capability (Phase 6f, #95) ───────────────
+
+    fn is_loading(&self) -> bool {
+        self.is_loading()
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.with_active(|t| t.browser.can_go_back() != 0)
+            .unwrap_or(false)
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.with_active(|t| t.browser.can_go_forward() != 0)
+            .unwrap_or(false)
+    }
+
+    // ── Context menu (Phase 6f, #95) ─────────────────────────────────────────
+    //
+    // Override the default empty impl. Drain the internal CEF sink and map
+    // `buffr_core::ContextMenuRequest` → `buffr_engine::ContextMenuRequest`.
+    // `source_url` maps to both `image_url` and `media_url` so the apps
+    // layer can use either field. `is_editable` is derived from the items.
+
+    fn drain_context_menu_requests(&self) -> Vec<buffr_engine::ContextMenuRequest> {
+        use buffr_engine::types::MediaType;
+        self.drain_context_menu_requests()
+            .into_iter()
+            .map(|r| {
+                let source = if r.source_url.is_empty() {
+                    None
+                } else {
+                    Some(r.source_url)
+                };
+                let is_editable = r.items.iter().any(|i| {
+                    matches!(
+                        i,
+                        buffr_core::ContextMenuItem::Cut | buffr_core::ContextMenuItem::Paste
+                    )
+                });
+                let has_image = r
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, buffr_core::ContextMenuItem::CopyImage));
+                let has_media_controls = r.items.iter().any(|i| {
+                    matches!(
+                        i,
+                        buffr_core::ContextMenuItem::MediaPlayPause { .. }
+                            | buffr_core::ContextMenuItem::MediaMute { .. }
+                    )
+                });
+                let media_type = if has_image {
+                    MediaType::Image
+                } else if has_media_controls {
+                    // CEF doesn't distinguish video/audio in the items list;
+                    // use Video as the canonical non-image media bucket.
+                    MediaType::Video
+                } else {
+                    MediaType::None
+                };
+                buffr_engine::ContextMenuRequest {
+                    browser_id: r.browser_id,
+                    x: r.x,
+                    y: r.y,
+                    page_url: String::new(),
+                    frame_url: String::new(),
+                    link_url: if r.link_url.is_empty() {
+                        None
+                    } else {
+                        Some(r.link_url)
+                    },
+                    image_url: source.clone(),
+                    media_url: source,
+                    selection_text: if r.selection_text.is_empty() {
+                        None
+                    } else {
+                        Some(r.selection_text)
+                    },
+                    is_editable,
+                    has_image_contents: has_image,
+                    media_type,
+                }
+            })
+            .collect()
+    }
+
+    // ── Action dispatch (Phase 6f, #95) ──────────────────────────────────────
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        self.dispatch(action)
+    }
 }
 
 #[cfg(test)]

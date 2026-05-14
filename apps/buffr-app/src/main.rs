@@ -180,6 +180,70 @@ use winit::{
     window::{CursorIcon, Window, WindowId},
 };
 
+// ── Context menu helpers ──────────────────────────────────────────────────────
+
+/// Build the item list for a CEF page right-click from a neutral
+/// `buffr_engine::ContextMenuRequest`. Uses the same `buffr_core::build_model`
+/// function as the CEF handler, reconstructing the necessary flags from the
+/// neutral fields:
+///   - `is_editable` → editable bucket (cut / copy / paste / …)
+///   - `link_url.is_some()` → link bucket
+///   - `media_type == Image` or `has_image_contents` → image bucket
+///   - `media_type == Video | Audio` → media bucket (limited state info)
+///   - `selection_text.is_some()` → selection bucket
+///   - else → page bucket (back / forward / reload / view-source / inspect)
+///
+/// The CEF media-state flags (muted, looped, PiP, etc.) are not available in
+/// the neutral type — the media bucket items appear but without dynamic state.
+fn build_context_menu_items_from_neutral(
+    req: &buffr_engine::ContextMenuRequest,
+    can_go_back: bool,
+    can_go_forward: bool,
+    is_loading: bool,
+) -> Vec<ContextMenuItem> {
+    use buffr_core::context_menu::{
+        MEDIATYPE_AUDIO, MEDIATYPE_IMAGE, MEDIATYPE_NONE, MEDIATYPE_VIDEO, TYPEFLAG_EDITABLE,
+        TYPEFLAG_LINK, TYPEFLAG_MEDIA, TYPEFLAG_PAGE, TYPEFLAG_SELECTION,
+    };
+    use buffr_engine::types::MediaType;
+
+    let type_flags: u32 = if req.is_editable {
+        TYPEFLAG_EDITABLE
+    } else if req.link_url.is_some() {
+        TYPEFLAG_LINK
+    } else if req.has_image_contents
+        || matches!(
+            req.media_type,
+            MediaType::Image | MediaType::Video | MediaType::Audio
+        )
+    {
+        TYPEFLAG_MEDIA
+    } else if req.selection_text.is_some() {
+        TYPEFLAG_SELECTION
+    } else {
+        TYPEFLAG_PAGE
+    };
+
+    let media_type_raw: u32 = match req.media_type {
+        MediaType::Image => MEDIATYPE_IMAGE,
+        MediaType::Video => MEDIATYPE_VIDEO,
+        MediaType::Audio => MEDIATYPE_AUDIO,
+        _ => MEDIATYPE_NONE,
+    };
+
+    buffr_core::build_context_menu_model(
+        type_flags,
+        media_type_raw,
+        0, // media_state_flags: no state info in neutral type
+        req.is_editable,
+        req.link_url.is_some(),
+        req.selection_text.is_some(),
+        can_go_back,
+        can_go_forward,
+        is_loading,
+    )
+}
+
 /// Custom user events sent into the winit loop from background threads.
 #[derive(Debug, Clone)]
 enum BuffrUserEvent {
@@ -1045,7 +1109,6 @@ fn main() -> Result<()> {
     info!("shutdown: dropping engine hosts");
     drop(app_state.engine_router.take());
     app_state.engines.clear();
-    app_state.cef_engines.clear();
 
     // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
     // same EGL / GL / Vulkan driver state on Linux; tearing down
@@ -1711,7 +1774,7 @@ struct AppState {
     // from `engines[active_engine]` at runtime so all existing paths work
     // unchanged. Multi-engine-aware paths use `engines` directly.
     //
-    // `host` field removed — use `self.active_host()` instead.
+    // `host` field removed — use `self.active_engine_dyn()` instead.
     /// Phase 3+: registered engine instances, keyed by [`EngineId`].
     /// Phase 4: changed from `Arc<BrowserHost>` to `Arc<dyn BrowserEngine>`
     /// so blink-cdp and future non-CEF backends can live here too.
@@ -1719,10 +1782,6 @@ struct AppState {
     /// entry, plus the synthesised default when `instances` is empty).
     engines:
         std::collections::HashMap<buffr_engine::EngineId, Arc<dyn buffr_engine::BrowserEngine>>,
-    /// Phase 4: CEF-specific reach-through for methods not on the trait
-    /// (popup_*, hint_*, favicon_sink, clipboard_text, etc.).
-    /// Populated only for `backend = "cef"` instances.
-    cef_engines: std::collections::HashMap<buffr_engine::EngineId, Arc<buffr_cef::BrowserHost>>,
     /// Which engine owns the currently-focused tab. Updated when a
     /// cross-engine navigation opens a tab on a different engine.
     active_engine: buffr_engine::EngineId,
@@ -2137,7 +2196,7 @@ struct AppState {
     /// `config.idle_inhibit.require_focus = true`.
     window_focused: bool,
     /// Active right-click context menu, if any. `None` when no menu is
-    /// visible. Set from `active_host().drain_context_menu_requests()` each tick;
+    /// visible. Set from `active_engine_dyn().drain_context_menu_requests()` each tick;
     /// cleared on Esc, Enter (activation), or click-outside.
     context_menu: Option<ActiveContextMenu>,
     /// UDS heartbeat liveness probe for the buffr (supervisor) watchdog.
@@ -2366,7 +2425,6 @@ impl AppState {
         Self {
             homepage,
             engines: std::collections::HashMap::new(),
-            cef_engines: std::collections::HashMap::new(),
             active_engine: buffr_engine::EngineId::new("cef"),
             engine_router: None,
             window: None,
@@ -2445,8 +2503,8 @@ impl AppState {
             popups: HashMap::new(),
             popup_window_id_by_browser: HashMap::new(),
             // Replaced in `resumed` once the host is constructed.
-            popup_create_sink: buffr_cef::new_popup_create_sink(),
-            popup_close_sink: buffr_cef::new_popup_close_sink(),
+            popup_create_sink: buffr_engine::new_popup_create_sink(),
+            popup_close_sink: buffr_engine::new_popup_close_sink(),
             favicons: HashMap::new(),
             show_favicons,
             favicon_cache,
@@ -2500,29 +2558,16 @@ impl AppState {
     }
 
     // ── Engine helpers ────────────────────────────────────────────────────────
-    //
-    // Phase 3: `active_host()` is the canonical single-engine accessor used
-    // by all existing code paths that only need the currently-focused engine.
-    // Multi-engine-aware paths (paint, resize, audio fan-out, cross-engine
-    // nav) use `self.engines` directly.
-
-    /// Return a clone of the active engine's `BrowserHost` handle, if any.
-    ///
-    /// Only returns `Some` when the active engine is a CEF backend.
-    /// For trait-level access to any backend, use `self.active_engine_dyn()`.
-    ///
-    /// Cloning the `Arc` is ~2 ns and breaks the borrow on `self`, which is
-    /// essential: callers typically mutate other `self` fields after obtaining
-    /// the handle. This is the Phase 3 replacement for the former `host` field.
-    #[inline]
-    fn active_host(&self) -> Option<Arc<buffr_cef::BrowserHost>> {
-        self.cef_engines.get(&self.active_engine).cloned()
-    }
 
     /// Return a clone of the active engine as a `dyn BrowserEngine`, if any.
     ///
-    /// Works for all backends (CEF, blink-cdp, future). Use this for popup_*
-    /// and other trait-level calls that don't require CEF-specific reach-through.
+    /// Works for all backends (CEF, blink-cdp, future). This is the canonical
+    /// single-engine accessor used by all code paths that need the currently-
+    /// focused engine. Multi-engine-aware paths use `self.engines` directly.
+    ///
+    /// Cloning the `Arc` is ~2 ns and breaks the borrow on `self`, which is
+    /// essential: callers typically mutate other `self` fields after obtaining
+    /// the handle.
     #[inline]
     fn active_engine_dyn(&self) -> Option<Arc<dyn buffr_engine::BrowserEngine>> {
         self.engines.get(&self.active_engine).cloned()
@@ -2532,8 +2577,8 @@ impl AppState {
     fn routed_open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab(url)
-        } else if let Some(host) = self.active_host() {
-            buffr_engine::BrowserEngine::open_tab(host.as_ref(), url)
+        } else if let Some(engine) = self.active_engine_dyn() {
+            engine.open_tab(url)
         } else {
             Err(buffr_engine::EngineError::Other(
                 "no engine available".into(),
@@ -2545,8 +2590,8 @@ impl AppState {
     fn routed_open_tab_background(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab_background(url)
-        } else if let Some(host) = self.active_host() {
-            buffr_engine::BrowserEngine::open_tab_background(host.as_ref(), url)
+        } else if let Some(engine) = self.active_engine_dyn() {
+            engine.open_tab_background(url)
         } else {
             Err(buffr_engine::EngineError::Other(
                 "no engine available".into(),
@@ -2562,8 +2607,8 @@ impl AppState {
     ) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab_at(url, insert_idx)
-        } else if let Some(host) = self.active_host() {
-            buffr_engine::BrowserEngine::open_tab_at(host.as_ref(), url, insert_idx)
+        } else if let Some(engine) = self.active_engine_dyn() {
+            engine.open_tab_at(url, insert_idx)
         } else {
             Err(buffr_engine::EngineError::Other(
                 "no engine available".into(),
@@ -2757,28 +2802,27 @@ impl AppState {
     fn dispatch_action(&mut self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
         // Adjacent-tab opens require both a host call and a &mut self call
-        // (open_omnibar). Handle them before the shared host borrow so the
+        // (open_omnibar). Handle them before the shared engine borrow so the
         // borrow checker sees two disjoint borrows.
         if matches!(action, A::TabNewRight | A::TabNewLeft) {
-            let Some(host) = self.active_host() else {
-                warn!(?action, "no browser host yet — dropping action");
+            let Some(engine) = self.active_engine_dyn() else {
+                warn!(?action, "no browser engine yet — dropping action");
                 return;
             };
             let raw_idx = if matches!(action, A::TabNewRight) {
-                host.active_index().unwrap_or(0).saturating_add(1)
+                engine.active_index().unwrap_or(0).saturating_add(1)
             } else {
-                host.active_index().unwrap_or(0)
+                engine.active_index().unwrap_or(0)
             };
             // The new tab is unpinned, so clamp to the unpinned region
             // (i.e. at or after the last pinned slot). Otherwise an
             // `O` from the first pinned tab would push the unpinned
             // entry into the pinned-only leading band.
-            let insert_idx = raw_idx.max(host.pinned_count());
+            let insert_idx = raw_idx.max(engine.pinned_count());
             let url = self.homepage.clone();
-            // Phase 2: route through the engine router (single-backend
-            // no-op today; ready for multi-engine Phase 3).
-            // `host` borrow ends here; `routed_open_tab_at` only borrows
-            // `self.engine_router` so there's no conflict.
+            // Route through the engine router (single-backend no-op when no
+            // router is configured; `engine` borrow ends here so the borrow
+            // checker sees `routed_open_tab_at` only borrows `engine_router`).
             let result = self.routed_open_tab_at(&url, insert_idx);
             match result {
                 Ok(new_id) => {
@@ -2793,8 +2837,8 @@ impl AppState {
             return;
         }
 
-        let Some(host) = self.active_host() else {
-            warn!(?action, "no browser host yet — dropping action");
+        let Some(host) = self.active_engine_dyn() else {
+            warn!(?action, "no browser engine yet — dropping action");
             return;
         };
         // Tab actions need apps-layer policy decisions (e.g. last-tab
@@ -2978,7 +3022,7 @@ impl AppState {
     /// the Yes button) reaches `confirm_close_now` which calls this
     /// path again with the confirmation already cleared.
     fn close_active_tab_or_exit(&mut self) -> bool {
-        let Some(host) = self.active_host() else {
+        let Some(host) = self.active_engine_dyn() else {
             return false;
         };
         if self.confirm_close_pinned.is_none()
@@ -3021,7 +3065,7 @@ impl AppState {
             return;
         }
         // Close the recorded tab even if focus shifted in between.
-        if let Some(host) = self.active_host() {
+        if let Some(host) = self.active_engine_dyn() {
             let _ = host.close_tab(target);
             // Phase 3: count across ALL engines for the exit decision.
             let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
@@ -3053,7 +3097,7 @@ impl AppState {
         let Some(path) = self.session_path.as_ref() else {
             return;
         };
-        let Some(host) = self.active_host() else {
+        let Some(host) = self.active_engine_dyn() else {
             return;
         };
         let summaries = host.tabs_summary();
@@ -3109,12 +3153,12 @@ impl AppState {
         let mut prefill_queue: Vec<(i32, String)> = Vec::new();
 
         {
-            let Some(host) = self.active_host() else {
+            let Some(host) = self.active_engine_dyn() else {
                 return;
             };
             // Restored session first — these were saved in the previous
             // run's tab order. The first one is already loaded as the
-            // initial tab via `BrowserHost::new`; the rest open in the
+            // initial tab via the engine constructor; the rest open in the
             // background so the user lands on tab 0.
             let session = std::mem::take(&mut self.pending_session_tabs);
             for (i, (url, pinned)) in session.iter().enumerate() {
@@ -3196,7 +3240,7 @@ impl AppState {
     /// Refresh the tab-strip render input from the host's current
     /// tab list. Cheap; runs every `about_to_wait` tick.
     fn refresh_tab_strip(&mut self) {
-        let Some(host) = self.active_host() else {
+        let Some(host) = self.active_engine_dyn() else {
             return;
         };
         let summaries = host.tabs_summary();
@@ -3492,7 +3536,7 @@ impl AppState {
             return;
         }
         self.find_smoke_at = None;
-        if let (Some(host), Some(query)) = (self.active_host(), self.pending_find.take()) {
+        if let (Some(host), Some(query)) = (self.active_engine_dyn(), self.pending_find.take()) {
             tracing::debug!(%query, "find smoke: start_find");
             self.statusline.find_query = Some(FindStatus {
                 query: query.clone(),
@@ -3592,14 +3636,14 @@ impl AppState {
             self.osr_wheel_last_at = None;
             return;
         }
-        if let Some(host) = self.active_host() {
+        if let Some(engine) = self.active_engine_dyn() {
             let mods = winit_mods_to_cef(&self.modifiers);
-            // osr_cursor is physical (browser-region-relative); CEF OSR takes DIPs.
+            // osr_cursor is physical (browser-region-relative); OSR takes DIPs.
             let (phys_bx, phys_by) = self.osr_cursor;
             let mom_scale = self.current_scale();
             let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, mom_scale);
-            tracing::trace!(dx, dy, "input: wheel_momentum -> CEF");
-            host.osr_mouse_wheel(bx, by, dx, dy, mods);
+            tracing::trace!(dx, dy, "input: wheel_momentum -> engine");
+            engine.osr_mouse_wheel(bx, by, dx, dy, mods);
         }
     }
 
@@ -3698,7 +3742,7 @@ impl AppState {
         //
         // Generation tracking guarantees the swap only fires when CEF
         // has actually written fresh pixels since our last swap.
-        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.active_host() {
+        let osr_meta: Option<(u32, u32, u64)> = if let Some(host) = self.active_engine_dyn() {
             // Read the dims we asked CEF for (osr_view atomics) so the
             // gate can reject in-flight stale-dim paints. Reading both
             // atomics under the frame lock matches CEF's IO-thread
@@ -3736,10 +3780,13 @@ impl AppState {
             None
         };
 
-        // Query the active host's loading state before taking the mutable
-        // renderer borrow — `active_host()` clones the Arc so this doesn't
+        // Query the active engine's loading state before taking the mutable
+        // renderer borrow — `active_engine_dyn()` clones the Arc so this doesn't
         // keep a borrow on `self`, allowing `renderer.as_mut()` below.
-        let host_is_loading = self.active_host().map(|h| h.is_loading()).unwrap_or(false);
+        let host_is_loading = self
+            .active_engine_dyn()
+            .map(|e| e.is_loading())
+            .unwrap_or(false);
 
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -4202,8 +4249,8 @@ impl AppState {
         // 250ms-throttled poll, so it can lag a tab switch and pre-fill
         // the omnibar with the previous tab's URL.
         let url = self
-            .active_host()
-            .map(|h| h.active_tab_live_url())
+            .active_engine_dyn()
+            .map(|e| e.active_tab_live_url())
             .unwrap_or_default();
         if !url.starts_with("buffr:") {
             bar.buffer = url;
@@ -4236,8 +4283,8 @@ impl AppState {
         let was_find = matches!(self.overlay, Some(OverlayState::Find { .. }));
         self.find_live_due = None;
         if was_find {
-            if let Some(host) = self.active_host() {
-                host.stop_find();
+            if let Some(engine) = self.active_engine_dyn() {
+                engine.stop_find();
             }
             self.statusline.find_query = None;
         }
@@ -4251,10 +4298,10 @@ impl AppState {
         // tab (`o` / `O`), close that tab on cancel — but only if
         // there'd be at least one tab left.
         if let Some(tab_id) = self.cancel_closes_tab.take()
-            && let Some(host) = self.active_host()
-            && host.tab_count() > 1
+            && let Some(engine) = self.active_engine_dyn()
+            && engine.tab_count() > 1
         {
-            let _ = host.close_tab(tab_id);
+            let _ = engine.close_tab(tab_id);
             self.refresh_tab_strip();
             self.mark_session_dirty();
         }
@@ -4306,16 +4353,16 @@ impl AppState {
         };
         let forward = *forward;
         let query = bar.current_value().trim().to_string();
-        let Some(host) = self.active_host() else {
+        let Some(engine) = self.active_engine_dyn() else {
             return;
         };
         if query.is_empty() {
-            host.stop_find();
+            engine.stop_find();
             self.statusline.find_query = None;
             self.mark_chrome_dirty();
             return;
         }
-        host.start_find(&query, forward);
+        engine.start_find(&query, forward);
         self.statusline.find_query = Some(FindStatus {
             query,
             current: 0,
@@ -4510,8 +4557,8 @@ impl AppState {
                     return;
                 }
                 let url = buffr_config::search::resolve_input(&query, &self.search_config);
-                if let Some(host) = self.active_host()
-                    && let Err(err) = host.open_tab(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && let Err(err) = engine.open_tab(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4528,8 +4575,8 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host()
-                    && let Err(err) = host.open_tab(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && let Err(err) = engine.open_tab(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4544,8 +4591,8 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host()
-                    && let Err(err) = host.open_tab_background(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && let Err(err) = engine.open_tab_background(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4565,8 +4612,8 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host()
-                    && let Err(err) = host.open_tab(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && let Err(err) = engine.open_tab(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4605,7 +4652,7 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host()
+                if let Some(host) = self.active_engine_dyn()
                     && let Err(err) = host.open_tab(&url)
                 {
                     tracing::warn!(
@@ -4653,14 +4700,14 @@ impl AppState {
             I::ViewPageSource => {
                 tracing::info!(target: "buffr::context_menu", action = "view_page_source", "dispatch");
                 let current_url = self
-                    .active_host()
-                    .map(|h| h.active_tab_live_url())
+                    .active_engine_dyn()
+                    .map(|e| e.active_tab_live_url())
                     .unwrap_or_default();
                 if current_url.is_empty() {
                     return;
                 }
                 let view_src_url = format!("buffr-src:{current_url}");
-                if let Some(host) = self.active_host()
+                if let Some(host) = self.active_engine_dyn()
                     && let Err(err) = host.open_tab(&view_src_url)
                 {
                     tracing::warn!(
@@ -4749,7 +4796,7 @@ impl AppState {
             I::TabReload => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_reload", "dispatch");
                 if let Some((_, id, _, _)) = self.resolve_tab_target(request)
-                    && let Some(host) = self.active_host()
+                    && let Some(host) = self.active_engine_dyn()
                 {
                     // Focus the tab first so the active-tab reload hits it.
                     host.select_tab(id);
@@ -4762,7 +4809,7 @@ impl AppState {
                 tracing::info!(target: "buffr::context_menu", action = "tab_duplicate", "dispatch");
                 if let Some((index, _, url, _)) = self.resolve_tab_target(request)
                     && !url.is_empty()
-                    && let Some(host) = self.active_host()
+                    && let Some(host) = self.active_engine_dyn()
                 {
                     // Insert the copy right after the source tab, Chrome-style.
                     if let Err(err) = host.open_tab_at(&url, index + 1) {
@@ -4779,7 +4826,7 @@ impl AppState {
             I::TabPin { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_pin", "dispatch");
                 if let Some((_, id, _, pinned)) = self.resolve_tab_target(request)
-                    && let Some(host) = self.active_host()
+                    && let Some(host) = self.active_engine_dyn()
                 {
                     host.set_pinned(id, !pinned);
                     self.refresh_tab_strip();
@@ -4808,7 +4855,7 @@ impl AppState {
                         self.request_redraw();
                         return;
                     }
-                    let remaining = if let Some(host) = self.active_host() {
+                    let remaining = if let Some(host) = self.active_engine_dyn() {
                         let _ = host.close_tab(id);
                         host.tab_count()
                     } else {
@@ -4830,16 +4877,16 @@ impl AppState {
                     // shifts indices. Skip the kept tab and any pinned
                     // tabs (Chrome leaves pinned tabs alone).
                     let victims: Vec<TabId> = self
-                        .active_host()
-                        .map(|h| {
-                            h.tabs_summary()
+                        .active_engine_dyn()
+                        .map(|e| {
+                            e.tabs_summary()
                                 .into_iter()
                                 .filter(|t| t.id != keep_id && !t.pinned)
                                 .map(|t| t.id)
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if let Some(host) = self.active_host() {
+                    if let Some(host) = self.active_engine_dyn() {
                         for id in victims {
                             let _ = host.close_tab(id);
                         }
@@ -4856,9 +4903,9 @@ impl AppState {
                     // skipping pinned tabs, before any closure shifts
                     // indices.
                     let victims: Vec<TabId> = self
-                        .active_host()
-                        .map(|h| {
-                            h.tabs_summary()
+                        .active_engine_dyn()
+                        .map(|e| {
+                            e.tabs_summary()
                                 .into_iter()
                                 .enumerate()
                                 .filter(|(i, t)| *i > index && !t.pinned)
@@ -4866,7 +4913,7 @@ impl AppState {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if let Some(host) = self.active_host() {
+                    if let Some(host) = self.active_engine_dyn() {
                         for id in victims {
                             let _ = host.close_tab(id);
                         }
@@ -4894,7 +4941,7 @@ impl AppState {
         let ContextMenuTarget::Tab { index } = request.target else {
             return None;
         };
-        let host = self.active_host()?;
+        let host = self.active_engine_dyn()?;
         let summaries = host.tabs_summary();
         let t = summaries.get(index)?;
         Some((index, t.id, t.url.clone(), t.pinned))
@@ -5122,7 +5169,7 @@ impl AppState {
                 self.dispatch_action(&buffr_modal::PageAction::HistoryForward);
             }
             Command::Open(url) => {
-                if let Some(host) = self.active_host() {
+                if let Some(host) = self.active_engine_dyn() {
                     if let Err(err) = host.navigate(&url) {
                         warn!(error = %err, %url, "open: navigate failed");
                     }
@@ -5132,7 +5179,7 @@ impl AppState {
             }
             Command::TabNew => {
                 let url = self.homepage.clone();
-                if let Some(host) = self.active_host()
+                if let Some(host) = self.active_engine_dyn()
                     && let Err(err) = host.open_tab(&url)
                 {
                     warn!(error = %err, %url, "cmdline :tabnew failed");
@@ -5142,7 +5189,7 @@ impl AppState {
                 self.apply_set(&key, &value);
             }
             Command::Find(query) => {
-                if let Some(host) = self.active_host() {
+                if let Some(host) = self.active_engine_dyn() {
                     self.statusline.find_query = Some(FindStatus {
                         query: query.clone(),
                         current: 0,
@@ -5590,7 +5637,7 @@ impl AppState {
 
         // Forward every other key directly to CEF. The page handles it
         // natively — no Rust-side editor model.
-        if let Some(host) = self.active_host() {
+        if let Some(host) = self.active_engine_dyn() {
             let mods = winit_mods_to_cef(&self.modifiers);
             // edit_mode_handle_key only runs when EditFocus::Editing is
             // active, so a text input is always focused here.
@@ -5753,7 +5800,7 @@ impl AppState {
         if target.is_empty() {
             return;
         }
-        if let Some(host) = self.active_host()
+        if let Some(host) = self.active_engine_dyn()
             && let Err(err) = host.navigate(&target)
         {
             warn!(error = %err, target = %target, "omnibar: navigate failed");
@@ -5770,7 +5817,7 @@ impl AppState {
             current: 0,
             total: 0,
         });
-        if let Some(host) = self.active_host() {
+        if let Some(host) = self.active_engine_dyn() {
             host.start_find(&query, forward);
         }
     }
@@ -6783,7 +6830,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             BuffrUserEvent::OpenUrls(urls) => {
                 debug!(count = urls.len(), "single_instance: opened forwarded URLs");
-                if let Some(host) = self.active_host() {
+                if let Some(host) = self.active_engine_dyn() {
                     for url in &urls {
                         if let Err(err) = host.open_tab_background(url) {
                             warn!(error = %err, %url, "single_instance: open_tab_background failed");
@@ -6927,15 +6974,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             host.set_device_scale(effective_scale);
                             let host = Arc::new(host);
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let cef_engine: Arc<dyn buffr_engine::BrowserEngine> =
-                                Arc::clone(&host) as _;
+                            let cef_engine: Arc<dyn buffr_engine::BrowserEngine> = host as _;
                             router_builder =
                                 router_builder.register(engine_id.clone(), cef_engine.clone());
-                            // Phase 4: populate both maps. `engines` holds the dyn
-                            // trait ref; `cef_engines` holds the concrete Arc<BrowserHost>
-                            // for CEF-only reach-through (popup_*, hint_*, etc.).
                             self.engines.insert(engine_id.clone(), cef_engine);
-                            self.cef_engines.insert(engine_id.clone(), host);
                             if first_instance {
                                 self.active_engine = engine_id;
                                 tracing::debug!(
@@ -6977,8 +7019,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
                             router_builder =
                                 router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            // NOTE: blink-cdp engines are NOT inserted into `cef_engines`
-                            // (which is CEF-only). They live only in `engines`.
                             self.engines.insert(engine_id.clone(), dyn_engine);
                             if first_instance {
                                 self.active_engine = engine_id;
@@ -7221,13 +7261,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                if let Some(host) = self.active_host() {
+                if let Some(host) = self.active_engine_dyn() {
                     let mods = winit_mods_to_cef(&self.modifiers);
                     host.osr_mouse_leave(mods);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(host) = self.active_host() {
+                if let Some(host) = self.active_engine_dyn() {
                     // Convert from window coords to browser-region coords.
                     // osr_cursor tracks physical pixels for chrome hit-tests.
                     // CEF OSR consumes DIPs (logical pixels), so we divide by
@@ -7451,8 +7491,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // drain_context_menu_requests path for this — build
                     // the request here and show it directly.
                     let (pinned, url) = self
-                        .active_host()
-                        .and_then(|h| h.tabs_summary().get(idx).map(|t| (t.pinned, t.url.clone())))
+                        .active_engine_dyn()
+                        .and_then(|e| e.tabs_summary().get(idx).map(|t| (t.pinned, t.url.clone())))
                         .unwrap_or((false, String::new()));
                     let tab_count = self.tab_ids.len().max(1);
                     let items = buffr_core::build_tab_context_menu_model(tab_count, idx, pinned);
@@ -7486,7 +7526,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && button == MouseButton::Left
                     && let Some(idx) = tab_strip_idx
                 {
-                    if let Some(host) = self.active_host() {
+                    if let Some(host) = self.active_engine_dyn() {
                         host.select_tab(self.tab_ids[idx]);
                     }
                     // Tab switch implies the user moved focus away from
@@ -7501,7 +7541,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && let Some(src) = self.tab_drag_src.take()
                     && let Some(dst) = tab_strip_idx
                     && dst != src
-                    && let Some(host) = self.active_host()
+                    && let Some(host) = self.active_engine_dyn()
                 {
                     host.move_tab(src, dst);
                     self.mark_session_dirty();
@@ -7518,15 +7558,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // the confirmation overlay so the user can't lose
                     // a pinned tab by misaiming.
                     let pinned = self
-                        .active_host()
-                        .and_then(|h| h.tabs_summary().get(idx).map(|t| t.pinned))
+                        .active_engine_dyn()
+                        .and_then(|e| e.tabs_summary().get(idx).map(|t| t.pinned))
                         .unwrap_or(false);
                     if pinned && self.confirm_close_pinned.is_none() {
                         self.confirm_close_pinned = Some(id);
                         self.request_redraw();
                         return;
                     }
-                    if let Some(host) = self.active_host() {
+                    if let Some(host) = self.active_engine_dyn() {
                         let _ = host.close_tab(id);
                     }
                     // Phase 3: check across all engines for the exit decision.
@@ -7540,7 +7580,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
                 let mut enter_visual = false;
                 let mut exit_visual = false;
-                if let Some(host) = self.active_host()
+                if let Some(host) = self.active_engine_dyn()
                     && let Some(cef_button) = winit_button_to_neutral(&button)
                 {
                     let mouse_up = state == winit::event::ElementState::Released;
@@ -7670,7 +7710,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
 
-                let host = self.active_host().unwrap();
+                let host = self.active_engine_dyn().unwrap();
                 let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
                 if is_pixel {
                     // Track velocity only for high-res input; discrete
@@ -7802,7 +7842,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         let pass_through =
                             matches!(post_mode, PageMode::Insert | PageMode::Command);
                         if pass_through {
-                            if let Some(host) = self.active_host() {
+                            if let Some(host) = self.active_engine_dyn() {
                                 let mods = winit_mods_to_cef(&self.modifiers);
                                 // Reject path: in Insert/Command modes a
                                 // text input may or may not be focused.
@@ -7956,7 +7996,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             {
                 self.probe_pending = true;
                 self.next_probe_at = None;
-                if let Some(host) = self.active_host() {
+                if let Some(host) = self.active_engine_dyn() {
                     host.osr_sleep(false);
                     host.osr_invalidate_view();
                 }
@@ -7982,7 +8022,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Address-change events: drain URL updates pushed by
         // on_address_change. No CEF call; purely reads from the shared
         // VecDeque. Fires before find so Tab.url is current.
-        if let Some(host) = self.active_host()
+        if let Some(host) = self.active_engine_dyn()
             && host.pump_address_changes()
         {
             self.mark_session_dirty();
@@ -8036,15 +8076,41 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Context-menu: drain any right-click requests. Only the most
         // recent is shown (earlier ones are dropped — only one menu visible
         // at a time). Mark chrome dirty so the overlay appears immediately.
-        if let Some(host) = self.active_host() {
-            let requests = host.drain_context_menu_requests();
-            if let Some(req) = requests.into_iter().last() {
+        if let Some(engine) = self.active_engine_dyn() {
+            let neutral_reqs = engine.drain_context_menu_requests();
+            if let Some(req) = neutral_reqs.into_iter().last() {
+                // Rebuild the item list from the neutral fields + engine state.
+                let items = build_context_menu_items_from_neutral(
+                    &req,
+                    engine.can_go_back(),
+                    engine.can_go_forward(),
+                    engine.is_loading(),
+                );
                 tracing::debug!(
                     browser_id = req.browser_id,
-                    items = req.items.len(),
+                    items = items.len(),
                     "context_menu: showing overlay"
                 );
-                self.context_menu = Some(ActiveContextMenu::new(req));
+                // Convert the neutral request back to the apps-layer type so
+                // `ActiveContextMenu`, `dispatch_context_menu_item`, and
+                // `resolve_tab_target` can work with a single unified type.
+                let source_url = req
+                    .image_url
+                    .as_deref()
+                    .or(req.media_url.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                let core_req = ContextMenuRequest {
+                    x: req.x,
+                    y: req.y,
+                    browser_id: req.browser_id,
+                    items,
+                    target: ContextMenuTarget::Page,
+                    link_url: req.link_url.unwrap_or_default(),
+                    source_url,
+                    selection_text: req.selection_text.unwrap_or_default(),
+                };
+                self.context_menu = Some(ActiveContextMenu::new(core_req));
                 self.mark_chrome_dirty();
                 self.request_redraw();
             }
@@ -8198,7 +8264,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Collect the poll results outside the borrow so we can call
         // `mark_session_dirty` (which takes &mut self) afterwards.
         let url_poll_result: Option<(String, Option<usize>, Vec<TabId>, f64)> = if let Some(host) =
-            self.active_host()
+            self.active_engine_dyn()
         {
             let now = Instant::now();
             if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
@@ -8412,7 +8478,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 .resize_paint_watchdog
                 .should_force_repaint(Instant::now())
         {
-            if let Some(host) = self.active_host() {
+            if let Some(host) = self.active_engine_dyn() {
                 let r = self.resize_paint_watchdog.retry_count();
                 tracing::debug!(retry = r, "watchdog: forcing repaint");
                 host.force_repaint_active();
