@@ -6940,15 +6940,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         for inst in &instances {
             match inst.backend.as_str() {
                 "cef" => {
-                    if let Some(ref dir) = inst.data_dir {
-                        tracing::warn!(
-                            engine_id = %inst.id,
-                            data_dir = %dir,
-                            "per-engine data_dir is advisory only in Phase 3 \
-                             (CEF cache is process-global; real isolation via \
-                             RequestContext is Phase 5+)"
-                        );
-                    }
                     // Only the first (active) engine gets the full sinks wired up.
                     // Additional instances share the same sinks so that hint/find/
                     // edit events route correctly regardless of which instance

@@ -158,6 +158,7 @@ impl Backend for CefBackend {
             options.private,
             sinks.counters,
             sinks.show_favicons,
+            options.data_dir,
         )
         .map_err(|e| e.to_string())?;
 
