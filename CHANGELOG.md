@@ -8,6 +8,63 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-15
+
+### Changed
+
+- **Engine refactor Phase 6 — apps layer fully agnostic** (#95). The
+  `cef_engines: HashMap<EngineId, Arc<BrowserHost>>` parallel map at the apps
+  layer is deleted. All ~113 reach-through call sites now route through
+  `Arc<dyn BrowserEngine>` via `self.engines`. Seven sub-phases shipped:
+  - **6a** — `BrowserEngine` trait widened with 14 `popup_*` methods (sinks,
+    resize, close, drain_address/title_changes, history_back/forward, OSR
+    input). `PopupQueue`, `PopupCreateSink`, `PopupCloseSink`,
+    `PendingPopupAlloc`, `PopupCreated` and their helpers move from `buffr-cef`
+    to `buffr-engine`. `BlinkCdpEngine` gets no-op stubs (deferred to a future
+    CDP popup pass).
+  - **6b** — trait widened with 6 `hint_*` methods (`cancel_hint`,
+    `backspace_hint`, `feed_hint_key`, `hint_status`, `is_hint_mode`,
+    `pump_hint_events`). `HintStatus` moves to `buffr-engine::hint`.
+    `HintAction` (formerly in `buffr-core`) re-exports through `buffr-engine`.
+  - **6c** — trait widened with 22 frame/edit/media/JS/devtools/downloads
+    methods (`frame_copy/cut/paste/paste_plain/redo/select_all/undo`,
+    `media_play_pause/picture_in_picture/toggle_controls/toggle_loop/toggle_mute`,
+    `image_rotate`, `run_js`, `run_main_frame_js`,
+    `run_edit_attach/cycle/detach/focus`, `run_media_probe`, `start_download`,
+    `show_dev_tools_at`). Default impls used heavily — void methods log a
+    `debug!`, `Result` returners default to `Err(EngineError::Unimplemented)`.
+    `BlinkCdpEngine` overrides `run_js` and `run_main_frame_js` via CDP
+    `Runtime.evaluate` and `show_dev_tools_at` via the existing CDP inspector
+    URL.
+  - **6d** — trait widened with 8 clipboard/audio/cursor/favicon/context-menu
+    methods. `ClipboardReader` becomes `Arc<dyn ClipboardRead>` (trait moved to
+    `buffr-engine::clipboard`); `FaviconUpdate` is a new neutral type in
+    `buffr-engine::favicon`. Audio drain fan-out switches from
+    `cef_engines.values()` to `engines.values()`.
+  - **6e** — `ProfilePaths` moves from `buffr-cef` to `buffr-engine::profile`.
+    New-tab HTML constants (`NEW_TAB_HTML_TEMPLATE`, `NEW_TAB_KEYBINDS_MARKER`,
+    `NEW_TAB_SPLASH_ART_MARKER`, `NEW_TAB_URL`, `SETTINGS_URL`) move to
+    `buffr-engine::newtab`. Apps imports `buffr_engine::TabId` directly instead
+    of routing through `buffr-cef`.
+  - **6f** — `cef_engines` map and `active_host()` method deleted. 38 call sites
+    migrated to `active_engine_dyn()`. New trait methods filled the last gaps
+    (`dispatch`, `is_loading`, `can_go_back`, `can_go_forward`,
+    `drain_context_menu_requests`).
+  - **6g** — `Backend` trait introduced in `buffr-engine::backend`. `CefBackend`
+    (owns `BuffrApp`, drives `cef::initialize`, message pump, scheme handlers,
+    cookie store, device-scale, accessibility hints) and `BlinkCdpBackend`
+    (no-op lifecycle, `open_engine` constructs `BlinkCdpEngine`) provide the two
+    backends. Apps holds `Arc<dyn Backend>`; all 10 CEF lifecycle call sites
+    (`cef_initialize`/`cef_shutdown`/`do_message_loop_work`/`load_cef_library`/
+    `execute_process_for_subprocess`/`take_scheduled_message_pump_delay_ms`/
+    `delete_all_cookies`/`set_force_renderer_accessibility`/
+    `set_device_scale_factor`) route through the trait.
+
+  Final state: `apps/buffr-app/src/main.rs` references only `CefBackend`,
+  `CefEngineSinks`, and the CEF-specific permissions queue types from
+  `buffr-cef`. All other engine interaction goes through `buffr-engine` trait
+  surfaces. Test count: 820/820.
+
 ## [0.7.1] - 2026-05-14
 
 ### Fixed
@@ -1020,7 +1077,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.0
 [0.7.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.1
 [0.7.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.0
 [0.6.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.3
