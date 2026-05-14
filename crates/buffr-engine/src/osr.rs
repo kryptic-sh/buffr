@@ -4,7 +4,7 @@
 //! dependency. `buffr-cef` re-exports these through its own `osr`
 //! module so callers don't need to import from both crates.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// A single captured OSR frame.
@@ -45,45 +45,52 @@ pub type SharedOsrFrame = Arc<Mutex<OsrFrame>>;
 /// Viewport dimensions + device scale factor, readable from any thread.
 ///
 /// All values are accessed with `Ordering::Relaxed` — they are written
-/// from the UI thread and read from the engine IO thread.
+/// from the UI thread and read from the engine IO thread. Tearing is not
+/// a concern because each field is a single 32-bit atomic; slight lag
+/// between a width and height write is acceptable.
 pub struct OsrViewState {
     pub width: AtomicU32,
     pub height: AtomicU32,
-    /// Device scale factor stored as thousandths (e.g. 1000 = 1.0×).
+    /// Device scale factor stored as thousandths (e.g. 1000 = 1.0×, 1500 = 1.5×).
     pub scale: AtomicU32,
-    /// Target frame rate in Hz (default 60).
+    /// CEF `windowless_frame_rate` to use when creating new browsers
+    /// and when retargeting live ones. Default 60. CEF clamps to its
+    /// own max (typically 60 in CEF 147).
     pub frame_rate_hz: AtomicU32,
-    /// Whether the surface is sleeping (was_hidden). Written by the
-    /// OSR sleep path; read by the engine's paint scheduler.
-    pub sleeping: AtomicBool,
-    /// Optional wake callback. Fired on every paint so the embedder
-    /// can nudge its UI loop (e.g. winit EventLoopProxy::send_event).
-    /// First setter wins; subsequent calls are silently ignored.
+    /// Optional callback invoked from `on_paint` after a frame lands.
+    /// The embedder uses this to wake the winit event loop so the UI
+    /// can pump a redraw without polling. Set once at startup; first
+    /// setter wins; subsequent calls are silently ignored.
     pub wake: OnceLock<Arc<dyn Fn() + Send + Sync>>,
-    /// CEF browser id for the tab owning this view. Set at construction.
-    pub main_id: AtomicI32,
 }
 
 impl OsrViewState {
+    /// Default viewport: 1280×800, scale 1.0×, 60 fps.
     pub fn new() -> Self {
         Self {
-            width: AtomicU32::new(800),
-            height: AtomicU32::new(600),
+            width: AtomicU32::new(1280),
+            height: AtomicU32::new(800),
             scale: AtomicU32::new(1000),
             frame_rate_hz: AtomicU32::new(60),
-            sleeping: AtomicBool::new(false),
             wake: OnceLock::new(),
-            main_id: AtomicI32::new(-1),
         }
     }
 
-    pub fn scale(&self) -> f32 {
-        self.scale.load(Ordering::Relaxed) as f32 / 1000.0
+    /// Install the wake callback. First call wins; subsequent calls are
+    /// silently ignored.
+    pub fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.wake.set(wake);
     }
 
+    /// Store the device scale factor (e.g. 1.5 → stored as 1500).
     pub fn set_scale(&self, scale: f32) {
-        let v = (scale * 1000.0).round().max(0.0) as u32;
+        let v = (scale * 1000.0).round().max(1.0) as u32;
         self.scale.store(v, Ordering::Relaxed);
+    }
+
+    /// Read the device scale factor (thousandths → float).
+    pub fn scale(&self) -> f32 {
+        self.scale.load(Ordering::Relaxed) as f32 / 1000.0
     }
 }
 

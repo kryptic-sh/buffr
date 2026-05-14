@@ -3,6 +3,7 @@
 //! Zero CEF dependency. `buffr-core` and the apps layer program against
 //! this interface; `buffr-cef` is the concrete backend.
 
+pub mod engine;
 pub mod error;
 pub mod event;
 pub mod input;
@@ -10,6 +11,7 @@ pub mod osr;
 pub mod tab;
 pub mod types;
 
+pub use engine::BrowserEngine;
 pub use error::EngineError;
 pub use event::EngineEvent;
 pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
