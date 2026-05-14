@@ -205,6 +205,17 @@ pub trait BrowserEngine: Send + Sync {
     /// Default no-op — backends that support zoom override this.
     fn zoom_reset(&self) {}
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    /// Open the developer tools panel/window for the given tab.
+    ///
+    /// Default no-op: backends that don't support it ignore the call.
+    /// Returns `Ok(())` even when stubbed so the apps layer doesn't
+    /// need to special-case missing capability.
+    fn open_devtools(&self, _tab: TabId) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     /// `true` when at least one browser has an active audio stream.
