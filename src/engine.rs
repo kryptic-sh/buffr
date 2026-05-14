@@ -654,6 +654,42 @@ pub trait BrowserEngine: Send + Sync {
         None
     }
 
+    // ── IME composition (Phase 8d, #86) ─────────────────────────────────────────
+    //
+    // Three-call lifecycle matching both CEF's BrowserHost IME API and the
+    // Chrome DevTools Protocol `Input.imeSetComposition` / `Input.insertText`
+    // commands:
+    //
+    //  1. `ime_set_composition` — called repeatedly while the user is composing
+    //     (winit `Ime::Preedit`).
+    //  2. `ime_commit` — called once when the user accepts the composition
+    //     (winit `Ime::Commit`).
+    //  3. `ime_cancel` — called when the IME is disabled or the window loses
+    //     focus (winit `Ime::Disabled` or `Ime::Enabled` without a pending
+    //     commit).
+    //
+    // All three have default no-op bodies so backends that do not yet support
+    // IME (e.g. future backends) compile without stubs.
+
+    /// Update IME composition state.  Called during pre-edit.
+    ///
+    /// `cursor` is a `(start, end)` byte range within `text` for the
+    /// composition selection, or `None` to indicate no active selection.
+    ///
+    /// Default: no-op (backends override for their platform IME API).
+    fn ime_set_composition(&self, _text: &str, _cursor: Option<(usize, usize)>) {}
+
+    /// Commit text to the focused editable.  Called when composition is accepted.
+    ///
+    /// Default: no-op.
+    fn ime_commit(&self, _text: &str) {}
+
+    /// Cancel the current composition.  Called when IME is disabled or the
+    /// window blurs while a composition is in progress.
+    ///
+    /// Default: no-op.
+    fn ime_cancel(&self) {}
+
     // ── Permissions (Phase 8a, #88) ───────────────────────────────────────────
     //
     // Both the CEF backend and blink-cdp push neutral `PendingPermission`
