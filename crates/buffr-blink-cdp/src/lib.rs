@@ -26,6 +26,7 @@
 
 pub mod backend;
 pub mod cdp;
+pub mod context_menu;
 pub mod engine;
 pub mod error;
 pub mod find;

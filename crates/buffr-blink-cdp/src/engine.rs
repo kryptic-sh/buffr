@@ -53,6 +53,7 @@ use crate::cdp::{
     DispatchKeyEventParams, DispatchMouseEventParams, SetDeviceMetricsParams, key_event_type,
     mouse_button_str, next_id,
 };
+use crate::context_menu::{ContextMenuSink, new_context_menu_sink};
 use crate::error::BlinkError;
 use crate::find::{find_expr, parse_find_result, stop_expr};
 use crate::subprocess::{find_chromium, pick_free_port, probe_ws_url, spawn_headless};
@@ -189,6 +190,10 @@ pub struct BlinkCdpEngine {
     /// `FindNext` / `FindPrev` (dispatched from `n` / `N` keybinds) can
     /// step through matches without repeating the full scan.
     find_query: Arc<Mutex<Option<String>>>,
+    /// Context-menu request queue (Phase 8c, #87). The worker pushes entries
+    /// when the JS shim fires `Runtime.bindingCalled` for `__buffrContextMenu`.
+    /// The UI thread drains via `drain_context_menu_requests`.
+    context_menu_sink: ContextMenuSink,
 }
 
 impl BlinkCdpEngine {
@@ -247,6 +252,9 @@ impl BlinkCdpEngine {
         let perm_session_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+        // Context-menu sink (Phase 8c, #87).
+        let context_menu_sink = new_context_menu_sink();
+
         // Resolve the effective download directory.  If the caller did not
         // supply one, fall back to `<data_dir>/downloads` so downloads always
         // land somewhere deterministic rather than Chromium's default desktop
@@ -271,6 +279,7 @@ impl BlinkCdpEngine {
         let worker_downloads = downloads.clone();
         let worker_notice_queue = notice_queue.clone();
         let worker_download_dir = effective_download_dir.clone();
+        let worker_context_menu_sink = Arc::clone(&context_menu_sink);
         let worker = std::thread::Builder::new()
             .name("blink-cdp-worker".to_owned())
             .spawn(move || {
@@ -284,6 +293,7 @@ impl BlinkCdpEngine {
                     worker_downloads,
                     worker_notice_queue,
                     worker_download_dir,
+                    worker_context_menu_sink,
                 )
             })
             .map_err(BlinkError::SpawnFailed)?;
@@ -336,6 +346,7 @@ impl BlinkCdpEngine {
             notice_queue,
             find_sink: find_sink.unwrap_or_else(new_find_sink),
             find_query: Arc::new(Mutex::new(None)),
+            context_menu_sink,
         })
     }
 
@@ -509,6 +520,21 @@ impl BlinkCdpEngine {
             &session_id,
             "Page.addScriptToEvaluateOnNewDocument",
             serde_json::json!({ "source": crate::find::find_shim_js() }),
+        );
+
+        // Register the context-menu binding and inject the hit-test shim
+        // (Phase 8c, #87). `Runtime.addBinding` makes `window.__buffrContextMenu`
+        // callable from the page's JS context, which the shim uses to post
+        // right-click metadata to the worker.
+        let _ = self.session_cmd(
+            &session_id,
+            "Runtime.addBinding",
+            serde_json::json!({ "name": "__buffrContextMenu" }),
+        );
+        let _ = self.session_cmd(
+            &session_id,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": crate::context_menu::context_menu_shim_js() }),
         );
 
         let mut state = self.state.lock().unwrap();
@@ -1134,6 +1160,15 @@ impl BrowserEngine for BlinkCdpEngine {
         open::that(&url)
             .map_err(|e| buffr_engine::EngineError::Other(format!("open devtools url: {e}")))?;
         Ok(())
+    }
+
+    // ── Context menu (Phase 8c, #87) ─────────────────────────────────────────
+
+    fn drain_context_menu_requests(&self) -> Vec<buffr_engine::ContextMenuRequest> {
+        match self.context_menu_sink.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     // ── Audio / video ────────────────────────────────────────────────────────

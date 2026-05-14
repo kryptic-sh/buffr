@@ -28,6 +28,8 @@ use buffr_downloads::{DownloadId, Downloads};
 use buffr_engine::{PermissionsQueue, SharedOsrFrame, SharedOsrViewState};
 use buffr_permissions::Capability;
 
+use crate::context_menu::ContextMenuSink;
+
 use crate::cdp::{
     CdpCommand, CdpMessage, DispatchKeyEventParams, DispatchMouseEventParams, NavigateParams,
     ScreencastFrameAckParams, SetDeviceMetricsParams, StartScreencastParams, next_id,
@@ -107,6 +109,7 @@ pub fn run(
     downloads: Option<Arc<Downloads>>,
     notice_queue: Option<DownloadNoticeQueue>,
     download_dir: PathBuf,
+    context_menu_sink: ContextMenuSink,
 ) {
     // Map from CDP message-id → reply sender.
     let mut pending: HashMap<u64, Sender<Result<Value, BlinkError>>> = HashMap::new();
@@ -277,6 +280,7 @@ pub fn run(
                         notice_queue.as_ref(),
                         &download_dir,
                         &mut download_ids,
+                        &context_menu_sink,
                     );
                 }
             },
@@ -324,6 +328,7 @@ fn dispatch_message(
     notice_queue: Option<&DownloadNoticeQueue>,
     download_dir: &Path,
     download_ids: &mut HashMap<String, DownloadId>,
+    context_menu_sink: &ContextMenuSink,
 ) {
     // Command response.
     if let Some(id) = msg.id {
@@ -377,6 +382,10 @@ fn dispatch_message(
                         permissions_queue,
                         perm_session_map,
                     );
+                } else if name == "__buffrContextMenu" {
+                    // Phase 8c (#87): context-menu hit-test from the JS shim.
+                    let payload = params.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                    handle_context_menu_binding(payload, context_menu_sink);
                 }
             }
         }
@@ -459,6 +468,31 @@ fn handle_permission_binding(
     };
     if let Ok(mut q) = permissions_queue.lock() {
         q.push_back(perm);
+    }
+}
+
+/// Handle a `Runtime.bindingCalled` event for `__buffrContextMenu`.
+///
+/// Parses the JSON payload from the JS hit-test shim and pushes a neutral
+/// [`buffr_engine::ContextMenuRequest`] onto the context-menu sink so the
+/// UI thread can drain and display it.
+fn handle_context_menu_binding(payload: &str, context_menu_sink: &ContextMenuSink) {
+    match crate::context_menu::parse_context_menu_binding(payload) {
+        Some(req) => {
+            tracing::debug!(
+                x = req.x,
+                y = req.y,
+                page_url = %req.page_url,
+                media_type = ?req.media_type,
+                "blink-cdp: context-menu request from JS shim"
+            );
+            if let Ok(mut q) = context_menu_sink.lock() {
+                q.push_back(req);
+            }
+        }
+        None => {
+            tracing::debug!(payload, "blink-cdp: invalid context-menu binding payload");
+        }
     }
 }
 
