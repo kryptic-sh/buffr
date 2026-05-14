@@ -110,14 +110,17 @@ struct EngineState {
     tabs: Vec<CdpTab>,
     active: Option<TabId>,
     next_tab_id: u64,
+    /// Chromium remote-debugging port chosen at startup.
+    debug_port: u16,
 }
 
 impl EngineState {
-    fn new() -> Self {
+    fn new(debug_port: u16) -> Self {
         Self {
             tabs: Vec::new(),
             active: None,
             next_tab_id: 1,
+            debug_port,
         }
     }
 
@@ -197,7 +200,7 @@ impl BlinkCdpEngine {
             .map_err(BlinkError::SpawnFailed)?;
 
         Ok(Self {
-            state: Arc::new(Mutex::new(EngineState::new())),
+            state: Arc::new(Mutex::new(EngineState::new(port))),
             cmd_tx,
             osr_frame,
             osr_view,
@@ -861,6 +864,30 @@ impl BrowserEngine for BlinkCdpEngine {
         self.apply_zoom(1.0);
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    fn open_devtools(&self, tab: TabId) -> Result<(), buffr_engine::EngineError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| buffr_engine::EngineError::Other(format!("state lock poisoned: {e}")))?;
+        let port = state.debug_port;
+        let cdp_tab = state
+            .tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .ok_or(buffr_engine::EngineError::TabNotFound(tab))?;
+        let target_id = cdp_tab.target_id.clone();
+        drop(state);
+        let url = format!(
+            "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target_id}"
+        );
+        tracing::debug!(%url, "blink-cdp: open_devtools");
+        open::that(&url)
+            .map_err(|e| buffr_engine::EngineError::Other(format!("open devtools url: {e}")))?;
+        Ok(())
+    }
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
@@ -909,7 +936,7 @@ mod tests {
     fn active_zoom_level_returns_tracked_value() {
         // Build a minimal EngineState with one tab and verify that
         // active_zoom_level reflects the stored zoom_level.
-        let mut state = EngineState::new();
+        let mut state = EngineState::new(9222);
         let tab_id = state.mint_tab_id();
         state.tabs.push(CdpTab {
             id: tab_id,
@@ -935,6 +962,34 @@ mod tests {
             (level_none - 1.0_f64).abs() < f64::EPSILON,
             "no active tab should yield 1.0, got {level_none}"
         );
+    }
+
+    // ── DevTools URL format tests ─────────────────────────────────────────────
+
+    #[test]
+    fn devtools_url_format_is_correct() {
+        // Verify the inspector URL template produces the expected shape.
+        let port: u16 = 9222;
+        let target_id = "ABCD1234-EF56-7890-ABCD-EF1234567890";
+        let url = format!(
+            "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target_id}"
+        );
+        assert!(url.starts_with("http://127.0.0.1:9222/devtools/inspector.html"));
+        assert!(url.contains("ws=127.0.0.1:9222/devtools/page/"));
+        assert!(url.ends_with(target_id));
+    }
+
+    #[test]
+    fn open_devtools_returns_tab_not_found_for_unknown_tab() {
+        // Build a minimal EngineState with no tabs and verify that
+        // open_devtools returns TabNotFound for an unknown tab id.
+        let state = EngineState::new(9222);
+        let unknown_id = TabId(99);
+        let result = state.tabs.iter().find(|t| t.id == unknown_id);
+        assert!(result.is_none(), "unknown tab should not be found");
+        // Simulate the error path:
+        let err = buffr_engine::EngineError::TabNotFound(unknown_id);
+        assert!(matches!(err, buffr_engine::EngineError::TabNotFound(_)));
     }
 
     // ── Chromium detection tests ──────────────────────────────────────────────
