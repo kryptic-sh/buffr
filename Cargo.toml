@@ -1,7 +1,7 @@
 [package]
 name = "buffr-core"
 description = "Engine-agnostic browser shell for buffr."
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

@@ -6,6 +6,31 @@ All notable changes to `buffr-core` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-15
+
+### Added
+
+- `Command::Engine(String)` in `cmdline` — parses `:engine <id>` from the
+  command bar. Empty id falls through to `Command::Unknown`. `"engine"` added to
+  `COMMAND_NAMES` for omnibar completion.
+
+### Changed
+
+- **Breaking: CEF integration removed from `buffr-core`.** All CEF-specific
+  modules (`app`, `audio`, `handlers`, `host`, `new_tab`, `osr`, `permissions`,
+  `view_source_scheme`) and their re-exported public items (`BuffrApp`,
+  `BrowserHost`, `Tab`, `TabId`, `TabSession`, `TabSummary`, `ClipboardReader`,
+  `HintStatus`, `OsrFrame`, `OsrViewState`, `AudioEvent`, `AudioEventQueue`,
+  `AudioState`, `AudioStateSink`, `PopupQueue`, `PopupCreated`,
+  `PopupCreateSink`, `PopupCloseSink`, `PendingPermission`, `PermissionsQueue`,
+  `PromptOutcome`, `NewTabHtmlProvider`, `register_buffr_src_handler_factory`,
+  `register_buffr_src_scheme`, `init_cef_api()`, etc.) are now in `buffr-cef`.
+  Engine-agnostic shell retained in `buffr-core`; `BrowserEngine` trait in
+  `buffr-engine`. Closes phase 1 of kryptic-sh/buffr#72.
+- `hint::HintAction` re-exported from `buffr-engine` (Phase 6b, #95). The
+  `buffr_core::HintAction` path is preserved via `pub use hint::HintAction`;
+  callers that import from `buffr_engine` directly are also fine.
+
 ## [0.6.3] — 2026-05-13
 
 ### Added
@@ -282,7 +307,8 @@ without `$HOME`).
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-core/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.7.0
 [0.6.3]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.3
 [0.6.2]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/buffr-core/releases/tag/v0.6.1
