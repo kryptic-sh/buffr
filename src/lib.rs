@@ -1,7 +1,47 @@
-//! `buffr-engine` — engine-agnostic browser trait and neutral types.
+//! Engine-agnostic browser trait + neutral types for buffr.
 //!
-//! Zero CEF dependency. `buffr-core` and the apps layer program against
-//! this interface; `buffr-cef` is the concrete backend.
+//! `buffr-engine` defines the [`BrowserEngine`] trait and all shared types
+//! that backends and the apps layer exchange.  It has **zero** dependency on
+//! any browser runtime — no CEF, no CDP, no system libraries.  Any code that
+//! needs to be portable across backends should depend only on this crate.
+//!
+//! # Position in the workspace
+//!
+//! ```text
+//! apps/buffr  ──depends──►  buffr-engine  (trait + types, this crate)
+//!                                │
+//!              ┌─────────────────┴──────────────────┐
+//!              ▼                                     ▼
+//!         buffr-cef                          buffr-blink-cdp
+//!    (CEF concrete backend)           (headless Chromium CDP backend)
+//! ```
+//!
+//! The apps layer and `buffr-core` import `buffr-engine` exclusively; they
+//! never reach into a backend crate directly.  Backend crates implement
+//! [`BrowserEngine`] and expose a single constructor to the application.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |---|---|
+//! | [`BrowserEngine`] | Central trait — one impl per backend |
+//! | [`EngineId`] | Unique handle identifying a live engine instance |
+//! | [`EngineEvent`] | Event enum produced by a running engine |
+//! | [`OsrFrame`] / [`SharedOsrFrame`] | Off-screen render buffer + sharing wrapper |
+//! | [`TabId`] / [`TabSummary`] | Lightweight tab identity and metadata |
+//! | [`PermissionsQueue`] | Lock-free queue for pending browser permission prompts |
+//! | [`PopupQueue`] | Lock-free queue for pending popup window requests |
+//!
+//! # Phases
+//!
+//! The v0.9.0 capability surface targeted for both backends covers:
+//! - Permissions: camera, microphone, geolocation, notifications, MIDI
+//! - Downloads: start, progress, cancel, open
+//! - Find-in-page: start, next/prev, close, result count
+//! - Context menu: build model, handle selection, image/media buckets
+//! - IME: composition start/update/end, candidate window hints
+//! - Custom schemes: `buffr-src:` handler registration
+//! - Picture-in-Picture (blink-cdp): `Page.setDocumentContent` + PiP API
 
 pub mod backend;
 pub mod clipboard;
