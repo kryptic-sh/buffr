@@ -52,9 +52,11 @@ pub use buffr_engine::{
     new_popup_close_sink, new_popup_create_sink, new_popup_queue,
 };
 pub use permissions::{
-    PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
-    capabilities_for_request_mask, drain_with_defer as drain_permissions_with_defer,
-    new_queue as new_permissions_queue, peek_front as peek_permission_front,
+    CefCallbackRegistry, PendingPermission, PermissionsQueue, PromptOutcome,
+    capabilities_for_media_mask, capabilities_for_request_mask,
+    drain_registry_with_defer as drain_permissions_registry_with_defer,
+    drain_with_defer as drain_permissions_with_defer, enqueue_to_both,
+    new_queue as new_permissions_queue, next_resolve_id, peek_front as peek_permission_front,
     pop_front as pop_permission_front, precheck as precheck_permission,
     queue_len as permissions_queue_len,
 };

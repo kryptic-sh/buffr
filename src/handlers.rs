@@ -92,6 +92,8 @@ pub fn make_client(
     zoom: Arc<ZoomStore>,
     permissions: Arc<Permissions>,
     permissions_queue: PermissionsQueue,
+    neutral_permissions_queue: buffr_engine::PermissionsQueue,
+    cef_callback_registry: crate::permissions::CefCallbackRegistry,
     find_sink: FindResultSink,
     hint_sink: HintEventSink,
     edit_sink: EditEventSink,
@@ -122,6 +124,8 @@ pub fn make_client(
         zoom,
         permissions,
         permissions_queue,
+        neutral_permissions_queue,
+        cef_callback_registry,
         find_sink,
         hint_sink,
         edit_sink,
@@ -213,11 +217,16 @@ pub fn make_find_handler(sink: FindResultSink) -> FindHandler {
 /// Standalone factory for the permission handler. Pre-checks the
 /// store synchronously; otherwise enqueues the request for the UI
 /// thread.
+///
+/// Phase 8a (#88): `neutral_queue` and `callback_registry` are the new
+/// dual-push targets; `queue` is kept for backward-compat shutdown drain.
 pub fn make_permission_handler(
     permissions: Arc<Permissions>,
     queue: PermissionsQueue,
+    neutral_queue: buffr_engine::PermissionsQueue,
+    callback_registry: crate::permissions::CefCallbackRegistry,
 ) -> PermissionHandler {
-    BuffrPermissionHandler::new(permissions, queue)
+    BuffrPermissionHandler::new(permissions, queue, neutral_queue, callback_registry)
 }
 
 wrap_life_span_handler! {
@@ -415,6 +424,8 @@ wrap_client! {
         zoom: Arc<ZoomStore>,
         permissions: Arc<Permissions>,
         permissions_queue: PermissionsQueue,
+        neutral_permissions_queue: buffr_engine::PermissionsQueue,
+        cef_callback_registry: crate::permissions::CefCallbackRegistry,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         edit_sink: EditEventSink,
@@ -498,6 +509,8 @@ wrap_client! {
             Some(BuffrPermissionHandler::new(
                 self.permissions.clone(),
                 self.permissions_queue.clone(),
+                self.neutral_permissions_queue.clone(),
+                self.cef_callback_registry.clone(),
             ))
         }
 
@@ -1270,6 +1283,8 @@ wrap_permission_handler! {
     pub struct BuffrPermissionHandler {
         permissions: Arc<Permissions>,
         queue: PermissionsQueue,
+        neutral_queue: buffr_engine::PermissionsQueue,
+        callback_registry: crate::permissions::CefCallbackRegistry,
     }
 
     impl PermissionHandler {
@@ -1322,21 +1337,22 @@ wrap_permission_handler! {
                 }
             }
 
-            // Enqueue. We clone the callback (RefGuard::Clone bumps
-            // refcount) so it survives until the UI thread resolves
-            // the request.
+            // Enqueue into callback registry + neutral queue (Phase 8a, #88).
+            // The old CEF-internal queue is no longer populated for new
+            // requests; `drain_registry_with_defer` handles shutdown cleanup.
             let pending = PendingPermission::MediaAccess {
                 origin,
                 capabilities: caps,
                 callback: callback.clone(),
                 requested_mask: requested_permissions,
             };
-            if let Ok(mut q) = self.queue.lock() {
-                q.push_back(pending);
-            } else {
-                tracing::warn!("permissions: queue mutex poisoned — denying");
-                callback.cancel();
-            }
+            let resolve_id = crate::permissions::next_resolve_id();
+            crate::permissions::enqueue_to_both(
+                pending,
+                &self.callback_registry,
+                &self.neutral_queue,
+                resolve_id,
+            );
             1
         }
 
@@ -1381,18 +1397,20 @@ wrap_permission_handler! {
                 }
             }
 
+            // Enqueue into callback registry + neutral queue (Phase 8a, #88).
             let pending = PendingPermission::Prompt {
                 origin,
                 capabilities: caps,
                 callback: callback.clone(),
                 prompt_id,
             };
-            if let Ok(mut q) = self.queue.lock() {
-                q.push_back(pending);
-            } else {
-                tracing::warn!("permissions: queue mutex poisoned — dismissing");
-                callback.cont(PermissionRequestResult::DISMISS);
-            }
+            let resolve_id = crate::permissions::next_resolve_id();
+            crate::permissions::enqueue_to_both(
+                pending,
+                &self.callback_registry,
+                &self.neutral_queue,
+                resolve_id,
+            );
             1
         }
 
