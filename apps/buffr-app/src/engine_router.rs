@@ -486,6 +486,22 @@ mod tests {
             _modifiers: u32,
         ) {
         }
+        fn is_hint_mode(&self) -> bool {
+            false
+        }
+        fn hint_status(&self) -> Option<buffr_engine::HintStatus> {
+            None
+        }
+        fn pump_hint_events(&self) -> bool {
+            false
+        }
+        fn feed_hint_key(&self, _c: char) -> Option<buffr_engine::HintAction> {
+            None
+        }
+        fn backspace_hint(&self) -> Option<buffr_engine::HintAction> {
+            None
+        }
+        fn cancel_hint(&self) {}
     }
 
     fn stub_arc() -> Arc<dyn BrowserEngine> {

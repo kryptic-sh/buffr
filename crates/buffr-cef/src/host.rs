@@ -55,10 +55,10 @@ use buffr_core::favicon::favicon_is_enabled;
 use buffr_core::favicon::{FaviconEnabled, FaviconSink, new_favicon_enabled, new_favicon_sink};
 use buffr_core::find::FindResultSink;
 use buffr_core::hint::{
-    DEFAULT_HINT_SELECTORS, Hint, HintAction, HintAlphabet, HintEventSink, HintSession,
-    build_inject_script,
+    DEFAULT_HINT_SELECTORS, Hint, HintAlphabet, HintEventSink, HintSession, build_inject_script,
 };
 use buffr_core::telemetry::{KEY_TABS_OPENED, UsageCounters};
+use buffr_engine::{HintAction, HintStatus};
 
 // `HostMode` removed: every platform now runs OSR. CEF paints into a
 // shared bitmap, the wgpu present layer composites it under buffr's
@@ -2719,14 +2719,6 @@ impl BrowserHost {
     }
 }
 
-/// Snapshot of hint-mode state for the statusline indicator.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HintStatus {
-    pub typed: String,
-    pub match_count: usize,
-    pub background: bool,
-}
-
 /// Format a string as a JS double-quoted literal, escaping every
 /// non-ASCII codepoint to `\uXXXX`. Used for the inline filter call
 /// so the splice survives any input the user might type.
@@ -3068,6 +3060,32 @@ impl buffr_engine::BrowserEngine for BrowserHost {
         modifiers: u32,
     ) {
         self.popup_osr_mouse_wheel(browser_id, x, y, delta_x, delta_y, modifiers)
+    }
+
+    // ── Hint mode (Phase 6b, #95) ─────────────────────────────────────────────
+
+    fn is_hint_mode(&self) -> bool {
+        self.is_hint_mode()
+    }
+
+    fn hint_status(&self) -> Option<buffr_engine::HintStatus> {
+        self.hint_status()
+    }
+
+    fn pump_hint_events(&self) -> bool {
+        self.pump_hint_events()
+    }
+
+    fn feed_hint_key(&self, c: char) -> Option<buffr_engine::HintAction> {
+        self.feed_hint_key(c)
+    }
+
+    fn backspace_hint(&self) -> Option<buffr_engine::HintAction> {
+        self.backspace_hint()
+    }
+
+    fn cancel_hint(&self) {
+        self.cancel_hint()
     }
 }
 

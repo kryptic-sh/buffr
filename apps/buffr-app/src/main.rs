@@ -5193,10 +5193,10 @@ impl AppState {
     /// other chord is silently swallowed so the modal trie can't fire
     /// on `j` / `k` etc. while a session is live.
     fn hint_mode_handle_key(&mut self, event: &winit::event::KeyEvent) -> bool {
-        let Some(host) = self.active_host() else {
+        let Some(engine) = self.active_engine_dyn() else {
             return false;
         };
-        if !host.is_hint_mode() {
+        if !engine.is_hint_mode() {
             return false;
         }
         let chord = match key_event_to_chord(event, self.modifiers) {
@@ -5209,16 +5209,16 @@ impl AppState {
             && !mods.contains(buffr_modal::Modifiers::SUPER);
         match chord.key {
             Key::Named(NamedKey::Esc) => {
-                host.cancel_hint();
+                engine.cancel_hint();
                 self.exit_hint_mode();
             }
             Key::Named(NamedKey::BS) => {
-                if let Some(action) = host.backspace_hint() {
+                if let Some(action) = engine.backspace_hint() {
                     self.handle_hint_action(action);
                 }
             }
             Key::Char(c) if plain => {
-                if let Some(action) = host.feed_hint_key(c) {
+                if let Some(action) = engine.feed_hint_key(c) {
                     self.handle_hint_action(action);
                 }
             }
@@ -8008,11 +8008,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Drain any hint event (Ready / Error from the renderer) and
         // refresh the statusline indicator off the live session.
-        if let Some(host) = self.active_host() {
-            if host.pump_hint_events() {
+        if let Some(engine) = self.active_engine_dyn() {
+            if engine.pump_hint_events() {
                 self.request_redraw();
             }
-            let new_status = host.hint_status().map(|h| UiHintStatus {
+            let new_status = engine.hint_status().map(|h| UiHintStatus {
                 typed: h.typed,
                 match_count: h.match_count as u32,
                 background: h.background,
