@@ -47,6 +47,23 @@ pub struct TabSummary {
     pub private: bool,
 }
 
+/// A popup browser window that has been created and is ready to render.
+///
+/// Emitted by the engine's lifespan handler when a popup browser
+/// (`window.open` / `NEW_POPUP` disposition) comes into existence.
+/// The apps layer drains these each tick and spawns a corresponding
+/// winit window for each.
+pub struct PopupCreated {
+    /// Engine-internal browser id for the new popup.
+    pub browser_id: i32,
+    /// Initial URL (from `on_before_popup`). May be empty.
+    pub url: String,
+    /// OSR frame buffer shared with the paint handler.
+    pub frame: crate::SharedOsrFrame,
+    /// OSR viewport state. The apps layer writes width/height on resize.
+    pub view: crate::SharedOsrViewState,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -78,7 +95,8 @@ mod tests {
     fn tab_id_clone_copy() {
         let a = TabId(7);
         let b = a; // Copy
-        let c = a.clone();
+        #[allow(clippy::clone_on_copy)]
+        let c = a.clone(); // exercise Clone impl explicitly
         assert_eq!(a, b);
         assert_eq!(a, c);
     }
@@ -118,21 +136,4 @@ mod tests {
         assert!(!summary.pinned);
         assert!(!summary.private);
     }
-}
-
-/// A popup browser window that has been created and is ready to render.
-///
-/// Emitted by the engine's lifespan handler when a popup browser
-/// (`window.open` / `NEW_POPUP` disposition) comes into existence.
-/// The apps layer drains these each tick and spawns a corresponding
-/// winit window for each.
-pub struct PopupCreated {
-    /// Engine-internal browser id for the new popup.
-    pub browser_id: i32,
-    /// Initial URL (from `on_before_popup`). May be empty.
-    pub url: String,
-    /// OSR frame buffer shared with the paint handler.
-    pub frame: crate::SharedOsrFrame,
-    /// OSR viewport state. The apps layer writes width/height on resize.
-    pub view: crate::SharedOsrViewState,
 }
