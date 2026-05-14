@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-14
+
+### Fixed
+
+- **macOS package build broken in v0.7.0**: `cef::Settings` binding in
+  `buffr_cef::cef_initialize` was `let` not `let mut`, but the
+  `#[cfg(target_os = "macos")]` block at `crates/buffr-cef/src/lib.rs:166`
+  assigns to `external_message_pump`, `browser_subprocess_path`,
+  `framework_dir_path`, and `resources_dir_path`. Linux cfg-gated the block out
+  so the issue was invisible locally; macOS package CI caught it.
+
 ## [0.7.0] - 2026-05-14
 
 ### Added
@@ -1009,7 +1020,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.1
 [0.7.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.7.0
 [0.6.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.3
 [0.6.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.6.2
