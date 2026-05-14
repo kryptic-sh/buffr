@@ -5,9 +5,6 @@
 //! concrete `BrowserHost` implementation backed by Chromium Embedded
 //! Framework.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
 pub mod app;
 pub mod audio;
 pub(crate) mod convert;
@@ -38,6 +35,14 @@ pub use new_tab::{
     register_buffr_scheme, settings_html,
 };
 pub use osr::{OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState};
+// Popup types and helpers promoted to buffr-engine in Phase 6a (#95).
+// Re-exported here so existing `buffr_cef::PopupQueue` / `drain_popup_*`
+// imports keep resolving without modification.
+pub use buffr_engine::{
+    PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue,
+    drain_popup_closes, drain_popup_creates, drain_popup_urls, new_pending_popup_alloc,
+    new_popup_close_sink, new_popup_create_sink, new_popup_queue,
+};
 pub use permissions::{
     PendingPermission, PermissionsQueue, PromptOutcome, capabilities_for_media_mask,
     capabilities_for_request_mask, drain_with_defer as drain_permissions_with_defer,
@@ -46,73 +51,6 @@ pub use permissions::{
     queue_len as permissions_queue_len,
 };
 pub use view_source_scheme::{register_buffr_src_handler_factory, register_buffr_src_scheme};
-
-/// URLs queued by `LifeSpanHandler::on_before_popup` for dispositions
-/// that should open as a new tab (`NEW_FOREGROUND_TAB`,
-/// `NEW_BACKGROUND_TAB`). `NEW_POPUP` / `NEW_WINDOW` are not enqueued.
-pub type PopupQueue = Arc<Mutex<VecDeque<String>>>;
-
-pub fn new_popup_queue() -> PopupQueue {
-    Arc::new(Mutex::new(VecDeque::new()))
-}
-
-pub fn drain_popup_urls(q: &PopupQueue) -> Vec<String> {
-    if let Ok(mut g) = q.lock() {
-        return g.drain(..).collect();
-    }
-    Vec::new()
-}
-
-/// A popup browser window ready to render. Emitted by the lifespan
-/// handler on `on_after_created` for popup browsers.
-pub struct PopupCreated {
-    /// CEF `Browser::identifier()` for the new popup browser.
-    pub browser_id: i32,
-    /// Initial URL from `on_before_popup`. May be empty.
-    pub url: String,
-    /// OSR frame buffer shared with the paint handler.
-    pub frame: SharedOsrFrame,
-    /// OSR viewport state.
-    pub view: SharedOsrViewState,
-}
-
-/// Queue of popup-created events.
-pub type PopupCreateSink = Arc<Mutex<VecDeque<PopupCreated>>>;
-
-/// Queue of `browser_id` values for closed popup browsers.
-pub type PopupCloseSink = Arc<Mutex<VecDeque<i32>>>;
-
-pub fn new_popup_create_sink() -> PopupCreateSink {
-    Arc::new(Mutex::new(VecDeque::new()))
-}
-
-pub fn new_popup_close_sink() -> PopupCloseSink {
-    Arc::new(Mutex::new(VecDeque::new()))
-}
-
-/// Single-slot pending popup alloc: allocated by `on_before_popup`,
-/// consumed by `on_after_created`.
-pub type PendingPopupAlloc = Arc<Mutex<Option<(SharedOsrFrame, SharedOsrViewState, String)>>>;
-
-pub fn new_pending_popup_alloc() -> PendingPopupAlloc {
-    Arc::new(Mutex::new(None))
-}
-
-/// Drain all pending popup-created events.
-pub fn drain_popup_creates(sink: &PopupCreateSink) -> Vec<PopupCreated> {
-    if let Ok(mut g) = sink.lock() {
-        return g.drain(..).collect();
-    }
-    Vec::new()
-}
-
-/// Drain all pending popup-close browser ids.
-pub fn drain_popup_closes(sink: &PopupCloseSink) -> Vec<i32> {
-    if let Ok(mut g) = sink.lock() {
-        return g.drain(..).collect();
-    }
-    Vec::new()
-}
 
 /// Pin the CEF runtime API version before any CEF entry point.
 ///

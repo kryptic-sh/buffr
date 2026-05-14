@@ -921,6 +921,67 @@ impl BrowserEngine for BlinkCdpEngine {
     fn any_video_active(&self) -> bool {
         false
     }
+
+    // ── Popup sinks (Phase 6a, #95) ──────────────────────────────────────────
+    // CDP popup support: future work, see #95.
+
+    fn popup_queue(&self) -> buffr_engine::popup::PopupQueue {
+        buffr_engine::new_popup_queue()
+    }
+
+    fn popup_create_sink(&self) -> buffr_engine::popup::PopupCreateSink {
+        buffr_engine::new_popup_create_sink()
+    }
+
+    fn popup_close_sink(&self) -> buffr_engine::popup::PopupCloseSink {
+        buffr_engine::new_popup_close_sink()
+    }
+
+    fn popup_resize(&self, _browser_id: i32, _width: u32, _height: u32) {}
+
+    fn popup_close(&self, _browser_id: i32) {}
+
+    fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
+        Vec::new()
+    }
+
+    fn popup_drain_title_changes(&self) -> Vec<(i32, String)> {
+        Vec::new()
+    }
+
+    fn popup_history_back(&self, _browser_id: i32) {}
+
+    fn popup_history_forward(&self, _browser_id: i32) {}
+
+    fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {}
+
+    fn popup_osr_key_event(&self, _browser_id: i32, _event: buffr_engine::NeutralKeyEvent) {}
+
+    #[allow(clippy::too_many_arguments)]
+    fn popup_osr_mouse_click(
+        &self,
+        _browser_id: i32,
+        _x: i32,
+        _y: i32,
+        _button: buffr_engine::MouseButton,
+        _mouse_up: bool,
+        _click_count: i32,
+        _modifiers: u32,
+    ) {
+    }
+
+    fn popup_osr_mouse_move(&self, _browser_id: i32, _x: i32, _y: i32, _modifiers: u32) {}
+
+    fn popup_osr_mouse_wheel(
+        &self,
+        _browser_id: i32,
+        _x: i32,
+        _y: i32,
+        _delta_x: i32,
+        _delta_y: i32,
+        _modifiers: u32,
+    ) {
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

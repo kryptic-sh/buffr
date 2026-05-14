@@ -9,6 +9,7 @@ pub mod error;
 pub mod event;
 pub mod input;
 pub mod osr;
+pub mod popup;
 pub mod tab;
 pub mod types;
 
@@ -18,5 +19,10 @@ pub use error::EngineError;
 pub use event::EngineEvent;
 pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
 pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
-pub use tab::{PopupCreated, TabId, TabOptions, TabSession, TabSummary};
+pub use popup::{
+    PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue,
+    drain_popup_closes, drain_popup_creates, drain_popup_urls, new_pending_popup_alloc,
+    new_popup_close_sink, new_popup_create_sink, new_popup_queue,
+};
+pub use tab::{TabId, TabOptions, TabSession, TabSummary};
 pub use types::{AudioEvent, ContextMenuRequest, CursorChanged, LoadState, NavigationEvent};

@@ -9,14 +9,15 @@
 //! **Not in Phase 1** (stays as inherent methods on `BrowserHost`):
 //!   - `dispatch(action: &buffr_modal::PageAction)` — modal action routing
 //!   - hint-mode methods (`enter_hint_mode`, `feed_hint_key`, etc.)
-//!   - popup-bookkeeping (`popup_osr_*`, `popup_history_*`, `popup_resize`,
-//!     `popup_close`, `popup_drain_*`)
 //!   - favicon accessors (`favicon_sink`, `favicon_enabled`, etc.)
 //!   - permissions accessors (`permissions`, `permissions_queue`)
 //!   - context-menu drain (`drain_context_menu_requests`)
 //!   - audio event queue drain (`drain_audio_events`)
 //!   - edit / clipboard helpers
 //!   - media probe helpers
+//!
+//! Phase 6a (#95): popup_* family added to the trait so `apps/buffr-app`
+//! no longer needs the `cef_engines` parallel map for popup calls.
 //!
 //! Phase 2 will widen the trait as the apps layer is further decoupled.
 
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use crate::{
     EngineError, MouseButton, NeutralKeyEvent, SharedOsrFrame, SharedOsrViewState, TabId,
     TabSummary,
+    popup::{PopupCloseSink, PopupCreateSink, PopupQueue},
 };
 
 /// Engine-agnostic browser abstraction.
@@ -223,6 +225,77 @@ pub trait BrowserEngine: Send + Sync {
 
     /// `true` when the last JS media probe reported a video signal active.
     fn any_video_active(&self) -> bool;
+
+    // ── Popup sinks ──────────────────────────────────────────────────────────
+    //
+    // Phase 6a (#95): popup_* family promoted to the trait so the apps layer
+    // can reach popup operations through `Arc<dyn BrowserEngine>` without a
+    // CEF-specific reach-through map.
+    //
+    // Backends that do not support popups (e.g. `buffr-blink-cdp`) return
+    // empty sinks / Vec or no-op, and log a debug note where appropriate.
+    // CDP popup support: future work, see #95.
+
+    /// Clone the popup URL queue (new-tab reroutes from `on_before_popup`).
+    fn popup_queue(&self) -> PopupQueue;
+
+    /// Clone the popup-create sink so the apps layer can drain it.
+    fn popup_create_sink(&self) -> PopupCreateSink;
+
+    /// Clone the popup-close sink so the apps layer can drain it.
+    fn popup_close_sink(&self) -> PopupCloseSink;
+
+    /// Notify the engine that a popup browser has been resized.
+    fn popup_resize(&self, browser_id: i32, width: u32, height: u32);
+
+    /// Request the engine to close a popup browser (async; teardown arrives
+    /// via `popup_close_sink`).
+    fn popup_close(&self, browser_id: i32);
+
+    /// Drain address-change events for popup browsers.
+    fn popup_drain_address_changes(&self) -> Vec<(i32, String)>;
+
+    /// Drain title-change events for popup browsers.
+    fn popup_drain_title_changes(&self) -> Vec<(i32, String)>;
+
+    /// Navigate a popup browser back in its own history.
+    fn popup_history_back(&self, browser_id: i32);
+
+    /// Navigate a popup browser forward in its own history.
+    fn popup_history_forward(&self, browser_id: i32);
+
+    /// Set focus on a popup browser.
+    fn popup_osr_focus(&self, browser_id: i32, focused: bool);
+
+    /// Forward a keyboard event to a popup browser.
+    fn popup_osr_key_event(&self, browser_id: i32, event: NeutralKeyEvent);
+
+    /// Forward a mouse-click to a popup browser.
+    #[allow(clippy::too_many_arguments)]
+    fn popup_osr_mouse_click(
+        &self,
+        browser_id: i32,
+        x: i32,
+        y: i32,
+        button: MouseButton,
+        mouse_up: bool,
+        click_count: i32,
+        modifiers: u32,
+    );
+
+    /// Forward a mouse-move to a popup browser.
+    fn popup_osr_mouse_move(&self, browser_id: i32, x: i32, y: i32, modifiers: u32);
+
+    /// Forward a mouse-wheel event to a popup browser.
+    fn popup_osr_mouse_wheel(
+        &self,
+        browser_id: i32,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: u32,
+    );
 }
 
 #[cfg(test)]
@@ -232,6 +305,10 @@ mod tests {
 
     use crate::{
         EngineError, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, TabId, TabSummary,
+        popup::{
+            PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink,
+            new_popup_create_sink, new_popup_queue,
+        },
     };
 
     /// Minimal no-op stub that compiles the required methods.
@@ -333,6 +410,49 @@ mod tests {
         }
         fn any_video_active(&self) -> bool {
             false
+        }
+        fn popup_queue(&self) -> PopupQueue {
+            new_popup_queue()
+        }
+        fn popup_create_sink(&self) -> PopupCreateSink {
+            new_popup_create_sink()
+        }
+        fn popup_close_sink(&self) -> PopupCloseSink {
+            new_popup_close_sink()
+        }
+        fn popup_resize(&self, _browser_id: i32, _width: u32, _height: u32) {}
+        fn popup_close(&self, _browser_id: i32) {}
+        fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
+            vec![]
+        }
+        fn popup_drain_title_changes(&self) -> Vec<(i32, String)> {
+            vec![]
+        }
+        fn popup_history_back(&self, _browser_id: i32) {}
+        fn popup_history_forward(&self, _browser_id: i32) {}
+        fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {}
+        fn popup_osr_key_event(&self, _browser_id: i32, _event: NeutralKeyEvent) {}
+        fn popup_osr_mouse_click(
+            &self,
+            _browser_id: i32,
+            _x: i32,
+            _y: i32,
+            _button: MouseButton,
+            _mouse_up: bool,
+            _click_count: i32,
+            _modifiers: u32,
+        ) {
+        }
+        fn popup_osr_mouse_move(&self, _browser_id: i32, _x: i32, _y: i32, _modifiers: u32) {}
+        fn popup_osr_mouse_wheel(
+            &self,
+            _browser_id: i32,
+            _x: i32,
+            _y: i32,
+            _delta_x: i32,
+            _delta_y: i32,
+            _modifiers: u32,
+        ) {
         }
     }
 

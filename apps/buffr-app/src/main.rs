@@ -2513,6 +2513,15 @@ impl AppState {
         self.cef_engines.get(&self.active_engine).cloned()
     }
 
+    /// Return a clone of the active engine as a `dyn BrowserEngine`, if any.
+    ///
+    /// Works for all backends (CEF, blink-cdp, future). Use this for popup_*
+    /// and other trait-level calls that don't require CEF-specific reach-through.
+    #[inline]
+    fn active_engine_dyn(&self) -> Option<Arc<dyn buffr_engine::BrowserEngine>> {
+        self.engines.get(&self.active_engine).cloned()
+    }
+
     /// Open a new foreground tab, routing through the engine router.
     fn routed_open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
@@ -5868,10 +5877,10 @@ impl AppState {
         match event {
             WindowEvent::CloseRequested => {
                 debug!(browser_id, "popup: CloseRequested");
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
-                    host.popup_close(browser_id);
+                    engine.popup_close(browser_id);
                 }
                 // Remove immediately; CEF on_before_close also drains
                 // popup_close_sink on the next about_to_wait tick.
@@ -5886,7 +5895,7 @@ impl AppState {
                     let w = new_size.width.max(1);
                     let h = new_size.height.max(1);
                     // Debounce: arm/refresh the pending deadline rather than
-                    // calling host.popup_resize immediately. Fired in about_to_wait.
+                    // calling engine.popup_resize immediately. Fired in about_to_wait.
                     if let Some(popup) = self.popups.get_mut(&window_id) {
                         popup.pending_cef_resize =
                             Some((w, h, Instant::now() + CEF_RESIZE_DEBOUNCE));
@@ -5901,10 +5910,10 @@ impl AppState {
                 }
             }
             WindowEvent::Focused(focused) => {
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
-                    host.popup_osr_focus(browser_id, focused);
+                    engine.popup_osr_focus(browser_id, focused);
                 }
             }
             WindowEvent::CursorLeft { .. } => {
@@ -5913,12 +5922,12 @@ impl AppState {
                     .get(&window_id)
                     .map(|p| winit_mods_to_cef(&p.modifiers))
                     .unwrap_or(0);
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
                     // Simulate mouse leave by moving to (0,0) outside the
                     // browser rect — same pattern as main window CursorLeft.
-                    host.popup_osr_mouse_move(browser_id, 0, 0, mods);
+                    engine.popup_osr_mouse_move(browser_id, 0, 0, mods);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -5935,10 +5944,10 @@ impl AppState {
                 let pop_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_scale);
                 let mods = winit_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
-                    host.popup_osr_mouse_move(browser_id, bx, by, mods);
+                    engine.popup_osr_mouse_move(browser_id, bx, by, mods);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -5983,7 +5992,7 @@ impl AppState {
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_click_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_click_scale);
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
                     // Pressed inside the OSR content (below the address bar)
@@ -5992,9 +6001,9 @@ impl AppState {
                     // doesn't reliably emit Focused() on click, so we drive
                     // it explicitly.
                     if !mouse_up && in_content {
-                        host.popup_osr_focus(browser_id, true);
+                        engine.popup_osr_focus(browser_id, true);
                     }
-                    host.popup_osr_mouse_click(
+                    engine.popup_osr_mouse_click(
                         browser_id,
                         bx,
                         by,
@@ -6011,15 +6020,15 @@ impl AppState {
                 // as the main window, routed to the popup's own history.
                 if let MouseScrollDelta::PixelDelta(px) = delta {
                     if let Some(action) = self.detect_swipe(px.x as f32, px.y as f32) {
-                        if let Some(host) = self.active_host()
+                        if let Some(engine) = self.active_engine_dyn()
                             && browser_id >= 0
                         {
                             match action {
                                 buffr_modal::PageAction::HistoryBack => {
-                                    host.popup_history_back(browser_id);
+                                    engine.popup_history_back(browser_id);
                                 }
                                 buffr_modal::PageAction::HistoryForward => {
-                                    host.popup_history_forward(browser_id);
+                                    engine.popup_history_forward(browser_id);
                                 }
                                 _ => {}
                             }
@@ -6040,10 +6049,10 @@ impl AppState {
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_wheel_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_wheel_scale);
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
-                    host.popup_osr_mouse_wheel(browser_id, bx, by, dx, dy, mods);
+                    engine.popup_osr_mouse_wheel(browser_id, bx, by, dx, dy, mods);
                 }
             }
             WindowEvent::KeyboardInput { event: key_ev, .. } => {
@@ -6056,11 +6065,11 @@ impl AppState {
                 // typing into popup forms gets the same dispatch as the
                 // main window's edit-mode path.
                 let events = winit_key_to_neutral_events(&key_ev, mods, true);
-                if let Some(host) = self.active_host()
+                if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
                     for ev in events {
-                        host.popup_osr_key_event(browser_id, ev);
+                        engine.popup_osr_key_event(browser_id, ev);
                     }
                 }
             }
@@ -8036,9 +8045,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // NEW_FOREGROUND_TAB / NEW_BACKGROUND_TAB dispositions and open
         // each as a tab. Popup-window dispositions (OAuth, etc) are not
         // queued — CEF handles those natively.
-        if let Some(host) = self.active_host() {
-            for url in drain_popup_urls(&host.popup_queue()) {
-                if let Err(err) = host.open_tab(&url) {
+        if let Some(engine) = self.active_engine_dyn() {
+            for url in drain_popup_urls(&engine.popup_queue()) {
+                if let Err(err) = engine.open_tab(&url) {
                     warn!(error = %err, %url, "popup -> open_tab failed");
                 }
             }
@@ -8075,8 +8084,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             let inner = popup_win.inner_size();
             let pw = inner.width.max(1);
             let ph = inner.height.max(1);
-            if let Some(host) = self.active_host() {
-                host.popup_resize(created.browser_id, pw, ph);
+            if let Some(engine) = self.active_engine_dyn() {
+                engine.popup_resize(created.browser_id, pw, ph);
             }
             // Wire OSR on_paint → popup window redraw via EventLoopProxy.
             let proxy = self.event_proxy.clone();
@@ -8128,8 +8137,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Popup URL updates: drain address-change events for popup browsers
         // and update the corresponding popup window's URL bar.
-        let popup_addr_changes: Vec<(i32, String)> = if let Some(host) = self.active_host() {
-            host.popup_drain_address_changes()
+        let popup_addr_changes: Vec<(i32, String)> = if let Some(engine) = self.active_engine_dyn()
+        {
+            engine.popup_drain_address_changes()
         } else {
             Vec::new()
         };
@@ -8147,8 +8157,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Popup title updates: drain title-change events for popup browsers
         // and update the winit window title.
-        let popup_title_changes: Vec<(i32, String)> = if let Some(host) = self.active_host() {
-            host.popup_drain_title_changes()
+        let popup_title_changes: Vec<(i32, String)> = if let Some(engine) = self.active_engine_dyn()
+        {
+            engine.popup_drain_title_changes()
         } else {
             Vec::new()
         };
@@ -8359,9 +8370,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             {
                 let browser_id = self.popups.get(&wid).map(|p| p.browser_id).unwrap_or(-1);
                 if browser_id >= 0
-                    && let Some(host) = self.active_host()
+                    && let Some(engine) = self.active_engine_dyn()
                 {
-                    host.popup_resize(browser_id, w, h);
+                    engine.popup_resize(browser_id, w, h);
                     tracing::debug!(
                         browser_id,
                         w,
