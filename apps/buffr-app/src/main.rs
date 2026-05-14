@@ -2921,6 +2921,22 @@ impl AppState {
                 self.mark_session_dirty();
                 self.request_redraw();
             }
+            // Zoom actions: route through the active engine's trait
+            // surface so non-CEF backends (blink-cdp etc.) receive
+            // them. CEF's BrowserHost implements the same trait
+            // methods, so this stays consistent for CEF-active tabs too.
+            buffr_modal::PageAction::ZoomIn
+            | buffr_modal::PageAction::ZoomOut
+            | buffr_modal::PageAction::ZoomReset => {
+                if let Some(engine) = self.engines.get(&self.active_engine) {
+                    match action {
+                        buffr_modal::PageAction::ZoomIn => engine.zoom_in(),
+                        buffr_modal::PageAction::ZoomOut => engine.zoom_out(),
+                        buffr_modal::PageAction::ZoomReset => engine.zoom_reset(),
+                        _ => unreachable!(),
+                    }
+                }
+            }
             _ => host.dispatch(action),
         }
     }
