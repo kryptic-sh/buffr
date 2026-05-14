@@ -1630,4 +1630,83 @@ data_dir = "/tmp/cef-cache"
             Some("/tmp/test")
         );
     }
+
+    // ── Additional engines tests ──────────────────────────────────────────────
+
+    #[test]
+    fn engines_serialize_round_trips_through_toml() {
+        // Build a config with a non-trivial engines section, serialize,
+        // parse back and assert equality.
+        let mut cfg = Config::default();
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "cef".into(),
+            backend: "cef".into(),
+            data_dir: None,
+        });
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "blink".into(),
+            backend: "blink-cdp".into(),
+            data_dir: Some("/tmp/blink-data".into()),
+        });
+        cfg.engines.default = "cef".into();
+        cfg.engines.rules.push(crate::EngineRule {
+            pattern: "*.figma.com".into(),
+            engine: "blink".into(),
+        });
+
+        let toml_str = to_toml_string(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(parsed.engines.default, cfg.engines.default);
+        assert_eq!(parsed.engines.instances.len(), 2);
+        assert_eq!(parsed.engines.instances[0].id, "cef");
+        assert_eq!(parsed.engines.instances[1].id, "blink");
+        assert_eq!(parsed.engines.instances[1].backend, "blink-cdp");
+        assert_eq!(
+            parsed.engines.instances[1].data_dir.as_deref(),
+            Some("/tmp/blink-data")
+        );
+        assert_eq!(parsed.engines.rules.len(), 1);
+        assert_eq!(parsed.engines.rules[0].pattern, "*.figma.com");
+        assert_eq!(parsed.engines.rules[0].engine, "blink");
+        assert_eq!(parsed.engines, cfg.engines);
+    }
+
+    #[test]
+    fn engines_rule_field_is_match_in_toml() {
+        // The Rust struct field `pattern` must serialize to `match` in TOML.
+        let mut cfg = Config::default();
+        cfg.engines.rules.push(crate::EngineRule {
+            pattern: "*.example.com".into(),
+            engine: "cef".into(),
+        });
+        let toml_str = to_toml_string(&cfg).unwrap();
+
+        // The serialized TOML must contain `match = "*.example.com"` not
+        // `pattern = "*.example.com"`.
+        assert!(
+            toml_str.contains(r#"match = "*.example.com""#),
+            "expected `match` key in TOML, got:\n{toml_str}"
+        );
+        assert!(
+            !toml_str.contains("pattern ="),
+            "`pattern` must not appear in TOML output"
+        );
+    }
+
+    #[test]
+    fn engines_rule_match_key_parses_correctly() {
+        // Verify that the `match` key in TOML is read back as `pattern` in Rust.
+        let toml = r#"
+[engines]
+default = "cef"
+
+[[engines.rules]]
+match = "*.example.com"
+engine = "cef"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.engines.rules[0].pattern, "*.example.com");
+        assert_eq!(cfg.engines.rules[0].engine, "cef");
+    }
 }
