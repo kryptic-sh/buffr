@@ -8,7 +8,7 @@ repository = "https://github.com/kryptic-sh/buffr-blink-cdp"
 description = "Headless Chromium CDP backend for buffr-engine (Phase 4 spike)"
 
 [dependencies]
-buffr-engine = { version = "0.1", path = "../buffr-engine" }
+buffr-engine = "0.1"
 buffr-modal = "0.1"
 buffr-permissions = "0.1"
 buffr-downloads = "0.1"
