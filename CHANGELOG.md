@@ -10,6 +10,41 @@ and this project adheres to
 
 ### Added
 
+- **Engine refactor — Phase 5 (initial cut): `:engine` command, tab strip engine
+  badge, `buffr://settings` scaffold** (#76, parent #54). Three user-visible
+  pieces shipped in this pass:
+  - **`:engine <id>` command** — rebinds the active tab to a different rendering
+    engine (same URL, new engine). Implemented as `Command::Engine(String)` in
+    `buffr-core/src/cmdline.rs` (parsed from the `:` command bar), dispatched to
+    `PageAction::Engine(String)` in `buffr-modal/src/actions.rs`, and handled in
+    `AppState::dispatch_action` in `apps/buffr-app/src/main.rs`. Pattern:
+    snapshot URL → `open_tab` on target → `close_active` on source →
+    `active_engine` swap. Unknown ids emit a `warn!` and are silently ignored
+    (no crash). `"engine"` added to `COMMAND_NAMES` for omnibar completion.
+  - **Tab strip engine badge** — a 4-px coloured band at the left edge of each
+    unpinned tab pill, visible only when >1 engine is registered. Colour is a
+    deterministic DJB2 hash of the engine id string mapped onto an 8-colour
+    palette (red / orange / yellow / green / blue / violet / pink / grey). The
+    primary `"cef"` engine id is exempt (no badge). Implementation:
+    `show_badges()` + `badge_color_for()` methods on `EngineRouter`;
+    `engine_badge: Option<u32>` field on `TabView`; badge painted in
+    `TabStrip::paint` before the favicon/title. `refresh_tab_strip` populates
+    the badge from the router on every tick.
+  - **`buffr://settings` scaffold** — new route in the
+    `BuffrSchemeHandlerFactory` (`crates/buffr-cef/src/new_tab.rs`). Requests to
+    `buffr://settings` are served a minimal HTML page listing registered engines
+    and active routing rules. `SettingsHtmlProvider` closure type +
+    `settings_html(engines, rules)` helper added so callers can inject live
+    router state without a restart.
+    `register_buffr_handler_factory_with_settings` is the new preferred entry
+    point; the original `register_buffr_handler_factory` retains its signature
+    and falls back to a static placeholder. `SETTINGS_URL` constant exported
+    from `buffr-cef`.
+  - Sub-issues for unimplemented feature-parity work filed against #76 (see
+    commit log for issue numbers).
+  - Six new unit tests: four in `engine_router` for badge logic, two in
+    `buffr-core/cmdline` for the `:engine` parser. 725/725 tests pass.
+
 - **Engine refactor — Phase 4: blink-cdp second backend spike** (#75, parent
   #54). New `buffr-blink-cdp` workspace crate (`crates/buffr-blink-cdp/`)
   implements `BrowserEngine` via headless Chromium driven over Chrome DevTools
