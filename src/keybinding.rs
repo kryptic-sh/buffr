@@ -246,6 +246,7 @@ fn action_to_string(action: &PageAction) -> String {
         EnterInsertMode => "enter_insert_mode".into(),
         FocusFirstInput => "focus_first_input".into(),
         ExitInsertMode => "exit_insert_mode".into(),
+        Engine(id) => format!("engine({id})"),
     }
 }
 
