@@ -25,3 +25,48 @@ pub enum EngineEvent {
     /// A popup window was closed.
     PopupClosed { browser_id: i32 },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_event_construction_doesnt_panic() {
+        let nav = EngineEvent::Navigation(crate::NavigationEvent {
+            tab_id: crate::TabId(1),
+            url: "https://example.com".into(),
+            state: crate::LoadState::Idle,
+        });
+        assert!(matches!(nav, EngineEvent::Navigation(_)));
+
+        let paint = EngineEvent::PaintReady { browser_id: 1 };
+        assert!(matches!(paint, EngineEvent::PaintReady { browser_id: 1 }));
+
+        let cursor = EngineEvent::CursorChanged(crate::types::CursorChanged {
+            browser_id: 2,
+            kind: crate::types::CursorKind::Pointer,
+        });
+        assert!(matches!(cursor, EngineEvent::CursorChanged(_)));
+
+        let audio = EngineEvent::AudioChanged(crate::types::AudioEvent {
+            browser_id: 3,
+            active: true,
+        });
+        assert!(matches!(audio, EngineEvent::AudioChanged(_)));
+
+        let popup_created = EngineEvent::PopupCreated {
+            browser_id: 4,
+            url: "https://popup.example.com".into(),
+        };
+        assert!(matches!(
+            popup_created,
+            EngineEvent::PopupCreated { browser_id: 4, .. }
+        ));
+
+        let popup_closed = EngineEvent::PopupClosed { browser_id: 5 };
+        assert!(matches!(
+            popup_closed,
+            EngineEvent::PopupClosed { browser_id: 5 }
+        ));
+    }
+}

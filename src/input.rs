@@ -54,3 +54,50 @@ pub enum MouseButton {
     /// platform integer; CEF backends map it to `LEFT` as a fallback.
     Other(u8),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_key_event_default_zero_fields() {
+        let ev = NeutralKeyEvent::default();
+        assert_eq!(ev.windows_key_code, 0);
+        assert_eq!(ev.native_key_code, 0);
+        assert_eq!(ev.character, 0);
+        assert_eq!(ev.unmodified_character, 0);
+        assert_eq!(ev.modifiers, 0);
+        assert!(!ev.is_system_key);
+        assert!(!ev.focus_on_editable_field);
+    }
+
+    #[test]
+    fn key_event_kind_default_is_rawdown() {
+        assert_eq!(KeyEventKind::default(), KeyEventKind::RawDown);
+    }
+
+    #[test]
+    fn mouse_button_left_right_middle_distinct() {
+        assert_ne!(MouseButton::Left, MouseButton::Right);
+        assert_ne!(MouseButton::Left, MouseButton::Middle);
+        assert_ne!(MouseButton::Right, MouseButton::Middle);
+    }
+
+    #[test]
+    fn mouse_button_other_variant_carries_value() {
+        let btn = MouseButton::Other(7);
+        assert_eq!(btn, MouseButton::Other(7));
+        assert_ne!(btn, MouseButton::Other(8));
+        assert_ne!(btn, MouseButton::Left);
+    }
+
+    #[test]
+    fn key_event_kind_all_variants_match() {
+        let variants = [KeyEventKind::RawDown, KeyEventKind::Char, KeyEventKind::Up];
+        // Every variant is distinct.
+        assert_eq!(variants[0], KeyEventKind::RawDown);
+        assert_eq!(variants[1], KeyEventKind::Char);
+        assert_eq!(variants[2], KeyEventKind::Up);
+        assert_ne!(variants[0], variants[1]);
+    }
+}

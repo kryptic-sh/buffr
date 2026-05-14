@@ -224,3 +224,132 @@ pub trait BrowserEngine: Send + Sync {
     /// `true` when the last JS media probe reported a video signal active.
     fn any_video_active(&self) -> bool;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::{
+        EngineError, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, TabId, TabSummary,
+    };
+
+    /// Minimal no-op stub that compiles the required methods.
+    struct NoOpEngine;
+
+    impl BrowserEngine for NoOpEngine {
+        fn close_all_browsers(&self) {}
+        fn open_tab(&self, _url: &str) -> Result<TabId, EngineError> {
+            unimplemented!()
+        }
+        fn open_tab_background(&self, _url: &str) -> Result<TabId, EngineError> {
+            unimplemented!()
+        }
+        fn open_tab_at(&self, _url: &str, _idx: usize) -> Result<TabId, EngineError> {
+            unimplemented!()
+        }
+        fn close_tab(&self, _id: TabId) -> Result<bool, EngineError> {
+            unimplemented!()
+        }
+        fn close_active(&self) -> Result<bool, EngineError> {
+            unimplemented!()
+        }
+        fn select_tab(&self, _id: TabId) {}
+        fn next_tab(&self) {}
+        fn prev_tab(&self) {}
+        fn move_tab(&self, _from: usize, _to: usize) {}
+        fn duplicate_active(&self) -> Result<TabId, EngineError> {
+            unimplemented!()
+        }
+        fn toggle_pin_active(&self) {}
+        fn set_pinned(&self, _id: TabId, _pinned: bool) {}
+        fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
+            unimplemented!()
+        }
+        fn closed_stack_len(&self) -> usize {
+            0
+        }
+        fn active_tab(&self) -> Option<TabSummary> {
+            None
+        }
+        fn tabs_summary(&self) -> Vec<TabSummary> {
+            vec![]
+        }
+        fn tab_count(&self) -> usize {
+            0
+        }
+        fn pinned_count(&self) -> usize {
+            0
+        }
+        fn active_index(&self) -> Option<usize> {
+            None
+        }
+        fn navigate(&self, _url: &str) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn active_tab_live_url(&self) -> String {
+            String::new()
+        }
+        fn pump_address_changes(&self) -> bool {
+            false
+        }
+        fn resize(&self, _w: u32, _h: u32) {}
+        fn set_device_scale(&self, _scale: f32) {}
+        fn set_frame_rate(&self, _hz: u32) {}
+        fn notify_screen_info_changed(&self) {}
+        fn osr_resize(&self, _w: u32, _h: u32) {}
+        fn osr_key_event(&self, _event: NeutralKeyEvent) {}
+        fn osr_mouse_move(&self, _x: i32, _y: i32, _mods: u32) {}
+        fn osr_mouse_click(
+            &self,
+            _x: i32,
+            _y: i32,
+            _btn: MouseButton,
+            _up: bool,
+            _cnt: i32,
+            _mods: u32,
+        ) {
+        }
+        fn osr_mouse_leave(&self, _mods: u32) {}
+        fn osr_mouse_wheel(&self, _x: i32, _y: i32, _dx: i32, _dy: i32, _mods: u32) {}
+        fn osr_focus(&self, _focused: bool) {}
+        fn osr_frame(&self) -> SharedOsrFrame {
+            Arc::new(Mutex::new(OsrFrame::new(1, 1)))
+        }
+        fn osr_view(&self) -> SharedOsrViewState {
+            Arc::new(OsrViewState::default())
+        }
+        fn force_repaint_active(&self) {}
+        fn osr_sleep(&self, _sleep: bool) {}
+        fn osr_invalidate_view(&self) {}
+        fn set_osr_wake(&self, _wake: Arc<dyn Fn() + Send + Sync>) {}
+        fn start_find(&self, _query: &str, _forward: bool) {}
+        fn stop_find(&self) {}
+        fn active_zoom_level(&self) -> f64 {
+            1.0
+        }
+        fn any_audio_active(&self) -> bool {
+            false
+        }
+        fn any_video_active(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn trait_default_zoom_methods_no_op() {
+        let eng = NoOpEngine;
+        // These have default no-op impls; must not panic and return the
+        // correct type (no return value — just must not panic).
+        eng.zoom_in();
+        eng.zoom_out();
+        eng.zoom_reset();
+    }
+
+    #[test]
+    fn trait_default_open_devtools_returns_ok() {
+        let eng = NoOpEngine;
+        let result = eng.open_devtools(TabId(1));
+        assert!(result.is_ok(), "default open_devtools should return Ok");
+    }
+}
