@@ -126,6 +126,41 @@ impl EngineRouter {
         self.engines.keys()
     }
 
+    /// Returns `true` when more than one engine is registered, indicating
+    /// that per-tab engine badges should be shown in the tab strip.
+    pub fn show_badges(&self) -> bool {
+        self.engines.len() > 1
+    }
+
+    /// Curated 8-colour palette for engine badges, as `0x00RRGGBB` values.
+    const BADGE_PALETTE: &'static [u32] = &[
+        0xFF6B6B, // red
+        0xFFAA45, // orange
+        0xFFD93D, // yellow
+        0x6BCB77, // green
+        0x4D96FF, // blue
+        0x9B59FF, // violet
+        0xFF61C2, // pink/magenta
+        0xA9A9A9, // grey
+    ];
+
+    /// Return the badge colour for `id`, or `None` if:
+    /// - Only one engine is registered (no badge needed), or
+    /// - `id` is `"cef"` (primary default — shown without a badge).
+    ///
+    /// The colour is deterministic: a DJB2 hash of the id string selects
+    /// an index into [`BADGE_PALETTE`].
+    pub fn badge_color_for(&self, id: &EngineId) -> Option<u32> {
+        if !self.show_badges() || id.as_str() == "cef" {
+            return None;
+        }
+        let mut h: u32 = 5381;
+        for b in id.as_str().bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u32);
+        }
+        Some(Self::BADGE_PALETTE[(h as usize) % Self::BADGE_PALETTE.len()])
+    }
+
     /// Direct lookup by id (e.g. for issuing engine-wide commands like
     /// resize-all or close-all). Used by Phase 3 multi-engine fan-out paths
     /// in `main.rs`; suppressed here because `main.rs` accesses engines via
@@ -597,5 +632,65 @@ mod tests {
         // about:blank has no host → default engine (cef-a) = active → SameEngine.
         let verdict = super::classify_navigation(&router, &active, "about:blank");
         assert_eq!(verdict, super::NavigationVerdict::SameEngine);
+    }
+
+    // ── badge_color_for tests ─────────────────────────────────────────────────
+
+    fn single_engine_router() -> EngineRouter {
+        EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .build()
+            .unwrap()
+    }
+
+    fn multi_engine_router_with_blink() -> EngineRouter {
+        EngineRouter::builder()
+            .register(EngineId::new("cef"), stub_arc())
+            .register(EngineId::new("blink-cdp"), stub_arc())
+            .default_engine(EngineId::new("cef"))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn badge_color_for_returns_none_for_cef() {
+        // "cef" is the primary default — no badge even in multi-engine config.
+        let router = multi_engine_router_with_blink();
+        assert_eq!(router.badge_color_for(&EngineId::new("cef")), None);
+    }
+
+    #[test]
+    fn badge_color_for_returns_color_for_non_cef_when_multi() {
+        let router = multi_engine_router_with_blink();
+        let color = router.badge_color_for(&EngineId::new("blink-cdp"));
+        assert!(
+            color.is_some(),
+            "blink-cdp should get a badge colour in multi-engine config"
+        );
+    }
+
+    #[test]
+    fn badge_color_for_returns_none_when_single_engine() {
+        // Only one engine registered → badges suppressed for all ids.
+        let router = single_engine_router();
+        assert_eq!(router.badge_color_for(&EngineId::new("cef")), None);
+        assert_eq!(router.badge_color_for(&EngineId::new("blink-cdp")), None);
+    }
+
+    #[test]
+    fn badge_color_for_deterministic_per_id() {
+        let router = multi_engine_router_with_blink();
+        let c1 = router.badge_color_for(&EngineId::new("blink-cdp"));
+        let c2 = router.badge_color_for(&EngineId::new("blink-cdp"));
+        assert_eq!(
+            c1, c2,
+            "badge_color_for must be deterministic for the same id"
+        );
+        // Different ids should (with extremely high probability) differ.
+        let c3 = router.badge_color_for(&EngineId::new("webkit"));
+        // No guarantee they differ but they usually will. We just verify the
+        // function runs without panic and returns Some for non-cef ids.
+        assert!(c3.is_some());
     }
 }
