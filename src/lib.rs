@@ -24,7 +24,10 @@ pub use audio::{
     AudioEvent, AudioEventQueue, AudioState, AudioStateSink, any_audio_active, drain_audio_events,
     new_audio_event_queue, new_audio_state_sink,
 };
-pub use host::{BrowserHost, ClipboardReader, HintStatus, Tab, TabSession};
+pub use host::{BrowserHost, ClipboardReader, Tab, TabSession};
+// HintStatus moved to buffr-engine in Phase 6b (#95). Re-exported here so
+// existing `buffr_cef::HintStatus` imports keep resolving without modification.
+pub use buffr_engine::HintStatus;
 // Re-export unified types from buffr-engine so callers using `buffr_cef::TabId`
 // keep working without also importing buffr-engine directly.
 pub use buffr_engine::{BrowserEngine, TabId, TabSummary};
