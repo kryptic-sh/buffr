@@ -129,11 +129,11 @@ fn build_palette(theme: &buffr_config::Theme) -> Palette {
 
 use anyhow::{Context, Result};
 use buffr_cef::{
-    BuffrApp, NEW_TAB_URL, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome,
-    SharedOsrFrame, SharedOsrViewState, TabId, drain_permissions_with_defer, drain_popup_closes,
-    drain_popup_creates, drain_popup_urls, init_cef_api, new_permissions_queue,
-    peek_permission_front, permissions_queue_len, pop_permission_front, profile_paths,
-    register_buffr_handler_factory, register_buffr_src_handler_factory,
+    BuffrApp, PermissionsQueue, PopupCloseSink, PopupCreateSink, PromptOutcome, SharedOsrFrame,
+    SharedOsrViewState, drain_permissions_with_defer, drain_popup_closes, drain_popup_creates,
+    drain_popup_urls, init_cef_api, new_permissions_queue, peek_permission_front,
+    permissions_queue_len, pop_permission_front, profile_paths, register_buffr_handler_factory,
+    register_buffr_src_handler_factory,
 };
 use buffr_config::{ClearableData, Config, ConfigSource};
 use buffr_core::cmdline::{Command, parse as parse_cmdline};
@@ -142,6 +142,12 @@ use buffr_core::{
     EditEventSink, FindResultSink, HintAction, HintAlphabet, HintEventSink, IdleInhibitor,
     drain_edit_events, expire_stale_notices, new_download_notice_queue, new_edit_event_sink,
     new_find_sink, new_hint_event_sink, new_inhibitor, peek_download_notice,
+};
+use buffr_engine::{
+    ProfilePaths, TabId,
+    newtab::{
+        NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
+    },
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -1464,10 +1470,10 @@ fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
         }
         s
     };
-    buffr_cef::NEW_TAB_HTML_TEMPLATE
-        .replacen(buffr_cef::NEW_TAB_KEYBINDS_MARKER, &body, 1)
+    NEW_TAB_HTML_TEMPLATE
+        .replacen(NEW_TAB_KEYBINDS_MARKER, &body, 1)
         .replacen(
-            buffr_cef::NEW_TAB_SPLASH_ART_MARKER,
+            NEW_TAB_SPLASH_ART_MARKER,
             &crate::loading_anim::splash_art_html(),
             1,
         )
@@ -1552,7 +1558,7 @@ fn run_list_session() -> Result<()> {
 }
 
 /// Resolve the (cache, data) profile paths. Returns the resolved
-/// [`buffr_cef::ProfilePaths`] plus an optional [`TempDir`] that owns
+/// [`ProfilePaths`] plus an optional [`TempDir`] that owns
 /// the lifetime of the `--private` tree (so the caller can drop it
 /// after CEF shuts down).
 ///
@@ -1563,7 +1569,7 @@ fn run_list_session() -> Result<()> {
 /// own root (no clobbering); the inner `cache` and `data` split
 /// matches the persistent shape so the rest of the codebase doesn't
 /// need conditionals.
-fn resolve_paths(private: bool) -> Result<(buffr_cef::ProfilePaths, Option<TempDir>)> {
+fn resolve_paths(private: bool) -> Result<(ProfilePaths, Option<TempDir>)> {
     if private {
         let pid = std::process::id();
         let prefix = format!("buffr-private-{pid}-");
@@ -1575,7 +1581,7 @@ fn resolve_paths(private: bool) -> Result<(buffr_cef::ProfilePaths, Option<TempD
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&cache).context("creating private cache subdir")?;
         std::fs::create_dir_all(&data).context("creating private data subdir")?;
-        Ok((buffr_cef::ProfilePaths { cache, data }, Some(tmp)))
+        Ok((ProfilePaths { cache, data }, Some(tmp)))
     } else {
         let paths = profile_paths().context("resolving profile dirs")?;
         std::fs::create_dir_all(&paths.cache).context("creating profile cache dir")?;
@@ -1597,7 +1603,7 @@ fn resolve_paths(private: bool) -> Result<(buffr_cef::ProfilePaths, Option<TempD
 /// / Downloads route through the corresponding store's `clear_all`.
 fn run_clear_on_exit(
     items: &[ClearableData],
-    paths: &buffr_cef::ProfilePaths,
+    paths: &ProfilePaths,
     history: &buffr_history::History,
     bookmarks: &buffr_bookmarks::Bookmarks,
     downloads: &buffr_downloads::Downloads,
@@ -1742,7 +1748,7 @@ struct AppState {
     /// answer (`y` / yes-button → close; `n` / no-button / `<Esc>`
     /// → dismiss). Mutually exclusive with `permissions_prompt` for
     /// rendering — the confirmation wins the slot.
-    confirm_close_pinned: Option<buffr_cef::TabId>,
+    confirm_close_pinned: Option<TabId>,
     /// Passive download-notification queue. CEF's `DownloadHandler`
     /// pushes notices onto this; the render loop composites the front
     /// notice (if any) above the permissions strip. Notices self-expire
@@ -1811,7 +1817,7 @@ struct AppState {
     /// TabNewLeft), this carries the freshly-created tab's id. If the
     /// user cancels the omnibar without confirming a URL, the tab is
     /// closed (unless it's the only remaining tab).
-    cancel_closes_tab: Option<buffr_cef::TabId>,
+    cancel_closes_tab: Option<TabId>,
     /// Debounced live-search trigger for the find overlay. Each
     /// keystroke while a `/` or `?` overlay is open pushes this
     /// `FIND_LIVE_DEBOUNCE_MS` into the future; `about_to_wait` fires
@@ -1836,7 +1842,7 @@ struct AppState {
     last_session_active: Option<usize>,
     /// Snapshot of the tab count + ID list at the last session save —
     /// detects open / close / reorder events the moment they happen.
-    last_session_tab_ids: Vec<buffr_cef::TabId>,
+    last_session_tab_ids: Vec<TabId>,
     /// Wall-clock instant of the last `active_tab_live_url()` call.
     /// Throttled to ~4 Hz (250 ms) to bound the cef-rs
     /// "Invalid UTF-16 string" stderr spam during page loads.
@@ -3052,7 +3058,7 @@ impl AppState {
         };
         let summaries = host.tabs_summary();
         let active = host.active_index();
-        let ids: Vec<buffr_cef::TabId> = summaries.iter().map(|t| t.id).collect();
+        let ids: Vec<TabId> = summaries.iter().map(|t| t.id).collect();
         let url = host.active_tab_live_url();
 
         // Skip if nothing changed and no external dirty signal.
@@ -4823,7 +4829,7 @@ impl AppState {
                     // Snapshot (id, pinned) before closing — closing
                     // shifts indices. Skip the kept tab and any pinned
                     // tabs (Chrome leaves pinned tabs alone).
-                    let victims: Vec<buffr_cef::TabId> = self
+                    let victims: Vec<TabId> = self
                         .active_host()
                         .map(|h| {
                             h.tabs_summary()
@@ -4849,7 +4855,7 @@ impl AppState {
                     // Snapshot ids for slots strictly after the target,
                     // skipping pinned tabs, before any closure shifts
                     // indices.
-                    let victims: Vec<buffr_cef::TabId> = self
+                    let victims: Vec<TabId> = self
                         .active_host()
                         .map(|h| {
                             h.tabs_summary()
@@ -4884,7 +4890,7 @@ impl AppState {
     fn resolve_tab_target(
         &self,
         request: &ContextMenuRequest,
-    ) -> Option<(usize, buffr_cef::TabId, String, bool)> {
+    ) -> Option<(usize, TabId, String, bool)> {
         let ContextMenuTarget::Tab { index } = request.target else {
             return None;
         };
@@ -6566,7 +6572,7 @@ fn paint_chrome_strips(
     tab_y: u32,
     notice_y: u32,
     current_notice: Option<&buffr_core::DownloadNotice>,
-    confirm_close_pinned: Option<buffr_cef::TabId>,
+    confirm_close_pinned: Option<TabId>,
     permissions_prompt: Option<&PermissionsPrompt>,
     overlay_data: Option<&InputBar>,
     context_menu: Option<&ContextMenuOverlay>,
@@ -8191,23 +8197,23 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // for the session dirty flag.
         // Collect the poll results outside the borrow so we can call
         // `mark_session_dirty` (which takes &mut self) afterwards.
-        let url_poll_result: Option<(String, Option<usize>, Vec<buffr_cef::TabId>, f64)> =
-            if let Some(host) = self.active_host() {
-                let now = Instant::now();
-                if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
-                    self.last_url_poll = now;
-                    let live = host.active_tab_live_url();
-                    let active_idx = host.active_index();
-                    let current_ids: Vec<buffr_cef::TabId> =
-                        host.tabs_summary().iter().map(|t| t.id).collect();
-                    let zoom = host.active_zoom_level();
-                    Some((live, active_idx, current_ids, zoom))
-                } else {
-                    None
-                }
+        let url_poll_result: Option<(String, Option<usize>, Vec<TabId>, f64)> = if let Some(host) =
+            self.active_host()
+        {
+            let now = Instant::now();
+            if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
+                self.last_url_poll = now;
+                let live = host.active_tab_live_url();
+                let active_idx = host.active_index();
+                let current_ids: Vec<TabId> = host.tabs_summary().iter().map(|t| t.id).collect();
+                let zoom = host.active_zoom_level();
+                Some((live, active_idx, current_ids, zoom))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         if let Some((live, active_idx, current_ids, zoom)) = url_poll_result {
             if !live.is_empty() && live != self.statusline.url {
                 self.statusline.url = live.clone();

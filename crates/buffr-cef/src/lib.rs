@@ -16,8 +16,8 @@ pub mod permissions;
 pub mod view_source_scheme;
 
 pub use app::{
-    BuffrApp, ProfilePaths, device_scale_factor, force_renderer_accessibility_enabled,
-    profile_paths, set_device_scale_factor, set_force_renderer_accessibility,
+    BuffrApp, device_scale_factor, force_renderer_accessibility_enabled, profile_paths,
+    set_device_scale_factor, set_force_renderer_accessibility,
     take_scheduled_message_pump_delay_ms,
 };
 pub use audio::{
@@ -28,6 +28,9 @@ pub use host::{BrowserHost, ClipboardReader, Tab, TabSession};
 // HintStatus moved to buffr-engine in Phase 6b (#95). Re-exported here so
 // existing `buffr_cef::HintStatus` imports keep resolving without modification.
 pub use buffr_engine::HintStatus;
+// ProfilePaths moved to buffr-engine in Phase 6e (#95). Re-exported here so
+// existing `buffr_cef::ProfilePaths` imports keep resolving without modification.
+pub use buffr_engine::ProfilePaths;
 // Re-export unified types from buffr-engine so callers using `buffr_cef::TabId`
 // keep working without also importing buffr-engine directly.
 pub use buffr_engine::{BrowserEngine, TabId, TabSummary};
