@@ -9,10 +9,10 @@
 //! Implemented (minimal):
 //!   - `open_tab` / `close_tab` / `close_all_browsers`
 //!   - `navigate`
-//!   - `osr_frame` (via `Page.captureScreenshot` polled at ~5 FPS)
+//!   - `osr_frame` (via `Page.startScreencast` push; replaced 5 FPS poll)
 //!   - `osr_mouse_click` / `osr_mouse_move` / `osr_mouse_wheel`
 //!   - `osr_key_event`
-//!   - `osr_resize` (via `Page.setDeviceMetricsOverride`)
+//!   - `osr_resize` (via `Page.setDeviceMetricsOverride` + screencast restart)
 //!   - `tabs_summary`, `tab_count`, `active_index`, `active_tab`
 //!
 //! Stubbed (return `EngineError::Unimplemented`):
@@ -47,7 +47,8 @@ use serde_json::Value;
 
 use crate::cdp::{
     AttachToTargetParams, CdpCommand, CloseTargetParams, CreateTargetParams,
-    DispatchKeyEventParams, DispatchMouseEventParams, key_event_type, mouse_button_str, next_id,
+    DispatchKeyEventParams, DispatchMouseEventParams, SetDeviceMetricsParams, key_event_type,
+    mouse_button_str, next_id,
 };
 use crate::error::BlinkError;
 use crate::subprocess::{find_chromium, pick_free_port, probe_ws_url, spawn_headless};
@@ -346,7 +347,7 @@ impl BlinkCdpEngine {
         let _ = self.session_cmd(
             &session_id,
             "Page.setDeviceMetricsOverride",
-            crate::cdp::SetDeviceMetricsParams {
+            SetDeviceMetricsParams {
                 width: w.max(1),
                 height: h.max(1),
                 device_scale_factor: 1.0,
@@ -368,12 +369,25 @@ impl BlinkCdpEngine {
         if make_active || state.active.is_none() {
             state.active = Some(tab_id);
             drop(state);
-            // Tell the worker to start polling screenshots for this session.
+            // Start screencast on the new session.
+            let (w, h) = self.viewport_dims();
             let _ = self.cmd_tx.try_send(Command::SetActiveSession {
                 session_id: Some(session_id),
+                width: w,
+                height: h,
             });
         }
         Ok(tab_id)
+    }
+
+    /// Read current viewport dimensions from the shared view state.
+    fn viewport_dims(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering;
+        let v = &self.osr_view;
+        (
+            v.width.load(Ordering::Relaxed).max(1),
+            v.height.load(Ordering::Relaxed).max(1),
+        )
     }
 }
 
@@ -384,10 +398,12 @@ impl BrowserEngine for BlinkCdpEngine {
 
     fn close_all_browsers(&self) {
         tracing::debug!("blink-cdp: close_all_browsers");
-        // Stop screenshot polling.
-        let _ = self
-            .cmd_tx
-            .try_send(Command::SetActiveSession { session_id: None });
+        // Stop screencast on the active session (worker will send stopScreencast).
+        let _ = self.cmd_tx.try_send(Command::SetActiveSession {
+            session_id: None,
+            width: 1,
+            height: 1,
+        });
         // Shut down the worker.
         let _ = self.cmd_tx.try_send(Command::Shutdown);
         // Kill the subprocess.
@@ -452,8 +468,11 @@ impl BrowserEngine for BlinkCdpEngine {
                     .map(|t| t.session_id.clone())
             });
             drop(state);
+            let (w, h) = self.viewport_dims();
             let _ = self.cmd_tx.try_send(Command::SetActiveSession {
                 session_id: new_session,
+                width: w,
+                height: h,
             });
         }
 
@@ -478,8 +497,11 @@ impl BrowserEngine for BlinkCdpEngine {
             let session_id = tab.session_id.clone();
             state.active = Some(id);
             drop(state);
+            let (w, h) = self.viewport_dims();
             let _ = self.cmd_tx.try_send(Command::SetActiveSession {
                 session_id: Some(session_id),
+                width: w,
+                height: h,
             });
         }
     }
@@ -647,7 +669,7 @@ impl BrowserEngine for BlinkCdpEngine {
     fn set_frame_rate(&self, hz: u32) {
         use std::sync::atomic::Ordering;
         self.osr_view.frame_rate_hz.store(hz, Ordering::Relaxed);
-        // Phase 4: screenshot poll rate is fixed at ~5 FPS regardless of this.
+        // startScreencast uses everyNthFrame=1; Chromium controls cadence naturally.
     }
 
     fn notify_screen_info_changed(&self) {
@@ -663,13 +685,14 @@ impl BrowserEngine for BlinkCdpEngine {
             .active_tab()
             .map(|t| t.session_id.clone());
         if let Some(sess) = session_id {
+            // Worker will: update device metrics + stop/restart screencast at new dims.
             let _ = self.cmd_tx.try_send(Command::Resize {
                 session_id: sess,
                 width: width.max(1),
                 height: height.max(1),
             });
         }
-        // Mark frame as needing a fresh paint at new dimensions.
+        // Mark frame as stale until the first screencast frame at new dimensions arrives.
         if let Ok(mut frame) = self.osr_frame.lock() {
             frame.needs_fresh = true;
         }
@@ -817,15 +840,16 @@ impl BrowserEngine for BlinkCdpEngine {
     }
 
     fn force_repaint_active(&self) {
-        // Phase 4: screenshot poll handles this passively.
+        // screencast pushes frames on demand; no explicit repaint needed.
     }
 
     fn osr_sleep(&self, _sleep: bool) {
-        // Phase 4: no sleep/wake — poll always runs.
+        // Future: send stopScreencast / startScreencast on sleep/wake.
+        // For now Chromium's ack backpressure handles idle naturally.
     }
 
     fn osr_invalidate_view(&self) {
-        // Phase 4: no explicit invalidation needed; poll handles it.
+        // screencast invalidation is implicit via the ack loop.
     }
 
     fn set_osr_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
