@@ -10,6 +10,21 @@ and this project adheres to
 
 ### Added
 
+- **blink-cdp: `:devtools` opens Chromium inspector in system browser** (#82).
+  `BlinkCdpEngine` now implements `open_devtools` on the `BrowserEngine` trait.
+  When `:devtools` is invoked with the blink-cdp engine active, buffr builds a
+  `http://127.0.0.1:<port>/devtools/inspector.html?ws=…/devtools/page/<target_id>`
+  URL and hands it to the OS via the `open` crate so the user's default browser
+  hosts the Chromium DevTools inspector. The debug port is tracked on
+  `EngineState.debug_port` (set once at `BlinkCdpEngine::new` from the ephemeral
+  port chosen by `pick_free_port`). `BrowserEngine::open_devtools` is a new
+  trait method with a default no-op body so backends that don't support it
+  return `Ok(())` without changes. `buffr-cef` overrides it to call the existing
+  `show_dev_tools_at(None, None)` inherent method. The `dispatch_action` arm in
+  `apps/buffr-app` routes `PageAction::OpenDevTools` through the active engine
+  trait surface (same pattern as the zoom arms added in #85) so both CEF and
+  blink-cdp receive the call correctly.
+
 - **tab strip: engine-badge 2-char glyph + hover outline + status-line tooltip**
   (#94). The flat 4-px coloured band on non-default-engine tab pills is replaced
   by a wider badge column that renders a 2-character uppercase label derived
