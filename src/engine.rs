@@ -35,8 +35,9 @@
 use std::sync::Arc;
 
 use crate::{
-    EngineError, HintAction, HintStatus, MouseButton, NeutralKeyEvent, SharedOsrFrame,
-    SharedOsrViewState, TabId, TabSummary,
+    AudioEvent, ClipboardReader, ContextMenuRequest, EngineError, FaviconUpdate, HintAction,
+    HintStatus, MouseButton, NeutralKeyEvent, SharedOsrFrame, SharedOsrViewState, TabId,
+    TabSummary,
     popup::{PopupCloseSink, PopupCreateSink, PopupQueue},
 };
 
@@ -552,6 +553,116 @@ pub trait BrowserEngine: Send + Sync {
     /// the full inspector (ignoring coordinates).
     fn show_dev_tools_at(&self, _x: i32, _y: i32) {
         tracing::debug!("BrowserEngine::show_dev_tools_at: not implemented by this backend");
+    }
+
+    // ── Clipboard (Phase 6d, #95) ─────────────────────────────────────────────
+    //
+    // Neutral clipboard surface. CEF wraps `hjkl_clipboard::Clipboard`;
+    // CDP and other backends return no-op defaults until implemented.
+    //
+    // `clipboard_handle` hands out a `ClipboardReader` (`Arc<dyn ClipboardRead>`)
+    // so the apps layer can do blocking reads on a worker thread without pulling
+    // in the backend clipboard crate directly, and without deadlocking the CEF
+    // UI thread (Wayland `wl_data_source.send` runs on the main thread).
+
+    /// Clone the clipboard reader handle for off-thread reads.
+    ///
+    /// Returns `None` when the backend has no system clipboard (e.g. CDP
+    /// in Phase 6d, or when clipboard initialisation failed at startup).
+    ///
+    /// Default: `None`.
+    fn clipboard_handle(&self) -> Option<ClipboardReader> {
+        None
+    }
+
+    /// Read the current system clipboard contents as UTF-8 text.
+    ///
+    /// Convenience wrapper — prefer [`Self::clipboard_handle`] when reads
+    /// must happen off-thread. Returns `None` when the clipboard is empty,
+    /// non-text, or unavailable.
+    ///
+    /// Default: `None`.
+    fn clipboard_text(&self) -> Option<String> {
+        None
+    }
+
+    /// Write `text` to the system clipboard. Returns `true` on success.
+    ///
+    /// Default: debug-log and return `false` (CEF backend overrides).
+    fn clipboard_set_text(&self, _text: &str) -> bool {
+        tracing::debug!("BrowserEngine::clipboard_set_text: not implemented by this backend");
+        false
+    }
+
+    /// Spawn an off-thread worker that fetches `url`, decodes the image,
+    /// re-encodes it as PNG, and writes it to the system clipboard.
+    ///
+    /// Used by the right-click "Copy Image" menu item. Returns immediately;
+    /// the outcome surfaces via `tracing`.
+    ///
+    /// Default: debug-log and no-op (CEF backend overrides via
+    /// `buffr_core::image_copy::copy_image_to_clipboard`).
+    fn copy_image_url_to_clipboard(&self, _url: &str) {
+        tracing::debug!(
+            "BrowserEngine::copy_image_url_to_clipboard: not implemented by this backend"
+        );
+    }
+
+    // ── Audio events (Phase 6d, #95) ─────────────────────────────────────────
+    //
+    // Drain the per-engine audio edge-event queue. The apps layer calls this
+    // each tick across all engines and recomputes `media_active`.
+
+    /// Drain all pending [`AudioEvent`]s that the backend has queued since
+    /// the last call. Returns an empty `Vec` when no audio events are pending
+    /// or the backend has no audio tracking (e.g. blink-cdp).
+    ///
+    /// Default: `Vec::new()`.
+    fn drain_audio_events(&self) -> Vec<AudioEvent> {
+        Vec::new()
+    }
+
+    // ── Context menu (Phase 6d, #95) ─────────────────────────────────────────
+
+    /// Drain all pending [`ContextMenuRequest`]s queued by the backend since
+    /// the last call. The apps layer shows the most-recent one as an overlay.
+    ///
+    /// Default: `Vec::new()`.
+    fn drain_context_menu_requests(&self) -> Vec<ContextMenuRequest> {
+        Vec::new()
+    }
+
+    // ── Cursor (Phase 6d, #95) ────────────────────────────────────────────────
+    //
+    // Returns a pending cursor change as `(browser_id, raw_kind)` and clears
+    // the dirty flag. The `raw_kind` is the platform-raw discriminant from
+    // CEF's `CursorType` enum (a `u32`); the apps layer maps it to
+    // `winit::CursorIcon` via `cef_cursor_type_to_winit`.
+    //
+    // Returning the raw pair rather than a `SharedCursorState` handle keeps
+    // `buffr-engine` free of any `buffr-core` dependency (which would be
+    // circular, since `buffr-core` depends on `buffr-engine`).
+
+    /// Take a pending cursor change, if any, and clear the dirty flag.
+    ///
+    /// Returns `Some((browser_id, raw_kind))` when a new cursor has arrived
+    /// since the last call, `None` otherwise. Last writer wins — CEF
+    /// coalesces multiple changes per frame into one slot.
+    ///
+    /// Default: `None` (CDP and other backends without cursor tracking).
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        None
+    }
+
+    // ── Favicon (Phase 6d, #95) ───────────────────────────────────────────────
+
+    /// Drain all pending [`FaviconUpdate`]s delivered by the backend since
+    /// the last call. The apps layer caches the bitmaps by browser id for
+    /// the tab strip.
+    ///
+    /// Default: `Vec::new()` (CDP and other backends without favicon tracking).
+    fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
+        Vec::new()
     }
 }
 
