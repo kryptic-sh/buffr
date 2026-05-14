@@ -1007,6 +1007,61 @@ impl BrowserEngine for BlinkCdpEngine {
     }
 
     fn cancel_hint(&self) {}
+
+    // ── Phase 6c (#95): JS execution + DevTools at point ─────────────────────
+    //
+    // The CDP backend can fulfil `run_js` and `run_main_frame_js` via
+    // `Runtime.evaluate` on the active session. All frame_*, media_*, image_*,
+    // run_edit_*, run_media_probe, and start_download fall through to the trait
+    // defaults (debug-log + no-op / Unimplemented) because they are
+    // CEF-specific or rely on context-menu coordinates unavailable over CDP.
+    //
+    // `show_dev_tools_at` ignores (x, y) and delegates to the existing
+    // `open_devtools` impl, which opens the CDP inspector URL in the system
+    // browser. The trait default is overridden with a thin wrapper so the
+    // apps layer gets behaviour rather than a silent no-op.
+
+    fn run_js(&self, code: &str) -> Result<(), buffr_engine::EngineError> {
+        self.run_main_frame_js(code, "")
+    }
+
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), buffr_engine::EngineError> {
+        let session_id = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|e| buffr_engine::EngineError::Other(format!("lock poisoned: {e}")))?;
+            let tab = state
+                .active_tab()
+                .ok_or(buffr_engine::EngineError::NoActiveTab)?;
+            tab.session_id.clone()
+        };
+        self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": code }),
+        )
+        .map(|_| ())
+        .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
+
+    fn show_dev_tools_at(&self, _x: i32, _y: i32) {
+        // CDP has no inspect-element at a specific point; open the full
+        // inspector via the existing open_devtools path, using the active tab.
+        let tab_id = {
+            match self.state.lock() {
+                Ok(s) => s.active_tab().map(|t| t.id),
+                Err(_) => None,
+            }
+        };
+        if let Some(id) = tab_id {
+            if let Err(err) = self.open_devtools(id) {
+                tracing::debug!(error = %err, "blink-cdp: show_dev_tools_at failed");
+            }
+        } else {
+            tracing::debug!("blink-cdp: show_dev_tools_at — no active tab");
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

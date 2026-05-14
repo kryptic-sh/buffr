@@ -22,6 +22,14 @@
 //! through `Arc<dyn BrowserEngine>` instead of the CEF-specific
 //! `active_host()` reach-through.
 //!
+//! Phase 6c (#95): frame editing, media, JS execution, run_edit_*,
+//! run_media_probe, image_rotate, start_download, and show_dev_tools_at
+//! added so `apps/buffr-app` no longer needs `active_host()` reach-
+//! through for these families. Methods that are CEF-specific or not yet
+//! implemented by CDP have default impls that return
+//! `EngineError::Unimplemented` (Result-returning) or emit a debug log
+//! and no-op (void). This avoids forcing every backend to write stubs.
+//!
 //! Phase 2 will widen the trait as the apps layer is further decoupled.
 
 use std::sync::Arc;
@@ -330,6 +338,221 @@ pub trait BrowserEngine: Send + Sync {
 
     /// Cancel the active tab's hint session and remove all overlays.
     fn cancel_hint(&self);
+
+    // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
+    //
+    // These methods forward CEF frame-level edit commands (undo, redo, cut,
+    // copy, paste, paste-as-plain-text, select-all) to the focused frame in
+    // the active tab.  They are void (no return value) because CEF does not
+    // surface per-command errors.
+    //
+    // Default impls emit a `tracing::debug!` and no-op so backends that don't
+    // support frame-level editing (e.g. blink-cdp in the initial phases) don't
+    // need to write 7 explicit stubs.
+
+    /// Send Undo to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op (backends that don't support it override).
+    fn frame_undo(&self) {
+        tracing::debug!("BrowserEngine::frame_undo: not implemented by this backend");
+    }
+
+    /// Send Redo to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op.
+    fn frame_redo(&self) {
+        tracing::debug!("BrowserEngine::frame_redo: not implemented by this backend");
+    }
+
+    /// Send Cut to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op.
+    fn frame_cut(&self) {
+        tracing::debug!("BrowserEngine::frame_cut: not implemented by this backend");
+    }
+
+    /// Send Copy to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op.
+    fn frame_copy(&self) {
+        tracing::debug!("BrowserEngine::frame_copy: not implemented by this backend");
+    }
+
+    /// Send Paste to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op.
+    fn frame_paste(&self) {
+        tracing::debug!("BrowserEngine::frame_paste: not implemented by this backend");
+    }
+
+    /// Send Paste-as-plain-text to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op.
+    fn frame_paste_plain(&self) {
+        tracing::debug!("BrowserEngine::frame_paste_plain: not implemented by this backend");
+    }
+
+    /// Send Select-All to the active tab's focused frame.
+    ///
+    /// Default: debug-log and no-op.
+    fn frame_select_all(&self) {
+        tracing::debug!("BrowserEngine::frame_select_all: not implemented by this backend");
+    }
+
+    // ── Media (Phase 6c, #95) ────────────────────────────────────────────────
+    //
+    // These helpers inject JS into the active tab's main frame to manipulate
+    // the media element at `(x, y)` (browser-local CSS pixels, from the
+    // context-menu request). They are CEF-specific (context-menu params supply
+    // the hit coordinates) so the default impls no-op.
+
+    /// Toggle play/pause on the media element under `(x, y)`.
+    ///
+    /// Default: debug-log and no-op.
+    fn media_play_pause(&self, _x: i32, _y: i32) {
+        tracing::debug!("BrowserEngine::media_play_pause: not implemented by this backend");
+    }
+
+    /// Request Picture-in-Picture for the media element under `(x, y)`.
+    ///
+    /// Default: debug-log and no-op.
+    fn media_picture_in_picture(&self, _x: i32, _y: i32) {
+        tracing::debug!("BrowserEngine::media_picture_in_picture: not implemented by this backend");
+    }
+
+    /// Toggle `.controls` on the media element under `(x, y)`.
+    ///
+    /// Default: debug-log and no-op.
+    fn media_toggle_controls(&self, _x: i32, _y: i32) {
+        tracing::debug!("BrowserEngine::media_toggle_controls: not implemented by this backend");
+    }
+
+    /// Toggle `.loop` on the media element under `(x, y)`.
+    ///
+    /// Default: debug-log and no-op.
+    fn media_toggle_loop(&self, _x: i32, _y: i32) {
+        tracing::debug!("BrowserEngine::media_toggle_loop: not implemented by this backend");
+    }
+
+    /// Toggle `.muted` on the media element under `(x, y)`.
+    ///
+    /// Default: debug-log and no-op.
+    fn media_toggle_mute(&self, _x: i32, _y: i32) {
+        tracing::debug!("BrowserEngine::media_toggle_mute: not implemented by this backend");
+    }
+
+    // ── Image (Phase 6c, #95) ────────────────────────────────────────────────
+
+    /// Rotate the `<img>` element under `(x, y)` by `delta_deg` degrees.
+    ///
+    /// Positive `delta_deg` = clockwise, negative = counter-clockwise.
+    /// Accumulates into `el.dataset.buffrRotate` so successive rotations compose.
+    ///
+    /// Default: debug-log and no-op.
+    fn image_rotate(&self, _x: i32, _y: i32, _delta_deg: i32) {
+        tracing::debug!("BrowserEngine::image_rotate: not implemented by this backend");
+    }
+
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Fire-and-forget JS execution. No synchronous return value is surfaced
+    // (CEF exposes no `StringVisitor` for `execute_java_script`; see host.rs
+    // doc comment for rationale).
+    //
+    // Default impls return `Err(Unimplemented)` so the apps layer can log
+    // and continue rather than panicking on unsupported backends.
+
+    /// Execute `code` on the active tab's main frame.
+    ///
+    /// Default: returns `Err(EngineError::Unimplemented)`.
+    fn run_js(&self, _code: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unimplemented { method: "run_js" })
+    }
+
+    /// Execute `code` on the active tab's main frame, attributed to `url`.
+    ///
+    /// The `url` is used as the script origin in DevTools / error stacks.
+    ///
+    /// Default: returns `Err(EngineError::Unimplemented)`.
+    fn run_main_frame_js(&self, _code: &str, _url: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unimplemented {
+            method: "run_main_frame_js",
+        })
+    }
+
+    // ── Edit IPC helpers (Phase 6c, #95) ─────────────────────────────────────
+    //
+    // Sentinel-driven IPC with the JS edit layer (`edit.js`). The JS side
+    // exposes `window.__buffrEditAttach`, `__buffrEditDetach`, etc. which
+    // are called via `run_main_frame_js` under the hood.
+    //
+    // Default impls no-op + debug log. CEF implements these via its inherent
+    // counterparts; CDP will implement them in a future phase.
+
+    /// Add the edit-active CSS class to `field_id` via `__buffrEditAttach`.
+    ///
+    /// Default: debug-log and no-op.
+    fn run_edit_attach(&self, _field_id: &str) {
+        tracing::debug!("BrowserEngine::run_edit_attach: not implemented by this backend");
+    }
+
+    /// Move focus to the next (`forward=true`) or previous visible input.
+    ///
+    /// Default: debug-log and no-op.
+    fn run_edit_cycle(&self, _forward: bool) {
+        tracing::debug!("BrowserEngine::run_edit_cycle: not implemented by this backend");
+    }
+
+    /// Remove the edit-active CSS class from `field_id` via `__buffrEditDetach`.
+    ///
+    /// Default: debug-log and no-op.
+    fn run_edit_detach(&self, _field_id: &str) {
+        tracing::debug!("BrowserEngine::run_edit_detach: not implemented by this backend");
+    }
+
+    /// Re-focus `field_id` by its buffr-assigned ID via `__buffrEditFocus`.
+    ///
+    /// Default: debug-log and no-op.
+    fn run_edit_focus(&self, _field_id: &str) {
+        tracing::debug!("BrowserEngine::run_edit_focus: not implemented by this backend");
+    }
+
+    /// Fire the JS media-activity poll against the active tab's main frame.
+    ///
+    /// The poll writes a boolean to `window.__buffr_media_active` which a
+    /// follow-up read can consume. See [`BrowserHost::run_media_probe`] for
+    /// the full rationale.
+    ///
+    /// Default: debug-log and no-op.
+    fn run_media_probe(&self) {
+        tracing::debug!("BrowserEngine::run_media_probe: not implemented by this backend");
+    }
+
+    // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
+
+    /// Trigger a file-as-download for `url` via the engine's download manager.
+    ///
+    /// Default: debug-log and no-op (CEF implements via
+    /// `CefBrowserHost::StartDownload`; CDP download support is future work).
+    fn start_download(&self, _url: &str) {
+        tracing::debug!("BrowserEngine::start_download: not implemented by this backend");
+    }
+
+    // ── DevTools at point (Phase 6c, #95) ────────────────────────────────────
+
+    /// Open DevTools for the active tab, focused on the element at `(x, y)`.
+    ///
+    /// Backends that support inspect-element use the coordinates to highlight
+    /// the element in the Elements panel. Backends that don't support
+    /// inspect-element (e.g. blink-cdp, which always opens the full inspector)
+    /// ignore `x`/`y` and delegate to their existing `open_devtools` impl.
+    ///
+    /// Default: debug-log and no-op. The CEF backend overrides with
+    /// `show_dev_tools_at(Some(x), Some(y))`. The blink-cdp backend opens
+    /// the full inspector (ignoring coordinates).
+    fn show_dev_tools_at(&self, _x: i32, _y: i32) {
+        tracing::debug!("BrowserEngine::show_dev_tools_at: not implemented by this backend");
+    }
 }
 
 #[cfg(test)]
@@ -522,5 +745,61 @@ mod tests {
         let eng = NoOpEngine;
         let result = eng.open_devtools(TabId(1));
         assert!(result.is_ok(), "default open_devtools should return Ok");
+    }
+
+    #[test]
+    fn trait_default_frame_methods_no_op() {
+        let eng = NoOpEngine;
+        // All frame_* defaults must not panic.
+        eng.frame_undo();
+        eng.frame_redo();
+        eng.frame_cut();
+        eng.frame_copy();
+        eng.frame_paste();
+        eng.frame_paste_plain();
+        eng.frame_select_all();
+    }
+
+    #[test]
+    fn trait_default_media_methods_no_op() {
+        let eng = NoOpEngine;
+        eng.media_play_pause(100, 200);
+        eng.media_picture_in_picture(100, 200);
+        eng.media_toggle_controls(100, 200);
+        eng.media_toggle_loop(100, 200);
+        eng.media_toggle_mute(100, 200);
+        eng.image_rotate(100, 200, 90);
+    }
+
+    #[test]
+    fn trait_default_run_js_returns_unimplemented() {
+        let eng = NoOpEngine;
+        let r = eng.run_js("alert(1)");
+        assert!(
+            matches!(r, Err(EngineError::Unimplemented { method: "run_js" })),
+            "default run_js should return Unimplemented"
+        );
+        let r2 = eng.run_main_frame_js("alert(1)", "buffr://test");
+        assert!(
+            matches!(
+                r2,
+                Err(EngineError::Unimplemented {
+                    method: "run_main_frame_js"
+                })
+            ),
+            "default run_main_frame_js should return Unimplemented"
+        );
+    }
+
+    #[test]
+    fn trait_default_edit_and_misc_methods_no_op() {
+        let eng = NoOpEngine;
+        eng.run_edit_attach("field-1");
+        eng.run_edit_cycle(true);
+        eng.run_edit_detach("field-1");
+        eng.run_edit_focus("field-1");
+        eng.run_media_probe();
+        eng.start_download("https://example.com/file.zip");
+        eng.show_dev_tools_at(0, 0);
     }
 }

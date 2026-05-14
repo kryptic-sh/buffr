@@ -3087,6 +3087,110 @@ impl buffr_engine::BrowserEngine for BrowserHost {
     fn cancel_hint(&self) {
         self.cancel_hint()
     }
+
+    // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
+
+    fn frame_undo(&self) {
+        self.frame_undo()
+    }
+
+    fn frame_redo(&self) {
+        self.frame_redo()
+    }
+
+    fn frame_cut(&self) {
+        self.frame_cut()
+    }
+
+    fn frame_copy(&self) {
+        self.frame_copy()
+    }
+
+    fn frame_paste(&self) {
+        self.frame_paste()
+    }
+
+    fn frame_paste_plain(&self) {
+        self.frame_paste_plain()
+    }
+
+    fn frame_select_all(&self) {
+        self.frame_select_all()
+    }
+
+    // ── Media (Phase 6c, #95) ────────────────────────────────────────────────
+
+    fn media_play_pause(&self, x: i32, y: i32) {
+        self.media_play_pause(x, y)
+    }
+
+    fn media_picture_in_picture(&self, x: i32, y: i32) {
+        self.media_picture_in_picture(x, y)
+    }
+
+    fn media_toggle_controls(&self, x: i32, y: i32) {
+        self.media_toggle_controls(x, y)
+    }
+
+    fn media_toggle_loop(&self, x: i32, y: i32) {
+        self.media_toggle_loop(x, y)
+    }
+
+    fn media_toggle_mute(&self, x: i32, y: i32) {
+        self.media_toggle_mute(x, y)
+    }
+
+    // ── Image (Phase 6c, #95) ────────────────────────────────────────────────
+
+    fn image_rotate(&self, x: i32, y: i32, delta_deg: i32) {
+        self.image_rotate(x, y, delta_deg)
+    }
+
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+
+    fn run_js(&self, code: &str) -> Result<(), buffr_engine::EngineError> {
+        self.run_js(code);
+        Ok(())
+    }
+
+    fn run_main_frame_js(&self, code: &str, url: &str) -> Result<(), buffr_engine::EngineError> {
+        self.run_main_frame_js(code, url);
+        Ok(())
+    }
+
+    // ── Edit IPC helpers (Phase 6c, #95) ─────────────────────────────────────
+
+    fn run_edit_attach(&self, field_id: &str) {
+        self.run_edit_attach(field_id)
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        self.run_edit_cycle(forward)
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        self.run_edit_detach(field_id)
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        self.run_edit_focus(field_id)
+    }
+
+    fn run_media_probe(&self) {
+        self.run_media_probe()
+    }
+
+    // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
+
+    fn start_download(&self, url: &str) {
+        self.start_download(url)
+    }
+
+    // ── DevTools at point (Phase 6c, #95) ────────────────────────────────────
+
+    fn show_dev_tools_at(&self, x: i32, y: i32) {
+        self.show_dev_tools_at(Some(x), Some(y))
+    }
 }
 
 #[cfg(test)]

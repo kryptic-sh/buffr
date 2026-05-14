@@ -2852,7 +2852,9 @@ impl AppState {
                 if let Some(ref id) = self.last_focused_field.clone() {
                     // Re-focus the previously-focused field by its stable
                     // buffr ID rather than always jumping to the first one.
-                    host.run_edit_focus(id);
+                    if let Some(engine) = self.active_engine_dyn() {
+                        engine.run_edit_focus(id);
+                    }
                 } else {
                     // No prior focus on this page — fall back to first-input.
                     host.dispatch(action);
@@ -3268,12 +3270,12 @@ impl AppState {
         let leaving_visual = self.statusline.mode == PageMode::Visual && mode != PageMode::Visual;
         self.statusline.mode = mode;
         self.statusline.count_buffer = count;
-        if leaving_visual && let Some(host) = self.active_host() {
+        if leaving_visual && let Some(engine) = self.active_engine_dyn() {
             // Drop the page's DOM selection so the highlight goes with
             // Visual mode. Any prior YankSelection JS has already been
             // queued in the renderer and runs first; this just collapses
             // what's left.
-            host.run_main_frame_js(
+            let _ = engine.run_main_frame_js(
                 "try { var s = window.getSelection && window.getSelection(); if (s) s.removeAllRanges(); } catch (_) {}",
                 "buffr://visual-clear-selection",
             );
@@ -4428,44 +4430,44 @@ impl AppState {
             // ── Edit (frame ops) ─────────────────────────────────────────────
             I::Undo => {
                 tracing::info!(target: "buffr::context_menu", action = "undo", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_undo();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_undo();
                 }
             }
             I::Redo => {
                 tracing::info!(target: "buffr::context_menu", action = "redo", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_redo();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_redo();
                 }
             }
             I::Cut => {
                 tracing::info!(target: "buffr::context_menu", action = "cut", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_cut();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_cut();
                 }
             }
             I::Copy => {
                 tracing::info!(target: "buffr::context_menu", action = "copy", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_copy();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_copy();
                 }
             }
             I::Paste => {
                 tracing::info!(target: "buffr::context_menu", action = "paste", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_paste();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_paste();
                 }
             }
             I::PasteAsPlainText => {
                 tracing::info!(target: "buffr::context_menu", action = "paste_plain", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_paste_plain();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_paste_plain();
                 }
             }
             I::SelectAll => {
                 tracing::info!(target: "buffr::context_menu", action = "select_all", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.frame_select_all();
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.frame_select_all();
                 }
             }
 
@@ -4474,17 +4476,20 @@ impl AppState {
                 tracing::info!(target: "buffr::context_menu", action = "copy_selection", "dispatch");
                 // selection_text is already extracted by CEF into the request.
                 let text = request.selection_text.clone();
-                if let Some(host) = self.active_host() {
-                    if !text.is_empty() {
-                        if !host.clipboard_set_text(&text) {
-                            tracing::warn!(
-                                target: "buffr::context_menu",
-                                "copy_selection: clipboard write failed"
-                            );
-                        }
-                    } else {
-                        // Fallback: ask CEF to copy the page selection.
-                        host.frame_copy();
+                if !text.is_empty() {
+                    // Fast path: write text directly to clipboard.
+                    if let Some(host) = self.active_host()
+                        && !host.clipboard_set_text(&text)
+                    {
+                        tracing::warn!(
+                            target: "buffr::context_menu",
+                            "copy_selection: clipboard write failed"
+                        );
+                    }
+                } else {
+                    // Fallback: ask the engine to copy the page selection.
+                    if let Some(engine) = self.active_engine_dyn() {
+                        engine.frame_copy();
                     }
                 }
             }
@@ -4582,8 +4587,8 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host() {
-                    host.start_download(&url);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.start_download(&url);
                 }
             }
 
@@ -4633,8 +4638,8 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host() {
-                    host.start_download(&url);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.start_download(&url);
                 }
             }
 
@@ -4661,40 +4666,40 @@ impl AppState {
             }
             I::InspectElement => {
                 tracing::info!(target: "buffr::context_menu", action = "inspect_element", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.show_dev_tools_at(Some(request.x), Some(request.y));
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.show_dev_tools_at(request.x, request.y);
                 }
             }
 
             // ── Media ────────────────────────────────────────────────────────
             I::MediaPlayPause { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "media_play_pause", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.media_play_pause(request.x, request.y);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.media_play_pause(request.x, request.y);
                 }
             }
             I::MediaMute { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "media_mute", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.media_toggle_mute(request.x, request.y);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.media_toggle_mute(request.x, request.y);
                 }
             }
             I::MediaLoop { .. } => {
                 tracing::info!(target: "buffr::context_menu", action = "media_loop", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.media_toggle_loop(request.x, request.y);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.media_toggle_loop(request.x, request.y);
                 }
             }
             I::MediaShowControls => {
                 tracing::info!(target: "buffr::context_menu", action = "media_show_controls", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.media_toggle_controls(request.x, request.y);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.media_toggle_controls(request.x, request.y);
                 }
             }
             I::PictureInPicture => {
                 tracing::info!(target: "buffr::context_menu", action = "picture_in_picture", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.media_picture_in_picture(request.x, request.y);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.media_picture_in_picture(request.x, request.y);
                 }
             }
             I::MediaSaveAs => {
@@ -4703,8 +4708,8 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host() {
-                    host.start_download(&url);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.start_download(&url);
                 }
             }
             I::CopyMediaAddress => {
@@ -4723,14 +4728,14 @@ impl AppState {
             // ── Image rotate ─────────────────────────────────────────────────
             I::RotateClockwise => {
                 tracing::info!(target: "buffr::context_menu", action = "rotate_clockwise", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.image_rotate(request.x, request.y, 90);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.image_rotate(request.x, request.y, 90);
                 }
             }
             I::RotateCounterclockwise => {
                 tracing::info!(target: "buffr::context_menu", action = "rotate_counterclockwise", "dispatch");
-                if let Some(host) = self.active_host() {
-                    host.image_rotate(request.x, request.y, -90);
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.image_rotate(request.x, request.y, -90);
                 }
             }
 
@@ -5298,8 +5303,8 @@ impl AppState {
                     if !already_editing && (user_intent || is_transfer) {
                         self.insert_intent_at = None;
                         self.pending_blur_at = None;
-                        if let Some(host) = self.active_host() {
-                            host.run_edit_attach(&field_id);
+                        if let Some(engine) = self.active_engine_dyn() {
+                            engine.run_edit_attach(&field_id);
                         }
                         if let Ok(mut e) = self.engine.lock() {
                             e.set_mode(buffr_modal::PageMode::Insert);
@@ -5500,10 +5505,10 @@ impl AppState {
         if is_esc_pressed {
             let fid = field_id.clone();
             self.edit_focus = EditFocus::None;
-            if let Some(host) = self.active_host() {
-                host.run_edit_detach(&fid);
+            if let Some(engine) = self.active_engine_dyn() {
+                engine.run_edit_detach(&fid);
                 // Blur the field so further typing doesn't go to it.
-                host.run_js(buffr_core::scripts::EXIT_INSERT);
+                let _ = engine.run_js(buffr_core::scripts::EXIT_INSERT);
             }
             if let Ok(mut e) = self.engine.lock() {
                 e.set_mode(PageMode::Normal);
@@ -5521,8 +5526,8 @@ impl AppState {
         if event.state == winit::event::ElementState::Pressed
             && matches!(planned, Some(PlannedInput::Key(SpecialKey::Tab, _)))
         {
-            if let Some(host) = self.active_host() {
-                host.run_edit_cycle(!self.modifiers.shift_key());
+            if let Some(engine) = self.active_engine_dyn() {
+                engine.run_edit_cycle(!self.modifiers.shift_key());
             }
             return true;
         }
@@ -6722,10 +6727,10 @@ impl AppState {
     /// animation without input. Clears state when the user navigates
     /// away from the new-tab page.
     fn tick_splash_js_push(&mut self) {
-        let Some(host) = self.active_host() else {
+        let Some(engine) = self.active_engine_dyn() else {
             return;
         };
-        let url = host.active_tab_live_url();
+        let url = engine.active_tab_live_url();
         let on_new_tab = url == NEW_TAB_URL || url.starts_with(NEW_TAB_URL);
         if !on_new_tab {
             self.last_splash_tick = None;
@@ -6736,7 +6741,7 @@ impl AppState {
         if Some(tick) != self.last_splash_tick {
             let html = crate::loading_anim::splash_frame_html(&self.splash);
             let escaped = serde_json::to_string(&html).unwrap_or_else(|_| "\"\"".to_string());
-            host.run_main_frame_js(
+            let _ = engine.run_main_frame_js(
                 &format!(
                     "(()=>{{const e=document.getElementById('buffr-splash');\
                      if(e)e.innerHTML={escaped};}})()"
@@ -6793,7 +6798,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 if text.is_empty() {
                     return;
                 }
-                let Some(host) = self.active_host() else {
+                let Some(engine) = self.active_engine_dyn() else {
                     return;
                 };
                 let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
@@ -6806,7 +6811,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                      }})();",
                     json
                 );
-                host.run_js(&js);
+                let _ = engine.run_js(&js);
             }
         }
     }
@@ -7923,12 +7928,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             //    and fullscreen-video changes are detected at ~2 s cadence.
             //    Probe runs on the active engine only — it's the one presenting.
             if self.occluded
-                && let Some(host) = self.active_host()
+                && let Some(engine) = self.active_engine_dyn()
             {
                 let now = Instant::now();
                 let due = self.media_probe_next.map(|t| now >= t).unwrap_or(true);
                 if due {
-                    host.run_media_probe();
+                    engine.run_media_probe();
                     self.media_probe_next = Some(now + MEDIA_PROBE_INTERVAL);
                 }
             }
