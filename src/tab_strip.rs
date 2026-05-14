@@ -73,6 +73,10 @@ pub struct TabView {
     pub pinned: bool,
     pub private: bool,
     pub favicon: Option<TabFavicon>,
+    /// Engine badge colour (`0x00RRGGBB`). `Some(colour)` paints a 4-px
+    /// coloured dot at the left edge of the tab pill. `None` means no badge
+    /// (single-engine config or the primary `cef` engine).
+    pub engine_badge: Option<u32>,
 }
 
 impl Default for TabView {
@@ -83,6 +87,7 @@ impl Default for TabView {
             pinned: false,
             private: false,
             favicon: None,
+            engine_badge: None,
         }
     }
 }
@@ -244,23 +249,41 @@ impl TabStrip {
                     font::draw_text(buffer, width, height, glyph_x, text_y, &glyph, fg);
                 }
             } else {
-                // Favicon (when present) at the left edge, then title.
+                // Engine badge: a 4×4 coloured dot at the top-left corner of the
+                // pill. Only rendered for non-primary, non-CEF engines when the
+                // router has more than one backend registered. Occupies 4 px at
+                // the very left; the favicon / text offset accounts for it.
+                let badge_w: i32 = if tab.engine_badge.is_some() { 4 } else { 0 };
+                if let Some(color) = tab.engine_badge {
+                    let opaque = color | 0xFF00_0000;
+                    fill_rect(
+                        buffer,
+                        width,
+                        height,
+                        x,
+                        start_y as i32,
+                        badge_w as usize,
+                        strip_h - 2,
+                        opaque,
+                    );
+                }
+                // Favicon (when present) at the left edge (after badge), then title.
                 let icon_size = FAVICON_RENDER_SIZE as i32;
                 let icon_y = start_y as i32 + ((strip_h as i32 - icon_size) / 2);
-                let mut text_x = x + 6;
+                let mut text_x = x + badge_w + 6;
                 if let Some(fav) = tab.favicon.as_ref() {
                     blit_favicon(
                         buffer,
                         width,
                         height,
-                        x + 6,
+                        x + badge_w + 6,
                         icon_y,
                         FAVICON_RENDER_SIZE,
                         FAVICON_RENDER_SIZE,
                         fav,
                         bg,
                     );
-                    text_x = x + 6 + icon_size + 4;
+                    text_x = x + badge_w + 6 + icon_size + 4;
                 }
                 let max_text_px = (pill_w as usize)
                     .saturating_sub((text_x - x) as usize)
