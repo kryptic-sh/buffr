@@ -161,6 +161,20 @@ impl EngineRouter {
         Some(Self::BADGE_PALETTE[(h as usize) % Self::BADGE_PALETTE.len()])
     }
 
+    /// Return the 2-character uppercase badge label for `id`, or `None` using
+    /// the same suppression rules as [`badge_color_for`].
+    ///
+    /// The label is the first two alphanumeric ASCII characters of `id`
+    /// (uppercased), skipping any leading non-alphanumeric characters such as
+    /// separators. Falls back to `"??"` when `id` contains fewer than two
+    /// usable characters.
+    pub fn badge_label_for(&self, id: &EngineId) -> Option<String> {
+        if !self.show_badges() || id.as_str() == "cef" {
+            return None;
+        }
+        Some(badge_label_text(id.as_str()))
+    }
+
     /// Direct lookup by id (e.g. for issuing engine-wide commands like
     /// resize-all or close-all). Used by Phase 3 multi-engine fan-out paths
     /// in `main.rs`; suppressed here because `main.rs` accesses engines via
@@ -169,6 +183,25 @@ impl EngineRouter {
     pub fn get(&self, id: &EngineId) -> Option<&Arc<dyn BrowserEngine>> {
         self.engines.get(id)
     }
+}
+
+/// Extract the 2-character badge text from an engine-id string.
+///
+/// Collects the first two ASCII alphanumeric characters (uppercased), skipping
+/// separators such as `-` and `_`. Falls back to `"??"` when fewer than two
+/// usable characters exist. This is a module-level free function so it can be
+/// unit-tested independently of an [`EngineRouter`] instance.
+pub(crate) fn badge_label_text(id: &str) -> String {
+    let mut chars: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .take(2)
+        .collect();
+    while chars.len() < 2 {
+        chars.push('?');
+    }
+    chars
 }
 
 // ── Cross-engine navigation verdict ──────────────────────────────────────────
@@ -692,5 +725,48 @@ mod tests {
         // No guarantee they differ but they usually will. We just verify the
         // function runs without panic and returns Some for non-cef ids.
         assert!(c3.is_some());
+    }
+
+    // ── badge_label_for / badge_label_text tests ──────────────────────────────
+
+    #[test]
+    fn badge_label_text_two_chars_uppercase() {
+        assert_eq!(super::badge_label_text("blink-cdp"), "BL");
+        assert_eq!(super::badge_label_text("webkit"), "WE");
+        assert_eq!(super::badge_label_text("cef"), "CE");
+    }
+
+    #[test]
+    fn badge_label_text_skips_separators() {
+        // Leading dashes / underscores are skipped; letters are taken.
+        assert_eq!(super::badge_label_text("--foo"), "FO");
+        assert_eq!(super::badge_label_text("_baz"), "BA");
+    }
+
+    #[test]
+    fn badge_label_text_fallback_on_short_id() {
+        assert_eq!(super::badge_label_text(""), "??");
+        assert_eq!(super::badge_label_text("a"), "A?");
+        assert_eq!(super::badge_label_text("-"), "??");
+    }
+
+    #[test]
+    fn badge_label_for_returns_none_for_cef_in_multi() {
+        let router = multi_engine_router_with_blink();
+        assert_eq!(router.badge_label_for(&EngineId::new("cef")), None);
+    }
+
+    #[test]
+    fn badge_label_for_returns_some_for_non_cef_in_multi() {
+        let router = multi_engine_router_with_blink();
+        let label = router.badge_label_for(&EngineId::new("blink-cdp"));
+        assert_eq!(label, Some("BL".to_string()));
+    }
+
+    #[test]
+    fn badge_label_for_returns_none_in_single_engine() {
+        let router = single_engine_router();
+        assert_eq!(router.badge_label_for(&EngineId::new("cef")), None);
+        assert_eq!(router.badge_label_for(&EngineId::new("blink-cdp")), None);
     }
 }

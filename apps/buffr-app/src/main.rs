@@ -3178,19 +3178,26 @@ impl AppState {
         let live_ids: std::collections::HashSet<i32> =
             summaries.iter().map(|s| s.browser_id).collect();
         self.favicons.retain(|id, _| live_ids.contains(id));
-        // Determine the engine badge colour for the currently-active engine.
-        // All tabs in the strip belong to `active_engine`; the badge is the
-        // same colour on every tab. `None` when there's only one engine or
-        // when `active_engine` is the primary `"cef"` engine.
+        // Determine the engine badge colour and 2-char label for the
+        // currently-active engine. All tabs in the strip belong to
+        // `active_engine`; the badge is the same on every tab. `None` when
+        // there's only one engine or when `active_engine` is the primary "cef".
         let active_engine_id = self.active_engine.clone();
         let engine_badge = self
             .engine_router
             .as_ref()
             .and_then(|r| r.badge_color_for(&active_engine_id));
+        let engine_label = self
+            .engine_router
+            .as_ref()
+            .and_then(|r| r.badge_label_for(&active_engine_id));
+        // Which tab index the cursor is hovering over (for badge outline).
+        let hovered_tab_idx = self.hit_test_tab_strip();
         let mut ids = Vec::with_capacity(summaries.len());
         let tabs = summaries
             .into_iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(idx, t)| {
                 ids.push(t.id);
                 let favicon = self.favicons.get(&t.browser_id).cloned();
                 TabView {
@@ -3200,6 +3207,8 @@ impl AppState {
                     private: t.private,
                     favicon,
                     engine_badge,
+                    engine_label: engine_label.clone(),
+                    hovered: hovered_tab_idx == Some(idx),
                 }
             })
             .collect();
@@ -7204,6 +7213,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let phys_bx = position.x as i32;
                     let phys_by = (position.y as i32).saturating_sub(cef_y as i32);
                     self.osr_cursor = (phys_bx, phys_by);
+
+                    // Engine-badge tooltip: when the cursor moves onto a tab
+                    // that carries an engine badge, write the engine id to the
+                    // statusline's `engine_hint` cell so the user can identify
+                    // which engine backs the tab without clicking. Cleared when
+                    // the cursor is not on a badged tab.
+                    {
+                        let hovered_idx = self.hit_test_tab_strip();
+                        let badge_engine = hovered_idx
+                            .and_then(|idx| self.tab_strip.tabs.get(idx))
+                            .filter(|t| t.engine_badge.is_some())
+                            .and_then(|_| {
+                                let router = self.engine_router.as_ref()?;
+                                Some(self.active_engine.as_str().to_owned())
+                                    .filter(|_| router.show_badges())
+                            });
+                        if self.statusline.engine_hint != badge_engine {
+                            self.statusline.engine_hint = badge_engine;
+                            self.mark_chrome_dirty();
+                            self.request_redraw();
+                        }
+                    }
 
                     // Context-menu hover: when the cursor is inside the
                     // menu panel, force the default arrow cursor, update
