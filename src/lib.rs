@@ -1,9 +1,51 @@
-//! CEF integration and browser host for buffr.
+//! CEF integration and browser host for buffr-engine.
 //!
-//! All CEF-specific code lives here. `buffr-core` depends on
-//! `buffr-engine` (the agnostic trait) only; this crate provides the
-//! concrete `BrowserHost` implementation backed by Chromium Embedded
-//! Framework.
+//! `buffr-cef` is the production browser backend for buffr.  It wraps
+//! Chromium Embedded Framework (CEF) and implements the [`buffr_engine::BrowserEngine`]
+//! trait so the apps layer can drive full Chromium rendering without knowing
+//! any CEF-specific types.
+//!
+//! # Position in the workspace
+//!
+//! ```text
+//! apps/buffr  ──►  buffr-engine (trait)
+//!                       ▲
+//!                  buffr-cef  (this crate — CEF backend)
+//! ```
+//!
+//! All CEF-specific code lives here.  `buffr-core` and the apps layer depend
+//! only on `buffr-engine`; this crate is selected at link time for production
+//! builds.
+//!
+//! # Implements
+//!
+//! [`BrowserEngine`] methods fully covered:
+//! - Tab lifecycle: `open_tab`, `close_tab`, `activate_tab`, `duplicate_active`,
+//!   `reopen_closed_tab`
+//! - Navigation: `navigate`, `go_back`, `go_forward`, `reload`, `stop`
+//! - OSR: `osr_resize`, `osr_sleep`, `osr_invalidate_view`, `force_repaint_active`
+//! - Input: `send_key_event`, `send_mouse_event`, `send_scroll_event`
+//! - Edit ops: `frame_undo/redo/cut/copy/paste/paste_plain/del/select_all`
+//! - Clipboard: `clipboard_handle`
+//! - Permissions: full `drain_permissions_*` + `precheck_permission`
+//! - Context menu: `build_model`, `build_tab_model`, `handle_menu_item`
+//! - Find-in-page: `find_start`, `find_next`, `find_prev`, `find_close`
+//! - Downloads: `start_download`, drain events
+//! - Audio: `any_audio_active`, `drain_audio_events`, `run_media_probe`
+//! - Dev tools: `show_dev_tools_at`
+//! - Custom schemes: `register_buffr_src_scheme`, `register_buffr_handler_factory`
+//!
+//! Deferred / unimplemented in this crate: none — CEF provides the full
+//! surface.  Per-engine `CefRequestContext` isolation is a Phase 5+ follow-up
+//! (see issue #74).
+//!
+//! # Phases
+//!
+//! The v0.9.0 capability surface adds:
+//! - IME composition events wired to `CefBrowserHost::ImeSetComposition`
+//! - PiP toggle via JS media helper (`media_picture_in_picture`)
+//! - Scheme handler factories for `buffr-src:` (view-source) and `buffr://`
+//!   (settings / new-tab)
 
 pub mod app;
 pub mod audio;
