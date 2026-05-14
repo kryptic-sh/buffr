@@ -94,7 +94,7 @@ semver = { version = "1", features = ["serde"] }
 buffr-engine = "0.1"
 buffr-cef = "0.1"
 buffr-blink-cdp = "0.1"
-buffr-core = "0.6"
+buffr-core = "0.7"
 buffr-modal = "0.1"
 buffr-ui = "0.2"
 buffr-config = "0.4"
