@@ -31,3 +31,9 @@
 [submodule "crates/buffr-engine"]
 	path = crates/buffr-engine
 	url = https://github.com/kryptic-sh/buffr-engine.git
+[submodule "crates/buffr-blink-cdp"]
+	path = crates/buffr-blink-cdp
+	url = https://github.com/kryptic-sh/buffr-blink-cdp.git
+[submodule "crates/buffr-cef"]
+	path = crates/buffr-cef
+	url = https://github.com/kryptic-sh/buffr-cef.git
