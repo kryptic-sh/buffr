@@ -40,6 +40,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use buffr_core::DownloadNoticeQueue;
+use buffr_core::find::{FindResult, FindResultSink, new_sink as new_find_sink};
 use buffr_downloads::Downloads;
 use buffr_engine::{
     BrowserEngine, EngineError, MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState,
@@ -53,6 +54,7 @@ use crate::cdp::{
     mouse_button_str, next_id,
 };
 use crate::error::BlinkError;
+use crate::find::{find_expr, parse_find_result, stop_expr};
 use crate::subprocess::{find_chromium, pick_free_port, probe_ws_url, spawn_headless};
 use crate::worker::{Command, run};
 use crate::ws::WsClient;
@@ -179,6 +181,14 @@ pub struct BlinkCdpEngine {
     /// Held here to keep the `Arc` alive for the worker thread's clone.
     #[allow(dead_code)]
     notice_queue: Option<DownloadNoticeQueue>,
+    /// One-slot mailbox written by [`start_find`] / [`stop_find`] after
+    /// each JS roundtrip. The apps layer polls this each tick via
+    /// `buffr_core::take_find_result` to update the statusline.
+    find_sink: FindResultSink,
+    /// Most recent search query on the active tab. Preserved so
+    /// `FindNext` / `FindPrev` (dispatched from `n` / `N` keybinds) can
+    /// step through matches without repeating the full scan.
+    find_query: Arc<Mutex<Option<String>>>,
 }
 
 impl BlinkCdpEngine {
@@ -201,11 +211,17 @@ impl BlinkCdpEngine {
     /// `downloads` and `notice_queue` are the shared stores used to record
     /// download progress and surface status-line banners. Pass `None` when
     /// running without storage (e.g. private mode without a persistent store).
+    ///
+    /// `find_sink` is the one-slot mailbox shared with the apps layer so
+    /// find results are visible in the statusline. Pass the same sink that
+    /// `AppState::find_sink` was constructed with. If `None`, a private
+    /// sink is created (results are computed but not surfaced to the UI).
     pub fn new(
         data_dir: &Path,
         download_dir: Option<&Path>,
         downloads: Option<Arc<Downloads>>,
         notice_queue: Option<DownloadNoticeQueue>,
+        find_sink: Option<FindResultSink>,
     ) -> Result<Self, BlinkError> {
         let chromium = find_chromium().ok_or(BlinkError::ChromiumNotFound)?;
 
@@ -318,6 +334,8 @@ impl BlinkCdpEngine {
             perm_session_map,
             downloads,
             notice_queue,
+            find_sink: find_sink.unwrap_or_else(new_find_sink),
+            find_query: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -483,6 +501,16 @@ impl BlinkCdpEngine {
             serde_json::json!({ "source": shim_js }),
         );
 
+        // Inject the find-in-page shim (Phase 8b, #83). Provides
+        // `__buffrFindNext`, `__buffrFindPrev`, and `__buffrFindStop`
+        // globally. The shim uses a TreeWalker-based DOM scan and CSS span
+        // overlays — no native CDP find API required.
+        let _ = self.session_cmd(
+            &session_id,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": crate::find::find_shim_js() }),
+        );
+
         let mut state = self.state.lock().unwrap();
         let tab_id = state.mint_tab_id();
         let tab = CdpTab {
@@ -516,6 +544,55 @@ impl BlinkCdpEngine {
             v.width.load(Ordering::Relaxed).max(1),
             v.height.load(Ordering::Relaxed).max(1),
         )
+    }
+
+    /// Evaluate `expr` on the active tab's session and write a
+    /// [`FindResult`] into `self.find_sink`.  Logs on failure and no-ops
+    /// rather than propagating errors — find is non-critical.
+    fn run_find_js(&self, expr: &str) {
+        let session_id = {
+            let state = self.state.lock().unwrap();
+            match state.active_tab().map(|t| t.session_id.clone()) {
+                Some(s) => s,
+                None => {
+                    tracing::debug!("blink-cdp: run_find_js — no active tab");
+                    return;
+                }
+            }
+        };
+
+        match self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": expr, "returnByValue": true }),
+        ) {
+            Ok(value) => {
+                if let Some(result) = parse_find_result(&value) {
+                    tracing::debug!(
+                        current = result.current,
+                        total = result.count,
+                        "blink-cdp: find result"
+                    );
+                    if let Ok(mut guard) = self.find_sink.lock() {
+                        *guard = Some(result);
+                    }
+                } else {
+                    tracing::debug!(?value, expr, "blink-cdp: find result parse failed");
+                    // Write a zero result so the UI shows "no matches" rather
+                    // than stale counts from a previous query.
+                    if let Ok(mut guard) = self.find_sink.lock() {
+                        *guard = Some(FindResult {
+                            count: 0,
+                            current: 0,
+                            final_update: true,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, expr, "blink-cdp: Runtime.evaluate for find failed");
+            }
+        }
     }
 }
 
@@ -987,12 +1064,31 @@ impl BrowserEngine for BlinkCdpEngine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::warn!("blink-cdp: start_find not implemented in Phase 4");
+    fn start_find(&self, query: &str, forward: bool) {
+        tracing::debug!(%query, forward, "blink-cdp: start_find");
+        // Persist the query so FindNext / FindPrev can step without re-scanning.
+        if let Ok(mut guard) = self.find_query.lock() {
+            *guard = if query.is_empty() {
+                None
+            } else {
+                Some(query.to_owned())
+            };
+        }
+        let expr = find_expr(query, false, forward);
+        self.run_find_js(&expr);
     }
 
     fn stop_find(&self) {
-        tracing::warn!("blink-cdp: stop_find not implemented in Phase 4");
+        tracing::debug!("blink-cdp: stop_find");
+        // Clear the stored query so FindNext / FindPrev are inert.
+        if let Ok(mut guard) = self.find_query.lock() {
+            *guard = None;
+        }
+        // Clear the find_sink so the statusline reflects no active find.
+        if let Ok(mut guard) = self.find_sink.lock() {
+            *guard = None;
+        }
+        self.run_find_js(stop_expr());
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -1234,6 +1330,45 @@ impl BrowserEngine for BlinkCdpEngine {
             tracing::debug!("blink-cdp: show_dev_tools_at — no active tab");
         }
     }
+
+    // ── Action dispatch (Phase 8b, #83) ──────────────────────────────────────
+    //
+    // Override the default no-op so `n` / `N` (`FindNext` / `FindPrev`)
+    // actually step through the JS find overlay managed by `start_find`.
+    // All other actions fall through to the trait default (debug-log +
+    // no-op) which is correct for CDP since most PageActions are CEF-specific.
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+        match action {
+            A::FindNext => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "blink-cdp: dispatch FindNext");
+                    let expr = find_expr(&q, false, true);
+                    self.run_find_js(&expr);
+                } else {
+                    tracing::debug!("blink-cdp: FindNext — no active find query");
+                }
+            }
+            A::FindPrev => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "blink-cdp: dispatch FindPrev");
+                    let expr = find_expr(&q, false, false);
+                    self.run_find_js(&expr);
+                } else {
+                    tracing::debug!("blink-cdp: FindPrev — no active find query");
+                }
+            }
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "blink-cdp: dispatch — action not handled by CDP backend (no-op)"
+                );
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1354,7 +1489,13 @@ mod tests {
             // Chromium present — skip spawning; would be an integration test.
             return;
         }
-        let result = BlinkCdpEngine::new(Path::new("/tmp/buffr-blink-cdp-test"), None, None, None);
+        let result = BlinkCdpEngine::new(
+            Path::new("/tmp/buffr-blink-cdp-test"),
+            None,
+            None,
+            None,
+            None,
+        );
         match result {
             Err(BlinkError::ChromiumNotFound) => {} // expected
             Err(other) => panic!("unexpected error: {other}"),

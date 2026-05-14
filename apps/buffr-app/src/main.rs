@@ -7114,6 +7114,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         Some(&blink_download_dir),
                         Some(self.downloads.clone()),
                         Some(self.download_notice_queue.clone()),
+                        Some(self.find_sink.clone()),
                     ) {
                         Ok(engine) => {
                             info!(engine_id = %inst.id, "blink-cdp engine created");

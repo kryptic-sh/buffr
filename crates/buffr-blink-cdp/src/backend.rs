@@ -77,9 +77,14 @@ impl Backend for BlinkCdpBackend {
             .cloned();
         let download_dir = options.download_dir.map(|p| p.to_path_buf());
 
-        let engine =
-            BlinkCdpEngine::new(&data_dir, download_dir.as_deref(), downloads, notice_queue)
-                .map_err(|e| e.to_string())?;
+        let engine = BlinkCdpEngine::new(
+            &data_dir,
+            download_dir.as_deref(),
+            downloads,
+            notice_queue,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Arc::new(engine) as Arc<dyn BrowserEngine>)
     }
 

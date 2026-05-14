@@ -28,6 +28,7 @@ pub mod backend;
 pub mod cdp;
 pub mod engine;
 pub mod error;
+pub mod find;
 pub mod permissions;
 pub mod subprocess;
 pub mod worker;

@@ -507,6 +507,7 @@ dependencies = [
  "buffr-core",
  "buffr-downloads",
  "buffr-engine",
+ "buffr-modal",
  "buffr-permissions",
  "image",
  "open",
