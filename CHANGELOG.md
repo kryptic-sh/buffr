@@ -10,6 +10,19 @@ and this project adheres to
 
 ### Added
 
+- **blink-cdp: replace `captureScreenshot` poll with `Page.startScreencast`
+  streaming** (#91). The 5 FPS `Page.captureScreenshot` poll loop is removed.
+  The worker now sends `Page.startScreencast` (PNG, `everyNthFrame=1`, at
+  viewport dimensions) when a session becomes active, and `Page.stopScreencast`
+  when it is deactivated or closed. Chromium pushes frames at its native render
+  cadence; backpressure is provided by the mandatory `Page.screencastFrameAck`
+  reply which the worker sends immediately after decoding each frame. On resize,
+  the worker stops and restarts the screencast with the new
+  `maxWidth`/`maxHeight` so Chromium re-renders at the correct dimensions. Tab
+  switches send stop on the old session and start on the new one. Interactive
+  pages now feel as responsive as CEF tabs; idle tabs consume no screenshot
+  bandwidth.
+
 - **blink-cdp: `:devtools` opens Chromium inspector in system browser** (#82).
   `BlinkCdpEngine` now implements `open_devtools` on the `BrowserEngine` trait.
   When `:devtools` is invoked with the blink-cdp engine active, buffr builds a

@@ -17,8 +17,9 @@
 //!
 //! ## Phase 4 scope
 //!
-//! Working: tab create/close, navigate, OSR frame via `captureScreenshot`
-//! polled at ~5 FPS, mouse click/move/wheel, keyboard events, viewport resize.
+//! Working: tab create/close, navigate, OSR frame via `Page.startScreencast`
+//! push (Chromium-native cadence, ack-throttled), mouse click/move/wheel,
+//! keyboard events, viewport resize.
 //!
 //! Stubbed (return `EngineError::Unimplemented`): `duplicate_active`,
 //! `reopen_closed_tab`, and any method not listed above.
