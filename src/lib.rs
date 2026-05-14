@@ -11,8 +11,10 @@ pub mod event;
 pub mod favicon;
 pub mod hint;
 pub mod input;
+pub mod newtab;
 pub mod osr;
 pub mod popup;
+pub mod profile;
 pub mod tab;
 pub mod types;
 
@@ -30,5 +32,6 @@ pub use popup::{
     drain_popup_closes, drain_popup_creates, drain_popup_urls, new_pending_popup_alloc,
     new_popup_close_sink, new_popup_create_sink, new_popup_queue,
 };
+pub use profile::ProfilePaths;
 pub use tab::{TabId, TabOptions, TabSession, TabSummary};
 pub use types::{AudioEvent, ContextMenuRequest, CursorChanged, LoadState, NavigationEvent};
