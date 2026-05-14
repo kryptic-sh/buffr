@@ -10,6 +10,20 @@ and this project adheres to
 
 ### Added
 
+- **tab strip: engine-badge 2-char glyph + hover outline + status-line tooltip**
+  (#94). The flat 4-px coloured band on non-default-engine tab pills is replaced
+  by a wider badge column that renders a 2-character uppercase label derived
+  from the engine id (e.g. `"BL"` for `blink-cdp`, `"WK"` for `webkit`, `"??"`
+  for empty ids). Badge width is `font::text_width("WW") + 2 × BADGE_SIDE_PAD`
+  so it adapts to the active font automatically. When the cursor hovers over a
+  badged tab, a 1-px white outline is drawn around the badge rectangle and the
+  engine id is written to the statusline as `"engine: <id>"`. The single-engine
+  (CEF-only) path is unchanged — no badges, no tooltip. New
+  `EngineRouter::badge_label_for` method and `badge_label_text` helper (6 new
+  unit tests). `TabView` gains `engine_label: Option<String>` and
+  `hovered: bool` fields; `Statusline` gains `engine_hint: Option<String>`
+  rendered on the right-hand cell.
+
 - **blink-cdp: zoom in/out/reset via `Runtime.evaluate` + per-tab tracking**
   (#85). `BlinkCdpEngine` now implements `zoom_in`, `zoom_out`, and `zoom_reset`
   (new default-no-op methods on `BrowserEngine`). Zoom is tracked per tab as a
