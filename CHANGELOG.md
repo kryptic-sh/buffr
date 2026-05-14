@@ -8,6 +8,21 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Engine refactor — Phase 1: `buffr-engine` trait + `buffr-cef` backend
+  extraction** (#72, parent #54). All CEF integration moved out of `buffr-core`
+  into a new `buffr-cef` backend crate; a new `buffr-engine` trait crate defines
+  the engine-agnostic surface (`trait BrowserEngine`, neutral `TabId` /
+  `NeutralKeyEvent` / `MouseButton` / `OsrFrame` / `OsrViewState` types).
+  `buffr-cef::BrowserHost` now implements `buffr_engine::BrowserEngine` and
+  exposes only neutral types at its public boundary — no `cef::*` leaks through
+  `buffr-core`, `apps/buffr-app`, or `apps/buffr-helper`. CEF library load and
+  settings construction encapsulated inside `buffr-cef`; helper binary routes
+  through `buffr_cef::execute_subprocess()`. No user-visible behaviour change;
+  686/686 tests pass. Groundwork for multi-engine routing (Phase 2, #73) and
+  alternate backends (Phase 4, #75).
+
 ## [0.6.3] - 2026-05-13
 
 ### Added
