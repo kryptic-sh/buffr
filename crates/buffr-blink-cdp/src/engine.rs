@@ -1,5 +1,9 @@
 //! `BlinkCdpEngine` — `BrowserEngine` impl backed by headless Chromium via CDP.
 //!
+//! The CDP remote-debugging port is selected at runtime via an OS ephemeral-port
+//! probe rather than a fixed value, so multiple engine instances can coexist
+//! without port conflicts.
+//!
 //! # Phase 4 scope
 //!
 //! Implemented (minimal):
@@ -46,7 +50,7 @@ use crate::cdp::{
     DispatchKeyEventParams, DispatchMouseEventParams, key_event_type, mouse_button_str, next_id,
 };
 use crate::error::BlinkError;
-use crate::subprocess::{find_chromium, probe_ws_url, spawn_headless};
+use crate::subprocess::{find_chromium, pick_free_port, probe_ws_url, spawn_headless};
 use crate::worker::{Command, run};
 use crate::ws::WsClient;
 
@@ -129,17 +133,21 @@ pub struct BlinkCdpEngine {
 impl BlinkCdpEngine {
     /// Construct a new engine instance.
     ///
-    /// Locates a system Chromium binary, spawns a headless subprocess on an
-    /// ephemeral port, waits for the CDP endpoint to become available, then
-    /// connects the WebSocket and starts the worker thread.
+    /// Locates a system Chromium binary, probes the OS for a free ephemeral
+    /// port, spawns a headless subprocess on that port, waits for the CDP
+    /// endpoint to become available, then connects the WebSocket and starts
+    /// the worker thread.
+    ///
+    /// The port is selected via [`pick_free_port`] — multiple engine instances
+    /// can therefore coexist without conflicts, and port 9222 is no longer
+    /// special.
     ///
     /// `data_dir` is used as the Chromium user-data directory.
     pub fn new(data_dir: &Path) -> Result<Self, BlinkError> {
         let chromium = find_chromium().ok_or(BlinkError::ChromiumNotFound)?;
 
-        // Use a fixed-but-randomly-chosen port in the ephemeral range.
-        // A smarter impl would probe for a free port; good enough for Phase 4.
-        let port: u16 = 9222;
+        // Ask the OS for a free ephemeral port.
+        let port = pick_free_port()?;
 
         std::fs::create_dir_all(data_dir).map_err(BlinkError::SpawnFailed)?;
 

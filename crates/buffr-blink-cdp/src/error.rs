@@ -11,6 +11,9 @@ pub enum BlinkError {
     #[error("failed to spawn chromium subprocess: {0}")]
     SpawnFailed(#[source] std::io::Error),
 
+    #[error("failed to probe for a free port: {0}")]
+    PortProbe(#[source] std::io::Error),
+
     #[error("CDP probe failed (is port {port} free?): {source}")]
     ProbeFailed {
         port: u16,
@@ -48,6 +51,7 @@ impl From<BlinkError> for buffr_engine::EngineError {
         match e {
             BlinkError::ChromiumNotFound => buffr_engine::EngineError::InitFailed(e.to_string()),
             BlinkError::SpawnFailed(_) => buffr_engine::EngineError::InitFailed(e.to_string()),
+            BlinkError::PortProbe(_) => buffr_engine::EngineError::InitFailed(e.to_string()),
             BlinkError::ProbeFailed { .. } => buffr_engine::EngineError::InitFailed(e.to_string()),
             BlinkError::WsConnect(_) => buffr_engine::EngineError::InitFailed(e.to_string()),
             BlinkError::NoActiveTab => buffr_engine::EngineError::NoActiveTab,

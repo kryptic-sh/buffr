@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **blink-cdp: free-port probe replaces hardcoded 9222** (#92).
+  `BlinkCdpEngine::new` now calls `pick_free_port()` — a
+  `TcpListener::bind("127.0.0.1:0")` probe — instead of the fixed port 9222.
+  Multiple engine instances can coexist without port conflicts, and starting
+  buffr when 9222 is already in use by another process no longer prevents
+  initialisation. New error variant `BlinkError::PortProbe(std::io::Error)` is
+  surfaced when the OS cannot allocate an ephemeral port.
+
 ### Added
 
 - **Engine refactor — Phase 5 (initial cut): `:engine` command, tab strip engine

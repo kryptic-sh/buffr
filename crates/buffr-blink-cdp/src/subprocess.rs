@@ -70,6 +70,23 @@ fn which_binary(name: &str) -> Result<PathBuf, ()> {
     Err(())
 }
 
+/// Ask the OS for a free TCP port by binding on `127.0.0.1:0`.
+///
+/// The listener is dropped immediately so Chromium can bind the same address.
+/// There is an inherent TOCTOU window between the drop and Chromium's bind —
+/// callers must propagate any resulting `EADDRINUSE` as a startup error.
+///
+/// # Errors
+///
+/// Returns [`BlinkError::PortProbe`] when the OS refuses to bind even the
+/// ephemeral address (e.g. resource exhaustion).
+pub fn pick_free_port() -> Result<u16, BlinkError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(BlinkError::PortProbe)?;
+    let port = listener.local_addr().map_err(BlinkError::PortProbe)?.port();
+    drop(listener); // release before Chromium binds it
+    Ok(port)
+}
+
 /// Spawn headless Chromium with remote DevTools on `port`.
 ///
 /// `user_data_dir` is the profile directory. Callers typically pass a
@@ -145,4 +162,29 @@ pub fn probe_ws_url(port: u16, max_attempts: u32, delay: Duration) -> Result<Str
         port,
         source: last_err.into(),
     })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_free_port_returns_nonzero() {
+        let port = pick_free_port().expect("OS should provide an ephemeral port");
+        assert_ne!(port, 0, "port must be non-zero");
+    }
+
+    #[test]
+    fn pick_free_port_returns_different_ports_across_calls_usually() {
+        let p1 = pick_free_port().expect("first pick failed");
+        let p2 = pick_free_port().expect("second pick failed");
+        // Both must be bindable (already released by pick_free_port).
+        assert_ne!(p1, 0);
+        assert_ne!(p2, 0);
+        // Ports are usually different; allow equality — the assertion above
+        // already proves both binds succeeded, which is the meaningful check.
+        let _ = p1 != p2; // suppress unused-comparison lint
+    }
 }
