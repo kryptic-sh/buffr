@@ -52,6 +52,10 @@ pub struct BackendOpenOptions<'a> {
     /// Shared download-notice queue. blink-cdp pushes notices here on
     /// `Started` / `Completed` / `Canceled`. CEF ignores this field.
     pub notice_queue: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Find-result sink (P1-1). blink-cdp downcasts to `FindResultSink` and
+    /// passes it to `BlinkCdpEngine::new`. CEF ignores this field (find results
+    /// are wired via `CefEngineSinks` inside `sinks`).
+    pub find_sink: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Backend-specific sink handles, type-erased.
     ///
     /// CEF: expects `Box<CefEngineSinks>` (defined in buffr-cef).
