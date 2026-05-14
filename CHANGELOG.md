@@ -6,6 +6,14 @@ All notable changes to `buffr-modal` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-15
+
+### Added
+
+- `PageAction::Engine(String)` variant — signals the apps layer to rebind the
+  active tab to a different registered engine backend. `action_kind()` in
+  `keymap.rs` updated to cover the new variant.
+
 ## [0.1.4] — 2026-05-13
 
 ### Changed
@@ -48,7 +56,8 @@ All notable changes to `buffr-modal` are documented here. Format follows
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-modal/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-modal/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.5
 [0.1.4]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.4
 [0.1.3]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kryptic-sh/buffr-modal/releases/tag/v0.1.2

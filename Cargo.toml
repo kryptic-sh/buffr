@@ -1,7 +1,7 @@
 [package]
 name = "buffr-modal"
 description = "Vim-style modal keybinding engine for buffr."
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
