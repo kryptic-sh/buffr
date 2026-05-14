@@ -8,6 +8,35 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-15
+
+### Changed
+
+- **Promote `buffr-engine`, `buffr-cef`, `buffr-blink-cdp` to standalone repos +
+  crates.io** (#72). All three new crates extracted to their own GitHub repos
+  (`kryptic-sh/buffr-engine`, `kryptic-sh/buffr-cef`,
+  `kryptic-sh/buffr-blink-cdp`) with full sibling boilerplate (README,
+  CHANGELOG, LICENSE, CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, deny.toml,
+  rust-toolchain.toml, rustfmt.toml, .editorconfig, tag-driven CI). Published to
+  crates.io as `buffr-engine@0.1.0`, `buffr-cef@0.1.0`, `buffr-blink-cdp@0.1.1`.
+  Umbrella now references all three as submodules under `crates/`, mirroring the
+  buffr-core / buffr-modal / buffr-config / buffr-ui pattern.
+  `[patch.crates-io]` table unchanged — keeps in-tree resolution for umbrella
+  builds.
+
+  Cascade BCTPs landed before promotion to unblock standalone CI:
+  - `buffr-modal` 0.1.4 → 0.1.5 — `PageAction::Engine(String)` variant
+  - `buffr-config` 0.4.0 → 0.4.1 — engines table + instances + per-domain rules
+  - `buffr-ui` 0.2.1 → 0.2.2 — tab-strip engine badge + hover outline
+  - `buffr-core` 0.6.3 → 0.7.0 — **minor bump**, dropped all CEF integration
+    code (~30 public types removed: `BrowserHost`, `Tab`, `OsrFrame`,
+    `BuffrApp`, `AudioEvent`, `PopupQueue`, `PermissionsQueue`, etc.).
+    buffr-core is now backend-agnostic.
+
+  `buffr-core`'s standalone CI now resolves cleanly (`buffr-engine = "0.1"`
+  available on crates.io). Apps layer unchanged — workspace builds via
+  `[patch.crates-io]` paths.
+
 ## [0.9.0] - 2026-05-15
 
 ### Added
@@ -1190,7 +1219,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.8.0
