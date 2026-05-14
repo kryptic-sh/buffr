@@ -6,6 +6,22 @@ All notable changes to `buffr-config` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-15
+
+### Added
+
+- `Engines` config section (`[engines]`): `default` engine id (defaults to
+  `"cef"`) and `[[engines.rules]]` with `match` (host glob) and `engine` fields.
+  Validation: non-empty `default` + non-empty pattern/engine per rule.
+- `EngineInstance` struct (`id`, `backend`, optional `data_dir`) and
+  `[[engines.instances]]` array. When `instances` is empty a single
+  `{ id: "cef", backend: "cef" }` instance is synthesised via
+  `effective_instances()` so existing configs need no changes.
+- `action_to_string` exhaustive match extended to cover `PageAction::Engine(id)`
+  so keybinding round-trip serialization compiles cleanly.
+- Round-trip and validation tests for engines TOML: synthesis, default
+  reference, rule reference, duplicate-id rejection, and field names.
+
 ## [0.4.0] — 2026-05-12
 
 ### Added
@@ -59,7 +75,8 @@ All notable changes to `buffr-config` are documented here. Format follows
   `directories::UserDirs::download_dir()` — same XDG resolution, fewer dep
   variants in the lock.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.2.1
