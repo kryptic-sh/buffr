@@ -47,9 +47,10 @@ jobs:
             libgl1 libegl1 libgles2
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,7 +96,9 @@ jobs:
             xvfb
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -184,9 +187,10 @@ jobs:
             libgl1 libegl1 libgles2
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -267,7 +271,9 @@ jobs:
             libxml2-utils
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -352,7 +358,9 @@ jobs:
             rpm
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -466,7 +474,9 @@ jobs:
           submodules: recursive
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -554,9 +564,10 @@ jobs:
           submodules: recursive
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          targets: ${{ matrix.rust_target }}
+          target: ${{ matrix.rust_target }}
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
