@@ -8,6 +8,28 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Engine refactor — Phase 2: engine router + per-domain rules config** (#73,
+  parent #54). New `EngineId` newtype in `buffr-engine` (serde transparent,
+  `Display`, `Hash`, `Eq`). New `[engines]` table in `buffr-config`: `default`
+  engine id + `[[engines.rules]]` with host-glob `match` and `engine` fields;
+  validated at load time (non-empty fields required; registry check deferred to
+  router). New `engine_router` module in `apps/buffr-app`: `EngineRouter`
+  (backed by `globset` host-glob matching, case-insensitive, `url` host
+  extraction; falls back to default for host-less URLs — `about:blank`, `data:`,
+  `file://`); `EngineRouterBuilder` (register / default / rule / build);
+  `RouterError` (`UnknownEngine`, `InvalidGlob`, `EmptyRegistry`). Router built
+  after `BrowserHost` construction in `resumed()`; host wrapped in
+  `Arc<dyn BrowserEngine>` and stored alongside `Arc<BrowserHost>` for the tab-
+  spawn routing path. Three tab-spawn actions (`TabNew`, `TabNewRight/Left`,
+  session + CLI tab restore) route through `routed_open_tab*` helpers; remaining
+  sites unchanged (single-backend, behaviour identical). Shutdown:
+  `engine_router` dropped before CEF shutdown to preserve `Arc<BrowserHost>`
+  drop ordering. Nine `EngineRouter` + builder tests; three `buffr-config`
+  engines-section tests. 704/704 tests pass. Groundwork for multi-engine runtime
+  (Phase 3, #74).
+
 ### Changed
 
 - **Engine refactor — Phase 1: `buffr-engine` trait + `buffr-cef` backend
