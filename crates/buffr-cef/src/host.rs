@@ -2964,6 +2964,13 @@ impl buffr_engine::BrowserEngine for BrowserHost {
         self.set_osr_wake(wake)
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    fn open_devtools(&self, _tab: buffr_engine::TabId) -> Result<(), buffr_engine::EngineError> {
+        self.show_dev_tools_at(None, None);
+        Ok(())
+    }
+
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
     fn start_find(&self, query: &str, forward: bool) {
