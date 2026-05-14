@@ -10,6 +10,31 @@ and this project adheres to
 
 ### Added
 
+- **Engine refactor — Phase 3: multi-engine runtime** (#74, parent #54).
+  Multiple `BrowserHost` instances now live simultaneously inside one CEF
+  process; each is registered under a unique `EngineId` in a
+  `HashMap<EngineId, Arc<BrowserHost>>` in `AppState`. New
+  `[[engines.instances]]` config table (`id`, `backend`, optional `data_dir`;
+  advisory-only in Phase 3 — CEF cache is process-global; Phase 5+ isolation via
+  `RequestContext`). When `instances` is empty a single
+  `{ id: "cef", backend: "cef" }` instance is synthesised so single-engine
+  configs need no changes. Config validation: unique ids, non-empty
+  `id`/`backend`, `default` and rule `engine` fields must reference declared
+  instances. Engine registry loop in `resumed()` replaces single-host
+  construction; each instance gets its own OSR wake callback, frame rate, and
+  device scale. Paint multiplexer: `active_host()` reads from
+  `engines[active_engine]`; resize/scale fan-out to all engines; audio/video
+  activity ORed across all engines. Cross-engine navigation:
+  `classify_navigation()` pure helper + `check_cross_engine_nav()` called after
+  each `pump_address_changes()` — opens a new tab on the target engine and
+  closes the source tab. Tab-count exit checks fan across all engines.
+  `active_engine: EngineId` field tracks focused engine; updated on cross-engine
+  nav. `buffr-cef/README.md` added documenting `cef::initialize` singleton,
+  global cache-path constraint, and multi-instance model. Four
+  `classify_navigation` unit tests; eleven `engines.instances` config tests.
+  715/715 tests pass. CEF global cache isolation (Phase 5+) and per-engine
+  helper subprocess args tracked as follow-ups to #74.
+
 - **Engine refactor — Phase 2: engine router + per-domain rules config** (#73,
   parent #54). New `EngineId` newtype in `buffr-engine` (serde transparent,
   `Display`, `Hash`, `Eq`). New `[engines]` table in `buffr-config`: `default`
