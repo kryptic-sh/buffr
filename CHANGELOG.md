@@ -6,6 +6,20 @@ All notable changes to `buffr-ui` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-15
+
+### Added
+
+- `TabView::engine_badge: Option<u32>` field — when `Some`, the tab strip
+  renders a badge column at the left edge of each unpinned tab showing a
+  2-character uppercase engine label (e.g. `"BL"` for blink-cdp, `"WK"` for
+  webkit). Width adapts to the active font via `font::text_width`. Single-engine
+  configs pass `None`; no visual change.
+- Hover outline: when `TabView::hovered` is `true`, a 1-px white outline is
+  drawn around the badge rectangle.
+- `Statusline::engine_hint: Option<String>` — rendered on the right side as
+  `"engine: <id>"` when populated by the app on tab hover.
+
 ## [0.2.1] — 2026-05-12
 
 ### Changed
@@ -51,7 +65,8 @@ All notable changes to `buffr-ui` are documented here. Format follows
 - Added per-repo CI (fmt / clippy / test matrix / cargo-deny) and a tag-driven
   release workflow that publishes idempotently to crates.io.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-ui/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-ui/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.2.2
 [0.2.1]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.2.0
 [0.1.2]: https://github.com/kryptic-sh/buffr-ui/releases/tag/v0.1.2
