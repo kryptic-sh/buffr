@@ -2009,7 +2009,7 @@ struct AppState {
     /// Popup-closed event queue. Drained each `about_to_wait` tick to
     /// drop popup windows. Obtained from `host.popup_close_sink()`.
     popup_close_sink: PopupCloseSink,
-    /// Per-browser favicon bitmaps. Populated from `host.favicon_sink()`
+    /// Per-browser favicon bitmaps. Populated from `engine.drain_favicon_updates()`
     /// drains and read in `refresh_tab_strip` to attach a `TabFavicon` to
     /// each `TabView`.
     favicons: HashMap<i32, buffr_ui::TabFavicon>,
@@ -2131,7 +2131,7 @@ struct AppState {
     /// `config.idle_inhibit.require_focus = true`.
     window_focused: bool,
     /// Active right-click context menu, if any. `None` when no menu is
-    /// visible. Set from `host.drain_context_menu_requests()` each tick;
+    /// visible. Set from `active_host().drain_context_menu_requests()` each tick;
     /// cleared on Esc, Enter (activation), or click-outside.
     context_menu: Option<ActiveContextMenu>,
     /// UDS heartbeat liveness probe for the buffr (supervisor) watchdog.
@@ -2826,7 +2826,7 @@ impl AppState {
                 } else {
                     active_idx
                 };
-                let url = match host.clipboard_text() {
+                let url = match self.active_engine_dyn().and_then(|e| e.clipboard_text()) {
                     Some(t) => t,
                     None => return,
                 };
@@ -3303,7 +3303,7 @@ impl AppState {
     ///   populate `self.favicons` before the CEF callback fires).
     /// - Persists every fresh CEF-delivered bitmap back to the disk cache.
     fn pump_favicon_updates(&mut self) -> bool {
-        let Some(host) = self.active_host() else {
+        let Some(engine) = self.active_engine_dyn() else {
             return false;
         };
         if !self.show_favicons {
@@ -3328,7 +3328,7 @@ impl AppState {
         // mismatch → enqueue a prefill. Closed browsers are dropped from the
         // memoization map to bound memory.
         if self.favicon_cache.is_some() {
-            let summaries = host.tabs_summary();
+            let summaries = engine.tabs_summary();
             let live_ids: std::collections::HashSet<i32> =
                 summaries.iter().map(|t| t.browser_id).collect();
             self.favicon_check_url.retain(|id, _| live_ids.contains(id));
@@ -3381,14 +3381,14 @@ impl AppState {
             self.pending_favicon_prefill.clear();
         }
 
-        // ── Drain fresh CEF-delivered bitmaps ────────────────────────────────
-        let updates = buffr_core::drain_favicon_updates(&host.favicon_sink());
+        // ── Drain fresh engine-delivered bitmaps ─────────────────────────────
+        let updates = engine.drain_favicon_updates();
         if updates.is_empty() {
             return changed;
         }
         // Build a browser_id → url map from the current tab list so we can
         // resolve the origin for each incoming favicon.
-        let id_to_url: HashMap<i32, String> = host
+        let id_to_url: HashMap<i32, String> = engine
             .tabs_summary()
             .into_iter()
             .map(|t| (t.browser_id, t.url))
@@ -3402,7 +3402,7 @@ impl AppState {
                 debug!(browser_id = u.browser_id, %origin, "favicon cache: write");
                 cache.put(&origin, u.width, u.height, &u.pixels);
             }
-            // CEF-delivered bitmap always wins — remove any prefill placeholder.
+            // Engine-delivered bitmap always wins — remove any prefill placeholder.
             self.pending_favicon_prefill.remove(&u.browser_id);
             let fav = buffr_ui::TabFavicon {
                 width: u.width,
@@ -3422,10 +3422,10 @@ impl AppState {
     /// wins — coalescing is desirable since CEF can fire many times per
     /// frame as the cursor moves.
     fn pump_cursor_changes(&self) {
-        let Some(host) = self.active_host() else {
+        let Some(engine) = self.active_engine_dyn() else {
             return;
         };
-        let Some((browser_id, raw)) = host.cursor_state().take() else {
+        let Some((browser_id, raw)) = engine.take_cursor_change() else {
             return;
         };
         let icon = cef_cursor_type_to_winit(raw);
@@ -4478,8 +4478,8 @@ impl AppState {
                 let text = request.selection_text.clone();
                 if !text.is_empty() {
                     // Fast path: write text directly to clipboard.
-                    if let Some(host) = self.active_host()
-                        && !host.clipboard_set_text(&text)
+                    if let Some(engine) = self.active_engine_dyn()
+                        && !engine.clipboard_set_text(&text)
                     {
                         tracing::warn!(
                             target: "buffr::context_menu",
@@ -4572,8 +4572,8 @@ impl AppState {
             I::CopyLinkAddress => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_link_address", "dispatch");
                 let url = request.link_url.clone();
-                if let Some(host) = self.active_host()
-                    && !host.clipboard_set_text(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && !engine.clipboard_set_text(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4612,8 +4612,8 @@ impl AppState {
             I::CopyImageAddress => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_image_address", "dispatch");
                 let url = request.source_url.clone();
-                if let Some(host) = self.active_host()
-                    && !host.clipboard_set_text(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && !engine.clipboard_set_text(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4627,9 +4627,9 @@ impl AppState {
                 if url.is_empty() {
                     return;
                 }
-                if let Some(host) = self.active_host() {
+                if let Some(engine) = self.active_engine_dyn() {
                     // Spawns a worker; logs success / fallback / failure.
-                    host.copy_image_url_to_clipboard(&url);
+                    engine.copy_image_url_to_clipboard(&url);
                 }
             }
             I::SaveImageAs => {
@@ -4715,8 +4715,8 @@ impl AppState {
             I::CopyMediaAddress => {
                 tracing::info!(target: "buffr::context_menu", action = "copy_media_address", "dispatch");
                 let url = request.source_url.clone();
-                if let Some(host) = self.active_host()
-                    && !host.clipboard_set_text(&url)
+                if let Some(engine) = self.active_engine_dyn()
+                    && !engine.clipboard_set_text(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4783,8 +4783,8 @@ impl AppState {
             I::TabCopyUrl => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_copy_url", "dispatch");
                 if let Some((_, _, url, _)) = self.resolve_tab_target(request)
-                    && let Some(host) = self.active_host()
-                    && !host.clipboard_set_text(&url)
+                    && let Some(engine) = self.active_engine_dyn()
+                    && !engine.clipboard_set_text(&url)
                 {
                     tracing::warn!(
                         target: "buffr::context_menu",
@@ -4996,8 +4996,8 @@ impl AppState {
                 // Paste clipboard text into the overlay input. Drop CR/LF
                 // so a multiline clipboard doesn't leak past the single
                 // input row.
-                if let Some(host) = self.active_host()
-                    && let Some(text) = host.clipboard_text()
+                if let Some(engine) = self.active_engine_dyn()
+                    && let Some(text) = engine.clipboard_text()
                     && let Some(o) = self.overlay.as_mut()
                 {
                     for c in text.chars() {
@@ -5358,8 +5358,8 @@ impl AppState {
                 EditConsoleEvent::Selection { value } => {
                     if value.is_empty() {
                         tracing::debug!("yank: selection event with empty value — nothing copied");
-                    } else if let Some(host) = self.active_host() {
-                        let ok = host.clipboard_set_text(&value);
+                    } else if let Some(engine) = self.active_engine_dyn() {
+                        let ok = engine.clipboard_set_text(&value);
                         tracing::debug!(
                             len = value.len(),
                             ok,
@@ -5570,8 +5570,8 @@ impl AppState {
             // EventLoopProxy as `ClipboardPasteText`.
             if lower == 'v'
                 && !self.modifiers.shift_key()
-                && let Some(host) = self.active_host()
-                && let Some(cb) = host.clipboard_handle()
+                && let Some(engine) = self.active_engine_dyn()
+                && let Some(cb) = engine.clipboard_handle()
             {
                 let proxy = self.event_proxy.clone();
                 std::thread::spawn(move || {
@@ -7879,14 +7879,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.sleep_deadline = None;
             }
 
-            // 2. Drain audio events from all CEF engines (fan-out).
-            //    Non-CEF engines (blink-cdp) don't have audio events; their
-            //    `any_audio_active()` / `any_video_active()` always return false
-            //    in Phase 4 and are read through the trait map below.
+            // 2. Drain audio events from all engines (fan-out via trait).
+            //    Non-CEF engines (blink-cdp) return Vec::new() by default.
             {
                 let mut any_audio_events = false;
-                for host in self.cef_engines.values() {
-                    let events = host.drain_audio_events();
+                for engine in self.engines.values() {
+                    let events = engine.drain_audio_events();
                     if !events.is_empty() {
                         any_audio_events = true;
                     }
