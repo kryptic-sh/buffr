@@ -115,6 +115,11 @@ pub struct Statusline {
     /// values zoom in, negative out. Rendered as a percentage in the
     /// statusline ("125%"). Hidden when at default.
     pub zoom_level: f64,
+    /// Transient engine-id tooltip. Set while the cursor hovers over a tab
+    /// that carries an engine badge; cleared when the cursor leaves the tab
+    /// strip or moves to a tab without a badge. Rendered on the right side of
+    /// the statusline as `"engine: <id>"`. `None` hides the cell.
+    pub engine_hint: Option<String>,
     /// Chrome colours. Set once on startup from `config.theme`; flip
     /// to [`Palette::high_contrast`] when `theme.high_contrast = true`.
     pub palette: Palette,
@@ -133,6 +138,7 @@ impl Default for Statusline {
             hint_state: None,
             update_indicator: None,
             zoom_level: 0.0,
+            engine_hint: None,
             palette: Palette::default(),
         }
     }
@@ -225,6 +231,13 @@ impl Statusline {
             let w = font::text_width(&s) as i32;
             right_pen -= w;
             font::draw_text(buffer, width, height, right_pen, text_y, &s, p.fg);
+            right_pen -= 8;
+        }
+        if let Some(engine_id) = self.engine_hint.as_ref() {
+            let s = format!("engine: {engine_id}");
+            let w = font::text_width(&s) as i32;
+            right_pen -= w;
+            font::draw_text(buffer, width, height, right_pen, text_y, &s, p.fg_dim);
             right_pen -= 8;
         }
         if let Some(count) = self.count_buffer

@@ -73,10 +73,17 @@ pub struct TabView {
     pub pinned: bool,
     pub private: bool,
     pub favicon: Option<TabFavicon>,
-    /// Engine badge colour (`0x00RRGGBB`). `Some(colour)` paints a 4-px
-    /// coloured dot at the left edge of the tab pill. `None` means no badge
+    /// Engine badge colour (`0x00RRGGBB`). `Some(colour)` paints a coloured
+    /// glyph column at the left edge of the tab pill. `None` means no badge
     /// (single-engine config or the primary `cef` engine).
     pub engine_badge: Option<u32>,
+    /// 2-character uppercase label rendered inside the badge column (e.g.
+    /// `"BL"` for `blink-cdp`, `"WK"` for `webkit`). Paired with
+    /// `engine_badge`; ignored when `engine_badge` is `None`.
+    pub engine_label: Option<String>,
+    /// Whether the cursor is hovering over this tab. When `true` and a badge
+    /// is present, a 1-px outline is drawn around the badge rectangle.
+    pub hovered: bool,
 }
 
 impl Default for TabView {
@@ -88,6 +95,8 @@ impl Default for TabView {
             private: false,
             favicon: None,
             engine_badge: None,
+            engine_label: None,
+            hovered: false,
         }
     }
 }
@@ -249,13 +258,22 @@ impl TabStrip {
                     font::draw_text(buffer, width, height, glyph_x, text_y, &glyph, fg);
                 }
             } else {
-                // Engine badge: a 4×4 coloured dot at the top-left corner of the
-                // pill. Only rendered for non-primary, non-CEF engines when the
-                // router has more than one backend registered. Occupies 4 px at
-                // the very left; the favicon / text offset accounts for it.
-                let badge_w: i32 = if tab.engine_badge.is_some() { 4 } else { 0 };
+                // Engine badge: a coloured rectangle at the left edge of the
+                // pill. Width is wide enough to render a 2-character uppercase
+                // glyph (e.g. "BL" for blink-cdp) with BADGE_SIDE_PAD px of
+                // horizontal padding on each side. Only painted when the router
+                // has more than one engine registered and this tab's engine is
+                // not the primary "cef" engine.
+                let two_char_px = font::text_width("WW") as i32; // widest 2-char label
+                let badge_content_w = two_char_px + 2 * BADGE_SIDE_PAD;
+                let badge_w: i32 = if tab.engine_badge.is_some() {
+                    badge_content_w
+                } else {
+                    0
+                };
                 if let Some(color) = tab.engine_badge {
                     let opaque = color | 0xFF00_0000;
+                    // Coloured background for the badge column.
                     fill_rect(
                         buffer,
                         width,
@@ -266,6 +284,54 @@ impl TabStrip {
                         strip_h - 2,
                         opaque,
                     );
+                    // 2-char white label centred in the badge rectangle.
+                    let label = tab.engine_label.as_deref().unwrap_or("??");
+                    let label_px = font::text_width(label) as i32;
+                    let label_x = x + (badge_w - label_px) / 2;
+                    font::draw_text(
+                        buffer,
+                        width,
+                        height,
+                        label_x,
+                        text_y,
+                        label,
+                        BADGE_TEXT_COLOR,
+                    );
+                    // Hover outline: 1-px border around the badge rect in the
+                    // same colour as the badge fill. Painted when `hovered` so
+                    // the user can tell the badge is interactive.
+                    if tab.hovered {
+                        let bx = x;
+                        let by = start_y as i32;
+                        let bw = badge_w as usize;
+                        let bh = strip_h - 2;
+                        // Top edge
+                        fill_rect(buffer, width, height, bx, by, bw, 1, opaque);
+                        // Bottom edge
+                        fill_rect(
+                            buffer,
+                            width,
+                            height,
+                            bx,
+                            by + bh as i32 - 1,
+                            bw,
+                            1,
+                            BADGE_OUTLINE_COLOR,
+                        );
+                        // Left edge
+                        fill_rect(buffer, width, height, bx, by, 1, bh, BADGE_OUTLINE_COLOR);
+                        // Right edge
+                        fill_rect(
+                            buffer,
+                            width,
+                            height,
+                            bx + bw as i32 - 1,
+                            by,
+                            1,
+                            bh,
+                            BADGE_OUTLINE_COLOR,
+                        );
+                    }
                 }
                 // Favicon (when present) at the left edge (after badge), then title.
                 let icon_size = FAVICON_RENDER_SIZE as i32;
@@ -358,6 +424,19 @@ fn truncate_to_width(s: &str, max_px: usize) -> &str {
 }
 
 const GUTTER: u32 = 4;
+
+/// Horizontal padding in pixels on each side of the 2-character engine-badge
+/// glyph. The total badge column width is therefore:
+///   `font::text_width("WW") + 2 * BADGE_SIDE_PAD`
+/// Using `"WW"` (two W's) as the widest 2-char upper-case bitmap string.
+const BADGE_SIDE_PAD: i32 = 2;
+
+/// White-ish foreground used for the 2-character label inside the engine badge.
+const BADGE_TEXT_COLOR: u32 = 0xFF_FF_FF_FF;
+
+/// Outline colour painted around the badge when the tab is hovered. Pure white
+/// so it contrasts against any badge fill colour.
+const BADGE_OUTLINE_COLOR: u32 = 0xFF_FF_FF_FF;
 
 /// Draw `fav` into the rect `(dst_x, dst_y, dst_w, dst_h)` using
 /// bilinear scaling and a `bg`-coloured backdrop for transparent pixels.
