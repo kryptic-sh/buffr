@@ -154,7 +154,10 @@ pub fn execute_subprocess() -> i32 {
 /// an `.app` bundle.
 pub fn cef_initialize(cache_path: &str, app: &mut cef::App) -> Result<(), String> {
     let args = cef::args::Args::new();
-    let settings = cef::Settings {
+    // `mut` only used in the macOS cfg block below; suppress
+    // unused_mut warning on Linux/Windows where the bindings are immutable.
+    #[allow(unused_mut)]
+    let mut settings = cef::Settings {
         no_sandbox: 1,
         multi_threaded_message_loop: 0,
         root_cache_path: cef::CefString::from(cache_path),
