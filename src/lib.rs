@@ -313,11 +313,48 @@ fn default_engine_id() -> String {
     "cef".to_string()
 }
 
+/// One registered engine instance inside `[[engines.instances]]`.
+///
+/// ```toml
+/// [[engines.instances]]
+/// id      = "cef-a"
+/// backend = "cef"
+///
+/// [[engines.instances]]
+/// id       = "cef-b"
+/// backend  = "cef"
+/// data_dir = "/tmp/cef-b-cache"  # advisory only in Phase 3
+/// ```
+///
+/// `id` is referenced by `engines.default` and `[[engines.rules]]`.
+/// `backend` selects the runtime crate: only `"cef"` is supported in Phase 3.
+/// `data_dir` is accepted but advisory — CEF's cache path is process-global.
+/// Real per-engine on-disk isolation requires `RequestContext` (Phase 5+).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineInstance {
+    /// Unique id referenced by `engines.default` and routing rules.
+    /// Lower-case ASCII recommended.
+    pub id: String,
+    /// Which backend crate hosts this instance.
+    /// Phase 3 supports only `"cef"`.
+    pub backend: String,
+    /// Optional per-instance data directory.
+    /// **Phase 3 advisory only** — CEF cache path is process-global.
+    /// Real isolation tracked as follow-up (Phase 5+).
+    #[serde(default)]
+    pub data_dir: Option<String>,
+}
+
 /// `[engines]` section — browser backend routing.
 ///
 /// ```toml
 /// [engines]
 /// default = "cef"
+///
+/// [[engines.instances]]
+/// id      = "cef"
+/// backend = "cef"
 ///
 /// [[engines.rules]]
 /// match = "*.figma.com"
@@ -325,16 +362,21 @@ fn default_engine_id() -> String {
 /// ```
 ///
 /// The `default` engine id is used for every URL that does not match a rule.
+/// `instances` lists the engine backends to construct at startup. When empty,
+/// a single default `EngineInstance { id: "cef", backend: "cef" }` is
+/// synthesised so single-engine configs require no changes.
 /// Rules are evaluated in declaration order; the first match wins. Engine ids
-/// are free-form strings that must correspond to a backend registered at
-/// runtime — the config crate does not know the set of registered engines.
-/// Validation against the registry happens in `engine_router`.
+/// must correspond to a declared instance — validated by [`validate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Engines {
     /// Engine id used when no rule matches. Defaults to `"cef"`.
     #[serde(default = "default_engine_id")]
     pub default: String,
+    /// Registered engine instances. When empty a default `cef` instance is
+    /// synthesised at runtime (see [`Engines::effective_instances`]).
+    #[serde(default)]
+    pub instances: Vec<EngineInstance>,
     /// Ordered list of per-domain routing rules. Evaluated in declaration
     /// order; the first matching rule wins.
     #[serde(default)]
@@ -345,7 +387,28 @@ impl Default for Engines {
     fn default() -> Self {
         Self {
             default: default_engine_id(),
+            instances: Vec::new(),
             rules: Vec::new(),
+        }
+    }
+}
+
+impl Engines {
+    /// Return the effective instance list.
+    ///
+    /// When `instances` is empty (the common single-engine case), returns a
+    /// one-element slice containing a synthesised `{ id: "cef", backend: "cef"
+    /// }` so callers always see at least one instance. When non-empty the
+    /// explicit list is returned unchanged.
+    pub fn effective_instances(&self) -> std::borrow::Cow<'_, [EngineInstance]> {
+        if self.instances.is_empty() {
+            std::borrow::Cow::Owned(vec![EngineInstance {
+                id: "cef".to_string(),
+                backend: "cef".to_string(),
+                data_dir: None,
+            }])
+        } else {
+            std::borrow::Cow::Borrowed(&self.instances)
         }
     }
 }
@@ -743,11 +806,14 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
 
     // -- engines --------------------------------------------------------------
-    // Validate that `default` is non-empty and that every rule has a
-    // non-empty `match` pattern and `engine` id. We intentionally do NOT
-    // validate engine ids against the runtime registry here — the config
-    // crate has no knowledge of registered backends; that check belongs in
-    // `engine_router::EngineRouterBuilder::build`.
+    // Validate that `default` is non-empty, that explicit instance ids are
+    // unique and non-empty, that `default` references a known instance, and
+    // that every rule has a non-empty `match` pattern and `engine` id that
+    // references a known instance.
+    //
+    // We intentionally do NOT validate engine ids against the runtime
+    // registry here — the config crate has no knowledge of registered
+    // backends; deep runtime checks belong in `engine_router`.
     {
         if cfg.engines.default.is_empty() {
             return Err(ConfigError::Validate {
@@ -755,18 +821,93 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 location: Some("engines.default".into()),
             });
         }
-        for (i, rule) in cfg.engines.rules.iter().enumerate() {
-            if rule.pattern.is_empty() {
+
+        // Validate explicit instances (when present).
+        if !cfg.engines.instances.is_empty() {
+            let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (i, inst) in cfg.engines.instances.iter().enumerate() {
+                if inst.id.is_empty() {
+                    return Err(ConfigError::Validate {
+                        message: format!("engines.instances[{i}].id must not be empty"),
+                        location: Some(format!("engines.instances[{i}].id")),
+                    });
+                }
+                if inst.backend.is_empty() {
+                    return Err(ConfigError::Validate {
+                        message: format!("engines.instances[{i}].backend must not be empty"),
+                        location: Some(format!("engines.instances[{i}].backend")),
+                    });
+                }
+                if !seen_ids.insert(inst.id.as_str()) {
+                    return Err(ConfigError::Validate {
+                        message: format!(
+                            "engines.instances[{i}].id = {:?} is a duplicate",
+                            inst.id
+                        ),
+                        location: Some(format!("engines.instances[{i}].id")),
+                    });
+                }
+            }
+            // `default` must reference a declared instance.
+            let known: Vec<&str> = cfg
+                .engines
+                .instances
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect();
+            if !known.contains(&cfg.engines.default.as_str()) {
                 return Err(ConfigError::Validate {
-                    message: format!("engines.rules[{i}].match must not be empty"),
-                    location: Some(format!("engines.rules[{i}].match")),
+                    message: format!(
+                        "engines.default = {:?} does not match any engines.instances id (known: {})",
+                        cfg.engines.default,
+                        known.join(", ")
+                    ),
+                    location: Some("engines.default".into()),
                 });
             }
-            if rule.engine.is_empty() {
-                return Err(ConfigError::Validate {
-                    message: format!("engines.rules[{i}].engine must not be empty"),
-                    location: Some(format!("engines.rules[{i}].engine")),
-                });
+            // Every rule's `engine` must reference a declared instance.
+            for (i, rule) in cfg.engines.rules.iter().enumerate() {
+                if rule.pattern.is_empty() {
+                    return Err(ConfigError::Validate {
+                        message: format!("engines.rules[{i}].match must not be empty"),
+                        location: Some(format!("engines.rules[{i}].match")),
+                    });
+                }
+                if rule.engine.is_empty() {
+                    return Err(ConfigError::Validate {
+                        message: format!("engines.rules[{i}].engine must not be empty"),
+                        location: Some(format!("engines.rules[{i}].engine")),
+                    });
+                }
+                if !known.contains(&rule.engine.as_str()) {
+                    return Err(ConfigError::Validate {
+                        message: format!(
+                            "engines.rules[{i}].engine = {:?} does not match any engines.instances id (known: {})",
+                            rule.engine,
+                            known.join(", ")
+                        ),
+                        location: Some(format!("engines.rules[{i}].engine")),
+                    });
+                }
+            }
+        } else {
+            // No explicit instances — just validate the rules' non-emptiness.
+            // The synthesised default instance id is "cef"; `default` must be
+            // "cef" or the user has set a non-empty custom value that will be
+            // caught at router build time.
+            for (i, rule) in cfg.engines.rules.iter().enumerate() {
+                if rule.pattern.is_empty() {
+                    return Err(ConfigError::Validate {
+                        message: format!("engines.rules[{i}].match must not be empty"),
+                        location: Some(format!("engines.rules[{i}].match")),
+                    });
+                }
+                if rule.engine.is_empty() {
+                    return Err(ConfigError::Validate {
+                        message: format!("engines.rules[{i}].engine must not be empty"),
+                        location: Some(format!("engines.rules[{i}].engine")),
+                    });
+                }
             }
         }
     }
@@ -1354,5 +1495,139 @@ engine = "cef"
             }
             _ => panic!("expected Validate error"),
         }
+    }
+
+    // ── engines.instances section (Phase 3) ───────────────────────────────────
+
+    #[test]
+    fn engines_instances_default_synthesized_when_empty() {
+        let cfg = Config::default();
+        assert!(cfg.engines.instances.is_empty(), "raw list is empty");
+        let eff = cfg.engines.effective_instances();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].id, "cef");
+        assert_eq!(eff[0].backend, "cef");
+        assert!(eff[0].data_dir.is_none());
+    }
+
+    #[test]
+    fn engines_instances_explicit_list_returned_unchanged() {
+        let toml = r#"
+[engines]
+default = "cef-a"
+
+[[engines.instances]]
+id      = "cef-a"
+backend = "cef"
+
+[[engines.instances]]
+id      = "cef-b"
+backend = "cef"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.engines.instances.len(), 2);
+        let eff = cfg.engines.effective_instances();
+        assert_eq!(eff.len(), 2);
+        assert_eq!(eff[0].id, "cef-a");
+        assert_eq!(eff[1].id, "cef-b");
+    }
+
+    #[test]
+    fn engines_default_must_reference_known_instance() {
+        let mut cfg = Config::default();
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "cef-a".into(),
+            backend: "cef".into(),
+            data_dir: None,
+        });
+        cfg.engines.default = "unknown".into();
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, location } => {
+                assert!(message.contains("unknown"), "msg: {message}");
+                assert_eq!(location.as_deref(), Some("engines.default"));
+            }
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn engines_rule_engine_must_reference_known_instance() {
+        let mut cfg = Config::default();
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "cef".into(),
+            backend: "cef".into(),
+            data_dir: None,
+        });
+        cfg.engines.rules.push(crate::EngineRule {
+            pattern: "*.example.com".into(),
+            engine: "webkit".into(), // not declared
+        });
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("webkit"), "msg: {message}");
+            }
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn engines_duplicate_instance_id_rejected() {
+        let mut cfg = Config::default();
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "cef".into(),
+            backend: "cef".into(),
+            data_dir: None,
+        });
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "cef".into(), // duplicate
+            backend: "cef".into(),
+            data_dir: None,
+        });
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("duplicate"), "msg: {message}");
+            }
+            _ => panic!("expected Validate error"),
+        }
+    }
+
+    #[test]
+    fn engines_instance_data_dir_parses() {
+        let toml = r#"
+[engines]
+default = "cef"
+
+[[engines.instances]]
+id       = "cef"
+backend  = "cef"
+data_dir = "/tmp/cef-cache"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(
+            cfg.engines.instances[0].data_dir.as_deref(),
+            Some("/tmp/cef-cache")
+        );
+    }
+
+    #[test]
+    fn engines_instance_round_trip() {
+        let mut cfg = Config::default();
+        cfg.engines.instances.push(crate::EngineInstance {
+            id: "cef".into(),
+            backend: "cef".into(),
+            data_dir: Some("/tmp/test".into()),
+        });
+        let s = to_toml_string(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&s).unwrap();
+        assert_eq!(parsed.engines.instances.len(), 1);
+        assert_eq!(
+            parsed.engines.instances[0].data_dir.as_deref(),
+            Some("/tmp/test")
+        );
     }
 }
