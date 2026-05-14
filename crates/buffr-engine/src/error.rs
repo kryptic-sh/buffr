@@ -21,4 +21,12 @@ pub enum EngineError {
 
     #[error("operation failed: {0}")]
     Other(String),
+
+    /// Returned by backends that have not yet implemented the method.
+    ///
+    /// `method` carries the trait method name for diagnostics. Phase 4
+    /// blink-cdp stubs return this for popup_*, hint_*, find_*, zoom_*,
+    /// devtools_*, scheme_handler_*, and other non-core methods.
+    #[error("not implemented: {method}")]
+    Unimplemented { method: &'static str },
 }
