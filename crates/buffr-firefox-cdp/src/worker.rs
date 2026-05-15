@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as B64Engine;
 use serde_json::Value;
 
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
+use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState};
 
 use crate::cdp::{
     CaptureScreenshotParams, CdpCommand, CdpMessage, DispatchKeyEventParams,
@@ -75,6 +75,18 @@ pub type TitleMap = Arc<Mutex<HashMap<String, String>>>;
 /// Create a new [`TitleMap`].
 pub fn new_title_map() -> TitleMap {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+// ── Favicon sink ──────────────────────────────────────────────────────────────
+
+/// Pending favicon updates populated by the worker from `Page.frameNavigated`
+/// `frame.faviconUrl` fields and drained by the engine in
+/// `drain_favicon_updates`.
+pub type FaviconSink = Arc<Mutex<Vec<FaviconUpdate>>>;
+
+/// Create a new [`FaviconSink`].
+pub fn new_favicon_sink() -> FaviconSink {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
 // ── Entry type for the pending map ───────────────────────────────────────────
@@ -143,6 +155,7 @@ pub fn run(
     loading_state: Arc<Mutex<HashMap<String, bool>>>,
     nav_count: Arc<Mutex<HashMap<String, usize>>>,
     title_map: TitleMap,
+    favicon_sink: FaviconSink,
 ) {
     let mut pending: HashMap<u64, PendingEntry> = HashMap::new();
     let mut active_session: Option<String> = None;
@@ -296,6 +309,7 @@ pub fn run(
                         &loading_state,
                         &nav_count,
                         &title_map,
+                        &favicon_sink,
                     );
                 }
             },
@@ -315,6 +329,7 @@ fn dispatch_message(
     loading_state: &Arc<Mutex<HashMap<String, bool>>>,
     nav_count: &Arc<Mutex<HashMap<String, usize>>>,
     title_map: &TitleMap,
+    favicon_sink: &FaviconSink,
 ) {
     // Command response — may be a screenshot reply or a normal reply.
     if let Some(id) = msg.id {
@@ -375,6 +390,19 @@ fn dispatch_message(
                             sink.push_back((session_id.clone(), url, title));
                         }
                     }
+                    // Extract faviconUrl and attempt to fetch + decode it.
+                    let favicon_url = frame
+                        .get("faviconUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if !favicon_url.is_empty() {
+                        tracing::debug!(
+                            favicon_url,
+                            "Firefox CDP: Page.frameNavigated — fetching favicon"
+                        );
+                        fetch_and_push_favicon(&favicon_url, favicon_sink);
+                    }
                 }
                 // Increment navigation count for back/forward heuristic.
                 if let Ok(mut map) = nav_count.lock() {
@@ -431,6 +459,80 @@ fn dispatch_message(
         }
         _ => {}
     }
+}
+
+// ── Favicon fetch ─────────────────────────────────────────────────────────────
+
+/// Fetch `favicon_url` (HTTP/HTTPS or `data:` URI), decode it as an image,
+/// convert to BGRA `u32` packed pixels, and push into `favicon_sink`.
+///
+/// Uses a `browser_id` of `0` (no per-tab integer ID in the CDP backend).
+/// Errors are debug-logged and silently discarded so the event loop is never
+/// interrupted by a slow or broken favicon resource.
+fn fetch_and_push_favicon(favicon_url: &str, favicon_sink: &FaviconSink) {
+    let image_bytes: Option<Vec<u8>> = if let Some(data) = favicon_url.strip_prefix("data:") {
+        // data: URI — extract the base64 payload after the first comma.
+        let payload = data.split_once(',').map(|x| x.1).unwrap_or("");
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()
+    } else {
+        // HTTP/HTTPS URL — blocking fetch with a short timeout.
+        match ureq::get(favicon_url).call() {
+            Ok(response) => match response.into_body().read_to_vec() {
+                Ok(buf) => Some(buf),
+                Err(e) => {
+                    tracing::debug!(error = %e, favicon_url, "Firefox CDP: favicon body read failed");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, favicon_url, "Firefox CDP: favicon fetch failed");
+                None
+            }
+        }
+    };
+
+    let Some(bytes) = image_bytes else { return };
+
+    let img = match image::load_from_memory(&bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::debug!(error = %e, favicon_url, "Firefox CDP: favicon image decode failed");
+            return;
+        }
+    };
+
+    let rgba = img.into_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    // Pack RGBA bytes as `0xAARRGGBB` u32 (matching CEF favicon layout).
+    let pixels: Vec<u32> = rgba
+        .chunks_exact(4)
+        .map(|c| {
+            let r = c[0] as u32;
+            let g = c[1] as u32;
+            let b = c[2] as u32;
+            let a = c[3] as u32;
+            (a << 24) | (r << 16) | (g << 8) | b
+        })
+        .collect();
+
+    let update = FaviconUpdate {
+        browser_id: 0,
+        width,
+        height,
+        pixels,
+    };
+    if let Ok(mut sink) = favicon_sink.lock() {
+        sink.push(update);
+    }
+    tracing::debug!(
+        width,
+        height,
+        favicon_url,
+        "Firefox CDP: favicon decoded and pushed"
+    );
 }
 
 // ── Frame decode ──────────────────────────────────────────────────────────────

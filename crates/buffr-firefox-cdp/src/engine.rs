@@ -38,8 +38,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use buffr_engine::{
-    BrowserEngine, EngineError, HintAction, HintStatus, MouseButton, NeutralKeyEvent, OsrFrame,
-    OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus, MouseButton,
+    NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
         new_popup_queue,
@@ -53,7 +53,10 @@ use crate::cdp::{
 };
 use crate::error::FirefoxError;
 use crate::subprocess::{find_firefox, init_profile, pick_free_port, probe_ws_url, spawn_headless};
-use crate::worker::{Command, TitleMap, UrlUpdateSink, new_title_map, new_url_update_sink, run};
+use crate::worker::{
+    Command, FaviconSink, TitleMap, UrlUpdateSink, new_favicon_sink, new_title_map,
+    new_url_update_sink, run,
+};
 use crate::ws::WsClient;
 
 // ── Internal tab representation ───────────────────────────────────────────────
@@ -178,6 +181,9 @@ pub struct FirefoxCdpEngine {
     /// `FindNext` / `FindPrev` without requiring the caller to re-supply the
     /// query string. Cleared by `stop_find`.
     find_query: Mutex<Option<String>>,
+    /// Favicon updates populated by the worker from `Page.frameNavigated`
+    /// `frame.faviconUrl` events.  Drained by `drain_favicon_updates`.
+    favicon_sink: FaviconSink,
 }
 
 impl FirefoxCdpEngine {
@@ -215,6 +221,7 @@ impl FirefoxCdpEngine {
         let loading_state: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
         let nav_count: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
         let title_map = new_title_map();
+        let favicon_sink = new_favicon_sink();
 
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(crate::worker::WORKER_CMD_CHANNEL_CAP);
 
@@ -224,6 +231,7 @@ impl FirefoxCdpEngine {
         let worker_loading = Arc::clone(&loading_state);
         let worker_nav = Arc::clone(&nav_count);
         let worker_title = Arc::clone(&title_map);
+        let worker_favicon = Arc::clone(&favicon_sink);
 
         let worker = std::thread::Builder::new()
             .name("firefox-cdp-worker".to_owned())
@@ -237,6 +245,7 @@ impl FirefoxCdpEngine {
                     worker_loading,
                     worker_nav,
                     worker_title,
+                    worker_favicon,
                 )
             })
             .map_err(FirefoxError::SpawnFailed)?;
@@ -257,6 +266,7 @@ impl FirefoxCdpEngine {
             title_map,
             nav_history_cache: Mutex::new(HashMap::new()),
             find_query: Mutex::new(None),
+            favicon_sink,
         })
     }
 
@@ -1198,9 +1208,7 @@ impl BrowserEngine for FirefoxCdpEngine {
         // Poll loop handles repaint; no explicit trigger needed.
     }
 
-    fn osr_sleep(&self, _sleep: bool) {
-        // Firefox CDP poll loop continues regardless; Phase C will pause it on sleep.
-    }
+    // osr_sleep is implemented below in the Gap 4 section.
 
     fn osr_invalidate_view(&self) {
         // No-op; poll loop handles invalidation.
@@ -1773,5 +1781,110 @@ impl BrowserEngine for FirefoxCdpEngine {
              document.body.appendChild(a); a.click(); a.remove(); }})();"
         );
         let _ = self.run_js(&js);
+    }
+
+    // ── Gap 1: Edit IPC helpers ───────────────────────────────────────────────
+    //
+    // Implemented via `run_js` — mirrors the CEF backend's JS hook pattern.
+
+    fn run_edit_attach(&self, field_id: &str) {
+        let id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let _ = self.run_js(&format!(
+            "window.__buffrEditAttach && window.__buffrEditAttach({id_json})"
+        ));
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        let forward_json = serde_json::to_string(&forward).unwrap_or_else(|_| "false".into());
+        let _ = self.run_js(&format!(
+            "window.__buffrCycleInput && window.__buffrCycleInput({forward_json})"
+        ));
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        let id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let _ = self.run_js(&format!(
+            "window.__buffrEditDetach && window.__buffrEditDetach({id_json})"
+        ));
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        let id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let _ = self.run_js(&format!(
+            "window.__buffrEditFocus && window.__buffrEditFocus({id_json})"
+        ));
+    }
+
+    // ── Gap 2: Favicons ───────────────────────────────────────────────────────
+    //
+    // The worker populates `favicon_sink` from `Page.frameNavigated`
+    // `frame.faviconUrl` events.  `drain_favicon_updates` drains that vec.
+
+    fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
+        self.favicon_sink
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
+    }
+
+    // ── Gap 3: Cursor change ──────────────────────────────────────────────────
+    //
+    // TODO: CDP has no native cursor-change event for Firefox.  A future
+    // implementation could inject a `mousemove` listener that reads
+    // `document.documentElement.style.cursor` and sends it back via a
+    // sentinel `console.log`, but that approach is complex and fragile.
+    // Returning `None` here matches the trait default and is safe.
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        None
+    }
+
+    // ── Gap 4: OSR sleep via Page.setWebLifecycleState ────────────────────────
+    //
+    // Firefox CDP supports `Page.setWebLifecycleState` with `state: "frozen"`
+    // (suspend) and `state: "active"` (resume).  Errors are debug-logged.
+
+    fn osr_sleep(&self, sleep: bool) {
+        let state_str = if sleep { "frozen" } else { "active" };
+        tracing::debug!(sleep, state_str, "firefox-cdp: osr_sleep");
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        if let Some(sess) = session_id
+            && let Err(e) = self.session_cmd(
+                &sess,
+                "Page.setWebLifecycleState",
+                serde_json::json!({ "state": state_str }),
+            )
+        {
+            tracing::debug!(error = %e, sleep, "firefox-cdp: osr_sleep Page.setWebLifecycleState failed");
+        }
+    }
+
+    // ── Gap 5: Clipboard ──────────────────────────────────────────────────────
+    //
+    // `clipboard_set_text`: inject `navigator.clipboard.writeText` via JS.
+    // `clipboard_text`: async-only CDP path, no sync return — stub with TODO.
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+        let js = format!("navigator.clipboard.writeText({text_json})");
+        match self.run_js(&js) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(error = %e, "firefox-cdp: clipboard_set_text JS injection failed");
+                false
+            }
+        }
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        // TODO: `navigator.clipboard.readText()` is async and CDP's
+        // Runtime.evaluate cannot synchronously return a Promise result
+        // without `awaitPromise: true` + a blocking round-trip, which
+        // risks deadlocking the engine thread.  A future implementation
+        // could use Runtime.evaluate with `awaitPromise: true` and a
+        // dedicated timeout, but that is out of scope for Phase B.
+        None
     }
 }
