@@ -21,6 +21,7 @@ publish = false
 
 [dependencies]
 buffr-engine = { path = "../buffr-engine" }
+buffr-modal = { path = "../buffr-modal" }
 thiserror = "2"
 tracing = "0.1"
 

@@ -99,6 +99,9 @@ pub struct ServoEngine {
     view: SharedOsrViewState,
     /// Cached tab snapshot (protected by Mutex for &self access).
     cache: Mutex<TabCache>,
+    /// Last find query stored by `start_find`; re-used by `dispatch` for
+    /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
+    find_query: Mutex<Option<String>>,
 }
 
 impl ServoEngine {
@@ -135,6 +138,7 @@ impl ServoEngine {
             frame,
             view,
             cache: Mutex::new(TabCache::default()),
+            find_query: Mutex::new(None),
         })
     }
 
@@ -435,12 +439,18 @@ impl BrowserEngine for ServoEngine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("servo: start_find not implemented in Phase B");
+    fn start_find(&self, query: &str, _forward: bool) {
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = Some(query.to_owned());
+        }
+        tracing::debug!("servo: start_find not implemented in Phase B (query stored)");
     }
 
     fn stop_find(&self) {
-        tracing::debug!("servo: stop_find not implemented in Phase B");
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = None;
+        }
+        tracing::debug!("servo: stop_find");
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -573,5 +583,66 @@ impl BrowserEngine for ServoEngine {
 
     fn cancel_hint(&self) {
         tracing::debug!("servo: cancel_hint not implemented");
+    }
+
+    // ── Action dispatch ───────────────────────────────────────────────────────
+    //
+    // History/stop → existing GoBack/GoForward/Reload/Stop worker Commands.
+    // Scroll → debug-log (no JS eval substrate; Phase C wires via WebView API).
+    // Zoom → existing zoom_* helpers.
+    // FindNext/FindPrev → debug-log (no find substrate in Phase B skeleton).
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+
+        match action {
+            // ── Find ─────────────────────────────────────────────────────────
+            A::FindNext => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "servo: dispatch FindNext — no find substrate in Phase B (no-op)");
+                } else {
+                    tracing::debug!("servo: FindNext — no active find query");
+                }
+            }
+            A::FindPrev => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "servo: dispatch FindPrev — no find substrate in Phase B (no-op)");
+                } else {
+                    tracing::debug!("servo: FindPrev — no active find query");
+                }
+            }
+
+            // ── History / reload / stop ───────────────────────────────────────
+            A::HistoryBack => {
+                tracing::debug!("servo: dispatch HistoryBack");
+                self.worker.send(Command::GoBack { n: 1 });
+            }
+            A::HistoryForward => {
+                tracing::debug!("servo: dispatch HistoryForward");
+                self.worker.send(Command::GoForward { n: 1 });
+            }
+            A::Reload | A::ReloadHard => {
+                tracing::debug!("servo: dispatch Reload");
+                self.worker.send(Command::Reload);
+            }
+            A::StopLoading => {
+                tracing::debug!("servo: dispatch StopLoading");
+                self.worker.send(Command::Stop);
+            }
+
+            // ── Zoom ──────────────────────────────────────────────────────────
+            A::ZoomIn => self.zoom_in(),
+            A::ZoomOut => self.zoom_out(),
+            A::ZoomReset => self.zoom_reset(),
+
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "servo: dispatch — action not handled by this backend (no-op)"
+                );
+            }
+        }
     }
 }

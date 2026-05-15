@@ -677,6 +677,7 @@ name = "buffr-servo"
 version = "0.1.0"
 dependencies = [
  "buffr-engine",
+ "buffr-modal",
  "dpi",
  "keyboard-types",
  "servo",

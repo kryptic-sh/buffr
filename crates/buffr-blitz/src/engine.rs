@@ -545,4 +545,48 @@ impl BrowserEngine for BlitzEngine {
     fn cancel_hint(&self) {
         tracing::debug!("blitz: cancel_hint — no-op");
     }
+
+    // ── Action dispatch ───────────────────────────────────────────────────────
+    //
+    // History/stop routed through existing worker Commands.  Scroll has no JS
+    // eval substrate in Phase B — falls through to debug-log.  Zoom delegates
+    // to the existing zoom_* helpers.  FindNext/FindPrev: start_find is a no-op
+    // in Phase B so these fall through as well.
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+
+        match action {
+            // ── History / reload / stop ───────────────────────────────────────
+            A::HistoryBack => {
+                tracing::debug!("blitz: dispatch HistoryBack");
+                self.worker.send(Command::GoBack { n: 1 });
+            }
+            A::HistoryForward => {
+                tracing::debug!("blitz: dispatch HistoryForward");
+                self.worker.send(Command::GoForward { n: 1 });
+            }
+            A::Reload | A::ReloadHard => {
+                tracing::debug!("blitz: dispatch Reload");
+                self.worker.send(Command::Reload);
+            }
+            A::StopLoading => {
+                tracing::debug!("blitz: dispatch StopLoading");
+                self.worker.send(Command::Stop);
+            }
+
+            // ── Zoom ──────────────────────────────────────────────────────────
+            A::ZoomIn => self.zoom_in(),
+            A::ZoomOut => self.zoom_out(),
+            A::ZoomReset => self.zoom_reset(),
+
+            // ── Find / scroll — no JS eval substrate in Phase B ───────────────
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "blitz: dispatch — action not yet implemented for this backend (no-op)"
+                );
+            }
+        }
+    }
 }

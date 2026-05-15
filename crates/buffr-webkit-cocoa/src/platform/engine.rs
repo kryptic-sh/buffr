@@ -77,6 +77,10 @@ pub struct WebKitCocoaEngine {
     /// Thread-safe tab snapshot. Updated by delegate callbacks on the main queue.
     #[cfg(target_os = "macos")]
     engine_state: Arc<Mutex<EngineState>>,
+    /// Last find query stored by `start_find`; re-used by `dispatch` for
+    /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
+    /// Available on all platforms so the struct layout is consistent.
+    find_query: Mutex<Option<String>>,
 }
 
 impl WebKitCocoaEngine {
@@ -116,6 +120,7 @@ impl WebKitCocoaEngine {
                 view,
                 worker,
                 engine_state,
+                find_query: Mutex::new(None),
             });
         }
 
@@ -126,6 +131,7 @@ impl WebKitCocoaEngine {
             engine_id: options.engine_id.clone(),
             frame,
             view,
+            find_query: Mutex::new(None),
         })
     }
 
@@ -464,12 +470,20 @@ impl BrowserEngine for WebKitCocoaEngine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("webkit-cocoa: start_find — no-op in Phase B");
+    fn start_find(&self, query: &str, _forward: bool) {
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = Some(query.to_owned());
+        }
+        tracing::debug!(
+            "webkit-cocoa: start_find — no WKFindInteraction in Phase B (query stored)"
+        );
     }
 
     fn stop_find(&self) {
-        tracing::debug!("webkit-cocoa: stop_find — no-op in Phase B");
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = None;
+        }
+        tracing::debug!("webkit-cocoa: stop_find");
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -592,6 +606,72 @@ impl BrowserEngine for WebKitCocoaEngine {
 
     fn cancel_hint(&self) {
         tracing::debug!("webkit-cocoa: cancel_hint — no-op");
+    }
+
+    // ── Action dispatch ───────────────────────────────────────────────────────
+    //
+    // History/stop → existing GoBack/GoForward/Reload/Stop worker commands
+    //   (guarded by #[cfg(target_os = "macos")] — on non-macOS all are no-ops).
+    // Scroll → debug-log (no JS eval worker command in Phase B).
+    // Zoom → existing zoom_* helpers.
+    // FindNext/FindPrev → debug-log (WKFindInteraction lands in Phase C).
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+
+        match action {
+            // ── Find ─────────────────────────────────────────────────────────
+            A::FindNext => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "webkit-cocoa: dispatch FindNext — WKFindInteraction not yet wired (no-op)");
+                } else {
+                    tracing::debug!("webkit-cocoa: FindNext — no active find query");
+                }
+            }
+            A::FindPrev => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "webkit-cocoa: dispatch FindPrev — WKFindInteraction not yet wired (no-op)");
+                } else {
+                    tracing::debug!("webkit-cocoa: FindPrev — no active find query");
+                }
+            }
+
+            // ── History / reload / stop ───────────────────────────────────────
+            A::HistoryBack => {
+                tracing::debug!("webkit-cocoa: dispatch HistoryBack");
+                #[cfg(target_os = "macos")]
+                self.worker.send(Command::GoBack);
+            }
+            A::HistoryForward => {
+                tracing::debug!("webkit-cocoa: dispatch HistoryForward");
+                #[cfg(target_os = "macos")]
+                self.worker.send(Command::GoForward);
+            }
+            A::Reload | A::ReloadHard => {
+                tracing::debug!("webkit-cocoa: dispatch Reload");
+                #[cfg(target_os = "macos")]
+                self.worker.send(Command::Reload);
+            }
+            A::StopLoading => {
+                tracing::debug!("webkit-cocoa: dispatch StopLoading");
+                #[cfg(target_os = "macos")]
+                self.worker.send(Command::Stop);
+            }
+
+            // ── Zoom ──────────────────────────────────────────────────────────
+            A::ZoomIn => self.zoom_in(),
+            A::ZoomOut => self.zoom_out(),
+            A::ZoomReset => self.zoom_reset(),
+
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "webkit-cocoa: dispatch — action not handled by this backend (no-op)"
+                );
+            }
+        }
     }
 }
 

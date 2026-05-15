@@ -52,8 +52,8 @@ use buffr_engine::{
 
 use super::error::WebKitGtkError;
 use super::input::{
-    neutral_click_to_gtk, neutral_key_to_gtk, neutral_leave_to_gtk, neutral_move_to_gtk,
-    neutral_scroll_to_gtk,
+    GtkInputEvent, GtkWheelEvent, neutral_click_to_gtk, neutral_key_to_gtk, neutral_leave_to_gtk,
+    neutral_move_to_gtk, neutral_scroll_to_gtk,
 };
 use super::worker::{Command, EngineState, WorkerHandle, spawn};
 
@@ -74,6 +74,9 @@ pub struct WebKitGtkEngine {
     worker: WorkerHandle,
     /// Thread-safe tab snapshot. Updated by WebView signal handlers.
     engine_state: Arc<Mutex<EngineState>>,
+    /// Last find query stored by `start_find`; re-used by `dispatch` for
+    /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
+    find_query: std::sync::Mutex<Option<(String, bool)>>,
 }
 
 impl WebKitGtkEngine {
@@ -111,6 +114,7 @@ impl WebKitGtkEngine {
             view,
             worker,
             engine_state,
+            find_query: std::sync::Mutex::new(None),
         })
     }
 
@@ -400,6 +404,9 @@ impl BrowserEngine for WebKitGtkEngine {
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
     fn start_find(&self, query: &str, forward: bool) {
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = Some((query.to_owned(), forward));
+        }
         self.worker.send(Command::StartFind {
             query: query.to_owned(),
             forward,
@@ -407,6 +414,9 @@ impl BrowserEngine for WebKitGtkEngine {
     }
 
     fn stop_find(&self) {
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = None;
+        }
         self.worker.send(Command::StopFind);
     }
 
@@ -517,5 +527,126 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn cancel_hint(&self) {
         tracing::debug!("webkitgtk: cancel_hint — no-op");
+    }
+
+    // ── Action dispatch ───────────────────────────────────────────────────────
+    //
+    // History/stop → existing worker Commands.
+    // Scroll → SendInput(GtkInputEvent::Wheel) which the worker dispatches via
+    //   wheel_js → `WheelEvent` DOM event → browser-native scroll.
+    // Zoom → existing zoom_* helpers.
+    // FindNext/FindPrev → re-send StartFind with the stored query / direction.
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+
+        /// Pixels per scroll-unit (matches blink-cdp / CEF backend constant).
+        const STEP_PX: f64 = 40.0;
+
+        // Helper: fire a synthetic WheelEvent through the SendInput path.
+        let scroll = |dy: f64| {
+            self.worker
+                .send(Command::SendInput(GtkInputEvent::Wheel(GtkWheelEvent {
+                    x: 0.0,
+                    y: 0.0,
+                    delta_x: 0.0,
+                    delta_y: dy,
+                })));
+        };
+
+        match action {
+            // ── Find ─────────────────────────────────────────────────────────
+            A::FindNext => {
+                let qf = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some((q, _fwd)) = qf {
+                    tracing::debug!(query = %q, "webkitgtk: dispatch FindNext");
+                    self.worker.send(Command::StartFind {
+                        query: q,
+                        forward: true,
+                    });
+                } else {
+                    tracing::debug!("webkitgtk: FindNext — no active find query");
+                }
+            }
+            A::FindPrev => {
+                let qf = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some((q, _fwd)) = qf {
+                    tracing::debug!(query = %q, "webkitgtk: dispatch FindPrev");
+                    self.worker.send(Command::StartFind {
+                        query: q,
+                        forward: false,
+                    });
+                } else {
+                    tracing::debug!("webkitgtk: FindPrev — no active find query");
+                }
+            }
+
+            // ── History / reload / stop ───────────────────────────────────────
+            A::HistoryBack => {
+                tracing::debug!("webkitgtk: dispatch HistoryBack");
+                self.worker.send(Command::GoBack);
+            }
+            A::HistoryForward => {
+                tracing::debug!("webkitgtk: dispatch HistoryForward");
+                self.worker.send(Command::GoForward);
+            }
+            A::Reload | A::ReloadHard => {
+                tracing::debug!("webkitgtk: dispatch Reload");
+                self.worker.send(Command::Reload);
+            }
+            A::StopLoading => {
+                tracing::debug!("webkitgtk: dispatch StopLoading");
+                self.worker.send(Command::Stop);
+            }
+
+            // ── Scroll via synthetic WheelEvent ───────────────────────────────
+            A::ScrollUp(n) => {
+                let dy = -(STEP_PX * (*n as f64));
+                tracing::debug!(n, dy, "webkitgtk: dispatch ScrollUp");
+                scroll(dy);
+            }
+            A::ScrollDown(n) => {
+                let dy = STEP_PX * (*n as f64);
+                tracing::debug!(n, dy, "webkitgtk: dispatch ScrollDown");
+                scroll(dy);
+            }
+            A::ScrollLeft(_) | A::ScrollRight(_) => {
+                tracing::debug!(action = ?action, "webkitgtk: dispatch ScrollLeft/Right — no-op (vertical only via wheel)");
+            }
+            A::ScrollPageDown | A::ScrollFullPageDown => {
+                tracing::debug!("webkitgtk: dispatch ScrollPageDown (600px approx)");
+                scroll(600.0);
+            }
+            A::ScrollPageUp | A::ScrollFullPageUp => {
+                tracing::debug!("webkitgtk: dispatch ScrollPageUp (600px approx)");
+                scroll(-600.0);
+            }
+            A::ScrollHalfPageDown => {
+                tracing::debug!("webkitgtk: dispatch ScrollHalfPageDown (300px approx)");
+                scroll(300.0);
+            }
+            A::ScrollHalfPageUp => {
+                tracing::debug!("webkitgtk: dispatch ScrollHalfPageUp (300px approx)");
+                scroll(-300.0);
+            }
+            A::ScrollTop | A::ScrollBottom => {
+                tracing::debug!(
+                    action = ?action,
+                    "webkitgtk: dispatch ScrollTop/Bottom — no-op (no absolute scroll without JS eval)"
+                );
+            }
+
+            // ── Zoom ──────────────────────────────────────────────────────────
+            A::ZoomIn => self.zoom_in(),
+            A::ZoomOut => self.zoom_out(),
+            A::ZoomReset => self.zoom_reset(),
+
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "webkitgtk: dispatch — action not handled by this backend (no-op)"
+                );
+            }
+        }
     }
 }

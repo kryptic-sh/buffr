@@ -174,6 +174,10 @@ pub struct FirefoxCdpEngine {
     /// corresponding session (in `navigate()` and `pump_address_changes()`).
     /// `can_go_back` / `can_go_forward` populate the cache on cache-miss.
     nav_history_cache: Mutex<NavHistoryCache>,
+    /// Last query passed to `start_find`. Used by `dispatch` to re-run
+    /// `FindNext` / `FindPrev` without requiring the caller to re-supply the
+    /// query string. Cleared by `stop_find`.
+    find_query: Mutex<Option<String>>,
 }
 
 impl FirefoxCdpEngine {
@@ -252,6 +256,7 @@ impl FirefoxCdpEngine {
             nav_count,
             title_map,
             nav_history_cache: Mutex::new(HashMap::new()),
+            find_query: Mutex::new(None),
         })
     }
 
@@ -1189,6 +1194,12 @@ impl BrowserEngine for FirefoxCdpEngine {
         // Backwards search is the second arg's logical inverse. JS-quote the
         // query to escape backslashes + single quotes; nothing else is needed
         // for this string literal context.
+
+        // Store for FindNext / FindPrev dispatch.
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = Some(query.to_owned());
+        }
+
         let escaped = query.replace('\\', r"\\").replace('\'', r"\'");
         let js = format!(
             "window.find('{escaped}', false /* caseSensitive */, {} /* backwards */, true /* wrapAround */, false /* wholeWord */, true /* searchInFrames */, false /* showDialog */)",
@@ -1217,6 +1228,11 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn stop_find(&self) {
+        // Clear the stored query so FindNext / FindPrev become no-ops.
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = None;
+        }
+
         // window.find leaves a selection — clearing window.getSelection()
         // matches Chrome's Page.stopFind { action: "clearSelection" } behaviour.
         let Some(session_id) = ({
@@ -1351,4 +1367,165 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn cancel_hint(&self) {}
+
+    // ── Action dispatch ───────────────────────────────────────────────────────
+    //
+    // Mirrors the blink-cdp implementation: history/stop via CDP Page commands,
+    // scroll via Runtime.evaluate JS injection, zoom via the existing zoom_*
+    // helpers, and FindNext/FindPrev via window.find re-invocation.
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+
+        const STEP_PX: i64 = 40;
+
+        // Fire-and-forget Runtime.evaluate on the active session.
+        let eval = |expr: String| {
+            let session_id = {
+                let state = self.lock_state();
+                state.active_tab().map(|t| t.session_id.clone())
+            };
+            if let Some(sess) = session_id {
+                let _ = self.session_cmd(
+                    &sess,
+                    "Runtime.evaluate",
+                    serde_json::json!({ "expression": expr }),
+                );
+            }
+        };
+
+        match action {
+            // ── Find ─────────────────────────────────────────────────────────
+            A::FindNext => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "firefox-cdp: dispatch FindNext");
+                    let escaped = q.replace('\\', r"\\").replace('\'', r"\'");
+                    let js =
+                        format!("window.find('{escaped}', false, false, true, false, true, false)");
+                    eval(js);
+                } else {
+                    tracing::debug!("firefox-cdp: FindNext — no active find query");
+                }
+            }
+            A::FindPrev => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "firefox-cdp: dispatch FindPrev");
+                    let escaped = q.replace('\\', r"\\").replace('\'', r"\'");
+                    let js =
+                        format!("window.find('{escaped}', false, true, true, false, true, false)");
+                    eval(js);
+                } else {
+                    tracing::debug!("firefox-cdp: FindPrev — no active find query");
+                }
+            }
+
+            // ── History / reload / stop ───────────────────────────────────────
+            A::HistoryBack => {
+                tracing::debug!("firefox-cdp: dispatch HistoryBack");
+                eval("window.history.back();".to_owned());
+            }
+            A::HistoryForward => {
+                tracing::debug!("firefox-cdp: dispatch HistoryForward");
+                eval("window.history.forward();".to_owned());
+            }
+            A::Reload => {
+                tracing::debug!("firefox-cdp: dispatch Reload");
+                let session_id = {
+                    let state = self.lock_state();
+                    state.active_tab().map(|t| t.session_id.clone())
+                };
+                if let Some(sess) = session_id {
+                    let _ = self.session_cmd(
+                        &sess,
+                        "Page.reload",
+                        serde_json::json!({ "ignoreCache": false }),
+                    );
+                }
+            }
+            A::ReloadHard => {
+                tracing::debug!("firefox-cdp: dispatch ReloadHard");
+                let session_id = {
+                    let state = self.lock_state();
+                    state.active_tab().map(|t| t.session_id.clone())
+                };
+                if let Some(sess) = session_id {
+                    let _ = self.session_cmd(
+                        &sess,
+                        "Page.reload",
+                        serde_json::json!({ "ignoreCache": true }),
+                    );
+                }
+            }
+            A::StopLoading => {
+                tracing::debug!("firefox-cdp: dispatch StopLoading");
+                let session_id = {
+                    let state = self.lock_state();
+                    state.active_tab().map(|t| t.session_id.clone())
+                };
+                if let Some(sess) = session_id {
+                    let _ = self.session_cmd(&sess, "Page.stopLoading", serde_json::json!({}));
+                }
+            }
+
+            // ── Scroll ────────────────────────────────────────────────────────
+            A::ScrollUp(n) => {
+                let dy = -(STEP_PX * (*n as i64));
+                tracing::debug!(n, dy, "firefox-cdp: dispatch ScrollUp");
+                eval(format!("window.scrollBy(0, {dy});"));
+            }
+            A::ScrollDown(n) => {
+                let dy = STEP_PX * (*n as i64);
+                tracing::debug!(n, dy, "firefox-cdp: dispatch ScrollDown");
+                eval(format!("window.scrollBy(0, {dy});"));
+            }
+            A::ScrollLeft(n) => {
+                let dx = -(STEP_PX * (*n as i64));
+                tracing::debug!(n, dx, "firefox-cdp: dispatch ScrollLeft");
+                eval(format!("window.scrollBy({dx}, 0);"));
+            }
+            A::ScrollRight(n) => {
+                let dx = STEP_PX * (*n as i64);
+                tracing::debug!(n, dx, "firefox-cdp: dispatch ScrollRight");
+                eval(format!("window.scrollBy({dx}, 0);"));
+            }
+            A::ScrollPageDown | A::ScrollFullPageDown => {
+                tracing::debug!("firefox-cdp: dispatch ScrollPageDown");
+                eval("window.scrollBy(0, window.innerHeight * 0.9);".to_owned());
+            }
+            A::ScrollPageUp | A::ScrollFullPageUp => {
+                tracing::debug!("firefox-cdp: dispatch ScrollPageUp");
+                eval("window.scrollBy(0, -window.innerHeight * 0.9);".to_owned());
+            }
+            A::ScrollHalfPageDown => {
+                tracing::debug!("firefox-cdp: dispatch ScrollHalfPageDown");
+                eval("window.scrollBy(0, window.innerHeight * 0.5);".to_owned());
+            }
+            A::ScrollHalfPageUp => {
+                tracing::debug!("firefox-cdp: dispatch ScrollHalfPageUp");
+                eval("window.scrollBy(0, -window.innerHeight * 0.5);".to_owned());
+            }
+            A::ScrollTop => {
+                tracing::debug!("firefox-cdp: dispatch ScrollTop");
+                eval("window.scrollTo(0, 0);".to_owned());
+            }
+            A::ScrollBottom => {
+                tracing::debug!("firefox-cdp: dispatch ScrollBottom");
+                eval("window.scrollTo(0, document.body.scrollHeight);".to_owned());
+            }
+
+            // ── Zoom ──────────────────────────────────────────────────────────
+            A::ZoomIn => self.zoom_in(),
+            A::ZoomOut => self.zoom_out(),
+            A::ZoomReset => self.zoom_reset(),
+
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "firefox-cdp: dispatch — action not handled by this backend (no-op)"
+                );
+            }
+        }
+    }
 }

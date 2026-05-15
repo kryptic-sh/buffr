@@ -53,8 +53,8 @@ use buffr_engine::{
 
 use super::error::WebView2Error;
 use super::input::{
-    neutral_click_to_wv2, neutral_key_to_wv2, neutral_leave_to_wv2, neutral_move_to_wv2,
-    neutral_scroll_to_wv2,
+    WebView2InputEvent, Wv2MouseEvent, Wv2MouseKind, neutral_click_to_wv2, neutral_key_to_wv2,
+    neutral_leave_to_wv2, neutral_move_to_wv2, neutral_scroll_to_wv2,
 };
 use super::worker::{Command, EngineState, WorkerHandle, spawn};
 
@@ -75,6 +75,9 @@ pub struct WebView2Engine {
     worker: WorkerHandle,
     /// Thread-safe tab snapshot. Updated by WebView2 event delegates.
     engine_state: Arc<Mutex<EngineState>>,
+    /// Last find query stored by `start_find`; re-used by `dispatch` for
+    /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
+    find_query: Mutex<Option<String>>,
 }
 
 impl WebView2Engine {
@@ -115,6 +118,7 @@ impl WebView2Engine {
             view,
             worker,
             engine_state,
+            find_query: Mutex::new(None),
         })
     }
 
@@ -403,12 +407,18 @@ impl BrowserEngine for WebView2Engine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("webview2: start_find — no-op in Phase B");
+    fn start_find(&self, query: &str, _forward: bool) {
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = Some(query.to_owned());
+        }
+        tracing::debug!("webview2: start_find — no native find API in Phase B (query stored)");
     }
 
     fn stop_find(&self) {
-        tracing::debug!("webview2: stop_find — no-op in Phase B");
+        if let Ok(mut g) = self.find_query.lock() {
+            *g = None;
+        }
+        tracing::debug!("webview2: stop_find");
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -521,5 +531,121 @@ impl BrowserEngine for WebView2Engine {
 
     fn cancel_hint(&self) {
         tracing::debug!("webview2: cancel_hint — no-op");
+    }
+
+    // ── Action dispatch ───────────────────────────────────────────────────────
+    //
+    // History/stop → existing GoBack/GoForward/Reload/Stop worker commands.
+    // Scroll → SendInput(WebView2InputEvent::Mouse(Wheel{delta})).
+    //   Windows WHEEL_DELTA = 120 per notch; we use 3 notches per STEP_PX unit.
+    // Zoom → existing zoom_* helpers.
+    // FindNext/FindPrev → debug-log (no native find API in Phase B).
+
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+
+        /// Pixels per scroll step (matches blink-cdp / CEF constant).
+        const STEP_PX: i32 = 40;
+        /// Win32 WHEEL_DELTA per notch. Negative = scroll down (away from user).
+        const WHEEL_DELTA: i32 = 120;
+
+        // Helper: send a vertical wheel event with `delta` (positive = up).
+        let wheel = |delta: i32| {
+            self.worker
+                .send(Command::SendInput(WebView2InputEvent::Mouse(
+                    Wv2MouseEvent {
+                        x: 0,
+                        y: 0,
+                        kind: Wv2MouseKind::Wheel { delta },
+                    },
+                )));
+        };
+
+        match action {
+            // ── Find ─────────────────────────────────────────────────────────
+            A::FindNext => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "webview2: dispatch FindNext — no native find API (no-op)");
+                } else {
+                    tracing::debug!("webview2: FindNext — no active find query");
+                }
+            }
+            A::FindPrev => {
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                if let Some(q) = query {
+                    tracing::debug!(query = %q, "webview2: dispatch FindPrev — no native find API (no-op)");
+                } else {
+                    tracing::debug!("webview2: FindPrev — no active find query");
+                }
+            }
+
+            // ── History / reload / stop ───────────────────────────────────────
+            A::HistoryBack => {
+                tracing::debug!("webview2: dispatch HistoryBack");
+                self.worker.send(Command::GoBack);
+            }
+            A::HistoryForward => {
+                tracing::debug!("webview2: dispatch HistoryForward");
+                self.worker.send(Command::GoForward);
+            }
+            A::Reload | A::ReloadHard => {
+                tracing::debug!("webview2: dispatch Reload");
+                self.worker.send(Command::Reload);
+            }
+            A::StopLoading => {
+                tracing::debug!("webview2: dispatch StopLoading");
+                self.worker.send(Command::Stop);
+            }
+
+            // ── Scroll via synthetic wheel event ──────────────────────────────
+            A::ScrollUp(n) => {
+                let delta = WHEEL_DELTA * (*n as i32) * STEP_PX / 40;
+                tracing::debug!(n, delta, "webview2: dispatch ScrollUp");
+                wheel(delta);
+            }
+            A::ScrollDown(n) => {
+                let delta = -(WHEEL_DELTA * (*n as i32) * STEP_PX / 40);
+                tracing::debug!(n, delta, "webview2: dispatch ScrollDown");
+                wheel(delta);
+            }
+            A::ScrollLeft(_) | A::ScrollRight(_) => {
+                tracing::debug!(action = ?action, "webview2: dispatch ScrollLeft/Right — no-op");
+            }
+            A::ScrollPageDown | A::ScrollFullPageDown => {
+                tracing::debug!("webview2: dispatch ScrollPageDown");
+                wheel(-(WHEEL_DELTA * 5));
+            }
+            A::ScrollPageUp | A::ScrollFullPageUp => {
+                tracing::debug!("webview2: dispatch ScrollPageUp");
+                wheel(WHEEL_DELTA * 5);
+            }
+            A::ScrollHalfPageDown => {
+                tracing::debug!("webview2: dispatch ScrollHalfPageDown");
+                wheel(-(WHEEL_DELTA * 3));
+            }
+            A::ScrollHalfPageUp => {
+                tracing::debug!("webview2: dispatch ScrollHalfPageUp");
+                wheel(WHEEL_DELTA * 3);
+            }
+            A::ScrollTop | A::ScrollBottom => {
+                tracing::debug!(
+                    action = ?action,
+                    "webview2: dispatch ScrollTop/Bottom — no-op (no absolute scroll without ExecuteScript)"
+                );
+            }
+
+            // ── Zoom ──────────────────────────────────────────────────────────
+            A::ZoomIn => self.zoom_in(),
+            A::ZoomOut => self.zoom_out(),
+            A::ZoomReset => self.zoom_reset(),
+
+            other => {
+                tracing::debug!(
+                    action = ?other,
+                    "webview2: dispatch — action not handled by this backend (no-op)"
+                );
+            }
+        }
     }
 }
