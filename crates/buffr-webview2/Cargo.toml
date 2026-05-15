@@ -14,3 +14,20 @@ publish = false
 buffr-engine.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows API bindings — feature set covers COM, WinRT, D3D11, DXGI, and
+# the Composition / Visual-layer APIs needed for composition-hosted WebView2.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+# WebView2 COM bindings generated from the official WebView2 SDK IDL.
+webview2-com = "0.39"
+webview2-com-sys = "0.39"
