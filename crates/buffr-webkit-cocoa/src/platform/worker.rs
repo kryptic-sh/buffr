@@ -47,6 +47,7 @@ pub(crate) mod macos {
     use std::thread;
     use std::time::Duration;
 
+    use buffr_core::hint::HintEventSink;
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
     use dispatch2::{DispatchQueue, DispatchTime};
@@ -182,6 +183,7 @@ pub(crate) mod macos {
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
+        hint_sink: HintEventSink,
     }
 
     impl RuntimeState {
@@ -189,6 +191,7 @@ pub(crate) mod macos {
             frame: SharedOsrFrame,
             view: SharedOsrViewState,
             engine_state: Arc<Mutex<EngineState>>,
+            hint_sink: HintEventSink,
         ) -> Self {
             RuntimeState {
                 tabs: Vec::new(),
@@ -197,6 +200,7 @@ pub(crate) mod macos {
                 frame,
                 view,
                 engine_state,
+                hint_sink,
             }
         }
 
@@ -247,7 +251,14 @@ pub(crate) mod macos {
             let id = self.next_id();
             let w = self.view.width.load(std::sync::atomic::Ordering::Relaxed);
             let h = self.view.height.load(std::sync::atomic::Ordering::Relaxed);
-            let entry = TabEntry::open(id, url, w, h, Arc::clone(&self.engine_state))?;
+            let entry = TabEntry::open(
+                id,
+                url,
+                w,
+                h,
+                Arc::clone(&self.engine_state),
+                Arc::clone(&self.hint_sink),
+            )?;
             self.tabs.push(entry);
             self.active_idx = Some(self.tabs.len() - 1);
             self.snapshot_to_engine_state();
@@ -763,6 +774,7 @@ pub(crate) mod macos {
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
+        hint_sink: HintEventSink,
     ) -> Result<WorkerHandle, WebKitCocoaError> {
         let (tx, rx) = mpsc::sync_channel::<Command>(64);
         let initial_url = initial_url.to_owned();
@@ -771,7 +783,7 @@ pub(crate) mod macos {
         // all closures that touch `rt` are dispatched via `dispatch_main_async`
         // and run exclusively on the serial GCD main queue.
         let rt: Arc<Mutex<MainQueueBox<RuntimeState>>> = Arc::new(Mutex::new(MainQueueBox(
-            RuntimeState::new(frame, view, Arc::clone(&engine_state)),
+            RuntimeState::new(frame, view, Arc::clone(&engine_state), hint_sink),
         )));
 
         // Submit the initial open_tab to the main queue.

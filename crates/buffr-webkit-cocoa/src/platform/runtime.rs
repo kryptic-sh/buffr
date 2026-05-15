@@ -87,17 +87,39 @@ pub(crate) mod macos {
 
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2::runtime::{NSObject, NSObjectProtocol};
-    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
+    use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
+    use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
     use objc2_foundation::{NSError, NSString, NSURL, NSURLRequest};
     use objc2_web_kit::{
-        WKNavigation, WKNavigationDelegate, WKUIDelegate, WKWebView, WKWebViewConfiguration,
+        WKNavigation, WKNavigationDelegate, WKScriptMessage, WKScriptMessageHandler, WKUIDelegate,
+        WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView,
+        WKWebViewConfiguration,
     };
 
+    use buffr_core::hint::{HintEventSink, parse_console_event};
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
     use super::super::error::WebKitCocoaError;
     use super::super::worker::EngineState;
+
+    // ── Console-bridge JS injected at document start ──────────────────────────
+    //
+    // Overrides console.log so that messages starting with the
+    // `__buffr_hint__:` sentinel are forwarded to the native handler
+    // `window.webkit.messageHandlers.buffrHint.postMessage(msg)`.
+    //
+    // This mirrors the webkitgtk approach (runtime.rs HINT_CONSOLE_BRIDGE_JS)
+    // and the CEF reference impl (host.rs sentinel scraping).
+    const HINT_CONSOLE_BRIDGE_JS: &str = r#"(function() {
+  var orig = console.log;
+  console.log = function() {
+    orig.apply(console, arguments);
+    var msg = arguments[0];
+    if (typeof msg === 'string' && msg.indexOf('__buffr_hint__:') === 0) {
+      try { window.webkit.messageHandlers.buffrHint.postMessage(msg); } catch(e) {}
+    }
+  };
+})();"#;
 
     // ── TabEntry ──────────────────────────────────────────────────────────────
 
@@ -114,6 +136,9 @@ pub(crate) mod macos {
         _nav_delegate: Retained<BuffrNavigationDelegate>,
         /// UI delegate — kept alive by strong ref here.
         _ui_delegate: Retained<BuffrUiDelegate>,
+        /// Hint script-message handler — kept alive by strong ref here.
+        /// `WKUserContentController` holds only a weak ref internally.
+        _hint_handler: Retained<BuffrHintMessageHandler>,
         pub url: String,
         pub title: String,
         pub is_loading: bool,
@@ -150,6 +175,7 @@ pub(crate) mod macos {
             width: u32,
             height: u32,
             state: Arc<Mutex<EngineState>>,
+            hint_sink: HintEventSink,
         ) -> Result<Self, WebKitCocoaError> {
             use objc2_core_foundation::CGRect;
 
@@ -163,6 +189,45 @@ pub(crate) mod macos {
             // init(this: Allocated<Self>) confirmed: WKWebViewConfiguration.rs:364-367.
             let config =
                 unsafe { WKWebViewConfiguration::init(WKWebViewConfiguration::alloc(mtm)) };
+
+            // ── Hint console bridge ───────────────────────────────────────────
+            //
+            // Get the default WKUserContentController from config and install:
+            //   1. A WKUserScript that wraps console.log (injected at document start).
+            //   2. A WKScriptMessageHandler named "buffrHint" that receives messages
+            //      when the JS sentinel `__buffr_hint__:` is detected.
+            //
+            // WKWebViewConfiguration::userContentController confirmed:
+            //   objc2-web-kit-0.3.2/src/generated/WKWebViewConfiguration.rs:143-145.
+            // WKUserContentController::addUserScript confirmed:
+            //   objc2-web-kit-0.3.2/src/generated/WKUserContentController.rs:44-50.
+            // WKUserContentController::addScriptMessageHandler_name confirmed:
+            //   objc2-web-kit-0.3.2/src/generated/WKUserContentController.rs:130-145.
+            let hint_handler = BuffrHintMessageHandler::new(mtm, hint_sink);
+            unsafe {
+                let ucm = config.userContentController();
+
+                // Inject the console.log bridge at document start, all frames.
+                // WKUserScript::initWithSource_injectionTime_forMainFrameOnly confirmed:
+                //   WKUserScript.rs:90-95.
+                let ns_bridge = NSString::from_str(HINT_CONSOLE_BRIDGE_JS);
+                let bridge_script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
+                    WKUserScript::alloc(mtm),
+                    &ns_bridge,
+                    WKUserScriptInjectionTime::AtDocumentStart,
+                    false, // inject into all frames
+                );
+                ucm.addUserScript(&bridge_script);
+
+                // Register the native message handler for "buffrHint".
+                // addScriptMessageHandler_name adds
+                //   window.webkit.messageHandlers.buffrHint.postMessage to all frames.
+                let handler_name = NSString::from_str("buffrHint");
+                ucm.addScriptMessageHandler_name(
+                    ProtocolObject::from_ref(&*hint_handler),
+                    &handler_name,
+                );
+            }
 
             // Off-screen rect. WKWebView does not need to be attached to a
             // visible window for snapshots to work.
@@ -218,6 +283,7 @@ pub(crate) mod macos {
                 web_view,
                 _nav_delegate: nav_delegate,
                 _ui_delegate: ui_delegate,
+                _hint_handler: hint_handler,
                 url: url.to_owned(),
                 title: String::new(),
                 is_loading: true,
@@ -612,6 +678,109 @@ pub(crate) mod macos {
     impl BuffrUiDelegate {
         fn new(mtm: MainThreadMarker) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(UiDelegateIvars);
+            unsafe { objc2::msg_send![super(this), init] }
+        }
+    }
+
+    // ── BuffrHintMessageHandler ───────────────────────────────────────────────
+    //
+    // Implements WKScriptMessageHandler to receive sentinel messages from the
+    // hint console bridge injected via HINT_CONSOLE_BRIDGE_JS.
+    //
+    // When the JS renderer emits `console.log("__buffr_hint__:<json>")`, the
+    // bridge calls `window.webkit.messageHandlers.buffrHint.postMessage(msg)`,
+    // which invokes `userContentController:didReceiveScriptMessage:` here.
+    //
+    // We parse the body (an NSString) via `buffr_core::hint::parse_console_event`
+    // and write the result into the one-slot `HintEventSink` (Arc<Mutex<Option>>).
+    // The engine polls it via `pump_hint_events()`.
+    //
+    // WKScriptMessageHandler protocol:
+    //   Confirmed: objc2-web-kit-0.3.2/src/generated/WKScriptMessageHandler.rs
+    //   Selector: userContentController:didReceiveScriptMessage:
+    //   Feature gate: WKScriptMessage + WKUserContentController
+    //
+    // WKScriptMessage::body() returns Retained<AnyObject> (NSString when JS
+    // posts a string). We downcast via Retained::downcast::<NSString>().
+    //   Confirmed: objc2-web-kit-0.3.2/src/generated/WKScriptMessage.rs:31-34.
+    //   Downcast API: objc2-0.6.4/src/rc/retained.rs:325.
+
+    /// Ivars stored inside `BuffrHintMessageHandler`.
+    pub struct HintMsgHandlerIvars {
+        sink: HintEventSink,
+    }
+
+    define_class!(
+        /// Script-message handler that receives hint sentinel messages from JS.
+        ///
+        /// MainThreadOnly because WKScriptMessageHandler callbacks arrive on
+        /// the main thread and WKScriptMessage is MainThreadOnly.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = HintMsgHandlerIvars]
+        #[name = "BuffrHintMessageHandler"]
+        pub struct BuffrHintMessageHandler;
+
+        unsafe impl NSObjectProtocol for BuffrHintMessageHandler {}
+
+        /// WKScriptMessageHandler — receive JS→native hint messages.
+        ///
+        /// Feature gate: WKScriptMessage + WKUserContentController required by
+        /// the binding at WKScriptMessageHandler.rs:15-16.
+        unsafe impl WKScriptMessageHandler for BuffrHintMessageHandler {
+            #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+            #[allow(non_snake_case)]
+            unsafe fn userContentController_didReceiveScriptMessage(
+                &self,
+                _controller: &WKUserContentController,
+                message: &WKScriptMessage,
+            ) {
+                use objc2::msg_send;
+
+                // body() returns Retained<AnyObject>. JS string posts arrive as
+                // NSString. We check with isKindOfClass: then cast unchecked.
+                // SAFETY: body() is a standard WKScriptMessage accessor; called
+                // on the main thread where WKScriptMessage is alive.
+                let body: Retained<AnyObject> = unsafe { message.body() };
+
+                // Check if body is an NSString using isKindOfClass:
+                // Confirmed: AnyObject::isKindOfClass: (objc2-0.6.4/src/runtime/mod.rs:1385).
+                let is_string: bool = unsafe {
+                    // Use NSString::class() to get the class pointer.
+                    // ClassType::class() confirmed: objc2 top_level_traits.rs.
+                    msg_send![&*body, isKindOfClass: NSString::class()]
+                };
+                if !is_string {
+                    tracing::debug!(
+                        "webkit-cocoa: buffrHint message body is not NSString (ignored)"
+                    );
+                    return;
+                }
+                // SAFETY: we verified isKindOfClass: NSString above.
+                let ns_str: Retained<NSString> = unsafe { Retained::cast_unchecked(body) };
+                let raw = ns_str.to_string();
+                match parse_console_event(&raw) {
+                    Some(Ok(event)) => {
+                        if let Ok(mut guard) = self.ivars().sink.lock() {
+                            *guard = Some(event);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, raw = raw.as_str(), "webkit-cocoa: malformed hint event");
+                    }
+                    None => {
+                        tracing::debug!(
+                            "webkit-cocoa: buffrHint message missing sentinel (ignored)"
+                        );
+                    }
+                }
+            }
+        }
+    );
+
+    impl BuffrHintMessageHandler {
+        fn new(mtm: MainThreadMarker, sink: HintEventSink) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(HintMsgHandlerIvars { sink });
             unsafe { objc2::msg_send![super(this), init] }
         }
     }

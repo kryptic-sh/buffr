@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::hint::HintEventSink;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitGtkError;
@@ -321,6 +322,9 @@ struct GtkRuntime {
     /// regardless of success or failure. Wrapped in `Rc<Cell<bool>>` so it
     /// can be shared into the `snapshot` callback closure without `Send`.
     snapshot_in_flight: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Forwarded from the engine so every new `WebView` can register the
+    /// `buffrHint` script-message handler and write events into it.
+    hint_sink: HintEventSink,
 }
 
 impl GtkRuntime {
@@ -328,6 +332,7 @@ impl GtkRuntime {
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
+        hint_sink: HintEventSink,
     ) -> Self {
         GtkRuntime {
             tabs: Vec::new(),
@@ -336,6 +341,7 @@ impl GtkRuntime {
             view,
             engine_state,
             snapshot_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
+            hint_sink,
         }
     }
 
@@ -368,6 +374,7 @@ impl GtkRuntime {
                 view: Arc::clone(&self.view),
                 snapshot_in_flight: std::rc::Rc::clone(&self.snapshot_in_flight),
             },
+            Arc::clone(&self.hint_sink),
         );
         self.tabs.push(entry);
         self.active_idx = Some(self.tabs.len() - 1);
@@ -865,6 +872,7 @@ pub(crate) fn spawn(
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
     engine_state: Arc<Mutex<EngineState>>,
+    hint_sink: HintEventSink,
 ) -> Result<WorkerHandle, WebKitGtkError> {
     // gtk4::init() must be called before any GTK widgets are created.
     // It is safe to call multiple times; subsequent calls are no-ops.
@@ -890,6 +898,7 @@ pub(crate) fn spawn(
                 Arc::clone(&frame),
                 Arc::clone(&view),
                 Arc::clone(&engine_state),
+                Arc::clone(&hint_sink),
             );
 
             // Open initial tab.

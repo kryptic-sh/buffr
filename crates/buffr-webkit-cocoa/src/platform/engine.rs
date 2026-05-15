@@ -40,6 +40,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use buffr_core::hint::{
+    DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintEventSink, HintSession,
+    build_inject_script, new_hint_event_sink, take_hint_event,
+};
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus,
     MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState,
@@ -101,6 +105,14 @@ pub struct WebKitCocoaEngine {
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     /// Available on all platforms so the struct layout is consistent.
     find_query: Mutex<Option<String>>,
+    // ── Hint mode (available on all platforms so the struct compiles on Linux) ─
+    /// Alphabet used to mint hint labels.
+    hint_alphabet: HintAlphabet,
+    /// Active hint session for the current tab.  `None` when not in hint mode.
+    hint_session: Mutex<Option<HintSession>>,
+    /// One-slot mailbox: the WKScriptMessageHandler writes a parsed
+    /// `HintConsoleEvent` each time the renderer emits the sentinel.
+    hint_sink: HintEventSink,
 }
 
 impl WebKitCocoaEngine {
@@ -114,6 +126,10 @@ impl WebKitCocoaEngine {
             v.height.store(height, Ordering::Relaxed);
             Arc::new(v)
         };
+
+        let hint_alphabet = HintAlphabet::from_str(buffr_core::hint::DEFAULT_HINT_ALPHABET)
+            .unwrap_or_else(|_| HintAlphabet::from_str("asdf").expect("fallback alphabet"));
+        let hint_sink = new_hint_event_sink();
 
         #[cfg(target_os = "macos")]
         {
@@ -147,6 +163,7 @@ impl WebKitCocoaEngine {
                 Arc::clone(&frame),
                 Arc::clone(&view),
                 Arc::clone(&engine_state),
+                Arc::clone(&hint_sink),
             )?;
 
             tracing::info!(
@@ -166,6 +183,9 @@ impl WebKitCocoaEngine {
                 favicon_updates,
                 osr_sleep,
                 find_query: Mutex::new(None),
+                hint_alphabet,
+                hint_session: Mutex::new(None),
+                hint_sink,
             });
         }
 
@@ -177,6 +197,9 @@ impl WebKitCocoaEngine {
             frame,
             view,
             find_query: Mutex::new(None),
+            hint_alphabet,
+            hint_session: Mutex::new(None),
+            hint_sink,
         })
     }
 
@@ -787,30 +810,125 @@ impl BrowserEngine for WebKitCocoaEngine {
     ) {
     }
 
-    // ── Hint mode stubs ───────────────────────────────────────────────────────
+    // ── Hint mode ─────────────────────────────────────────────────────────────
 
     fn is_hint_mode(&self) -> bool {
-        false
+        self.hint_session
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
     }
 
     fn hint_status(&self) -> Option<HintStatus> {
-        None
+        let g = self.hint_session.lock().ok()?;
+        let s = g.as_ref()?;
+        Some(HintStatus {
+            typed: s.typed.clone(),
+            match_count: s.match_count(),
+            background: s.background,
+        })
     }
 
     fn pump_hint_events(&self) -> bool {
-        false
+        let Some(event) = take_hint_event(&self.hint_sink) else {
+            return false;
+        };
+        match event {
+            HintConsoleEvent::Ready { hints, alphabet: _ } => {
+                let alphabet = self.hint_alphabet.clone();
+                if let Ok(mut g) = self.hint_session.lock()
+                    && let Some(existing) = g.as_mut()
+                {
+                    let background = existing.background;
+                    *existing = HintSession::new(alphabet, hints, background);
+                }
+                true
+            }
+            HintConsoleEvent::Error { message } => {
+                tracing::warn!(message, "webkit-cocoa: hint mode renderer error");
+                self.cancel_hint();
+                true
+            }
+        }
     }
 
-    fn feed_hint_key(&self, _c: char) -> Option<HintAction> {
-        None
+    fn feed_hint_key(&self, ch: char) -> Option<HintAction> {
+        let mut commit_id: Option<u32> = None;
+        let mut filter_typed: Option<String> = None;
+        let mut clear = false;
+        let mut cancel = false;
+
+        let action = {
+            let mut g = self.hint_session.lock().ok()?;
+            let session = g.as_mut()?;
+            let action = session.feed(ch);
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Click(id) | HintAction::OpenInBackground(id) => {
+                    commit_id = Some(*id);
+                    clear = true;
+                }
+                HintAction::Cancel => cancel = true,
+            }
+            action
+        };
+
+        if let Some(typed) = filter_typed {
+            let js = format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                serde_json::to_string(&typed).unwrap_or_else(|_| "\"\"".into())
+            );
+            let _ = self.run_js(&js);
+        }
+        if let Some(id) = commit_id {
+            let js = format!("if (window.__buffrHintCommit) window.__buffrHintCommit({id})");
+            let _ = self.run_js(&js);
+        }
+        if clear && let Ok(mut g) = self.hint_session.lock() {
+            *g = None;
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
     fn backspace_hint(&self) -> Option<HintAction> {
-        None
+        let mut filter_typed: Option<String> = None;
+        let mut cancel = false;
+
+        let action = {
+            let mut g = self.hint_session.lock().ok()?;
+            let session = g.as_mut()?;
+            let action = session.backspace();
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Cancel => cancel = true,
+                _ => {}
+            }
+            action
+        };
+
+        if let Some(typed) = filter_typed {
+            let js = format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                serde_json::to_string(&typed).unwrap_or_else(|_| "\"\"".into())
+            );
+            let _ = self.run_js(&js);
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
     fn cancel_hint(&self) {
-        tracing::debug!("webkit-cocoa: cancel_hint — no-op");
+        let _ = self.run_js("if (window.__buffrHintCancel) window.__buffrHintCancel()");
+        if let Ok(mut g) = self.hint_session.lock() {
+            *g = None;
+        }
     }
 
     // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
@@ -982,6 +1100,10 @@ impl BrowserEngine for WebKitCocoaEngine {
             A::ZoomOut => self.zoom_out(),
             A::ZoomReset => self.zoom_reset(),
 
+            // ── Hint mode ─────────────────────────────────────────────────────
+            A::EnterHintMode => self.enter_hint_mode(false),
+            A::EnterHintModeBackground => self.enter_hint_mode(true),
+
             other => {
                 tracing::debug!(
                     action = ?other,
@@ -989,6 +1111,29 @@ impl BrowserEngine for WebKitCocoaEngine {
                 );
             }
         }
+    }
+}
+
+// ── Hint mode helper ──────────────────────────────────────────────────────────
+
+impl WebKitCocoaEngine {
+    /// Inject hint.js into the active tab and initialise a `HintSession`.
+    fn enter_hint_mode(&self, background: bool) {
+        const LABEL_BUDGET: usize = 256;
+        let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
+        let alphabet_str = self.hint_alphabet.as_string();
+        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
+
+        let alphabet = self.hint_alphabet.clone();
+        if let Ok(mut g) = self.hint_session.lock() {
+            *g = Some(HintSession::new(alphabet, Vec::new(), background));
+        }
+        let _ = self.run_js(&script);
+        tracing::info!(
+            background,
+            label_budget = LABEL_BUDGET,
+            "webkit-cocoa: hint mode injected"
+        );
     }
 }
 

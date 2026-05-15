@@ -17,10 +17,30 @@ use std::sync::{Arc, Mutex};
 use webkit6::prelude::*;
 use webkit6::{LoadEvent, WebView};
 
+use buffr_core::hint::{HintEventSink, parse_console_event};
 use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId};
 
 use super::osr::request_snapshot;
 use super::worker::EngineState;
+
+// ── Console-bridge JS ─────────────────────────────────────────────────────────
+//
+// Injected at document start on every page. Overrides console.log to also
+// post messages beginning with the buffr hint sentinel to the native
+// `buffrHint` WKScriptMessageHandler (registered by TabEntry::new below).
+// The original console.log is still called so developer-tool logging is unaffected.
+const HINT_CONSOLE_BRIDGE_JS: &str = r#"
+(function() {
+  var orig = console.log;
+  console.log = function() {
+    orig.apply(console, arguments);
+    var msg = arguments[0];
+    if (typeof msg === 'string' && msg.indexOf('__buffr_hint__:') === 0) {
+      try { window.webkit.messageHandlers.buffrHint.postMessage(msg); } catch(e) {}
+    }
+  };
+})();
+"#;
 
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +64,9 @@ impl TabEntry {
     /// `osr` carries the frame/view/in_flight handles shared with the snapshot
     /// pipeline so that the `load-changed` signal can trigger a real pixel
     /// readback when a navigation completes.
+    ///
+    /// `hint_sink` is the one-slot mailbox into which the `buffrHint`
+    /// script-message handler writes parsed [`HintConsoleEvent`]s.
     pub(crate) fn new(
         id: TabId,
         url: &str,
@@ -51,14 +74,59 @@ impl TabEntry {
         _height: u32,
         engine_state: Arc<Mutex<EngineState>>,
         osr: OsrHandles,
+        hint_sink: HintEventSink,
     ) -> Self {
-        let web_view = WebView::new();
+        use webkit6::{
+            UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime,
+        };
+
+        // ── Build UserContentManager with hint bridge ─────────────────────────
+        //
+        // 1. Register the `buffrHint` native script-message handler.
+        // 2. Inject a console.log wrapper at document start that forwards
+        //    messages beginning with the buffr hint sentinel to that handler.
+        let ucm = UserContentManager::new();
+
+        // Inject console bridge script at document start on all frames.
+        let bridge_script = UserScript::new(
+            HINT_CONSOLE_BRIDGE_JS,
+            UserContentInjectedFrames::AllFrames,
+            UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        );
+        ucm.add_script(&bridge_script);
+
+        // Register the native handler name.
+        ucm.register_script_message_handler("buffrHint", None);
+
+        // Connect signal: parse and write into hint_sink.
+        let sink_clone = Arc::clone(&hint_sink);
+        ucm.connect_script_message_received(Some("buffrHint"), move |_ucm, js_value| {
+            let gstr = js_value.to_str();
+            let raw: &str = &gstr;
+            tracing::debug!(raw, "webkitgtk: buffrHint message received");
+            match parse_console_event(raw) {
+                Some(Ok(event)) => {
+                    if let Ok(mut guard) = sink_clone.lock() {
+                        *guard = Some(event);
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, raw, "webkitgtk: malformed hint event");
+                }
+                None => {
+                    tracing::debug!("webkitgtk: buffrHint message missing sentinel (ignored)");
+                }
+            }
+        });
+
+        // ── Create WebView with our UserContentManager ────────────────────────
+        let web_view = WebView::builder().user_content_manager(&ucm).build();
 
         // ── Enable developer extras (required for WebInspector::show) ─────────
-        {
-            if let Some(settings) = webkit6::prelude::WebViewExt::settings(&web_view) {
-                settings.set_enable_developer_extras(true);
-            }
+        if let Some(settings) = webkit6::prelude::WebViewExt::settings(&web_view) {
+            settings.set_enable_developer_extras(true);
         }
 
         // ── load-changed signal ──────────────────────────────────────────────
