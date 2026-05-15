@@ -464,11 +464,26 @@ pub(crate) fn spawn(
         .name("buffr-blitz-worker".into())
         .spawn(move || {
             tracing::info!("blitz worker: starting");
-            let mut worker = Worker::new(Arc::clone(&frame), Arc::clone(&view), width, height);
-            if let Err(e) = worker.open_tab(&initial_url) {
-                tracing::error!("blitz worker: failed to open initial tab: {e}");
+            // Catch worker panics so the failure surfaces as a log line
+            // instead of a silent channel disconnect — otherwise the
+            // engine side sees `Disconnected` and reports a misleading
+            // "worker timeout" via recv_timeout's error mapping.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut worker = Worker::new(Arc::clone(&frame), Arc::clone(&view), width, height);
+                if let Err(e) = worker.open_tab(&initial_url) {
+                    tracing::error!("blitz worker: failed to open initial tab: {e}");
+                }
+                worker.run(rx);
+            }));
+            if let Err(payload) = result {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                tracing::error!("blitz worker: panicked: {msg}");
+                eprintln!("blitz worker thread panic: {msg}");
             }
-            worker.run(rx);
         })
         .map_err(|e| BlitzError::InitFailed(e.to_string()))?;
 
