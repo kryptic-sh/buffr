@@ -10,16 +10,27 @@
 //! instances are owned by `GtkRuntime` which itself runs exclusively on the
 //! dedicated GTK thread.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use webkit6::prelude::*;
 use webkit6::{LoadEvent, WebView};
 
-use buffr_engine::TabId;
+use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
+use super::osr::request_snapshot;
 use super::worker::EngineState;
 
 // ── TabEntry ──────────────────────────────────────────────────────────────────
+
+/// OSR handles passed to `TabEntry::new` so that navigation signals can
+/// trigger a real pixel snapshot without exceeding the 7-argument limit.
+pub(crate) struct OsrHandles {
+    pub frame: SharedOsrFrame,
+    pub view: SharedOsrViewState,
+    pub snapshot_in_flight: Rc<Cell<bool>>,
+}
 
 /// One open browser tab. Owns a `WebView` and its signal handler IDs.
 pub(crate) struct TabEntry {
@@ -29,18 +40,26 @@ pub(crate) struct TabEntry {
 
 impl TabEntry {
     /// Create a new WebView, connect signals, and load `url`.
+    ///
+    /// `osr` carries the frame/view/in_flight handles shared with the snapshot
+    /// pipeline so that the `load-changed` signal can trigger a real pixel
+    /// readback when a navigation completes.
     pub(crate) fn new(
         id: TabId,
         url: &str,
         _width: u32,
         _height: u32,
         engine_state: Arc<Mutex<EngineState>>,
+        osr: OsrHandles,
     ) -> Self {
         let web_view = WebView::new();
 
         // ── load-changed signal ──────────────────────────────────────────────
         {
             let st = Arc::clone(&engine_state);
+            let frame_lc = Arc::clone(&osr.frame);
+            let view_lc = Arc::clone(&osr.view);
+            let in_flight_lc = Rc::clone(&osr.snapshot_in_flight);
             web_view.connect_load_changed(move |wv, event| {
                 let url = wv.uri().map(|s| s.to_string()).unwrap_or_default();
                 let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
@@ -53,6 +72,15 @@ impl TabEntry {
                     tab.is_loading = is_loading;
                     tab.can_go_back = wv.can_go_back();
                     tab.can_go_forward = wv.can_go_forward();
+                }
+                // Trigger a snapshot on navigation complete.
+                if matches!(event, LoadEvent::Finished) {
+                    request_snapshot(
+                        wv,
+                        Arc::clone(&frame_lc),
+                        Arc::clone(&view_lc),
+                        Rc::clone(&in_flight_lc),
+                    );
                 }
             });
         }
