@@ -1,0 +1,16 @@
+[package]
+name = "buffr-webkit-cocoa"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "WebKit Cocoa (macOS) backend for buffr-engine"
+publish = false
+
+[dependencies]
+buffr-engine.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

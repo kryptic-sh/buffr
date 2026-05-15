@@ -521,6 +521,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffr-blitz"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "buffr-bookmarks"
 version = "0.1.2"
 dependencies = [
@@ -652,6 +661,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffr-firefox-cdp"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "buffr-helper"
 version = "0.12.0"
 dependencies = [
@@ -668,6 +686,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "buffr-ladybird"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -698,6 +725,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffr-servo"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "buffr-ui"
 version = "0.2.2"
 dependencies = [
@@ -715,6 +751,33 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hjkl-bonsai",
+ "tracing",
+]
+
+[[package]]
+name = "buffr-webkit-cocoa"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "buffr-webkitgtk"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "buffr-webview2"
+version = "0.1.0"
+dependencies = [
+ "buffr-engine",
+ "thiserror 2.0.18",
  "tracing",
 ]
 

@@ -4,6 +4,13 @@ members = [
     "crates/buffr-engine",
     "crates/buffr-cef",
     "crates/buffr-blink-cdp",
+    "crates/buffr-blitz",
+    "crates/buffr-firefox-cdp",
+    "crates/buffr-ladybird",
+    "crates/buffr-servo",
+    "crates/buffr-webkit-cocoa",
+    "crates/buffr-webkitgtk",
+    "crates/buffr-webview2",
     "crates/buffr-core",
     "crates/buffr-modal",
     "crates/buffr-ui",
@@ -94,6 +101,13 @@ semver = { version = "1", features = ["serde"] }
 buffr-engine = "0.1"
 buffr-cef = "0.1"
 buffr-blink-cdp = "0.1"
+buffr-blitz = { path = "crates/buffr-blitz" }
+buffr-firefox-cdp = { path = "crates/buffr-firefox-cdp" }
+buffr-ladybird = { path = "crates/buffr-ladybird" }
+buffr-servo = { path = "crates/buffr-servo" }
+buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
+buffr-webkitgtk = { path = "crates/buffr-webkitgtk" }
+buffr-webview2 = { path = "crates/buffr-webview2" }
 buffr-core = "0.7"
 buffr-modal = "0.1"
 buffr-ui = "0.2"
