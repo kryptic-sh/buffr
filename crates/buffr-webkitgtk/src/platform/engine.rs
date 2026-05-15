@@ -37,7 +37,7 @@
 //! Input synthesis (key/mouse events) is logged but not yet dispatched to the
 //! WebView — see `input.rs` TODO markers.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_engine::{
@@ -74,6 +74,9 @@ pub struct WebKitGtkEngine {
     worker: WorkerHandle,
     /// Thread-safe tab snapshot. Updated by WebView signal handlers.
     engine_state: Arc<Mutex<EngineState>>,
+    /// Cached "any tab playing audio?" flag.  Written by the 500 ms GTK-thread
+    /// poll tick; read from any thread by `any_audio_active()`.
+    audio_active: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     find_query: std::sync::Mutex<Option<(String, bool)>>,
@@ -92,6 +95,13 @@ impl WebKitGtkEngine {
         };
 
         let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
+
+        // Clone the Arc<AtomicBool> from inside EngineState so the engine can
+        // read the audio flag from any thread without locking the Mutex.
+        let audio_active = engine_state
+            .lock()
+            .map(|g| Arc::clone(&g.audio_active))
+            .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
 
         let worker = spawn(
             options.initial_url,
@@ -114,6 +124,7 @@ impl WebKitGtkEngine {
             view,
             worker,
             engine_state,
+            audio_active,
             find_query: std::sync::Mutex::new(None),
         })
     }
@@ -481,7 +492,7 @@ impl BrowserEngine for WebKitGtkEngine {
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
-        false
+        self.audio_active.load(Ordering::Relaxed)
     }
 
     fn any_video_active(&self) -> bool {

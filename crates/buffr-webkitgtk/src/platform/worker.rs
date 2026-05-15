@@ -20,6 +20,7 @@
 //! `timeout_add_local` (not `idle_add`) avoids the `Send` bound since the
 //! closure runs on the same thread that installed it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -50,6 +51,13 @@ pub(crate) struct EngineState {
     pub width: u32,
     /// Current viewport height (pixels).
     pub height: u32,
+    /// Cached result of the 500 ms audio-activity poll.
+    ///
+    /// Written by `glib::timeout_add_local` on the GTK thread; read from any
+    /// thread by `BrowserEngine::any_audio_active`.  `Relaxed` ordering is
+    /// sufficient — no synchronisation is required between the writer and the
+    /// reader.
+    pub audio_active: Arc<AtomicBool>,
 }
 
 impl EngineState {
@@ -60,6 +68,7 @@ impl EngineState {
             next_id: 1,
             width,
             height,
+            audio_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -730,6 +739,25 @@ pub(crate) fn spawn(
                 glib::timeout_add_local(Duration::from_millis(250), move || {
                     let rt = rt_rc_snap.borrow();
                     rt.paint();
+                    glib::ControlFlow::Continue
+                });
+            }
+
+            // ── Audio-activity poll tick (500 ms) ─────────────────────────
+            //
+            // Walks all open WebViews on the GTK thread and checks
+            // `WebViewExt::is_playing_audio()`.  The ORed result is stored in
+            // `EngineState::audio_active` (an `Arc<AtomicBool>`) so the engine
+            // thread can read it from any thread without blocking.
+            {
+                let rt_rc_audio = Rc::clone(&runtime_rc);
+                glib::timeout_add_local(Duration::from_millis(500), move || {
+                    use webkit6::prelude::WebViewExt;
+                    let rt = rt_rc_audio.borrow();
+                    let any_audio = rt.tabs.iter().any(|t| t.web_view.is_playing_audio());
+                    if let Ok(st) = rt.engine_state.lock() {
+                        st.audio_active.store(any_audio, Ordering::Relaxed);
+                    }
                     glib::ControlFlow::Continue
                 });
             }

@@ -42,13 +42,14 @@ pub(crate) use macos::*;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
-    use dispatch2::DispatchQueue;
+    use dispatch2::{DispatchQueue, DispatchTime};
 
     use super::super::error::WebKitCocoaError;
     use super::super::runtime::macos::{TabEntry, TabState};
@@ -62,6 +63,13 @@ pub(crate) mod macos {
         pub tabs: Vec<TabState>,
         /// Index of the active tab.
         pub active_idx: Option<usize>,
+        /// Cached result of the 500 ms audio-activity poll.
+        ///
+        /// Written by `dispatch_main_async` on the GCD main queue; read from
+        /// any thread by `BrowserEngine::any_audio_active`.  `Relaxed` ordering
+        /// is sufficient — no synchronisation is required between writer and
+        /// reader.
+        pub audio_active: Arc<AtomicBool>,
     }
 
     impl EngineState {
@@ -69,6 +77,7 @@ pub(crate) mod macos {
             EngineState {
                 tabs: Vec::new(),
                 active_idx: None,
+                audio_active: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -557,6 +566,52 @@ pub(crate) mod macos {
                     }
                 }
             });
+        }
+
+        // ── Audio-activity poll (500 ms recurring, main-queue) ────────────────
+        //
+        // WKWebView::isPlayingAudio must be called on the main thread.  We use a
+        // self-rescheduling `dispatch_main_async` + `after` pattern: each tick
+        // reads all tabs, ORs `isPlayingAudio`, stores the result in the atomic,
+        // then schedules the next tick.
+        {
+            let rt_audio = Arc::clone(&rt);
+            let audio_flag = Arc::clone(
+                &engine_state
+                    .lock()
+                    .map(|g| Arc::clone(&g.audio_active))
+                    .unwrap_or_else(|_| Arc::new(AtomicBool::new(false))),
+            );
+
+            // Recursive tick function, expressed as a plain function rather than
+            // a Fn closure to keep the capture set simple.
+            fn schedule_audio_tick(
+                rt: Arc<Mutex<MainQueueBox<RuntimeState>>>,
+                audio_flag: Arc<AtomicBool>,
+            ) {
+                let when =
+                    DispatchTime::try_from(Duration::from_millis(500)).unwrap_or(DispatchTime::NOW);
+                let _ = DispatchQueue::main().after(when, move || {
+                    // Poll all WKWebView instances on the main queue.
+                    let any_audio = rt.lock().is_ok_and(|guard| {
+                        use objc2::msg_send;
+                        guard.0.tabs.iter().any(|tab| {
+                            // SAFETY: `isPlayingAudio` is a read-only selector on
+                            // WKWebView that only inspects internal media engine
+                            // state.  It is safe to call from the GCD main queue
+                            // as long as the WKWebView is alive, which is
+                            // guaranteed here because `TabEntry` holds a strong
+                            // `Retained<WKWebView>` reference.
+                            unsafe { msg_send![&*tab.web_view, isPlayingAudio] }
+                        })
+                    });
+                    audio_flag.store(any_audio, Ordering::Relaxed);
+                    // Re-schedule the next tick.
+                    schedule_audio_tick(rt, audio_flag);
+                });
+            }
+
+            schedule_audio_tick(rt_audio, audio_flag);
         }
 
         // Spawn the worker thread.

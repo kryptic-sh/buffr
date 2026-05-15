@@ -37,7 +37,7 @@
 //!
 //! popup, hint, find, zoom, downloads, devtools, scheme, edit, clipboard.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_engine::{
@@ -77,6 +77,10 @@ pub struct WebKitCocoaEngine {
     /// Thread-safe tab snapshot. Updated by delegate callbacks on the main queue.
     #[cfg(target_os = "macos")]
     engine_state: Arc<Mutex<EngineState>>,
+    /// Cached "any tab playing audio?" flag.  Written by the 500 ms GCD main-
+    /// queue poll; read from any thread by `any_audio_active()`.
+    #[cfg(target_os = "macos")]
+    audio_active: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     /// Available on all platforms so the struct layout is consistent.
@@ -99,6 +103,13 @@ impl WebKitCocoaEngine {
         {
             let engine_state = Arc::new(Mutex::new(EngineState::new()));
 
+            // Clone the Arc<AtomicBool> from inside EngineState so the engine
+            // can read the audio flag from any thread without locking the Mutex.
+            let audio_active = engine_state
+                .lock()
+                .map(|g| Arc::clone(&g.audio_active))
+                .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+
             let worker = super::worker::macos::spawn(
                 options.initial_url,
                 width,
@@ -120,6 +131,7 @@ impl WebKitCocoaEngine {
                 view,
                 worker,
                 engine_state,
+                audio_active,
                 find_query: Mutex::new(None),
             });
         }
@@ -563,6 +575,10 @@ impl BrowserEngine for WebKitCocoaEngine {
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.audio_active.load(Ordering::Relaxed);
+
+        #[cfg(not(target_os = "macos"))]
         false
     }
 
