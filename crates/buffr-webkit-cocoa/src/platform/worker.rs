@@ -175,6 +175,7 @@ pub(crate) mod macos {
                         is_loading: t.is_loading,
                         can_go_back: t.can_go_back(),
                         can_go_forward: t.can_go_forward(),
+                        zoom: t.zoom,
                     })
                     .collect();
                 st.active_idx = self.active_idx;
@@ -377,6 +378,18 @@ pub(crate) mod macos {
                 .and_then(|i| self.tabs.get(i))
                 .is_some_and(|t| t.can_go_forward())
         }
+
+        /// Apply a zoom level to the active tab's WKWebView and snapshot the
+        /// updated TabState into EngineState so `active_zoom_level()` can read
+        /// it from any thread without a main-queue round-trip.
+        fn set_zoom(&mut self, level: f64) {
+            if let Some(idx) = self.active_idx {
+                if let Some(tab) = self.tabs.get_mut(idx) {
+                    tab.set_zoom(level);
+                    self.snapshot_to_engine_state();
+                }
+            }
+        }
     }
 
     // ── Commands ──────────────────────────────────────────────────────────────
@@ -438,6 +451,12 @@ pub(crate) mod macos {
         QueryCanGoForward {
             reply: mpsc::SyncSender<bool>,
         },
+        /// Set the active tab's page zoom level. Clamped to [0.25, 5.0].
+        ///
+        /// Dispatched to the GCD main queue and calls
+        /// `WKWebView::setPageZoom` (macOS 11+).
+        /// Source: objc2-web-kit-0.3.2/src/generated/WKWebView.rs:809-811.
+        SetZoom(f64),
         Shutdown,
     }
 
@@ -720,6 +739,14 @@ pub(crate) mod macos {
                 dispatch_main_async(move || {
                     if let Ok(r) = rt2.lock() {
                         r.0.dispatch_mouse_wheel(x, y, delta_x, delta_y, modifiers);
+                    }
+                });
+            }
+            Command::SetZoom(level) => {
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.0.set_zoom(level);
                     }
                 });
             }

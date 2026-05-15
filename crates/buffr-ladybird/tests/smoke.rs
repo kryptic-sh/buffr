@@ -129,3 +129,36 @@ fn backend_id_is_ladybird() {
     let backend = LadybirdBackend::new();
     assert_eq!(backend.id(), "ladybird");
 }
+
+#[test]
+fn zoom_default_is_one() {
+    let engine = open_engine("about:blank");
+    assert!(
+        (engine.active_zoom_level() - 1.0).abs() < f64::EPSILON,
+        "initial zoom must be 1.0, got {}",
+        engine.active_zoom_level()
+    );
+}
+
+#[test]
+fn zoom_in_raises_level() {
+    let engine = open_engine("about:blank");
+    engine.zoom_in();
+    let after = engine.active_zoom_level();
+    assert!(
+        after > 1.0,
+        "zoom_in must raise zoom above 1.0, got {after}"
+    );
+}
+
+#[test]
+fn zoom_reset_restores_one() {
+    let engine = open_engine("about:blank");
+    engine.zoom_in();
+    engine.zoom_reset();
+    let after = engine.active_zoom_level();
+    assert!(
+        (after - 1.0).abs() < f64::EPSILON,
+        "zoom_reset must restore 1.0, got {after}"
+    );
+}

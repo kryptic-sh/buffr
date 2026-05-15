@@ -115,6 +115,10 @@ pub(crate) struct TabInfo {
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub progress: f64,
+    /// Current zoom level. Updated from the STA thread after every
+    /// `ICoreWebView2Controller::SetZoomFactor(...)` call; read by
+    /// `active_zoom_level()` without blocking the STA thread.
+    pub zoom: f64,
 }
 
 impl TabInfo {
@@ -158,6 +162,15 @@ pub(crate) enum Command {
     GoForward,
     Reload,
     Stop,
+    /// Set the active tab's zoom level.
+    ///
+    /// On Windows: calls `ICoreWebView2Controller::SetZoomFactor(clamped)` and
+    /// mirrors the clamped value into the shared `EngineState` so that
+    /// `active_zoom_level()` reads it without round-tripping the STA thread.
+    ///
+    /// Source: webview2-com-sys-0.39.1/src/bindings.rs — `ICoreWebView2Controller`
+    /// exposes `pub unsafe fn SetZoomFactor(&self, zoomfactor: f64)`.
+    SetZoom(f64),
     Resize {
         width: u32,
         height: u32,
@@ -343,6 +356,36 @@ impl StaRuntime {
         }
     }
 
+    fn set_zoom(&mut self, level: f64) {
+        let clamped = level.clamp(0.25, 5.0);
+        let Some(active_idx) = self.active_idx else {
+            return;
+        };
+        let id = self.tabs[active_idx].id;
+
+        // On Windows: call ICoreWebView2Controller::SetZoomFactor.
+        // Source: webview2-com-sys-0.39.1/src/bindings.rs
+        //   `pub unsafe fn SetZoomFactor(&self, zoomfactor: f64) -> windows_core::Result<()>`
+        // The controller field is held directly on TabEntry.
+        #[cfg(target_os = "windows")]
+        {
+            // SAFETY: SetZoomFactor is a COM method on a valid controller
+            // pointer owned by the STA thread. The STA thread is the only
+            // consumer of these COM objects.
+            if let Err(e) = unsafe { self.tabs[active_idx].controller.SetZoomFactor(clamped) } {
+                tracing::warn!("webview2: SetZoomFactor({clamped}) failed: {e}");
+            }
+        }
+
+        // Mirror the clamped value into EngineState so active_zoom_level()
+        // reads it without blocking the STA thread.
+        if let Ok(mut guard) = self.engine_state.lock()
+            && let Some(t) = guard.tabs.iter_mut().find(|t| t.id == id)
+        {
+            t.zoom = clamped;
+        }
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         {
             let mut st = self.engine_state.lock().unwrap();
@@ -426,6 +469,9 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
         }
         Command::Stop => {
             rt.stop();
+        }
+        Command::SetZoom(level) => {
+            rt.set_zoom(level);
         }
         Command::Resize { width, height } => {
             rt.resize(width, height);

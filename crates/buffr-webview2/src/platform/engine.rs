@@ -412,7 +412,30 @@ impl BrowserEngine for WebView2Engine {
     }
 
     fn active_zoom_level(&self) -> f64 {
+        // Read from the EngineState cache; no STA round-trip needed.
+        // The cache is updated by `Command::SetZoom` on the STA thread after
+        // every `ICoreWebView2Controller::SetZoomFactor` call.
+        if let Ok(guard) = self.engine_state.lock()
+            && let Some(idx) = guard.active_idx
+            && let Some(tab) = guard.tabs.get(idx)
+        {
+            return tab.zoom;
+        }
         1.0
+    }
+
+    fn zoom_in(&self) {
+        let next = (self.active_zoom_level() + 0.1).min(5.0);
+        self.worker.send(Command::SetZoom(next));
+    }
+
+    fn zoom_out(&self) {
+        let next = (self.active_zoom_level() - 0.1).max(0.25);
+        self.worker.send(Command::SetZoom(next));
+    }
+
+    fn zoom_reset(&self) {
+        self.worker.send(Command::SetZoom(1.0));
     }
 
     // ── Audio / video ────────────────────────────────────────────────────────

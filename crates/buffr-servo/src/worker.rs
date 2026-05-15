@@ -141,6 +141,18 @@ pub(crate) enum Command {
     QueryTabs {
         reply: mpsc::SyncSender<TabsSnapshot>,
     },
+    /// Set the active tab's page zoom level. Clamped to [0.25, 5.0].
+    ///
+    /// Calls `WebView::set_page_zoom(f32)` on the Servo WebView.
+    /// Source: servo-0.1.0/webview.rs:553-558
+    ///   `pub fn set_page_zoom(&self, new_zoom: f32)`
+    SetZoom(f64),
+    /// Query the active tab's current page zoom level.
+    ///
+    /// Reads `WebView::page_zoom() -> f32` from Servo.
+    /// Source: servo-0.1.0/webview.rs:561-563
+    ///   `pub fn page_zoom(&self) -> f32`
+    QueryActiveZoom { reply: mpsc::SyncSender<f64> },
     /// Shut down the worker.
     Shutdown,
 }
@@ -458,6 +470,29 @@ impl Worker {
         }
     }
 
+    // ── Zoom ──────────────────────────────────────────────────────────────────
+
+    /// Set the active tab's page zoom level, clamped to [0.25, 5.0].
+    ///
+    /// Calls `WebView::set_page_zoom(f32)`.
+    /// Source: servo-0.1.0/webview.rs:553-558
+    fn set_zoom(&self, level: f64) {
+        let clamped = level.clamp(0.25, 5.0);
+        if let Some(wv) = self.active_webview() {
+            wv.set_page_zoom(clamped as f32);
+        }
+    }
+
+    /// Read the active tab's current page zoom level.
+    ///
+    /// Calls `WebView::page_zoom() -> f32`.
+    /// Source: servo-0.1.0/webview.rs:561-563
+    fn query_active_zoom(&self) -> f64 {
+        self.active_webview()
+            .map(|wv| wv.page_zoom() as f64)
+            .unwrap_or(1.0)
+    }
+
     fn build_snapshot(&self) -> TabsSnapshot {
         let tabs: Vec<ServoTab> = self
             .tabs
@@ -552,6 +587,12 @@ impl Worker {
             }
             Command::QueryTabs { reply } => {
                 let _ = reply.send(self.build_snapshot());
+            }
+            Command::SetZoom(level) => {
+                self.set_zoom(level);
+            }
+            Command::QueryActiveZoom { reply } => {
+                let _ = reply.send(self.query_active_zoom());
             }
             Command::Shutdown => {
                 return true;

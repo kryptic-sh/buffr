@@ -93,5 +93,16 @@ pub(crate) mod bridge {
         ///
         /// `(x, y)`: cursor position; `(dx, dy)`: wheel deltas in CSS pixels.
         fn webcontent_send_scroll(wc: Pin<&mut WebContent>, x: i32, y: i32, dx: f64, dy: f64);
+
+        // ── Zoom ──────────────────────────────────────────────────────────────
+
+        /// Set the page zoom level.
+        ///
+        /// Phase B: stored in `WebContent::m_zoom` with no rendering effect.
+        /// Phase C: maps to LibWeb `Page::set_zoom_level` via WebContent IPC.
+        fn webcontent_set_zoom(wc: Pin<&mut WebContent>, zoom: f64);
+
+        /// Read back the current page zoom level.
+        fn webcontent_zoom(wc: &WebContent) -> f64;
     }
 }

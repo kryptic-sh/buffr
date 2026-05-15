@@ -143,6 +143,19 @@ void WebContent::send_scroll(int32_t x, int32_t y, double dx, double dy)
     (void)x; (void)y; (void)dx; (void)dy;
 }
 
+void WebContent::set_zoom(double zoom)
+{
+    // Phase B: store the zoom level in m_zoom. No render effect.
+    // Phase C: send SetZoomLevel IPC message to WebContentServer (maps to
+    //          LibWeb `Page::set_zoom_level`).
+    m_zoom = zoom;
+}
+
+double WebContent::zoom() const
+{
+    return m_zoom;
+}
+
 // ── Free-function entry points (called from cxx bridge) ─────────────────────
 
 ::std::unique_ptr<WebContent> webcontent_new(rust::Str initial_url, uint32_t width, uint32_t height)
@@ -190,6 +203,9 @@ void webcontent_send_scroll(WebContent& wc, int32_t x, int32_t y, double dx, dou
 {
     wc.send_scroll(x, y, dx, dy);
 }
+
+void webcontent_set_zoom(WebContent& wc, double zoom) { wc.set_zoom(zoom); }
+double webcontent_zoom(const WebContent& wc)          { return wc.zoom(); }
 
 } // namespace ladybird
 } // namespace buffr

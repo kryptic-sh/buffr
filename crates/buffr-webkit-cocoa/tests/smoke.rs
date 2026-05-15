@@ -75,6 +75,32 @@ fn open_engine_returns_macos_only_error() {
     );
 }
 
+/// On non-macOS, verify the zoom API stubs compile cleanly.
+/// (No engine to open on non-macOS; we just verify the backend rejects.)
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn zoom_stub_compiles_on_non_macos() {
+    let backend = WebKitCocoaBackend::new();
+    let opts = BackendOpenOptions {
+        engine_id: EngineId::new("zoom-stub"),
+        initial_url: "about:blank",
+        initial_size: (800, 600),
+        data_dir: None,
+        cache_dir: None,
+        frame_rate: 60,
+        device_scale: 1.0,
+        private: false,
+        download_dir: None,
+        downloads: None,
+        notice_queue: None,
+        find_sink: None,
+        sinks: Box::new(()),
+    };
+    let result = backend.open_engine(opts);
+    // Stub must return Err — zoom methods are unreachable but must compile.
+    assert!(result.is_err(), "stub must return Err on non-macOS");
+}
+
 /// On non-macOS, `initialize` must also return an error.
 #[cfg(not(target_os = "macos"))]
 #[test]

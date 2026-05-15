@@ -473,7 +473,40 @@ impl BrowserEngine for WebKitCocoaEngine {
     }
 
     fn active_zoom_level(&self) -> f64 {
+        // Read from EngineState cache — no main-queue round-trip needed.
+        // The cache is refreshed by `RuntimeState::snapshot_to_engine_state()`
+        // after every `Command::SetZoom` dispatch.
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(guard) = self.engine_state.lock()
+                && let Some(idx) = guard.active_idx
+                && let Some(tab) = guard.tabs.get(idx)
+            {
+                return tab.zoom;
+            }
+        }
         1.0
+    }
+
+    fn zoom_in(&self) {
+        let next = (self.active_zoom_level() + 0.1).min(5.0);
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::SetZoom(next));
+        #[cfg(not(target_os = "macos"))]
+        let _ = next;
+    }
+
+    fn zoom_out(&self) {
+        let next = (self.active_zoom_level() - 0.1).max(0.25);
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::SetZoom(next));
+        #[cfg(not(target_os = "macos"))]
+        let _ = next;
+    }
+
+    fn zoom_reset(&self) {
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::SetZoom(1.0));
     }
 
     // ── Audio / video ────────────────────────────────────────────────────────

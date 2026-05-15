@@ -117,6 +117,10 @@ pub(crate) mod macos {
         pub url: String,
         pub title: String,
         pub is_loading: bool,
+        /// Current zoom level applied to this tab's WKWebView.
+        /// Updated by `set_zoom`; mirrored into `TabState` by
+        /// `RuntimeState::snapshot_to_engine_state()`.
+        pub zoom: f64,
     }
 
     impl TabEntry {
@@ -217,6 +221,7 @@ pub(crate) mod macos {
                 url: url.to_owned(),
                 title: String::new(),
                 is_loading: true,
+                zoom: 1.0,
             })
         }
 
@@ -310,6 +315,24 @@ pub(crate) mod macos {
         /// `WKWebView::canGoForward` confirmed: WKWebView.rs:453-456.
         pub(crate) fn can_go_forward(&self) -> bool {
             unsafe { self.web_view.canGoForward() }
+        }
+
+        /// Set the page zoom factor on the WKWebView.
+        ///
+        /// API: `WKWebView::setPageZoom` (macOS 11+).
+        /// Source: objc2-web-kit-0.3.2/src/generated/WKWebView.rs:809-811
+        ///   `#[unsafe(method(setPageZoom:))]`
+        ///   `pub unsafe fn setPageZoom(&self, page_zoom: CGFloat)`
+        ///
+        /// The companion read accessor `pageZoom()` returns the same value.
+        pub(crate) fn set_zoom(&mut self, level: f64) {
+            let clamped = level.clamp(0.25, 5.0);
+            // SAFETY: setPageZoom is a standard WKWebView ObjC method (macOS 11+).
+            // Called exclusively on the GCD main queue.
+            unsafe {
+                self.web_view.setPageZoom(clamped);
+            }
+            self.zoom = clamped;
         }
 
         /// Request an OSR snapshot of this tab and write BGRA into `frame`.
@@ -591,5 +614,10 @@ pub(crate) mod macos {
         pub is_loading: bool,
         pub can_go_back: bool,
         pub can_go_forward: bool,
+        /// Current zoom level mirrored from the main-thread `TabEntry` after
+        /// every `WKWebView::setPageZoom` call.
+        /// Source: objc2-web-kit-0.3.2/src/generated/WKWebView.rs
+        ///   `pub unsafe fn setPageZoom(&self, page_zoom: CGFloat)` / `pageZoom()`
+        pub zoom: f64,
     }
 }

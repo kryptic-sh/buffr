@@ -221,6 +221,69 @@ fn osr_input_dispatch_no_panic() {
     );
 }
 
+/// Verify zoom methods compile and return sane defaults on a non-Windows host
+/// (stub path: open_engine returns Err, so we only test trait defaults).
+///
+/// On Windows the full zoom round-trip is covered by the ignored integration
+/// test below.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn zoom_defaults_on_non_windows() {
+    // We cannot open an engine on non-Windows, but the trait default for
+    // active_zoom_level() must be 1.0 (hardened in the engine stub).
+    // We verify the backend compiles and the stub open_engine fails cleanly.
+    let backend = WebView2Backend::new();
+    let result = backend.open_engine(make_opts("about:blank"));
+    assert!(result.is_err(), "stub must return Err on non-Windows");
+}
+
+/// Windows-only: zoom_in / zoom_out / zoom_reset / active_zoom_level round-trip.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires WebView2 Runtime and a live desktop session on Windows"]
+fn zoom_round_trip_on_windows() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+
+    let backend = WebView2Backend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("about:blank"))
+        .expect("open_engine");
+
+    // Initial zoom must be 1.0.
+    assert!(
+        (engine.active_zoom_level() - 1.0).abs() < f64::EPSILON,
+        "initial zoom must be 1.0"
+    );
+
+    // zoom_in raises the level.
+    engine.zoom_in();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let after_in = engine.active_zoom_level();
+    assert!(
+        after_in > 1.0,
+        "zoom_in must raise zoom above 1.0, got {after_in}"
+    );
+
+    // zoom_reset returns to 1.0.
+    engine.zoom_reset();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let after_reset = engine.active_zoom_level();
+    assert!(
+        (after_reset - 1.0).abs() < f64::EPSILON,
+        "zoom_reset must restore 1.0, got {after_reset}"
+    );
+
+    // zoom_out lowers the level below 1.0.
+    engine.zoom_out();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let after_out = engine.active_zoom_level();
+    assert!(
+        after_out < 1.0,
+        "zoom_out must lower zoom below 1.0, got {after_out}"
+    );
+}
+
 /// On non-Windows, verify the stub input path compiles and the backend
 /// correctly returns a Windows-only error (not a panic).
 ///

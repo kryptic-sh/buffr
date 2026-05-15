@@ -451,7 +451,25 @@ impl BrowserEngine for LadybirdEngine {
     }
 
     fn active_zoom_level(&self) -> f64 {
-        1.0
+        // Query the worker — zoom is owned by the worker thread's LadybirdTab
+        // (via the C++ stub's m_zoom field, read back through webcontent_zoom).
+        self.worker
+            .call(|reply| Command::QueryActiveZoom { reply })
+            .unwrap_or(1.0)
+    }
+
+    fn zoom_in(&self) {
+        let next = (self.active_zoom_level() + 0.1).min(5.0);
+        self.worker.send(Command::SetZoom(next));
+    }
+
+    fn zoom_out(&self) {
+        let next = (self.active_zoom_level() - 0.1).max(0.25);
+        self.worker.send(Command::SetZoom(next));
+    }
+
+    fn zoom_reset(&self) {
+        self.worker.send(Command::SetZoom(1.0));
     }
 
     // ── Audio / video ────────────────────────────────────────────────────────

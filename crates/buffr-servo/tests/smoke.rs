@@ -59,6 +59,51 @@ fn servo_open_engine_constructs() {
     assert!(engine.is_ok(), "open_engine should succeed");
 }
 
+/// `active_zoom_level()` returns 1.0 before any zoom change.
+#[test]
+#[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]
+fn servo_zoom_default_is_one() {
+    let backend = ServoBackend::new();
+    let opts = dummy_options();
+    let engine = backend.open_engine(opts).expect("open_engine");
+    let zoom = engine.active_zoom_level();
+    assert!(
+        (zoom - 1.0).abs() < f64::EPSILON,
+        "initial zoom must be 1.0, got {zoom}"
+    );
+}
+
+/// `zoom_in()` raises the zoom level above 1.0.
+#[test]
+#[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]
+fn servo_zoom_in_raises_level() {
+    let backend = ServoBackend::new();
+    let opts = dummy_options();
+    let engine = backend.open_engine(opts).expect("open_engine");
+    engine.zoom_in();
+    let after = engine.active_zoom_level();
+    assert!(
+        after > 1.0,
+        "zoom_in must raise zoom above 1.0, got {after}"
+    );
+}
+
+/// `zoom_reset()` restores the zoom level to 1.0.
+#[test]
+#[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]
+fn servo_zoom_reset_restores_one() {
+    let backend = ServoBackend::new();
+    let opts = dummy_options();
+    let engine = backend.open_engine(opts).expect("open_engine");
+    engine.zoom_in();
+    engine.zoom_reset();
+    let after = engine.active_zoom_level();
+    assert!(
+        (after - 1.0).abs() < f64::EPSILON,
+        "zoom_reset must restore 1.0, got {after}"
+    );
+}
+
 /// Verify `osr_frame` and `osr_view` return stable Arc handles.
 #[test]
 #[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]

@@ -57,6 +57,13 @@ public:
     void send_mouse_button(uint32_t button, int32_t x, int32_t y, bool is_press);
     void send_scroll(int32_t x, int32_t y, double dx, double dy);
 
+    // Zoom
+    //
+    // Phase B: stores the requested zoom level in `m_zoom` (no render effect).
+    // Phase C: maps to LibWeb `Page::set_zoom_level` via WebContent IPC.
+    void set_zoom(double zoom);
+    double zoom() const;
+
 private:
     std::string m_url;
     std::string m_title;
@@ -64,6 +71,8 @@ private:
     std::vector<std::string> m_forward_history;
     uint32_t m_width;
     uint32_t m_height;
+    /// Current page zoom level. Clamped to [0.25, 5.0] on the Rust side.
+    double m_zoom = 1.0;
 };
 
 // Free-function FFI entry points — called from the cxx bridge.
@@ -87,6 +96,10 @@ void webcontent_send_key(WebContent& wc, uint32_t key_code, bool is_press, uint3
 void webcontent_send_mouse_move(WebContent& wc, int32_t x, int32_t y);
 void webcontent_send_mouse_button(WebContent& wc, uint32_t button, int32_t x, int32_t y, bool is_press);
 void webcontent_send_scroll(WebContent& wc, int32_t x, int32_t y, double dx, double dy);
+
+// Zoom
+void webcontent_set_zoom(WebContent& wc, double zoom);
+double webcontent_zoom(const WebContent& wc);
 
 } // namespace ladybird
 } // namespace buffr

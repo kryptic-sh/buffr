@@ -79,7 +79,7 @@ pub(crate) struct TabEntry {
     /// COM controller (HWND path). Created once in `new`; kept for the tab
     /// lifetime so WebView2 stays alive.
     #[cfg(target_os = "windows")]
-    controller: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller,
+    pub(crate) controller: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller,
     /// Raw ICoreWebView2 interface. Obtained from `controller.CoreWebView2()`.
     #[cfg(target_os = "windows")]
     webview: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
@@ -138,6 +138,7 @@ impl TabEntry {
                 can_go_back: false,
                 can_go_forward: false,
                 progress: 0.0,
+                zoom: 1.0,
             });
         }
 
@@ -449,6 +450,7 @@ impl TabEntry {
                 can_go_back: false,
                 can_go_forward: false,
                 progress: 0.0,
+                zoom: 1.0,
             });
         }
         TabEntry {

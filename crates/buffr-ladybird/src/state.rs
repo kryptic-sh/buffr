@@ -33,8 +33,8 @@ use crate::ffi::bridge::{
     WebContent, webcontent_can_go_back, webcontent_can_go_forward, webcontent_go_back,
     webcontent_go_forward, webcontent_navigate, webcontent_new, webcontent_read_pixels,
     webcontent_reload, webcontent_resize, webcontent_send_key, webcontent_send_mouse_button,
-    webcontent_send_mouse_move, webcontent_send_scroll, webcontent_stop, webcontent_title,
-    webcontent_url,
+    webcontent_send_mouse_move, webcontent_send_scroll, webcontent_set_zoom, webcontent_stop,
+    webcontent_title, webcontent_url, webcontent_zoom,
 };
 
 // ── Tab ───────────────────────────────────────────────────────────────────────
@@ -96,6 +96,19 @@ impl LadybirdTab {
             buf.resize(len, 0);
         }
         webcontent_read_pixels(&self.wc, buf.as_mut_slice());
+    }
+
+    /// Set the page zoom level.
+    ///
+    /// Phase B: forwarded to the C++ stub which stores it in `m_zoom`.
+    /// Phase C: wires to LibWeb `Page::set_zoom_level` via the IPC shim.
+    pub(crate) fn set_zoom(&mut self, zoom: f64) {
+        webcontent_set_zoom(self.wc.pin_mut(), zoom);
+    }
+
+    /// Read the current page zoom level from the C++ stub.
+    pub(crate) fn zoom(&self) -> f64 {
+        webcontent_zoom(&self.wc)
     }
 
     #[allow(dead_code)]
@@ -173,6 +186,17 @@ pub(crate) enum Command {
         y: i32,
         dx: f64,
         dy: f64,
+    },
+    /// Set the active tab's page zoom level. Clamped to [0.25, 5.0].
+    ///
+    /// Forwarded to `webcontent_set_zoom` in the C++ shim.
+    /// Phase C: maps to LibWeb `Page::set_zoom_level`.
+    SetZoom(f64),
+    /// Query the active tab's current zoom level.
+    ///
+    /// Reads back from `webcontent_zoom` in the C++ shim (returns `m_zoom`).
+    QueryActiveZoom {
+        reply: mpsc::SyncSender<f64>,
     },
     Shutdown,
 }
@@ -397,6 +421,27 @@ impl Worker {
         }
     }
 
+    /// Set the active tab's page zoom level.
+    ///
+    /// Clamps to [0.25, 5.0] and forwards to the C++ shim's
+    /// `webcontent_set_zoom`. Phase C wires this to LibWeb's
+    /// `Page::set_zoom_level` via the WebContent IPC shim.
+    fn set_zoom(&mut self, level: f64) {
+        let clamped = level.clamp(0.25, 5.0);
+        if let Some(idx) = self.active_idx {
+            self.tabs[idx].set_zoom(clamped);
+            tracing::debug!("ladybird worker: set_zoom({clamped:.2})");
+        }
+    }
+
+    /// Query the active tab's current zoom level.
+    ///
+    /// Reads back from the C++ shim via `webcontent_zoom`, which returns
+    /// `m_zoom` (Phase B: no real rendering effect).
+    fn query_active_zoom(&self) -> f64 {
+        self.active_idx.map(|i| self.tabs[i].zoom()).unwrap_or(1.0)
+    }
+
     fn build_snapshot(&self) -> TabsSnapshot {
         let tabs: Vec<TabRecord> = self
             .tabs
@@ -542,6 +587,12 @@ impl Worker {
             }
             Command::SendScroll { x, y, dx, dy } => {
                 self.send_scroll(x, y, dx, dy);
+            }
+            Command::SetZoom(level) => {
+                self.set_zoom(level);
+            }
+            Command::QueryActiveZoom { reply } => {
+                let _ = reply.send(self.query_active_zoom());
             }
             Command::Shutdown => {
                 return true;
