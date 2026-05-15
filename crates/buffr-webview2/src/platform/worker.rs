@@ -133,6 +133,7 @@ pub(crate) enum Command {
     },
     Navigate {
         url: String,
+        reply: mpsc::SyncSender<Result<(), WebView2Error>>,
     },
     GoBack,
     GoForward,
@@ -271,9 +272,13 @@ impl StaRuntime {
         self.paint();
     }
 
-    fn navigate(&mut self, url: &str) {
-        if let Some(idx) = self.active_idx {
-            self.tabs[idx].load_uri(url, &self.engine_state);
+    fn navigate(&mut self, url: &str) -> Result<(), WebView2Error> {
+        match self.active_idx {
+            Some(idx) => {
+                self.tabs[idx].load_uri(url, &self.engine_state);
+                Ok(())
+            }
+            None => Err(WebView2Error::InitFailed("no active tab".into())),
         }
     }
 
@@ -341,8 +346,8 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
         Command::CycleTab { forward } => {
             rt.cycle_tab(forward);
         }
-        Command::Navigate { url } => {
-            rt.navigate(&url);
+        Command::Navigate { url, reply } => {
+            let _ = reply.send(rt.navigate(&url));
         }
         Command::GoBack => {
             rt.go_back();

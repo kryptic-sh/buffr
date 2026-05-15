@@ -139,3 +139,55 @@ fn osr_view_arc_is_stable() {
         "osr_view() must return the same Arc on every call"
     );
 }
+
+/// `navigate` must propagate errors from the worker rather than silently
+/// returning `Ok(())`.  With no active tab the worker returns an error.
+///
+/// NOTE: invalid URL strings (e.g. "invalid://bad") are not rejected at the
+/// worker level — WebKitGTK's `load_uri` accepts arbitrary strings.  A
+/// separate bug should be filed if URL validation is desired.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn navigate_with_no_active_tab_returns_err() {
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("about:blank"))
+        .expect("open_engine");
+
+    // Close all tabs so there is no active tab.
+    engine.close_all_browsers();
+
+    let result = engine.navigate("https://example.com");
+    assert!(
+        result.is_err(),
+        "navigate must return Err when no active tab exists, got: {result:?}"
+    );
+}
+
+/// `navigate` errors propagate via the reply channel — not silently discarded.
+/// Drop the engine (which shuts down the worker) then verify that a navigate
+/// call on a freshly-killed worker surface is an Err, not a silent Ok.
+///
+/// This test uses a separate engine instance to avoid GTK re-init issues.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn navigate_after_worker_death_returns_err() {
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("about:blank"))
+        .expect("open_engine");
+
+    // Keep a second Arc clone, drop the first to send Shutdown.
+    let engine2 = Arc::clone(&engine);
+    drop(engine);
+    // Give the worker a moment to process the Shutdown command.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // navigate on engine2 — the worker has exited; the reply channel will time
+    // out and the timeout maps to WorkerTimeout → EngineError::Other.
+    let result = engine2.navigate("https://example.com");
+    assert!(
+        result.is_err(),
+        "navigate must return Err after worker shutdown, got: {result:?}"
+    );
+}

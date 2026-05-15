@@ -116,6 +116,7 @@ pub(crate) enum Command {
     },
     Navigate {
         url: String,
+        reply: mpsc::SyncSender<Result<(), WebKitGtkError>>,
     },
     /// Navigate the active tab back. No return value needed.
     GoBack,
@@ -276,9 +277,13 @@ impl GtkRuntime {
         self.paint();
     }
 
-    fn navigate(&mut self, url: &str) {
-        if let Some(idx) = self.active_idx {
-            self.tabs[idx].load_uri(url);
+    fn navigate(&mut self, url: &str) -> Result<(), WebKitGtkError> {
+        match self.active_idx {
+            Some(idx) => {
+                self.tabs[idx].load_uri(url);
+                Ok(())
+            }
+            None => Err(WebKitGtkError::InitFailed("no active tab".into())),
         }
     }
 
@@ -347,8 +352,8 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         Command::CycleTab { forward } => {
             rt.cycle_tab(forward);
         }
-        Command::Navigate { url } => {
-            rt.navigate(&url);
+        Command::Navigate { url, reply } => {
+            let _ = reply.send(rt.navigate(&url));
         }
         Command::GoBack => {
             rt.go_back();

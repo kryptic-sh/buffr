@@ -255,10 +255,13 @@ impl BrowserEngine for WebView2Engine {
 
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
         tracing::debug!("webview2: navigate {url}");
-        self.worker.send(Command::Navigate {
-            url: url.to_owned(),
-        });
-        Ok(())
+        self.worker
+            .call(|reply| Command::Navigate {
+                url: url.to_owned(),
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn active_tab_live_url(&self) -> String {
