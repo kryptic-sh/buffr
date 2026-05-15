@@ -171,6 +171,14 @@ pub(crate) enum Command {
     /// Source: webview2-com-sys-0.39.1/src/bindings.rs — `ICoreWebView2Controller`
     /// exposes `pub unsafe fn SetZoomFactor(&self, zoomfactor: f64)`.
     SetZoom(f64),
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    ///
+    /// On Windows: calls `ICoreWebView2::ExecuteScript` with an
+    /// `ExecuteScriptCompletedHandler` that discards the result.
+    /// Source: webview2-com-sys-0.39.1/src/bindings.rs:1358-1369.
+    EvalJs {
+        code: String,
+    },
     Resize {
         width: u32,
         height: u32,
@@ -356,6 +364,38 @@ impl StaRuntime {
         }
     }
 
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    ///
+    /// On Windows: calls `ICoreWebView2::ExecuteScript` with a no-op completion
+    /// handler. `code` is widened to UTF-16 via `HSTRING::from`.
+    ///
+    /// Source: webview2-com-sys-0.39.1/src/bindings.rs:1358-1369.
+    /// Handler shape: webview2-com-0.39.1/src/callback.rs:295-299
+    ///   `ExecuteScriptCompletedHandler(ICoreWebView2ExecuteScriptCompletedHandler, HRESULT, PCWSTR)`.
+    fn eval_js(&self, code: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            use webview2_com::ExecuteScriptCompletedHandler;
+            use windows_core::HSTRING;
+
+            let Some(tab) = self.active_tab() else {
+                tracing::debug!("webview2 worker: eval_js — no active tab, dropping");
+                return;
+            };
+            let js = HSTRING::from(code);
+            let handler = ExecuteScriptCompletedHandler::create(Box::new(|_hr, _result| Ok(())));
+            // SAFETY: ExecuteScript is a COM method on a valid ICoreWebView2 STA pointer.
+            // The handler closure is invoked by WebView2 on the STA thread.
+            if let Err(e) = unsafe { tab.webview().ExecuteScript(&js, &handler) } {
+                tracing::warn!("webview2: ExecuteScript failed: {e}");
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            tracing::debug!("webview2 worker: eval_js — stub path (no-op on non-Windows)");
+        }
+    }
+
     fn set_zoom(&mut self, level: f64) {
         let clamped = level.clamp(0.25, 5.0);
         let Some(active_idx) = self.active_idx else {
@@ -472,6 +512,9 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
         }
         Command::SetZoom(level) => {
             rt.set_zoom(level);
+        }
+        Command::EvalJs { code } => {
+            rt.eval_js(&code);
         }
         Command::Resize { width, height } => {
             rt.resize(width, height);

@@ -129,5 +129,25 @@ pub(crate) mod bridge {
 
         /// Cancel the current IME composition, discarding the preedit string.
         fn webcontent_ime_cancel(wc: Pin<&mut WebContent>);
+
+        // ── JS evaluation ─────────────────────────────────────────────────────
+        //
+        // Phase B: C++ stub logs the call and no-ops — LibJS is not linked.
+        // Phase C: forward to LibJS via LibWeb's JavaScript execution path, e.g.
+        //   `WebContentServer::execute_script(script)` IPC message (exact API
+        //   TBD at Ladybird pin time; LibJS has no fire-and-forget public API
+        //   separate from the full eval pipeline).
+        //
+        // TODO(phase-c): wire to real LibJS dispatch once Ladybird embedding
+        //   exposes a stable `eval_script` IPC surface.
+
+        /// Evaluate `code` in the active main-frame JS context (fire-and-forget).
+        fn webcontent_eval_js(wc: Pin<&mut WebContent>, code: &str);
+
+        /// Evaluate `code` attributed to `url` (fire-and-forget).
+        ///
+        /// `url` is used as the script origin in DevTools / error stacks.
+        /// Phase B stub: `url` is logged but otherwise ignored.
+        fn webcontent_eval_main_frame_js(wc: Pin<&mut WebContent>, code: &str, url: &str);
     }
 }

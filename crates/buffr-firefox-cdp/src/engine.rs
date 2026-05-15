@@ -1612,4 +1612,32 @@ impl BrowserEngine for FirefoxCdpEngine {
             );
         }
     }
+
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Firefox CDP supports `Runtime.evaluate` on the active session, matching
+    // the blink-cdp pattern almost verbatim.  `run_js` delegates to
+    // `run_main_frame_js` (the `_url` origin parameter is ignored by the
+    // Gecko CDP agent, which derives the script origin from the active frame).
+
+    fn run_js(&self, code: &str) -> Result<(), buffr_engine::EngineError> {
+        self.run_main_frame_js(code, "")
+    }
+
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), buffr_engine::EngineError> {
+        let session_id = {
+            let state = self.lock_state();
+            state
+                .active_tab()
+                .map(|t| t.session_id.clone())
+                .ok_or(buffr_engine::EngineError::NoActiveTab)?
+        };
+        self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": code }),
+        )
+        .map(|_| ())
+        .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
+    }
 }

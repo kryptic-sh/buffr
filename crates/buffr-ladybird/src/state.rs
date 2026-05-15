@@ -30,10 +30,11 @@ use cxx::UniquePtr;
 
 use crate::error::LadybirdError;
 use crate::ffi::bridge::{
-    WebContent, webcontent_can_go_back, webcontent_can_go_forward, webcontent_go_back,
-    webcontent_go_forward, webcontent_ime_cancel, webcontent_ime_commit,
-    webcontent_ime_set_composition, webcontent_navigate, webcontent_new, webcontent_read_pixels,
-    webcontent_reload, webcontent_resize, webcontent_send_key, webcontent_send_mouse_button,
+    WebContent, webcontent_can_go_back, webcontent_can_go_forward, webcontent_eval_js,
+    webcontent_eval_main_frame_js, webcontent_go_back, webcontent_go_forward,
+    webcontent_ime_cancel, webcontent_ime_commit, webcontent_ime_set_composition,
+    webcontent_navigate, webcontent_new, webcontent_read_pixels, webcontent_reload,
+    webcontent_resize, webcontent_send_key, webcontent_send_mouse_button,
     webcontent_send_mouse_move, webcontent_send_scroll, webcontent_set_zoom, webcontent_stop,
     webcontent_title, webcontent_url, webcontent_zoom,
 };
@@ -134,6 +135,24 @@ impl LadybirdTab {
     /// Phase C: IPC CancelComposition to WebContentServer.
     pub(crate) fn ime_cancel(&mut self) {
         webcontent_ime_cancel(self.wc.pin_mut());
+    }
+
+    /// Evaluate `code` in the JS context (fire-and-forget).
+    ///
+    /// Phase B stub: logs and no-ops.
+    /// Phase C: IPC execute_script to WebContentServer.
+    /// TODO(phase-c): wire to real LibJS dispatch.
+    pub(crate) fn eval_js(&mut self, code: &str) {
+        webcontent_eval_js(self.wc.pin_mut(), code);
+    }
+
+    /// Evaluate `code` attributed to `url` (fire-and-forget).
+    ///
+    /// Phase B stub: logs and no-ops.
+    /// Phase C: IPC execute_script with origin URL to WebContentServer.
+    /// TODO(phase-c): wire to real LibJS dispatch with script URL.
+    pub(crate) fn eval_main_frame_js(&mut self, code: &str, url: &str) {
+        webcontent_eval_main_frame_js(self.wc.pin_mut(), code, url);
     }
 
     #[allow(dead_code)]
@@ -245,6 +264,24 @@ pub(crate) enum Command {
     /// Phase B: forwarded to `webcontent_ime_cancel` (clears `m_ime_composition`).
     /// Phase C: IPC CancelComposition message.
     ImeCancel,
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    ///
+    /// Phase B: forwarded to `webcontent_eval_js` in the C++ shim, which
+    ///   logs and no-ops (LibJS not linked).
+    /// Phase C: IPC execute_script message to the Ladybird WebContentServer.
+    /// TODO(phase-c): wire to real LibJS dispatch once the IPC surface is stable.
+    EvalJs {
+        code: String,
+    },
+    /// Evaluate `code` attributed to `url` in the active tab's JS context.
+    ///
+    /// Phase B: forwarded to `webcontent_eval_main_frame_js` (logs, no-ops).
+    /// Phase C: same as EvalJs but also sets the script origin URL.
+    /// TODO(phase-c): wire to real LibJS dispatch with script URL.
+    EvalMainFrameJs {
+        code: String,
+        url: String,
+    },
     Shutdown,
 }
 
@@ -510,6 +547,29 @@ impl Worker {
         }
     }
 
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    fn eval_js(&mut self, code: &str) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: eval_js ({} bytes)", code.len());
+            self.tabs[i].eval_js(code);
+        } else {
+            tracing::debug!("ladybird worker: eval_js — no active tab, dropping");
+        }
+    }
+
+    /// Evaluate `code` attributed to `url` in the active tab's JS context.
+    fn eval_main_frame_js(&mut self, code: &str, url: &str) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!(
+                "ladybird worker: eval_main_frame_js ({} bytes, url={url})",
+                code.len()
+            );
+            self.tabs[i].eval_main_frame_js(code, url);
+        } else {
+            tracing::debug!("ladybird worker: eval_main_frame_js — no active tab, dropping");
+        }
+    }
+
     fn build_snapshot(&self) -> TabsSnapshot {
         let tabs: Vec<TabRecord> = self
             .tabs
@@ -682,6 +742,12 @@ impl Worker {
             Command::ImeCancel => {
                 tracing::debug!("ladybird worker: ImeCancel");
                 self.ime_cancel();
+            }
+            Command::EvalJs { code } => {
+                self.eval_js(&code);
+            }
+            Command::EvalMainFrameJs { code, url } => {
+                self.eval_main_frame_js(&code, &url);
             }
             Command::Shutdown => {
                 return true;

@@ -502,6 +502,30 @@ impl BrowserEngine for WebKitCocoaEngine {
         1.0
     }
 
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Dispatch a fire-and-forget `WKWebView::evaluateJavaScript:completionHandler:`
+    // call to the active tab via the GCD main-queue worker.  The `url` script
+    // origin parameter is not accepted by the simple `evaluateJavaScript:` API;
+    // WKWebView derives the origin from the currently loaded document.
+    //
+    // TODO(phase-c): switch to
+    //   `WKWebView::evaluateJavaScript:inFrame:inContentWorld:completionHandler:`
+    //   to surface evaluation errors via `tracing::warn!`.
+
+    fn run_js(&self, code: &str) -> Result<(), EngineError> {
+        tracing::debug!("webkit-cocoa: run_js ({} bytes)", code.len());
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::EvalJs {
+            code: code.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), EngineError> {
+        self.run_js(code)
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         #[cfg(target_os = "macos")]

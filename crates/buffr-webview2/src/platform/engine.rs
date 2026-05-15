@@ -434,6 +434,28 @@ impl BrowserEngine for WebView2Engine {
         1.0
     }
 
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Fire-and-forget JS evaluation via the STA worker →
+    // `ICoreWebView2::ExecuteScript`. The completion handler is a no-op.
+    // The `url` origin parameter is not exposed by the WebView2 ExecuteScript
+    // API — the document origin is derived from the currently loaded page.
+    //
+    // TODO(phase-c): use `ICoreWebView2_10::ExecuteScriptWithResult` to surface
+    //   evaluation errors via `tracing::warn!`.
+
+    fn run_js(&self, code: &str) -> Result<(), EngineError> {
+        tracing::debug!("webview2: run_js ({} bytes)", code.len());
+        self.worker.send(Command::EvalJs {
+            code: code.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), EngineError> {
+        self.run_js(code)
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));

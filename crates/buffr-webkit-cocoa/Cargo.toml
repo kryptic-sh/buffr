@@ -36,6 +36,7 @@ objc2-web-kit = { version = "0.3", features = [
     "WKNavigationDelegate",
     "WKUIDelegate",
     "WKSnapshotConfiguration",
+    "block2",
 ] }
 objc2-core-foundation = "0.3"
 block2 = "0.6"

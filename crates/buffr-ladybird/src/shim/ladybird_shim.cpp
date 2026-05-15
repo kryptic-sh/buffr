@@ -182,6 +182,26 @@ void WebContent::ime_cancel()
     m_ime_composition.clear();
 }
 
+void WebContent::eval_js(rust::Str code)
+{
+    // Phase B stub: log and no-op (LibJS is not linked in Phase B).
+    // Phase C: send an execute_script IPC message to WebContentServer so
+    //   LibJS evaluates `code` in the active main-frame JS context.
+    //   Exact IPC message name TBD at Ladybird API pin time.
+    // TODO(phase-c): wire to real LibJS dispatch.
+    (void)code;
+}
+
+void WebContent::eval_main_frame_js(rust::Str code, rust::Str url)
+{
+    // Phase B stub: log and no-op.
+    // `url` is the script origin passed to LibJS for DevTools/error stacks.
+    // Phase C: same as eval_js but also set the script origin URL.
+    // TODO(phase-c): wire to real LibJS dispatch with script URL.
+    (void)code;
+    (void)url;
+}
+
 // ── Free-function entry points (called from cxx bridge) ─────────────────────
 
 ::std::unique_ptr<WebContent> webcontent_new(rust::Str initial_url, uint32_t width, uint32_t height)
@@ -246,6 +266,16 @@ void webcontent_ime_commit(WebContent& wc, rust::Str text)
 void webcontent_ime_cancel(WebContent& wc)
 {
     wc.ime_cancel();
+}
+
+void webcontent_eval_js(WebContent& wc, rust::Str code)
+{
+    wc.eval_js(code);
+}
+
+void webcontent_eval_main_frame_js(WebContent& wc, rust::Str code, rust::Str url)
+{
+    wc.eval_main_frame_js(code, url);
 }
 
 } // namespace ladybird

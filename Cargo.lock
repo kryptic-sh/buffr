@@ -721,6 +721,7 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "buffr-engine",
+ "buffr-modal",
  "keyboard-types",
  "smol_str 0.3.6",
  "thiserror 2.0.18",
@@ -866,6 +867,7 @@ dependencies = [
  "base64",
  "buffr-core",
  "buffr-engine",
+ "buffr-modal",
  "image",
  "open",
  "serde",
@@ -963,6 +965,7 @@ version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
  "buffr-engine",
+ "buffr-modal",
  "dispatch2",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -978,6 +981,7 @@ name = "buffr-webkitgtk"
 version = "0.1.0"
 dependencies = [
  "buffr-engine",
+ "buffr-modal",
  "glib",
  "gtk4",
  "thiserror 2.0.18",
@@ -990,6 +994,7 @@ name = "buffr-webview2"
 version = "0.1.0"
 dependencies = [
  "buffr-engine",
+ "buffr-modal",
  "image",
  "thiserror 2.0.18",
  "tracing",

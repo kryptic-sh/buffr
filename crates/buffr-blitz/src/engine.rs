@@ -433,6 +433,21 @@ impl BrowserEngine for BlitzEngine {
             .unwrap_or(1.0)
     }
 
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Blitz is a CSS/layout engine with no JavaScript runtime. Returning
+    // `Err(EngineError::Other(...))` gives the apps layer a real signal instead
+    // of the default `Err(Unimplemented)`, and clearly documents the capability
+    // boundary. Any caller that checks the error can fall back gracefully.
+
+    fn run_js(&self, _code: &str) -> Result<(), EngineError> {
+        Err(EngineError::Other("blitz: no JS engine".into()))
+    }
+
+    fn run_main_frame_js(&self, _code: &str, _url: &str) -> Result<(), EngineError> {
+        Err(EngineError::Other("blitz: no JS engine".into()))
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));

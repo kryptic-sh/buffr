@@ -430,6 +430,27 @@ impl BrowserEngine for WebKitGtkEngine {
         1.0
     }
 
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Fire-and-forget JS evaluation via GTK worker → WebViewExt::evaluate_javascript.
+    // The `url` origin parameter is not accepted by the WebKitGTK API at the
+    // level we call it; the document origin is derived from the loaded page.
+    //
+    // TODO(phase-c): pass a content-world / frame parameter when WebKitGTK
+    //   exposes it in a stable Rust binding.
+
+    fn run_js(&self, code: &str) -> Result<(), EngineError> {
+        tracing::debug!("webkitgtk: run_js ({} bytes)", code.len());
+        self.worker.send(Command::EvalJs {
+            code: code.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), EngineError> {
+        self.run_js(code)
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));

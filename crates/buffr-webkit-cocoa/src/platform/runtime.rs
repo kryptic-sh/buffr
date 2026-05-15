@@ -317,6 +317,25 @@ pub(crate) mod macos {
             unsafe { self.web_view.canGoForward() }
         }
 
+        /// Evaluate `code` in the WKWebView's JS context (fire-and-forget).
+        ///
+        /// API: `WKWebView::evaluateJavaScript:completionHandler:`.
+        /// Source: objc2-web-kit-0.3.2/src/generated/WKWebView.rs:499-505.
+        /// The completion handler is `None` — matching the trait's fire-and-forget
+        /// contract (no synchronous return value is surfaced).
+        ///
+        /// TODO(phase-c): thread the completion handler through to surface errors
+        ///   via `tracing::warn!` if the script evaluation fails.
+        pub(crate) fn eval_js(&self, code: &str) {
+            let ns_code = NSString::from_str(code);
+            // SAFETY: evaluateJavaScript:completionHandler: is a well-known
+            // WKWebView ObjC method. Called exclusively on the GCD main queue.
+            unsafe {
+                self.web_view
+                    .evaluateJavaScript_completionHandler(&ns_code, None);
+            }
+        }
+
         /// Set the page zoom factor on the WKWebView.
         ///
         /// API: `WKWebView::setPageZoom` (macOS 11+).

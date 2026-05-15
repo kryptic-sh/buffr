@@ -77,6 +77,16 @@ public:
     void ime_commit(rust::Str text);
     void ime_cancel();
 
+    // JS evaluation
+    //
+    // Phase B stub: logs the call and no-ops (LibJS not linked in Phase B).
+    // Phase C: forward via LibWeb's WebContentServer IPC, e.g.
+    //   `WebContentServer::execute_script(script)` (exact API TBD at pin time).
+    //
+    // TODO(phase-c): wire to real LibJS dispatch.
+    void eval_js(rust::Str code);
+    void eval_main_frame_js(rust::Str code, rust::Str url);
+
 private:
     std::string m_url;
     std::string m_title;
@@ -120,6 +130,10 @@ double webcontent_zoom(const WebContent& wc);
 void webcontent_ime_set_composition(WebContent& wc, rust::Str text, uint32_t sel_start, uint32_t sel_end);
 void webcontent_ime_commit(WebContent& wc, rust::Str text);
 void webcontent_ime_cancel(WebContent& wc);
+
+// JS evaluation
+void webcontent_eval_js(WebContent& wc, rust::Str code);
+void webcontent_eval_main_frame_js(WebContent& wc, rust::Str code, rust::Str url);
 
 } // namespace ladybird
 } // namespace buffr

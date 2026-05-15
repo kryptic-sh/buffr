@@ -153,6 +153,19 @@ pub(crate) enum Command {
     /// Source: servo-0.1.0/webview.rs:561-563
     ///   `pub fn page_zoom(&self) -> f32`
     QueryActiveZoom { reply: mpsc::SyncSender<f64> },
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    ///
+    /// Calls `WebView::evaluate_javascript(script, callback)`.
+    /// Source: servo-0.1.0/webview.rs:642-652.
+    ///   `pub fn evaluate_javascript<T: ToString>(&self, script: T,
+    ///     callback: impl FnOnce(Result<JSValue, JavaScriptEvaluationError>) + 'static)`
+    ///
+    /// The callback discards the result — matching the trait's fire-and-forget
+    /// contract. The result is logged at debug level if evaluation fails.
+    ///
+    /// TODO(phase-c): wire the callback result to surface script errors via
+    ///   `tracing::warn!` so they are visible in debug builds.
+    EvalJs { code: String },
     /// Shut down the worker.
     Shutdown,
 }
@@ -483,6 +496,22 @@ impl Worker {
         }
     }
 
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    ///
+    /// Calls `WebView::evaluate_javascript(script, callback)`.
+    /// Source: servo-0.1.0/webview.rs:642-652.
+    fn eval_js(&self, code: String) {
+        if let Some(wv) = self.active_webview() {
+            wv.evaluate_javascript(code, |result| {
+                if let Err(e) = result {
+                    tracing::debug!("servo worker: eval_js completed with error: {e:?}");
+                }
+            });
+        } else {
+            tracing::debug!("servo worker: eval_js — no active tab, dropping");
+        }
+    }
+
     /// Read the active tab's current page zoom level.
     ///
     /// Calls `WebView::page_zoom() -> f32`.
@@ -593,6 +622,9 @@ impl Worker {
             }
             Command::QueryActiveZoom { reply } => {
                 let _ = reply.send(self.query_active_zoom());
+            }
+            Command::EvalJs { code } => {
+                self.eval_js(code);
             }
             Command::Shutdown => {
                 return true;

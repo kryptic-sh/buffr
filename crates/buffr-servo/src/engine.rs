@@ -459,6 +459,30 @@ impl BrowserEngine for ServoEngine {
             .unwrap_or(1.0)
     }
 
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Delegates to `WebView::evaluate_javascript` on the active tab's Servo
+    // WebView (worker thread). The callback discards the result — matching the
+    // trait's fire-and-forget contract.
+    //
+    // The `url` script origin parameter is not exposed by the Servo
+    // `evaluate_javascript` API; the origin is derived from the loaded page.
+    //
+    // TODO(phase-c): when the dep conflict (rusqlite 0.37 vs 0.39) is resolved,
+    //   verify this compiles against the real servo 0.1 types.
+
+    fn run_js(&self, code: &str) -> Result<(), buffr_engine::EngineError> {
+        tracing::debug!("servo: run_js ({} bytes)", code.len());
+        self.worker.send(Command::EvalJs {
+            code: code.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), buffr_engine::EngineError> {
+        self.run_js(code)
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));

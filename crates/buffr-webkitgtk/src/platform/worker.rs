@@ -136,6 +136,14 @@ pub(crate) enum Command {
     Stop,
     /// Set the active tab's zoom level. Clamped to [0.25, 5.0].
     SetZoom(f64),
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    ///
+    /// Dispatched to the GTK main thread and calls
+    /// `webkit6::prelude::WebViewExt::evaluate_javascript`. The callback is
+    /// a no-op — matching the trait's fire-and-forget contract.
+    EvalJs {
+        code: String,
+    },
     /// Start an in-page find. `forward = false` searches backwards.
     StartFind {
         query: String,
@@ -373,6 +381,22 @@ impl GtkRuntime {
         }
     }
 
+    /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+    fn eval_js(&self, code: &str) {
+        use webkit6::prelude::WebViewExt;
+        if let Some(tab) = self.active_tab() {
+            tab.web_view.evaluate_javascript(
+                code,
+                None,
+                None,
+                None::<&webkit6::gio::Cancellable>,
+                |_| {},
+            );
+        } else {
+            tracing::debug!("webkitgtk worker: eval_js — no active tab, dropping");
+        }
+    }
+
     fn start_find(&mut self, query: &str, forward: bool) {
         use webkit6::prelude::WebViewExt;
         const CASE_INSENSITIVE: u32 = 1;
@@ -480,6 +504,9 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         }
         Command::SetZoom(level) => {
             rt.set_zoom(level);
+        }
+        Command::EvalJs { code } => {
+            rt.eval_js(&code);
         }
         Command::StartFind { query, forward } => {
             rt.start_find(&query, forward);

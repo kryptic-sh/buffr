@@ -458,6 +458,35 @@ impl BrowserEngine for LadybirdEngine {
             .unwrap_or(1.0)
     }
 
+    // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
+    //
+    // Delegates to the cxx FFI shim via the worker thread.
+    //
+    // Phase B: the C++ stub logs and no-ops (LibJS is not linked).
+    // Phase C: wire to real LibJS dispatch via the Ladybird WebContentServer IPC.
+    // TODO(phase-c): replace the no-op shim with real LibJS execution once the
+    //   Ladybird embedding IPC surface stabilises.
+
+    fn run_js(&self, code: &str) -> Result<(), EngineError> {
+        tracing::debug!("ladybird: run_js ({} bytes)", code.len());
+        self.worker.send(Command::EvalJs {
+            code: code.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn run_main_frame_js(&self, code: &str, url: &str) -> Result<(), EngineError> {
+        tracing::debug!(
+            "ladybird: run_main_frame_js ({} bytes, url={url})",
+            code.len()
+        );
+        self.worker.send(Command::EvalMainFrameJs {
+            code: code.to_owned(),
+            url: url.to_owned(),
+        });
+        Ok(())
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));

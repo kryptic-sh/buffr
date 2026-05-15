@@ -379,6 +379,15 @@ pub(crate) mod macos {
                 .is_some_and(|t| t.can_go_forward())
         }
 
+        /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+        fn eval_js(&self, code: &str) {
+            if let Some(idx) = self.active_idx {
+                if let Some(tab) = self.tabs.get(idx) {
+                    tab.eval_js(code);
+                }
+            }
+        }
+
         /// Apply a zoom level to the active tab's WKWebView and snapshot the
         /// updated TabState into EngineState so `active_zoom_level()` can read
         /// it from any thread without a main-queue round-trip.
@@ -457,6 +466,14 @@ pub(crate) mod macos {
         /// `WKWebView::setPageZoom` (macOS 11+).
         /// Source: objc2-web-kit-0.3.2/src/generated/WKWebView.rs:809-811.
         SetZoom(f64),
+        /// Evaluate `code` in the active tab's JS context (fire-and-forget).
+        ///
+        /// Dispatched to the GCD main queue and calls
+        /// `WKWebView::evaluateJavaScript:completionHandler:`. The completion
+        /// handler is ignored — this matches the trait's fire-and-forget contract.
+        EvalJs {
+            code: String,
+        },
         Shutdown,
     }
 
@@ -747,6 +764,14 @@ pub(crate) mod macos {
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
                         r.0.set_zoom(level);
+                    }
+                });
+            }
+            Command::EvalJs { code } => {
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.0.eval_js(&code);
                     }
                 });
             }
