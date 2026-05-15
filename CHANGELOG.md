@@ -8,6 +8,23 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-05-15
+
+### Added
+
+- `tracing::debug!` log when CEF backend silently drops `cache_dir` option —
+  diagnostic for multi-engine on-disk layout comparison (buffr-cef 0.1.1).
+- `BlinkError::CacheDirCreate` distinguishes pre-spawn `mkdir` failures from
+  actual `Command::spawn` failures (buffr-blink-cdp 0.1.4).
+- New unit test `migration_skips_when_new_path_already_exists` covers the
+  both-old-and-new-exist case in `engine_migrate`, asserting the production
+  guard preserves new-layout content and leaves old in place.
+
+### Dependencies
+
+- `buffr-cef` 0.1.0 → 0.1.1
+- `buffr-blink-cdp` 0.1.3 → 0.1.4
+
 ## [0.11.0] - 2026-05-15
 
 ### Fixed
@@ -1279,7 +1296,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
 [0.10.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.10.0
 [0.9.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.1
