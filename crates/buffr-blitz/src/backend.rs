@@ -1,4 +1,4 @@
-//! [`BlitzBackend`] — stub [`Backend`] impl for the Blitz browser engine.
+//! [`BlitzBackend`] — [`Backend`] impl for the Blitz browser engine.
 
 use std::sync::Arc;
 
@@ -32,8 +32,9 @@ impl Backend for BlitzBackend {
         self
     }
 
-    /// Blitz has no global init in Phase A. Always succeeds.
+    /// Blitz has no global init — always succeeds.
     fn initialize(&self, _cache_path: &str) -> Result<(), String> {
+        tracing::info!("blitz backend: initialize (no-op)");
         Ok(())
     }
 

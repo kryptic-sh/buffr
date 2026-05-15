@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use buffr_engine::TabId;
+
 /// Errors specific to the Blitz backend.
 #[derive(Debug, Error)]
 pub enum BlitzError {
@@ -10,6 +12,12 @@ pub enum BlitzError {
 
     #[error("blitz initialization failed: {0}")]
     InitFailed(String),
+
+    #[error("tab {0} not found")]
+    TabNotFound(TabId),
+
+    #[error("blitz network fetch failed: {0}")]
+    FetchFailed(String),
 }
 
 impl From<BlitzError> for buffr_engine::EngineError {
@@ -17,6 +25,10 @@ impl From<BlitzError> for buffr_engine::EngineError {
         match e {
             BlitzError::Unsupported(msg) => buffr_engine::EngineError::Other(msg),
             BlitzError::InitFailed(msg) => buffr_engine::EngineError::InitFailed(msg),
+            BlitzError::TabNotFound(id) => {
+                buffr_engine::EngineError::Other(format!("tab {id} not found"))
+            }
+            BlitzError::FetchFailed(msg) => buffr_engine::EngineError::Other(msg),
         }
     }
 }

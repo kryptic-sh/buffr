@@ -1,0 +1,147 @@
+//! Smoke tests for the Blitz backend.
+//!
+//! Validates that:
+//! - `BlitzBackend::new()` + `initialize()` succeed
+//! - `open_engine()` with a `data:` URL opens a real tab
+//! - `tabs_summary().len() == 1` and `active_tab().is_some()`
+//! - `osr_frame()` / `osr_view()` return stable `Arc` handles (pointer equality)
+
+use std::sync::Arc;
+
+use buffr_blitz::BlitzBackend;
+use buffr_engine::{Backend, BackendOpenOptions, BrowserEngine, engine_id::EngineId};
+
+/// Helper: open an engine at the given `data:` URL.
+fn open_engine(url: &str) -> Arc<dyn BrowserEngine> {
+    let backend = BlitzBackend::new();
+    let engine_id = EngineId::new("test");
+    let opts = BackendOpenOptions {
+        engine_id,
+        initial_url: url,
+        initial_size: (800, 600),
+        data_dir: None,
+        cache_dir: None,
+        frame_rate: 60,
+        device_scale: 1.0,
+        private: false,
+        download_dir: None,
+        downloads: None,
+        notice_queue: None,
+        find_sink: None,
+        sinks: Box::new(()),
+    };
+    backend.open_engine(opts).expect("open_engine failed")
+}
+
+#[test]
+fn backend_initialize_succeeds() {
+    let backend = BlitzBackend::new();
+    let result = backend.initialize("/tmp/buffr-blitz-smoke");
+    assert!(result.is_ok(), "initialize() should return Ok: {result:?}");
+}
+
+#[test]
+fn open_engine_data_uri() {
+    let engine = open_engine("data:text/html,<h1>Hi</h1>");
+    // After open_engine the worker should have opened one tab.
+    assert_eq!(
+        engine.tab_count(),
+        1,
+        "expected exactly 1 tab after open_engine"
+    );
+    assert!(engine.active_tab().is_some(), "active_tab() should be Some");
+}
+
+#[test]
+fn tabs_summary_matches_count() {
+    let engine = open_engine("data:text/html,<h1>Tabs</h1>");
+    let summary = engine.tabs_summary();
+    assert_eq!(summary.len(), engine.tab_count());
+    assert_eq!(summary.len(), 1);
+}
+
+#[test]
+fn osr_frame_arc_is_stable() {
+    let engine = open_engine("data:text/html,<h1>OSR</h1>");
+    let frame_a = engine.osr_frame();
+    let frame_b = engine.osr_frame();
+    // Both clones must point to the same allocation.
+    assert!(
+        Arc::ptr_eq(&frame_a, &frame_b),
+        "osr_frame() must return the same Arc on every call"
+    );
+}
+
+#[test]
+fn osr_view_arc_is_stable() {
+    let engine = open_engine("data:text/html,<h1>View</h1>");
+    let view_a = engine.osr_view();
+    let view_b = engine.osr_view();
+    assert!(
+        Arc::ptr_eq(&view_a, &view_b),
+        "osr_view() must return the same Arc on every call"
+    );
+}
+
+#[test]
+fn osr_frame_has_pixels_after_open() {
+    let engine = open_engine("data:text/html,<h1>Pixels</h1>");
+    let frame = engine.osr_frame();
+    let guard = frame.lock().expect("frame lock failed");
+    assert!(
+        !guard.pixels.is_empty(),
+        "pixels should be non-empty after open_engine"
+    );
+    assert_eq!(
+        guard.pixels.len(),
+        (guard.width as usize) * (guard.height as usize) * 4,
+        "pixel buffer length mismatch"
+    );
+}
+
+#[test]
+fn open_tab_increments_count() {
+    let engine = open_engine("data:text/html,<p>first</p>");
+    assert_eq!(engine.tab_count(), 1);
+    engine
+        .open_tab("data:text/html,<p>second</p>")
+        .expect("open_tab failed");
+    assert_eq!(engine.tab_count(), 2);
+}
+
+#[test]
+fn close_tab_decrements_count() {
+    let engine = open_engine("data:text/html,<p>A</p>");
+    let id = engine
+        .open_tab("data:text/html,<p>B</p>")
+        .expect("open_tab B");
+    assert_eq!(engine.tab_count(), 2);
+    engine.close_tab(id).expect("close_tab B");
+    assert_eq!(engine.tab_count(), 1);
+}
+
+#[test]
+fn navigate_updates_url() {
+    let engine = open_engine("data:text/html,<p>A</p>");
+    engine
+        .navigate("data:text/html,<p>B</p>")
+        .expect("navigate failed");
+    let url = engine.active_tab_live_url();
+    assert_eq!(
+        url, "data:text/html,<p>B</p>",
+        "URL should update after navigate"
+    );
+}
+
+#[test]
+fn active_index_is_valid() {
+    let engine = open_engine("data:text/html,<p>X</p>");
+    let idx = engine.active_index();
+    assert_eq!(idx, Some(0), "first tab should be at index 0");
+}
+
+#[test]
+fn backend_id_is_blitz() {
+    let backend = BlitzBackend::new();
+    assert_eq!(backend.id(), "blitz");
+}
