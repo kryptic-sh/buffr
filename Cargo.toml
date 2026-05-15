@@ -13,6 +13,7 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
 buffr-modal = "0.1"
 # Only pulls the `Capability` / `Decision` type surface. The SQLite store
 # is gated behind buffr-permissions' `store` feature, which we don't

@@ -52,6 +52,7 @@ pub mod event;
 pub mod favicon;
 pub mod hint;
 pub mod input;
+pub mod media_js;
 pub mod newtab;
 pub mod osr;
 pub mod permissions;
