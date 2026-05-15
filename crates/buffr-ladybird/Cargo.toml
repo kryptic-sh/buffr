@@ -14,3 +14,8 @@ publish = false
 buffr-engine.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
+cc = "1"
