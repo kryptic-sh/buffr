@@ -6,6 +6,15 @@ All notable changes to `buffr-config` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-05-15
+
+### Fixed
+
+- **Security:** `resolve_input` now treats `javascript:` and `data:` schemes as
+  search queries instead of navigable URLs, closing an XSS vector via the
+  omnibar. `is_real_scheme` allow-list updated; 5 regression tests added. Audit
+  finding #1.
+
 ## [0.4.1] - 2026-05-15
 
 ### Added
@@ -75,7 +84,8 @@ All notable changes to `buffr-config` are documented here. Format follows
   `directories::UserDirs::download_dir()` — same XDG resolution, fewer dep
   variants in the lock.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-config/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.4.2
 [0.4.1]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kryptic-sh/buffr-config/releases/tag/v0.3.0
