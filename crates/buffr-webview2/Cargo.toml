@@ -39,6 +39,12 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     # WM_MOUSELEAVE constant lives in Win32_UI_Controls
     "Win32_UI_Controls",
+    # Clipboard: OpenClipboard / GetClipboardData / SetClipboardData
+    "Win32_System_DataExchange",
+    # GlobalAlloc / GlobalLock / GlobalUnlock / GMEM_MOVEABLE
+    "Win32_System_Memory",
+    # CF_UNICODETEXT constant
+    "Win32_System_Ole",
 ] }
 # WebView2 COM bindings generated from the official WebView2 SDK IDL.
 webview2-com = "0.39"

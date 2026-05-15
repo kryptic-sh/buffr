@@ -42,8 +42,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_engine::{
-    BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
-    NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    BackendOpenOptions, BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus,
+    MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState,
+    TabId, TabSummary,
     engine_id::EngineId,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
@@ -88,6 +89,10 @@ pub struct WebView2Engine {
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     find_query: Mutex<Option<String>>,
+    /// Shared favicon update queue.  Favicon events are pushed by the STA
+    /// thread's `FaviconChanged` handler; drained from any thread by
+    /// `BrowserEngine::drain_favicon_updates`.
+    favicon_updates: Arc<Mutex<Vec<FaviconUpdate>>>,
 }
 
 impl WebView2Engine {
@@ -104,15 +109,23 @@ impl WebView2Engine {
 
         let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
 
-        // Clone Arc<AtomicBool>s from inside EngineState so the engine can
-        // read these flags from any thread without locking the Mutex.
-        let (audio_active, loading_active) = engine_state
+        // Clone Arc<AtomicBool>s and shared queues from inside EngineState so
+        // the engine can read / drain them from any thread without locking the
+        // Mutex on every call.
+        let (audio_active, loading_active, favicon_updates) = engine_state
             .lock()
-            .map(|g| (Arc::clone(&g.audio_active), Arc::clone(&g.loading_active)))
+            .map(|g| {
+                (
+                    Arc::clone(&g.audio_active),
+                    Arc::clone(&g.loading_active),
+                    Arc::clone(&g.favicon_updates),
+                )
+            })
             .unwrap_or_else(|_| {
                 (
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(Vec::new())),
                 )
             });
 
@@ -143,6 +156,7 @@ impl WebView2Engine {
             audio_active,
             loading_active,
             find_query: Mutex::new(None),
+            favicon_updates,
         })
     }
 
@@ -427,7 +441,8 @@ impl BrowserEngine for WebView2Engine {
     }
 
     fn osr_sleep(&self, sleep: bool) {
-        tracing::debug!("webview2: osr_sleep({sleep}) — no-op");
+        tracing::debug!("webview2: osr_sleep({sleep})");
+        self.worker.send(Command::SetSleep { sleep });
     }
 
     fn osr_invalidate_view(&self) {
@@ -442,11 +457,19 @@ impl BrowserEngine for WebView2Engine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, query: &str, _forward: bool) {
+    fn start_find(&self, query: &str, forward: bool) {
         if let Ok(mut g) = self.find_query.lock() {
             *g = Some(query.to_owned());
         }
-        tracing::debug!("webview2: start_find — no native find API in Phase B (query stored)");
+        tracing::debug!(
+            query,
+            forward,
+            "webview2: start_find — dispatching to STA worker"
+        );
+        self.worker.send(Command::StartFind {
+            query: query.to_owned(),
+            forward,
+        });
     }
 
     fn stop_find(&self) {
@@ -454,6 +477,7 @@ impl BrowserEngine for WebView2Engine {
             *g = None;
         }
         tracing::debug!("webview2: stop_find");
+        self.worker.send(Command::StopFind);
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -649,6 +673,103 @@ impl BrowserEngine for WebView2Engine {
         tracing::debug!("webview2: cancel_hint — no-op");
     }
 
+    // ── Favicon (Gap 1) ───────────────────────────────────────────────────────
+    //
+    // The STA thread's `FaviconChanged` handler reads `FaviconUri` from
+    // `ICoreWebView2_15` and pushes a sentinel `FaviconUpdate` (empty pixels,
+    // browser_id = tab_id.0) into the shared queue.  The apps layer drains it
+    // each tick and uses the `browser_id` to invalidate its favicon cache.
+
+    fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
+        match self.favicon_updates.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // ── Cursor (Gap 2) ────────────────────────────────────────────────────────
+    //
+    // WebView2 does not expose cursor changes to the host via the HWND controller
+    // path.  The composition-controller path exposes `ICoreWebView2CompositionController::Cursor`
+    // but that path is not yet adopted (Phase C TODO).
+    //
+    // TODO(phase-c): implement via `ICoreWebView2CompositionController::Cursor`
+    // once the composition controller path lands.
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        None
+    }
+
+    // ── Clipboard (Gap 4) ─────────────────────────────────────────────────────
+    //
+    // Win32 clipboard must be accessed from the thread that owns the clipboard
+    // window (or any thread for CF_UNICODETEXT without a window owner).  We
+    // dispatch reads and writes through the STA worker channel so they run on
+    // the STA thread alongside the HWND that owns the hidden controller windows.
+
+    fn clipboard_text(&self) -> Option<String> {
+        tracing::debug!("webview2: clipboard_text");
+        self.worker
+            .call(|reply| Command::ClipboardRead { reply })
+            .unwrap_or(None)
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        tracing::debug!("webview2: clipboard_set_text ({} chars)", text.len());
+        self.worker.send(Command::ClipboardWrite {
+            text: text.to_owned(),
+        });
+        // Fire-and-forget: optimistically return true.
+        // The STA worker logs a warning on failure.
+        true
+    }
+
+    // ── Edit IPC (Gap 5) ──────────────────────────────────────────────────────
+    //
+    // JS injection via `self.run_js`.  The edit.js layer exposes sentinel
+    // globals:
+    //   window.__buffrEditAttach({field_id})
+    //   window.__buffrEditCycle({forward: true/false})
+    //   window.__buffrEditDetach({field_id})
+    //   window.__buffrEditFocus({field_id})
+    //
+    // If the page has not loaded edit.js the call is silently discarded by JS.
+
+    fn run_edit_attach(&self, field_id: &str) {
+        tracing::debug!("webview2: run_edit_attach {field_id:?}");
+        let field_id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let js = format!(
+            "if(typeof window.__buffrEditAttach==='function')window.__buffrEditAttach({{field_id:{field_id_json}}})"
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        tracing::debug!("webview2: run_edit_cycle forward={forward}");
+        let js = format!(
+            "if(typeof window.__buffrEditCycle==='function')window.__buffrEditCycle({{forward:{forward}}})"
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        tracing::debug!("webview2: run_edit_detach {field_id:?}");
+        let field_id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let js = format!(
+            "if(typeof window.__buffrEditDetach==='function')window.__buffrEditDetach({{field_id:{field_id_json}}})"
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        tracing::debug!("webview2: run_edit_focus {field_id:?}");
+        let field_id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let js = format!(
+            "if(typeof window.__buffrEditFocus==='function')window.__buffrEditFocus({{field_id:{field_id_json}}})"
+        );
+        let _ = self.run_js(&js);
+    }
+
     // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
 
     fn frame_undo(&self) {
@@ -760,10 +881,19 @@ impl BrowserEngine for WebView2Engine {
 
         match action {
             // ── Find ─────────────────────────────────────────────────────────
+            //
+            // FindNext / FindPrev are handled by re-issuing StartFind so the
+            // STA worker calls ICoreWebView2Find::FindNext / FindPrevious on
+            // the live session.  The query is retrieved from the cached value
+            // stored by `start_find`.
             A::FindNext => {
                 let query = self.find_query.lock().ok().and_then(|g| g.clone());
                 if let Some(q) = query {
-                    tracing::debug!(query = %q, "webview2: dispatch FindNext — no native find API (no-op)");
+                    tracing::debug!(query = %q, "webview2: dispatch FindNext");
+                    self.worker.send(Command::StartFind {
+                        query: q,
+                        forward: true,
+                    });
                 } else {
                     tracing::debug!("webview2: FindNext — no active find query");
                 }
@@ -771,7 +901,11 @@ impl BrowserEngine for WebView2Engine {
             A::FindPrev => {
                 let query = self.find_query.lock().ok().and_then(|g| g.clone());
                 if let Some(q) = query {
-                    tracing::debug!(query = %q, "webview2: dispatch FindPrev — no native find API (no-op)");
+                    tracing::debug!(query = %q, "webview2: dispatch FindPrev");
+                    self.worker.send(Command::StartFind {
+                        query: q,
+                        forward: false,
+                    });
                 } else {
                     tracing::debug!("webview2: FindPrev — no active find query");
                 }

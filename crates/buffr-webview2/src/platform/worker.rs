@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebView2Error;
 use super::input::WebView2InputEvent;
@@ -89,6 +89,11 @@ pub(crate) struct EngineState {
     /// lock-free from any thread by `BrowserEngine::is_loading`.
     /// `Relaxed` ordering is sufficient — same rationale as `audio_active`.
     pub loading_active: Arc<AtomicBool>,
+    /// Pending favicon URL events.
+    ///
+    /// Written by `FaviconChanged` event delegates on the STA thread.
+    /// Drained from any thread by `BrowserEngine::drain_favicon_updates`.
+    pub favicon_updates: Arc<Mutex<Vec<FaviconUpdate>>>,
 }
 
 impl EngineState {
@@ -101,6 +106,7 @@ impl EngineState {
             height,
             audio_active: Arc::new(AtomicBool::new(false)),
             loading_active: Arc::new(AtomicBool::new(false)),
+            favicon_updates: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -241,6 +247,46 @@ pub(crate) enum Command {
         id: TabId,
         reply: mpsc::SyncSender<Result<(), WebView2Error>>,
     },
+    /// Put the active tab's WebView2 controller to sleep or wake it.
+    ///
+    /// On Windows: calls `ICoreWebView2Controller::SetIsVisible(BOOL)`.
+    /// When `sleep=true` the controller is hidden and skips paint ticks;
+    /// when `sleep=false` it is made visible again.
+    ///
+    /// Source: webview2-com-sys-0.39.1/src/bindings.rs — `ICoreWebView2Controller`.
+    SetSleep {
+        sleep: bool,
+    },
+    /// Read the system clipboard contents as a UTF-16 string.
+    ///
+    /// On Windows: opens the clipboard with `OpenClipboard(hwnd)`,
+    /// reads `CF_UNICODETEXT` via `GetClipboardData`, closes it.
+    /// Must be dispatched to the STA thread because the HWND owner is there.
+    ClipboardRead {
+        reply: mpsc::SyncSender<Option<String>>,
+    },
+    /// Write `text` to the system clipboard as `CF_UNICODETEXT`.
+    ///
+    /// On Windows: `OpenClipboard → EmptyClipboard → GlobalAlloc/Lock/copy
+    /// → SetClipboardData → CloseClipboard`.
+    ClipboardWrite {
+        text: String,
+    },
+    /// Begin a find session on the active tab.
+    ///
+    /// On Windows: QI-casts to `ICoreWebView2_28` and calls `Find()` to get
+    /// an `ICoreWebView2Find`, then calls `Start(options, handler)`.
+    /// Falls back to `document.execCommand('FindString', false, query)`
+    /// if the runtime is older than WebView2 SDK 1.0.2739+ (which exposes
+    /// `ICoreWebView2_28`).
+    StartFind {
+        query: String,
+        forward: bool,
+    },
+    /// Stop the active find session.
+    ///
+    /// Calls `ICoreWebView2Find::Stop()` if a session is live, otherwise no-op.
+    StopFind,
     Shutdown,
 }
 
@@ -288,6 +334,18 @@ struct StaRuntime {
     /// closure in `osr.rs`. `true` while a capture is pending; cleared by the
     /// completion handler regardless of success or failure.
     capture_in_flight: CaptureInFlight,
+    /// Whether the active tab is currently sleeping (SetIsVisible(false)).
+    ///
+    /// When `true` the OSR tick in `paint()` is skipped to avoid waking the
+    /// controller unnecessarily.
+    osr_sleeping: bool,
+    /// Live find session for the active tab (Windows only).
+    ///
+    /// Held for `Stop()` without needing a round-trip to retrieve it again.
+    /// `None` when no find session is active or the runtime is too old to
+    /// support `ICoreWebView2_28::Find()`.
+    #[cfg(target_os = "windows")]
+    find_session: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Find>,
 }
 
 impl StaRuntime {
@@ -479,6 +537,12 @@ impl StaRuntime {
     }
 
     fn paint(&self) {
+        // Skip paint when the active tab is sleeping (SetIsVisible(false)).
+        // The compositor still holds the previous frame, so no blank needed.
+        if self.osr_sleeping {
+            tracing::debug!("webview2 osr: paint skipped — tab is sleeping");
+            return;
+        }
         // On Windows: if there is an active tab with a ready webview, request
         // a CapturePreview screenshot. Fall back to paint_blank when no tab is
         // available or when running on a non-Windows host (stub path).
@@ -539,6 +603,335 @@ impl StaRuntime {
             let _ = tab;
         }
         Ok(())
+    }
+
+    /// Put the active tab controller to sleep or wake it.
+    ///
+    /// When `sleep=true`: calls `ICoreWebView2Controller::SetIsVisible(BOOL(0))`
+    /// and sets `self.osr_sleeping = true` so the OSR paint tick is skipped.
+    /// When `sleep=false`: calls `SetIsVisible(BOOL(1))` and clears the flag.
+    fn set_sleep(&mut self, sleep: bool) {
+        self.osr_sleeping = sleep;
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(idx) = self.active_idx {
+                let controller = &self.tabs[idx].controller;
+                let visible = windows::core::BOOL(!sleep as i32);
+                // SAFETY: SetIsVisible is an STA COM method on a valid
+                // ICoreWebView2Controller owned by this thread.
+                if let Err(e) = unsafe { controller.SetIsVisible(visible) } {
+                    tracing::warn!("webview2: SetIsVisible({}) failed: {e}", !sleep);
+                } else {
+                    tracing::debug!("webview2: SetIsVisible({}) ok", !sleep);
+                }
+            } else {
+                tracing::debug!("webview2: set_sleep — no active tab, flag stored");
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        tracing::debug!("webview2: set_sleep({sleep}) — stub path (no-op on non-Windows)");
+    }
+
+    /// Read the system clipboard as a UTF-8 string.
+    ///
+    /// On Windows: uses `OpenClipboard` / `GetClipboardData(CF_UNICODETEXT)`.
+    /// Must be called on the STA thread because the HWND owner (hidden tab
+    /// window) lives here; passing `None` as the HWND also works and is
+    /// standard practice for clipboard ownership without a visible window.
+    ///
+    /// Returns `None` when the clipboard is empty, non-text, or unavailable.
+    fn clipboard_read(&self) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+            use windows::Win32::System::DataExchange::{
+                CloseClipboard, GetClipboardData, OpenClipboard,
+            };
+            use windows::Win32::System::Memory::GlobalLock;
+            use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+            // SAFETY: OpenClipboard(None) opens the clipboard for this thread.
+            // No HWND owner required; passing None is valid per Win32 docs.
+            if unsafe { OpenClipboard(None) }.is_err() {
+                tracing::debug!("webview2: clipboard_read — OpenClipboard failed");
+                return None;
+            }
+
+            let result = (|| -> Option<String> {
+                // SAFETY: GetClipboardData returns a shared HGLOBAL owned by
+                // the clipboard; we must not free it. GlobalLock returns a
+                // pointer valid until GlobalUnlock.
+                let handle: HANDLE = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }.ok()?;
+                if handle.is_invalid() {
+                    return None;
+                }
+                let hglobal = HGLOBAL(handle.0);
+                let ptr = unsafe { GlobalLock(hglobal) };
+                if ptr.is_null() {
+                    return None;
+                }
+                // SAFETY: ptr is a valid NUL-terminated UTF-16 string allocated
+                // by the clipboard. We compute the length by scanning for NUL.
+                let wide_ptr = ptr as *const u16;
+                let mut len = 0usize;
+                while unsafe { *wide_ptr.add(len) } != 0 {
+                    len += 1;
+                }
+                let slice = unsafe { std::slice::from_raw_parts(wide_ptr, len) };
+                let text = String::from_utf16_lossy(slice);
+                // SAFETY: GlobalUnlock releases the lock obtained by GlobalLock.
+                let _ = unsafe { windows::Win32::System::Memory::GlobalUnlock(hglobal) };
+                Some(text)
+            })();
+
+            // SAFETY: CloseClipboard must be called after every successful OpenClipboard.
+            let _ = unsafe { CloseClipboard() };
+            result
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            tracing::debug!("webview2: clipboard_read — stub path (non-Windows)");
+            None
+        }
+    }
+
+    /// Write `text` to the system clipboard as `CF_UNICODETEXT`.
+    ///
+    /// On Windows: `OpenClipboard → EmptyClipboard → GlobalAlloc(MOVEABLE) →
+    /// GlobalLock → copy UTF-16 → SetClipboardData(CF_UNICODETEXT) →
+    /// CloseClipboard`. Returns `true` on success.
+    fn clipboard_write(&self, text: &str) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::System::DataExchange::{
+                CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+            };
+            use windows::Win32::System::Memory::{
+                GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+            };
+            use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+            // Encode as NUL-terminated UTF-16.
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0u16);
+            let byte_len = wide.len() * std::mem::size_of::<u16>();
+
+            // SAFETY: OpenClipboard(None) opens the clipboard for this thread.
+            if unsafe { OpenClipboard(None) }.is_err() {
+                tracing::debug!("webview2: clipboard_write — OpenClipboard failed");
+                return false;
+            }
+
+            let ok = (|| -> bool {
+                // SAFETY: EmptyClipboard clears the current clipboard contents.
+                if unsafe { EmptyClipboard() }.is_err() {
+                    tracing::debug!("webview2: clipboard_write — EmptyClipboard failed");
+                    return false;
+                }
+
+                // SAFETY: GlobalAlloc(MOVEABLE) allocates a relocatable block.
+                let hglobal = match unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) } {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!("webview2: clipboard_write — GlobalAlloc failed: {e}");
+                        return false;
+                    }
+                };
+
+                // SAFETY: GlobalLock pins the block and returns a valid write pointer.
+                let ptr = unsafe { GlobalLock(hglobal) };
+                if ptr.is_null() {
+                    tracing::warn!("webview2: clipboard_write — GlobalLock returned null");
+                    return false;
+                }
+
+                // SAFETY: ptr is a valid writable allocation of `byte_len` bytes.
+                // We copy the UTF-16 encoded text (including NUL terminator).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        wide.as_ptr() as *const u8,
+                        ptr as *mut u8,
+                        byte_len,
+                    );
+                }
+
+                // SAFETY: GlobalUnlock releases the lock before we hand the
+                // handle to SetClipboardData. Required: the clipboard takes
+                // ownership after a successful SetClipboardData call.
+                let _ = unsafe { GlobalUnlock(hglobal) };
+
+                // SAFETY: SetClipboardData transfers HGLOBAL ownership to the
+                // clipboard; we must NOT free it after this succeeds.
+                if let Err(e) =
+                    unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0))) }
+                {
+                    tracing::warn!("webview2: clipboard_write — SetClipboardData failed: {e}");
+                    return false;
+                }
+
+                true
+            })();
+
+            // SAFETY: CloseClipboard must be called after every successful OpenClipboard.
+            let _ = unsafe { CloseClipboard() };
+            ok
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = text;
+            tracing::debug!("webview2: clipboard_write — stub path (non-Windows)");
+            false
+        }
+    }
+
+    /// Start or advance a find-in-page session on the active tab.
+    ///
+    /// # Behaviour
+    ///
+    /// - If a native session is already live (`self.find_session.is_some()`):
+    ///   call `FindNext()` or `FindPrevious()` on the existing session.
+    ///   This handles the `FindNext` / `FindPrev` dispatch action without
+    ///   restarting the session.
+    ///
+    /// - Otherwise, start a new session on Windows (WebView2 SDK ≥ 1.0.2739,
+    ///   `ICoreWebView2_28`):
+    ///   1. QI-cast the active tab's `ICoreWebView2` to `ICoreWebView2_28`.
+    ///   2. Call `Find()` to get an `ICoreWebView2Find`.
+    ///   3. QI-cast the environment to `ICoreWebView2Environment15` to call
+    ///      `CreateFindOptions()`.
+    ///   4. Set `FindTerm`, `SuppressDefaultFindDialog = true`,
+    ///      `ShouldHighlightAllMatches = true`.
+    ///   5. Call `Start(options, no-op handler)`.
+    ///
+    /// - Falls back to `document.execCommand('FindString', false, query)` when
+    ///   the QI-cast to `ICoreWebView2_28` fails (older runtime).
+    ///
+    /// The live `ICoreWebView2Find` is stored in `self.find_session` for
+    /// `stop_find()` and subsequent `FindNext` / `FindPrev` dispatches.
+    fn start_find(&mut self, query: &str, forward: bool) {
+        #[cfg(target_os = "windows")]
+        {
+            use webview2_com::FindStartCompletedHandler;
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2_28, ICoreWebView2Environment15, ICoreWebView2Find,
+            };
+            use windows::core::HSTRING;
+
+            // ── If a session is already live, navigate it ─────────────────────
+            if let Some(ref session) = self.find_session {
+                let result = if forward {
+                    // SAFETY: FindNext is an STA COM method on a valid ICoreWebView2Find.
+                    unsafe { session.FindNext() }
+                } else {
+                    // SAFETY: FindPrevious is an STA COM method.
+                    unsafe { session.FindPrevious() }
+                };
+                if let Err(e) = result {
+                    tracing::warn!(
+                        "webview2: Find{} failed: {e}",
+                        if forward { "Next" } else { "Previous" }
+                    );
+                } else {
+                    tracing::debug!(
+                        "webview2: Find{} called on live session",
+                        if forward { "Next" } else { "Previous" }
+                    );
+                }
+                return;
+            }
+
+            let Some(tab) = self.active_tab() else {
+                tracing::debug!("webview2: start_find — no active tab");
+                return;
+            };
+
+            // ── Try the native Find API (ICoreWebView2_28) ────────────────────
+            let wv28_result: Option<ICoreWebView2Find> = (|| {
+                let wv28 =
+                    windows::core::Interface::cast::<ICoreWebView2_28>(tab.webview()).ok()?;
+
+                // Obtain ICoreWebView2Find from the webview.
+                // SAFETY: Find() is an STA COM method on a valid ICoreWebView2_28.
+                let find_iface = unsafe { wv28.Find() }.ok()?;
+
+                // Obtain ICoreWebView2FindOptions from the environment.
+                let env15 =
+                    windows::core::Interface::cast::<ICoreWebView2Environment15>(&self.environment)
+                        .ok()?;
+                // SAFETY: CreateFindOptions is an STA COM method.
+                let opts = unsafe { env15.CreateFindOptions() }.ok()?;
+
+                let term = HSTRING::from(query);
+                // SAFETY: SetFindTerm / SetSuppressDefaultFindDialog /
+                // SetShouldHighlightAllMatches are STA COM methods on a valid
+                // ICoreWebView2FindOptions pointer.
+                let _ = unsafe { opts.SetFindTerm(&term) };
+                let _ = unsafe { opts.SetSuppressDefaultFindDialog(true) };
+                let _ = unsafe { opts.SetShouldHighlightAllMatches(true) };
+                // ShouldMatchWord and IsCaseSensitive left at their defaults (false).
+
+                // Fire the start — completion handler is a no-op (fire-and-forget).
+                let handler =
+                    FindStartCompletedHandler::create(Box::new(|_hr, _active_idx| Ok(())));
+                // SAFETY: Start is an STA COM method.
+                let _ = unsafe { find_iface.Start(&opts, &handler) };
+
+                // Navigate to the first match in the requested direction.
+                if !forward {
+                    let _ = unsafe { find_iface.FindPrevious() };
+                }
+
+                tracing::debug!(
+                    query,
+                    forward,
+                    "webview2: start_find via ICoreWebView2_28::Find (native)"
+                );
+                Some(find_iface)
+            })();
+
+            if let Some(session) = wv28_result {
+                self.find_session = Some(session);
+            } else {
+                // ── Fallback: document.execCommand (deprecated, but works) ────
+                tracing::debug!(
+                    query,
+                    "webview2: start_find fallback to document.execCommand('FindString')"
+                );
+                self.find_session = None;
+                let query_json = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".into());
+                let js = format!("document.execCommand('FindString', false, {query_json})");
+                self.eval_js(&js);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (query, forward);
+            tracing::debug!("webview2: start_find — stub path (non-Windows)");
+        }
+    }
+
+    /// Stop the current find session.
+    ///
+    /// If a native `ICoreWebView2Find` session is stored, calls `Stop()` on it.
+    /// Otherwise no-op (the fallback `execCommand` path has no explicit stop).
+    fn stop_find(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref session) = self.find_session {
+                // SAFETY: Stop() is an STA COM method on a valid ICoreWebView2Find.
+                if let Err(e) = unsafe { session.Stop() } {
+                    tracing::warn!("webview2: ICoreWebView2Find::Stop failed: {e}");
+                } else {
+                    tracing::debug!("webview2: find session stopped");
+                }
+                self.find_session = None;
+            } else {
+                tracing::debug!("webview2: stop_find — no active find session");
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        tracing::debug!("webview2: stop_find — stub path (non-Windows)");
     }
 }
 
@@ -630,6 +1023,21 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
         }
         Command::OpenDevtools { id, reply } => {
             let _ = reply.send(rt.open_devtools(id));
+        }
+        Command::SetSleep { sleep } => {
+            rt.set_sleep(sleep);
+        }
+        Command::ClipboardRead { reply } => {
+            let _ = reply.send(rt.clipboard_read());
+        }
+        Command::ClipboardWrite { text } => {
+            rt.clipboard_write(&text);
+        }
+        Command::StartFind { query, forward } => {
+            rt.start_find(&query, forward);
+        }
+        Command::StopFind => {
+            rt.stop_find();
         }
         Command::Shutdown => {
             tracing::info!("webview2 worker: shutdown requested");
@@ -1156,6 +1564,8 @@ pub(crate) fn spawn(
                 cmd_tx: tx.clone(),
                 environment,
                 capture_in_flight: std::sync::Arc::new(std::sync::Mutex::new(false)),
+                osr_sleeping: false,
+                find_session: None,
             };
 
             #[cfg(not(target_os = "windows"))]

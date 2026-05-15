@@ -374,24 +374,64 @@ impl TabEntry {
         // `add_FaviconChanged` lives on ICoreWebView2_15. We QI-cast and skip
         // gracefully if the runtime predates SDK 1.0.1369 (runtime ~107).
         //
-        // `Interface::cast` is a safe method (QueryInterface via the vtable).
-        // Failure means the runtime is older and we proceed without favicon events.
+        // On each event we call `ICoreWebView2_15::FaviconUri` to read the URL
+        // (CoTask-allocated PWSTR), then push a `FaviconUpdate` sentinel with
+        // `browser_id = tab.id.0 as i32` and empty pixels into the shared
+        // `engine_state.favicon_updates` queue so `drain_favicon_updates` can
+        // surface it to the apps layer.
+        //
+        // Pixel decoding (fetch URL → BGRA) is deferred to phase-c; the apps
+        // layer uses the `browser_id` to refresh its favicon cache trigger.
         if let Ok(wv15) = windows::core::Interface::cast::<
             webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_15,
         >(&webview)
         {
             use webview2_com::FaviconChangedEventHandler;
             let state_favicon = Arc::clone(engine_state);
+            let wv15_fav = wv15.clone();
             let mut favicon_token: i64 = 0;
             // SAFETY: add_FaviconChanged is an STA COM method on `wv15`.
-            // The handler closure captures only Arc<Mutex<EngineState>>.
+            // The handler closure captures:
+            //   - `Arc<Mutex<EngineState>>` which is Send,
+            //   - `ICoreWebView2_15` (COM STA pointer, valid on this thread),
+            //   - `id` (Copy).
+            // The closure is called by WebView2 on the STA thread.
             if let Err(e) = unsafe {
                 wv15.add_FaviconChanged(
                     &FaviconChangedEventHandler::create(Box::new(move |_sender, _args| {
-                        // Phase B-2: acknowledge the event to keep EngineState dirty flag.
-                        // TODO(phase-c): read FaviconUri from ICoreWebView2_15 and store it.
-                        if let Ok(_guard) = state_favicon.lock() {
-                            // No-op: favicon byte retrieval is Phase C.
+                        // Read the current favicon URI from the webview.
+                        let mut uri_pwstr = windows::core::PWSTR::null();
+                        let uri_str = if wv15_fav.FaviconUri(&mut uri_pwstr).is_ok()
+                            && !uri_pwstr.is_null()
+                        {
+                            // SAFETY: uri_pwstr is a valid CoTask-allocated PWSTR.
+                            // Convert to String then free with CoTaskMemFree.
+                            let s = uri_pwstr.to_string().unwrap_or_default();
+                            windows::Win32::System::Com::CoTaskMemFree(Some(uri_pwstr.0.cast()));
+                            s
+                        } else {
+                            String::new()
+                        };
+
+                        tracing::debug!(
+                            tab_id = id.0,
+                            favicon_uri = %uri_str,
+                            "webview2 runtime: FaviconChanged"
+                        );
+
+                        // Push a FaviconUpdate sentinel so the apps layer can
+                        // refresh its favicon cache.  Pixels are empty — the
+                        // URL is logged above; a future phase can fetch and
+                        // decode the favicon image.
+                        if let Ok(guard) = state_favicon.lock() {
+                            if let Ok(mut fav) = guard.favicon_updates.lock() {
+                                fav.push(buffr_engine::FaviconUpdate {
+                                    browser_id: id.0 as i32,
+                                    width: 0,
+                                    height: 0,
+                                    pixels: Vec::new(),
+                                });
+                            }
                         }
                         Ok(())
                     })),
