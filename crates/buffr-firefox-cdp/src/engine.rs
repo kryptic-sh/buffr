@@ -1184,12 +1184,61 @@ impl BrowserEngine for FirefoxCdpEngine {
 
     // ── Stubs (Phase C) ──────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("firefox-cdp: start_find — deferred to Phase C");
+    fn start_find(&self, query: &str, forward: bool) {
+        // Firefox CDP has no Page.find — use window.find via Runtime.evaluate.
+        // Backwards search is the second arg's logical inverse. JS-quote the
+        // query to escape backslashes + single quotes; nothing else is needed
+        // for this string literal context.
+        let escaped = query.replace('\\', r"\\").replace('\'', r"\'");
+        let js = format!(
+            "window.find('{escaped}', false /* caseSensitive */, {} /* backwards */, true /* wrapAround */, false /* wholeWord */, true /* searchInFrames */, false /* showDialog */)",
+            !forward,
+        );
+        let Some(session_id) = ({
+            let state = self.lock_state();
+            state.active.and_then(|id| {
+                state
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.session_id.clone())
+            })
+        }) else {
+            return;
+        };
+        let _ = self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": js,
+                "returnByValue": true,
+            }),
+        );
     }
 
     fn stop_find(&self) {
-        tracing::debug!("firefox-cdp: stop_find — deferred to Phase C");
+        // window.find leaves a selection — clearing window.getSelection()
+        // matches Chrome's Page.stopFind { action: "clearSelection" } behaviour.
+        let Some(session_id) = ({
+            let state = self.lock_state();
+            state.active.and_then(|id| {
+                state
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.session_id.clone())
+            })
+        }) else {
+            return;
+        };
+        let _ = self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "window.getSelection().removeAllRanges()",
+                "returnByValue": true,
+            }),
+        );
     }
 
     fn active_zoom_level(&self) -> f64 {
