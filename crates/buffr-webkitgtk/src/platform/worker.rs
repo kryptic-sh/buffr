@@ -81,6 +81,9 @@ pub(crate) struct TabInfo {
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub progress: f64,
+    /// Current zoom level. Updated from the GTK thread after every
+    /// `webview.set_zoom_level(...)` call; read by `active_zoom_level()`.
+    pub zoom: f64,
 }
 
 impl TabInfo {
@@ -128,6 +131,8 @@ pub(crate) enum Command {
     Reload,
     /// Stop loading the active tab.
     Stop,
+    /// Set the active tab's zoom level. Clamped to [0.25, 5.0].
+    SetZoom(f64),
     Resize {
         width: u32,
         height: u32,
@@ -340,6 +345,24 @@ impl GtkRuntime {
         }
     }
 
+    fn set_zoom(&mut self, level: f64) {
+        use webkit6::prelude::WebViewExt;
+        let clamped = level.clamp(0.25, 5.0);
+        let Some(active_idx) = self.active_idx else {
+            return;
+        };
+        let id = self.tabs[active_idx].id;
+        self.tabs[active_idx].web_view.set_zoom_level(clamped);
+        // Mirror the clamped value into the shared EngineState so
+        // active_zoom_level() reads it without round-tripping the
+        // GTK thread.
+        if let Ok(mut guard) = self.engine_state.lock()
+            && let Some(t) = guard.tabs.iter_mut().find(|t| t.id == id)
+        {
+            t.zoom = clamped;
+        }
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         {
             let mut st = self.engine_state.lock().unwrap();
@@ -415,6 +438,9 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         }
         Command::Stop => {
             rt.stop();
+        }
+        Command::SetZoom(level) => {
+            rt.set_zoom(level);
         }
         Command::Resize { width, height } => {
             rt.resize(width, height);

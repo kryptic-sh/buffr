@@ -137,6 +137,7 @@ impl TabEntry {
                     can_go_back: false,
                     can_go_forward: false,
                     progress: 0.0,
+                    zoom: 1.0,
                 });
             }
         }
