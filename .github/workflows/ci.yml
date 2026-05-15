@@ -44,7 +44,8 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
-            libgl1 libegl1 libgles2
+            libgl1 libegl1 libgles2 \
+            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -95,6 +96,7 @@ jobs:
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
+            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev \
             xvfb
 
       - name: install rust toolchain
@@ -188,7 +190,8 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
-            libgl1 libegl1 libgles2
+            libgl1 libegl1 libgles2 \
+            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -344,6 +347,7 @@ jobs:
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
+            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev \
             libxml2-utils
 
       - name: install rust toolchain

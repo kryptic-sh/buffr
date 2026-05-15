@@ -70,6 +70,13 @@ pub(crate) mod macos {
         /// is sufficient — no synchronisation is required between writer and
         /// reader.
         pub audio_active: Arc<AtomicBool>,
+        /// Cached loading state of the **active** tab.
+        ///
+        /// Written by `WKNavigationDelegate` callbacks (on the GCD main queue)
+        /// and by the worker's active-tab switch helpers.  Read lock-free from
+        /// any thread by `BrowserEngine::is_loading`.
+        /// `Relaxed` ordering is sufficient — same rationale as `audio_active`.
+        pub loading_active: Arc<AtomicBool>,
     }
 
     impl EngineState {
@@ -78,12 +85,25 @@ pub(crate) mod macos {
                 tabs: Vec::new(),
                 active_idx: None,
                 audio_active: Arc::new(AtomicBool::new(false)),
+                loading_active: Arc::new(AtomicBool::new(false)),
             }
         }
 
         #[allow(dead_code)] // Used in Phase D for popup/hint routing.
         pub(crate) fn active_id(&self) -> Option<TabId> {
             self.active_idx.and_then(|i| self.tabs.get(i)).map(|t| t.id)
+        }
+
+        /// Sync `loading_active` from the active tab's `is_loading` field.
+        ///
+        /// Call whenever `active_idx` changes or any tab's `is_loading` is updated.
+        pub(crate) fn sync_loading_active(&self) {
+            let loading = self
+                .active_idx
+                .and_then(|i| self.tabs.get(i))
+                .map(|t| t.is_loading)
+                .unwrap_or(false);
+            self.loading_active.store(loading, Ordering::Relaxed);
         }
 
         pub(crate) fn summaries(&self) -> Vec<TabSummary> {
@@ -188,6 +208,9 @@ pub(crate) mod macos {
                     })
                     .collect();
                 st.active_idx = self.active_idx;
+                // Keep loading_active current whenever the tab list or
+                // active-tab index changes.
+                st.sync_loading_active();
             }
         }
 

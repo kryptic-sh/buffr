@@ -316,6 +316,15 @@ impl BrowserEngine for BlitzEngine {
         true
     }
 
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Blitz uses a synchronous `ureq` fetch: by the time `navigate` returns
+    /// the document is already parsed.  The active tab is never "in flight"
+    /// from the engine thread's perspective, so this always returns `false`.
+    fn is_loading(&self) -> bool {
+        false
+    }
+
     // ── Viewport ─────────────────────────────────────────────────────────────
 
     fn resize(&self, width: u32, height: u32) {

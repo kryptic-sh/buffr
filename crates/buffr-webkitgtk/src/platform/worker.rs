@@ -58,6 +58,14 @@ pub(crate) struct EngineState {
     /// sufficient — no synchronisation is required between the writer and the
     /// reader.
     pub audio_active: Arc<AtomicBool>,
+    /// Cached loading state of the **active** tab.
+    ///
+    /// Written by the `load-changed` GTK signal whenever the active tab's
+    /// loading status changes, and by `sync_active_idx` whenever the active
+    /// tab switches.  Read from any thread by
+    /// `BrowserEngine::is_loading` without locking the `Mutex<EngineState>`.
+    /// `Relaxed` ordering is sufficient — same rationale as `audio_active`.
+    pub loading_active: Arc<AtomicBool>,
 }
 
 impl EngineState {
@@ -69,7 +77,20 @@ impl EngineState {
             width,
             height,
             audio_active: Arc::new(AtomicBool::new(false)),
+            loading_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sync `loading_active` from the active tab's `is_loading` field.
+    ///
+    /// Call whenever `active_idx` changes or any tab's `is_loading` is updated.
+    pub(crate) fn sync_loading_active(&self) {
+        let loading = self
+            .active_idx
+            .and_then(|i| self.tabs.get(i))
+            .map(|t| t.is_loading)
+            .unwrap_or(false);
+        self.loading_active.store(loading, Ordering::Relaxed);
     }
 
     pub(crate) fn next_tab_id(&mut self) -> TabId {
@@ -492,10 +513,12 @@ impl GtkRuntime {
         }
     }
 
-    /// Write active_idx into the shared EngineState.
+    /// Write active_idx into the shared EngineState and sync `loading_active`
+    /// from the newly-active tab's current `is_loading` value.
     fn sync_active_idx(&self) {
         if let Ok(mut st) = self.engine_state.lock() {
             st.active_idx = self.active_idx;
+            st.sync_loading_active();
         }
     }
 }

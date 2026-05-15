@@ -81,6 +81,13 @@ pub struct WebKitCocoaEngine {
     /// queue poll; read from any thread by `any_audio_active()`.
     #[cfg(target_os = "macos")]
     audio_active: Arc<AtomicBool>,
+    /// Cached loading state of the **active** tab.
+    ///
+    /// Written by `WKNavigationDelegate` callbacks and `snapshot_to_engine_state`
+    /// (both on the GCD main queue) via `EngineState::sync_loading_active`.
+    /// Read lock-free from any thread by `BrowserEngine::is_loading`.
+    #[cfg(target_os = "macos")]
+    loading_active: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     /// Available on all platforms so the struct layout is consistent.
@@ -103,12 +110,17 @@ impl WebKitCocoaEngine {
         {
             let engine_state = Arc::new(Mutex::new(EngineState::new()));
 
-            // Clone the Arc<AtomicBool> from inside EngineState so the engine
-            // can read the audio flag from any thread without locking the Mutex.
-            let audio_active = engine_state
+            // Clone Arc<AtomicBool>s from inside EngineState so the engine can
+            // read these flags from any thread without locking the Mutex.
+            let (audio_active, loading_active) = engine_state
                 .lock()
-                .map(|g| Arc::clone(&g.audio_active))
-                .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+                .map(|g| (Arc::clone(&g.audio_active), Arc::clone(&g.loading_active)))
+                .unwrap_or_else(|_| {
+                    (
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                });
 
             let worker = super::worker::macos::spawn(
                 options.initial_url,
@@ -132,6 +144,7 @@ impl WebKitCocoaEngine {
                 worker,
                 engine_state,
                 audio_active,
+                loading_active,
                 find_query: Mutex::new(None),
             });
         }
@@ -355,6 +368,20 @@ impl BrowserEngine for WebKitCocoaEngine {
             .worker
             .call(|reply| Command::QueryCanGoForward { reply })
             .unwrap_or(false);
+
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Read the active tab's loading flag from an `Arc<AtomicBool>` kept in
+    /// sync by the `WKNavigationDelegate` callbacks and `snapshot_to_engine_state`.
+    ///
+    /// Lock-free; safe to call on any thread.
+    fn is_loading(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.loading_active.load(Ordering::Relaxed);
 
         #[cfg(not(target_os = "macos"))]
         false

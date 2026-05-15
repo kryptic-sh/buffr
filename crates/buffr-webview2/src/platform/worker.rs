@@ -82,6 +82,13 @@ pub(crate) struct EngineState {
     /// `BrowserEngine::any_audio_active`.  `Relaxed` ordering is sufficient —
     /// no synchronisation is required between the writer and the reader.
     pub audio_active: Arc<AtomicBool>,
+    /// Cached loading state of the **active** tab.
+    ///
+    /// Written by `NavigationStarting` / `NavigationCompleted` event handlers
+    /// and by the active-tab switch helpers (both on the STA thread).  Read
+    /// lock-free from any thread by `BrowserEngine::is_loading`.
+    /// `Relaxed` ordering is sufficient — same rationale as `audio_active`.
+    pub loading_active: Arc<AtomicBool>,
 }
 
 impl EngineState {
@@ -93,6 +100,7 @@ impl EngineState {
             width,
             height,
             audio_active: Arc::new(AtomicBool::new(false)),
+            loading_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -100,6 +108,18 @@ impl EngineState {
         let id = TabId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Sync `loading_active` from the active tab's `is_loading` field.
+    ///
+    /// Call whenever `active_idx` changes or any tab's `is_loading` is updated.
+    pub(crate) fn sync_loading_active(&self) {
+        let loading = self
+            .active_idx
+            .and_then(|i| self.tabs.get(i))
+            .map(|t| t.is_loading)
+            .unwrap_or(false);
+        self.loading_active.store(loading, Ordering::Relaxed);
     }
 
     pub(crate) fn summaries(&self) -> Vec<TabSummary> {
@@ -392,7 +412,7 @@ impl StaRuntime {
         #[cfg(target_os = "windows")]
         {
             use webview2_com::ExecuteScriptCompletedHandler;
-            use windows_core::HSTRING;
+            use windows::core::HSTRING;
 
             let Some(tab) = self.active_tab() else {
                 tracing::debug!("webview2 worker: eval_js — no active tab, dropping");
@@ -480,6 +500,8 @@ impl StaRuntime {
     fn sync_active_idx(&self) {
         if let Ok(mut st) = self.engine_state.lock() {
             st.active_idx = self.active_idx;
+            // Keep loading_active in sync with the newly-active tab.
+            st.sync_loading_active();
         }
     }
 
@@ -1257,7 +1279,7 @@ pub(crate) fn spawn(
                                     else {
                                         return false;
                                     };
-                                    let mut playing = windows::Win32::Foundation::BOOL(0);
+                                    let mut playing = windows::core::BOOL::default();
                                     // SAFETY: IsDocumentPlayingAudio is an STA COM method
                                     // on a valid ICoreWebView2_8 pointer. `playing` is a
                                     // valid out-pointer on the stack.

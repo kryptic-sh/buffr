@@ -71,14 +71,17 @@ impl TabEntry {
                 let url = wv.uri().map(|s| s.to_string()).unwrap_or_default();
                 let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
                 let is_loading = !matches!(event, LoadEvent::Finished);
-                if let Ok(mut guard) = st.lock()
-                    && let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id)
-                {
-                    tab.url = url;
-                    tab.title = title;
-                    tab.is_loading = is_loading;
-                    tab.can_go_back = wv.can_go_back();
-                    tab.can_go_forward = wv.can_go_forward();
+                if let Ok(mut guard) = st.lock() {
+                    if let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id) {
+                        tab.url = url;
+                        tab.title = title;
+                        tab.is_loading = is_loading;
+                        tab.can_go_back = wv.can_go_back();
+                        tab.can_go_forward = wv.can_go_forward();
+                    }
+                    // Keep loading_active in sync for the active tab so that
+                    // BrowserEngine::is_loading() can read it lock-free.
+                    guard.sync_loading_active();
                 }
                 // Trigger a snapshot on navigation complete.
                 if matches!(event, LoadEvent::Finished) {

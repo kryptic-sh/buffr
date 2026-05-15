@@ -862,6 +862,29 @@ impl BrowserEngine for FirefoxCdpEngine {
         state.tabs.iter().position(|t| t.id == active)
     }
 
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Read the active tab's loading state directly from the
+    /// `Page.lifecycleEvent`-driven `loading_state` map.
+    ///
+    /// Avoids the full `TabSummary` allocation that the default impl incurs
+    /// via `active_tab()`.  Lock order: `state` then `loading_state` (never
+    /// held simultaneously — we drop `state` before acquiring the map).
+    fn is_loading(&self) -> bool {
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        let Some(sess) = session_id else {
+            return false;
+        };
+        self.loading_state
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&sess).copied())
+            .unwrap_or(false)
+    }
+
     fn can_go_back(&self) -> bool {
         let session_id = {
             let state = self.lock_state();

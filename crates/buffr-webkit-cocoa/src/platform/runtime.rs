@@ -439,6 +439,7 @@ pub(crate) mod macos {
                         tab.url = url;
                         tab.is_loading = true;
                     }
+                    st.sync_loading_active();
                 }
             }
 
@@ -459,6 +460,7 @@ pub(crate) mod macos {
                         tab.url = url;
                         tab.is_loading = true;
                     }
+                    st.sync_loading_active();
                 }
             }
 
@@ -481,6 +483,7 @@ pub(crate) mod macos {
                         tab.title = title;
                         tab.is_loading = false;
                     }
+                    st.sync_loading_active();
                 }
             }
 
@@ -500,6 +503,7 @@ pub(crate) mod macos {
                     if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
                         tab.is_loading = false;
                     }
+                    st.sync_loading_active();
                 }
             }
 
@@ -522,6 +526,7 @@ pub(crate) mod macos {
                     if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
                         tab.is_loading = false;
                     }
+                    st.sync_loading_active();
                 }
             }
         }

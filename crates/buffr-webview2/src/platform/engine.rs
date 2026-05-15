@@ -78,6 +78,13 @@ pub struct WebView2Engine {
     /// Cached "any tab playing audio?" flag.  Written by the 500 ms STA-thread
     /// `WM_TIMER` handler; read from any thread by `any_audio_active()`.
     audio_active: Arc<AtomicBool>,
+    /// Cached loading state of the **active** tab.
+    ///
+    /// Written by `NavigationStarting` / `NavigationCompleted` event handlers
+    /// and `sync_active_idx` (both on the STA thread) via
+    /// `EngineState::sync_loading_active`.  Read lock-free from any thread by
+    /// `BrowserEngine::is_loading`.
+    loading_active: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     find_query: Mutex<Option<String>>,
@@ -97,12 +104,17 @@ impl WebView2Engine {
 
         let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
 
-        // Clone the Arc<AtomicBool> from inside EngineState so the engine can
-        // read the audio flag from any thread without locking the Mutex.
-        let audio_active = engine_state
+        // Clone Arc<AtomicBool>s from inside EngineState so the engine can
+        // read these flags from any thread without locking the Mutex.
+        let (audio_active, loading_active) = engine_state
             .lock()
-            .map(|g| Arc::clone(&g.audio_active))
-            .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+            .map(|g| (Arc::clone(&g.audio_active), Arc::clone(&g.loading_active)))
+            .unwrap_or_else(|_| {
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                )
+            });
 
         let data_dir = options.data_dir.map(|p| p.to_path_buf());
 
@@ -129,6 +141,7 @@ impl WebView2Engine {
             worker,
             engine_state,
             audio_active,
+            loading_active,
             find_query: Mutex::new(None),
         })
     }
@@ -305,6 +318,17 @@ impl BrowserEngine for WebView2Engine {
         self.worker
             .call(|reply| Command::QueryCanGoForward { reply })
             .unwrap_or(false)
+    }
+
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Read the active tab's loading flag from an `Arc<AtomicBool>` kept in
+    /// sync by `NavigationStarting` / `NavigationCompleted` event handlers
+    /// and `sync_active_idx` on tab switches.
+    ///
+    /// Lock-free; safe to call on any thread.
+    fn is_loading(&self) -> bool {
+        self.loading_active.load(Ordering::Relaxed)
     }
 
     // ── Viewport ─────────────────────────────────────────────────────────────

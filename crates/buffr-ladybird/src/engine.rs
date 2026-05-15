@@ -303,6 +303,18 @@ impl BrowserEngine for LadybirdEngine {
         true
     }
 
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Ladybird Phase B uses a C++ stub (`webcontent_navigate` is synchronous
+    /// at the FFI boundary).  No async load event is wired; always `false`.
+    ///
+    /// TODO(ladybird-phase-c): add `webcontent_is_loading() -> bool` to the
+    /// cxx bridge (`ffi.rs`) and delegate to it here once real Ladybird IPC
+    /// (out-of-process WebContentServer) is connected.
+    fn is_loading(&self) -> bool {
+        false
+    }
+
     fn can_go_back(&self) -> bool {
         self.worker
             .call(|reply| Command::QueryCanGoBack { reply })

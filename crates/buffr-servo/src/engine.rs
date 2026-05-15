@@ -342,6 +342,18 @@ impl BrowserEngine for ServoEngine {
         true
     }
 
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Servo backend is a skeleton (libsqlite3-sys dep conflict prevents real
+    /// WebView creation).  No async load machinery is wired; always `false`.
+    ///
+    /// TODO(servo-phase-c): track real load status via `WebViewDelegate`
+    /// `notify_load_status_changed` or equivalent once the dep conflict is
+    /// resolved and real WebViews exist.
+    fn is_loading(&self) -> bool {
+        false
+    }
+
     // ── Viewport ─────────────────────────────────────────────────────────────
 
     fn resize(&self, width: u32, height: u32) {

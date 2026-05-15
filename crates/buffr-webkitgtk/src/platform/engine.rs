@@ -77,6 +77,12 @@ pub struct WebKitGtkEngine {
     /// Cached "any tab playing audio?" flag.  Written by the 500 ms GTK-thread
     /// poll tick; read from any thread by `any_audio_active()`.
     audio_active: Arc<AtomicBool>,
+    /// Cached loading state of the **active** tab.
+    ///
+    /// Written by the `load-changed` GTK signal (via `EngineState::sync_loading_active`)
+    /// and by `sync_active_idx` on tab switches.  Read lock-free from any
+    /// thread by `BrowserEngine::is_loading`.
+    loading_active: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     find_query: std::sync::Mutex<Option<(String, bool)>>,
@@ -96,12 +102,17 @@ impl WebKitGtkEngine {
 
         let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
 
-        // Clone the Arc<AtomicBool> from inside EngineState so the engine can
-        // read the audio flag from any thread without locking the Mutex.
-        let audio_active = engine_state
+        // Clone Arc<AtomicBool>s from inside EngineState so the engine can
+        // read these flags from any thread without locking the Mutex.
+        let (audio_active, loading_active) = engine_state
             .lock()
-            .map(|g| Arc::clone(&g.audio_active))
-            .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+            .map(|g| (Arc::clone(&g.audio_active), Arc::clone(&g.loading_active)))
+            .unwrap_or_else(|_| {
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                )
+            });
 
         let worker = spawn(
             options.initial_url,
@@ -125,6 +136,7 @@ impl WebKitGtkEngine {
             worker,
             engine_state,
             audio_active,
+            loading_active,
             find_query: std::sync::Mutex::new(None),
         })
     }
@@ -290,6 +302,16 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn pump_address_changes(&self) -> bool {
         true
+    }
+
+    // ── Loading state ────────────────────────────────────────────────────────
+
+    /// Read the active tab's loading flag from an `Arc<AtomicBool>` kept in
+    /// sync by the `load-changed` GTK signal and `sync_active_idx`.
+    ///
+    /// Lock-free; safe to call on any thread.
+    fn is_loading(&self) -> bool {
+        self.loading_active.load(Ordering::Relaxed)
     }
 
     fn can_go_back(&self) -> bool {

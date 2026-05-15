@@ -228,11 +228,13 @@ impl TabEntry {
             webview
                 .add_NavigationStarting(
                     &NavigationStartingEventHandler::create(Box::new(move |_sender, _args| {
-                        if let Ok(mut guard) = state_nav_starting.lock()
-                            && let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id)
-                        {
-                            tab.is_loading = true;
-                            tab.progress = 0.0;
+                        if let Ok(mut guard) = state_nav_starting.lock() {
+                            if let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id) {
+                                tab.is_loading = true;
+                                tab.progress = 0.0;
+                            }
+                            // Keep loading_active in sync for the active tab.
+                            guard.sync_loading_active();
                         }
                         Ok(())
                     })),
@@ -247,11 +249,13 @@ impl TabEntry {
             webview
                 .add_NavigationCompleted(
                     &NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
-                        if let Ok(mut guard) = state_nav_completed.lock()
-                            && let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id)
-                        {
-                            tab.is_loading = false;
-                            tab.progress = 1.0;
+                        if let Ok(mut guard) = state_nav_completed.lock() {
+                            if let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id) {
+                                tab.is_loading = false;
+                                tab.progress = 1.0;
+                            }
+                            // Keep loading_active in sync for the active tab.
+                            guard.sync_loading_active();
                         }
                         // Post a TriggerCapture so the worker fires CapturePreview
                         // as soon as the page finishes loading. Fire-and-forget:
