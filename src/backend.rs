@@ -136,6 +136,14 @@ impl Backend for CefBackend {
         &self,
         options: BackendOpenOptions<'_>,
     ) -> Result<Arc<dyn BrowserEngine>, String> {
+        if options.cache_dir.is_some() {
+            ::tracing::debug!(
+                engine_id = %options.engine_id,
+                "cef backend ignores BackendOpenOptions.cache_dir; \
+                 CEF stores persistent + ephemeral state together under data_dir/cache_path"
+            );
+        }
+
         let sinks = options
             .sinks
             .downcast::<CefEngineSinks>()
