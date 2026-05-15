@@ -1,4 +1,4 @@
-//! [`WebKitCocoaBackend`] — stub [`Backend`] impl for WebKit Cocoa (macOS only).
+//! [`WebKitCocoaBackend`] — [`Backend`] impl for WebKit Cocoa (macOS only).
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ impl Backend for WebKitCocoaBackend {
         self
     }
 
-    /// WebKit Cocoa has no global init in Phase A. Always succeeds.
+    /// WebKit Cocoa has no global init step. Always succeeds.
     fn initialize(&self, _cache_path: &str) -> Result<(), String> {
         Ok(())
     }

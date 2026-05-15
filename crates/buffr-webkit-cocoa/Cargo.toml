@@ -7,10 +7,25 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "WebKit Cocoa (macOS) backend for buffr-engine"
+description = "WKWebView (macOS) backend for buffr-engine"
 publish = false
 
 [dependencies]
 buffr-engine.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSWindow", "NSView"] }
+objc2-web-kit = { version = "0.3", features = [
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKNavigation",
+    "WKNavigationDelegate",
+    "WKUIDelegate",
+    "WKSnapshotConfiguration",
+] }
+block2 = "0.6"
+dispatch2 = "0.3"
