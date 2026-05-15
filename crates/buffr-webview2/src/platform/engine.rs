@@ -34,13 +34,17 @@
 //!
 //! ## Still stubbed
 //!
-//! popup, hint, find, zoom, downloads, devtools, scheme, edit, clipboard.
+//! popup, find, zoom, downloads, devtools, scheme, edit, clipboard.
 //! Input synthesis is logged but not yet dispatched to the composition
 //! controller — see `input.rs` TODO markers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use buffr_core::hint::{
+    DEFAULT_HINT_SELECTORS, HintAlphabet, HintEventSink, HintSession, build_inject_script,
+    new_hint_event_sink, take_hint_event,
+};
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus,
     MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState,
@@ -93,6 +97,18 @@ pub struct WebView2Engine {
     /// thread's `FaviconChanged` handler; drained from any thread by
     /// `BrowserEngine::drain_favicon_updates`.
     favicon_updates: Arc<Mutex<Vec<FaviconUpdate>>>,
+    /// Hint-mode alphabet.  Cloned into `HintSession` on each `EnterHintMode`.
+    hint_alphabet: HintAlphabet,
+    /// One-slot mailbox for `__buffr_hint__:` messages from the renderer.
+    ///
+    /// Written by the `WebMessageReceived` handler on the STA thread;
+    /// drained from any thread by `BrowserEngine::pump_hint_events`.
+    hint_sink: HintEventSink,
+    /// Active hint session for the current tab, if any.
+    ///
+    /// Stored behind an `Arc<Mutex<…>>` so `pump_hint_events` (called from any
+    /// thread) can mutate it without touching the STA thread.
+    hint_session: Arc<Mutex<Option<HintSession>>>,
 }
 
 impl WebView2Engine {
@@ -131,6 +147,14 @@ impl WebView2Engine {
 
         let data_dir = options.data_dir.map(|p| p.to_path_buf());
 
+        // Hint-mode infrastructure: alphabet, event sink, session slot.
+        // The hint_alphabet falls back to the buffr-core default if the
+        // options struct doesn't carry one yet.
+        let hint_alphabet = HintAlphabet::from_str(buffr_core::hint::DEFAULT_HINT_ALPHABET)
+            .expect("default hint alphabet is always valid");
+        let hint_sink = new_hint_event_sink();
+        let hint_session: Arc<Mutex<Option<HintSession>>> = Arc::new(Mutex::new(None));
+
         let worker = spawn(
             options.initial_url,
             width,
@@ -138,6 +162,7 @@ impl WebView2Engine {
             Arc::clone(&frame),
             Arc::clone(&view),
             Arc::clone(&engine_state),
+            Arc::clone(&hint_sink),
             data_dir,
         )?;
 
@@ -157,6 +182,9 @@ impl WebView2Engine {
             loading_active,
             find_query: Mutex::new(None),
             favicon_updates,
+            hint_alphabet,
+            hint_sink,
+            hint_session,
         })
     }
 
@@ -647,30 +675,124 @@ impl BrowserEngine for WebView2Engine {
     ) {
     }
 
-    // ── Hint mode stubs ───────────────────────────────────────────────────────
+    // ── Hint mode ─────────────────────────────────────────────────────────────
 
     fn is_hint_mode(&self) -> bool {
-        false
+        self.hint_session
+            .lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
     }
 
     fn hint_status(&self) -> Option<HintStatus> {
-        None
+        let guard = self.hint_session.lock().ok()?;
+        let s = guard.as_ref()?;
+        Some(HintStatus {
+            typed: s.typed.clone(),
+            match_count: s.match_count(),
+            background: s.background,
+        })
     }
 
     fn pump_hint_events(&self) -> bool {
-        false
+        let Some(event) = take_hint_event(&self.hint_sink) else {
+            return false;
+        };
+        match event {
+            buffr_core::hint::HintConsoleEvent::Ready { hints, alphabet: _ } => {
+                let alphabet = self.hint_alphabet.clone();
+                if let Ok(mut guard) = self.hint_session.lock() {
+                    if let Some(existing) = guard.as_mut() {
+                        let background = existing.background;
+                        *existing = HintSession::new(alphabet, hints, background);
+                    }
+                }
+                true
+            }
+            buffr_core::hint::HintConsoleEvent::Error { message } => {
+                tracing::warn!(message, "webview2: hint mode: renderer reported error");
+                self.cancel_hint();
+                true
+            }
+        }
     }
 
-    fn feed_hint_key(&self, _c: char) -> Option<HintAction> {
-        None
+    fn feed_hint_key(&self, c: char) -> Option<HintAction> {
+        let mut commit_id: Option<u32> = None;
+        let mut filter_typed: Option<String> = None;
+        let mut clear = false;
+        let mut cancel = false;
+        let action = {
+            let mut guard = self.hint_session.lock().ok()?;
+            let session = guard.as_mut()?;
+            let action = session.feed(c);
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Click(id) | HintAction::OpenInBackground(id) => {
+                    commit_id = Some(*id);
+                    clear = true;
+                }
+                HintAction::Cancel => cancel = true,
+            }
+            action
+        };
+        if let Some(typed) = filter_typed {
+            let _ = self.run_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                js_string_literal(&typed)
+            ));
+        }
+        if let Some(id) = commit_id {
+            let _ = self.run_js(&format!(
+                "if (window.__buffrHintCommit) window.__buffrHintCommit({id})"
+            ));
+        }
+        if clear {
+            if let Ok(mut guard) = self.hint_session.lock() {
+                *guard = None;
+            }
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
     fn backspace_hint(&self) -> Option<HintAction> {
-        None
+        let mut filter_typed: Option<String> = None;
+        let mut cancel = false;
+        let action = {
+            let mut guard = self.hint_session.lock().ok()?;
+            let session = guard.as_mut()?;
+            let action = session.backspace();
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Cancel => cancel = true,
+                _ => {}
+            }
+            action
+        };
+        if let Some(typed) = filter_typed {
+            let _ = self.run_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                js_string_literal(&typed)
+            ));
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
     fn cancel_hint(&self) {
-        tracing::debug!("webview2: cancel_hint — no-op");
+        tracing::debug!("webview2: cancel_hint");
+        let _ = self.run_js("if (window.__buffrHintCancel) window.__buffrHintCancel()");
+        if let Ok(mut guard) = self.hint_session.lock() {
+            *guard = None;
+        }
     }
 
     // ── Favicon (Gap 1) ───────────────────────────────────────────────────────
@@ -971,6 +1093,10 @@ impl BrowserEngine for WebView2Engine {
             A::ZoomOut => self.zoom_out(),
             A::ZoomReset => self.zoom_reset(),
 
+            // ── Hint mode ─────────────────────────────────────────────────────
+            A::EnterHintMode => self.enter_hint_mode(false),
+            A::EnterHintModeBackground => self.enter_hint_mode(true),
+
             other => {
                 tracing::debug!(
                     action = ?other,
@@ -979,4 +1105,60 @@ impl BrowserEngine for WebView2Engine {
             }
         }
     }
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+impl WebView2Engine {
+    /// Inject `hint.js` into the active tab and open a hint session.
+    fn enter_hint_mode(&self, background: bool) {
+        const LABEL_BUDGET: usize = 256;
+        let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
+        let alphabet_str = self.hint_alphabet.as_string();
+        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
+
+        // Seed an empty session immediately so `is_hint_mode` returns `true`
+        // before the renderer responds.  `pump_hint_events` replaces it with the
+        // real hint list when the `ready` message arrives.
+        if let Ok(mut guard) = self.hint_session.lock() {
+            *guard = Some(HintSession::new(
+                self.hint_alphabet.clone(),
+                Vec::new(),
+                background,
+            ));
+        }
+        let _ = self.run_js(&script);
+        tracing::info!(
+            background,
+            label_budget = LABEL_BUDGET,
+            "webview2: hint mode: injected"
+        );
+    }
+}
+
+/// Format a Rust string as a JS double-quoted literal with `\uXXXX` escaping
+/// for every non-ASCII codepoint.  Mirrors `json_string_literal` from the CEF
+/// host so the inline `__buffrHintFilter` / `__buffrHintCancel` calls are safe
+/// to splice regardless of what the user typed.
+fn js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c => {
+                let mut buf = [0u16; 2];
+                for unit in c.encode_utf16(&mut buf).iter() {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
 }

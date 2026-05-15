@@ -52,6 +52,8 @@
 
 use std::sync::{Arc, Mutex, mpsc};
 
+#[cfg(target_os = "windows")]
+use buffr_core::hint::{HINT_CONSOLE_SENTINEL, HintEventSink, parse_console_event};
 use buffr_engine::TabId;
 
 use super::worker::{Command, EngineState, TabInfo};
@@ -119,11 +121,14 @@ impl TabEntry {
         engine_state: &Arc<Mutex<EngineState>>,
         environment: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
         cmd_tx: &mpsc::SyncSender<Command>,
+        hint_sink: HintEventSink,
     ) -> Result<Self, WebView2Error> {
         use webview2_com::{
+            AddScriptToExecuteOnDocumentCreatedCompletedHandler,
             CreateCoreWebView2ControllerCompletedHandler, DocumentTitleChangedEventHandler,
             HistoryChangedEventHandler, NavigationCompletedEventHandler,
             NavigationStartingEventHandler, SourceChangedEventHandler,
+            WebMessageReceivedEventHandler,
         };
         use windows::Win32::Foundation::E_POINTER;
 
@@ -441,6 +446,100 @@ impl TabEntry {
                 tracing::debug!(
                     "webview2 runtime: add_FaviconChanged skipped (older runtime?): {e}"
                 );
+            }
+        }
+
+        // ── Hint-mode: console-log interceptor (AddScriptToExecuteOnDocumentCreated) ──
+        //
+        // Inject a tiny console.log wrapper on every document load so the hint
+        // JS can tunnel events back to Rust via `window.chrome.webview.postMessage`.
+        // The script is registered before the initial navigation so it fires even
+        // on the first page.  We ignore the returned ID (we never remove the script).
+        //
+        // SAFETY: AddScriptToExecuteOnDocumentCreated is an STA COM method on a
+        // valid ICoreWebView2 pointer. The handler closure is called on the STA
+        // thread by WebView2.
+        {
+            use windows::core::HSTRING;
+            const INTERCEPT_JS: &str = concat!(
+                "(function(){",
+                "var _orig=console.log;",
+                "console.log=function(msg){",
+                "_orig.call(this,msg);",
+                "if(typeof msg==='string'&&msg.startsWith('__buffr_hint__:')){",
+                "window.chrome.webview.postMessage(msg);",
+                "}",
+                "};",
+                "})();"
+            );
+            let js_wide = HSTRING::from(INTERCEPT_JS);
+            let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+                |_hr, _id| Ok(()),
+            ));
+            // SAFETY: STA COM method; handler and js_wide are valid for the duration
+            // of this call.
+            if let Err(e) =
+                unsafe { webview.AddScriptToExecuteOnDocumentCreated(&js_wide, &handler) }
+            {
+                tracing::warn!("webview2 runtime: AddScriptToExecuteOnDocumentCreated failed: {e}");
+            } else {
+                tracing::debug!("webview2 runtime: hint console-log interceptor registered");
+            }
+        }
+
+        // ── Hint-mode: WebMessageReceived ─────────────────────────────────────
+        //
+        // Subscribe to web messages on this tab's webview.  When the injected
+        // console-log wrapper intercepts a `__buffr_hint__:…` line it calls
+        // `window.chrome.webview.postMessage(msg)`, which fires this handler on
+        // the STA thread.  We parse the JSON tail and write to `hint_sink`.
+        //
+        // Approach (a) from the spec: lock the `Arc<Mutex<…>>` directly here on
+        // the STA thread — writes are cheap (a single `Option` swap) and the
+        // lock contention is negligible.
+        {
+            let mut web_msg_token: i64 = 0;
+            // SAFETY: add_WebMessageReceived is an STA COM method.
+            // The handler closure captures `hint_sink` (Arc<Mutex<…>> — Send)
+            // and is invoked on the STA thread by WebView2.
+            if let Err(e) = unsafe {
+                webview.add_WebMessageReceived(
+                    &WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
+                        let Some(args) = args else { return Ok(()) };
+                        // TryGetWebMessageAsString returns a CoTask-allocated PWSTR.
+                        let mut msg_pwstr = windows::core::PWSTR::null();
+                        if args.TryGetWebMessageAsString(&mut msg_pwstr).is_err()
+                            || msg_pwstr.is_null()
+                        {
+                            return Ok(());
+                        }
+                        // SAFETY: msg_pwstr is a valid CoTask-allocated PWSTR; convert
+                        // then free.
+                        let line = msg_pwstr.to_string().unwrap_or_default();
+                        windows::Win32::System::Com::CoTaskMemFree(Some(msg_pwstr.0.cast()));
+
+                        if !line.contains(HINT_CONSOLE_SENTINEL) {
+                            return Ok(());
+                        }
+                        match parse_console_event(&line) {
+                            Some(Ok(event)) => {
+                                if let Ok(mut guard) = hint_sink.lock() {
+                                    *guard = Some(event);
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("webview2 runtime: malformed hint event JSON: {e}");
+                            }
+                            None => {}
+                        }
+                        Ok(())
+                    })),
+                    &mut web_msg_token,
+                )
+            } {
+                tracing::warn!("webview2 runtime: add_WebMessageReceived failed: {e}");
+            } else {
+                tracing::debug!("webview2 runtime: WebMessageReceived hint handler wired");
             }
         }
 

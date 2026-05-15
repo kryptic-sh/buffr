@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::hint::HintEventSink;
 use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebView2Error;
@@ -346,6 +347,13 @@ struct StaRuntime {
     /// support `ICoreWebView2_28::Find()`.
     #[cfg(target_os = "windows")]
     find_session: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Find>,
+    /// One-slot mailbox for `__buffr_hint__:` web-message events.
+    ///
+    /// Cloned into every new `TabEntry`'s `WebMessageReceived` handler so the
+    /// handler can write received hint events without a command-channel
+    /// round-trip.  `WebView2Engine::pump_hint_events` drains this from any
+    /// thread.
+    hint_sink: HintEventSink,
 }
 
 impl StaRuntime {
@@ -368,7 +376,14 @@ impl StaRuntime {
             st.next_tab_id()
         };
         #[cfg(target_os = "windows")]
-        let entry = TabEntry::new(id, url, &self.engine_state, &self.environment, &self.cmd_tx)?;
+        let entry = TabEntry::new(
+            id,
+            url,
+            &self.engine_state,
+            &self.environment,
+            &self.cmd_tx,
+            Arc::clone(&self.hint_sink),
+        )?;
         #[cfg(not(target_os = "windows"))]
         let entry = TabEntry::new(id, url, &self.engine_state);
         self.tabs.push(entry);
@@ -1466,6 +1481,7 @@ pub(crate) fn spawn(
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
     engine_state: Arc<Mutex<EngineState>>,
+    hint_sink: HintEventSink,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<WorkerHandle, WebView2Error> {
     let (tx, rx) = mpsc::sync_channel::<Command>(64);
@@ -1565,6 +1581,7 @@ pub(crate) fn spawn(
                 capture_in_flight: std::sync::Arc::new(std::sync::Mutex::new(false)),
                 osr_sleeping: false,
                 find_session: None,
+                hint_sink: Arc::clone(&hint_sink),
             };
 
             #[cfg(not(target_os = "windows"))]
@@ -1572,7 +1589,7 @@ pub(crate) fn spawn(
                 // Non-Windows path never reaches here (spawn is only called via
                 // the Windows platform path), but the compiler still type-checks
                 // both branches.
-                let _ = (frame, view, engine_state, data_dir);
+                let _ = (frame, view, engine_state, hint_sink, data_dir);
                 return;
             };
 
