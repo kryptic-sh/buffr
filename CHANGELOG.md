@@ -8,6 +8,66 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-15
+
+### Security
+
+- **XSS chain closed at three layers.** `javascript:` and `data:` URIs are
+  rejected by the omnibar resolver (treated as search queries), the IPC
+  single-instance accept thread (dropped before dispatch), and the navigation
+  router (`NavigationVerdict::DisallowedScheme`). Previously a crafted paste,
+  malicious second-instance invocation, or attacker-controlled bookmark could
+  reach `engine.navigate()` and execute arbitrary script.
+- **view-source SSRF closed.** `spawn_view_source_fetch` validates the URL
+  scheme is `http` or `https` before issuing the ureq fetch, blocking
+  `file:///etc/passwd` and `http://169.254.169.254/` exfiltration paths.
+- **IPC payload caps.** Forward payloads on the local socket are limited to 100
+  URLs of 1024 bytes each before scheme validation runs.
+
+### Fixed
+
+- `WindowEvent::MouseWheel` no longer panics on `active_engine_dyn().unwrap()`
+  during startup or after the last tab closes.
+- `BlinkCdpEngine::close_all_browsers` uses blocking `send` for `Shutdown` so a
+  full channel never silently leaks the worker thread + child process.
+- blink-cdp page title now sourced from `Target.targetInfoChanged` (the previous
+  `frame.name` read was almost always empty, blanking the tab strip after each
+  navigation).
+- blink-cdp `Mutex<EngineState>` lock failures recover from poison via a
+  `lock_state()` helper instead of cascading panics to the UI thread.
+- blink-cdp WebSocket `try_recv_text` returns `Ok(None)` for non-`Plain` (TLS)
+  streams instead of blocking the worker forever.
+- blink-cdp permission shim injects a `beforeunload` listener that resolves
+  pending Promises with `denied` on navigation, eliminating per-navigation
+  Promise leaks in SPAs.
+- blink-cdp pending CDP commands carry an `Instant`; entries older than 30 s are
+  swept and error-replied each iteration to bound memory under hung Chromium.
+- CEF `on_dismiss_permission_prompt` removes the dismissed entry from the
+  callback registry and neutral queue (slow-leak fix).
+- CEF `sanitise_filename` rejects Windows reserved device stems (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM[1-9]`, `LPT[1-9]`) on every platform.
+
+### Changed
+
+- `BrowserEngine::can_go_back()` and `can_go_forward()` trait defaults changed
+  from `true` to `false`. Both engines override these methods, so concrete
+  behavior is unchanged.
+- `EngineEvent`, `LoadState`, `CursorKind`, `MediaType` annotated with
+  `#[non_exhaustive]` to allow additive variants without breaking downstream
+  exhaustive matches.
+
+### Removed
+
+- `tracing::debug!` calls from CEF `view_rect` and `get_screen_info` (per-paint
+  hot path, called at 60+ Hz).
+
+### Dependencies
+
+- `buffr-config` 0.4.1 → 0.4.2
+- `buffr-engine` 0.1.2 → 0.1.3
+- `buffr-blink-cdp` 0.1.4 → 0.1.5
+- `buffr-cef` 0.1.1 → 0.1.2
+
 ## [0.11.1] - 2026-05-15
 
 ### Added
@@ -1296,7 +1356,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
 [0.10.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.10.0
