@@ -93,13 +93,40 @@ pub(crate) mod macos {
         }
     }
 
+    // ── MainQueueBox ──────────────────────────────────────────────────────────
+
+    /// A `Send`-asserting wrapper for values that must only be accessed on the
+    /// GCD main queue.
+    ///
+    /// # Safety
+    ///
+    /// The wrapped value (`T`) is `!Send` (e.g. contains ObjC objects with
+    /// `#[thread_kind = MainThreadOnly]`). We assert `Send` here because every
+    /// consumer of `MainQueueBox` passes it into a `dispatch_main_async` closure
+    /// that runs exclusively on the GCD main queue — a single serial queue.
+    ///
+    /// The `Arc<Mutex<MainQueueBox<T>>>` pattern means the value is always
+    /// accessed under the mutex, and since the GCD main queue is serial, the
+    /// mutex is never actually contended. The `Mutex` wrapper is kept because
+    /// `Arc<T>` requires `T: Sync` for the `Arc` itself to be `Send`; wrapping in
+    /// `Mutex` satisfies that without requiring `T: Sync`.
+    struct MainQueueBox<T>(T);
+
+    // SAFETY: `T` is only ever accessed from closures dispatched via
+    // `dispatch_main_async`, which run on the single serial GCD main queue.
+    // No other thread can hold a reference to the inner value simultaneously.
+    unsafe impl<T> Send for MainQueueBox<T> {}
+    // SAFETY: same guarantee — serial main queue prevents concurrent access.
+    unsafe impl<T> Sync for MainQueueBox<T> {}
+
     // ── RuntimeState (main-thread only) ───────────────────────────────────────
 
     /// Mutable per-tab WKWebView table. Accessed only from the GCD main queue.
     ///
-    /// Wrapped in `Arc<Mutex<…>>` (not `Rc<RefCell<…>>`) because
-    /// `dispatch2::DispatchQueue::exec_async` requires `Send` closures.
-    /// The GCD main queue is serial so the `Mutex` is never contended.
+    /// Stored inside `Arc<Mutex<MainQueueBox<RuntimeState>>>` so that closures
+    /// dispatched via `dispatch_main_async` (which require `Send + 'static`) can
+    /// capture an `Arc` clone. `MainQueueBox` asserts `Send + Sync` by safety
+    /// contract: all access is serialised on the GCD main queue.
     struct RuntimeState {
         tabs: Vec<TabEntry>,
         active_idx: Option<usize>,
@@ -475,10 +502,11 @@ pub(crate) mod macos {
         let (tx, rx) = mpsc::sync_channel::<Command>(64);
         let initial_url = initial_url.to_owned();
 
-        let rt = Arc::new(Mutex::new(RuntimeState::new(
-            frame,
-            view,
-            Arc::clone(&engine_state),
+        // SAFETY: `MainQueueBox<RuntimeState>` is `Send` by our invariant —
+        // all closures that touch `rt` are dispatched via `dispatch_main_async`
+        // and run exclusively on the serial GCD main queue.
+        let rt: Arc<Mutex<MainQueueBox<RuntimeState>>> = Arc::new(Mutex::new(MainQueueBox(
+            RuntimeState::new(frame, view, Arc::clone(&engine_state)),
         )));
 
         // Submit the initial open_tab to the main queue.
@@ -486,8 +514,8 @@ pub(crate) mod macos {
             let rt_init = Arc::clone(&rt);
             let url_init = initial_url.clone();
             dispatch_main_async(move || {
-                if let Ok(mut rt) = rt_init.lock() {
-                    if let Err(e) = rt.open_tab(&url_init) {
+                if let Ok(mut guard) = rt_init.lock() {
+                    if let Err(e) = guard.0.open_tab(&url_init) {
                         tracing::error!("webkit-cocoa worker: initial open_tab failed: {e}");
                     }
                 }
@@ -521,18 +549,28 @@ pub(crate) mod macos {
 
     fn handle_command(
         cmd: Command,
-        rt: &Arc<Mutex<RuntimeState>>,
+        rt: &Arc<Mutex<MainQueueBox<RuntimeState>>>,
         engine_state: &Arc<Mutex<EngineState>>,
     ) -> bool {
         match cmd {
             // ── Synchronous queries ───────────────────────────────────────────
+            //
+            // QueryCanGoBack / QueryCanGoForward: these read from RuntimeState
+            // which holds the live WKWebView. They must be dispatched to the
+            // main queue and reply via the channel.
             Command::QueryCanGoBack { reply } => {
-                let v = rt.lock().is_ok_and(|r| r.can_go_back());
-                let _ = reply.send(v);
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    let v = rt2.lock().is_ok_and(|r| r.0.can_go_back());
+                    let _ = reply.send(v);
+                });
             }
             Command::QueryCanGoForward { reply } => {
-                let v = rt.lock().is_ok_and(|r| r.can_go_forward());
-                let _ = reply.send(v);
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    let v = rt2.lock().is_ok_and(|r| r.0.can_go_forward());
+                    let _ = reply.send(v);
+                });
             }
             Command::Shutdown => {
                 return true;
@@ -545,7 +583,7 @@ pub(crate) mod macos {
                     let result = rt2
                         .lock()
                         .map_err(|_| WebKitCocoaError::WorkerGone)
-                        .and_then(|mut r| r.open_tab(&url));
+                        .and_then(|mut r| r.0.open_tab(&url));
                     let _ = reply.send(result);
                 });
             }
@@ -555,7 +593,7 @@ pub(crate) mod macos {
                     let result = rt2
                         .lock()
                         .map_err(|_| WebKitCocoaError::WorkerGone)
-                        .and_then(|mut r| r.close_tab(id));
+                        .and_then(|mut r| r.0.close_tab(id));
                     let _ = reply.send(result);
                 });
             }
@@ -563,7 +601,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.close_all();
+                        r.0.close_all();
                     }
                 });
             }
@@ -571,7 +609,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.select_tab(id);
+                        r.0.select_tab(id);
                     }
                 });
             }
@@ -579,7 +617,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.cycle_tab(forward);
+                        r.0.cycle_tab(forward);
                     }
                 });
             }
@@ -587,7 +625,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.navigate(&url);
+                        r.0.navigate(&url);
                     }
                 });
             }
@@ -595,7 +633,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.go_back();
+                        r.0.go_back();
                     }
                 });
             }
@@ -603,7 +641,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.go_forward();
+                        r.0.go_forward();
                     }
                 });
             }
@@ -611,7 +649,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.reload();
+                        r.0.reload();
                     }
                 });
             }
@@ -619,7 +657,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.stop();
+                        r.0.stop();
                     }
                 });
             }
@@ -627,7 +665,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(mut r) = rt2.lock() {
-                        r.resize(width, height);
+                        r.0.resize(width, height);
                     }
                 });
             }
@@ -635,7 +673,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(r) = rt2.lock() {
-                        r.request_active_snapshot();
+                        r.0.request_active_snapshot();
                     }
                 });
             }
@@ -643,7 +681,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(r) = rt2.lock() {
-                        r.dispatch_key_event(event);
+                        r.0.dispatch_key_event(event);
                     }
                 });
             }
@@ -651,7 +689,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(r) = rt2.lock() {
-                        r.dispatch_mouse_move(x, y, modifiers);
+                        r.0.dispatch_mouse_move(x, y, modifiers);
                     }
                 });
             }
@@ -666,7 +704,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(r) = rt2.lock() {
-                        r.dispatch_mouse_click(x, y, button, mouse_up, click_count, modifiers);
+                        r.0.dispatch_mouse_click(x, y, button, mouse_up, click_count, modifiers);
                     }
                 });
             }
@@ -680,7 +718,7 @@ pub(crate) mod macos {
                 let rt2 = Arc::clone(rt);
                 dispatch_main_async(move || {
                     if let Ok(r) = rt2.lock() {
-                        r.dispatch_mouse_wheel(x, y, delta_x, delta_y, modifiers);
+                        r.0.dispatch_mouse_wheel(x, y, delta_x, delta_y, modifiers);
                     }
                 });
             }
