@@ -1640,4 +1640,17 @@ impl BrowserEngine for FirefoxCdpEngine {
         .map(|_| ())
         .map_err(|e| buffr_engine::EngineError::Other(e.to_string()))
     }
+
+    // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
+
+    fn start_download(&self, url: &str) {
+        tracing::debug!("firefox-cdp: start_download url={url}");
+        let url_json = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
+        let js = format!(
+            "(() => {{ const a = document.createElement('a'); \
+             a.href = {url_json}; a.download = ''; \
+             document.body.appendChild(a); a.click(); a.remove(); }})();"
+        );
+        let _ = self.run_js(&js);
+    }
 }

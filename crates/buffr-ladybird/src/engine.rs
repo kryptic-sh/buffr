@@ -487,6 +487,23 @@ impl BrowserEngine for LadybirdEngine {
         Ok(())
     }
 
+    // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
+
+    /// Inject a link-click download trigger via `run_js`.
+    ///
+    /// The JS reaches the C++ stub (`EvalJs` command) and is dropped until
+    /// phase C lands (real LibJS dispatch via the Ladybird WebContentServer IPC).
+    fn start_download(&self, url: &str) {
+        tracing::debug!("ladybird: start_download url={url}");
+        let url_json = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
+        let js = format!(
+            "(() => {{ const a = document.createElement('a'); \
+             a.href = {url_json}; a.download = ''; \
+             document.body.appendChild(a); a.click(); a.remove(); }})();"
+        );
+        let _ = self.run_js(&js);
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));

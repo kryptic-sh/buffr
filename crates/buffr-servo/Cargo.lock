@@ -680,6 +680,7 @@ dependencies = [
  "buffr-modal",
  "dpi",
  "keyboard-types",
+ "serde_json",
  "servo",
  "thiserror 2.0.18",
  "tracing",

@@ -448,6 +448,13 @@ impl BrowserEngine for BlitzEngine {
         Err(EngineError::Other("blitz: no JS engine".into()))
     }
 
+    // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
+
+    fn start_download(&self, url: &str) {
+        tracing::debug!("blitz: start_download url={url}");
+        tracing::warn!("blitz: start_download not supported (no JS engine)");
+    }
+
     fn zoom_in(&self) {
         let next = (self.active_zoom_level() + 0.1).min(5.0);
         self.worker.send(Command::SetZoom(next));
