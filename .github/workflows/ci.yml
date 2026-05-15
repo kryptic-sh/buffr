@@ -234,6 +234,71 @@ jobs:
           command: check
           arguments: --all-features
 
+  # Verifies that each engine backend builds + tests cleanly on its target
+  # platform. Catches the macOS / Windows / GPU paths that the main Linux
+  # `linux` job can't exercise (webkit-cocoa platform module, webview2 COM
+  # stack, servo standalone with Mesa software rasterizer).
+  backends:
+    name: backend ${{ matrix.crate }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Cross-plat backends — build & test on Linux (host CI baseline)
+          - { os: ubuntu-latest, crate: buffr-firefox-cdp, args: "-p buffr-firefox-cdp", apt: "" }
+          - { os: ubuntu-latest, crate: buffr-blitz,       args: "-p buffr-blitz",       apt: "" }
+          - { os: ubuntu-latest, crate: buffr-ladybird,    args: "-p buffr-ladybird",    apt: "" }
+
+          # Linux-gated backend
+          - { os: ubuntu-latest, crate: buffr-webkitgtk,   args: "-p buffr-webkitgtk",   apt: "libwebkitgtk-6.0-dev libgtk-4-dev libglib2.0-dev" }
+
+          # macOS-gated backend — exercises the platform/ module (untestable on Linux)
+          - { os: macos-latest,  crate: buffr-webkit-cocoa, args: "-p buffr-webkit-cocoa", apt: "" }
+
+          # Windows-gated backend — exercises the platform/ module on MSVC
+          - { os: windows-latest, crate: buffr-webview2,   args: "-p buffr-webview2",     apt: "" }
+
+          # Servo: standalone crate (outside workspace). Build only — runtime
+          # tests are #[ignore] because servo's compositor needs EGL/GPU which
+          # GitHub's ubuntu-latest doesn't provide reliably. The build pass
+          # validates the 690-crate dep graph + our integration code compiles.
+          - { os: ubuntu-latest, crate: buffr-servo,       args: "--manifest-path crates/buffr-servo/Cargo.toml", apt: "libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev pkg-config" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: install apt deps
+        if: runner.os == 'Linux' && matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backends-${{ matrix.crate }}-${{ matrix.os }}
+
+      - name: cargo build
+        run: cargo build ${{ matrix.args }}
+
+      - name: cargo test
+        # Skip tests on the servo standalone matrix entry — they need a GPU.
+        # All other backends have either offline tests or stub-path tests
+        # that work fine without a display server.
+        if: matrix.crate != 'buffr-servo'
+        run: cargo test ${{ matrix.args }}
+
+      - name: cargo clippy
+        run: cargo clippy ${{ matrix.args }} --tests -- -D warnings
+
   bundle-macos-cross:
     # Cross-bundle the macOS .app on a Linux runner. Catches
     # `xtask bundle-macos` regressions per-commit without paying for a real
