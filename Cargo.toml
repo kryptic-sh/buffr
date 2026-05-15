@@ -7,7 +7,6 @@ members = [
     "crates/buffr-blitz",
     "crates/buffr-firefox-cdp",
     "crates/buffr-ladybird",
-    "crates/buffr-servo",
     "crates/buffr-webkit-cocoa",
     "crates/buffr-webkitgtk",
     "crates/buffr-webview2",
@@ -30,7 +29,15 @@ members = [
 # crates.io-published stub that owns the `buffr` name on crates.io.
 # Publish it independently:
 #   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
-exclude = ["apps/buffr-stub", "fuzz"]
+#
+# `crates/buffr-servo` is also intentionally outside the workspace.
+# Servo 0.1.0 pins stylo 0.15; blitz 0.3-alpha.2 pins stylo 0.16.
+# Both crates are `links = "servo_style_crate"`, so they cannot share
+# one Cargo.lock. Keeping buffr-servo standalone lets it resolve its
+# own stylo + libsqlite3-sys + transitive Servo deps without forcing
+# downgrades on the rest of the workspace.  Build with:
+#   cargo build --manifest-path crates/buffr-servo/Cargo.toml
+exclude = ["apps/buffr-stub", "crates/buffr-servo", "fuzz"]
 # `cargo build` (no -p) builds all three app binaries — supervisor,
 # browser, and helper — so a sibling-resolved `target/debug/buffr-app`
 # exists when you `cargo run -b buffr`. Multiple bins make `cargo run`
@@ -104,7 +111,7 @@ buffr-blink-cdp = "0.1"
 buffr-blitz = { path = "crates/buffr-blitz" }
 buffr-firefox-cdp = { path = "crates/buffr-firefox-cdp" }
 buffr-ladybird = { path = "crates/buffr-ladybird" }
-buffr-servo = { path = "crates/buffr-servo" }
+# buffr-servo is intentionally absent — see [workspace.exclude] above.
 buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
 buffr-webkitgtk = { path = "crates/buffr-webkitgtk" }
 buffr-webview2 = { path = "crates/buffr-webview2" }
