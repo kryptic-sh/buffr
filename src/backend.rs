@@ -24,11 +24,32 @@ pub type NewTabHtmlProvider = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
 /// `buffr-core`) are erased as [`std::any::Any`] so `buffr-engine`
 /// stays free of `buffr-core` imports. Each backend's `open_engine`
 /// implementation downcasts `sinks` back to its concrete type.
+///
+/// # Persistent / ephemeral split
+///
+/// Some engines can separate long-lived state (cookies, localStorage,
+/// history) from ephemeral caches (HTTP response cache, GPU shader cache,
+/// V8 code cache, etc.):
+///
+/// - `data_dir` — persistent profile directory. Always honoured by every
+///   backend that stores on-disk state.
+/// - `cache_dir` — ephemeral cache directory. Only blink-cdp currently
+///   supports this via `--disk-cache-dir`. CEF silently ignores it (CEF
+///   uses a single `cache_path` for both persistent and ephemeral data).
 pub struct BackendOpenOptions<'a> {
     /// Logical identifier for this engine instance (from config).
     pub engine_id: EngineId,
-    /// Optional on-disk data / profile directory.
+    /// Optional on-disk data / profile directory (persistent state:
+    /// cookies, localStorage, history, etc.).
     pub data_dir: Option<&'a Path>,
+    /// Optional ephemeral cache directory for engines that support a
+    /// persistent/ephemeral split (e.g. blink-cdp via `--disk-cache-dir`).
+    ///
+    /// When `Some`, the engine writes ephemeral data (HTTP cache, GPU
+    /// shader cache, code cache, etc.) here instead of inside `data_dir`.
+    /// Engines that do not support a split (e.g. CEF) ignore this field
+    /// and store everything in `data_dir`.
+    pub cache_dir: Option<&'a Path>,
     /// URL to navigate to when the first tab is created.
     pub initial_url: &'a str,
     /// Requested OSR frame rate in Hz.
