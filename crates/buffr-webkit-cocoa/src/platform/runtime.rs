@@ -356,7 +356,7 @@ pub(crate) mod macos {
     //   webView:didFailProvisionalNavigation:withError: → line ~240
 
     /// Ivars stored inside `BuffrNavigationDelegate` Objective-C instances.
-    pub(crate) struct NavDelegateIvars {
+    pub struct NavDelegateIvars {
         tab_id: TabId,
         state: Arc<Mutex<EngineState>>,
     }
@@ -525,7 +525,7 @@ pub(crate) mod macos {
     // The selector and block signature are in WKUIDelegate.rs.
 
     /// Ivars for `BuffrUiDelegate` — none needed, so use the unit type.
-    pub(crate) struct UiDelegateIvars;
+    pub struct UiDelegateIvars;
 
     define_class!(
         /// UI delegate that suppresses JavaScript dialogs.
