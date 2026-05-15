@@ -12,5 +12,20 @@ publish = false
 
 [dependencies]
 buffr-engine.workspace = true
+buffr-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+url.workspace = true
+ureq = { workspace = true }
+tungstenite = "0.24"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+open = "5"
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -1,83 +1,640 @@
-//! [`FirefoxCdpEngine`] — stub [`BrowserEngine`] impl for the Firefox CDP backend.
+//! `FirefoxCdpEngine` — `BrowserEngine` impl backed by headless Firefox via CDP.
+//!
+//! Firefox supports a subset of Chrome DevTools Protocol (CDP) via its Remote
+//! Agent. This engine drives Firefox over that subset.
+//!
+//! # Key Firefox differences from blink-cdp
+//!
+//! - **No `Page.startScreencast`**: Firefox CDP has no streaming screencast.
+//!   OSR uses a `Page.captureScreenshot` poll loop at 4 fps (Phase B hard-code;
+//!   tunable in Phase C). This is the canonical Firefox-CDP OSR approach.
+//! - **Profile not user-data-dir**: Firefox requires `--profile <dir>` with a
+//!   pre-initialised `prefs.js` to enable the Remote Agent and suppress the
+//!   first-run wizard.
+//! - **`Emulation.setDeviceMetricsOverride`** instead of
+//!   `Page.setDeviceMetricsOverride` for viewport.
+//! - **`Browser.grantPermissions`** is deferred (not supported in Firefox CDP).
+//!
+//! # Phase B scope
+//!
+//! Implemented:
+//! - `open_tab`, `open_tab_background`, `open_tab_at`, `close_tab`, `close_active`
+//! - `select_tab`, `next_tab`, `prev_tab`
+//! - `navigate`, `go_back`, `go_forward`, `reload`, `stop`
+//! - `active_tab`, `tabs_summary`, `tab_count`, `active_index`, `active_tab_live_url`
+//! - `osr_resize`, `osr_frame`, `osr_view`
+//! - `osr_key_event`, `osr_mouse_move`, `osr_mouse_click`, `osr_mouse_leave`,
+//!   `osr_mouse_wheel`
+//! - `pump_address_changes`
+//!
+//! Still `Unimplemented`:
+//! - popup_*, hint_*, find_*, zoom_*, devtools_*, scheme_handler_*, audio_*, video_*
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use buffr_engine::{
-    BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
-    NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
-    engine_id::EngineId,
+    BrowserEngine, EngineError, HintAction, HintStatus, MouseButton, NeutralKeyEvent, OsrFrame,
+    OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
         new_popup_queue,
     },
 };
 
+use crate::cdp::{
+    AttachToTargetParams, CdpCommand, CloseTargetParams, CreateTargetParams,
+    DispatchKeyEventParams, DispatchMouseEventParams, SetDeviceMetricsParams, key_event_type,
+    mouse_button_str, next_id,
+};
 use crate::error::FirefoxError;
+use crate::subprocess::{find_firefox, init_profile, pick_free_port, probe_ws_url, spawn_headless};
+use crate::worker::{Command, TitleMap, UrlUpdateSink, new_title_map, new_url_update_sink, run};
+use crate::ws::WsClient;
 
-/// Firefox CDP browser engine stub.
+// ── Internal tab representation ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct FfTab {
+    id: TabId,
+    target_id: String,
+    session_id: String,
+    url: String,
+    title: String,
+}
+
+impl FfTab {
+    fn to_summary(&self, is_loading: bool) -> TabSummary {
+        TabSummary {
+            id: self.id,
+            browser_id: 0,
+            title: self.title.clone(),
+            url: self.url.clone(),
+            progress: if is_loading { 0.5 } else { 1.0 },
+            is_loading,
+            pinned: false,
+            private: false,
+        }
+    }
+}
+
+// ── Engine state ──────────────────────────────────────────────────────────────
+
+struct EngineState {
+    tabs: Vec<FfTab>,
+    active: Option<TabId>,
+    next_tab_id: u64,
+    /// CDP remote-debugging port. Kept for devtools URL construction (Phase C).
+    #[allow(dead_code)]
+    debug_port: u16,
+    /// Maps `target_id → original_url` for tabs navigated via internal schemes.
+    original_urls: HashMap<String, String>,
+}
+
+impl EngineState {
+    fn new(debug_port: u16) -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: None,
+            next_tab_id: 1,
+            debug_port,
+            original_urls: HashMap::new(),
+        }
+    }
+
+    fn mint_tab_id(&mut self) -> TabId {
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        id
+    }
+
+    fn tab_by_id(&self, id: TabId) -> Option<&FfTab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    fn active_tab(&self) -> Option<&FfTab> {
+        let id = self.active?;
+        self.tab_by_id(id)
+    }
+}
+
+// ── Public engine struct ──────────────────────────────────────────────────────
+
+/// Return the display URL for a tab, preferring any stashed original URL.
+fn display_url_for<'a>(tab: &'a FfTab, original_urls: &'a HashMap<String, String>) -> &'a str {
+    original_urls
+        .get(&tab.target_id)
+        .map(String::as_str)
+        .unwrap_or(tab.url.as_str())
+}
+
+/// Headless Firefox engine driven over Chrome DevTools Protocol.
 ///
-/// Phase A: all methods return `EngineError::Unimplemented`. Phase B will
-/// wire real Firefox CDP integration.
+/// Construct via [`FirefoxCdpEngine::new`]. Each instance owns a dedicated
+/// Firefox subprocess and a single CDP WebSocket connection.
 pub struct FirefoxCdpEngine {
-    engine_id: EngineId,
-    // Phase B will add real fields.
+    state: Arc<Mutex<EngineState>>,
+    cmd_tx: SyncSender<Command>,
+    osr_frame: SharedOsrFrame,
+    osr_view: SharedOsrViewState,
+    worker: Option<JoinHandle<()>>,
+    subprocess: Arc<Mutex<Option<std::process::Child>>>,
+    popup_queue: PopupQueue,
+    popup_create_sink: PopupCreateSink,
+    popup_close_sink: PopupCloseSink,
+    url_update_sink: UrlUpdateSink,
+    loading_state: Arc<Mutex<HashMap<String, bool>>>,
+    nav_count: Arc<Mutex<HashMap<String, usize>>>,
+    title_map: TitleMap,
 }
 
 impl FirefoxCdpEngine {
-    pub fn new(options: &BackendOpenOptions<'_>) -> Result<Self, FirefoxError> {
+    /// Construct a new engine instance.
+    ///
+    /// Locates a Firefox binary, probes the OS for a free port, initialises
+    /// the profile directory with the required `prefs.js`, spawns Firefox
+    /// in headless mode, waits for the CDP endpoint, then connects the
+    /// WebSocket and starts the worker thread.
+    ///
+    /// `profile_dir` is used as the Firefox profile directory (`--profile`).
+    ///
+    /// `private` — when `true`, passes `--private-window` to Firefox.
+    pub fn new(profile_dir: &Path, private: bool) -> Result<Self, FirefoxError> {
+        let firefox = find_firefox().ok_or(FirefoxError::FirefoxNotFound)?;
+
+        let port = pick_free_port()?;
+
+        init_profile(profile_dir)?;
+
+        let child = spawn_headless(&firefox, port, profile_dir, private)?;
+
+        let ws_url = probe_ws_url(
+            port,
+            crate::subprocess::WS_PROBE_MAX_RETRIES,
+            Duration::from_millis(crate::subprocess::WS_PROBE_INTERVAL_MS),
+        )?;
+
+        let ws = WsClient::connect(&ws_url)?;
+
+        let osr_frame = Arc::new(Mutex::new(OsrFrame::new(1280, 800)));
+        let osr_view = Arc::new(OsrViewState::new());
+
+        let url_update_sink = new_url_update_sink();
+        let loading_state: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+        let nav_count: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        let title_map = new_title_map();
+
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(crate::worker::WORKER_CMD_CHANNEL_CAP);
+
+        let worker_frame = Arc::clone(&osr_frame);
+        let worker_view = Arc::clone(&osr_view);
+        let worker_url_sink = Arc::clone(&url_update_sink);
+        let worker_loading = Arc::clone(&loading_state);
+        let worker_nav = Arc::clone(&nav_count);
+        let worker_title = Arc::clone(&title_map);
+
+        let worker = std::thread::Builder::new()
+            .name("firefox-cdp-worker".to_owned())
+            .spawn(move || {
+                run(
+                    ws,
+                    cmd_rx,
+                    worker_frame,
+                    worker_view,
+                    worker_url_sink,
+                    worker_loading,
+                    worker_nav,
+                    worker_title,
+                )
+            })
+            .map_err(FirefoxError::SpawnFailed)?;
+
         Ok(Self {
-            engine_id: options.engine_id.clone(),
+            state: Arc::new(Mutex::new(EngineState::new(port))),
+            cmd_tx,
+            osr_frame,
+            osr_view,
+            worker: Some(worker),
+            subprocess: Arc::new(Mutex::new(Some(child))),
+            popup_queue: new_popup_queue(),
+            popup_create_sink: new_popup_create_sink(),
+            popup_close_sink: new_popup_close_sink(),
+            url_update_sink,
+            loading_state,
+            nav_count,
+            title_map,
         })
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, EngineState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Send a browser-level CDP command and wait for the response.
+    fn browser_cmd(
+        &self,
+        method: &'static str,
+        params: impl serde::Serialize,
+    ) -> Result<serde_json::Value, FirefoxError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let cmd = CdpCommand {
+            id: next_id(),
+            method,
+            params: Some(serde_json::to_value(params).unwrap_or(serde_json::Value::Null)),
+            session_id: None,
+        };
+        self.cmd_tx
+            .try_send(Command::BrowserCmd {
+                cmd,
+                reply: reply_tx,
+            })
+            .map_err(|_| FirefoxError::WorkerDead)?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(
+                crate::worker::CDP_RESPONSE_TIMEOUT_SECS,
+            ))
+            .map_err(|_| FirefoxError::Timeout { method })
+            .and_then(|r| r)
+    }
+
+    /// Send a session-scoped CDP command and wait for the response.
+    fn session_cmd(
+        &self,
+        session_id: &str,
+        method: &'static str,
+        params: impl serde::Serialize,
+    ) -> Result<serde_json::Value, FirefoxError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let cmd = CdpCommand {
+            id: next_id(),
+            method,
+            params: Some(serde_json::to_value(params).unwrap_or(serde_json::Value::Null)),
+            session_id: Some(session_id.to_owned()),
+        };
+        self.cmd_tx
+            .try_send(Command::SessionCmd {
+                session_id: session_id.to_owned(),
+                cmd,
+                reply: reply_tx,
+            })
+            .map_err(|_| FirefoxError::WorkerDead)?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(
+                crate::worker::CDP_RESPONSE_TIMEOUT_SECS,
+            ))
+            .map_err(|_| FirefoxError::Timeout { method })
+            .and_then(|r| r)
+    }
+
+    /// Create a new CDP target (page) and attach to it.
+    ///
+    /// Returns `(target_id, session_id)`.
+    fn create_and_attach(&self, url: &str) -> Result<(String, String), FirefoxError> {
+        let result = self.browser_cmd(
+            "Target.createTarget",
+            CreateTargetParams {
+                url: url.to_owned(),
+            },
+        )?;
+        let target_id = result
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                FirefoxError::Protocol("missing targetId in createTarget response".into())
+            })?
+            .to_owned();
+
+        let result = self.browser_cmd(
+            "Target.attachToTarget",
+            AttachToTargetParams {
+                target_id: target_id.clone(),
+                flatten: true,
+            },
+        )?;
+        let session_id = result
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                FirefoxError::Protocol("missing sessionId in attachToTarget response".into())
+            })?
+            .to_owned();
+
+        Ok((target_id, session_id))
+    }
+
+    /// Internal open-tab implementation.
+    ///
+    /// `make_active` — whether to switch to the new tab immediately.
+    /// `insert_idx` — when `Some(i)`, insert at that position instead of pushing.
+    fn open_tab_internal(
+        &self,
+        url: &str,
+        make_active: bool,
+        insert_idx: Option<usize>,
+    ) -> Result<TabId, EngineError> {
+        // Open with about:blank first so we can set up metrics before loading.
+        let (target_id, session_id) = self
+            .create_and_attach("about:blank")
+            .map_err(EngineError::from)?;
+
+        // Helper: run a session setup command, warn but continue on failure.
+        let setup_cmd = |engine: &Self, method: &'static str, params: serde_json::Value| {
+            if let Err(e) = engine.session_cmd(&session_id, method, params) {
+                tracing::warn!(
+                    target_id = %target_id,
+                    method,
+                    error = %e,
+                    "firefox-cdp: session setup command failed"
+                );
+            }
+        };
+
+        // Enable Page domain for frameNavigated events.
+        setup_cmd(self, "Page.enable", serde_json::json!({}));
+        // Enable Runtime domain for Runtime.evaluate.
+        setup_cmd(self, "Runtime.enable", serde_json::json!({}));
+
+        // Enable lifecycle events for loading state tracking.
+        setup_cmd(
+            self,
+            "Page.setLifecycleEventsEnabled",
+            serde_json::json!({ "enabled": true }),
+        );
+        if let Ok(mut map) = self.loading_state.lock() {
+            map.insert(session_id.clone(), true);
+        }
+
+        // Apply initial viewport metrics.
+        let (w, h) = self.viewport_dims();
+        setup_cmd(
+            self,
+            "Emulation.setDeviceMetricsOverride",
+            serde_json::to_value(SetDeviceMetricsParams {
+                width: w.max(1),
+                height: h.max(1),
+                device_scale_factor: 1.0,
+                mobile: false,
+            })
+            .unwrap_or(serde_json::Value::Null),
+        );
+
+        // Navigate to the real URL.
+        tracing::debug!(url, "firefox-cdp: navigating to real URL");
+        let (nav_reply_tx, nav_reply_rx) = mpsc::channel();
+        self.cmd_tx
+            .try_send(Command::Navigate {
+                session_id: session_id.clone(),
+                url: url.to_owned(),
+                reply: nav_reply_tx,
+            })
+            .map_err(|_| EngineError::Other("worker channel full during open_tab".into()))?;
+        match nav_reply_rx.recv_timeout(Duration::from_secs(
+            crate::worker::CDP_RESPONSE_TIMEOUT_SECS,
+        )) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(url, error = %e, "firefox-cdp: initial navigation error (continuing)");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    url,
+                    "firefox-cdp: initial navigation timed out (continuing)"
+                );
+            }
+        }
+
+        let mut state = self.lock_state();
+        let tab_id = state.mint_tab_id();
+        let tab = FfTab {
+            id: tab_id,
+            target_id: target_id.clone(),
+            session_id: session_id.clone(),
+            url: url.to_owned(),
+            title: url.to_owned(),
+        };
+        match insert_idx {
+            Some(idx) => {
+                let clamped = idx.min(state.tabs.len());
+                state.tabs.insert(clamped, tab);
+            }
+            None => state.tabs.push(tab),
+        }
+        if make_active || state.active.is_none() {
+            state.active = Some(tab_id);
+            drop(state);
+            let _ = self.cmd_tx.try_send(Command::SetActiveSession {
+                session_id: Some(session_id),
+            });
+        }
+        Ok(tab_id)
+    }
+
+    /// Read current viewport dimensions from the shared view state.
+    fn viewport_dims(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering;
+        let v = &self.osr_view;
+        (
+            v.width.load(Ordering::Relaxed).max(1),
+            v.height.load(Ordering::Relaxed).max(1),
+        )
     }
 }
 
+// ── Drop ──────────────────────────────────────────────────────────────────────
+
+impl Drop for FirefoxCdpEngine {
+    fn drop(&mut self) {
+        tracing::debug!("firefox-cdp: Drop — shutting down worker and subprocess");
+
+        if let Err(e) = self.cmd_tx.send(Command::Shutdown) {
+            tracing::debug!(error = %e, "firefox-cdp: Drop — Shutdown send failed (worker already gone)");
+        }
+
+        if let Some(handle) = self.worker.take()
+            && let Err(e) = handle.join()
+        {
+            tracing::warn!("firefox-cdp: Drop — worker thread panicked: {:?}", e);
+        }
+
+        if let Ok(mut guard) = self.subprocess.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            tracing::debug!("firefox-cdp: Drop — Firefox subprocess killed");
+        }
+    }
+}
+
+// ── BrowserEngine impl ────────────────────────────────────────────────────────
+
 impl BrowserEngine for FirefoxCdpEngine {
+    // ── Lifecycle ────────────────────────────────────────────────────────────
+
     fn close_all_browsers(&self) {
-        tracing::debug!("firefox-cdp::close_all_browsers not yet implemented");
+        tracing::debug!("firefox-cdp: close_all_browsers");
+        let _ = self
+            .cmd_tx
+            .try_send(Command::SetActiveSession { session_id: None });
+        if let Err(e) = self.cmd_tx.send(Command::Shutdown) {
+            tracing::warn!(error = %e, "firefox-cdp: close_all_browsers — Shutdown send failed");
+        }
+        if let Ok(mut guard) = self.subprocess.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.tabs.clear();
+            state.active = None;
+            state.original_urls.clear();
+        }
     }
 
-    fn open_tab(&self, _url: &str) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented { method: "open_tab" })
+    // ── Tabs ─────────────────────────────────────────────────────────────────
+
+    fn open_tab(&self, url: &str) -> Result<TabId, EngineError> {
+        tracing::debug!(url, "firefox-cdp: open_tab");
+        self.open_tab_internal(url, true, None)
     }
 
-    fn open_tab_background(&self, _url: &str) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "open_tab_background",
-        })
+    fn open_tab_background(&self, url: &str) -> Result<TabId, EngineError> {
+        tracing::debug!(url, "firefox-cdp: open_tab_background");
+        self.open_tab_internal(url, false, None)
     }
 
-    fn open_tab_at(&self, _url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "open_tab_at",
-        })
+    fn open_tab_at(&self, url: &str, insert_idx: usize) -> Result<TabId, EngineError> {
+        tracing::debug!(url, insert_idx, "firefox-cdp: open_tab_at");
+        self.open_tab_internal(url, true, Some(insert_idx))
     }
 
-    fn close_tab(&self, _id: TabId) -> Result<bool, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "close_tab",
-        })
+    fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
+        tracing::debug!(%id, "firefox-cdp: close_tab");
+        let (target_id, session_id, was_active) = {
+            let state = self.lock_state();
+            let tab = state.tab_by_id(id).ok_or(EngineError::TabNotFound(id))?;
+            (
+                tab.target_id.clone(),
+                tab.session_id.clone(),
+                state.active == Some(id),
+            )
+        };
+
+        // Close the CDP target.
+        if let Err(e) = self.browser_cmd(
+            "Target.closeTarget",
+            CloseTargetParams {
+                target_id: target_id.clone(),
+            },
+        ) {
+            tracing::warn!(%id, error = %e, "firefox-cdp: close_tab — closeTarget failed (continuing)");
+        }
+
+        // Clean up per-session state.
+        if let Ok(mut m) = self.loading_state.lock() {
+            m.remove(&session_id);
+        }
+        if let Ok(mut m) = self.nav_count.lock() {
+            m.remove(&session_id);
+        }
+
+        let mut state = self.lock_state();
+        state.tabs.retain(|t| t.id != id);
+        state.original_urls.remove(&target_id);
+
+        if was_active {
+            state.active = state.tabs.last().map(|t| t.id);
+            let new_session = state.active.and_then(|active_id| {
+                state
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == active_id)
+                    .map(|t| t.session_id.clone())
+            });
+            drop(state);
+            let _ = self.cmd_tx.try_send(Command::SetActiveSession {
+                session_id: new_session,
+            });
+        }
+
+        let remaining = self.lock_state().tabs.len();
+        Ok(remaining > 0)
     }
 
     fn close_active(&self) -> Result<bool, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "close_active",
-        })
+        let id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active
+            .ok_or(EngineError::NoActiveTab)?;
+        self.close_tab(id)
     }
 
-    fn select_tab(&self, _id: TabId) {
-        tracing::debug!("firefox-cdp::select_tab not yet implemented");
+    fn select_tab(&self, id: TabId) {
+        tracing::debug!(%id, "firefox-cdp: select_tab");
+        let mut state = self.lock_state();
+        if let Some(tab) = state.tab_by_id(id) {
+            let session_id = tab.session_id.clone();
+            state.active = Some(id);
+            drop(state);
+            let _ = self.cmd_tx.try_send(Command::SetActiveSession {
+                session_id: Some(session_id),
+            });
+        }
     }
 
     fn next_tab(&self) {
-        tracing::debug!("firefox-cdp::next_tab not yet implemented");
+        let (len, current_idx) = {
+            let state = self.lock_state();
+            let len = state.tabs.len();
+            let idx = state
+                .active
+                .and_then(|id| state.tabs.iter().position(|t| t.id == id))
+                .unwrap_or(0);
+            (len, idx)
+        };
+        if len == 0 {
+            return;
+        }
+        let next_idx = (current_idx + 1) % len;
+        let id = self.lock_state().tabs[next_idx].id;
+        self.select_tab(id);
     }
 
     fn prev_tab(&self) {
-        tracing::debug!("firefox-cdp::prev_tab not yet implemented");
+        let (len, current_idx) = {
+            let state = self.lock_state();
+            let len = state.tabs.len();
+            let idx = state
+                .active
+                .and_then(|id| state.tabs.iter().position(|t| t.id == id))
+                .unwrap_or(0);
+            (len, idx)
+        };
+        if len == 0 {
+            return;
+        }
+        let prev_idx = if current_idx == 0 {
+            len - 1
+        } else {
+            current_idx - 1
+        };
+        let id = self.lock_state().tabs[prev_idx].id;
+        self.select_tab(id);
     }
 
     fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::debug!("firefox-cdp::move_tab not yet implemented");
+        tracing::warn!("firefox-cdp: move_tab not implemented in Phase B");
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
@@ -87,11 +644,11 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn toggle_pin_active(&self) {
-        tracing::debug!("firefox-cdp::toggle_pin_active not yet implemented");
+        tracing::warn!("firefox-cdp: toggle_pin_active not implemented in Phase B");
     }
 
     fn set_pinned(&self, _id: TabId, _pinned: bool) {
-        tracing::debug!("firefox-cdp::set_pinned not yet implemented");
+        tracing::warn!("firefox-cdp: set_pinned not implemented in Phase B");
     }
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
@@ -105,15 +662,59 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn active_tab(&self) -> Option<TabSummary> {
-        None
+        let state = self.lock_state();
+        let loading = self.loading_state.lock().ok();
+        let titles = self.title_map.lock().ok();
+        state.active_tab().map(|t| {
+            let is_loading = loading
+                .as_ref()
+                .and_then(|m| m.get(&t.session_id))
+                .copied()
+                .unwrap_or(false);
+            let display = display_url_for(t, &state.original_urls).to_owned();
+            let mut summary = t.to_summary(is_loading);
+            summary.url = display;
+            if let Some(live_title) = titles
+                .as_ref()
+                .and_then(|m| m.get(&t.target_id))
+                .filter(|s| !s.is_empty())
+            {
+                summary.title = live_title.clone();
+            }
+            summary
+        })
     }
 
     fn tabs_summary(&self) -> Vec<TabSummary> {
-        vec![]
+        let state = self.lock_state();
+        let loading = self.loading_state.lock().ok();
+        let titles = self.title_map.lock().ok();
+        state
+            .tabs
+            .iter()
+            .map(|t| {
+                let is_loading = loading
+                    .as_ref()
+                    .and_then(|m| m.get(&t.session_id))
+                    .copied()
+                    .unwrap_or(false);
+                let display = display_url_for(t, &state.original_urls).to_owned();
+                let mut summary = t.to_summary(is_loading);
+                summary.url = display;
+                if let Some(live_title) = titles
+                    .as_ref()
+                    .and_then(|m| m.get(&t.target_id))
+                    .filter(|s| !s.is_empty())
+                {
+                    summary.title = live_title.clone();
+                }
+                summary
+            })
+            .collect()
     }
 
     fn tab_count(&self) -> usize {
-        0
+        self.lock_state().tabs.len()
     }
 
     fn pinned_count(&self) -> usize {
@@ -121,103 +722,330 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn active_index(&self) -> Option<usize> {
-        None
+        let state = self.lock_state();
+        let active = state.active?;
+        state.tabs.iter().position(|t| t.id == active)
     }
 
-    fn navigate(&self, _url: &str) -> Result<(), EngineError> {
-        Err(EngineError::Unimplemented { method: "navigate" })
+    fn can_go_back(&self) -> bool {
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        let Some(sess) = session_id else { return false };
+        self.nav_count
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&sess).copied())
+            .unwrap_or(0)
+            >= 2
     }
 
-    fn active_tab_live_url(&self) -> String {
-        String::new()
-    }
-
-    fn pump_address_changes(&self) -> bool {
+    fn can_go_forward(&self) -> bool {
+        // Firefox CDP doesn't expose a forward-history signal without a JS call.
         false
     }
 
-    fn resize(&self, _width: u32, _height: u32) {
-        tracing::debug!("firefox-cdp::resize not yet implemented");
+    // ── Navigation ───────────────────────────────────────────────────────────
+
+    fn navigate(&self, url: &str) -> Result<(), EngineError> {
+        tracing::debug!(url, "firefox-cdp: navigate");
+
+        let (session_id, target_id) = {
+            let state = self.lock_state();
+            let tab = state.active_tab().ok_or(EngineError::NoActiveTab)?;
+            (tab.session_id.clone(), tab.target_id.clone())
+        };
+
+        // Optimistically update state; real URL arrives via Page.frameNavigated.
+        {
+            let mut state = self.lock_state();
+            if let Some(id) = state.active
+                && let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id)
+            {
+                tab.url = url.to_owned();
+                tab.title = url.to_owned();
+            }
+            state.original_urls.remove(&target_id);
+        }
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.cmd_tx
+            .try_send(Command::Navigate {
+                session_id,
+                url: url.to_owned(),
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::Other("worker channel full".into()))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(
+                crate::worker::CDP_RESPONSE_TIMEOUT_SECS,
+            ))
+            .map_err(|_| EngineError::Other("navigate timed out".into()))
+            .and_then(|r| r.map(|_| ()).map_err(EngineError::from))
     }
 
-    fn set_device_scale(&self, _scale: f32) {
-        tracing::debug!("firefox-cdp::set_device_scale not yet implemented");
+    fn active_tab_live_url(&self) -> String {
+        let state = self.lock_state();
+        state
+            .active_tab()
+            .map(|t| display_url_for(t, &state.original_urls).to_owned())
+            .unwrap_or_default()
     }
 
-    fn set_frame_rate(&self, _hz: u32) {
-        tracing::debug!("firefox-cdp::set_frame_rate not yet implemented");
+    fn pump_address_changes(&self) -> bool {
+        let updates: Vec<(String, String, String)> = {
+            match self.url_update_sink.lock() {
+                Ok(mut sink) => sink.drain(..).collect(),
+                Err(_) => return false,
+            }
+        };
+
+        if updates.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        let mut state = self.lock_state();
+        for (session_id, url, title) in updates {
+            let tab_info = state
+                .tabs
+                .iter()
+                .find(|t| t.session_id == session_id)
+                .map(|t| (t.target_id.clone(), t.url.clone()));
+
+            if let Some((target_id, old_url)) = tab_info {
+                let has_original = state.original_urls.contains_key(&target_id);
+                if !has_original && old_url != url {
+                    if let Some(t) = state.tabs.iter_mut().find(|t| t.target_id == target_id) {
+                        t.url = url;
+                        if !title.is_empty() {
+                            t.title = title;
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    // ── Viewport ─────────────────────────────────────────────────────────────
+
+    fn resize(&self, width: u32, height: u32) {
+        use std::sync::atomic::Ordering;
+        self.osr_view.width.store(width, Ordering::Relaxed);
+        self.osr_view.height.store(height, Ordering::Relaxed);
+        self.osr_resize(width, height);
+    }
+
+    fn set_device_scale(&self, scale: f32) {
+        self.osr_view.set_scale(scale);
+        tracing::debug!(
+            scale,
+            "firefox-cdp: set_device_scale (scale stored, not forwarded to CDP)"
+        );
+    }
+
+    fn set_frame_rate(&self, hz: u32) {
+        use std::sync::atomic::Ordering;
+        self.osr_view.frame_rate_hz.store(hz, Ordering::Relaxed);
+        // Phase B: poll rate is hard-coded at 4 fps in the worker.
+        // Phase C will wire this to the OSR_POLL_INTERVAL_MS via an atomic.
+        tracing::debug!(
+            hz,
+            "firefox-cdp: set_frame_rate (hard-coded 4 fps in Phase B)"
+        );
     }
 
     fn notify_screen_info_changed(&self) {
-        tracing::debug!("firefox-cdp::notify_screen_info_changed not yet implemented");
+        // No-op.
     }
 
-    fn osr_resize(&self, _width: u32, _height: u32) {
-        tracing::debug!("firefox-cdp::osr_resize not yet implemented");
+    fn osr_resize(&self, width: u32, height: u32) {
+        tracing::debug!(width, height, "firefox-cdp: osr_resize");
+        let session_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_tab()
+            .map(|t| t.session_id.clone());
+        if let Some(sess) = session_id {
+            let _ = self.cmd_tx.try_send(Command::Resize {
+                session_id: sess,
+                width: width.max(1),
+                height: height.max(1),
+            });
+        }
+        if let Ok(mut frame) = self.osr_frame.lock() {
+            frame.needs_fresh = true;
+        }
     }
 
-    fn osr_key_event(&self, _event: NeutralKeyEvent) {
-        tracing::debug!("firefox-cdp::osr_key_event not yet implemented");
+    // ── Input ────────────────────────────────────────────────────────────────
+
+    fn osr_key_event(&self, event: NeutralKeyEvent) {
+        let session_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_tab()
+            .map(|t| t.session_id.clone());
+        let Some(session_id) = session_id else { return };
+
+        let text = if event.character != 0 {
+            char::from_u32(event.character as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let unmodified_text = if event.unmodified_character != 0 {
+            char::from_u32(event.unmodified_character as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let params = DispatchKeyEventParams {
+            event_type: key_event_type(event.kind),
+            windows_virtual_key_code: event.windows_key_code,
+            native_virtual_key_code: event.native_key_code,
+            text,
+            unmodified_text,
+            modifiers: event.modifiers,
+            is_system_key: event.is_system_key,
+        };
+        let _ = self
+            .cmd_tx
+            .try_send(Command::KeyEvent { session_id, params });
     }
 
-    fn osr_mouse_move(&self, _x: i32, _y: i32, _modifiers: u32) {
-        tracing::debug!("firefox-cdp::osr_mouse_move not yet implemented");
+    fn osr_mouse_move(&self, x: i32, y: i32, modifiers: u32) {
+        let session_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_tab()
+            .map(|t| t.session_id.clone());
+        let Some(session_id) = session_id else { return };
+        let params = DispatchMouseEventParams {
+            event_type: "mouseMoved",
+            x,
+            y,
+            button: "none",
+            click_count: 0,
+            modifiers,
+            delta_x: None,
+            delta_y: None,
+        };
+        let _ = self
+            .cmd_tx
+            .try_send(Command::MouseEvent { session_id, params });
     }
 
     fn osr_mouse_click(
         &self,
-        _x: i32,
-        _y: i32,
-        _button: MouseButton,
-        _mouse_up: bool,
-        _click_count: i32,
-        _modifiers: u32,
+        x: i32,
+        y: i32,
+        button: MouseButton,
+        mouse_up: bool,
+        click_count: i32,
+        modifiers: u32,
     ) {
-        tracing::debug!("firefox-cdp::osr_mouse_click not yet implemented");
+        let session_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_tab()
+            .map(|t| t.session_id.clone());
+        let Some(session_id) = session_id else { return };
+        let event_type = if mouse_up {
+            "mouseReleased"
+        } else {
+            "mousePressed"
+        };
+        let params = DispatchMouseEventParams {
+            event_type,
+            x,
+            y,
+            button: mouse_button_str(button),
+            click_count,
+            modifiers,
+            delta_x: None,
+            delta_y: None,
+        };
+        let _ = self
+            .cmd_tx
+            .try_send(Command::MouseEvent { session_id, params });
     }
 
     fn osr_mouse_leave(&self, _modifiers: u32) {
-        tracing::debug!("firefox-cdp::osr_mouse_leave not yet implemented");
+        // No direct CDP equivalent; ignore.
     }
 
-    fn osr_mouse_wheel(&self, _x: i32, _y: i32, _delta_x: i32, _delta_y: i32, _modifiers: u32) {
-        tracing::debug!("firefox-cdp::osr_mouse_wheel not yet implemented");
+    fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
+        let session_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_tab()
+            .map(|t| t.session_id.clone());
+        let Some(session_id) = session_id else { return };
+        let params = DispatchMouseEventParams {
+            event_type: "mouseWheel",
+            x,
+            y,
+            button: "none",
+            click_count: 0,
+            modifiers,
+            delta_x: Some(delta_x as f64),
+            delta_y: Some(delta_y as f64),
+        };
+        let _ = self
+            .cmd_tx
+            .try_send(Command::MouseEvent { session_id, params });
     }
 
     fn osr_focus(&self, _focused: bool) {
-        tracing::debug!("firefox-cdp::osr_focus not yet implemented");
+        // No-op — CDP has no direct "focus window" command.
     }
 
+    // ── OSR state ────────────────────────────────────────────────────────────
+
     fn osr_frame(&self) -> SharedOsrFrame {
-        Arc::new(Mutex::new(OsrFrame::new(1, 1)))
+        Arc::clone(&self.osr_frame)
     }
 
     fn osr_view(&self) -> SharedOsrViewState {
-        Arc::new(OsrViewState::default())
+        Arc::clone(&self.osr_view)
     }
 
     fn force_repaint_active(&self) {
-        tracing::debug!("firefox-cdp::force_repaint_active not yet implemented");
+        // Poll loop handles repaint; no explicit trigger needed.
     }
 
     fn osr_sleep(&self, _sleep: bool) {
-        tracing::debug!("firefox-cdp::osr_sleep not yet implemented");
+        // Firefox CDP poll loop continues regardless; Phase C will pause it on sleep.
     }
 
     fn osr_invalidate_view(&self) {
-        tracing::debug!("firefox-cdp::osr_invalidate_view not yet implemented");
+        // No-op; poll loop handles invalidation.
     }
 
-    fn set_osr_wake(&self, _wake: Arc<dyn Fn() + Send + Sync>) {
-        tracing::debug!("firefox-cdp::set_osr_wake not yet implemented");
+    fn set_osr_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.osr_view.set_wake(wake);
     }
+
+    // ── Stubs (Phase C) ──────────────────────────────────────────────────────
 
     fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("firefox-cdp::start_find not yet implemented");
+        tracing::debug!("firefox-cdp: start_find — deferred to Phase C");
     }
 
     fn stop_find(&self) {
-        tracing::debug!("firefox-cdp::stop_find not yet implemented");
+        tracing::debug!("firefox-cdp: stop_find — deferred to Phase C");
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -233,23 +1061,23 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn popup_queue(&self) -> PopupQueue {
-        new_popup_queue()
+        Arc::clone(&self.popup_queue)
     }
 
     fn popup_create_sink(&self) -> PopupCreateSink {
-        new_popup_create_sink()
+        Arc::clone(&self.popup_create_sink)
     }
 
     fn popup_close_sink(&self) -> PopupCloseSink {
-        new_popup_close_sink()
+        Arc::clone(&self.popup_close_sink)
     }
 
     fn popup_resize(&self, _browser_id: i32, _width: u32, _height: u32) {
-        tracing::debug!("firefox-cdp::popup_resize not yet implemented");
+        tracing::debug!("firefox-cdp: popup_resize not implemented");
     }
 
     fn popup_close(&self, _browser_id: i32) {
-        tracing::debug!("firefox-cdp::popup_close not yet implemented");
+        tracing::debug!("firefox-cdp: popup_close not implemented");
     }
 
     fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
@@ -260,21 +1088,10 @@ impl BrowserEngine for FirefoxCdpEngine {
         vec![]
     }
 
-    fn popup_history_back(&self, _browser_id: i32) {
-        tracing::debug!("firefox-cdp::popup_history_back not yet implemented");
-    }
-
-    fn popup_history_forward(&self, _browser_id: i32) {
-        tracing::debug!("firefox-cdp::popup_history_forward not yet implemented");
-    }
-
-    fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {
-        tracing::debug!("firefox-cdp::popup_osr_focus not yet implemented");
-    }
-
-    fn popup_osr_key_event(&self, _browser_id: i32, _event: NeutralKeyEvent) {
-        tracing::debug!("firefox-cdp::popup_osr_key_event not yet implemented");
-    }
+    fn popup_history_back(&self, _browser_id: i32) {}
+    fn popup_history_forward(&self, _browser_id: i32) {}
+    fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {}
+    fn popup_osr_key_event(&self, _browser_id: i32, _event: NeutralKeyEvent) {}
 
     fn popup_osr_mouse_click(
         &self,
@@ -286,12 +1103,9 @@ impl BrowserEngine for FirefoxCdpEngine {
         _click_count: i32,
         _modifiers: u32,
     ) {
-        tracing::debug!("firefox-cdp::popup_osr_mouse_click not yet implemented");
     }
 
-    fn popup_osr_mouse_move(&self, _browser_id: i32, _x: i32, _y: i32, _modifiers: u32) {
-        tracing::debug!("firefox-cdp::popup_osr_mouse_move not yet implemented");
-    }
+    fn popup_osr_mouse_move(&self, _browser_id: i32, _x: i32, _y: i32, _modifiers: u32) {}
 
     fn popup_osr_mouse_wheel(
         &self,
@@ -302,7 +1116,6 @@ impl BrowserEngine for FirefoxCdpEngine {
         _delta_y: i32,
         _modifiers: u32,
     ) {
-        tracing::debug!("firefox-cdp::popup_osr_mouse_wheel not yet implemented");
     }
 
     fn is_hint_mode(&self) -> bool {
@@ -325,7 +1138,5 @@ impl BrowserEngine for FirefoxCdpEngine {
         None
     }
 
-    fn cancel_hint(&self) {
-        tracing::debug!("firefox-cdp::cancel_hint not yet implemented");
-    }
+    fn cancel_hint(&self) {}
 }

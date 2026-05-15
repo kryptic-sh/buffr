@@ -801,9 +801,19 @@ dependencies = [
 name = "buffr-firefox-cdp"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "buffr-core",
  "buffr-engine",
+ "image",
+ "open",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "tungstenite",
+ "ureq",
+ "url",
 ]
 
 [[package]]
