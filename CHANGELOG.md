@@ -6,6 +6,20 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-15
+
+### Changed
+
+- `#[non_exhaustive]` annotation added to public enums `EngineEvent`,
+  `LoadState`, `CursorKind`, `MediaType` so downstream crates cannot
+  exhaustively match on variants we may add in future minor releases. Audit
+  finding #12.
+- `BrowserEngine::can_go_back()` and `can_go_forward()` trait defaults changed
+  from `true` to `false`. A freshly opened tab has no history, so the previous
+  defaults misled UIs into showing the back button as enabled. Both CEF and
+  blink-cdp override these methods, so concrete behavior is unchanged. Audit
+  finding #17.
+
 ## [0.1.2] - 2026-05-15
 
 ### Added
@@ -28,7 +42,8 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 _Initial release._
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.0
