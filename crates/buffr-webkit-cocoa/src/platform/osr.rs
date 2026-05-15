@@ -26,7 +26,7 @@
 //! ## takeSnapshotWithConfiguration:completionHandler: (WKWebView.rs:696-703)
 //!
 //! Confirmed signature:
-//!   ```
+//!   ```text
 //!   pub unsafe fn takeSnapshotWithConfiguration_completionHandler(
 //!       &self,
 //!       snapshot_configuration: Option<&WKSnapshotConfiguration>,
