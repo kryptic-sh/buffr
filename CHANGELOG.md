@@ -6,6 +6,14 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-15
+
+### Added
+
+- `BackendOpenOptions.cache_dir: Option<&Path>` — optional ephemeral cache
+  directory for backends that support a persistent/ephemeral split. Backends
+  that do not support a split (e.g. CEF) ignore this field. Phase 11b (#96).
+
 ## [0.1.1] - 2026-05-15
 
 ### Added
@@ -20,6 +28,7 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 _Initial release._
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.0
