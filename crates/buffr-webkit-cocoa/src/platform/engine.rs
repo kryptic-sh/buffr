@@ -20,8 +20,12 @@
 //! - `close_all_browsers` / `open_tab` / `open_tab_background` / `open_tab_at`
 //! - `close_tab` / `close_active`
 //! - `select_tab` / `next_tab` / `prev_tab`
-//! - `navigate` / `go_back` / `go_forward` / `reload` / `stop`
+//! - `navigate`
 //! - `can_go_back` / `can_go_forward`
+//!
+//! `go_back` / `go_forward` / `reload` / `stop` are NOT on the `BrowserEngine`
+//! trait; they live as inherent methods. Phase C wires them in via
+//! `dispatch(&PageAction)`.
 //! - `active_tab` / `tabs_summary` / `tab_count` / `active_index`
 //! - `active_tab_live_url`
 //! - `osr_resize` / `osr_frame` / `osr_view` / `set_osr_wake`
@@ -316,36 +320,6 @@ impl BrowserEngine for WebKitCocoaEngine {
         true
     }
 
-    fn go_back(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.worker.send(Command::GoBack);
-            return true;
-        }
-        #[allow(unreachable_code)]
-        false
-    }
-
-    fn go_forward(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.worker.send(Command::GoForward);
-            return true;
-        }
-        #[allow(unreachable_code)]
-        false
-    }
-
-    fn reload(&self) {
-        #[cfg(target_os = "macos")]
-        self.worker.send(Command::Reload);
-    }
-
-    fn stop(&self) {
-        #[cfg(target_os = "macos")]
-        self.worker.send(Command::Stop);
-    }
-
     fn can_go_back(&self) -> bool {
         #[cfg(target_os = "macos")]
         return self
@@ -585,5 +559,33 @@ impl BrowserEngine for WebKitCocoaEngine {
 
     fn cancel_hint(&self) {
         tracing::debug!("webkit-cocoa: cancel_hint — no-op");
+    }
+}
+
+/// History / loading controls — NOT on the `BrowserEngine` trait.
+///
+/// These live as inherent methods because the trait surface routes navigation
+/// through `dispatch(&PageAction)`. Phase C can override `dispatch()` to call
+/// these via `PageAction::Back` / `Forward` / `Reload` / `StopLoading`. The
+/// corresponding `Command::GoBack` / `GoForward` / `Reload` / `Stop` worker
+/// commands are wired and ready.
+#[cfg(target_os = "macos")]
+impl WebKitCocoaEngine {
+    pub fn go_back(&self) -> bool {
+        self.worker.send(Command::GoBack);
+        true
+    }
+
+    pub fn go_forward(&self) -> bool {
+        self.worker.send(Command::GoForward);
+        true
+    }
+
+    pub fn reload(&self) {
+        self.worker.send(Command::Reload);
+    }
+
+    pub fn stop(&self) {
+        self.worker.send(Command::Stop);
     }
 }

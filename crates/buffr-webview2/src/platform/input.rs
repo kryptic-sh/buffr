@@ -87,6 +87,21 @@ pub(crate) enum Wv2MouseButton {
 // KEYEVENTF_KEYUP — set in dwFlags to signal key-release.
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 
+// ── Neutral wrapper sent over the worker command channel ──────────────────────
+
+/// A translated WebView2 input event, ready to be routed to the STA worker.
+///
+/// The worker receives this on the STA thread — the correct COM apartment for
+/// `ICoreWebView2CompositionController` calls.
+///
+/// Phase B (blocked by #106): logs at `debug` level.
+/// TODO(#106): dispatch via `ICoreWebView2CompositionController::SendMouseInput`
+/// / `SendKeyboardInput` once COM init lands.
+pub(crate) enum WebView2InputEvent {
+    Key(Wv2KeyEvent),
+    Mouse(Wv2MouseEvent),
+}
+
 // ── Translators ───────────────────────────────────────────────────────────────
 
 /// Translate a `NeutralKeyEvent` to a `Wv2KeyEvent`.
@@ -94,12 +109,12 @@ const KEYEVENTF_KEYUP: u32 = 0x0002;
 /// `NeutralKeyEvent::windows_key_code` is already a VK_* code so the
 /// translation is nearly 1:1. `native_key_code` carries the hardware scan
 /// code on Windows (DMI/HID scan) — used as the scan code for extended keys.
-pub(crate) fn neutral_key_to_wv2(event: &NeutralKeyEvent) -> Wv2KeyEvent {
+pub(crate) fn neutral_key_to_wv2(event: &NeutralKeyEvent) -> WebView2InputEvent {
     let flags = match event.kind {
         KeyEventKind::Up => KEYEVENTF_KEYUP,
         _ => 0,
     };
-    Wv2KeyEvent {
+    WebView2InputEvent::Key(Wv2KeyEvent {
         vk: event.windows_key_code,
         scan_code: event.native_key_code as u16,
         flags,
@@ -107,31 +122,31 @@ pub(crate) fn neutral_key_to_wv2(event: &NeutralKeyEvent) -> Wv2KeyEvent {
             "key vk={} char={} kind={:?}",
             event.windows_key_code, event.character, event.kind
         ),
-    }
+    })
 }
 
-/// Translate a mouse-move into a `Wv2MouseEvent`.
-pub(crate) fn neutral_move_to_wv2(x: i32, y: i32) -> Wv2MouseEvent {
-    Wv2MouseEvent {
+/// Translate a mouse-move into a `WebView2InputEvent::Mouse`.
+pub(crate) fn neutral_move_to_wv2(x: i32, y: i32) -> WebView2InputEvent {
+    WebView2InputEvent::Mouse(Wv2MouseEvent {
         x,
         y,
         kind: Wv2MouseKind::Move,
-    }
+    })
 }
 
-/// Translate a mouse-click into a `Wv2MouseEvent`.
+/// Translate a mouse-click into a `WebView2InputEvent::Mouse`.
 pub(crate) fn neutral_click_to_wv2(
     x: i32,
     y: i32,
     button: MouseButton,
     mouse_up: bool,
-) -> Wv2MouseEvent {
+) -> WebView2InputEvent {
     let btn = match button {
         MouseButton::Left => Wv2MouseButton::Left,
         MouseButton::Middle => Wv2MouseButton::Middle,
         MouseButton::Right | MouseButton::Other(_) => Wv2MouseButton::Right,
     };
-    Wv2MouseEvent {
+    WebView2InputEvent::Mouse(Wv2MouseEvent {
         x,
         y,
         kind: if mouse_up {
@@ -139,40 +154,45 @@ pub(crate) fn neutral_click_to_wv2(
         } else {
             Wv2MouseKind::ButtonDown(btn)
         },
-    }
+    })
 }
 
-/// Translate a mouse-leave into a `Wv2MouseEvent`.
-pub(crate) fn neutral_leave_to_wv2() -> Wv2MouseEvent {
-    Wv2MouseEvent {
+/// Translate a mouse-leave into a `WebView2InputEvent::Mouse`.
+pub(crate) fn neutral_leave_to_wv2() -> WebView2InputEvent {
+    WebView2InputEvent::Mouse(Wv2MouseEvent {
         x: 0,
         y: 0,
         kind: Wv2MouseKind::Leave,
-    }
+    })
 }
 
-/// Translate a mouse-wheel event into a `Wv2MouseEvent`.
+/// Translate a mouse-wheel event into a `WebView2InputEvent::Mouse`.
 ///
 /// Windows `WHEEL_DELTA` is 120 per notch. `delta_y` from `NeutralKeyEvent`
 /// is already in "lines" (positive = up). We multiply by 120 to get the
 /// Win32 wheel-delta unit.
-pub(crate) fn neutral_scroll_to_wv2(x: i32, y: i32, delta_x: i32, delta_y: i32) -> Wv2MouseEvent {
+pub(crate) fn neutral_scroll_to_wv2(
+    x: i32,
+    y: i32,
+    delta_x: i32,
+    delta_y: i32,
+) -> WebView2InputEvent {
     // Primary scroll axis: use vertical if non-zero, else horizontal.
     if delta_y != 0 {
-        Wv2MouseEvent {
+        WebView2InputEvent::Mouse(Wv2MouseEvent {
             x,
             y,
             kind: Wv2MouseKind::Wheel {
                 delta: delta_y * 120,
             },
-        }
+        })
     } else {
-        Wv2MouseEvent {
+        WebView2InputEvent::Mouse(Wv2MouseEvent {
             x,
             y,
             kind: Wv2MouseKind::HWheel {
                 delta: delta_x * 120,
             },
-        }
+        })
     }
 }

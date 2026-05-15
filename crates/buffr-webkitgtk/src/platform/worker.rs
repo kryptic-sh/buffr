@@ -27,6 +27,7 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitGtkError;
+use super::input::GtkInputEvent;
 use super::osr::paint_blank;
 use super::runtime::TabEntry;
 
@@ -116,6 +117,7 @@ pub(crate) enum Command {
     },
     Navigate {
         url: String,
+        reply: mpsc::SyncSender<Result<(), WebKitGtkError>>,
     },
     /// Navigate the active tab back. No return value needed.
     GoBack,
@@ -130,6 +132,15 @@ pub(crate) enum Command {
         height: u32,
     },
     ForcePaint,
+    /// Dispatch an input event to the active WebView.
+    ///
+    /// Fire-and-forget: no reply channel. Input events return `()` on the
+    /// `BrowserEngine` trait surface.
+    ///
+    /// Phase B: the worker logs the event at `debug` level.
+    /// TODO(input-key/input-mouse): synthesise real `gdk4::Event` and dispatch
+    /// via `WebView::event()` when safe constructors are available (gdk4 >= 0.12).
+    SendInput(GtkInputEvent),
     /// Full tab snapshot (used internally by QueryCanGoBack/Forward).
     QueryTabs {
         reply: mpsc::SyncSender<TabsSnapshot>,
@@ -276,9 +287,13 @@ impl GtkRuntime {
         self.paint();
     }
 
-    fn navigate(&mut self, url: &str) {
-        if let Some(idx) = self.active_idx {
-            self.tabs[idx].load_uri(url);
+    fn navigate(&mut self, url: &str) -> Result<(), WebKitGtkError> {
+        match self.active_idx {
+            Some(idx) => {
+                self.tabs[idx].load_uri(url);
+                Ok(())
+            }
+            None => Err(WebKitGtkError::InitFailed("no active tab".into())),
         }
     }
 
@@ -347,8 +362,8 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         Command::CycleTab { forward } => {
             rt.cycle_tab(forward);
         }
-        Command::Navigate { url } => {
-            rt.navigate(&url);
+        Command::Navigate { url, reply } => {
+            let _ = reply.send(rt.navigate(&url));
         }
         Command::GoBack => {
             rt.go_back();
@@ -367,6 +382,28 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         }
         Command::ForcePaint => {
             rt.paint();
+        }
+        Command::SendInput(event) => {
+            // Phase B: log the event on the GTK thread (the correct dispatch queue).
+            // GTK4 / gdk4 0.11 does not expose safe synthetic-event constructors;
+            // real dispatch requires unsafe FFI or gdk4 >= 0.12.
+            // TODO(input-key/input-mouse): synthesise gdk4::Event and call
+            // WebView::event() once safe constructors are available.
+            match &event {
+                GtkInputEvent::Key(ev) => {
+                    tracing::debug!(
+                        "webkitgtk worker: received key event '{}' (pending gdk4 dispatch)",
+                        ev.description
+                    );
+                }
+                GtkInputEvent::Mouse(ev) => {
+                    tracing::debug!(
+                        "webkitgtk worker: received mouse event ({:.0},{:.0}) (pending gdk4 dispatch)",
+                        ev.x,
+                        ev.y
+                    );
+                }
+            }
         }
         Command::QueryTabs { reply } => {
             let summaries = rt

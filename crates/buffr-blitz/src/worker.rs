@@ -19,8 +19,11 @@ use std::time::Duration;
 
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
+use blitz_dom::Document;
+
 use crate::document::BlitzTab;
 use crate::error::BlitzError;
+use crate::input::BlitzInputEvent;
 
 // ── Tab snapshot ──────────────────────────────────────────────────────────────
 
@@ -105,6 +108,11 @@ pub(crate) enum Command {
         height: u32,
     },
     ForcePaint,
+    /// Dispatch an input event to the active tab's document.
+    ///
+    /// Fire-and-forget: no reply channel.  Input events return `()` on the
+    /// `BrowserEngine` trait surface and are handled asynchronously.
+    SendInput(BlitzInputEvent),
     QueryTabs {
         reply: mpsc::SyncSender<TabsSnapshot>,
     },
@@ -269,6 +277,24 @@ impl Worker {
         tracing::debug!("blitz worker: stop — no-op (synchronous load model)");
     }
 
+    /// Dispatch an input event to the active tab's `HtmlDocument`.
+    ///
+    /// `HtmlDocument` implements `blitz_dom::Document`, which exposes
+    /// `handle_ui_event(UiEvent)` — the canonical entry point for pointer and
+    /// keyboard events in `blitz-dom 0.3.0-alpha.2`.
+    fn send_input(&mut self, event: BlitzInputEvent) {
+        if let Some(idx) = self.active_idx {
+            let ui_event = event.into_ui_event();
+            tracing::debug!(
+                "blitz worker: dispatching ui_event to tab {}",
+                self.tabs[idx].id
+            );
+            self.tabs[idx].doc.handle_ui_event(ui_event);
+        } else {
+            tracing::debug!("blitz worker: send_input — no active tab, dropping event");
+        }
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
@@ -374,6 +400,9 @@ impl Worker {
             }
             Command::ForcePaint => {
                 self.paint();
+            }
+            Command::SendInput(event) => {
+                self.send_input(event);
             }
             Command::QueryTabs { reply } => {
                 let _ = reply.send(self.build_snapshot());

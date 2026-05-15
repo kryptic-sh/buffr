@@ -255,10 +255,13 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
         tracing::debug!("webkitgtk: navigate {url}");
-        self.worker.send(Command::Navigate {
-            url: url.to_owned(),
-        });
-        Ok(())
+        self.worker
+            .call(|reply| Command::Navigate {
+                url: url.to_owned(),
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn active_tab_live_url(&self) -> String {
@@ -323,19 +326,14 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn osr_key_event(&self, event: NeutralKeyEvent) {
         let ev = neutral_key_to_gtk(&event);
-        tracing::debug!(
-            "webkitgtk: osr_key_event {} — TODO(input-key): dispatch to WebView",
-            ev.description
-        );
+        tracing::debug!("webkitgtk: osr_key_event — routing to GTK worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_move(&self, x: i32, y: i32, _modifiers: u32) {
         let ev = neutral_move_to_gtk(x, y);
-        tracing::debug!(
-            "webkitgtk: osr_mouse_move ({:.0},{:.0}) — TODO(input-mouse): dispatch",
-            ev.x,
-            ev.y
-        );
+        tracing::debug!("webkitgtk: osr_mouse_move ({x},{y}) — routing to GTK worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_click(
@@ -349,26 +347,21 @@ impl BrowserEngine for WebKitGtkEngine {
     ) {
         let ev = neutral_click_to_gtk(x, y, button, mouse_up);
         tracing::debug!(
-            "webkitgtk: osr_mouse_click ({:.0},{:.0}) up={mouse_up} — TODO(input-mouse): dispatch",
-            ev.x,
-            ev.y
+            "webkitgtk: osr_mouse_click ({x},{y}) up={mouse_up} — routing to GTK worker"
         );
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_leave(&self, _modifiers: u32) {
-        let _ev = neutral_leave_to_gtk();
-        tracing::debug!("webkitgtk: osr_mouse_leave — TODO(input-mouse): dispatch");
-        // Force repaint so hover state is cleared visually.
-        self.worker.send(Command::ForcePaint);
+        let ev = neutral_leave_to_gtk();
+        tracing::debug!("webkitgtk: osr_mouse_leave — routing to GTK worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, _modifiers: u32) {
         let ev = neutral_scroll_to_gtk(x, y, delta_x, delta_y);
-        tracing::debug!(
-            "webkitgtk: osr_mouse_wheel ({:.0},{:.0}) — TODO(input-mouse): dispatch",
-            ev.x,
-            ev.y
-        );
+        tracing::debug!("webkitgtk: osr_mouse_wheel ({x},{y}) — routing to GTK worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_focus(&self, focused: bool) {
