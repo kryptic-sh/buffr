@@ -167,6 +167,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "anyrender"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf4f4f85f41e104c77b0beb5f9161bd674ce1b8deeb25b7900668ac13cb8b8b6"
+dependencies = [
+ "kurbo",
+ "peniko",
+ "raw-window-handle",
+]
+
+[[package]]
+name = "anyrender_svg"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21afa29f9105f5e7b4deb6738cb81d207554d27e810e77dbf6084b18150c6404"
+dependencies = [
+ "anyrender",
+ "image",
+ "kurbo",
+ "peniko",
+ "usvg",
+]
+
+[[package]]
+name = "anyrender_vello_cpu"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e32f4924fc3cf3ff5c7ada02aa2b84861420bbb2aa69f8f06092496efbf2facf"
+dependencies = [
+ "anyrender",
+ "debug_timer",
+ "kurbo",
+ "peniko",
+ "vello_cpu",
+]
+
+[[package]]
 name = "app_units"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -482,6 +519,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "blitz-paint"
+version = "0.3.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16c1f086318deab4b177b65715d60ff4a9853897afcfed887acc2ec0d1748921"
+dependencies = [
+ "anyrender",
+ "anyrender_svg",
+ "blitz-dom",
+ "blitz-traits",
+ "color",
+ "euclid",
+ "kurbo",
+ "parley",
+ "peniko",
+ "stylo",
+ "taffy",
+ "usvg",
+]
+
+[[package]]
 name = "blitz-traits"
 version = "0.3.0-alpha.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -657,8 +714,11 @@ dependencies = [
 name = "buffr-blitz"
 version = "0.1.0"
 dependencies = [
+ "anyrender",
+ "anyrender_vello_cpu",
  "blitz-dom",
  "blitz-html",
+ "blitz-paint",
  "blitz-traits",
  "buffr-engine",
  "keyboard-types",
@@ -1243,6 +1303,9 @@ name = "color"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ec7c5eb7a16992b1904d76c517d170ab353b0e0b3d5a0c81a8a0cd1037893cf"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "color_quant"
@@ -2074,6 +2137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76258897e51fd156ee03b6246ea53f3e0eb395d0b327e9961c4fc4c8b2fa151a"
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2737,6 +2806,15 @@ dependencies = [
  "libc",
  "pango-sys",
  "system-deps",
+]
+
+[[package]]
+name = "guillotiere"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b17e70c989c36bad147b27a58d148c0741c51448aa5653436547323e524d0ab"
+dependencies = [
+ "euclid",
 ]
 
 [[package]]
@@ -4499,6 +4577,19 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "peniko"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "839c8299360d2e998bdb106dc0a6cd71dcc5f4df51df1b620361bf50e283cca6"
+dependencies = [
+ "bytemuck",
+ "color",
+ "kurbo",
+ "linebender_resource_handle",
+ "smallvec",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -6867,6 +6958,45 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vello_api"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5088cd0113bc5332c753f24503825e3bc93e26c7883c9dc3ad9637bb62c4634"
+dependencies = [
+ "bytemuck",
+ "peniko",
+]
+
+[[package]]
+name = "vello_common"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "986dc49a501a683477614bf07b8e7b6c79ae4828efce3bf22e51850f4a0a8a4c"
+dependencies = [
+ "bytemuck",
+ "fearless_simd",
+ "guillotiere",
+ "hashbrown 0.16.1",
+ "log",
+ "peniko",
+ "skrifa 0.40.0",
+ "smallvec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "vello_cpu"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a678f91c7524a3a9ac9a19df9f83552866ec70b2ca26441b916a6b219b6aa2de"
+dependencies = [
+ "bytemuck",
+ "hashbrown 0.16.1",
+ "vello_api",
+ "vello_common",
+]
 
 [[package]]
 name = "version-compare"

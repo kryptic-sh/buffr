@@ -146,6 +146,46 @@ fn backend_id_is_blitz() {
     assert_eq!(backend.id(), "blitz");
 }
 
+// ── Renderer smoke test ───────────────────────────────────────────────────────
+
+/// Verify the CPU renderer writes non-white pixels for a page with coloured content.
+///
+/// Opens an engine on a `data:` URL with a red background and waits for the
+/// worker to finish painting.  The OSR frame must contain at least one pixel
+/// that is not all-0xFF (pure white BGRA) — proving the real renderer ran.
+///
+/// Not marked `#[ignore]` because blitz uses a synchronous layout model and
+/// the paint happens on the worker thread before `open_engine` returns.
+#[test]
+fn osr_frame_not_all_white_after_render() {
+    let engine = open_engine("data:text/html,<body style=\"background:red\"><h1>Hi</h1></body>");
+
+    // Give the worker thread a moment to finish painting (it's already done
+    // before open_engine returns, but be defensive).
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let frame = engine.osr_frame();
+    let guard = frame.lock().expect("frame lock failed");
+
+    // The pixel buffer must be non-empty.
+    assert!(
+        !guard.pixels.is_empty(),
+        "pixel buffer should be non-empty after render"
+    );
+
+    // At least one pixel must differ from all-0xFF (solid white BGRA fill).
+    // A red background (BGRA = 0x00, 0x00, 0xFF, 0xFF with premul) will have
+    // B=0 in most pixels, which is != 0xFF.
+    let has_non_white = guard.pixels.chunks_exact(4).any(|p| {
+        // p = [B, G, R, A]
+        p[0] != 0xFF || p[1] != 0xFF || p[2] != 0xFF
+    });
+    assert!(
+        has_non_white,
+        "expected non-white pixels from CPU renderer; all pixels were 0xFF (white fill fallback)"
+    );
+}
+
 // ── Input dispatch smoke tests ────────────────────────────────────────────────
 
 /// Verify the full input dispatch chain is wired and does not panic.
