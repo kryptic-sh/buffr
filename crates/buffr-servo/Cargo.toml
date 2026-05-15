@@ -1,0 +1,50 @@
+[package]
+name = "buffr-servo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Servo backend for buffr-engine"
+publish = false
+
+[dependencies]
+buffr-engine.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# ── Servo embedding API ───────────────────────────────────────────────────────
+#
+# Servo is published to crates.io as the `servo` crate at v0.1.0 (2026-04-13).
+# Tag v0.1.0 = commit 8032867a0d5ffc319320ab45ad5b071155aeed48.
+# MSRV of servo 0.1.0 is Rust 1.86; workspace is pinned to 1.95 — compatible.
+# Servo edition is 2024, matching the workspace.
+#
+# BLOCKER (documented 2026-05-15):
+# servo 0.1.0 → servo-storage 0.1.0 → rusqlite 0.37 → libsqlite3-sys ^0.35.0
+#                                                          (resolves 0.35.x)
+# workspace → buffr-history → rusqlite 0.39 → libsqlite3-sys ^0.37.0
+#                                                   (resolves 0.37.x)
+# Cargo cannot unify libsqlite3-sys 0.35.x and 0.37.x simultaneously.
+# This is a transitive dep version conflict that is not patchable from our side
+# without either:
+#   (a) Waiting for servo 0.2+ to update rusqlite to 0.39, or
+#   (b) Downgrading the workspace rusqlite from 0.39 to 0.37 (breaks
+#       buffr-history which requires rusqlite 0.39 API surface), or
+#   (c) Disabling the servo-storage feature in libservo (no such feature flag
+#       is exposed in servo 0.1.0's public Cargo.toml).
+#
+# Resolution: Phase B uses shape-complete skeleton code (all Servo type imports
+# are in comments, methods return EngineError::Unimplemented).  The code
+# structure is complete and ready for Phase C once the dep conflict is resolved.
+# When servo 0.2+ ships (expected to update rusqlite), re-enable by uncommenting
+# the dep lines below and removing the cfg(servo_available) guards.
+#
+# To re-enable when conflict is fixed:
+#   servo = "0.1"             # or next compatible version
+#   keyboard-types = "0.7"   # re-exported from servo
+#   euclid = "0.22"           # WebViewPoint coordinate types
+#   dpi = "0.1"               # PhysicalSize for rendering context
+# url is already a workspace dep

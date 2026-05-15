@@ -167,6 +167,7 @@ use buffr_ui::{
 };
 
 mod crash_guard;
+mod engine_migrate;
 mod engine_router;
 mod heartbeat;
 mod loading_anim;
@@ -610,6 +611,15 @@ fn main() -> Result<()> {
     } else {
         info!("profile paths resolved");
         debug!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
+    }
+
+    // -------- Phase 11a: engine on-disk layout migration -----------------
+    //
+    // Runs before the event loop so the new paths are correct from first use.
+    // Private mode skips migration: the tempdir is empty by construction and
+    // there is nothing to move.
+    if !cli.private {
+        engine_migrate::migrate_engine_layout(&paths.cache, &paths.data);
     }
 
     // -------- single-instance check -----------------------------------
@@ -1075,6 +1085,7 @@ fn main() -> Result<()> {
         search_config,
         engines_config,
         cli.private,
+        paths.cache.clone(),
         paths.data.clone(),
         find_sink,
         hint_sink,
@@ -1874,6 +1885,11 @@ struct AppState {
     /// stamp and is purely informational — the storage layer already
     /// captured the choice at construction time.
     private: bool,
+    /// Root of the cache directory for this session. In normal mode this is
+    /// `<XDG_CACHE_HOME>/buffr` (or equivalent); in `--private` mode it is
+    /// `$TMPDIR/buffr-private-<pid>/cache`. Per-engine CEF directories land
+    /// under `<cache_root>/engines/<id>/` (Phase 11a).
+    cache_root: PathBuf,
     /// Root of the user-data directory for this session. In normal mode
     /// this is `<XDG_DATA_HOME>/buffr` (or equivalent); in `--private`
     /// mode it is `$TMPDIR/buffr-private-<pid>/data` (deleted on Drop
@@ -2435,6 +2451,7 @@ impl AppState {
         search_config: Arc<buffr_config::Search>,
         engines_config: Arc<buffr_config::Engines>,
         private: bool,
+        cache_root: PathBuf,
         data_root: PathBuf,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
@@ -2492,6 +2509,7 @@ impl AppState {
             engines_config,
             overlay: None,
             private,
+            cache_root,
             data_root,
             modifiers: ModifiersState::empty(),
             startup: Instant::now(),
@@ -2807,6 +2825,7 @@ impl AppState {
         let target_id = match verdict {
             engine_router::NavigationVerdict::SameEngine => return,
             engine_router::NavigationVerdict::CrossEngine { target } => target,
+            engine_router::NavigationVerdict::DisallowedScheme => return,
         };
         tracing::debug!(
             url = %url,
@@ -7060,11 +7079,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     } else {
                         None
                     };
+                    // Default: ~/.cache/buffr/engines/<id>/ (Phase 11a layout).
+                    // Per-engine RequestContext keeps CEF state namespaced under
+                    // the cache root rather than flat at ~/.cache/buffr/.
                     let data_dir_buf: Option<std::path::PathBuf> =
-                        inst.data_dir.as_deref().map(std::path::PathBuf::from);
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => engine_migrate::compute_cef_default(&self.cache_root, &inst.id),
+                        });
                     let options = BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
                         data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
                         initial_url: &self.homepage,
                         frame_rate: display_hz as i32,
                         device_scale: effective_scale as f64,
@@ -7137,14 +7163,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .as_deref()
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| {
-                            // Default to <data_root>/blink-cdp/<instance-id> so each
-                            // instance gets its own isolated profile. In normal mode
-                            // data_root is the XDG data dir; in --private mode it is
-                            // the throwaway TempDir, so cookies/storage are deleted on
-                            // process exit without any extra teardown code.
-                            self.data_root.join("blink-cdp").join(&inst.id)
+                            // Default to <data_root>/engines/<instance-id>/profile/
+                            // (Phase 11a layout). Each instance gets its own isolated
+                            // profile. In normal mode data_root is the XDG data dir;
+                            // in --private mode it is the throwaway TempDir, so
+                            // cookies/storage are deleted on process exit without any
+                            // extra teardown code.
+                            engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
                         });
                     tracing::debug!(?data_dir, "blink-cdp profile dir");
+                    // Phase 11b: ephemeral cache directory for --disk-cache-dir split.
+                    // Canonical location: <cache_root>/engines/<id>/
+                    // Ephemeral by definition — no migration needed; user gets a fresh
+                    // cache on first run with Phase 11b.
+                    let blink_cache_dir =
+                        engine_migrate::compute_blink_cdp_cache_default(&self.cache_root, &inst.id);
+                    tracing::debug!(?blink_cache_dir, "blink-cdp cache dir");
                     // Resolve download directory for this blink-cdp instance.
                     // Prefer the user-configured `[downloads] default_dir`; fall
                     // back to `<data_dir>/downloads` so Chromium never touches
@@ -7156,6 +7190,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or_else(|| data_dir.join("downloads"));
                     match buffr_blink_cdp::BlinkCdpEngine::new(
                         &data_dir,
+                        Some(&blink_cache_dir),
                         Some(&blink_download_dir),
                         Some(self.downloads.clone()),
                         Some(self.download_notice_queue.clone()),
@@ -7866,7 +7901,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
 
-                let host = self.active_engine_dyn().unwrap();
+                let Some(host) = self.active_engine_dyn() else {
+                    // No active engine yet (startup race) — silently discard the event.
+                    return;
+                };
                 let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
                 if is_pixel {
                     // Track velocity only for high-res input; discrete

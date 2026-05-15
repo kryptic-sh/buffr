@@ -1,0 +1,420 @@
+//! Blitz worker thread.
+//!
+//! `HtmlDocument` (and Stylo's `BaseDocument`) is `!Send + !Sync`.  This
+//! module runs a dedicated thread that owns all Blitz documents and exposes
+//! them via `mpsc` commands from `BlitzEngine`.
+//!
+//! # OSR pipeline (Phase B placeholder)
+//!
+//! After every document mutation (open / navigate / reload / resize) we write
+//! a solid white BGRA frame into `SharedOsrFrame`.
+//!
+//! Phase C will wire `anyrender_vello` → wgpu → readback once the wgpu
+//! version conflict is resolved (workspace pins ^29; blitz needs ^28).
+
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Duration;
+
+use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+
+use crate::document::BlitzTab;
+use crate::error::BlitzError;
+
+// ── Tab snapshot ──────────────────────────────────────────────────────────────
+
+/// Lightweight data about a single tab, safe to send across threads.
+pub(crate) struct TabRecord {
+    pub id: TabId,
+    pub url: String,
+    pub title: String,
+    pub is_loading: bool,
+    /// Used by `can_go_back` query; not read from the snapshot struct itself.
+    #[allow(dead_code)]
+    pub can_go_back: bool,
+    /// Used by `can_go_forward` query; not read from the snapshot struct itself.
+    #[allow(dead_code)]
+    pub can_go_forward: bool,
+}
+
+impl TabRecord {
+    fn from_tab(tab: &BlitzTab) -> Self {
+        TabRecord {
+            id: tab.id,
+            url: tab.url.clone(),
+            title: tab.title.clone(),
+            is_loading: tab.is_loading,
+            can_go_back: tab.can_go_back(),
+            can_go_forward: tab.can_go_forward(),
+        }
+    }
+
+    pub(crate) fn to_summary(&self) -> TabSummary {
+        TabSummary {
+            id: self.id,
+            browser_id: 0,
+            title: self.title.clone(),
+            url: self.url.clone(),
+            progress: 1.0,
+            is_loading: self.is_loading,
+            pinned: false,
+            private: false,
+        }
+    }
+}
+
+/// Snapshot of tab state, sent back from the worker.
+pub(crate) struct TabsSnapshot {
+    pub tabs: Vec<TabRecord>,
+    pub active: Option<TabId>,
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+pub(crate) enum Command {
+    OpenTab {
+        url: String,
+        reply: mpsc::SyncSender<Result<TabId, BlitzError>>,
+    },
+    CloseTab {
+        id: TabId,
+        reply: mpsc::SyncSender<Result<bool, BlitzError>>,
+    },
+    SelectTab {
+        id: TabId,
+    },
+    CycleTab {
+        forward: bool,
+    },
+    Navigate {
+        url: String,
+        reply: mpsc::SyncSender<Result<(), BlitzError>>,
+    },
+    GoBack {
+        n: usize,
+    },
+    GoForward {
+        n: usize,
+    },
+    Reload,
+    Stop,
+    Resize {
+        width: u32,
+        height: u32,
+    },
+    ForcePaint,
+    QueryTabs {
+        reply: mpsc::SyncSender<TabsSnapshot>,
+    },
+    QueryCanGoBack {
+        reply: mpsc::SyncSender<bool>,
+    },
+    QueryCanGoForward {
+        reply: mpsc::SyncSender<bool>,
+    },
+    Shutdown,
+}
+
+// ── WorkerHandle ──────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub(crate) struct WorkerHandle {
+    tx: mpsc::SyncSender<Command>,
+}
+
+impl WorkerHandle {
+    pub(crate) fn send(&self, cmd: Command) {
+        let _ = self.tx.send(cmd);
+    }
+
+    pub(crate) fn call<T: Send + 'static>(
+        &self,
+        build: impl FnOnce(mpsc::SyncSender<T>) -> Command,
+    ) -> Result<T, BlitzError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.send(build(reply_tx));
+        reply_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| BlitzError::FetchFailed("worker timeout".into()))
+    }
+}
+
+// ── Worker ────────────────────────────────────────────────────────────────────
+
+struct Worker {
+    tabs: Vec<BlitzTab>,
+    active_idx: Option<usize>,
+    next_id: u64,
+    frame: SharedOsrFrame,
+    view: SharedOsrViewState,
+    width: u32,
+    height: u32,
+}
+
+impl Worker {
+    fn new(frame: SharedOsrFrame, view: SharedOsrViewState, width: u32, height: u32) -> Self {
+        Worker {
+            tabs: Vec::new(),
+            active_idx: None,
+            next_id: 1,
+            frame,
+            view,
+            width,
+            height,
+        }
+    }
+
+    fn next_tab_id(&mut self) -> TabId {
+        let id = TabId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    fn tab_index_by_id(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    fn open_tab(&mut self, url: &str) -> Result<TabId, BlitzError> {
+        let id = self.next_tab_id();
+        tracing::info!("blitz worker: open_tab {id} → {url}");
+        let tab = BlitzTab::open(id, url, self.width, self.height)?;
+        self.tabs.push(tab);
+        self.active_idx = Some(self.tabs.len() - 1);
+        self.paint();
+        Ok(id)
+    }
+
+    fn close_tab(&mut self, id: TabId) -> Result<bool, BlitzError> {
+        let idx = self
+            .tab_index_by_id(id)
+            .ok_or(BlitzError::TabNotFound(id))?;
+        self.tabs.remove(idx);
+        match self.active_idx {
+            Some(a) if a == idx => {
+                self.active_idx = if self.tabs.is_empty() {
+                    None
+                } else {
+                    Some(idx.saturating_sub(1).min(self.tabs.len() - 1))
+                };
+            }
+            Some(a) if a > idx => {
+                self.active_idx = Some(a - 1);
+            }
+            _ => {}
+        }
+        self.paint();
+        Ok(!self.tabs.is_empty())
+    }
+
+    fn select_tab(&mut self, id: TabId) {
+        if let Some(idx) = self.tab_index_by_id(id) {
+            self.active_idx = Some(idx);
+        }
+        self.paint();
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.tabs.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.active_idx.unwrap_or(0);
+        self.active_idx = Some(if forward {
+            (cur + 1) % n
+        } else {
+            cur.checked_sub(1).unwrap_or(n - 1)
+        });
+        self.paint();
+    }
+
+    fn navigate(&mut self, url: &str) -> Result<(), BlitzError> {
+        let (w, h) = (self.width, self.height);
+        if let Some(idx) = self.active_idx {
+            self.tabs[idx].navigate(url, w, h);
+            self.paint();
+            Ok(())
+        } else {
+            Err(BlitzError::InitFailed("no active tab".into()))
+        }
+    }
+
+    fn go_back(&mut self, n: usize) {
+        let (w, h) = (self.width, self.height);
+        if let Some(idx) = self.active_idx {
+            self.tabs[idx].go_back(n, w, h);
+            self.paint();
+        }
+    }
+
+    fn go_forward(&mut self, n: usize) {
+        let (w, h) = (self.width, self.height);
+        if let Some(idx) = self.active_idx {
+            self.tabs[idx].go_forward(n, w, h);
+            self.paint();
+        }
+    }
+
+    fn reload(&mut self) {
+        let (w, h) = (self.width, self.height);
+        if let Some(idx) = self.active_idx {
+            self.tabs[idx].reload(w, h);
+            self.paint();
+        }
+    }
+
+    fn stop(&self) {
+        // Blitz has no async loading; no-op.
+        tracing::debug!("blitz worker: stop — no-op (synchronous load model)");
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.view.width.store(width, Ordering::Relaxed);
+        self.view.height.store(height, Ordering::Relaxed);
+        for tab in &mut self.tabs {
+            tab.resize(width, height);
+        }
+        self.paint();
+    }
+
+    fn build_snapshot(&self) -> TabsSnapshot {
+        let tabs: Vec<TabRecord> = self.tabs.iter().map(TabRecord::from_tab).collect();
+        let active = self.active_idx.and_then(|i| tabs.get(i).map(|t| t.id));
+        TabsSnapshot { tabs, active }
+    }
+
+    fn active_can_go_back(&self) -> bool {
+        self.active_idx
+            .map(|i| self.tabs[i].can_go_back())
+            .unwrap_or(false)
+    }
+
+    fn active_can_go_forward(&self) -> bool {
+        self.active_idx
+            .map(|i| self.tabs[i].can_go_forward())
+            .unwrap_or(false)
+    }
+
+    /// Write a solid white BGRA frame into `SharedOsrFrame`.
+    ///
+    /// Phase B placeholder — Phase C replaces with Vello→wgpu→readback.
+    fn paint(&self) {
+        let w = self.view.width.load(Ordering::Relaxed);
+        let h = self.view.height.load(Ordering::Relaxed);
+        if let Ok(mut guard) = self.frame.lock() {
+            let len = (w as usize) * (h as usize) * 4;
+            if guard.width != w || guard.height != h || guard.pixels.len() != len {
+                guard.width = w;
+                guard.height = h;
+                guard.pixels = vec![0xffu8; len];
+            } else {
+                guard.pixels.fill(0xff);
+            }
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.needs_fresh = false;
+        }
+        if let Some(wake) = self.view.wake.get() {
+            wake();
+        }
+        tracing::debug!("blitz worker: painted frame {w}×{h}");
+    }
+
+    fn run(mut self, rx: mpsc::Receiver<Command>) {
+        tracing::info!("blitz worker: running");
+        loop {
+            match rx.recv() {
+                Ok(cmd) => {
+                    if self.handle_command(cmd) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    tracing::info!("blitz worker: channel closed, exiting");
+                    break;
+                }
+            }
+        }
+        tracing::info!("blitz worker: exited");
+    }
+
+    fn handle_command(&mut self, cmd: Command) -> bool {
+        match cmd {
+            Command::OpenTab { url, reply } => {
+                let _ = reply.send(self.open_tab(&url));
+            }
+            Command::CloseTab { id, reply } => {
+                let _ = reply.send(self.close_tab(id));
+            }
+            Command::SelectTab { id } => {
+                self.select_tab(id);
+            }
+            Command::CycleTab { forward } => {
+                self.cycle_tab(forward);
+            }
+            Command::Navigate { url, reply } => {
+                let _ = reply.send(self.navigate(&url));
+            }
+            Command::GoBack { n } => {
+                self.go_back(n);
+            }
+            Command::GoForward { n } => {
+                self.go_forward(n);
+            }
+            Command::Reload => {
+                self.reload();
+            }
+            Command::Stop => {
+                self.stop();
+            }
+            Command::Resize { width, height } => {
+                self.resize(width, height);
+            }
+            Command::ForcePaint => {
+                self.paint();
+            }
+            Command::QueryTabs { reply } => {
+                let _ = reply.send(self.build_snapshot());
+            }
+            Command::QueryCanGoBack { reply } => {
+                let _ = reply.send(self.active_can_go_back());
+            }
+            Command::QueryCanGoForward { reply } => {
+                let _ = reply.send(self.active_can_go_forward());
+            }
+            Command::Shutdown => {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ── Spawn helper ──────────────────────────────────────────────────────────────
+
+pub(crate) fn spawn(
+    initial_url: &str,
+    width: u32,
+    height: u32,
+    frame: SharedOsrFrame,
+    view: SharedOsrViewState,
+) -> Result<WorkerHandle, BlitzError> {
+    let (tx, rx) = mpsc::sync_channel::<Command>(64);
+    let initial_url = initial_url.to_owned();
+
+    thread::Builder::new()
+        .name("buffr-blitz-worker".into())
+        .spawn(move || {
+            tracing::info!("blitz worker: starting");
+            let mut worker = Worker::new(Arc::clone(&frame), Arc::clone(&view), width, height);
+            if let Err(e) = worker.open_tab(&initial_url) {
+                tracing::error!("blitz worker: failed to open initial tab: {e}");
+            }
+            worker.run(rx);
+        })
+        .map_err(|e| BlitzError::InitFailed(e.to_string()))?;
+
+    Ok(WorkerHandle { tx })
+}

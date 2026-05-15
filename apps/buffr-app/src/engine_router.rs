@@ -65,6 +65,16 @@ pub enum RouterError {
     /// `build()` was called with zero registered engines.
     #[error("empty engine registry")]
     EmptyRegistry,
+    /// The URL scheme is not allowed for navigation (e.g. `javascript:`,
+    /// `data:`). The caller should drop the navigation request.
+    ///
+    /// Note: scheme blocking in `classify_navigation` uses the
+    /// [`NavigationVerdict::DisallowedScheme`] path. This error variant exists
+    /// for future callers (e.g. direct `resolve_safe()`) that prefer
+    /// `Result`-based error propagation.
+    #[allow(dead_code)]
+    #[error("disallowed URL scheme `{0}` — navigation rejected")]
+    DisallowedScheme(String),
 }
 
 impl std::fmt::Debug for EngineRouter {
@@ -218,13 +228,28 @@ pub enum NavigationVerdict {
         /// The engine that should host this URL.
         target: EngineId,
     },
+    /// The URL's scheme is not allowed for navigation (e.g. `javascript:`,
+    /// `data:`). The caller must drop the navigation — do not pass to an
+    /// engine.
+    DisallowedScheme,
 }
 
+/// Schemes that must never reach an engine regardless of routing rules.
+///
+/// `javascript:` can execute arbitrary JS in the engine process if allowed
+/// through — treat it as a blocked navigation, not a search query, at this
+/// layer. `data:` URLs arrived through untrusted IPC (the single-instance
+/// forwarding socket) are similarly rejected; programmatic `data:` navigations
+/// originate from within the app, not this routing path.
+const DISALLOWED_NAV_SCHEMES: &[&str] = &["javascript", "data"];
+
 /// Classify whether navigating `url` from `active_engine` requires a
-/// cross-engine handoff.
+/// cross-engine handoff or should be dropped entirely.
 ///
 /// Returns [`NavigationVerdict::SameEngine`] when the resolved engine matches
-/// `active_engine`; otherwise [`NavigationVerdict::CrossEngine`].
+/// `active_engine`; [`NavigationVerdict::CrossEngine`] on a mismatch;
+/// [`NavigationVerdict::DisallowedScheme`] when the URL scheme is not safe to
+/// forward to any engine.
 ///
 /// This is a pure function — no side effects — which makes it trivially
 /// unit-testable with stub engines. The `check_cross_engine_nav` method in
@@ -235,6 +260,18 @@ pub fn classify_navigation(
     active_engine: &EngineId,
     url: &str,
 ) -> NavigationVerdict {
+    // Reject disallowed schemes before any routing logic.
+    if let Ok(parsed) = url::Url::parse(url)
+        && DISALLOWED_NAV_SCHEMES.contains(&parsed.scheme())
+    {
+        tracing::warn!(
+            scheme = parsed.scheme(),
+            url,
+            "classify_navigation: disallowed scheme — dropping navigation"
+        );
+        return NavigationVerdict::DisallowedScheme;
+    }
+
     let target = router.resolve(url);
     if target == active_engine {
         NavigationVerdict::SameEngine
@@ -1015,8 +1052,36 @@ mod tests {
         // URL with no host → resolves to default (cef). Active = cef → SameEngine.
         let router = two_engine_router();
         let active = EngineId::new("cef-a");
-        let verdict = super::classify_navigation(&router, &active, "data:text/plain,hello");
+        // about:blank has no host and is a safe scheme → SameEngine.
+        let verdict = super::classify_navigation(&router, &active, "about:blank");
         assert_eq!(verdict, super::NavigationVerdict::SameEngine);
+    }
+
+    // ── Security: disallowed schemes are rejected by classify_navigation ───────
+
+    #[test]
+    fn classify_navigation_rejects_javascript_scheme() {
+        let router = two_engine_router();
+        let active = EngineId::new("cef-a");
+        let verdict = super::classify_navigation(&router, &active, "javascript:alert(1)");
+        assert_eq!(
+            verdict,
+            super::NavigationVerdict::DisallowedScheme,
+            "javascript: must be rejected"
+        );
+    }
+
+    #[test]
+    fn classify_navigation_rejects_data_scheme() {
+        let router = two_engine_router();
+        let active = EngineId::new("cef-a");
+        let verdict =
+            super::classify_navigation(&router, &active, "data:text/html,<script>xss</script>");
+        assert_eq!(
+            verdict,
+            super::NavigationVerdict::DisallowedScheme,
+            "data: must be rejected"
+        );
     }
 
     #[test]
