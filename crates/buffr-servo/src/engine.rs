@@ -28,8 +28,14 @@
 //!
 //! # What returns `Unimplemented` / no-op
 //!
-//! - `navigate` — blocked by dep conflict; returns Err with explanation
-//! - `go_back`, `go_forward`, `reload`, `stop` — no-ops (no real WebView)
+//! - `navigate` — wired through the worker, which records the URL on the
+//!   active tab and returns InitFailed (dep conflict). Caller sees the error
+//!   but `active_tab_live_url` reflects the requested URL.
+//! - `duplicate_active`, `reopen_closed_tab` — no worker support (genuine
+//!   `Unimplemented`)
+//! - `Command::GoBack` / `GoForward` / `Reload` / `Stop` worker variants exist
+//!   but are unreachable from the trait surface today. Phase C wires them in
+//!   via `dispatch(&PageAction::Back/Forward/Reload/StopLoading)`.
 //! - All popup, hint, find, zoom, devtools, clipboard methods
 //!
 //! # Architecture (ready for real Servo when conflict is resolved)
@@ -308,14 +314,18 @@ impl BrowserEngine for ServoEngine {
     // ── Navigation ───────────────────────────────────────────────────────────
 
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
-        // Phase B skeleton: navigate is wired through the worker but the
-        // worker returns InitFailed("servo: libsqlite3-sys dep conflict…")
-        // because no real WebView exists.  The Unimplemented message below
-        // surfaces it clearly to the apps layer.
-        tracing::debug!("servo: navigate {url} — blocked by libsqlite3-sys dep conflict");
-        Err(EngineError::Unimplemented {
-            method: "navigate (servo: libsqlite3-sys dep conflict — see Cargo.toml)",
-        })
+        // Skeleton: the worker records the requested URL on the active tab and
+        // returns InitFailed("servo: libsqlite3-sys dep conflict…") because no
+        // real WebView exists. The error propagates to the apps layer; the URL
+        // still shows up in the cache so address-bar reads behave reasonably.
+        tracing::debug!("servo: navigate {url} (skeleton — dep conflict)");
+        self.worker
+            .call(|reply| Command::Navigate {
+                url: url.to_owned(),
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn active_tab_live_url(&self) -> String {
