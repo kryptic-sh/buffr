@@ -1420,12 +1420,45 @@ wrap_permission_handler! {
             prompt_id: u64,
             _result: PermissionRequestResult,
         ) {
-            // Fired when CEF cancels the prompt itself (e.g. tab
-            // navigated away). We don't have a stable identifier on
-            // the queue entry yet, so this is informational — the
-            // pending entry will eventually be resolved by the user or
-            // by `drain_with_defer` at shutdown.
-            tracing::trace!(prompt_id, "permissions: dismissed by CEF");
+            // Fired when CEF cancels the prompt itself (e.g. tab navigated away).
+            // Remove the matching entry from both the callback registry and the
+            // neutral queue so the UI thread doesn't surface a stale prompt.
+            tracing::trace!(prompt_id, "permissions: dismissed by CEF — cleaning up queue");
+
+            // Find and remove the entry from the callback registry by prompt_id.
+            let resolve_id = match self.callback_registry.lock() {
+                Ok(mut reg) => {
+                    // Find the resolve_id whose PendingPermission has this prompt_id.
+                    let found_id = reg
+                        .iter()
+                        .find_map(|(id, p)| match p {
+                            crate::permissions::PendingPermission::Prompt {
+                                prompt_id: pid, ..
+                            } if *pid == prompt_id => Some(id.clone()),
+                            _ => None,
+                        });
+                    if let Some(ref id) = found_id {
+                        reg.remove(id);
+                    }
+                    found_id
+                }
+                Err(_) => {
+                    tracing::warn!(prompt_id, "permissions: callback registry poisoned in dismiss");
+                    return;
+                }
+            };
+
+            // Remove the matching entry from the neutral queue by resolve_id.
+            if let Some(rid) = resolve_id {
+                match self.neutral_queue.lock() {
+                    Ok(mut q) => {
+                        q.retain(|p| p.resolve_id.as_deref() != Some(&rid));
+                    }
+                    Err(_) => {
+                        tracing::warn!(prompt_id, "permissions: neutral queue poisoned in dismiss");
+                    }
+                }
+            }
         }
     }
 }
@@ -1603,10 +1636,24 @@ wrap_context_menu_handler! {
     }
 }
 
+/// Windows reserved device names (case-insensitive, stem-only).
+///
+/// Applied on all platforms: users may copy downloads to Windows shares, and
+/// creating a file named `CON` or `NUL` on a Samba mount causes silent
+/// data-loss or hangs on the Windows side.
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Strip path-traversal bits and OS-meaningful separators from a CEF
 /// suggested filename. We don't attempt full sanitisation — CEF
 /// already filters most malicious cases — but a `Path::file_name`
 /// pass guards against `../` prefixes leaking through.
+///
+/// Additionally, if the filename stem matches a Windows reserved device name
+/// (case-insensitively), we prepend an underscore so the file is safe to
+/// copy to Windows file systems or Samba shares.
 fn sanitise_filename(name: &str) -> String {
     let trimmed = name.trim();
     let stripped = std::path::Path::new(trimmed)
@@ -1616,7 +1663,16 @@ fn sanitise_filename(name: &str) -> String {
     if stripped.is_empty() {
         // Last-resort fallback — a download with no filename and no
         // way to derive one. CEF sometimes emits this for blob: URLs.
-        "download".to_string()
+        return "download".to_string();
+    }
+    // Extract the stem (filename without extension) for reserved-name check.
+    let stem = std::path::Path::new(&stripped)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_uppercase())
+        .unwrap_or_default();
+    if WINDOWS_RESERVED_STEMS.contains(&stem.as_str()) {
+        // Prepend underscore to avoid Windows reserved device names.
+        format!("_{stripped}")
     } else {
         stripped
     }
@@ -1724,5 +1780,39 @@ mod tests {
         // Pure path-traversal with no real basename also resolves to
         // the fallback after `Path::file_name` strips dot-segments.
         assert_eq!(sanitise_filename("/"), "download");
+    }
+
+    #[test]
+    fn sanitise_filename_rejects_windows_reserved_stems() {
+        // Bare reserved names get underscore prefix.
+        assert_eq!(sanitise_filename("CON"), "_CON");
+        assert_eq!(sanitise_filename("NUL"), "_NUL");
+        assert_eq!(sanitise_filename("PRN"), "_PRN");
+        assert_eq!(sanitise_filename("AUX"), "_AUX");
+        assert_eq!(sanitise_filename("COM1"), "_COM1");
+        assert_eq!(sanitise_filename("LPT9"), "_LPT9");
+    }
+
+    #[test]
+    fn sanitise_filename_rejects_windows_reserved_with_extension() {
+        // `CON.txt` is still reserved (Windows uses only the stem for device detection).
+        assert_eq!(sanitise_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitise_filename("NUL.pdf"), "_NUL.pdf");
+    }
+
+    #[test]
+    fn sanitise_filename_reserved_names_case_insensitive() {
+        // Windows is case-insensitive for reserved names.
+        assert_eq!(sanitise_filename("con"), "_con");
+        assert_eq!(sanitise_filename("nul"), "_nul");
+        assert_eq!(sanitise_filename("Com3.log"), "_Com3.log");
+    }
+
+    #[test]
+    fn sanitise_filename_non_reserved_unchanged() {
+        // Names that look like reserved but aren't should pass through.
+        assert_eq!(sanitise_filename("console.log"), "console.log");
+        assert_eq!(sanitise_filename("null_values.csv"), "null_values.csv");
+        assert_eq!(sanitise_filename("COM10.txt"), "COM10.txt"); // COM10 is not reserved
     }
 }

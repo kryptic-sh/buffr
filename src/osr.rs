@@ -78,7 +78,8 @@ wrap_render_handler! {
             rect.y = 0;
             rect.width = w as i32;
             rect.height = h as i32;
-            tracing::debug!(browser_id = ?browser.as_deref().map(|b| b.identifier()), w = rect.width, h = rect.height, "osr: view_rect queried");
+            // No debug log here — view_rect is called on every frame by the CEF
+            // compositor thread and the log volume would swamp all other output.
         }
 
         fn screen_info(
@@ -93,13 +94,8 @@ wrap_render_handler! {
             let browser_id = browser.as_deref().map(|b| b.identifier());
             let (w, h) = self.resolve_dims(browser_id);
             let scale = self.resolve_scale(browser_id);
-            tracing::debug!(
-                ?browser_id,
-                w,
-                h,
-                scale,
-                "osr: screen_info queried",
-            );
+            // No debug log here — screen_info is called on every frame paint
+            // alongside view_rect; log volume would swamp all other output.
             si.device_scale_factor = scale;
             si.depth = 32;
             si.depth_per_component = 8;
