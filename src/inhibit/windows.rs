@@ -141,11 +141,11 @@ fn run_worker(rx: mpsc::Receiver<InhibitCmd>, active: Arc<AtomicBool>) {
     for cmd in rx {
         match cmd {
             InhibitCmd::Acquire => {
-                if !active.load(Ordering::Relaxed) {
-                    if set_execution_state(ES_CONTINUOUS | ES_DISPLAY_REQUIRED) {
-                        active.store(true, Ordering::Relaxed);
-                        tracing::debug!("windows idle inhibitor: acquired");
-                    }
+                if !active.load(Ordering::Relaxed)
+                    && set_execution_state(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
+                {
+                    active.store(true, Ordering::Relaxed);
+                    tracing::debug!("windows idle inhibitor: acquired");
                 }
             }
             InhibitCmd::Release => {
