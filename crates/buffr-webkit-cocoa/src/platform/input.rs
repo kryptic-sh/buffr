@@ -103,10 +103,7 @@
 //! input types.
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::*;
-
-#[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use core::ffi::c_float;
 
     use buffr_engine::{KeyEventKind, MouseButton, NeutralKeyEvent};
@@ -206,7 +203,6 @@ mod macos {
         unsafe {
             // Dispatch via NSResponder interface inherited by WKWebView → NSView.
             // `keyDown:` / `keyUp:` confirmed: NSResponder.rs:151-158.
-            use objc2::ClassType as _;
             let view = self_as_nsview(web_view);
             match event.kind {
                 KeyEventKind::RawDown | KeyEventKind::Char => view.keyDown(&ns_event),
@@ -506,7 +502,6 @@ mod macos {
     /// points to a live WKWebView instance (guaranteed by `Retained<WKWebView>`
     /// lifetime in the caller).
     unsafe fn self_as_nsview(web_view: &WKWebView) -> &NSView {
-        use objc2::ClassType as _;
         web_view.as_ref() as &NSView
     }
 }

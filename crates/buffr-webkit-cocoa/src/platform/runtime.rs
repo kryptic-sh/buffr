@@ -82,15 +82,14 @@
 //!   the retained-return dance. See objc2-0.6.4/src/macros/mod.rs:1306.
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::*;
-
-#[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use std::sync::{Arc, Mutex};
 
-    use objc2::ProtocolObject;
     use objc2::rc::Retained;
-    use objc2_foundation::{NSString, NSURL, NSURLRequest};
+    use objc2::runtime::ProtocolObject;
+    use objc2::runtime::{NSObject, NSObjectProtocol};
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
+    use objc2_foundation::{NSError, NSString, NSURL, NSURLRequest};
     use objc2_web_kit::{
         WKNavigation, WKNavigationDelegate, WKUIDelegate, WKWebView, WKWebViewConfiguration,
     };
@@ -150,11 +149,16 @@ mod macos {
         ) -> Result<Self, WebKitCocoaError> {
             use objc2_core_foundation::CGRect;
 
-            // Build the configuration. Using alloc().init() so we don't need
-            // a MainThreadMarker handle threaded through all callers.
-            // WKWebViewConfiguration::alloc().init() is the designated init.
-            // Confirmed: WKWebViewConfiguration.rs:364-367.
-            let config = unsafe { WKWebViewConfiguration::alloc().init() };
+            // SAFETY: This function is only called from the GCD main queue
+            // (inside dispatch_main_async closures in worker.rs). We are
+            // guaranteed to be on the main thread here.
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+
+            // Build the configuration.
+            // WKWebViewConfiguration is MainThreadOnly; alloc() requires mtm.
+            // init(this: Allocated<Self>) confirmed: WKWebViewConfiguration.rs:364-367.
+            let config =
+                unsafe { WKWebViewConfiguration::init(WKWebViewConfiguration::alloc(mtm)) };
 
             // Off-screen rect. WKWebView does not need to be attached to a
             // visible window for snapshots to work.
@@ -167,16 +171,18 @@ mod macos {
                 },
             };
 
-            // initWithFrame:configuration: confirmed at WKWebView.rs:236-242.
+            // initWithFrame_configuration(this, CGRect, config) confirmed: WKWebView.rs:236-242.
             // Takes CGRect (not NSRect) and requires objc2-core-foundation feature.
-            let web_view =
-                unsafe { WKWebView::alloc().initWithFrame_configuration(frame, &config) };
+            // WKWebView is MainThreadOnly; alloc() requires mtm.
+            let web_view = unsafe {
+                WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config)
+            };
 
             // Install navigation delegate.
             // BuffrNavigationDelegate implements WKNavigationDelegate.
             // setNavigationDelegate takes Option<&ProtocolObject<dyn WKNavigationDelegate>>.
             // We hold a strong Retained here; WKWebView holds weak ref internally.
-            let nav_delegate = BuffrNavigationDelegate::new(id, Arc::clone(&state));
+            let nav_delegate = BuffrNavigationDelegate::new(id, Arc::clone(&state), mtm);
             unsafe {
                 // ProtocolObject::from_ref coerces &BuffrNavigationDelegate to
                 // &ProtocolObject<dyn WKNavigationDelegate>. Confirmed:
@@ -185,7 +191,7 @@ mod macos {
             }
 
             // Install UI delegate.
-            let ui_delegate = BuffrUiDelegate::new();
+            let ui_delegate = BuffrUiDelegate::new(mtm);
             unsafe {
                 web_view.setUIDelegate(Some(ProtocolObject::from_ref(&*ui_delegate)));
             }
@@ -235,12 +241,9 @@ mod macos {
                     height: height as f64,
                 },
             };
-            unsafe {
-                // Cast: WKWebView → NSView via Deref chain.
-                // NSView::setFrame confirmed: NSView.rs:410-412.
-                use objc2::ClassType as _;
-                (self.web_view.as_ref() as &NSView).setFrame(frame);
-            }
+            // Cast: WKWebView → NSView via Deref chain.
+            // NSView::setFrame is safe (confirmed: NSView.rs:410-412).
+            (self.web_view.as_ref() as &NSView).setFrame(frame);
         }
 
         /// Navigate to a new URL.
@@ -326,7 +329,8 @@ mod macos {
     /// Returns `Option<Retained<NSURL>>` — nil if the string is malformed.
     fn nsurl_from_str(s: &str) -> Option<Retained<NSURL>> {
         let ns = NSString::from_str(s);
-        unsafe { NSURL::URLWithString(&ns) }
+        // URLWithString is safe (no `unsafe` in objc2-foundation binding).
+        NSURL::URLWithString(&ns)
     }
 
     // ── BuffrNavigationDelegate ───────────────────────────────────────────────
@@ -350,12 +354,6 @@ mod macos {
     //   webView:didFinishNavigation:            → line ~278
     //   webView:didFailNavigation:withError:    → line ~296
     //   webView:didFailProvisionalNavigation:withError: → line ~240
-
-    use objc2::rc::Allocated;
-    use objc2::runtime::{NSObject, NSObjectProtocol};
-    use objc2::{MainThreadOnly, define_class};
-    use objc2_foundation::NSError;
-    use objc2_web_kit::WKNavigation;
 
     /// Ivars stored inside `BuffrNavigationDelegate` Objective-C instances.
     pub(crate) struct NavDelegateIvars {
@@ -392,7 +390,7 @@ mod macos {
                 web_view: &WKWebView,
                 _navigation: Option<&WKNavigation>,
             ) {
-                let url = get_url_string(web_view);
+                let url = unsafe { get_url_string(web_view) };
                 tracing::debug!("webkit-cocoa nav: didStartProvisionalNavigation url={url}");
                 if let Ok(mut st) = self.ivars().state.lock() {
                     if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
@@ -412,7 +410,7 @@ mod macos {
                 web_view: &WKWebView,
                 _navigation: Option<&WKNavigation>,
             ) {
-                let url = get_url_string(web_view);
+                let url = unsafe { get_url_string(web_view) };
                 tracing::debug!("webkit-cocoa nav: didCommitNavigation url={url}");
                 if let Ok(mut st) = self.ivars().state.lock() {
                     if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
@@ -432,8 +430,8 @@ mod macos {
                 web_view: &WKWebView,
                 _navigation: Option<&WKNavigation>,
             ) {
-                let url = get_url_string(web_view);
-                let title = get_title_string(web_view);
+                let url = unsafe { get_url_string(web_view) };
+                let title = unsafe { get_title_string(web_view) };
                 tracing::debug!("webkit-cocoa nav: didFinishNavigation url={url} title={title}");
                 if let Ok(mut st) = self.ivars().state.lock() {
                     if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
@@ -490,12 +488,20 @@ mod macos {
     impl BuffrNavigationDelegate {
         /// Allocate and initialise a new `BuffrNavigationDelegate`.
         ///
-        /// Pattern: `Class::alloc().set_ivars(…)` then `msg_send![this, init]`.
-        /// `set_ivars` confirmed: objc2-0.6.4/src/rc/allocated_partial_init.rs:200.
-        /// `msg_send!` (retained variant) for init: objc2/src/macros/mod.rs:1246.
-        fn new(tab_id: TabId, state: Arc<Mutex<EngineState>>) -> Retained<Self> {
-            let this = Self::alloc().set_ivars(NavDelegateIvars { tab_id, state });
-            unsafe { objc2::msg_send![this, init] }
+        /// Pattern: `Class::alloc(mtm).set_ivars(…)` then `msg_send![super(this), init]`.
+        /// - `alloc(mtm)` required because class is `MainThreadOnly`.
+        ///   Confirmed: objc2-0.6.4/src/top_level_traits.rs:547.
+        /// - `set_ivars` confirmed: objc2-0.6.4/src/rc/allocated_partial_init.rs:200.
+        /// - `msg_send![super(this), init]` required for `PartialInit<T>` receivers.
+        ///   The `super` keyword routes via `IsSuper` semantics.
+        ///   Confirmed: objc2-0.6.4/src/__macro_helpers/retain_semantics.rs:474+.
+        fn new(
+            tab_id: TabId,
+            state: Arc<Mutex<EngineState>>,
+            mtm: MainThreadMarker,
+        ) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(NavDelegateIvars { tab_id, state });
+            unsafe { objc2::msg_send![super(this), init] }
         }
     }
 
@@ -537,9 +543,9 @@ mod macos {
     );
 
     impl BuffrUiDelegate {
-        fn new() -> Retained<Self> {
-            let this = Self::alloc().set_ivars(UiDelegateIvars);
-            unsafe { objc2::msg_send![this, init] }
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(UiDelegateIvars);
+            unsafe { objc2::msg_send![super(this), init] }
         }
     }
 
@@ -551,19 +557,23 @@ mod macos {
     /// `NSURL::absoluteString()` → `Option<Retained<NSString>>`. Confirmed: NSURL.rs:1264-1266.
     /// `NSString::to_string()` via the `Display` impl in objc2-foundation.
     unsafe fn get_url_string(web_view: &WKWebView) -> String {
-        web_view
-            .URL()
-            .as_ref()
-            .and_then(|u| u.absoluteString())
-            .map(|s| s.to_string())
-            .unwrap_or_default()
+        // SAFETY: caller guarantees web_view is a live WKWebView on the main thread.
+        unsafe {
+            web_view
+                .URL()
+                .as_ref()
+                .and_then(|u| u.absoluteString())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        }
     }
 
     /// Read the current page title from a WKWebView.
     ///
     /// `WKWebView::title()` → `Option<Retained<NSString>>`. Confirmed: WKWebView.rs:348-350.
     unsafe fn get_title_string(web_view: &WKWebView) -> String {
-        web_view.title().map(|s| s.to_string()).unwrap_or_default()
+        // SAFETY: caller guarantees web_view is a live WKWebView on the main thread.
+        unsafe { web_view.title().map(|s| s.to_string()).unwrap_or_default() }
     }
 
     // ── TabState (for EngineState below) ─────────────────────────────────────

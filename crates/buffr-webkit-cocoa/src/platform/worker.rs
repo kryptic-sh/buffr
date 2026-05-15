@@ -42,7 +42,6 @@ pub(crate) use macos::*;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos {
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;

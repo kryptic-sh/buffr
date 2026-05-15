@@ -5,7 +5,6 @@ use std::sync::Arc;
 use buffr_engine::{Backend, BackendOpenOptions, BrowserEngine};
 
 use super::engine::WebKitCocoaEngine;
-use super::error::WebKitCocoaError;
 
 /// WebKit Cocoa process-model lifecycle backend (macOS only).
 ///

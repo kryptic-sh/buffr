@@ -82,7 +82,7 @@
 
 use std::sync::atomic::Ordering;
 
-use buffr_engine::{OsrFrame, SharedOsrFrame, SharedOsrViewState};
+use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
 
 // ── Blank-frame paint ─────────────────────────────────────────────────────────
 
@@ -114,15 +114,12 @@ pub(crate) fn paint_blank(frame: &SharedOsrFrame, view: &SharedOsrViewState) {
 // ── Real pixel extraction (macOS) ─────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::request_snapshot;
-
-#[cfg(target_os = "macos")]
 pub(crate) mod macos {
     use std::sync::atomic::Ordering;
 
     use block2::RcBlock;
     use objc2_app_kit::{NSBitmapImageRep, NSImage};
-    use objc2_foundation::{NSData, NSError};
+    use objc2_foundation::NSError;
     use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
 
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState};

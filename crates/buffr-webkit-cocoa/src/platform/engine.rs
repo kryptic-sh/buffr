@@ -119,9 +119,9 @@ impl WebKitCocoaEngine {
             });
         }
 
-        // Non-macOS: never reached in practice (Backend::open_engine returns Err
-        // on non-macOS), but must compile.
-        #[allow(unreachable_code)]
+        // Non-macOS: only compiled and reachable on non-macOS targets.
+        // The `#[cfg(target_os = "macos")]` block above returns early on macOS.
+        #[cfg(not(target_os = "macos"))]
         Ok(WebKitCocoaEngine {
             engine_id: options.engine_id.clone(),
             frame,
@@ -132,10 +132,10 @@ impl WebKitCocoaEngine {
     /// Read a snapshot from `engine_state`. Non-blocking, safe from any thread.
     #[cfg(target_os = "macos")]
     fn with_state<T>(&self, f: impl FnOnce(&EngineState) -> T) -> T {
-        self.engine_state
-            .lock()
-            .map(|g| f(&g))
-            .unwrap_or_else(|_| f(&EngineState::new()))
+        match self.engine_state.lock() {
+            Ok(g) => f(&g),
+            Err(_) => f(&EngineState::new()),
+        }
     }
 }
 
@@ -172,7 +172,7 @@ impl BrowserEngine for WebKitCocoaEngine {
             .map_err(EngineError::from)?
             .map_err(EngineError::from);
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         Err(EngineError::Unimplemented { method: "open_tab" })
     }
 
@@ -199,7 +199,7 @@ impl BrowserEngine for WebKitCocoaEngine {
             .map_err(EngineError::from)?
             .map_err(EngineError::from);
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         Err(EngineError::Unimplemented {
             method: "close_tab",
         })
@@ -260,7 +260,7 @@ impl BrowserEngine for WebKitCocoaEngine {
                 .and_then(|i| st.summaries().into_iter().nth(i))
         });
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         None
     }
 
@@ -268,7 +268,7 @@ impl BrowserEngine for WebKitCocoaEngine {
         #[cfg(target_os = "macos")]
         return self.with_state(|st| st.summaries());
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         vec![]
     }
 
@@ -276,7 +276,7 @@ impl BrowserEngine for WebKitCocoaEngine {
         #[cfg(target_os = "macos")]
         return self.with_state(|st| st.tabs.len());
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         0
     }
 
@@ -288,7 +288,7 @@ impl BrowserEngine for WebKitCocoaEngine {
         #[cfg(target_os = "macos")]
         return self.with_state(|st| st.active_idx);
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         None
     }
 
@@ -312,7 +312,7 @@ impl BrowserEngine for WebKitCocoaEngine {
                 .unwrap_or_default()
         });
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         String::new()
     }
 
@@ -327,7 +327,7 @@ impl BrowserEngine for WebKitCocoaEngine {
             .call(|reply| Command::QueryCanGoBack { reply })
             .unwrap_or(false);
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         false
     }
 
@@ -338,7 +338,7 @@ impl BrowserEngine for WebKitCocoaEngine {
             .call(|reply| Command::QueryCanGoForward { reply })
             .unwrap_or(false);
 
-        #[allow(unreachable_code)]
+        #[cfg(not(target_os = "macos"))]
         false
     }
 
