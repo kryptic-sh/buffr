@@ -638,7 +638,7 @@ impl BrowserEngine for LadybirdEngine {
     ) {
     }
 
-    // ── Hint mode stubs ───────────────────────────────────────────────────────
+    // Hint mode unsupported on ladybird (Phase B FFI stub; LibWeb JS not yet bridged).
 
     fn is_hint_mode(&self) -> bool {
         false
@@ -660,9 +660,7 @@ impl BrowserEngine for LadybirdEngine {
         None
     }
 
-    fn cancel_hint(&self) {
-        tracing::debug!("ladybird: cancel_hint — no-op");
-    }
+    fn cancel_hint(&self) {}
 
     // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
     //

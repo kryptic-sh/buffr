@@ -682,7 +682,7 @@ impl BrowserEngine for ServoEngine {
     ) {
     }
 
-    // ── Hint mode stubs ───────────────────────────────────────────────────────
+    // Hint mode unsupported on Servo 0.1 (no console.log scraping or overlay-rendering API).
 
     fn is_hint_mode(&self) -> bool {
         false
@@ -704,9 +704,7 @@ impl BrowserEngine for ServoEngine {
         None
     }
 
-    fn cancel_hint(&self) {
-        tracing::debug!("servo: cancel_hint not implemented");
-    }
+    fn cancel_hint(&self) {}
 
     // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
 

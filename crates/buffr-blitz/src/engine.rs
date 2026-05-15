@@ -554,7 +554,7 @@ impl BrowserEngine for BlitzEngine {
     ) {
     }
 
-    // ── Hint mode stubs ───────────────────────────────────────────────────────
+    // Hint mode unsupported on blitz (no JS engine).
 
     fn is_hint_mode(&self) -> bool {
         false
@@ -576,9 +576,7 @@ impl BrowserEngine for BlitzEngine {
         None
     }
 
-    fn cancel_hint(&self) {
-        tracing::debug!("blitz: cancel_hint — no-op");
-    }
+    fn cancel_hint(&self) {}
 
     // ── Frame editing stubs ──────────────────────────────────────────────────
     //
