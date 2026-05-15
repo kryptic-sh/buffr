@@ -467,6 +467,36 @@ impl BrowserEngine for WebView2Engine {
         self.run_js(code)
     }
 
+    // ── Media / image (Phase 6c, #95) ────────────────────────────────────────
+
+    fn media_play_pause(&self, x: i32, y: i32) {
+        let _ = self.run_js(&buffr_engine::media_js::play_pause(x, y));
+    }
+
+    fn media_toggle_mute(&self, x: i32, y: i32) {
+        let _ = self.run_js(&buffr_engine::media_js::toggle_mute(x, y));
+    }
+
+    fn media_toggle_loop(&self, x: i32, y: i32) {
+        let _ = self.run_js(&buffr_engine::media_js::toggle_loop(x, y));
+    }
+
+    fn media_toggle_controls(&self, x: i32, y: i32) {
+        let _ = self.run_js(&buffr_engine::media_js::toggle_controls(x, y));
+    }
+
+    fn media_picture_in_picture(&self, x: i32, y: i32) {
+        let _ = self.run_js(&buffr_engine::media_js::picture_in_picture(x, y));
+    }
+
+    fn image_rotate(&self, x: i32, y: i32, delta_deg: i32) {
+        let _ = self.run_js(&buffr_engine::media_js::image_rotate(x, y, delta_deg));
+    }
+
+    fn copy_image_url_to_clipboard(&self, url: &str) {
+        let _ = self.run_js(&buffr_engine::media_js::copy_image_url(url));
+    }
+
     // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
 
     fn start_download(&self, url: &str) {
