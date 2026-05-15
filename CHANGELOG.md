@@ -8,6 +8,35 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-15
+
+### Fixed
+
+- CEF engine no longer spills its Chromium profile flat into `~/.cache/buffr/`
+  (`Default/`, `ShaderCache/`, `chrome_debug.log`, etc. at the root). Each CEF
+  engine instance now gets its own namespaced directory under
+  `~/.cache/buffr/engines/<engine-id>/`. Phase 11a (#96).
+- blink-cdp profile directory moved from `~/.local/share/buffr/blink-cdp/<id>/`
+  to `~/.local/share/buffr/engines/<id>/profile/`. Existing profiles are
+  migrated automatically on first launch via `fs::rename`. Phase 11a (#96).
+
+### Added
+
+- Startup migration shim (`engine_migrate`) moves blink-cdp profiles from the
+  pre-11a layout to the new `engines/<id>/profile/` path. Warns on stale CEF
+  flat state without auto-deleting. Migration is skipped in `--private` mode.
+- `BackendOpenOptions.cache_dir: Option<&Path>` — ephemeral cache directory for
+  backends that support a persistent/ephemeral split. Phase 11b (#96).
+- blink-cdp now passes `--disk-cache-dir=<cache_root>/engines/<id>/` to headless
+  Chromium. HTTP cache, shader cache, and code cache land in
+  `~/.cache/buffr/engines/<id>/` while cookies, IndexedDB, and prefs remain in
+  `~/.local/share/buffr/engines/<id>/profile/`. Phase 11b (#96).
+
+### Dependencies
+
+- `buffr-engine` 0.1.1 → 0.1.2
+- `buffr-blink-cdp` 0.1.2 → 0.1.3
+
 ## [0.10.0] - 2026-05-15
 
 ### Fixed
@@ -1250,7 +1279,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
 [0.10.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.10.0
 [0.9.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.9.0

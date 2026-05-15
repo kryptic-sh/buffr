@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "buffr"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-app"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "buffr-blink-cdp",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-blink-cdp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "buffr-core",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "buffr-modal",
  "buffr-permissions",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "buffr-cef",
 ]
@@ -6184,7 +6184,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "bzip2",
