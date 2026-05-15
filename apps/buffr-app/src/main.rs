@@ -7089,6 +7089,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let options = BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
                         data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
                         initial_url: &self.homepage,
                         frame_rate: display_hz as i32,
                         device_scale: effective_scale as f64,
@@ -7170,6 +7171,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
                         });
                     tracing::debug!(?data_dir, "blink-cdp profile dir");
+                    // Phase 11b: ephemeral cache directory for --disk-cache-dir split.
+                    // Canonical location: <cache_root>/engines/<id>/
+                    // Ephemeral by definition — no migration needed; user gets a fresh
+                    // cache on first run with Phase 11b.
+                    let blink_cache_dir =
+                        engine_migrate::compute_blink_cdp_cache_default(&self.cache_root, &inst.id);
+                    tracing::debug!(?blink_cache_dir, "blink-cdp cache dir");
                     // Resolve download directory for this blink-cdp instance.
                     // Prefer the user-configured `[downloads] default_dir`; fall
                     // back to `<data_dir>/downloads` so Chromium never touches
@@ -7181,6 +7189,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or_else(|| data_dir.join("downloads"));
                     match buffr_blink_cdp::BlinkCdpEngine::new(
                         &data_dir,
+                        Some(&blink_cache_dir),
                         Some(&blink_download_dir),
                         Some(self.downloads.clone()),
                         Some(self.download_notice_queue.clone()),

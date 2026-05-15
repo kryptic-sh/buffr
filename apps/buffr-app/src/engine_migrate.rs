@@ -34,6 +34,15 @@ pub fn compute_blink_cdp_default(data_root: &Path, engine_id: &str) -> PathBuf {
     data_root.join("engines").join(engine_id).join("profile")
 }
 
+/// Compute the default blink-cdp ephemeral cache directory for `engine_id`
+/// under `cache_root`.
+///
+/// Canonical location: `<cache_root>/engines/<engine_id>/`
+/// Used by Phase 11b for `--disk-cache-dir` split.
+pub fn compute_blink_cdp_cache_default(cache_root: &Path, engine_id: &str) -> PathBuf {
+    cache_root.join("engines").join(engine_id)
+}
+
 /// Run the Phase 11a layout migration on startup.
 ///
 /// **blink-cdp**: If `<data_root>/blink-cdp/` exists, every `<inst-id>/`
@@ -190,6 +199,16 @@ mod tests {
         assert_eq!(
             result,
             PathBuf::from("/home/user/.local/share/buffr/engines/engine-x/profile")
+        );
+    }
+
+    #[test]
+    fn compute_blink_cdp_cache_default_matches_expected() {
+        let cache_root = PathBuf::from("/home/user/.cache/buffr");
+        let result = compute_blink_cdp_cache_default(&cache_root, "engine-z");
+        assert_eq!(
+            result,
+            PathBuf::from("/home/user/.cache/buffr/engines/engine-z")
         );
     }
 
