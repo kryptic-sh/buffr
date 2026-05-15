@@ -411,8 +411,10 @@ impl BrowserEngine for BlitzEngine {
         self.worker.send(Command::ForcePaint);
     }
 
-    fn osr_sleep(&self, sleep: bool) {
-        tracing::debug!("blitz: osr_sleep({sleep}) — no-op");
+    fn osr_sleep(&self, _sleep: bool) {
+        // Blitz renders purely on-demand (event-driven, no idle paint loop).
+        // osr_sleep is a CEF concept — there is no background loop to pause.
+        tracing::debug!("blitz: osr_sleep — no-op (on-demand render, no idle loop)");
     }
 
     fn osr_invalidate_view(&self) {
@@ -499,6 +501,7 @@ impl BrowserEngine for BlitzEngine {
     }
 
     fn any_video_active(&self) -> bool {
+        // Blitz has no media element support — video decoding is not available.
         false
     }
 
@@ -577,6 +580,109 @@ impl BrowserEngine for BlitzEngine {
         tracing::debug!("blitz: cancel_hint — no-op");
     }
 
+    // ── Frame editing stubs ──────────────────────────────────────────────────
+    //
+    // Blitz is a read-only CSS/layout renderer — there is no editable DOM
+    // surface and no JavaScript engine to drive edit commands.  Each method
+    // below is an explicit STUB so future contributors know these are not
+    // accidental omissions.
+
+    fn frame_undo(&self) {
+        tracing::warn!("blitz: frame_undo unsupported (read-only render, no JS engine)");
+    }
+
+    fn frame_redo(&self) {
+        tracing::warn!("blitz: frame_redo unsupported (read-only render, no JS engine)");
+    }
+
+    fn frame_cut(&self) {
+        tracing::warn!("blitz: frame_cut unsupported (read-only render, no JS engine)");
+    }
+
+    fn frame_copy(&self) {
+        tracing::warn!("blitz: frame_copy unsupported (read-only render, no JS engine)");
+    }
+
+    fn frame_paste(&self) {
+        tracing::warn!("blitz: frame_paste unsupported (read-only render, no JS engine)");
+    }
+
+    fn frame_paste_plain(&self) {
+        tracing::warn!("blitz: frame_paste_plain unsupported (read-only render, no JS engine)");
+    }
+
+    fn frame_select_all(&self) {
+        tracing::warn!("blitz: frame_select_all unsupported (read-only render, no JS engine)");
+    }
+
+    // ── Media stubs ───────────────────────────────────────────────────────────
+    //
+    // Media ops inject JS into the active frame — no JS engine means these
+    // are permanently unsupported on the Blitz backend.
+
+    fn media_play_pause(&self, _x: i32, _y: i32) {
+        tracing::warn!("blitz: media_play_pause unsupported (read-only render, no JS engine)");
+    }
+
+    fn media_picture_in_picture(&self, _x: i32, _y: i32) {
+        tracing::warn!(
+            "blitz: media_picture_in_picture unsupported (read-only render, no JS engine)"
+        );
+    }
+
+    fn media_toggle_controls(&self, _x: i32, _y: i32) {
+        tracing::warn!("blitz: media_toggle_controls unsupported (read-only render, no JS engine)");
+    }
+
+    fn media_toggle_loop(&self, _x: i32, _y: i32) {
+        tracing::warn!("blitz: media_toggle_loop unsupported (read-only render, no JS engine)");
+    }
+
+    fn media_toggle_mute(&self, _x: i32, _y: i32) {
+        tracing::warn!("blitz: media_toggle_mute unsupported (read-only render, no JS engine)");
+    }
+
+    fn image_rotate(&self, _x: i32, _y: i32, _delta_deg: i32) {
+        tracing::warn!("blitz: image_rotate unsupported (read-only render, no JS engine)");
+    }
+
+    // ── Clipboard stubs ───────────────────────────────────────────────────────
+
+    fn copy_image_url_to_clipboard(&self, _url: &str) {
+        tracing::warn!(
+            "blitz: copy_image_url_to_clipboard unsupported (no clipboard wiring in Blitz backend)"
+        );
+    }
+
+    // ── Edit IPC stubs ────────────────────────────────────────────────────────
+    //
+    // These helpers drive the JS edit layer (`edit.js`) — no JS engine means
+    // they are permanently unsupported on the Blitz backend.
+
+    fn run_edit_attach(&self, _field_id: &str) {
+        tracing::warn!("blitz: run_edit_attach unsupported (read-only render, no JS engine)");
+    }
+
+    fn run_edit_cycle(&self, _forward: bool) {
+        tracing::warn!("blitz: run_edit_cycle unsupported (read-only render, no JS engine)");
+    }
+
+    fn run_edit_detach(&self, _field_id: &str) {
+        tracing::warn!("blitz: run_edit_detach unsupported (read-only render, no JS engine)");
+    }
+
+    fn run_edit_focus(&self, _field_id: &str) {
+        tracing::warn!("blitz: run_edit_focus unsupported (read-only render, no JS engine)");
+    }
+
+    // ── Cursor stub ───────────────────────────────────────────────────────────
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        // TODO: Blitz does not track hover/cursor state yet. Return None until
+        // blitz-traits exposes a cursor-change callback in the render pipeline.
+        None
+    }
+
     // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
     //
     // blitz-traits 0.3.0-alpha.2 defines `UiEvent::Ime(BlitzImeEvent)` with:
@@ -612,10 +718,12 @@ impl BrowserEngine for BlitzEngine {
 
     // ── Action dispatch ───────────────────────────────────────────────────────
     //
-    // History/stop routed through existing worker Commands.  Scroll has no JS
-    // eval substrate in Phase B — falls through to debug-log.  Zoom delegates
-    // to the existing zoom_* helpers.  FindNext/FindPrev: start_find is a no-op
-    // in Phase B so these fall through as well.
+    // History/reload/stop routed through existing worker Commands.
+    // Zoom delegates to the existing zoom_* helpers.
+    // Find: Blitz has no JS engine so text-find is unsupported — explicit warn
+    // arm so contributors know it's a known gap, not an oversight.
+    // Scroll and remaining actions: no JS eval substrate in Phase B, fall
+    // through to debug-log.
 
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
@@ -644,7 +752,12 @@ impl BrowserEngine for BlitzEngine {
             A::ZoomOut => self.zoom_out(),
             A::ZoomReset => self.zoom_reset(),
 
-            // ── Find / scroll — no JS eval substrate in Phase B ───────────────
+            // ── Find — no JS engine, unsupported ──────────────────────────────
+            A::Find { .. } | A::FindNext | A::FindPrev => {
+                tracing::warn!("blitz: find unsupported (read-only render, no JS engine)");
+            }
+
+            // ── Scroll and all other actions — no JS eval substrate in Phase B
             other => {
                 tracing::debug!(
                     action = ?other,
