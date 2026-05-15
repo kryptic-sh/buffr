@@ -477,13 +477,33 @@ pub(crate) mod macos {
                 let url = unsafe { get_url_string(web_view) };
                 let title = unsafe { get_title_string(web_view) };
                 tracing::debug!("webkit-cocoa nav: didFinishNavigation url={url} title={title}");
+                let tab_id = self.ivars().tab_id;
                 if let Ok(mut st) = self.ivars().state.lock() {
-                    if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
+                    if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == tab_id) {
                         tab.url = url;
                         tab.title = title;
                         tab.is_loading = false;
                     }
                     st.sync_loading_active();
+
+                    // ── Favicon heuristic ────────────────────────────────────────
+                    // WKWebView does not expose a public favicon API. We push a
+                    // navigation-completion sentinel using the `/favicon.ico`
+                    // convention.  Pixel data is intentionally left empty
+                    // (width=0, height=0, pixels=[]) — the apps layer can use the
+                    // tab URL to initiate a separate fetch if desired.
+                    //
+                    // TODO(phase-d): perform an async URLSession fetch of
+                    //   `<url_origin>/favicon.ico`, decode to BGRA, and push a
+                    //   FaviconUpdate with real pixel data.
+                    if let Ok(mut fav) = st.favicon_updates.lock() {
+                        fav.push(buffr_engine::FaviconUpdate {
+                            browser_id: tab_id.0 as i32,
+                            width: 0,
+                            height: 0,
+                            pixels: Vec::new(),
+                        });
+                    }
                 }
             }
 

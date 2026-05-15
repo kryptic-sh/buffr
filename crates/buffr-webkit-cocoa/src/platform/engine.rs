@@ -41,8 +41,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_engine::{
-    BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
-    NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    BackendOpenOptions, BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus,
+    MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState,
+    TabId, TabSummary,
     engine_id::EngineId,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
@@ -88,6 +89,14 @@ pub struct WebKitCocoaEngine {
     /// Read lock-free from any thread by `BrowserEngine::is_loading`.
     #[cfg(target_os = "macos")]
     loading_active: Arc<AtomicBool>,
+    /// Pending favicon updates pushed by the navigation delegate.
+    /// Drained by `drain_favicon_updates` from any thread.
+    #[cfg(target_os = "macos")]
+    favicon_updates: Arc<Mutex<Vec<FaviconUpdate>>>,
+    /// OSR sleep flag — shared with the worker's audio poll tick.
+    /// Set by `osr_sleep`; read by the recurring tick functions.
+    #[cfg(target_os = "macos")]
+    osr_sleep: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     /// Available on all platforms so the struct layout is consistent.
@@ -110,14 +119,23 @@ impl WebKitCocoaEngine {
         {
             let engine_state = Arc::new(Mutex::new(EngineState::new()));
 
-            // Clone Arc<AtomicBool>s from inside EngineState so the engine can
-            // read these flags from any thread without locking the Mutex.
-            let (audio_active, loading_active) = engine_state
+            // Clone Arc handles from inside EngineState so the engine can
+            // read/write these flags from any thread without locking the Mutex.
+            let (audio_active, loading_active, favicon_updates, osr_sleep) = engine_state
                 .lock()
-                .map(|g| (Arc::clone(&g.audio_active), Arc::clone(&g.loading_active)))
+                .map(|g| {
+                    (
+                        Arc::clone(&g.audio_active),
+                        Arc::clone(&g.loading_active),
+                        Arc::clone(&g.favicon_updates),
+                        Arc::clone(&g.osr_sleep),
+                    )
+                })
                 .unwrap_or_else(|_| {
                     (
                         Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(Mutex::new(Vec::new())),
                         Arc::new(AtomicBool::new(false)),
                     )
                 });
@@ -145,6 +163,8 @@ impl WebKitCocoaEngine {
                 engine_state,
                 audio_active,
                 loading_active,
+                favicon_updates,
+                osr_sleep,
                 find_query: Mutex::new(None),
             });
         }
@@ -493,7 +513,14 @@ impl BrowserEngine for WebKitCocoaEngine {
     }
 
     fn osr_sleep(&self, sleep: bool) {
-        tracing::debug!("webkit-cocoa: osr_sleep({sleep}) — no-op");
+        tracing::debug!("webkit-cocoa: osr_sleep({sleep})");
+        // Store the flag lock-free.  The audio-activity poll tick holds the
+        // same Arc<AtomicBool> (cloned from engine_state during init) and will
+        // see the updated value on its next 500 ms wakeup.
+        #[cfg(target_os = "macos")]
+        self.osr_sleep.store(sleep, Ordering::Relaxed);
+        #[cfg(not(target_os = "macos"))]
+        let _ = sleep;
     }
 
     fn osr_invalidate_view(&self) {
@@ -509,20 +536,25 @@ impl BrowserEngine for WebKitCocoaEngine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, query: &str, _forward: bool) {
+    fn start_find(&self, query: &str, forward: bool) {
+        tracing::debug!("webkit-cocoa: start_find query={query:?} forward={forward}");
         if let Ok(mut g) = self.find_query.lock() {
             *g = Some(query.to_owned());
         }
-        tracing::debug!(
-            "webkit-cocoa: start_find — no WKFindInteraction in Phase B (query stored)"
-        );
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::StartFind {
+            query: query.to_owned(),
+            forward,
+        });
     }
 
     fn stop_find(&self) {
+        tracing::debug!("webkit-cocoa: stop_find");
         if let Ok(mut g) = self.find_query.lock() {
             *g = None;
         }
-        tracing::debug!("webkit-cocoa: stop_find");
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::StopFind);
     }
 
     fn active_zoom_level(&self) -> f64 {
@@ -595,6 +627,41 @@ impl BrowserEngine for WebKitCocoaEngine {
         let _ = self.run_js(&buffr_engine::media_js::copy_image_url(url));
     }
 
+    // ── Clipboard (Gap 6) ────────────────────────────────────────────────────
+    //
+    // NSPasteboard must be called on the macOS main thread.  `clipboard_text`
+    // dispatches a `ClipboardRead` command to the worker which round-trips
+    // through the GCD main queue and waits for a reply.
+    //
+    // `clipboard_set_text` is fire-and-forget: the write command is dispatched
+    // and we return immediately without confirmation.
+    //
+    // Both methods are no-ops on non-macOS targets (stub compile path).
+
+    fn clipboard_text(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        return self
+            .worker
+            .call(|reply| Command::ClipboardRead { reply })
+            .unwrap_or(None);
+
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        tracing::debug!("webkit-cocoa: clipboard_set_text ({} bytes)", text.len());
+        #[cfg(target_os = "macos")]
+        {
+            self.worker.send(Command::ClipboardWrite {
+                text: text.to_owned(),
+            });
+            return true;
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
     // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
 
     fn start_download(&self, url: &str) {
@@ -627,6 +694,29 @@ impl BrowserEngine for WebKitCocoaEngine {
     fn zoom_reset(&self) {
         #[cfg(target_os = "macos")]
         self.worker.send(Command::SetZoom(1.0));
+    }
+
+    // ── Favicon (Gap 1) ──────────────────────────────────────────────────────
+    //
+    // Navigation-completion sentinel using the `<url>/favicon.ico` heuristic.
+    // Pixel data is empty; a future phase will perform an async URLSession fetch.
+
+    fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
+        #[cfg(target_os = "macos")]
+        if let Ok(mut guard) = self.favicon_updates.lock() {
+            return std::mem::take(&mut *guard);
+        }
+        Vec::new()
+    }
+
+    // ── Cursor (Gap 2 — Stubbed) ──────────────────────────────────────────────
+    //
+    // WKWebView does not expose cursor-change notifications via a public API.
+    // TODO(phase-d): investigate KVO on WKWebView._cursorType or
+    // NSCursorPopUpButton to surface cursor state.
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        None
     }
 
     // ── DevTools ─────────────────────────────────────────────────────────────
@@ -794,6 +884,45 @@ impl BrowserEngine for WebKitCocoaEngine {
         tracing::debug!("webkit-cocoa: ime_cancel — Phase D (NSTextInputClient not yet wired)");
     }
 
+    // ── Edit IPC helpers (Gap 7) ──────────────────────────────────────────────
+    //
+    // Sentinel-driven IPC with the JS edit layer (`edit.js`).  The JS side
+    // exposes `window.__buffrEditAttach`, `__buffrEditDetach`, etc.  We call
+    // them via `run_js` exactly as the CEF reference implementation does.
+    // See `buffr_engine::BrowserEngine::run_edit_attach` doc for rationale.
+
+    fn run_edit_attach(&self, field_id: &str) {
+        let js = format!(
+            "window.__buffrEditAttach && window.__buffrEditAttach({})",
+            serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into())
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        let js = format!(
+            "window.__buffrEditCycle && window.__buffrEditCycle({})",
+            if forward { "true" } else { "false" }
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        let js = format!(
+            "window.__buffrEditDetach && window.__buffrEditDetach({})",
+            serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into())
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        let js = format!(
+            "window.__buffrEditFocus && window.__buffrEditFocus({})",
+            serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into())
+        );
+        let _ = self.run_js(&js);
+    }
+
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
 
@@ -802,7 +931,12 @@ impl BrowserEngine for WebKitCocoaEngine {
             A::FindNext => {
                 let query = self.find_query.lock().ok().and_then(|g| g.clone());
                 if let Some(q) = query {
-                    tracing::debug!(query = %q, "webkit-cocoa: dispatch FindNext — WKFindInteraction not yet wired (no-op)");
+                    tracing::debug!(query = %q, "webkit-cocoa: dispatch FindNext");
+                    #[cfg(target_os = "macos")]
+                    self.worker.send(Command::StartFind {
+                        query: q,
+                        forward: true,
+                    });
                 } else {
                     tracing::debug!("webkit-cocoa: FindNext — no active find query");
                 }
@@ -810,7 +944,12 @@ impl BrowserEngine for WebKitCocoaEngine {
             A::FindPrev => {
                 let query = self.find_query.lock().ok().and_then(|g| g.clone());
                 if let Some(q) = query {
-                    tracing::debug!(query = %q, "webkit-cocoa: dispatch FindPrev — WKFindInteraction not yet wired (no-op)");
+                    tracing::debug!(query = %q, "webkit-cocoa: dispatch FindPrev");
+                    #[cfg(target_os = "macos")]
+                    self.worker.send(Command::StartFind {
+                        query: q,
+                        forward: false,
+                    });
                 } else {
                     tracing::debug!("webkit-cocoa: FindPrev — no active find query");
                 }

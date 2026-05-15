@@ -77,6 +77,22 @@ pub(crate) mod macos {
         /// any thread by `BrowserEngine::is_loading`.
         /// `Relaxed` ordering is sufficient — same rationale as `audio_active`.
         pub loading_active: Arc<AtomicBool>,
+        /// Pending favicon updates queued by the navigation delegate on the GCD
+        /// main queue.  Drained by `BrowserEngine::drain_favicon_updates` from
+        /// any thread.
+        ///
+        /// Each navigation completion pushes one entry using the heuristic URL
+        /// `<page_url>/favicon.ico`.  Pixel data is not available without an
+        /// async fetch; width/height/pixels are left at zero/empty as a
+        /// navigation-completed sentinel.  A future phase can perform the fetch
+        /// off-thread and fill real bitmap data.
+        pub favicon_updates: Arc<Mutex<Vec<buffr_engine::FaviconUpdate>>>,
+        /// OSR sleep state flag.
+        ///
+        /// When `true`, the audio-activity poll and OSR tick skip their work to
+        /// reduce CPU usage while the tab is backgrounded.  Set by
+        /// `BrowserEngine::osr_sleep`; read by the recurring tick functions.
+        pub osr_sleep: Arc<AtomicBool>,
     }
 
     impl EngineState {
@@ -86,6 +102,8 @@ pub(crate) mod macos {
                 active_idx: None,
                 audio_active: Arc::new(AtomicBool::new(false)),
                 loading_active: Arc::new(AtomicBool::new(false)),
+                favicon_updates: Arc::new(Mutex::new(Vec::new())),
+                osr_sleep: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -431,6 +449,161 @@ pub(crate) mod macos {
                 }
             }
         }
+
+        /// Start or stop an in-page find session on the active tab.
+        ///
+        /// Uses `WKWebView::findString:withConfiguration:completionHandler:` when
+        /// available (macOS 14 / WebKit 617+).  `query=""` cancels the highlight.
+        ///
+        /// The bindings in `objc2-web-kit 0.3.2` may not expose
+        /// `WKFindConfiguration` at all.  We call via `objc2::msg_send!` so the
+        /// code compiles regardless of the binding coverage.  At runtime the
+        /// selector is resolved dynamically; if WKWebView does not respond to it
+        /// (macOS < 14), the call is silently dropped by the ObjC runtime.
+        /// Start or stop an in-page find session on the active tab.
+        ///
+        /// Uses `WKWebView::findString:withConfiguration:completionHandler:` when
+        /// available (macOS 14 / WebKit 617+).  `query=""` cancels the highlight.
+        ///
+        /// The bindings in `objc2-web-kit 0.3.2` do not expose
+        /// `WKFindConfiguration`.  We call via `objc2::msg_send!` so the
+        /// code compiles regardless of binding coverage.  At runtime the
+        /// selector is resolved dynamically; if WKWebView does not respond to it
+        /// (macOS < 14), the call is silently dropped by the ObjC runtime.
+        fn find_string(&self, query: &str, forward: bool) {
+            use std::ffi::CStr;
+
+            use objc2::msg_send;
+            use objc2_foundation::NSString;
+
+            if let Some(idx) = self.active_idx {
+                if let Some(tab) = self.tabs.get(idx) {
+                    let ns_query = NSString::from_str(query);
+                    // Build WKFindConfiguration via msg_send! to avoid requiring
+                    // WKFindConfiguration bindings from objc2-web-kit.
+                    //
+                    // Class lookup: +[WKFindConfiguration new] allocates the object.
+                    // If the class does not exist on older macOS, AnyClass::get returns
+                    // None and we fall back to a no-op.
+                    //
+                    // WKFindConfiguration properties:
+                    //   backwards: BOOL  (default NO = forward)
+                    //   wraps:     BOOL  (default YES)
+                    //   caseSensitive: BOOL (default NO)
+                    // Selector confirmed: developer.apple.com WKFindConfiguration (WebKit 617+).
+                    unsafe {
+                        // AnyClass::get takes &CStr (objc2 0.6).
+                        // c"WKFindConfiguration" is a CStr literal (Rust 1.77+).
+                        let find_cfg_class_name: &CStr = c"WKFindConfiguration";
+                        let cls: *mut objc2::runtime::AnyClass =
+                            objc2::runtime::AnyClass::get(find_cfg_class_name)
+                                .map(|c| c as *const _ as *mut _)
+                                .unwrap_or(std::ptr::null_mut());
+                        if cls.is_null() {
+                            // WKFindConfiguration unavailable (macOS < 14).
+                            // A JS-based find (window.find) is deprecated since macOS 11;
+                            // skip it to avoid console noise.
+                            tracing::debug!(
+                                "webkit-cocoa: WKFindConfiguration not available on this macOS version"
+                            );
+                            return;
+                        }
+                        let cfg: *mut objc2::runtime::AnyObject = msg_send![cls, new];
+                        if cfg.is_null() {
+                            return;
+                        }
+                        // Set backwards property (NO = forward, YES = backward).
+                        let backwards: objc2::runtime::Bool = (!forward).into();
+                        let _: () = msg_send![cfg, setBackwards: backwards];
+                        // Call findString:withConfiguration:completionHandler:
+                        // completionHandler is nil — fire-and-forget.
+                        let _: () = msg_send![
+                            &*tab.web_view,
+                            findString: &*ns_query,
+                            withConfiguration: cfg,
+                            completionHandler: std::ptr::null::<objc2::runtime::AnyObject>()
+                        ];
+                        // Release the configuration object (+new retains once).
+                        let _: () = msg_send![cfg, release];
+                    }
+                }
+            }
+        }
+
+        /// Read the system clipboard text.  Must be called on the main thread.
+        ///
+        /// Uses `NSPasteboard::generalPasteboard` and reads the first plain-text
+        /// item.  Returns `None` when the clipboard is empty or contains non-text.
+        ///
+        /// NSPasteboard confirmed: objc2-app-kit NSPasteboard (AppKit).
+        /// We reach it via raw `AnyClass::get` + `msg_send!` to avoid depending
+        /// on the `NSPasteboard` binding feature in `objc2-app-kit`.
+        fn clipboard_read() -> Option<String> {
+            use std::ffi::CStr;
+
+            use objc2::msg_send;
+            use objc2_foundation::NSString;
+
+            unsafe {
+                // AnyClass::get takes &CStr (objc2 0.6).
+                let pb_class_name: &CStr = c"NSPasteboard";
+                let cls: *mut objc2::runtime::AnyClass =
+                    objc2::runtime::AnyClass::get(pb_class_name)
+                        .map(|c| c as *const _ as *mut _)
+                        .unwrap_or(std::ptr::null_mut());
+                if cls.is_null() {
+                    return None;
+                }
+                // +[NSPasteboard generalPasteboard]
+                let pb: *mut objc2::runtime::AnyObject = msg_send![cls, generalPasteboard];
+                if pb.is_null() {
+                    return None;
+                }
+                // -[NSPasteboard stringForType:] with NSPasteboardTypeString.
+                // NSPasteboardTypeString UTI = "public.utf8-plain-text"
+                let type_str = NSString::from_str("public.utf8-plain-text");
+                let result: *mut NSString = msg_send![pb, stringForType: &*type_str];
+                if result.is_null() {
+                    None
+                } else {
+                    Some((*result).to_string())
+                }
+            }
+        }
+
+        /// Write `text` to the system clipboard.  Must be called on the main thread.
+        ///
+        /// Uses `NSPasteboard::generalPasteboard`, clears it, then writes a plain
+        /// UTF-8 string.
+        fn clipboard_write(text: &str) {
+            use std::ffi::CStr;
+
+            use objc2::msg_send;
+            use objc2_foundation::NSString;
+
+            unsafe {
+                let pb_class_name: &CStr = c"NSPasteboard";
+                let cls: *mut objc2::runtime::AnyClass =
+                    objc2::runtime::AnyClass::get(pb_class_name)
+                        .map(|c| c as *const _ as *mut _)
+                        .unwrap_or(std::ptr::null_mut());
+                if cls.is_null() {
+                    return;
+                }
+                // +[NSPasteboard generalPasteboard]
+                let pb: *mut objc2::runtime::AnyObject = msg_send![cls, generalPasteboard];
+                if pb.is_null() {
+                    return;
+                }
+                // -[NSPasteboard clearContents] → NSInteger (number of items cleared)
+                let _: objc2::ffi::NSInteger = msg_send![pb, clearContents];
+                // -[NSPasteboard setString:forType:] → BOOL
+                let ns_text = NSString::from_str(text);
+                let type_str = NSString::from_str("public.utf8-plain-text");
+                let _: objc2::runtime::Bool =
+                    msg_send![pb, setString: &*ns_text, forType: &*type_str];
+            }
+        }
     }
 
     // ── Commands ──────────────────────────────────────────────────────────────
@@ -505,6 +678,29 @@ pub(crate) mod macos {
         /// handler is ignored — this matches the trait's fire-and-forget contract.
         EvalJs {
             code: String,
+        },
+        /// Begin an in-page find session using WKFindConfiguration (macOS 16+ /
+        /// WebKit 619+).  Falls back to `document.execCommand` on older systems.
+        ///
+        /// `query=""` acts as a stop-find (clears the active highlight).
+        StartFind {
+            query: String,
+            forward: bool,
+        },
+        /// Stop the active find session (alias for `StartFind { query: "" }`).
+        StopFind,
+        /// Read the system clipboard text on the main thread and reply.
+        ///
+        /// NSPasteboard must be called on the main thread.  The reply sender
+        /// carries `Option<String>` — `None` if the clipboard is empty/non-text.
+        ClipboardRead {
+            reply: mpsc::SyncSender<Option<String>>,
+        },
+        /// Write `text` to the system clipboard on the main thread.
+        ///
+        /// NSPasteboard must be called on the main thread.
+        ClipboardWrite {
+            text: String,
         },
         Shutdown,
     }
@@ -597,6 +793,9 @@ pub(crate) mod macos {
         // self-rescheduling `dispatch_main_async` + `after` pattern: each tick
         // reads all tabs, ORs `isPlayingAudio`, stores the result in the atomic,
         // then schedules the next tick.
+        //
+        // The tick respects `osr_sleep`: when true, audio polling is skipped and
+        // the result is frozen at false to avoid unnecessary wakeups.
         {
             let rt_audio = Arc::clone(&rt);
             let audio_flag = Arc::clone(
@@ -605,16 +804,29 @@ pub(crate) mod macos {
                     .map(|g| Arc::clone(&g.audio_active))
                     .unwrap_or_else(|_| Arc::new(AtomicBool::new(false))),
             );
+            let osr_sleep_audio = Arc::clone(
+                &engine_state
+                    .lock()
+                    .map(|g| Arc::clone(&g.osr_sleep))
+                    .unwrap_or_else(|_| Arc::new(AtomicBool::new(false))),
+            );
 
             // Recursive tick function, expressed as a plain function rather than
             // a Fn closure to keep the capture set simple.
             fn schedule_audio_tick(
                 rt: Arc<Mutex<MainQueueBox<RuntimeState>>>,
                 audio_flag: Arc<AtomicBool>,
+                osr_sleep: Arc<AtomicBool>,
             ) {
                 let when =
                     DispatchTime::try_from(Duration::from_millis(500)).unwrap_or(DispatchTime::NOW);
                 let _ = DispatchQueue::main().after(when, move || {
+                    // When osr_sleep is active, skip polling and keep audio false.
+                    if osr_sleep.load(Ordering::Relaxed) {
+                        audio_flag.store(false, Ordering::Relaxed);
+                        schedule_audio_tick(rt, audio_flag, osr_sleep);
+                        return;
+                    }
                     // Poll all WKWebView instances on the main queue.
                     let any_audio = rt.lock().is_ok_and(|guard| {
                         use objc2::msg_send;
@@ -630,11 +842,11 @@ pub(crate) mod macos {
                     });
                     audio_flag.store(any_audio, Ordering::Relaxed);
                     // Re-schedule the next tick.
-                    schedule_audio_tick(rt, audio_flag);
+                    schedule_audio_tick(rt, audio_flag, osr_sleep);
                 });
             }
 
-            schedule_audio_tick(rt_audio, audio_flag);
+            schedule_audio_tick(rt_audio, audio_flag, osr_sleep_audio);
         }
 
         // Spawn the worker thread.
@@ -851,6 +1063,34 @@ pub(crate) mod macos {
                     if let Ok(r) = rt2.lock() {
                         r.0.eval_js(&code);
                     }
+                });
+            }
+            Command::StartFind { query, forward } => {
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.0.find_string(&query, forward);
+                    }
+                });
+            }
+            Command::StopFind => {
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        // Empty query clears the find highlight.
+                        r.0.find_string("", true);
+                    }
+                });
+            }
+            Command::ClipboardRead { reply } => {
+                dispatch_main_async(move || {
+                    let result = RuntimeState::clipboard_read();
+                    let _ = reply.send(result);
+                });
+            }
+            Command::ClipboardWrite { text } => {
+                dispatch_main_async(move || {
+                    RuntimeState::clipboard_write(&text);
                 });
             }
         }
