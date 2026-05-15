@@ -193,6 +193,12 @@ fn needs_http(s: &str) -> bool {
 /// outside this list (including the false-positive "scheme" parse of
 /// `localhost:3000` as scheme=`localhost`) drops through to the
 /// host-shape heuristic.
+///
+/// `javascript:` is intentionally excluded — any input with that scheme
+/// is treated as a search query for the literal text to prevent XSS via
+/// the omnibar.  `data:` is likewise excluded: callers that legitimately
+/// need to navigate to a data URL do so programmatically, not via user
+/// input.
 fn is_real_scheme(s: &str) -> bool {
     matches!(
         s,
@@ -201,11 +207,9 @@ fn is_real_scheme(s: &str) -> bool {
             | "file"
             | "ftp"
             | "ftps"
-            | "data"
             | "about"
             | "chrome"
             | "view-source"
-            | "javascript"
             | "mailto"
             | "buffr"
     )
@@ -444,5 +448,58 @@ mod tests {
         assert_eq!(url_encode("hello world"), "hello+world");
         assert_eq!(url_encode("a&b"), "a%26b");
         assert_eq!(url_encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    // ── Security: javascript: and data: are treated as search, not URLs ─────
+
+    #[test]
+    fn javascript_scheme_becomes_search() {
+        // `javascript:alert(1)` must never navigate — it must become a search
+        // query for the literal text to prevent XSS via the omnibar.
+        let s = search();
+        let resolved = resolve_input("javascript:alert(1)", &s);
+        assert!(
+            resolved.starts_with("https://duckduckgo.com/?q="),
+            "expected search URL, got: {resolved}"
+        );
+        assert!(
+            !resolved.starts_with("javascript:"),
+            "javascript: must not pass through: {resolved}"
+        );
+    }
+
+    #[test]
+    fn javascript_void_becomes_search() {
+        let s = search();
+        let resolved = resolve_input("javascript:void(0)", &s);
+        assert!(
+            resolved.starts_with("https://duckduckgo.com/?q="),
+            "javascript:void(0) must become search, got: {resolved}"
+        );
+    }
+
+    #[test]
+    fn data_scheme_becomes_search() {
+        // `data:` URLs typed in the omnibar are treated as search queries.
+        let s = search();
+        let resolved = resolve_input("data:text/html,<h1>xss</h1>", &s);
+        assert!(
+            resolved.starts_with("https://duckduckgo.com/?q="),
+            "data: must become search, got: {resolved}"
+        );
+    }
+
+    #[test]
+    fn classify_input_javascript_is_search() {
+        assert_eq!(classify_input("javascript:alert(1)"), InputKind::Search);
+        assert_eq!(classify_input("javascript:void(0)"), InputKind::Search);
+    }
+
+    #[test]
+    fn classify_input_data_is_search() {
+        assert_eq!(
+            classify_input("data:text/html,<h1>hi</h1>"),
+            InputKind::Search
+        );
     }
 }
