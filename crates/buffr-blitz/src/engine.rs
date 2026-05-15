@@ -347,12 +347,14 @@ impl BrowserEngine for BlitzEngine {
 
     fn osr_key_event(&self, event: NeutralKeyEvent) {
         let ev = neutral_key_to_blitz(&event);
-        tracing::debug!("blitz: key_event {}", ev.description);
+        tracing::debug!("blitz: osr_key_event — dispatching to worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_move(&self, x: i32, y: i32, _modifiers: u32) {
         let ev = neutral_move_to_blitz(x, y);
-        tracing::debug!("blitz: mouse_move ({}, {})", ev.x, ev.y);
+        tracing::debug!("blitz: osr_mouse_move ({x},{y}) — dispatching to worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_click(
@@ -365,17 +367,20 @@ impl BrowserEngine for BlitzEngine {
         _modifiers: u32,
     ) {
         let ev = neutral_click_to_blitz(x, y, button, mouse_up);
-        tracing::debug!("blitz: mouse_click ({}, {})", ev.x, ev.y);
+        tracing::debug!("blitz: osr_mouse_click ({x},{y}) up={mouse_up} — dispatching to worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_leave(&self, _modifiers: u32) {
         let ev = neutral_leave_to_blitz();
-        tracing::debug!("blitz: mouse_leave ({}, {})", ev.x, ev.y);
+        tracing::debug!("blitz: osr_mouse_leave — dispatching to worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, _modifiers: u32) {
         let ev = neutral_scroll_to_blitz(x, y, delta_x, delta_y);
-        tracing::debug!("blitz: mouse_wheel ({}, {})", ev.x, ev.y);
+        tracing::debug!("blitz: osr_mouse_wheel ({x},{y}) — dispatching to worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_focus(&self, focused: bool) {

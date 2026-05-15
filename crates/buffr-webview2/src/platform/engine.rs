@@ -327,21 +327,14 @@ impl BrowserEngine for WebView2Engine {
 
     fn osr_key_event(&self, event: NeutralKeyEvent) {
         let ev = neutral_key_to_wv2(&event);
-        tracing::debug!(
-            "webview2: osr_key_event {} — TODO(input-key): dispatch to CompositionController",
-            ev.description
-        );
-        // TODO(input-key): self.worker.send(Command::SendKeyboard { ev });
+        tracing::debug!("webview2: osr_key_event — routing to STA worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_move(&self, x: i32, y: i32, _modifiers: u32) {
         let ev = neutral_move_to_wv2(x, y);
-        tracing::debug!(
-            "webview2: osr_mouse_move ({},{}) — TODO(input-mouse): dispatch",
-            ev.x,
-            ev.y
-        );
-        // TODO(input-mouse): self.worker.send(Command::SendMouse { ev });
+        tracing::debug!("webview2: osr_mouse_move ({x},{y}) — routing to STA worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_click(
@@ -355,27 +348,21 @@ impl BrowserEngine for WebView2Engine {
     ) {
         let ev = neutral_click_to_wv2(x, y, button, mouse_up);
         tracing::debug!(
-            "webview2: osr_mouse_click ({},{}) up={mouse_up} — TODO(input-mouse): dispatch",
-            ev.x,
-            ev.y
+            "webview2: osr_mouse_click ({x},{y}) up={mouse_up} — routing to STA worker"
         );
-        // TODO(input-mouse): self.worker.send(Command::SendMouse { ev });
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_leave(&self, _modifiers: u32) {
-        let _ev = neutral_leave_to_wv2();
-        tracing::debug!("webview2: osr_mouse_leave — TODO(input-mouse): dispatch");
-        self.worker.send(Command::ForcePaint);
+        let ev = neutral_leave_to_wv2();
+        tracing::debug!("webview2: osr_mouse_leave — routing to STA worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, _modifiers: u32) {
         let ev = neutral_scroll_to_wv2(x, y, delta_x, delta_y);
-        tracing::debug!(
-            "webview2: osr_mouse_wheel ({},{}) — TODO(input-mouse): dispatch",
-            ev.x,
-            ev.y
-        );
-        // TODO(input-mouse): self.worker.send(Command::SendMouse { ev });
+        tracing::debug!("webview2: osr_mouse_wheel ({x},{y}) — routing to STA worker");
+        self.worker.send(Command::SendInput(ev));
     }
 
     fn osr_focus(&self, focused: bool) {

@@ -12,8 +12,9 @@
 //! `&gdk4::Event`) requires a fully constructed `GdkEvent` which cannot be
 //! built without unsafe FFI at this crate version.
 //!
-//! Phase B: log + no-op for all input synthesis. The debug log records the
-//! event kind so tests can confirm routing reaches here.
+//! The structural plumbing (translators → `GtkInputEvent` → `Command::SendInput`
+//! → worker) is complete. The worker logs each event at `debug` level. Actual
+//! GTK4 dispatch lands when safe constructors are available (gdk4 >= 0.12).
 //!
 //! # TODO markers
 //!
@@ -52,23 +53,35 @@ pub(crate) enum GtkMouseButton {
     Right,
 }
 
+// ── Neutral wrapper sent over the worker command channel ──────────────────────
+
+/// A translated GTK input event ready to be routed to the worker.
+///
+/// The worker receives this on the GTK main thread. Phase B: logs at debug
+/// level. Phase C: synthesises a real `gdk4::Event` and dispatches via
+/// `WebView::event()` when safe `gdk4` constructors are available (>= 0.12).
+pub(crate) enum GtkInputEvent {
+    Key(GtkKeyEvent),
+    Mouse(GtkMouseEvent),
+}
+
 // ── Translators ───────────────────────────────────────────────────────────────
 
-pub(crate) fn neutral_key_to_gtk(event: &NeutralKeyEvent) -> GtkKeyEvent {
-    GtkKeyEvent {
+pub(crate) fn neutral_key_to_gtk(event: &NeutralKeyEvent) -> GtkInputEvent {
+    GtkInputEvent::Key(GtkKeyEvent {
         description: format!(
             "key vk={} char={} kind={:?}",
             event.windows_key_code, event.character, event.kind
         ),
-    }
+    })
 }
 
-pub(crate) fn neutral_move_to_gtk(x: i32, y: i32) -> GtkMouseEvent {
-    GtkMouseEvent {
+pub(crate) fn neutral_move_to_gtk(x: i32, y: i32) -> GtkInputEvent {
+    GtkInputEvent::Mouse(GtkMouseEvent {
         x: x as f64,
         y: y as f64,
         kind: GtkMouseKind::Move,
-    }
+    })
 }
 
 pub(crate) fn neutral_click_to_gtk(
@@ -76,13 +89,13 @@ pub(crate) fn neutral_click_to_gtk(
     y: i32,
     button: MouseButton,
     mouse_up: bool,
-) -> GtkMouseEvent {
+) -> GtkInputEvent {
     let btn = match button {
         MouseButton::Left => GtkMouseButton::Left,
         MouseButton::Middle => GtkMouseButton::Middle,
         MouseButton::Right | MouseButton::Other(_) => GtkMouseButton::Right,
     };
-    GtkMouseEvent {
+    GtkInputEvent::Mouse(GtkMouseEvent {
         x: x as f64,
         y: y as f64,
         kind: if mouse_up {
@@ -90,24 +103,24 @@ pub(crate) fn neutral_click_to_gtk(
         } else {
             GtkMouseKind::ButtonPress(btn)
         },
-    }
+    })
 }
 
-pub(crate) fn neutral_leave_to_gtk() -> GtkMouseEvent {
-    GtkMouseEvent {
+pub(crate) fn neutral_leave_to_gtk() -> GtkInputEvent {
+    GtkInputEvent::Mouse(GtkMouseEvent {
         x: 0.0,
         y: 0.0,
         kind: GtkMouseKind::Leave,
-    }
+    })
 }
 
-pub(crate) fn neutral_scroll_to_gtk(x: i32, y: i32, dx: i32, dy: i32) -> GtkMouseEvent {
-    GtkMouseEvent {
+pub(crate) fn neutral_scroll_to_gtk(x: i32, y: i32, dx: i32, dy: i32) -> GtkInputEvent {
+    GtkInputEvent::Mouse(GtkMouseEvent {
         x: x as f64,
         y: y as f64,
         kind: GtkMouseKind::Scroll {
             delta_x: dx as f64,
             delta_y: dy as f64,
         },
-    }
+    })
 }

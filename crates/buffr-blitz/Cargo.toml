@@ -34,5 +34,8 @@ tracing.workspace = true
 blitz-dom = "=0.3.0-alpha.2"
 blitz-html = "=0.3.0-alpha.2"
 blitz-traits = "=0.3.0-alpha.2"
+# Input event translation — versions must match blitz-traits 0.3.0-alpha.2.
+keyboard-types = "0.7"
+smol_str = "0.3"
 # Synchronous HTTP fetcher for initial HTML load.
 ureq.workspace = true

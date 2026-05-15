@@ -45,6 +45,7 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebView2Error;
+use super::input::WebView2InputEvent;
 use super::osr::paint_blank;
 use super::runtime::TabEntry;
 
@@ -144,6 +145,16 @@ pub(crate) enum Command {
         height: u32,
     },
     ForcePaint,
+    /// Dispatch an input event on the STA thread.
+    ///
+    /// Fire-and-forget: no reply channel. Input events return `()` on the
+    /// `BrowserEngine` trait surface.
+    ///
+    /// Phase B (blocked by #106): the STA worker logs the event at `debug`
+    /// level. No `ICoreWebView2CompositionController` exists yet.
+    /// TODO(#106): dispatch via ICoreWebView2CompositionController::SendMouseInput
+    /// / SendKeyboardInput once COM init lands.
+    SendInput(WebView2InputEvent),
     QueryCanGoBack {
         reply: mpsc::SyncSender<bool>,
     },
@@ -366,6 +377,25 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
         }
         Command::ForcePaint => {
             rt.paint();
+        }
+        Command::SendInput(event) => {
+            // TODO(#106): dispatch via ICoreWebView2CompositionController::SendMouseInput
+            // / SendKeyboardInput once COM init lands.
+            match &event {
+                WebView2InputEvent::Key(ev) => {
+                    tracing::debug!(
+                        "webview2 worker: received key event '{}' — pending COM init (#106)",
+                        ev.description
+                    );
+                }
+                WebView2InputEvent::Mouse(ev) => {
+                    tracing::debug!(
+                        "webview2 worker: received mouse event ({},{}) — pending COM init (#106)",
+                        ev.x,
+                        ev.y
+                    );
+                }
+            }
         }
         Command::QueryCanGoBack { reply } => {
             let result = rt.active_tab().map(|t| t.can_go_back()).unwrap_or(false);
