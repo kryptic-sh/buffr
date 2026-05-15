@@ -156,6 +156,32 @@ double WebContent::zoom() const
     return m_zoom;
 }
 
+void WebContent::ime_set_composition(rust::Str text, uint32_t sel_start, uint32_t sel_end)
+{
+    // Phase B: store the preedit string. No render effect.
+    // Phase C: send SetComposition IPC to WebContentServer.
+    //   LibWeb expected message: Messages::WebContentClient::SetComposition
+    //   (exact name TBD at Ladybird API pin time).
+    m_ime_composition = std::string(text.begin(), text.end());
+    (void)sel_start; (void)sel_end;
+}
+
+void WebContent::ime_commit(rust::Str text)
+{
+    // Phase B: clear preedit, store committed text.
+    // Phase C: send CommitComposition IPC to WebContentServer so LibWeb inserts
+    //   `text` into the focused editing host.
+    m_ime_composition.clear();
+    (void)text;
+}
+
+void WebContent::ime_cancel()
+{
+    // Phase B: clear preedit.
+    // Phase C: send CancelComposition IPC to WebContentServer.
+    m_ime_composition.clear();
+}
+
 // ── Free-function entry points (called from cxx bridge) ─────────────────────
 
 ::std::unique_ptr<WebContent> webcontent_new(rust::Str initial_url, uint32_t width, uint32_t height)
@@ -206,6 +232,21 @@ void webcontent_send_scroll(WebContent& wc, int32_t x, int32_t y, double dx, dou
 
 void webcontent_set_zoom(WebContent& wc, double zoom) { wc.set_zoom(zoom); }
 double webcontent_zoom(const WebContent& wc)          { return wc.zoom(); }
+
+void webcontent_ime_set_composition(WebContent& wc, rust::Str text, uint32_t sel_start, uint32_t sel_end)
+{
+    wc.ime_set_composition(text, sel_start, sel_end);
+}
+
+void webcontent_ime_commit(WebContent& wc, rust::Str text)
+{
+    wc.ime_commit(text);
+}
+
+void webcontent_ime_cancel(WebContent& wc)
+{
+    wc.ime_cancel();
+}
 
 } // namespace ladybird
 } // namespace buffr

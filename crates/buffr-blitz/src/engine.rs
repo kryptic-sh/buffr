@@ -546,6 +546,39 @@ impl BrowserEngine for BlitzEngine {
         tracing::debug!("blitz: cancel_hint — no-op");
     }
 
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // blitz-traits 0.3.0-alpha.2 defines `UiEvent::Ime(BlitzImeEvent)` with:
+    //   - `Preedit(String, Option<(usize, usize)>)` — live preedit update
+    //   - `Commit(String)` — accepted text insertion
+    //   - `Disabled` — composition cancelled / IME disabled
+    //   - `Enabled` — IME enabled (informational; no text yet)
+    //
+    // Source: blitz-traits-0.3.0-alpha.2/src/events.rs:65 (UiEvent::Ime),
+    //         lines 651–695 (BlitzImeEvent variants).
+    //
+    // All three are dispatched through `Command::SendInput(BlitzInputEvent::Ime)`,
+    // which is already matched in `run()` via the `BlitzInputEvent::into_ui_event()`
+    // conversion that now maps `BlitzInputEvent::Ime(ev) → UiEvent::Ime(ev)`.
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        tracing::debug!(text, ?cursor, "blitz: ime_set_composition");
+        let ev = crate::input::ime_preedit_to_blitz(text, cursor);
+        self.worker.send(Command::SendInput(ev));
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(text, "blitz: ime_commit");
+        let ev = crate::input::ime_commit_to_blitz(text);
+        self.worker.send(Command::SendInput(ev));
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!("blitz: ime_cancel");
+        let ev = crate::input::ime_cancel_to_blitz();
+        self.worker.send(Command::SendInput(ev));
+    }
+
     // ── Action dispatch ───────────────────────────────────────────────────────
     //
     // History/stop routed through existing worker Commands.  Scroll has no JS

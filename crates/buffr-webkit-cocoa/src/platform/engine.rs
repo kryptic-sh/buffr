@@ -616,6 +616,39 @@ impl BrowserEngine for WebKitCocoaEngine {
     // Zoom → existing zoom_* helpers.
     // FindNext/FindPrev → debug-log (WKFindInteraction lands in Phase C).
 
+    // ── IME composition (Phase 8d, #86 — Phase D for macOS) ──────────────────
+    //
+    // Real IME on macOS requires implementing the `NSTextInputClient` protocol
+    // on a custom `NSView` host.  `WKWebView`'s internal `WKContentView` already
+    // implements `NSTextInputClient`, but synthesising IME events into it
+    // requires patching the Cocoa responder chain (method swizzling or a forked
+    // `WKWebView` subclass) — both are out of scope for Phase B.
+    //
+    // TODO(phase-d): Implement NSTextInputClient on a transparent overlay NSView
+    //   that forwards insertText / setMarkedText / unmarkText to the underlying
+    //   WKContentView.  Then wire these three methods to that overlay.
+    //
+    // For now: debug-log only.  Release builds optimise these calls away.
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        tracing::debug!(
+            text,
+            ?cursor,
+            "webkit-cocoa: ime_set_composition — Phase D (NSTextInputClient not yet wired)"
+        );
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(
+            text,
+            "webkit-cocoa: ime_commit — Phase D (NSTextInputClient not yet wired)"
+        );
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!("webkit-cocoa: ime_cancel — Phase D (NSTextInputClient not yet wired)");
+    }
+
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
 

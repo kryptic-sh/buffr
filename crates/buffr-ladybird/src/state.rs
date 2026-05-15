@@ -31,7 +31,8 @@ use cxx::UniquePtr;
 use crate::error::LadybirdError;
 use crate::ffi::bridge::{
     WebContent, webcontent_can_go_back, webcontent_can_go_forward, webcontent_go_back,
-    webcontent_go_forward, webcontent_navigate, webcontent_new, webcontent_read_pixels,
+    webcontent_go_forward, webcontent_ime_cancel, webcontent_ime_commit,
+    webcontent_ime_set_composition, webcontent_navigate, webcontent_new, webcontent_read_pixels,
     webcontent_reload, webcontent_resize, webcontent_send_key, webcontent_send_mouse_button,
     webcontent_send_mouse_move, webcontent_send_scroll, webcontent_set_zoom, webcontent_stop,
     webcontent_title, webcontent_url, webcontent_zoom,
@@ -109,6 +110,30 @@ impl LadybirdTab {
     /// Read the current page zoom level from the C++ stub.
     pub(crate) fn zoom(&self) -> f64 {
         webcontent_zoom(&self.wc)
+    }
+
+    /// Update IME preedit string.
+    ///
+    /// Phase B: stored in `m_ime_composition` (no render effect).
+    /// Phase C: IPC SetComposition to WebContentServer.
+    pub(crate) fn ime_set_composition(&mut self, text: &str, sel_start: u32, sel_end: u32) {
+        webcontent_ime_set_composition(self.wc.pin_mut(), text, sel_start, sel_end);
+    }
+
+    /// Commit composed text into the focused element.
+    ///
+    /// Phase B: clears `m_ime_composition` (no render effect).
+    /// Phase C: IPC CommitComposition to WebContentServer.
+    pub(crate) fn ime_commit(&mut self, text: &str) {
+        webcontent_ime_commit(self.wc.pin_mut(), text);
+    }
+
+    /// Cancel the current IME composition.
+    ///
+    /// Phase B: clears `m_ime_composition` (no render effect).
+    /// Phase C: IPC CancelComposition to WebContentServer.
+    pub(crate) fn ime_cancel(&mut self) {
+        webcontent_ime_cancel(self.wc.pin_mut());
     }
 
     #[allow(dead_code)]
@@ -198,6 +223,28 @@ pub(crate) enum Command {
     QueryActiveZoom {
         reply: mpsc::SyncSender<f64>,
     },
+    /// Update the active tab's IME preedit string.
+    ///
+    /// Phase B: forwarded to `webcontent_ime_set_composition` in the C++ shim,
+    ///   which stores the text in `m_ime_composition` (no render effect).
+    /// Phase C: IPC message to WebContentServer's IME handler.
+    ImeSetComposition {
+        text: String,
+        sel_start: u32,
+        sel_end: u32,
+    },
+    /// Commit the composed text into the active tab's focused element.
+    ///
+    /// Phase B: forwarded to `webcontent_ime_commit` (clears `m_ime_composition`).
+    /// Phase C: IPC CommitComposition message.
+    ImeCommit {
+        text: String,
+    },
+    /// Cancel the current IME composition.
+    ///
+    /// Phase B: forwarded to `webcontent_ime_cancel` (clears `m_ime_composition`).
+    /// Phase C: IPC CancelComposition message.
+    ImeCancel,
     Shutdown,
 }
 
@@ -442,6 +489,27 @@ impl Worker {
         self.active_idx.map(|i| self.tabs[i].zoom()).unwrap_or(1.0)
     }
 
+    /// Forward an IME preedit update to the active tab.
+    fn ime_set_composition(&mut self, text: &str, sel_start: u32, sel_end: u32) {
+        if let Some(i) = self.active_idx {
+            self.tabs[i].ime_set_composition(text, sel_start, sel_end);
+        }
+    }
+
+    /// Forward an IME commit to the active tab.
+    fn ime_commit(&mut self, text: &str) {
+        if let Some(i) = self.active_idx {
+            self.tabs[i].ime_commit(text);
+        }
+    }
+
+    /// Cancel IME composition on the active tab.
+    fn ime_cancel(&mut self) {
+        if let Some(i) = self.active_idx {
+            self.tabs[i].ime_cancel();
+        }
+    }
+
     fn build_snapshot(&self) -> TabsSnapshot {
         let tabs: Vec<TabRecord> = self
             .tabs
@@ -593,6 +661,27 @@ impl Worker {
             }
             Command::QueryActiveZoom { reply } => {
                 let _ = reply.send(self.query_active_zoom());
+            }
+            Command::ImeSetComposition {
+                text,
+                sel_start,
+                sel_end,
+            } => {
+                tracing::debug!(
+                    text = %text,
+                    sel_start,
+                    sel_end,
+                    "ladybird worker: ImeSetComposition"
+                );
+                self.ime_set_composition(&text, sel_start, sel_end);
+            }
+            Command::ImeCommit { text } => {
+                tracing::debug!(text = %text, "ladybird worker: ImeCommit");
+                self.ime_commit(&text);
+            }
+            Command::ImeCancel => {
+                tracing::debug!("ladybird worker: ImeCancel");
+                self.ime_cancel();
             }
             Command::Shutdown => {
                 return true;

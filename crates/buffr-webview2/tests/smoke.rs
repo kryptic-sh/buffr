@@ -414,3 +414,58 @@ fn navigate_after_worker_death_returns_err() {
         "navigate must return Err after worker shutdown, got: {result:?}"
     );
 }
+
+// ── IME smoke tests ───────────────────────────────────────────────────────────
+//
+// On Windows: dispatches WM_CHAR per character via PostMessageW.
+// On non-Windows (stub path): debug-log only.
+// All three must not panic in either path.
+
+/// `ime_set_composition` dispatches preedit via WM_CHAR (simplified).
+/// Requires Windows with a real WebView2 installation.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Windows + WebView2 runtime"]
+fn ime_set_composition_no_panic() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+    let engine: Arc<dyn BrowserEngine> = WebView2Backend::new()
+        .open_engine(make_opts("about:blank"))
+        .expect("open_engine");
+    engine.ime_set_composition("日本語", Some((0, 9)));
+    engine.ime_set_composition("にほんご", None);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// `ime_commit` dispatches committed text via WM_CHAR.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Windows + WebView2 runtime"]
+fn ime_commit_no_panic() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+    let engine: Arc<dyn BrowserEngine> = WebView2Backend::new()
+        .open_engine(make_opts("about:blank"))
+        .expect("open_engine");
+    engine.ime_set_composition("te", Some((0, 2)));
+    engine.ime_commit("test");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// `ime_cancel` dispatches WM_CHAR(VK_ESCAPE).
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Windows + WebView2 runtime"]
+fn ime_cancel_no_panic() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+    let engine: Arc<dyn BrowserEngine> = WebView2Backend::new()
+        .open_engine(make_opts("about:blank"))
+        .expect("open_engine");
+    engine.ime_set_composition("te", None);
+    engine.ime_cancel();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1);
+}

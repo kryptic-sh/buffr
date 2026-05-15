@@ -505,6 +505,11 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
                             ev.y
                         );
                     }
+                    WebView2InputEvent::Ime(_) => {
+                        tracing::debug!(
+                            "webview2 worker: IME event — stub path (no-op on non-Windows)"
+                        );
+                    }
                 }
             }
         }
@@ -739,6 +744,67 @@ fn osr_dispatch_input(event: &super::input::WebView2InputEvent, rt: &StaRuntime)
                 if msg == WM_KEYDOWN { "DOWN" } else { "UP" },
                 ev.vk
             );
+        }
+
+        super::input::WebView2InputEvent::Ime(ev) => {
+            // IME dispatch via WM_CHAR-per-character.
+            //
+            // Full WM_IME_* dispatch requires reading the composition string from
+            // an IME-managed buffer after WM_IME_COMPOSITION, which is difficult
+            // to orchestrate from Rust without a live ImmGetCompositionString call
+            // on the same thread.  The WM_CHAR approach (used by AutoHotkey,
+            // Playwright, and other Win32 automation tools) is simpler and
+            // sufficient for most web input handlers.
+            //
+            // Phase D: implement WM_IME_STARTCOMPOSITION → WM_IME_COMPOSITION
+            // (GCS_COMPSTR + GCS_CURSORPOS) → WM_IME_ENDCOMPOSITION for proper
+            // preedit display in native form elements.
+            use super::input::Wv2ImeEvent;
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
+
+            let hwnd = match rt.active_tab() {
+                Some(tab) => tab.hwnd(),
+                None => {
+                    tracing::debug!("webview2 worker: SendInput(Ime) — no active tab, dropping");
+                    return;
+                }
+            };
+
+            let post_chars = |text: &str| {
+                for ch in text.chars() {
+                    let code_point = ch as u32;
+                    // SAFETY: WM_CHAR with a valid Unicode scalar value is always safe.
+                    let _ = unsafe {
+                        PostMessageW(Some(hwnd), WM_CHAR, WPARAM(code_point as usize), LPARAM(1))
+                    };
+                }
+            };
+
+            match ev {
+                Wv2ImeEvent::Preedit { text, cursor } => {
+                    // Simplified: send preedit characters as WM_CHAR sequence.
+                    // This does not display an OS preedit window — it inserts
+                    // the composition text directly.  Phase D: WM_IME_COMPOSITION.
+                    tracing::debug!(
+                        text = %text,
+                        ?cursor,
+                        "webview2 worker: ime_set_composition via WM_CHAR (simplified, Phase D deferred)"
+                    );
+                    post_chars(text);
+                }
+                Wv2ImeEvent::Commit { text } => {
+                    tracing::debug!(text = %text, "webview2 worker: ime_commit via WM_CHAR");
+                    post_chars(text);
+                }
+                Wv2ImeEvent::Cancel => {
+                    // Send VK_ESCAPE (0x1B) as WM_CHAR to dismiss the composition.
+                    tracing::debug!("webview2 worker: ime_cancel via WM_CHAR(VK_ESCAPE)");
+                    const VK_ESCAPE: usize = 0x1B;
+                    let _ =
+                        unsafe { PostMessageW(Some(hwnd), WM_CHAR, WPARAM(VK_ESCAPE), LPARAM(1)) };
+                }
+            }
         }
 
         super::input::WebView2InputEvent::Mouse(ev) => {

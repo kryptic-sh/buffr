@@ -27,8 +27,11 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitGtkError;
-use super::input::{GtkInputEvent, GtkMouseButton, GtkMouseKind};
-use super::input_js::{key_js, mouse_click_js, mouse_leave_js, mouse_move_js, wheel_js};
+use super::input::{GtkImeEvent, GtkInputEvent, GtkMouseButton, GtkMouseKind};
+use super::input_js::{
+    ime_cancel_js, ime_commit_js, ime_set_composition_js, key_js, mouse_click_js, mouse_leave_js,
+    mouse_move_js, wheel_js,
+};
 use super::osr::{paint_blank, request_snapshot};
 use super::runtime::{OsrHandles, TabEntry};
 
@@ -565,6 +568,35 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
                         ev.delta_y,
                     );
                     Some(wheel_js(ev))
+                }
+                GtkInputEvent::Ime(ev) => {
+                    // IME composition / commit / cancel via JS CompositionEvent
+                    // injection.  Uses `compositionupdate`, `compositionend`, and
+                    // `document.execCommand('insertText')` to approximate what a
+                    // real OS-level IME would deliver to the browser's responder
+                    // chain.  Full fidelity requires native GDK4 IME support
+                    // (Phase D) — this is the headless approximation.
+                    match ev {
+                        GtkImeEvent::Preedit { text, cursor } => {
+                            tracing::debug!(
+                                text = %text,
+                                ?cursor,
+                                "webkitgtk worker: JS ime_set_composition"
+                            );
+                            Some(ime_set_composition_js(text, *cursor))
+                        }
+                        GtkImeEvent::Commit { text } => {
+                            tracing::debug!(
+                                text = %text,
+                                "webkitgtk worker: JS ime_commit"
+                            );
+                            Some(ime_commit_js(text))
+                        }
+                        GtkImeEvent::Cancel => {
+                            tracing::debug!("webkitgtk worker: JS ime_cancel");
+                            Some(ime_cancel_js())
+                        }
+                    }
                 }
             };
 

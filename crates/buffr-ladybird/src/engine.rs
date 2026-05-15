@@ -556,4 +556,44 @@ impl BrowserEngine for LadybirdEngine {
     fn cancel_hint(&self) {
         tracing::debug!("ladybird: cancel_hint — no-op");
     }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // Substrate: `cxx::bridge` FFI functions `webcontent_ime_set_composition`,
+    //   `webcontent_ime_commit`, `webcontent_ime_cancel` in
+    //   `src/shim/ladybird_shim.{h,cpp}`.
+    //
+    // Phase B: C++ stub stores preedit in `WebContent::m_ime_composition` (no
+    //   render effect). `commit` and `cancel` clear it.
+    //
+    // Phase C: replace with real Ladybird WebContentServer IPC messages.
+    //   Expected message types (TBD at Ladybird API pin time):
+    //     Messages::WebContentClient::SetComposition
+    //     Messages::WebContentClient::CommitComposition
+    //     Messages::WebContentClient::CancelComposition
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        tracing::debug!(text, ?cursor, "ladybird: ime_set_composition");
+        let (sel_start, sel_end) = cursor.unwrap_or_else(|| {
+            let len = text.len() as u32;
+            (len as usize, len as usize)
+        });
+        self.worker.send(crate::state::Command::ImeSetComposition {
+            text: text.to_owned(),
+            sel_start: sel_start as u32,
+            sel_end: sel_end as u32,
+        });
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(text, "ladybird: ime_commit");
+        self.worker.send(crate::state::Command::ImeCommit {
+            text: text.to_owned(),
+        });
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!("ladybird: ime_cancel");
+        self.worker.send(crate::state::Command::ImeCancel);
+    }
 }

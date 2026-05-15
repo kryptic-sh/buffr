@@ -163,3 +163,101 @@ fn open_engine_constructs_on_macos() {
         "osr_view() must return the same Arc on every call"
     );
 }
+
+// ── IME smoke tests ───────────────────────────────────────────────────────────
+//
+// Phase B: all three IME methods are debug-log only (NSTextInputClient not yet
+// wired; Phase D deferred). They must not panic on any supported target.
+
+/// `ime_set_composition` must not panic (debug-log only in Phase B).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires macOS + real WKWebView runtime"]
+fn ime_set_composition_no_panic() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+    let opts = BackendOpenOptions {
+        engine_id: EngineId::new("ime-smoke"),
+        initial_url: "about:blank",
+        initial_size: (800, 600),
+        data_dir: None,
+        cache_dir: None,
+        frame_rate: 60,
+        device_scale: 1.0,
+        private: false,
+        download_dir: None,
+        downloads: None,
+        notice_queue: None,
+        find_sink: None,
+        sinks: Box::new(()),
+    };
+    let engine: Arc<dyn BrowserEngine> = WebKitCocoaBackend::new()
+        .open_engine(opts)
+        .expect("open_engine");
+    engine.ime_set_composition("日本語", Some((0, 9)));
+    engine.ime_set_composition("にほんご", None);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// `ime_commit` must not panic (debug-log only in Phase B).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires macOS + real WKWebView runtime"]
+fn ime_commit_no_panic() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+    let opts = BackendOpenOptions {
+        engine_id: EngineId::new("ime-smoke"),
+        initial_url: "about:blank",
+        initial_size: (800, 600),
+        data_dir: None,
+        cache_dir: None,
+        frame_rate: 60,
+        device_scale: 1.0,
+        private: false,
+        download_dir: None,
+        downloads: None,
+        notice_queue: None,
+        find_sink: None,
+        sinks: Box::new(()),
+    };
+    let engine: Arc<dyn BrowserEngine> = WebKitCocoaBackend::new()
+        .open_engine(opts)
+        .expect("open_engine");
+    engine.ime_set_composition("te", Some((0, 2)));
+    engine.ime_commit("test");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// `ime_cancel` must not panic (debug-log only in Phase B).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires macOS + real WKWebView runtime"]
+fn ime_cancel_no_panic() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+    let opts = BackendOpenOptions {
+        engine_id: EngineId::new("ime-smoke"),
+        initial_url: "about:blank",
+        initial_size: (800, 600),
+        data_dir: None,
+        cache_dir: None,
+        frame_rate: 60,
+        device_scale: 1.0,
+        private: false,
+        download_dir: None,
+        downloads: None,
+        notice_queue: None,
+        find_sink: None,
+        sinks: Box::new(()),
+    };
+    let engine: Arc<dyn BrowserEngine> = WebKitCocoaBackend::new()
+        .open_engine(opts)
+        .expect("open_engine");
+    engine.ime_set_composition("te", None);
+    engine.ime_cancel();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1);
+}

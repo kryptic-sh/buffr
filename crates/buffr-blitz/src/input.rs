@@ -10,7 +10,7 @@
 //! own the translated event and call `handle_ui_event` on the right thread.
 
 use blitz_traits::events::{
-    BlitzKeyEvent as BKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
+    BlitzImeEvent, BlitzKeyEvent as BKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
     BlitzWheelEvent, KeyState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails,
 };
 use keyboard_types::{Code, Key, Location, Modifiers};
@@ -30,6 +30,16 @@ pub(crate) enum BlitzInputEvent {
     PointerUp(BlitzPointerEvent),
     PointerLeave,
     Wheel(BlitzWheelEvent),
+    /// IME composition / commit / cancel — forwarded as `UiEvent::Ime`.
+    ///
+    /// `blitz-traits 0.3.0-alpha.2` defines `UiEvent::Ime(BlitzImeEvent)` with
+    /// variants `Preedit(String, Option<(usize, usize)>)`, `Commit(String)`,
+    /// `Disabled`, and `Enabled`.
+    ///
+    /// Source: blitz-traits-0.3.0-alpha.2/src/events.rs:65 (`UiEvent::Ime`),
+    ///         line 653 (`BlitzImeEvent::Preedit`), line 673 (`BlitzImeEvent::Commit`),
+    ///         line 694 (`BlitzImeEvent::Disabled`).
+    Ime(BlitzImeEvent),
 }
 
 impl BlitzInputEvent {
@@ -59,6 +69,7 @@ impl BlitzInputEvent {
                 ))
             }
             BlitzInputEvent::Wheel(ev) => UiEvent::Wheel(ev),
+            BlitzInputEvent::Ime(ev) => UiEvent::Ime(ev),
         }
     }
 }
@@ -129,6 +140,25 @@ pub(crate) fn neutral_click_to_blitz(
 /// Translate a mouse-leave to `BlitzInputEvent::PointerLeave`.
 pub(crate) fn neutral_leave_to_blitz() -> BlitzInputEvent {
     BlitzInputEvent::PointerLeave
+}
+
+/// Translate a preedit string + optional cursor range to `BlitzInputEvent::Ime`.
+///
+/// Maps to `BlitzImeEvent::Preedit(text, cursor)`.
+pub(crate) fn ime_preedit_to_blitz(text: &str, cursor: Option<(usize, usize)>) -> BlitzInputEvent {
+    BlitzInputEvent::Ime(BlitzImeEvent::Preedit(text.to_owned(), cursor))
+}
+
+/// Translate a commit string to `BlitzInputEvent::Ime`.
+///
+/// Maps to `BlitzImeEvent::Commit(text)`.
+pub(crate) fn ime_commit_to_blitz(text: &str) -> BlitzInputEvent {
+    BlitzInputEvent::Ime(BlitzImeEvent::Commit(text.to_owned()))
+}
+
+/// Cancel the current IME composition via `BlitzImeEvent::Disabled`.
+pub(crate) fn ime_cancel_to_blitz() -> BlitzInputEvent {
+    BlitzInputEvent::Ime(BlitzImeEvent::Disabled)
 }
 
 /// Translate a scroll wheel event to `BlitzInputEvent::Wheel`.

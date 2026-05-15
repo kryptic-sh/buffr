@@ -298,10 +298,89 @@ fn osr_input_dispatch_evaluates_js() {
     );
 }
 
-/// `navigate` errors propagate via the reply channel — not silently discarded.
-/// Drop the engine (which shuts down the worker) then verify that a navigate
-/// call on a freshly-killed worker surface is an Err, not a silent Ok.
-///
+// ── IME smoke tests (require display server + WebKitGTK 6.0) ─────────────────
+
+/// `ime_set_composition` dispatches a CompositionEvent via JS injection.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn ime_set_composition_no_panic() {
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("data:text/html,<input id=i>"))
+        .expect("open_engine");
+    engine.ime_set_composition("日本語", Some((0, 9)));
+    engine.ime_set_composition("にほんご", None);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// `ime_commit` dispatches compositionend + execCommand('insertText') via JS.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn ime_commit_no_panic() {
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("data:text/html,<input id=i>"))
+        .expect("open_engine");
+    engine.ime_set_composition("te", Some((0, 2)));
+    engine.ime_commit("test");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// `ime_cancel` dispatches compositionend with empty data via JS.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn ime_cancel_no_panic() {
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("data:text/html,<input id=i>"))
+        .expect("open_engine");
+    engine.ime_set_composition("te", None);
+    engine.ime_cancel();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(engine.tab_count() >= 1);
+}
+
+/// IME JS snippet builder — set_composition produces valid CompositionEvent JS.
+#[test]
+#[cfg(target_os = "linux")]
+fn ime_set_composition_js_shape() {
+    use buffr_webkitgtk::ime_set_composition_js;
+    let js = ime_set_composition_js("日本語", Some((0, 9)));
+    assert!(
+        js.contains("compositionupdate"),
+        "missing compositionupdate: {js}"
+    );
+    assert!(js.contains("日本語"), "missing text: {js}");
+}
+
+/// IME JS snippet builder — commit produces compositionend + execCommand.
+#[test]
+#[cfg(target_os = "linux")]
+fn ime_commit_js_shape() {
+    use buffr_webkitgtk::ime_commit_js;
+    let js = ime_commit_js("test");
+    assert!(
+        js.contains("compositionend"),
+        "missing compositionend: {js}"
+    );
+    assert!(js.contains("insertText"), "missing insertText: {js}");
+    assert!(js.contains("test"), "missing commit text: {js}");
+}
+
+/// IME JS snippet builder — cancel produces compositionend with empty data.
+#[test]
+#[cfg(target_os = "linux")]
+fn ime_cancel_js_shape() {
+    use buffr_webkitgtk::ime_cancel_js;
+    let js = ime_cancel_js();
+    assert!(
+        js.contains("compositionend"),
+        "missing compositionend: {js}"
+    );
+}
+
 /// This test uses a separate engine instance to avoid GTK re-init issues.
 #[test]
 #[ignore = "requires display server and WebKitGTK 6.0"]

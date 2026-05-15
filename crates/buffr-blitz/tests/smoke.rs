@@ -242,3 +242,51 @@ fn osr_input_dispatch_no_panic() {
         "tab must still be open after input"
     );
 }
+
+// ── IME smoke tests ───────────────────────────────────────────────────────────
+
+/// `ime_set_composition` must not panic and the engine must remain healthy.
+///
+/// Blitz wires this through `UiEvent::Ime(BlitzImeEvent::Preedit)` via the
+/// worker's `Command::SendInput` channel.
+#[test]
+fn ime_set_composition_no_panic() {
+    let engine = open_engine("data:text/html,<input id=i>");
+    engine.ime_set_composition("日本語", Some((0, 9)));
+    engine.ime_set_composition("にほんご", None);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        engine.tab_count() >= 1,
+        "engine still alive after ime_set_composition"
+    );
+}
+
+/// `ime_commit` must not panic.
+///
+/// Wires through `BlitzImeEvent::Commit`.
+#[test]
+fn ime_commit_no_panic() {
+    let engine = open_engine("data:text/html,<input id=i>");
+    engine.ime_set_composition("te", Some((0, 2)));
+    engine.ime_commit("test");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        engine.tab_count() >= 1,
+        "engine still alive after ime_commit"
+    );
+}
+
+/// `ime_cancel` must not panic.
+///
+/// Wires through `BlitzImeEvent::Disabled`.
+#[test]
+fn ime_cancel_no_panic() {
+    let engine = open_engine("data:text/html,<input id=i>");
+    engine.ime_set_composition("te", None);
+    engine.ime_cancel();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        engine.tab_count() >= 1,
+        "engine still alive after ime_cancel"
+    );
+}

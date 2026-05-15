@@ -310,6 +310,64 @@ fn reopen_closed_tab_empty_stack_returns_none() {
     assert!(result.is_none(), "empty stack must return None");
 }
 
+// ── IME smoke tests (offline — no Firefox binary required) ───────────────────
+
+/// `ime_set_composition` CDP params serialize correctly.
+///
+/// The JSON for `Input.imeSetComposition` must carry text, selectionStart,
+/// selectionEnd, replacementStart, replacementEnd.
+#[test]
+fn ime_set_composition_json_shape() {
+    use buffr_firefox_cdp::cdp::CdpCommand;
+    let cmd = CdpCommand::new(
+        "Input.imeSetComposition",
+        serde_json::json!({
+            "text": "日本語",
+            "selectionStart": 0,
+            "selectionEnd": 9,
+            "replacementStart": 0,
+            "replacementEnd": 0,
+        }),
+    );
+    let json = cmd.serialize();
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(v["method"], "Input.imeSetComposition");
+    assert_eq!(v["params"]["text"], "日本語");
+    assert_eq!(v["params"]["selectionStart"], 0);
+    assert_eq!(v["params"]["selectionEnd"], 9);
+}
+
+/// `ime_commit` maps to `Input.insertText`.
+#[test]
+fn ime_commit_json_shape() {
+    use buffr_firefox_cdp::cdp::CdpCommand;
+    let cmd = CdpCommand::new("Input.insertText", serde_json::json!({ "text": "日本語" }));
+    let json = cmd.serialize();
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(v["method"], "Input.insertText");
+    assert_eq!(v["params"]["text"], "日本語");
+}
+
+/// `ime_cancel` maps to `Input.imeSetComposition` with empty text.
+#[test]
+fn ime_cancel_json_shape() {
+    use buffr_firefox_cdp::cdp::CdpCommand;
+    let cmd = CdpCommand::new(
+        "Input.imeSetComposition",
+        serde_json::json!({
+            "text": "",
+            "selectionStart": 0,
+            "selectionEnd": 0,
+            "replacementStart": 0,
+            "replacementEnd": 0,
+        }),
+    );
+    let json = cmd.serialize();
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(v["params"]["text"], "");
+    assert_eq!(v["params"]["selectionStart"], 0);
+}
+
 /// `can_go_back` / `can_go_forward` via Page.getNavigationHistory. Requires Firefox.
 #[test]
 #[ignore = "requires Firefox binary"]

@@ -104,5 +104,30 @@ pub(crate) mod bridge {
 
         /// Read back the current page zoom level.
         fn webcontent_zoom(wc: &WebContent) -> f64;
+
+        // ── IME composition ───────────────────────────────────────────────────
+        //
+        // Phase B: C++ stub stores the latest preedit string in
+        //   `WebContent::m_ime_composition` and no-ops the rest.
+        // Phase C: forward to LibWeb's WebContentServer via IPC messages
+        //   `Messages::SetIMEComposition`, `Messages::CommitIME`,
+        //   `Messages::CancelIME` (exact names TBD by Ladybird API at pin time).
+
+        /// Notify the engine of an in-progress IME composition update.
+        ///
+        /// `text`: current preedit string.
+        /// `sel_start`, `sel_end`: cursor/selection byte range within `text`.
+        fn webcontent_ime_set_composition(
+            wc: Pin<&mut WebContent>,
+            text: &str,
+            sel_start: u32,
+            sel_end: u32,
+        );
+
+        /// Commit the composed text, inserting it into the focused element.
+        fn webcontent_ime_commit(wc: Pin<&mut WebContent>, text: &str);
+
+        /// Cancel the current IME composition, discarding the preedit string.
+        fn webcontent_ime_cancel(wc: Pin<&mut WebContent>);
     }
 }

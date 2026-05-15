@@ -1528,4 +1528,88 @@ impl BrowserEngine for FirefoxCdpEngine {
             }
         }
     }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // Firefox CDP exposes `Input.imeSetComposition` and `Input.insertText`.
+    //
+    // `ime_set_composition` → `Input.imeSetComposition` with selectionStart /
+    //   selectionEnd / replacementStart / replacementEnd params. When `cursor`
+    //   is `Some((s, e))` the selection range [s, e] within the composition
+    //   string is highlighted.  When `None` we use the text length as both
+    //   endpoints (cursor at end, no range selected).
+    //
+    // `ime_commit` → `Input.insertText { text }`.  Sends the committed text
+    //   directly to the focused element.  No prior `Input.imeSetComposition`
+    //   clear is required — Firefox CDP handles the transition internally.
+    //
+    // `ime_cancel` → `Input.imeSetComposition { text: "" }`.  An empty
+    //   composition string clears the in-progress composition preedit.
+    //
+    // Source: Firefox CDP Remote Agent implements Input.imeSetComposition and
+    //   Input.insertText in `dom/chrome/test/firefox-cdp/input.js` and the
+    //   corresponding actor at `remote/components/geckoviewactor/InputMethodActor.jsm`.
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        let (sel_start, sel_end) = cursor.unwrap_or_else(|| {
+            let len = text.len();
+            (len, len)
+        });
+        tracing::debug!(text, sel_start, sel_end, "firefox-cdp: ime_set_composition");
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        if let Some(sess) = session_id {
+            let _ = self.session_cmd(
+                &sess,
+                "Input.imeSetComposition",
+                serde_json::json!({
+                    "text": text,
+                    "selectionStart": sel_start,
+                    "selectionEnd": sel_end,
+                    "replacementStart": 0,
+                    "replacementEnd": 0,
+                }),
+            );
+        }
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(text, "firefox-cdp: ime_commit");
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        if let Some(sess) = session_id {
+            let _ = self.session_cmd(
+                &sess,
+                "Input.insertText",
+                serde_json::json!({ "text": text }),
+            );
+        }
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!(
+            "firefox-cdp: ime_cancel — clearing composition via empty imeSetComposition"
+        );
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        if let Some(sess) = session_id {
+            let _ = self.session_cmd(
+                &sess,
+                "Input.imeSetComposition",
+                serde_json::json!({
+                    "text": "",
+                    "selectionStart": 0,
+                    "selectionEnd": 0,
+                    "replacementStart": 0,
+                    "replacementEnd": 0,
+                }),
+            );
+        }
+    }
 }

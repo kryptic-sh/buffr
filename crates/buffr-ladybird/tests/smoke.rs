@@ -162,3 +162,43 @@ fn zoom_reset_restores_one() {
         "zoom_reset must restore 1.0, got {after}"
     );
 }
+
+// ── IME smoke tests ───────────────────────────────────────────────────────────
+//
+// Substrate: `webcontent_ime_set_composition` / `webcontent_ime_commit` /
+//   `webcontent_ime_cancel` cxx::bridge FFI functions.
+// Phase B: C++ stub stores preedit in `m_ime_composition` (no render effect).
+// All three must not panic.
+
+/// `ime_set_composition` dispatches via the cxx bridge FFI shim.
+#[test]
+fn ime_set_composition_no_panic() {
+    let engine = open_engine("about:blank");
+    engine.ime_set_composition("日本語", Some((0, 9)));
+    engine.ime_set_composition("にほんご", None);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        engine.tab_count() >= 1,
+        "engine alive after ime_set_composition"
+    );
+}
+
+/// `ime_commit` dispatches via the cxx bridge FFI shim.
+#[test]
+fn ime_commit_no_panic() {
+    let engine = open_engine("about:blank");
+    engine.ime_set_composition("te", Some((0, 2)));
+    engine.ime_commit("test");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1, "engine alive after ime_commit");
+}
+
+/// `ime_cancel` dispatches via the cxx bridge FFI shim.
+#[test]
+fn ime_cancel_no_panic() {
+    let engine = open_engine("about:blank");
+    engine.ime_set_composition("te", None);
+    engine.ime_cancel();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() >= 1, "engine alive after ime_cancel");
+}

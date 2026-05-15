@@ -500,6 +500,86 @@ pub(crate) fn wheel_js(event: &GtkWheelEvent) -> String {
     )
 }
 
+// ── IME composition JS helpers ────────────────────────────────────────────────
+
+/// Build a JS snippet that dispatches `compositionupdate` on the active element.
+///
+/// This is the WebKitGTK JS-injection substrate for `ime_set_composition`.
+/// A real WKWebView would handle IME via `NSTextInputClient` at the OS level;
+/// JS composition events are the closest approximation available through the
+/// `evaluate_javascript` path.
+///
+/// # Safety / injection note
+///
+/// `text` is user-supplied and **must** be JS-escaped before interpolation.
+/// We escape single-quotes and backslashes here. Callers must not bypass this.
+pub fn ime_set_composition_js(text: &str, cursor: Option<(usize, usize)>) -> String {
+    let escaped = js_escape(text);
+    // data attribute: full composition string.
+    // The cursor/selection positions are not exposed via CompositionEvent.data,
+    // but we append them as a detail comment for debugging.
+    let (sel_start, sel_end) = cursor.unwrap_or((text.len(), text.len()));
+    format!(
+        "(function(){{ \
+            var el = document.activeElement || document.body; \
+            el.dispatchEvent(new CompositionEvent('compositionupdate', {{ \
+                data: '{text}', \
+                bubbles: true, \
+                cancelable: true \
+            }})); \
+            /* cursor range: [{sel_start}, {sel_end}] */ \
+        }})();",
+        text = escaped,
+        sel_start = sel_start,
+        sel_end = sel_end,
+    )
+}
+
+/// Build a JS snippet that dispatches `compositionend` + inserts text via
+/// `document.execCommand('insertText', false, text)` on the active element.
+///
+/// This is the WebKitGTK JS-injection substrate for `ime_commit`.
+///
+/// # Safety / injection note
+///
+/// `text` is user-supplied and JS-escaped before interpolation.
+pub fn ime_commit_js(text: &str) -> String {
+    let escaped = js_escape(text);
+    format!(
+        "(function(){{ \
+            var el = document.activeElement || document.body; \
+            el.dispatchEvent(new CompositionEvent('compositionend', {{ \
+                data: '{text}', \
+                bubbles: true, \
+                cancelable: true \
+            }})); \
+            document.execCommand('insertText', false, '{text}'); \
+        }})();",
+        text = escaped,
+    )
+}
+
+/// Build a JS snippet that dispatches `compositionend` with empty data.
+///
+/// This is the WebKitGTK JS-injection substrate for `ime_cancel`.
+pub fn ime_cancel_js() -> String {
+    "(function(){{ \
+        var el = document.activeElement || document.body; \
+        el.dispatchEvent(new CompositionEvent('compositionend', {{ \
+            data: '', \
+            bubbles: true, \
+            cancelable: true \
+        }})); \
+    }})();"
+        .to_owned()
+}
+
+/// Escape a user-supplied string for safe embedding in a JS single-quoted
+/// string literal. Escapes `\` and `'`.
+fn js_escape(s: &str) -> String {
+    s.replace('\\', r"\\").replace('\'', r"\'")
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Wrap a string in JS single-quoted notation.

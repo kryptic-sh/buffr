@@ -64,8 +64,8 @@ use buffr_engine::{
 
 use crate::error::ServoError;
 use crate::input::{
-    neutral_click_to_servo, neutral_key_to_servo, neutral_leave_to_servo, neutral_move_to_servo,
-    neutral_scroll_to_servo,
+    ime_cancel_to_servo, ime_commit_to_servo, ime_preedit_to_servo, neutral_click_to_servo,
+    neutral_key_to_servo, neutral_leave_to_servo, neutral_move_to_servo, neutral_scroll_to_servo,
 };
 use crate::worker::{Command, WorkerHandle, spawn};
 
@@ -583,6 +583,45 @@ impl BrowserEngine for ServoEngine {
 
     fn cancel_hint(&self) {
         tracing::debug!("servo: cancel_hint not implemented");
+    }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // Servo's `embedder_traits::input_events` (servo-embedder-traits-0.1.0)
+    // defines `InputEvent::Ime(ImeEvent)` with:
+    //   - `ImeEvent::Composition(CompositionEvent)` — preedit update or commit
+    //   - `ImeEvent::Dismissed` — composition dismissed / cancelled
+    //
+    // `CompositionEvent` (from `keyboard_types`) has fields:
+    //   - `state: CompositionState` — `Start`, `Update`, or `End`
+    //   - `data: String` — the preedit / committed text
+    //
+    // Source:
+    //   servo-embedder-traits-0.1.0/input_events.rs:331 (`ImeEvent::Composition`)
+    //   servo-embedder-traits-0.1.0/input_events.rs:333 (`ImeEvent::Dismissed`)
+    //   keyboard_types: `CompositionEvent`, `CompositionState`
+    //   servo-0.1.0/lib.rs:38 (`pub use keyboard_types::CompositionEvent, CompositionState`)
+    //   servo-0.1.0/webview.rs:510 (`WebView::notify_input_event`)
+    //
+    // All three are forwarded as `Command::SendInput { event: ServoInputEvent }`
+    // to the worker, which calls `webview.notify_input_event(inner.clone())`.
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        tracing::debug!(text, ?cursor, "servo: ime_set_composition");
+        let ev = ime_preedit_to_servo(text, cursor);
+        self.worker.send(Command::SendInput { event: ev });
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(text, "servo: ime_commit");
+        let ev = ime_commit_to_servo(text);
+        self.worker.send(Command::SendInput { event: ev });
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!("servo: ime_cancel");
+        let ev = ime_cancel_to_servo();
+        self.worker.send(Command::SendInput { event: ev });
     }
 
     // ── Action dispatch ───────────────────────────────────────────────────────

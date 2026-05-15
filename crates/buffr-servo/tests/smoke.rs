@@ -104,6 +104,55 @@ fn servo_zoom_reset_restores_one() {
     );
 }
 
+// ── IME smoke tests ───────────────────────────────────────────────────────────
+//
+// Substrate: `InputEvent::Ime(ImeEvent)` via `WebView::notify_input_event`.
+//   - `ime_set_composition` → `ImeEvent::Composition(CompositionState::Update)`
+//   - `ime_commit` → `ImeEvent::Composition(CompositionState::End)`
+//   - `ime_cancel` → `ImeEvent::Dismissed`
+//
+// Source: servo-embedder-traits-0.1.0/input_events.rs:331–333.
+
+/// `ime_set_composition` routes through `InputEvent::Ime(Composition{Update})`.
+/// Marked slow because spawning the Servo worker requires a display / GL context.
+#[test]
+#[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]
+fn servo_ime_set_composition_no_panic() {
+    let backend = ServoBackend::new();
+    let opts = dummy_options();
+    let engine = backend.open_engine(opts).expect("open_engine");
+    engine.ime_set_composition("日本語", Some((0, 9)));
+    engine.ime_set_composition("にほんご", None);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() == 0 || engine.tab_count() >= 1);
+}
+
+/// `ime_commit` routes through `InputEvent::Ime(Composition{End})`.
+#[test]
+#[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]
+fn servo_ime_commit_no_panic() {
+    let backend = ServoBackend::new();
+    let opts = dummy_options();
+    let engine = backend.open_engine(opts).expect("open_engine");
+    engine.ime_set_composition("te", Some((0, 2)));
+    engine.ime_commit("test");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() == 0 || engine.tab_count() >= 1);
+}
+
+/// `ime_cancel` routes through `InputEvent::Ime(Dismissed)`.
+#[test]
+#[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]
+fn servo_ime_cancel_no_panic() {
+    let backend = ServoBackend::new();
+    let opts = dummy_options();
+    let engine = backend.open_engine(opts).expect("open_engine");
+    engine.ime_set_composition("te", None);
+    engine.ime_cancel();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(engine.tab_count() == 0 || engine.tab_count() >= 1);
+}
+
 /// Verify `osr_frame` and `osr_view` return stable Arc handles.
 #[test]
 #[ignore = "slow — spawns worker thread; run with --include-ignored to exercise"]

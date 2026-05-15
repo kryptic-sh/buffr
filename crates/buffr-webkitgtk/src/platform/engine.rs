@@ -52,8 +52,8 @@ use buffr_engine::{
 
 use super::error::WebKitGtkError;
 use super::input::{
-    GtkInputEvent, GtkWheelEvent, neutral_click_to_gtk, neutral_key_to_gtk, neutral_leave_to_gtk,
-    neutral_move_to_gtk, neutral_scroll_to_gtk,
+    GtkImeEvent, GtkInputEvent, GtkWheelEvent, neutral_click_to_gtk, neutral_key_to_gtk,
+    neutral_leave_to_gtk, neutral_move_to_gtk, neutral_scroll_to_gtk,
 };
 use super::worker::{Command, EngineState, WorkerHandle, spawn};
 
@@ -527,6 +527,42 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn cancel_hint(&self) {
         tracing::debug!("webkitgtk: cancel_hint — no-op");
+    }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // WebKitGTK has no synthetic IME event API in the gdk4 0.11 Rust bindings.
+    // We approximate via JS CompositionEvent injection through `evaluate_javascript`,
+    // which covers the ~80 % case (JS composition handlers, contenteditable, etc.).
+    // Native `<input>` / `<textarea>` insertion for `ime_commit` uses
+    // `document.execCommand('insertText')`.
+    //
+    // Phase D: once gdk4 >= 0.12 exposes `GtkIMContext` Rust constructors,
+    // replace the JS path with `WebKitWebView::im_context()` + `filter_keypress`.
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        tracing::debug!(text, ?cursor, "webkitgtk: ime_set_composition");
+        self.worker.send(Command::SendInput(GtkInputEvent::Ime(
+            GtkImeEvent::Preedit {
+                text: text.to_owned(),
+                cursor,
+            },
+        )));
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(text, "webkitgtk: ime_commit");
+        self.worker.send(Command::SendInput(GtkInputEvent::Ime(
+            GtkImeEvent::Commit {
+                text: text.to_owned(),
+            },
+        )));
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!("webkitgtk: ime_cancel");
+        self.worker
+            .send(Command::SendInput(GtkInputEvent::Ime(GtkImeEvent::Cancel)));
     }
 
     // ── Action dispatch ───────────────────────────────────────────────────────

@@ -64,6 +64,19 @@ public:
     void set_zoom(double zoom);
     double zoom() const;
 
+    // IME composition
+    //
+    // Phase B stub: `set_composition` stores the latest preedit in
+    //   `m_ime_composition`; `commit` and `cancel` clear it.
+    // Phase C: forward to LibWeb WebContentServer via IPC.
+    //   Expected message names (TBD at Ladybird API pin time):
+    //   `Messages::WebContentClient::SetComposition`,
+    //   `Messages::WebContentClient::CommitComposition`,
+    //   `Messages::WebContentClient::CancelComposition`.
+    void ime_set_composition(rust::Str text, uint32_t sel_start, uint32_t sel_end);
+    void ime_commit(rust::Str text);
+    void ime_cancel();
+
 private:
     std::string m_url;
     std::string m_title;
@@ -73,6 +86,8 @@ private:
     uint32_t m_height;
     /// Current page zoom level. Clamped to [0.25, 5.0] on the Rust side.
     double m_zoom = 1.0;
+    /// Latest IME preedit string (Phase B stub — no render effect).
+    std::string m_ime_composition;
 };
 
 // Free-function FFI entry points — called from the cxx bridge.
@@ -100,6 +115,11 @@ void webcontent_send_scroll(WebContent& wc, int32_t x, int32_t y, double dx, dou
 // Zoom
 void webcontent_set_zoom(WebContent& wc, double zoom);
 double webcontent_zoom(const WebContent& wc);
+
+// IME composition
+void webcontent_ime_set_composition(WebContent& wc, rust::Str text, uint32_t sel_start, uint32_t sel_end);
+void webcontent_ime_commit(WebContent& wc, rust::Str text);
+void webcontent_ime_cancel(WebContent& wc);
 
 } // namespace ladybird
 } // namespace buffr

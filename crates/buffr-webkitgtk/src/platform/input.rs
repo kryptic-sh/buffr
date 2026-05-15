@@ -72,6 +72,21 @@ pub(crate) enum GtkInputEvent {
     Key(GtkKeyEvent),
     Mouse(GtkMouseEvent),
     Wheel(GtkWheelEvent),
+    /// IME composition / commit / cancel dispatched via JS CompositionEvent.
+    Ime(GtkImeEvent),
+}
+
+/// IME event payload for the JS-injection IME path.
+pub(crate) enum GtkImeEvent {
+    /// Preedit update: live composition string + optional (start, end) cursor.
+    Preedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// Commit: accepted composition text inserted into the focused element.
+    Commit { text: String },
+    /// Cancel: composition was dismissed with no committed text.
+    Cancel,
 }
 
 // ── Translators ───────────────────────────────────────────────────────────────

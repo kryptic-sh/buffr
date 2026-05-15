@@ -101,6 +101,39 @@ const KEYEVENTF_KEYUP: u32 = 0x0002;
 pub(crate) enum WebView2InputEvent {
     Key(Wv2KeyEvent),
     Mouse(Wv2MouseEvent),
+    /// IME input event.
+    ///
+    /// # Windows strategy
+    ///
+    /// Full `WM_IME_*` dispatch (WM_IME_STARTCOMPOSITION, WM_IME_COMPOSITION,
+    /// WM_IME_ENDCOMPOSITION) is complex because the result string lives in an
+    /// IME-managed buffer, not in lParam.  Most automation tools instead send
+    /// `WM_CHAR` per character for both composition updates and commits, which
+    /// mimics what a real IME does on commit.
+    ///
+    /// - `Preedit` → `WM_CHAR` per character of the composition string (simplification).
+    /// - `Commit` → `WM_CHAR` per character of the committed text.
+    /// - `Cancel` → a single `WM_CHAR(0x1B)` (Escape) to dismiss the composition.
+    ///
+    /// On non-Windows targets this variant is logged and dropped (the worker is
+    /// a non-Windows stub that does nothing with messages anyway).
+    Ime(Wv2ImeEvent),
+}
+
+/// IME event payload for the WM_CHAR-based IME path on Windows.
+pub(crate) enum Wv2ImeEvent {
+    /// Preedit: live composition string + optional (start, end) cursor range.
+    ///
+    /// Simplified to WM_CHAR-per-character on Windows.  A proper
+    /// WM_IME_COMPOSITION path is deferred to Phase D.
+    Preedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// Commit: accepted composition text.  Sent as WM_CHAR per character.
+    Commit { text: String },
+    /// Cancel: dismiss composition.  Sent as WM_CHAR(VK_ESCAPE).
+    Cancel,
 }
 
 // ── Translators ───────────────────────────────────────────────────────────────

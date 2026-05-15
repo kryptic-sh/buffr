@@ -11,9 +11,10 @@
 use buffr_engine::{KeyEventKind, MouseButton as NeutralButton, NeutralKeyEvent};
 use keyboard_types;
 use servo::{
-    Code, InputEvent, Key, KeyState, Location, Modifiers, MouseButton as ServoMouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NamedKey,
-    WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    Code, CompositionEvent, CompositionState, ImeEvent, InputEvent, Key, KeyState, Location,
+    Modifiers, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, NamedKey, WebViewPoint, WheelDelta, WheelEvent,
+    WheelMode,
 };
 
 // Servo re-exports `keyboard_types::KeyboardEvent` under the servo namespace
@@ -286,6 +287,48 @@ pub fn neutral_leave_to_servo() -> ServoInputEvent {
             focus_moving_to_another_iframe: false,
         }),
     )
+}
+
+/// Translate a preedit update to a [`ServoInputEvent`] via `ImeEvent::Composition`.
+///
+/// `servo-embedder-traits-0.1.0/input_events.rs:331`:
+///   `ImeEvent::Composition(CompositionEvent)`
+///
+/// `keyboard_types::CompositionEvent { state: CompositionState::Update, data: text }`
+/// carries the live preedit string.  Servo does not have a separate
+/// preedit-cursor-range field on `CompositionEvent`; the cursor position is
+/// managed by the engine internally.  `cursor` is accepted here for API symmetry
+/// but is not forwarded to Servo (no field available).
+pub fn ime_preedit_to_servo(text: &str, _cursor: Option<(usize, usize)>) -> ServoInputEvent {
+    let composition = CompositionEvent {
+        state: CompositionState::Update,
+        data: text.to_owned(),
+    };
+    let desc = format!("ime:preedit({text:?})");
+    tracing::debug!("servo input: {desc}");
+    ServoInputEvent::new(desc, InputEvent::Ime(ImeEvent::Composition(composition)))
+}
+
+/// Translate a commit string to a [`ServoInputEvent`] via `ImeEvent::Composition`.
+///
+/// `keyboard_types::CompositionState::End` signals that the composition is
+/// complete and the text should be committed.
+pub fn ime_commit_to_servo(text: &str) -> ServoInputEvent {
+    let composition = CompositionEvent {
+        state: CompositionState::End,
+        data: text.to_owned(),
+    };
+    let desc = format!("ime:commit({text:?})");
+    tracing::debug!("servo input: {desc}");
+    ServoInputEvent::new(desc, InputEvent::Ime(ImeEvent::Composition(composition)))
+}
+
+/// Cancel IME composition via `ImeEvent::Dismissed`.
+///
+/// `servo-embedder-traits-0.1.0/input_events.rs:333`: `ImeEvent::Dismissed`.
+pub fn ime_cancel_to_servo() -> ServoInputEvent {
+    tracing::debug!("servo input: ime:cancel");
+    ServoInputEvent::new("ime:cancel", InputEvent::Ime(ImeEvent::Dismissed))
 }
 
 /// Translate a neutral scroll to a [`ServoInputEvent`].

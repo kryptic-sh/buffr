@@ -53,8 +53,8 @@ use buffr_engine::{
 
 use super::error::WebView2Error;
 use super::input::{
-    WebView2InputEvent, Wv2MouseEvent, Wv2MouseKind, neutral_click_to_wv2, neutral_key_to_wv2,
-    neutral_leave_to_wv2, neutral_move_to_wv2, neutral_scroll_to_wv2,
+    WebView2InputEvent, Wv2ImeEvent, Wv2MouseEvent, Wv2MouseKind, neutral_click_to_wv2,
+    neutral_key_to_wv2, neutral_leave_to_wv2, neutral_move_to_wv2, neutral_scroll_to_wv2,
 };
 use super::worker::{Command, EngineState, WorkerHandle, spawn};
 
@@ -531,6 +531,57 @@ impl BrowserEngine for WebView2Engine {
 
     fn cancel_hint(&self) {
         tracing::debug!("webview2: cancel_hint — no-op");
+    }
+
+    // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
+    //
+    // On Windows, real IME delivery goes through WM_IME_STARTCOMPOSITION /
+    // WM_IME_COMPOSITION / WM_IME_ENDCOMPOSITION with the composition string
+    // stored in an IME-managed buffer (read via ImmGetCompositionString).
+    //
+    // Phase B simplification: we send WM_CHAR per character via PostMessageW,
+    // which mimics the final keystroke sequence a real IME would produce.
+    // This is the same approach used by AutoHotkey, Playwright for Electron,
+    // and other Win32 automation tools when IME simulation is needed.
+    //
+    // ime_set_composition and ime_cancel use the same WM_CHAR path:
+    //   - set_composition → WM_CHAR per preedit character (no OS preedit popup)
+    //   - cancel → WM_CHAR(VK_ESCAPE)
+    //
+    // Phase D: replace with WM_IME_STARTCOMPOSITION → WM_IME_COMPOSITION
+    //   (GCS_COMPSTR | GCS_CURSORPOS lParam) → WM_IME_ENDCOMPOSITION and use
+    //   ImmSetCompositionString to plant the preedit in the IME buffer first.
+    //
+    // On non-Windows targets: debug-log only (the STA worker stub ignores these).
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        tracing::debug!(
+            text,
+            ?cursor,
+            "webview2: ime_set_composition (WM_CHAR simplification; Phase D deferred)"
+        );
+        self.worker.send(Command::SendInput(WebView2InputEvent::Ime(
+            Wv2ImeEvent::Preedit {
+                text: text.to_owned(),
+                cursor,
+            },
+        )));
+    }
+
+    fn ime_commit(&self, text: &str) {
+        tracing::debug!(text, "webview2: ime_commit via WM_CHAR");
+        self.worker.send(Command::SendInput(WebView2InputEvent::Ime(
+            Wv2ImeEvent::Commit {
+                text: text.to_owned(),
+            },
+        )));
+    }
+
+    fn ime_cancel(&self) {
+        tracing::debug!("webview2: ime_cancel via WM_CHAR(VK_ESCAPE)");
+        self.worker.send(Command::SendInput(WebView2InputEvent::Ime(
+            Wv2ImeEvent::Cancel,
+        )));
     }
 
     // ── Action dispatch ───────────────────────────────────────────────────────
