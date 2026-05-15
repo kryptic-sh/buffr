@@ -66,6 +66,25 @@ pub(crate) struct EngineState {
     /// `BrowserEngine::is_loading` without locking the `Mutex<EngineState>`.
     /// `Relaxed` ordering is sufficient — same rationale as `audio_active`.
     pub loading_active: Arc<AtomicBool>,
+    /// `true` while the engine is sleeping (OSR paint suppressed).
+    ///
+    /// Set by `BrowserEngine::osr_sleep`; read by the 250 ms snapshot tick
+    /// to skip `request_snapshot` when sleeping.  `Relaxed` ordering is
+    /// sufficient — no cross-thread synchronisation needed beyond visibility.
+    pub osr_sleeping: Arc<AtomicBool>,
+    /// Pending favicon URL updates, drained by `drain_favicon_updates`.
+    ///
+    /// Written by the `connect_favicon_notify` GTK signal; drained from any
+    /// thread by `BrowserEngine::drain_favicon_updates` via a
+    /// `Command::DrainFaviconUpdates` round-trip to the GTK thread.
+    pub favicon_updates: Arc<Mutex<Vec<buffr_engine::FaviconUpdate>>>,
+    /// Last cursor change from `mouse-target-changed`.
+    ///
+    /// Written on the GTK thread by `connect_mouse_target_changed`; read from
+    /// any thread by `BrowserEngine::take_cursor_change` via
+    /// `Command::TakeCursorChange`.  `Option<(i32, u32)>` matches the
+    /// `BrowserEngine::take_cursor_change` return type directly.
+    pub cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
 }
 
 impl EngineState {
@@ -78,6 +97,9 @@ impl EngineState {
             height,
             audio_active: Arc::new(AtomicBool::new(false)),
             loading_active: Arc::new(AtomicBool::new(false)),
+            osr_sleeping: Arc::new(AtomicBool::new(false)),
+            favicon_updates: Arc::new(Mutex::new(Vec::new())),
+            cursor_change: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -213,6 +235,42 @@ pub(crate) enum Command {
     OpenDevtools {
         id: TabId,
         reply: mpsc::SyncSender<Result<(), WebKitGtkError>>,
+    },
+    /// Put the active WebView to sleep or wake it up.
+    ///
+    /// When `sleep = true`, mutes the WebView and stops snapshot ticks.
+    /// When `sleep = false`, unmutes and resumes ticks.
+    SetOsrSleep {
+        sleep: bool,
+    },
+    /// Drain all pending favicon updates from the internal queue.
+    ///
+    /// Returns the accumulated `Vec<FaviconUpdate>` collected from
+    /// `connect_favicon_notify` callbacks since the last drain.
+    DrainFaviconUpdates {
+        reply: mpsc::SyncSender<Vec<buffr_engine::FaviconUpdate>>,
+    },
+    /// Take the last cursor change, if any.
+    ///
+    /// Returns `Some((browser_id, raw_kind))` when a new cursor has arrived
+    /// since the last call via `mouse-target-changed`, `None` otherwise.
+    TakeCursorChange {
+        reply: mpsc::SyncSender<Option<(i32, u32)>>,
+    },
+    /// Write `text` to the system clipboard via GDK4.
+    ///
+    /// Fire-and-forget: no reply channel. Called on the GTK thread where
+    /// `gdk::Display::default()` is valid.
+    ClipboardSetText {
+        text: String,
+    },
+    /// Trigger a WebKitGTK-managed download for `url`.
+    ///
+    /// Calls `WebViewExt::download_uri` which hands the download off to the
+    /// WebKit download manager.  More robust than the JS `<a>` click trick for
+    /// direct-resource URLs and cross-origin assets.
+    DownloadUri {
+        url: String,
     },
     Shutdown,
 }
@@ -733,6 +791,62 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         Command::OpenDevtools { id, reply } => {
             let _ = reply.send(rt.open_devtools(id));
         }
+        Command::SetOsrSleep { sleep } => {
+            use webkit6::prelude::WebViewExt;
+            if let Ok(st) = rt.engine_state.lock() {
+                st.osr_sleeping.store(sleep, Ordering::Relaxed);
+            }
+            // Mute/unmute audio and adjust WebView priority when sleeping.
+            if let Some(tab) = rt.active_tab() {
+                tab.web_view.set_is_muted(sleep);
+                tracing::debug!("webkitgtk worker: osr_sleep({sleep}) — is_muted={sleep}");
+            }
+        }
+        Command::DrainFaviconUpdates { reply } => {
+            let updates = rt
+                .engine_state
+                .lock()
+                .map(|st| {
+                    let mut v = st.favicon_updates.lock().unwrap_or_else(|e| e.into_inner());
+                    std::mem::take(&mut *v)
+                })
+                .unwrap_or_default();
+            let _ = reply.send(updates);
+        }
+        Command::TakeCursorChange { reply } => {
+            let change = rt
+                .engine_state
+                .lock()
+                .map(|st| {
+                    let mut v = st.cursor_change.lock().unwrap_or_else(|e| e.into_inner());
+                    v.take()
+                })
+                .unwrap_or(None);
+            let _ = reply.send(change);
+        }
+        Command::ClipboardSetText { text } => {
+            // Must run on the GTK thread — `gdk::Display::default()` is only
+            // valid here.
+            use gtk4::gdk::prelude::DisplayExt;
+            if let Some(display) = gtk4::gdk::Display::default() {
+                display.clipboard().set_text(&text);
+                tracing::debug!(
+                    "webkitgtk worker: clipboard_set_text ({} bytes)",
+                    text.len()
+                );
+            } else {
+                tracing::warn!("webkitgtk worker: clipboard_set_text — no GDK display");
+            }
+        }
+        Command::DownloadUri { url } => {
+            use webkit6::prelude::WebViewExt;
+            if let Some(tab) = rt.active_tab() {
+                tab.web_view.download_uri(&url);
+                tracing::debug!("webkitgtk worker: download_uri {url}");
+            } else {
+                tracing::debug!("webkitgtk worker: download_uri — no active tab");
+            }
+        }
         Command::Shutdown => {
             tracing::info!("webkitgtk worker: shutdown requested");
             main_loop.quit();
@@ -792,11 +906,21 @@ pub(crate) fn spawn(
             // If a snapshot is already in-flight the tick is a no-op (the
             // `in_flight` flag is checked inside `request_snapshot`).
             // Falls back to `paint_blank` when no tab is open yet.
+            // Skipped entirely when `osr_sleeping` is set (Gap 3).
             {
                 let rt_rc_snap = Rc::clone(&runtime_rc);
+                let engine_state_snap = Arc::clone(&engine_state);
                 glib::timeout_add_local(Duration::from_millis(250), move || {
-                    let rt = rt_rc_snap.borrow();
-                    rt.paint();
+                    // Skip paint while sleeping — avoids stale snapshots and
+                    // reduces CPU load when the view is hidden.
+                    let sleeping = engine_state_snap
+                        .lock()
+                        .map(|st| st.osr_sleeping.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    if !sleeping {
+                        let rt = rt_rc_snap.borrow();
+                        rt.paint();
+                    }
                     glib::ControlFlow::Continue
                 });
             }

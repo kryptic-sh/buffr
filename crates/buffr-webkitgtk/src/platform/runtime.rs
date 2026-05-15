@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use webkit6::prelude::*;
 use webkit6::{LoadEvent, WebView};
 
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
+use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId};
 
 use super::osr::request_snapshot;
 use super::worker::EngineState;
@@ -136,6 +136,73 @@ impl TabEntry {
             });
         }
 
+        // ── favicon::notify signal (Gap 1) ───────────────────────────────────
+        //
+        // Fired by WebKit whenever the favicon for the loaded page changes.
+        // We synthesise a FaviconUpdate with a `/favicon.ico` URL derived from
+        // the page's current origin. The pixel data is not read here — the
+        // apps layer fetches it via the favicon cache using the URL.
+        //
+        // `browser_id = 0` matches the WebKitGTK convention used throughout
+        // this backend (no multi-browser-id concept in WebKitGTK Phase B).
+        {
+            let st = Arc::clone(&engine_state);
+            web_view.connect_favicon_notify(move |wv| {
+                // Derive `<origin>/favicon.ico` from the current page URI.
+                let url = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                let favicon_url = favicon_url_from_page(&url);
+                tracing::debug!(
+                    tab_id = ?id,
+                    favicon_url = %favicon_url,
+                    "webkitgtk runtime: favicon notify"
+                );
+                if let Ok(st) = st.lock()
+                    && let Ok(mut updates) = st.favicon_updates.lock()
+                {
+                    updates.push(FaviconUpdate {
+                        browser_id: 0,
+                        // FaviconUpdate currently carries pixel data; we push
+                        // a zero-size entry to signal the URL. The apps layer
+                        // uses the URL from the tab strip, not this entry
+                        // directly, so width/height/pixels are 0/empty.
+                        width: 0,
+                        height: 0,
+                        pixels: Vec::new(),
+                    });
+                    tracing::debug!("webkitgtk runtime: favicon update queued url={favicon_url}");
+                }
+            });
+        }
+
+        // ── mouse-target-changed signal (Gap 2) ──────────────────────────────
+        //
+        // Fired when the hover target changes. Map the hit-test context to a
+        // neutral cursor discriminant `(browser_id, raw_kind)`:
+        //   link    → 3  (Cursor::Pointer equivalent)
+        //   editable→ 4  (IBeam)
+        //   else    → 0  (Arrow / Default)
+        //
+        // The raw_kind values match the CEF `CursorType` constants used by the
+        // apps layer; the mapping is kept minimal for Phase B.
+        {
+            let st = Arc::clone(&engine_state);
+            web_view.connect_mouse_target_changed(move |_wv, hit, _modifiers| {
+                let raw_kind: u32 = if hit.context_is_link() {
+                    3 // Pointer
+                } else if hit.context_is_editable() {
+                    4 // IBeam
+                } else {
+                    0 // Arrow
+                };
+                if let Ok(st) = st.lock()
+                    && let Ok(mut slot) = st.cursor_change.lock()
+                {
+                    *slot = Some((0, raw_kind));
+                }
+                tracing::debug!(raw_kind, "webkitgtk runtime: cursor changed");
+            });
+        }
+
         // Mirror initial tab info into engine state.
         {
             if let Ok(mut guard) = engine_state.lock() {
@@ -193,4 +260,34 @@ impl TabEntry {
     pub(crate) fn can_go_forward(&self) -> bool {
         self.web_view.can_go_forward()
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Derive a `/favicon.ico` URL from a page URL.
+///
+/// Strips the path/query/fragment and appends `favicon.ico`. Falls back to
+/// the original URL string on parse failure.
+///
+/// # Examples
+///
+/// ```
+/// let url = "https://example.com/some/page?q=1";
+/// // → "https://example.com/favicon.ico"
+/// ```
+pub(crate) fn favicon_url_from_page(page_url: &str) -> String {
+    // Simple origin extraction: find "://", then take up to the first "/" after
+    // the authority.  Avoids pulling in a full URL crate.
+    if let Some(authority_start) = page_url.find("://") {
+        let after_scheme = &page_url[authority_start + 3..];
+        // Authority ends at the first "/" (path), "?" (query), or "#" (fragment).
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        let scheme = &page_url[..authority_start];
+        return format!("{scheme}://{authority}/favicon.ico");
+    }
+    // Fallback: non-http scheme or malformed URL — return unchanged.
+    page_url.to_owned()
 }

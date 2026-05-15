@@ -83,6 +83,11 @@ pub struct WebKitGtkEngine {
     /// and by `sync_active_idx` on tab switches.  Read lock-free from any
     /// thread by `BrowserEngine::is_loading`.
     loading_active: Arc<AtomicBool>,
+    /// OSR sleep flag — skips snapshot tick when set.
+    ///
+    /// Cloned from `EngineState::osr_sleeping` so `osr_sleep()` can write it
+    /// without locking the full EngineState mutex.
+    osr_sleeping: Arc<AtomicBool>,
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     find_query: std::sync::Mutex<Option<(String, bool)>>,
@@ -104,11 +109,18 @@ impl WebKitGtkEngine {
 
         // Clone Arc<AtomicBool>s from inside EngineState so the engine can
         // read these flags from any thread without locking the Mutex.
-        let (audio_active, loading_active) = engine_state
+        let (audio_active, loading_active, osr_sleeping) = engine_state
             .lock()
-            .map(|g| (Arc::clone(&g.audio_active), Arc::clone(&g.loading_active)))
+            .map(|g| {
+                (
+                    Arc::clone(&g.audio_active),
+                    Arc::clone(&g.loading_active),
+                    Arc::clone(&g.osr_sleeping),
+                )
+            })
             .unwrap_or_else(|_| {
                 (
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                 )
@@ -137,6 +149,7 @@ impl WebKitGtkEngine {
             engine_state,
             audio_active,
             loading_active,
+            osr_sleeping,
             find_query: std::sync::Mutex::new(None),
         })
     }
@@ -421,7 +434,11 @@ impl BrowserEngine for WebKitGtkEngine {
     }
 
     fn osr_sleep(&self, sleep: bool) {
-        tracing::debug!("webkitgtk: osr_sleep({sleep}) — no-op");
+        tracing::debug!("webkitgtk: osr_sleep({sleep})");
+        // Write the flag lock-free so the snapshot tick sees it immediately.
+        self.osr_sleeping.store(sleep, Ordering::Relaxed);
+        // Forward to GTK thread so it can mute/unmute the active WebView.
+        self.worker.send(Command::SetOsrSleep { sleep });
     }
 
     fn osr_invalidate_view(&self) {
@@ -518,13 +535,13 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn start_download(&self, url: &str) {
         tracing::debug!("webkitgtk: start_download url={url}");
-        let url_json = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
-        let js = format!(
-            "(() => {{ const a = document.createElement('a'); \
-             a.href = {url_json}; a.download = ''; \
-             document.body.appendChild(a); a.click(); a.remove(); }})();"
-        );
-        let _ = self.run_js(&js);
+        // Use WebKitGTK's native download manager (WebViewExt::download_uri).
+        // This is more robust than the JS <a> click trick — it handles
+        // cross-origin assets, `Content-Disposition: attachment` headers, and
+        // direct resource URLs correctly without page-context JS execution.
+        self.worker.send(Command::DownloadUri {
+            url: url.to_owned(),
+        });
     }
 
     fn zoom_in(&self) {
@@ -670,6 +687,79 @@ impl BrowserEngine for WebKitGtkEngine {
 
     fn frame_select_all(&self) {
         let _ = self.run_js("document.execCommand('selectAll')");
+    }
+
+    // ── Favicon (Gap 1) ───────────────────────────────────────────────────────
+
+    fn drain_favicon_updates(&self) -> Vec<buffr_engine::FaviconUpdate> {
+        self.worker
+            .call(|reply| Command::DrainFaviconUpdates { reply })
+            .unwrap_or_default()
+    }
+
+    // ── Cursor (Gap 2) ────────────────────────────────────────────────────────
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        self.worker
+            .call(|reply| Command::TakeCursorChange { reply })
+            .unwrap_or(None)
+    }
+
+    // ── Clipboard (Gap 4) ─────────────────────────────────────────────────────
+
+    /// Read the current clipboard contents as UTF-8 text.
+    ///
+    /// GDK4 clipboard reads are async — there is no synchronous API available
+    /// on the GTK thread without running a nested main loop. Returning `None`
+    /// here matches the trait default. Use `clipboard_handle()` on a worker
+    /// thread if a blocking read is required in a future phase.
+    fn clipboard_text(&self) -> Option<String> {
+        // TODO(phase-d): implement via a Command + GDK4 read_text_async with a
+        // local GLib main loop spin to collect the result synchronously off the
+        // GTK thread.
+        None
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        tracing::debug!("webkitgtk: clipboard_set_text ({} bytes)", text.len());
+        // GDK4 `Clipboard::set_text` is synchronous and fire-and-forget.
+        // We forward to the GTK thread (where GDK Display is valid) via the
+        // Command channel. No reply needed — the write either succeeds or logs.
+        self.worker.send(Command::ClipboardSetText {
+            text: text.to_owned(),
+        });
+        true
+    }
+
+    // ── Edit IPC (Gap 5) ──────────────────────────────────────────────────────
+    //
+    // JS injection pattern — calls `window.__buffrEdit*` helpers injected by
+    // buffr's edit.js content script via `run_js`.
+
+    fn run_edit_attach(&self, field_id: &str) {
+        let id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let js = format!("window.__buffrEditAttach && window.__buffrEditAttach({id_json});");
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        let js = format!(
+            "window.__buffrEditCycle && window.__buffrEditCycle({});",
+            if forward { "true" } else { "false" }
+        );
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        let id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let js = format!("window.__buffrEditDetach && window.__buffrEditDetach({id_json});");
+        let _ = self.run_js(&js);
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        let id_json = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".into());
+        let js = format!("window.__buffrEditFocus && window.__buffrEditFocus({id_json});");
+        let _ = self.run_js(&js);
     }
 
     // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
