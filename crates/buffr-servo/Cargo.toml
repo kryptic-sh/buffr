@@ -28,6 +28,15 @@ tracing = "0.1"
 # `servo` crate at v0.1.0 (LTS). MSRV 1.86 (workspace pins 1.95).
 servo = "0.1"
 
+# Direct deps needed for servo interop (same versions servo itself pins):
+#   - dpi: PhysicalSize used by WebView::resize and SoftwareRenderingContext::new
+#   - url: url::Url used by WebView::load and Url::parse
+dpi = "0.1"
+url = "2"
+# keyboard-types 0.8.3 matches the version servo 0.1.0 uses; needed to
+# construct keyboard_types::KeyboardEvent for ServoKeyboardEvent::new().
+keyboard-types = "0.8"
+
 # buffr-engine path-depends on buffr-permissions / buffr-modal via
 # registry pins for its standalone CI. Force the resolver to pick up the
 # local in-tree versions instead — keeps our submodule-pointer changes
