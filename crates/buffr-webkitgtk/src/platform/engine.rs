@@ -574,6 +574,36 @@ impl BrowserEngine for WebKitGtkEngine {
         tracing::debug!("webkitgtk: cancel_hint — no-op");
     }
 
+    // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
+
+    fn frame_undo(&self) {
+        let _ = self.run_js("document.execCommand('undo')");
+    }
+
+    fn frame_redo(&self) {
+        let _ = self.run_js("document.execCommand('redo')");
+    }
+
+    fn frame_cut(&self) {
+        let _ = self.run_js("document.execCommand('cut')");
+    }
+
+    fn frame_copy(&self) {
+        let _ = self.run_js("document.execCommand('copy')");
+    }
+
+    fn frame_paste(&self) {
+        let _ = self.run_js("document.execCommand('paste')");
+    }
+
+    fn frame_paste_plain(&self) {
+        let _ = self.run_js("navigator.clipboard.readText().then(t => document.execCommand('insertText', false, t))");
+    }
+
+    fn frame_select_all(&self) {
+        let _ = self.run_js("document.execCommand('selectAll')");
+    }
+
     // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
     //
     // WebKitGTK has no synthetic IME event API in the gdk4 0.11 Rust bindings.
