@@ -54,6 +54,13 @@ impl TabEntry {
     ) -> Self {
         let web_view = WebView::new();
 
+        // ── Enable developer extras (required for WebInspector::show) ─────────
+        {
+            if let Some(settings) = webkit6::prelude::WebViewExt::settings(&web_view) {
+                settings.set_enable_developer_extras(true);
+            }
+        }
+
         // ── load-changed signal ──────────────────────────────────────────────
         {
             let st = Arc::clone(&engine_state);

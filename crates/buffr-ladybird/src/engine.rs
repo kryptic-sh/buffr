@@ -518,6 +518,11 @@ impl BrowserEngine for LadybirdEngine {
         self.worker.send(Command::SetZoom(1.0));
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    // TODO(devtools): Ladybird has a separate Inspector process, but our FFI is
+    // a stub. Leave trait default until the FFI surface is fleshed out.
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {

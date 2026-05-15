@@ -184,6 +184,15 @@ pub(crate) enum Command {
     QueryCanGoForward {
         reply: mpsc::SyncSender<bool>,
     },
+    /// Open the WebInspector for the tab with the given id.
+    ///
+    /// Calls `webkit6::WebInspector::show()` on the inspector associated with
+    /// the tab's `WebView`. Requires `enable-developer-extras = true` on the
+    /// `WebView`'s `WebkitSettings` (set during view creation in `TabEntry::new`).
+    OpenDevtools {
+        id: TabId,
+        reply: mpsc::SyncSender<Result<(), WebKitGtkError>>,
+    },
     Shutdown,
 }
 
@@ -435,6 +444,29 @@ impl GtkRuntime {
         }
     }
 
+    fn open_devtools(&self, id: TabId) -> Result<(), WebKitGtkError> {
+        use webkit6::prelude::WebViewExt;
+        let tab = self
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or(WebKitGtkError::TabNotFound(id))?;
+        match tab.web_view.inspector() {
+            Some(inspector) => {
+                inspector.show();
+                tracing::debug!("webkitgtk: open_devtools — inspector shown for tab {id:?}");
+                Ok(())
+            }
+            None => {
+                tracing::debug!(
+                    "webkitgtk: open_devtools — no inspector for tab {id:?} \
+                     (enable-developer-extras not set?)"
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         {
             let mut st = self.engine_state.lock().unwrap();
@@ -674,6 +706,9 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         Command::QueryCanGoForward { reply } => {
             let result = rt.active_tab().map(|t| t.can_go_forward()).unwrap_or(false);
             let _ = reply.send(result);
+        }
+        Command::OpenDevtools { id, reply } => {
+            let _ = reply.send(rt.open_devtools(id));
         }
         Command::Shutdown => {
             tracing::info!("webkitgtk worker: shutdown requested");

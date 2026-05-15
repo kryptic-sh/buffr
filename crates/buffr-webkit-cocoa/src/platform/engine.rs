@@ -572,6 +572,11 @@ impl BrowserEngine for WebKitCocoaEngine {
         self.worker.send(Command::SetZoom(1.0));
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    // TODO(devtools): WKWebView devtools requires private API
+    // (`_inspector` / `_showInspector`). Skipping for now; leave trait default.
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {

@@ -494,6 +494,22 @@ impl BrowserEngine for WebView2Engine {
         self.worker.send(Command::SetZoom(1.0));
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    fn open_devtools(&self, tab: TabId) -> Result<(), EngineError> {
+        tracing::debug!("webview2: open_devtools {tab:?}");
+        self.worker
+            .call(|reply| Command::OpenDevtools { id: tab, reply })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
+    }
+
+    fn show_dev_tools_at(&self, _x: i32, _y: i32) {
+        if let Some(tab) = self.active_tab() {
+            let _ = self.open_devtools(tab.id);
+        }
+    }
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {

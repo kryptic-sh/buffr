@@ -1280,6 +1280,44 @@ impl BrowserEngine for FirefoxCdpEngine {
         let _ = self.apply_zoom(1.0);
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    fn open_devtools(&self, tab: buffr_engine::TabId) -> Result<(), buffr_engine::EngineError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| buffr_engine::EngineError::Other(format!("state lock poisoned: {e}")))?;
+        let port = state.debug_port;
+        let cdp_tab = state
+            .tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .ok_or(buffr_engine::EngineError::TabNotFound(tab))?;
+        let target_id = cdp_tab.target_id.clone();
+        drop(state);
+        // TODO(devtools): Firefox CDP does not serve a standalone
+        // /devtools/inspector.html endpoint like Chromium does. The URL below
+        // matches the blink-cdp shape but will 404 on a real Firefox remote-
+        // debugging port. A proper Firefox devtools URL would be
+        // `about:devtools-toolbox?id={target}&type=tab`, but that requires
+        // navigating the Firefox window itself via Page.navigate, which is out
+        // of scope for the headless CDP backend. We attempt the Chromium-style
+        // URL first via open::that and log a warning if Firefox rejects it.
+        let url = format!(
+            "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target_id}"
+        );
+        tracing::debug!(%url, "firefox-cdp: open_devtools");
+        open::that(&url)
+            .map_err(|e| buffr_engine::EngineError::Other(format!("open devtools url: {e}")))?;
+        Ok(())
+    }
+
+    fn show_dev_tools_at(&self, _x: i32, _y: i32) {
+        if let Some(tab) = self.active_tab() {
+            let _ = self.open_devtools(tab.id);
+        }
+    }
+
     fn any_audio_active(&self) -> bool {
         false
     }

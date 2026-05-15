@@ -213,6 +213,14 @@ pub(crate) enum Command {
     QueryCanGoForward {
         reply: mpsc::SyncSender<bool>,
     },
+    /// Open the DevTools window for the given tab.
+    ///
+    /// Calls `ICoreWebView2::OpenDevToolsWindow()` on the STA thread.
+    /// Source: webview2-com-sys-0.39.1/src/bindings.rs — `ICoreWebView2`.
+    OpenDevtools {
+        id: TabId,
+        reply: mpsc::SyncSender<Result<(), WebView2Error>>,
+    },
     Shutdown,
 }
 
@@ -484,6 +492,32 @@ impl StaRuntime {
             .map(|t| t.can_go_forward())
             .unwrap_or(false)
     }
+
+    fn open_devtools(&self, id: TabId) -> Result<(), WebView2Error> {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or(WebView2Error::TabNotFound(id))?;
+        #[cfg(target_os = "windows")]
+        {
+            // SAFETY: OpenDevToolsWindow is an STA COM method on a valid
+            // ICoreWebView2 pointer owned by this thread.
+            if let Err(e) = unsafe { tab.webview().OpenDevToolsWindow() } {
+                tracing::warn!("webview2: OpenDevToolsWindow failed: {e}");
+                return Err(WebView2Error::InitFailed(format!(
+                    "OpenDevToolsWindow: {e}"
+                )));
+            }
+            tracing::debug!("webview2: OpenDevToolsWindow called for tab {id:?}");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            tracing::debug!("webview2: open_devtools — stub path (no-op on non-Windows)");
+            let _ = tab;
+        }
+        Ok(())
+    }
 }
 
 // ── Command handler ───────────────────────────────────────────────────────────
@@ -571,6 +605,9 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
         Command::QueryCanGoForward { reply } => {
             let result = rt.can_go_forward();
             let _ = reply.send(result);
+        }
+        Command::OpenDevtools { id, reply } => {
+            let _ = reply.send(rt.open_devtools(id));
         }
         Command::Shutdown => {
             tracing::info!("webview2 worker: shutdown requested");

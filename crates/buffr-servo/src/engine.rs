@@ -510,6 +510,11 @@ impl BrowserEngine for ServoEngine {
         self.worker.send(Command::SetZoom(1.0));
     }
 
+    // ── DevTools ─────────────────────────────────────────────────────────────
+
+    // TODO(devtools): Servo's devtools is a separate process. The servo 0.1 API
+    // does not expose a public `WebView::open_devtools` hook. Leave trait default.
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
