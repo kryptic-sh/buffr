@@ -91,6 +91,8 @@ impl WebView2Engine {
 
         let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
 
+        let data_dir = options.data_dir.map(|p| p.to_path_buf());
+
         let worker = spawn(
             options.initial_url,
             width,
@@ -98,6 +100,7 @@ impl WebView2Engine {
             Arc::clone(&frame),
             Arc::clone(&view),
             Arc::clone(&engine_state),
+            data_dir,
         )?;
 
         tracing::info!(
