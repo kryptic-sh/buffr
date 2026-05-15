@@ -1,19 +1,23 @@
 //! Blitz backend for buffr-engine.
 //!
-//! # Phase B status
+//! # Status
 //!
-//! Real Blitz DOM/layout integration using:
-//!   - `blitz-dom`   — DOM tree, Stylo CSS parsing, Taffy layout
-//!   - `blitz-html`  — HTML5 parser
-//!   - `blitz-traits` — shared trait surface
+//! Real Blitz DOM/layout + CPU rasterisation using:
+//!   - `blitz-dom`          — DOM tree, Stylo CSS parsing, Taffy layout
+//!   - `blitz-html`         — HTML5 parser
+//!   - `blitz-traits`       — shared trait surface
+//!   - `blitz-paint`        — `paint_scene` bridge (DOM → anyrender draw commands)
+//!   - `anyrender_vello_cpu` — pure-CPU rasteriser; no wgpu dependency
 //!
-//! # wgpu version conflict note
+//! # Renderer strategy
 //!
-//! The GPU rendering layer (`anyrender_vello`) requires `wgpu ^28`.
-//! The workspace pins `wgpu = "29"` (semver-incompatible).  Rather than
-//! downgrading the workspace we skip the Vello renderer for Phase B.
-//! OSR frames are written as solid-colour fills; real GPU readback lands
-//! in Phase C once the wgpu version is aligned.
+//! The workspace pins `wgpu = "29"`.  The GPU rendering layer
+//! (`anyrender_vello`) requires `wgpu ^28` (semver-incompatible), so we use
+//! the CPU path instead.  `anyrender_vello_cpu 0.10` requires `anyrender ^0.8`
+//! which matches `blitz-paint 0.3.0-alpha.2` exactly.
+//!
+//! OSR frames are premultiplied BGRA8 (R↔B-swapped from vello_cpu's
+//! premultiplied RGBA8 output).
 //!
 //! # Architecture
 //!
@@ -31,6 +35,7 @@ pub mod document;
 pub mod engine;
 pub mod error;
 pub mod input;
+pub(crate) mod render;
 pub mod worker;
 
 pub use backend::BlitzBackend;

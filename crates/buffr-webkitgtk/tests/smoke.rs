@@ -200,6 +200,62 @@ fn osr_input_dispatch_no_panic() {
     );
 }
 
+/// After the GTK worker runs for ~500 ms on a green-background data: URL,
+/// the OSR frame must contain at least one pixel that is not solid white.
+///
+/// This validates the real `WebView::snapshot()` → `gdk::Texture::download()`
+/// pipeline. The white pixel check is intentionally loose — we only prove that
+/// *something* was rendered, not that it is pixel-perfect.
+///
+/// Marked `#[ignore]` because it requires a live Wayland/X11 display and a
+/// working WebKitGTK 6.0 installation.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn osr_frame_not_all_white_after_snapshot() {
+    const GREEN_URL: &str = "data:text/html,<body style=\"background:lime\"><h1>Hi</h1></body>";
+
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts(GREEN_URL))
+        .expect("open_engine on green data: URL");
+
+    // Give the GTK worker enough time for:
+    //   - gtk4::init() + WebView creation
+    //   - data: URL parse + render
+    //   - at least two 250 ms snapshot ticks
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    let frame = engine.osr_frame();
+    let guard = frame.lock().expect("osr_frame lock");
+
+    // The frame must have been populated (non-zero dimensions).
+    assert!(
+        guard.width > 0 && guard.height > 0,
+        "osr_frame must have non-zero dimensions after snapshot ({}×{})",
+        guard.width,
+        guard.height,
+    );
+    assert!(
+        !guard.pixels.is_empty(),
+        "osr_frame pixel buffer must not be empty"
+    );
+
+    // At least one pixel must differ from solid white (0xFF, 0xFF, 0xFF, 0xFF).
+    let all_white = guard
+        .pixels
+        .chunks_exact(4)
+        .all(|p| p[0] == 0xFF && p[1] == 0xFF && p[2] == 0xFF && p[3] == 0xFF);
+
+    assert!(
+        !all_white,
+        "osr_frame must contain at least one non-white pixel after snapshot \
+         (frame is {}×{}, {} bytes)",
+        guard.width,
+        guard.height,
+        guard.pixels.len(),
+    );
+}
+
 /// `navigate` errors propagate via the reply channel — not silently discarded.
 /// Drop the engine (which shuts down the worker) then verify that a navigate
 /// call on a freshly-killed worker surface is an Err, not a silent Ok.

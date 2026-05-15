@@ -67,6 +67,14 @@ struct FfTab {
     title: String,
 }
 
+// ── Navigation-history cache ──────────────────────────────────────────────────
+
+/// Cached `Page.getNavigationHistory` result for a single session.
+///
+/// Keyed by `session_id`. Invalidated on any navigation event for that session
+/// (including `navigate()` calls and `pump_address_changes` URL updates).
+type NavHistoryCache = HashMap<String, crate::cdp::NavigationHistoryResult>;
+
 impl FfTab {
     fn to_summary(&self, is_loading: bool) -> TabSummary {
         TabSummary {
@@ -93,6 +101,11 @@ struct EngineState {
     debug_port: u16,
     /// Maps `target_id → original_url` for tabs navigated via internal schemes.
     original_urls: HashMap<String, String>,
+    /// Stack of URLs from recently closed tabs (most-recent last).
+    ///
+    /// Pushed by `close_tab`; popped by `reopen_closed_tab`. Mirrors the
+    /// browser's "recently closed" undo stack.
+    closed_stack: Vec<String>,
 }
 
 impl EngineState {
@@ -103,6 +116,7 @@ impl EngineState {
             next_tab_id: 1,
             debug_port,
             original_urls: HashMap::new(),
+            closed_stack: Vec::new(),
         }
     }
 
@@ -150,6 +164,12 @@ pub struct FirefoxCdpEngine {
     loading_state: Arc<Mutex<HashMap<String, bool>>>,
     nav_count: Arc<Mutex<HashMap<String, usize>>>,
     title_map: TitleMap,
+    /// Cache of `Page.getNavigationHistory` results keyed by `session_id`.
+    ///
+    /// Entries are invalidated whenever a navigation event is observed for the
+    /// corresponding session (in `navigate()` and `pump_address_changes()`).
+    /// `can_go_back` / `can_go_forward` populate the cache on cache-miss.
+    nav_history_cache: Mutex<NavHistoryCache>,
 }
 
 impl FirefoxCdpEngine {
@@ -227,6 +247,7 @@ impl FirefoxCdpEngine {
             loading_state,
             nav_count,
             title_map,
+            nav_history_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -437,6 +458,54 @@ impl FirefoxCdpEngine {
         Ok(tab_id)
     }
 
+    /// Query (or return a cached) `Page.getNavigationHistory` result.
+    ///
+    /// On cache-hit the CDP round-trip is skipped. On cache-miss the result is
+    /// stored for subsequent calls. Errors during the CDP call are silently
+    /// treated as "no history" — the cache is **not** populated on error so the
+    /// next call will retry.
+    fn nav_history(&self, session_id: &str) -> Option<crate::cdp::NavigationHistoryResult> {
+        {
+            let cache = self
+                .nav_history_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(cached) = cache.get(session_id) {
+                return Some(cached.clone());
+            }
+        }
+
+        // Cache miss — query Firefox.
+        let result = self
+            .session_cmd(
+                session_id,
+                "Page.getNavigationHistory",
+                serde_json::json!({}),
+            )
+            .ok()?;
+
+        let history: crate::cdp::NavigationHistoryResult = serde_json::from_value(result).ok()?;
+
+        {
+            let mut cache = self
+                .nav_history_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cache.insert(session_id.to_owned(), history.clone());
+        }
+
+        Some(history)
+    }
+
+    /// Invalidate the nav-history cache for the given session.
+    fn invalidate_nav_history(&self, session_id: &str) {
+        let mut cache = self
+            .nav_history_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        cache.remove(session_id);
+    }
+
     /// Read current viewport dimensions from the shared view state.
     fn viewport_dims(&self) -> (u32, u32) {
         use std::sync::atomic::Ordering;
@@ -519,13 +588,15 @@ impl BrowserEngine for FirefoxCdpEngine {
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
         tracing::debug!(%id, "firefox-cdp: close_tab");
-        let (target_id, session_id, was_active) = {
+        let (target_id, session_id, was_active, closing_url) = {
             let state = self.lock_state();
             let tab = state.tab_by_id(id).ok_or(EngineError::TabNotFound(id))?;
+            let url = display_url_for(tab, &state.original_urls).to_owned();
             (
                 tab.target_id.clone(),
                 tab.session_id.clone(),
                 state.active == Some(id),
+                url,
             )
         };
 
@@ -546,10 +617,17 @@ impl BrowserEngine for FirefoxCdpEngine {
         if let Ok(mut m) = self.nav_count.lock() {
             m.remove(&session_id);
         }
+        self.invalidate_nav_history(&session_id);
 
         let mut state = self.lock_state();
         state.tabs.retain(|t| t.id != id);
         state.original_urls.remove(&target_id);
+
+        // Push the closing URL onto the reopen stack (skip internal-only URLs).
+        if !closing_url.is_empty() && closing_url != "about:blank" && closing_url != "about:newtab"
+        {
+            state.closed_stack.push(closing_url);
+        }
 
         if was_active {
             state.active = state.tabs.last().map(|t| t.id);
@@ -638,9 +716,14 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "duplicate_active",
-        })
+        tracing::debug!("firefox-cdp: duplicate_active");
+        let url = {
+            let state = self.lock_state();
+            let tab = state.active_tab().ok_or(EngineError::NoActiveTab)?;
+            display_url_for(tab, &state.original_urls).to_owned()
+        };
+        // Open as a new foreground tab at the same URL.
+        self.open_tab_internal(&url, true, None)
     }
 
     fn toggle_pin_active(&self) {
@@ -652,13 +735,22 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "reopen_closed_tab",
-        })
+        tracing::debug!("firefox-cdp: reopen_closed_tab");
+        let url = {
+            let mut state = self.lock_state();
+            state.closed_stack.pop()
+        };
+        match url {
+            None => Ok(None),
+            Some(u) => {
+                let tab_id = self.open_tab_internal(&u, true, None)?;
+                Ok(Some(tab_id))
+            }
+        }
     }
 
     fn closed_stack_len(&self) -> usize {
-        0
+        self.lock_state().closed_stack.len()
     }
 
     fn active_tab(&self) -> Option<TabSummary> {
@@ -733,17 +825,20 @@ impl BrowserEngine for FirefoxCdpEngine {
             state.active_tab().map(|t| t.session_id.clone())
         };
         let Some(sess) = session_id else { return false };
-        self.nav_count
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&sess).copied())
-            .unwrap_or(0)
-            >= 2
+        self.nav_history(&sess)
+            .map(|h| h.can_go_back())
+            .unwrap_or(false)
     }
 
     fn can_go_forward(&self) -> bool {
-        // Firefox CDP doesn't expose a forward-history signal without a JS call.
-        false
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        let Some(sess) = session_id else { return false };
+        self.nav_history(&sess)
+            .map(|h| h.can_go_forward())
+            .unwrap_or(false)
     }
 
     // ── Navigation ───────────────────────────────────────────────────────────
@@ -756,6 +851,9 @@ impl BrowserEngine for FirefoxCdpEngine {
             let tab = state.active_tab().ok_or(EngineError::NoActiveTab)?;
             (tab.session_id.clone(), tab.target_id.clone())
         };
+
+        // Invalidate nav-history cache — the current position will change.
+        self.invalidate_nav_history(&session_id);
 
         // Optimistically update state; real URL arrives via Page.frameNavigated.
         {
@@ -806,26 +904,34 @@ impl BrowserEngine for FirefoxCdpEngine {
         }
 
         let mut changed = false;
-        let mut state = self.lock_state();
-        for (session_id, url, title) in updates {
-            let tab_info = state
-                .tabs
-                .iter()
-                .find(|t| t.session_id == session_id)
-                .map(|t| (t.target_id.clone(), t.url.clone()));
+        let mut navigated_sessions: Vec<String> = Vec::new();
+        {
+            let mut state = self.lock_state();
+            for (session_id, url, title) in updates {
+                let tab_info = state
+                    .tabs
+                    .iter()
+                    .find(|t| t.session_id == session_id)
+                    .map(|t| (t.target_id.clone(), t.url.clone()));
 
-            if let Some((target_id, old_url)) = tab_info {
-                let has_original = state.original_urls.contains_key(&target_id);
-                if !has_original && old_url != url {
-                    if let Some(t) = state.tabs.iter_mut().find(|t| t.target_id == target_id) {
-                        t.url = url;
-                        if !title.is_empty() {
-                            t.title = title;
+                if let Some((target_id, old_url)) = tab_info {
+                    let has_original = state.original_urls.contains_key(&target_id);
+                    if !has_original && old_url != url {
+                        if let Some(t) = state.tabs.iter_mut().find(|t| t.target_id == target_id) {
+                            t.url = url;
+                            if !title.is_empty() {
+                                t.title = title;
+                            }
                         }
+                        navigated_sessions.push(session_id);
+                        changed = true;
                     }
-                    changed = true;
                 }
             }
+        }
+        // Invalidate nav-history cache for every session that just navigated.
+        for sess in navigated_sessions {
+            self.invalidate_nav_history(&sess);
         }
         changed
     }

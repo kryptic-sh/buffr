@@ -28,8 +28,8 @@ use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitGtkError;
 use super::input::GtkInputEvent;
-use super::osr::paint_blank;
-use super::runtime::TabEntry;
+use super::osr::{paint_blank, request_snapshot};
+use super::runtime::{OsrHandles, TabEntry};
 
 // ── EngineState (thread-safe snapshot) ────────────────────────────────────────
 
@@ -194,6 +194,12 @@ struct GtkRuntime {
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
     engine_state: Arc<Mutex<EngineState>>,
+    /// `true` while a `WebView::snapshot()` call is in-flight.
+    ///
+    /// Prevents stacking up snapshot callbacks. Cleared by the callback
+    /// regardless of success or failure. Wrapped in `Rc<Cell<bool>>` so it
+    /// can be shared into the `snapshot` callback closure without `Send`.
+    snapshot_in_flight: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl GtkRuntime {
@@ -208,6 +214,7 @@ impl GtkRuntime {
             frame,
             view,
             engine_state,
+            snapshot_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
         }
     }
 
@@ -229,7 +236,18 @@ impl GtkRuntime {
             (st.width, st.height)
         };
         // TabEntry::new registers itself in engine_state.tabs.
-        let entry = TabEntry::new(id, url, w, h, Arc::clone(&self.engine_state));
+        let entry = TabEntry::new(
+            id,
+            url,
+            w,
+            h,
+            Arc::clone(&self.engine_state),
+            OsrHandles {
+                frame: Arc::clone(&self.frame),
+                view: Arc::clone(&self.view),
+                snapshot_in_flight: std::rc::Rc::clone(&self.snapshot_in_flight),
+            },
+        );
         self.tabs.push(entry);
         self.active_idx = Some(self.tabs.len() - 1);
         self.sync_active_idx();
@@ -334,7 +352,16 @@ impl GtkRuntime {
     }
 
     fn paint(&self) {
-        paint_blank(&self.frame, &self.view);
+        if let Some(tab) = self.active_tab() {
+            request_snapshot(
+                &tab.web_view,
+                Arc::clone(&self.frame),
+                Arc::clone(&self.view),
+                std::rc::Rc::clone(&self.snapshot_in_flight),
+            );
+        } else {
+            paint_blank(&self.frame, &self.view);
+        }
     }
 
     /// Write active_idx into the shared EngineState.
@@ -480,12 +507,15 @@ pub(crate) fn spawn(
 
             // ── 4 fps snapshot tick (250 ms) ──────────────────────────────
             //
-            // Phase B: paint blank frame. Phase C: call WebView::snapshot().
+            // Calls `WebView::snapshot()` on the active tab every 250 ms.
+            // If a snapshot is already in-flight the tick is a no-op (the
+            // `in_flight` flag is checked inside `request_snapshot`).
+            // Falls back to `paint_blank` when no tab is open yet.
             {
-                let frame_clone = Arc::clone(&frame);
-                let view_clone = Arc::clone(&view);
+                let rt_rc_snap = Rc::clone(&runtime_rc);
                 glib::timeout_add_local(Duration::from_millis(250), move || {
-                    paint_blank(&frame_clone, &view_clone);
+                    let rt = rt_rc_snap.borrow();
+                    rt.paint();
                     glib::ControlFlow::Continue
                 });
             }

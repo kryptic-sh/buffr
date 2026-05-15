@@ -4,13 +4,13 @@
 //! module runs a dedicated thread that owns all Blitz documents and exposes
 //! them via `mpsc` commands from `BlitzEngine`.
 //!
-//! # OSR pipeline (Phase B placeholder)
+//! # OSR pipeline
 //!
-//! After every document mutation (open / navigate / reload / resize) we write
-//! a solid white BGRA frame into `SharedOsrFrame`.
-//!
-//! Phase C will wire `anyrender_vello` → wgpu → readback once the wgpu
-//! version conflict is resolved (workspace pins ^29; blitz needs ^28).
+//! After every document mutation (open / navigate / reload / resize / input)
+//! we rasterise the active tab with the CPU Vello renderer via
+//! [`crate::render::render_doc_into_frame`] and write premultiplied BGRA8
+//! pixels into `SharedOsrFrame`.  On error, a solid white fill is used as
+//! fallback.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
@@ -24,6 +24,7 @@ use blitz_dom::Document;
 use crate::document::BlitzTab;
 use crate::error::BlitzError;
 use crate::input::BlitzInputEvent;
+use crate::render::{render_doc_into_frame, write_white_fill};
 
 // ── Tab snapshot ──────────────────────────────────────────────────────────────
 
@@ -282,6 +283,9 @@ impl Worker {
     /// `HtmlDocument` implements `blitz_dom::Document`, which exposes
     /// `handle_ui_event(UiEvent)` — the canonical entry point for pointer and
     /// keyboard events in `blitz-dom 0.3.0-alpha.2`.
+    ///
+    /// Repaints after the event so pointer/keyboard state changes are
+    /// reflected in the OSR frame.
     fn send_input(&mut self, event: BlitzInputEvent) {
         if let Some(idx) = self.active_idx {
             let ui_event = event.into_ui_event();
@@ -290,6 +294,7 @@ impl Worker {
                 self.tabs[idx].id
             );
             self.tabs[idx].doc.handle_ui_event(ui_event);
+            self.paint();
         } else {
             tracing::debug!("blitz worker: send_input — no active tab, dropping event");
         }
@@ -324,28 +329,25 @@ impl Worker {
             .unwrap_or(false)
     }
 
-    /// Write a solid white BGRA frame into `SharedOsrFrame`.
+    /// Rasterise the active tab into `SharedOsrFrame`.
     ///
-    /// Phase B placeholder — Phase C replaces with Vello→wgpu→readback.
+    /// Uses the CPU Vello renderer via [`render_doc_into_frame`].  If there is
+    /// no active tab, or the renderer returns an error, falls back to a solid
+    /// white fill so the frame is never left stale.
     fn paint(&self) {
         let w = self.view.width.load(Ordering::Relaxed);
         let h = self.view.height.load(Ordering::Relaxed);
-        if let Ok(mut guard) = self.frame.lock() {
-            let len = (w as usize) * (h as usize) * 4;
-            if guard.width != w || guard.height != h || guard.pixels.len() != len {
-                guard.width = w;
-                guard.height = h;
-                guard.pixels = vec![0xffu8; len];
-            } else {
-                guard.pixels.fill(0xff);
-            }
-            guard.generation = guard.generation.wrapping_add(1);
-            guard.needs_fresh = false;
+        let scale = self.view.scale();
+
+        if let Some(idx) = self.active_idx {
+            render_doc_into_frame(&self.tabs[idx].doc, &self.frame, w, h, scale as f64);
+        } else {
+            write_white_fill(&self.frame, w, h);
         }
+
         if let Some(wake) = self.view.wake.get() {
             wake();
         }
-        tracing::debug!("blitz worker: painted frame {w}×{h}");
     }
 
     fn run(mut self, rx: mpsc::Receiver<Command>) {

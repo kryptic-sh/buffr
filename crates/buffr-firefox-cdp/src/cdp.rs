@@ -170,6 +170,43 @@ pub struct DispatchMouseEventParams {
     pub delta_y: Option<f64>,
 }
 
+/// `Page.getNavigationHistory` result.
+///
+/// Firefox returns the same shape as Chromium for this method.
+/// `current_index` is the 0-based index into `entries` of the current page.
+/// `can_go_back  = current_index > 0`
+/// `can_go_forward = current_index < entries.len() - 1`
+///
+/// Note: Firefox includes an extra synthetic `about:blank` entry at index 0
+/// when the tab was first opened via `Target.createTarget("about:blank")` and
+/// then navigated away. This is identical to Chromium's behaviour.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NavigationHistoryResult {
+    #[serde(rename = "currentIndex")]
+    pub current_index: usize,
+    pub entries: Vec<NavigationEntry>,
+}
+
+impl NavigationHistoryResult {
+    /// Whether the browser can navigate back from the current position.
+    pub fn can_go_back(&self) -> bool {
+        self.current_index > 0
+    }
+
+    /// Whether the browser can navigate forward from the current position.
+    pub fn can_go_forward(&self) -> bool {
+        !self.entries.is_empty() && self.current_index < self.entries.len() - 1
+    }
+}
+
+/// A single entry in the navigation history.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NavigationEntry {
+    pub id: i64,
+    pub url: String,
+    pub title: String,
+}
+
 /// `Input.dispatchKeyEvent` params.
 #[derive(Serialize)]
 pub struct DispatchKeyEventParams {
@@ -335,6 +372,92 @@ mod tests {
         assert_eq!(v["params"]["button"], "left");
         assert_eq!(v["params"]["type"], "mousePressed");
         assert_eq!(v["params"]["x"], 100);
+    }
+
+    #[test]
+    fn navigation_history_can_go_back_and_forward() {
+        // Single entry: no back, no forward.
+        let single = NavigationHistoryResult {
+            current_index: 0,
+            entries: vec![NavigationEntry {
+                id: 1,
+                url: "https://example.com".into(),
+                title: "Example".into(),
+            }],
+        };
+        assert!(!single.can_go_back(), "single entry — no back");
+        assert!(!single.can_go_forward(), "single entry — no forward");
+
+        // Two entries, at the first: can go forward, cannot go back.
+        let at_first = NavigationHistoryResult {
+            current_index: 0,
+            entries: vec![
+                NavigationEntry {
+                    id: 1,
+                    url: "https://a.example".into(),
+                    title: "A".into(),
+                },
+                NavigationEntry {
+                    id: 2,
+                    url: "https://b.example".into(),
+                    title: "B".into(),
+                },
+            ],
+        };
+        assert!(!at_first.can_go_back(), "at first — no back");
+        assert!(at_first.can_go_forward(), "at first — can forward");
+
+        // Two entries, at the last: can go back, cannot go forward.
+        let at_last = NavigationHistoryResult {
+            current_index: 1,
+            entries: at_first.entries.clone(),
+        };
+        assert!(at_last.can_go_back(), "at last — can back");
+        assert!(!at_last.can_go_forward(), "at last — no forward");
+
+        // Three entries, in the middle: can go both.
+        let in_middle = NavigationHistoryResult {
+            current_index: 1,
+            entries: vec![
+                NavigationEntry {
+                    id: 1,
+                    url: "https://a.example".into(),
+                    title: "A".into(),
+                },
+                NavigationEntry {
+                    id: 2,
+                    url: "https://b.example".into(),
+                    title: "B".into(),
+                },
+                NavigationEntry {
+                    id: 3,
+                    url: "https://c.example".into(),
+                    title: "C".into(),
+                },
+            ],
+        };
+        assert!(in_middle.can_go_back(), "middle — can back");
+        assert!(in_middle.can_go_forward(), "middle — can forward");
+    }
+
+    #[test]
+    fn parse_navigation_history_result() {
+        // Verify the serde mapping from CDP JSON matches our struct layout.
+        // Firefox returns the same field names as Chromium for this method.
+        let json = r#"{
+            "currentIndex": 1,
+            "entries": [
+                {"id": 10, "url": "https://a.example", "title": "A"},
+                {"id": 11, "url": "https://b.example", "title": "B"}
+            ]
+        }"#;
+        let h: NavigationHistoryResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(h.current_index, 1);
+        assert_eq!(h.entries.len(), 2);
+        assert_eq!(h.entries[0].url, "https://a.example");
+        assert_eq!(h.entries[1].id, 11);
+        assert!(h.can_go_back());
+        assert!(!h.can_go_forward());
     }
 
     #[test]

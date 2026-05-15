@@ -50,11 +50,11 @@
 //! that unsafe context (Rust 2024 edition), so the closure bodies that call
 //! COM methods do not need a redundant inner `unsafe {}`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use buffr_engine::TabId;
 
-use super::worker::{EngineState, TabInfo};
+use super::worker::{Command, EngineState, TabInfo};
 
 #[cfg(target_os = "windows")]
 use super::error::WebView2Error;
@@ -118,6 +118,7 @@ impl TabEntry {
         url: &str,
         engine_state: &Arc<Mutex<EngineState>>,
         environment: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+        cmd_tx: &mpsc::SyncSender<Command>,
     ) -> Result<Self, WebView2Error> {
         use webview2_com::{
             CreateCoreWebView2ControllerCompletedHandler, DocumentTitleChangedEventHandler,
@@ -209,6 +210,8 @@ impl TabEntry {
         let state_source = Arc::clone(engine_state);
         let state_title = Arc::clone(engine_state);
         let state_history = Arc::clone(engine_state);
+        // Clone for NavigationCompleted → TriggerCapture post.
+        let cmd_tx_nav_completed = cmd_tx.clone();
 
         let mut nav_starting_token: i64 = 0;
         let mut nav_completed_token: i64 = 0;
@@ -249,6 +252,11 @@ impl TabEntry {
                             tab.is_loading = false;
                             tab.progress = 1.0;
                         }
+                        // Post a TriggerCapture so the worker fires CapturePreview
+                        // as soon as the page finishes loading. Fire-and-forget:
+                        // if the channel is full the capture will happen on the
+                        // next 250 ms OSR timer tick instead.
+                        let _ = cmd_tx_nav_completed.try_send(Command::TriggerCapture);
                         Ok(())
                     })),
                     &mut nav_completed_token,
@@ -560,6 +568,15 @@ impl TabEntry {
         {
             let _ = (width, height);
         }
+    }
+
+    /// Borrow the raw `ICoreWebView2` interface for OSR capture.
+    ///
+    /// Used by `StaRuntime::paint` to pass the webview pointer to
+    /// `osr::request_capture` without transferring ownership.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn webview(&self) -> &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2 {
+        &self.webview
     }
 
     /// Back-stack presence from cached state (mirrored by HistoryChanged).
