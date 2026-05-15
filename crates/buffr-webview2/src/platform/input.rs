@@ -46,6 +46,7 @@ pub(crate) struct Wv2KeyEvent {
     #[allow(dead_code)]
     pub flags: u32,
     /// Human-readable description used in debug logging.
+    #[allow(dead_code)]
     pub description: String,
 }
 

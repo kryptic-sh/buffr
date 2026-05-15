@@ -33,6 +33,10 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    # SetFocus (keyboard focus before PostMessageW key events)
+    "Win32_UI_Input_KeyboardAndMouse",
+    # WM_MOUSELEAVE constant lives in Win32_UI_Controls
+    "Win32_UI_Controls",
 ] }
 # WebView2 COM bindings generated from the official WebView2 SDK IDL.
 webview2-com = "0.39"

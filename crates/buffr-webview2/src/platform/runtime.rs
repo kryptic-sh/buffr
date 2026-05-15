@@ -579,6 +579,15 @@ impl TabEntry {
         &self.webview
     }
 
+    /// Return the hidden HWND used as the controller parent for this tab.
+    ///
+    /// Used by the STA worker to `PostMessageW` Win32 input messages (Option A
+    /// input dispatch). The HWND is valid for the lifetime of this `TabEntry`.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn hwnd(&self) -> windows::Win32::Foundation::HWND {
+        self._hwnd
+    }
+
     /// Back-stack presence from cached state (mirrored by HistoryChanged).
     pub(crate) fn can_go_back(&self) -> bool {
         self.can_go_back

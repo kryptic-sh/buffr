@@ -275,6 +275,53 @@ fn osr_frame_not_all_white_after_capture() {
     );
 }
 
+/// Smoke test: Option-A PostMessageW key dispatch does not panic.
+///
+/// Opens a real WebView2 engine on a page with an autofocus `<input>` so the
+/// DOM is ready to receive keyboard input.  Sends a single `WM_KEYDOWN` for
+/// the 'X' key (VK=0x58) via `osr_key_event`, then the matching `WM_KEYUP`.
+/// The assertion floor is "no panic" — JS eval to read the DOM value is a
+/// Phase C concern.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires WebView2 Runtime and a live desktop session on Windows"]
+fn osr_postmessage_key_dispatch_no_panic() {
+    use buffr_engine::{BrowserEngine, KeyEventKind, NeutralKeyEvent};
+    use std::sync::Arc;
+
+    let backend = WebView2Backend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("data:text/html,<input id=x autofocus>"))
+        .expect("open_engine");
+
+    // Allow NavigationCompleted to fire so the page and autofocus are ready.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // VK_X = 0x58 on Windows.
+    engine.osr_key_event(NeutralKeyEvent {
+        kind: KeyEventKind::RawDown,
+        windows_key_code: 0x58, // 'X'
+        native_key_code: 0x2D,  // scancode for X on a US layout
+        character: b'x' as u16,
+        ..Default::default()
+    });
+    engine.osr_key_event(NeutralKeyEvent {
+        kind: KeyEventKind::Up,
+        windows_key_code: 0x58,
+        native_key_code: 0x2D,
+        character: b'x' as u16,
+        ..Default::default()
+    });
+
+    // Give the STA worker time to drain the command channel and PostMessageW.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    assert!(
+        engine.tab_count() >= 1,
+        "tab must still be open after PostMessageW key dispatch"
+    );
+}
+
 /// `navigate` errors propagate via the reply channel — not silently discarded.
 /// Drop the engine (which shuts down the worker) then verify that a navigate
 /// call on a freshly-killed worker is an Err, not a silent Ok.

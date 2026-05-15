@@ -169,17 +169,14 @@ pub(crate) enum Command {
     /// The STA worker calls `request_capture` on the active tab if available and
     /// no capture is already in-flight.
     TriggerCapture,
-    /// Dispatch an input event on the STA thread.
+    /// Dispatch an input event on the STA thread via `PostMessageW` (Option A).
     ///
     /// Fire-and-forget: no reply channel. Input events return `()` on the
     /// `BrowserEngine` trait surface.
     ///
-    /// Phase B-2: STA has a controller but input synthesis (SendMouseInput /
-    /// SendKeyboardInput) requires `ICoreWebView2CompositionController`, which
-    /// is available only on the composition path. On the HWND path these remain
-    /// no-op until a follow-up migrates to composition or uses SendInput.
-    /// TODO(#106-followup): dispatch via ICoreWebView2CompositionController::SendMouseInput
-    /// / SendKeyboardInput once the composition controller path is adopted.
+    /// The STA worker calls `osr_dispatch_input`, which looks up the active
+    /// tab's hidden HWND and posts the appropriate Win32 message
+    /// (`WM_KEYDOWN`, `WM_MOUSEMOVE`, etc.) to WebView2's child WndProc.
     SendInput(WebView2InputEvent),
     QueryCanGoBack {
         reply: mpsc::SyncSender<bool>,
@@ -440,21 +437,28 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
             rt.paint();
         }
         Command::SendInput(event) => {
-            // TODO(#106-followup): dispatch via ICoreWebView2CompositionController::SendMouseInput
-            // / SendKeyboardInput once the composition controller path is adopted.
-            match &event {
-                WebView2InputEvent::Key(ev) => {
-                    tracing::debug!(
-                        "webview2 worker: key event '{}' — input synthesis pending composition controller (#106-followup)",
-                        ev.description
-                    );
-                }
-                WebView2InputEvent::Mouse(ev) => {
-                    tracing::debug!(
-                        "webview2 worker: mouse event ({},{}) — input synthesis pending composition controller (#106-followup)",
-                        ev.x,
-                        ev.y
-                    );
+            // Option A: PostMessageW to the tab's hidden HWND.
+            // WebView2's child WndProc processes standard Win32 messages the same
+            // way a real user would, so no composition controller migration is needed.
+            #[cfg(target_os = "windows")]
+            osr_dispatch_input(&event, rt);
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Stub path: log only (unreachable at runtime on non-Windows).
+                match &event {
+                    WebView2InputEvent::Key(ev) => {
+                        tracing::debug!(
+                            "webview2 worker: key event '{}' — stub path (no-op)",
+                            ev.description
+                        );
+                    }
+                    WebView2InputEvent::Mouse(ev) => {
+                        tracing::debug!(
+                            "webview2 worker: mouse event ({},{}) — stub path (no-op)",
+                            ev.x,
+                            ev.y
+                        );
+                    }
                 }
             }
         }
@@ -602,6 +606,152 @@ pub(super) fn create_hidden_hwnd() -> Result<windows::Win32::Foundation::HWND, W
     };
 
     Ok(hwnd)
+}
+
+/// Dispatch one `WebView2InputEvent` to the active tab's hidden HWND via
+/// `PostMessageW` (Option A input dispatch).
+///
+/// # Keyboard
+///
+/// `SetFocus(hwnd)` is called before each key event so WebView2's child
+/// WndProc honours the key. Without focus WebView2 may silently discard
+/// `WM_KEYDOWN`/`WM_KEYUP` on hidden HWNDs.
+///
+/// lParam for `WM_KEYDOWN` / `WM_KEYUP`:
+///
+/// ```text
+/// bits 31-30: transition / previous-key-state (0 for down, 0b11 for up)
+/// bits 16-23: scan code (from `Wv2KeyEvent::scan_code`)
+/// bits  0-15: repeat count (1)
+/// ```
+///
+/// # Mouse
+///
+/// Coordinates are packed into lParam with the standard Win32
+/// `MAKELPARAM(x, y)` formula: `(y as u32) << 16 | (x as u16 as u32)`.
+///
+/// `WM_MOUSEWHEEL` packs the WHEEL_DELTA (in units of 120 per notch) into
+/// the high word of wParam: `((delta as u16 as u32) << 16)`.
+///
+/// `WM_MOUSELEAVE` carries no coordinates — wParam and lParam are zero.
+///
+/// # Safety
+///
+/// All `PostMessageW` calls are in `unsafe` blocks. The HWND is valid for
+/// the lifetime of the `TabEntry` (verified by `StaRuntime::active_tab`).
+/// `SetFocus` is called inside an `unsafe` block; it only changes keyboard
+/// focus within the Win32 subsystem and does not violate memory safety.
+#[cfg(target_os = "windows")]
+fn osr_dispatch_input(event: &super::input::WebView2InputEvent, rt: &StaRuntime) {
+    use super::input::{Wv2MouseButton, Wv2MouseKind};
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+        WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+
+    let hwnd = match rt.active_tab() {
+        Some(tab) => tab.hwnd(),
+        None => {
+            tracing::debug!("webview2 worker: SendInput — no active tab, dropping event");
+            return;
+        }
+    };
+
+    match event {
+        super::input::WebView2InputEvent::Key(ev) => {
+            // Give the hidden HWND keyboard focus so WebView2's WndProc
+            // accepts the synthesised key messages.
+            // SAFETY: SetFocus is a Win32 API that changes the focused HWND
+            // on this thread's message queue. The HWND is valid (owned by TabEntry).
+            let _ = unsafe { SetFocus(Some(hwnd)) };
+
+            // Build lParam: repeat=1, scan code in bits 16-23, transition bits.
+            let scan = (ev.scan_code as u32) << 16;
+            let (msg, lp_flags) = if ev.flags & 0x0002 != 0 {
+                // KEYEVENTF_KEYUP: set bits 31 (transition) + 30 (prev state)
+                (WM_KEYUP, (0b11u32) << 30)
+            } else {
+                (WM_KEYDOWN, 0u32)
+            };
+            let lparam_val = scan | lp_flags | 1u32;
+
+            // SAFETY: PostMessageW posts a message to the hidden HWND's queue.
+            // HWND is valid; msg/wParam/lParam are valid Win32 key-message fields.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    msg,
+                    WPARAM(ev.vk as usize),
+                    LPARAM(lparam_val as isize),
+                )
+            };
+            tracing::debug!(
+                "webview2 worker: PostMessageW key {} vk={}",
+                if msg == WM_KEYDOWN { "DOWN" } else { "UP" },
+                ev.vk
+            );
+        }
+
+        super::input::WebView2InputEvent::Mouse(ev) => {
+            // Pack (x, y) into lParam: high word = y, low word = x.
+            // Equivalent to Win32 MAKELPARAM(x, y).
+            let lp = (((ev.y as u16) as u32) << 16) | ((ev.x as u16) as u32);
+            let lparam = LPARAM(lp as isize);
+
+            let (msg, wparam_val): (u32, usize) = match &ev.kind {
+                Wv2MouseKind::Move => (WM_MOUSEMOVE, 0),
+                Wv2MouseKind::ButtonDown(btn) => {
+                    let m = match btn {
+                        Wv2MouseButton::Left => WM_LBUTTONDOWN,
+                        Wv2MouseButton::Right => WM_RBUTTONDOWN,
+                        Wv2MouseButton::Middle => WM_MBUTTONDOWN,
+                    };
+                    (m, 0)
+                }
+                Wv2MouseKind::ButtonUp(btn) => {
+                    let m = match btn {
+                        Wv2MouseButton::Left => WM_LBUTTONUP,
+                        Wv2MouseButton::Right => WM_RBUTTONUP,
+                        Wv2MouseButton::Middle => WM_MBUTTONUP,
+                    };
+                    (m, 0)
+                }
+                Wv2MouseKind::Leave => (WM_MOUSELEAVE, 0),
+                Wv2MouseKind::Wheel { delta } => {
+                    // High word of wParam = WHEEL_DELTA (i16 cast to u16 preserves sign).
+                    let wp = ((*delta as i16 as u16 as u32) << 16) as usize;
+                    (WM_MOUSEWHEEL, wp)
+                }
+                Wv2MouseKind::HWheel { delta } => {
+                    // WM_MOUSEHWHEEL = 0x020E; not in Win32_UI_WindowsAndMessaging
+                    // as a named constant, so use the raw value.
+                    const WM_MOUSEHWHEEL: u32 = 0x020E;
+                    let wp = ((*delta as i16 as u16 as u32) << 16) as usize;
+                    (WM_MOUSEHWHEEL, wp)
+                }
+            };
+
+            // WM_MOUSELEAVE has no coordinates — override lparam to zero.
+            let final_lp = if msg == WM_MOUSELEAVE {
+                LPARAM(0)
+            } else {
+                lparam
+            };
+
+            // SAFETY: PostMessageW posts a message to the hidden HWND's queue.
+            // HWND is valid; msg/wParam/lParam are valid Win32 mouse-message fields.
+            let _ = unsafe { PostMessageW(Some(hwnd), msg, WPARAM(wparam_val), final_lp) };
+            tracing::debug!(
+                "webview2 worker: PostMessageW mouse msg=0x{:04X} ({},{})",
+                msg,
+                ev.x,
+                ev.y
+            );
+        }
+    }
 }
 
 /// Create the `ICoreWebView2Environment` on the STA thread.
