@@ -72,6 +72,7 @@ pub(crate) mod macos {
             }
         }
 
+        #[allow(dead_code)] // Used in Phase D for popup/hint routing.
         pub(crate) fn active_id(&self) -> Option<TabId> {
             self.active_idx.and_then(|i| self.tabs.get(i)).map(|t| t.id)
         }
@@ -493,8 +494,8 @@ pub(crate) mod macos {
     /// - Dispatches closures to the GCD main queue for WKWebView mutations.
     pub(crate) fn spawn(
         initial_url: &str,
-        width: u32,
-        height: u32,
+        _width: u32,
+        _height: u32,
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
@@ -550,7 +551,7 @@ pub(crate) mod macos {
     fn handle_command(
         cmd: Command,
         rt: &Arc<Mutex<MainQueueBox<RuntimeState>>>,
-        engine_state: &Arc<Mutex<EngineState>>,
+        _engine_state: &Arc<Mutex<EngineState>>,
     ) -> bool {
         match cmd {
             // ── Synchronous queries ───────────────────────────────────────────

@@ -583,6 +583,7 @@ pub(crate) mod macos {
     /// Written by delegate callbacks on the main queue; read from any thread
     /// by the engine behind `Mutex<EngineState>`.
     #[derive(Clone)]
+    #[allow(dead_code)] // can_go_back/forward read in Phase D via dispatch override.
     pub(crate) struct TabState {
         pub id: TabId,
         pub url: String,
