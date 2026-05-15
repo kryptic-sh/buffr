@@ -296,7 +296,10 @@ jobs:
         # All other backends have either offline tests or stub-path tests
         # that work fine without a display server.
         if: matrix.crate != 'buffr-servo'
-        run: cargo test ${{ matrix.args }}
+        # --test-threads=1 keeps the blitz/webkitgtk renderers from racing
+        # on fontconfig + WebKit init when CI runners have only 2 vCPUs.
+        # The flake otherwise hits a 30s worker-recv timeout intermittently.
+        run: cargo test ${{ matrix.args }} -- --test-threads=1
 
       - name: cargo clippy
         run: cargo clippy ${{ matrix.args }} --tests -- -D warnings
