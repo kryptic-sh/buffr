@@ -30,13 +30,15 @@ use cxx::UniquePtr;
 
 use crate::error::LadybirdError;
 use crate::ffi::bridge::{
-    WebContent, webcontent_can_go_back, webcontent_can_go_forward, webcontent_eval_js,
+    WebContent, webcontent_any_audio_active, webcontent_any_video_active, webcontent_can_go_back,
+    webcontent_can_go_forward, webcontent_edit_attach, webcontent_edit_cycle,
+    webcontent_edit_detach, webcontent_edit_focus, webcontent_eval_js,
     webcontent_eval_main_frame_js, webcontent_go_back, webcontent_go_forward,
     webcontent_ime_cancel, webcontent_ime_commit, webcontent_ime_set_composition,
-    webcontent_navigate, webcontent_new, webcontent_read_pixels, webcontent_reload,
-    webcontent_resize, webcontent_send_key, webcontent_send_mouse_button,
-    webcontent_send_mouse_move, webcontent_send_scroll, webcontent_set_zoom, webcontent_stop,
-    webcontent_title, webcontent_url, webcontent_zoom,
+    webcontent_is_loading, webcontent_navigate, webcontent_new, webcontent_read_pixels,
+    webcontent_reload, webcontent_resize, webcontent_send_key, webcontent_send_mouse_button,
+    webcontent_send_mouse_move, webcontent_send_scroll, webcontent_set_sleep, webcontent_set_zoom,
+    webcontent_start_download, webcontent_stop, webcontent_title, webcontent_url, webcontent_zoom,
 };
 
 // ── Tab ───────────────────────────────────────────────────────────────────────
@@ -153,6 +155,93 @@ impl LadybirdTab {
     /// TODO(phase-c): wire to real LibJS dispatch with script URL.
     pub(crate) fn eval_main_frame_js(&mut self, code: &str, url: &str) {
         webcontent_eval_main_frame_js(self.wc.pin_mut(), code, url);
+    }
+
+    // ── Edit IPC helpers ──────────────────────────────────────────────────────
+
+    /// Attach the edit-active CSS class to `field_id`.
+    ///
+    /// Phase B stub: no-ops.
+    /// Phase C: IPC `__buffrEditAttach` to LibWeb JS.
+    pub(crate) fn edit_attach(&mut self, field_id: &str) {
+        cxx::let_cxx_string!(cxx_field_id = field_id);
+        webcontent_edit_attach(self.wc.pin_mut(), &cxx_field_id);
+    }
+
+    /// Cycle focus to the next/previous visible input.
+    ///
+    /// Phase B stub: no-ops.
+    /// Phase C: IPC `__buffrEditCycle` to LibWeb JS.
+    pub(crate) fn edit_cycle(&mut self, forward: bool) {
+        webcontent_edit_cycle(self.wc.pin_mut(), forward);
+    }
+
+    /// Detach the edit-active CSS class from `field_id`.
+    ///
+    /// Phase B stub: no-ops.
+    /// Phase C: IPC `__buffrEditDetach` to LibWeb JS.
+    pub(crate) fn edit_detach(&mut self, field_id: &str) {
+        cxx::let_cxx_string!(cxx_field_id = field_id);
+        webcontent_edit_detach(self.wc.pin_mut(), &cxx_field_id);
+    }
+
+    /// Re-focus the element identified by `field_id`.
+    ///
+    /// Phase B stub: no-ops.
+    /// Phase C: IPC `__buffrEditFocus` to LibWeb JS.
+    pub(crate) fn edit_focus(&mut self, field_id: &str) {
+        cxx::let_cxx_string!(cxx_field_id = field_id);
+        webcontent_edit_focus(self.wc.pin_mut(), &cxx_field_id);
+    }
+
+    // ── Audio / video activity ────────────────────────────────────────────────
+
+    /// Whether this WebContent has an active audio stream.
+    ///
+    /// Phase B stub: always false.
+    /// Phase C: query real Ladybird media-activity state.
+    pub(crate) fn any_audio_active(&self) -> bool {
+        webcontent_any_audio_active(&self.wc)
+    }
+
+    /// Whether this WebContent has an active video stream.
+    ///
+    /// Phase B stub: always false.
+    /// Phase C: query real Ladybird media-activity state.
+    pub(crate) fn any_video_active(&self) -> bool {
+        webcontent_any_video_active(&self.wc)
+    }
+
+    // ── Sleep / wake ──────────────────────────────────────────────────────────
+
+    /// Put this WebContent to sleep or wake it.
+    ///
+    /// Phase B stub: no-ops.
+    /// Phase C: Ladybird WebContent visibility/suspend IPC.
+    pub(crate) fn set_sleep(&mut self, sleep: bool) {
+        webcontent_set_sleep(self.wc.pin_mut(), sleep);
+    }
+
+    // ── Downloads ─────────────────────────────────────────────────────────────
+
+    /// Trigger a managed browser download for `url`.
+    ///
+    /// Phase B stub: no-ops.
+    /// Phase C: trigger the Ladybird download manager.
+    /// TODO(phase-c): wire to real Ladybird download infra.
+    pub(crate) fn start_download(&mut self, url: &str) {
+        cxx::let_cxx_string!(cxx_url = url);
+        webcontent_start_download(self.wc.pin_mut(), &cxx_url);
+    }
+
+    // ── Loading state ─────────────────────────────────────────────────────────
+
+    /// Whether this WebContent is currently loading a document.
+    ///
+    /// Phase B stub: always false.
+    /// Phase C: reflect real Ladybird page-load state.
+    pub(crate) fn is_loading(&self) -> bool {
+        webcontent_is_loading(&self.wc)
     }
 
     #[allow(dead_code)]
@@ -281,6 +370,81 @@ pub(crate) enum Command {
     EvalMainFrameJs {
         code: String,
         url: String,
+    },
+    /// Attach the edit-active CSS class to `field_id` on the active tab.
+    ///
+    /// Phase B: forwarded to `webcontent_edit_attach` (no-ops).
+    /// Phase C: IPC `__buffrEditAttach` to LibWeb JS.
+    EditAttach {
+        field_id: String,
+    },
+    /// Cycle focus to the next/previous visible input on the active tab.
+    ///
+    /// Phase B: forwarded to `webcontent_edit_cycle` (no-ops).
+    /// Phase C: IPC `__buffrEditCycle` to LibWeb JS.
+    EditCycle {
+        forward: bool,
+    },
+    /// Detach the edit-active CSS class from `field_id` on the active tab.
+    ///
+    /// Phase B: forwarded to `webcontent_edit_detach` (no-ops).
+    /// Phase C: IPC `__buffrEditDetach` to LibWeb JS.
+    EditDetach {
+        field_id: String,
+    },
+    /// Re-focus the element identified by `field_id` on the active tab.
+    ///
+    /// Phase B: forwarded to `webcontent_edit_focus` (no-ops).
+    /// Phase C: IPC `__buffrEditFocus` to LibWeb JS.
+    EditFocus {
+        field_id: String,
+    },
+    /// Query whether any tab has an active audio stream.
+    ///
+    /// Phase B: always returns false (stub).
+    /// Phase C: query real Ladybird media-activity state.
+    QueryAnyAudioActive {
+        reply: mpsc::SyncSender<bool>,
+    },
+    /// Query whether any tab has an active video stream.
+    ///
+    /// Phase B: always returns false (stub).
+    /// Phase C: query real Ladybird media-activity state.
+    QueryAnyVideoActive {
+        reply: mpsc::SyncSender<bool>,
+    },
+    /// Put the active tab to sleep or wake it.
+    ///
+    /// Phase B: forwarded to `webcontent_set_sleep` (no-ops).
+    /// Phase C: Ladybird WebContent visibility/suspend IPC.
+    SetSleep {
+        sleep: bool,
+    },
+    /// Trigger a managed browser download for `url` on the active tab.
+    ///
+    /// Phase B: forwarded to `webcontent_start_download` (no-ops).
+    /// Phase C: trigger the Ladybird download manager.
+    /// TODO(phase-c): wire to real Ladybird download infra.
+    StartDownload {
+        url: String,
+    },
+    /// Query whether the active tab is currently loading a document.
+    ///
+    /// Phase B: always returns false (stub).
+    /// Phase C: reflect real Ladybird page-load state.
+    QueryIsLoading {
+        reply: mpsc::SyncSender<bool>,
+    },
+    /// Drain pending favicon updates from all tabs.
+    ///
+    /// Phase B: always returns an empty Vec — favicon push notifications are
+    /// a C++-to-Rust callback that Phase C will wire via a shared queue. For
+    /// now the worker has no favicon state to drain.
+    ///
+    /// Phase C: wire to a `SharedFaviconQueue` populated by an
+    ///   `on_favicon_change` Ladybird callback.
+    DrainFavicons {
+        reply: mpsc::SyncSender<Vec<buffr_engine::FaviconUpdate>>,
     },
     Shutdown,
 }
@@ -570,6 +734,86 @@ impl Worker {
         }
     }
 
+    // ── Edit IPC helpers ──────────────────────────────────────────────────────
+
+    fn edit_attach(&mut self, field_id: &str) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: edit_attach field_id={field_id}");
+            self.tabs[i].edit_attach(field_id);
+        } else {
+            tracing::debug!("ladybird worker: edit_attach — no active tab, dropping");
+        }
+    }
+
+    fn edit_cycle(&mut self, forward: bool) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: edit_cycle forward={forward}");
+            self.tabs[i].edit_cycle(forward);
+        } else {
+            tracing::debug!("ladybird worker: edit_cycle — no active tab, dropping");
+        }
+    }
+
+    fn edit_detach(&mut self, field_id: &str) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: edit_detach field_id={field_id}");
+            self.tabs[i].edit_detach(field_id);
+        } else {
+            tracing::debug!("ladybird worker: edit_detach — no active tab, dropping");
+        }
+    }
+
+    fn edit_focus(&mut self, field_id: &str) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: edit_focus field_id={field_id}");
+            self.tabs[i].edit_focus(field_id);
+        } else {
+            tracing::debug!("ladybird worker: edit_focus — no active tab, dropping");
+        }
+    }
+
+    // ── Audio / video activity ────────────────────────────────────────────────
+
+    /// `true` when any tab has an active audio stream.
+    fn any_audio_active(&self) -> bool {
+        self.tabs.iter().any(|t| t.any_audio_active())
+    }
+
+    /// `true` when any tab has an active video stream.
+    fn any_video_active(&self) -> bool {
+        self.tabs.iter().any(|t| t.any_video_active())
+    }
+
+    // ── Sleep / wake ──────────────────────────────────────────────────────────
+
+    fn set_sleep(&mut self, sleep: bool) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: set_sleep({sleep})");
+            self.tabs[i].set_sleep(sleep);
+        } else {
+            tracing::debug!("ladybird worker: set_sleep — no active tab, dropping");
+        }
+    }
+
+    // ── Downloads ─────────────────────────────────────────────────────────────
+
+    fn start_download(&mut self, url: &str) {
+        if let Some(i) = self.active_idx {
+            tracing::debug!("ladybird worker: start_download url={url}");
+            self.tabs[i].start_download(url);
+        } else {
+            tracing::debug!("ladybird worker: start_download — no active tab, dropping");
+        }
+    }
+
+    // ── Loading state ─────────────────────────────────────────────────────────
+
+    fn query_is_loading(&self) -> bool {
+        self.active_idx
+            .map(|i| self.tabs[i].is_loading())
+            .unwrap_or(false)
+    }
+
     fn build_snapshot(&self) -> TabsSnapshot {
         let tabs: Vec<TabRecord> = self
             .tabs
@@ -748,6 +992,38 @@ impl Worker {
             }
             Command::EvalMainFrameJs { code, url } => {
                 self.eval_main_frame_js(&code, &url);
+            }
+            Command::EditAttach { field_id } => {
+                self.edit_attach(&field_id);
+            }
+            Command::EditCycle { forward } => {
+                self.edit_cycle(forward);
+            }
+            Command::EditDetach { field_id } => {
+                self.edit_detach(&field_id);
+            }
+            Command::EditFocus { field_id } => {
+                self.edit_focus(&field_id);
+            }
+            Command::QueryAnyAudioActive { reply } => {
+                let _ = reply.send(self.any_audio_active());
+            }
+            Command::QueryAnyVideoActive { reply } => {
+                let _ = reply.send(self.any_video_active());
+            }
+            Command::SetSleep { sleep } => {
+                self.set_sleep(sleep);
+            }
+            Command::StartDownload { url } => {
+                self.start_download(&url);
+            }
+            Command::QueryIsLoading { reply } => {
+                let _ = reply.send(self.query_is_loading());
+            }
+            Command::DrainFavicons { reply } => {
+                // Phase B: no favicon tracking — return empty Vec.
+                // Phase C: drain a shared queue populated by on_favicon_change callbacks.
+                let _ = reply.send(Vec::new());
             }
             Command::Shutdown => {
                 return true;

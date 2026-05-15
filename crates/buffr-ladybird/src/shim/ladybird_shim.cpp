@@ -202,6 +202,80 @@ void WebContent::eval_main_frame_js(rust::Str code, rust::Str url)
     (void)url;
 }
 
+// ── Edit IPC helpers ─────────────────────────────────────────────────────────
+
+void WebContent::edit_attach(const std::string& field_id)
+{
+    // Phase B stub: log and no-op.
+    // Phase C: forward `__buffrEditAttach(field_id)` via LibWeb JS IPC.
+    (void)field_id;
+}
+
+void WebContent::edit_cycle(bool forward)
+{
+    // Phase B stub: log and no-op.
+    // Phase C: forward `__buffrEditCycle(forward)` via LibWeb JS IPC.
+    (void)forward;
+}
+
+void WebContent::edit_detach(const std::string& field_id)
+{
+    // Phase B stub: log and no-op.
+    // Phase C: forward `__buffrEditDetach(field_id)` via LibWeb JS IPC.
+    (void)field_id;
+}
+
+void WebContent::edit_focus(const std::string& field_id)
+{
+    // Phase B stub: log and no-op.
+    // Phase C: forward `__buffrEditFocus(field_id)` via LibWeb JS IPC.
+    (void)field_id;
+}
+
+// ── Audio / video activity ────────────────────────────────────────────────────
+
+bool WebContent::any_audio_active() const
+{
+    // Phase B stub: no audio tracking — return false.
+    // Phase C: query real Ladybird media-activity state via WebContent IPC.
+    return false;
+}
+
+bool WebContent::any_video_active() const
+{
+    // Phase B stub: no video tracking — return false.
+    // Phase C: query real Ladybird media-activity state via WebContent IPC.
+    return false;
+}
+
+// ── Sleep / wake ─────────────────────────────────────────────────────────────
+
+void WebContent::set_sleep(bool sleep)
+{
+    // Phase B stub: log and no-op.
+    // Phase C: send Ladybird WebContent visibility/suspend IPC message.
+    (void)sleep;
+}
+
+// ── Downloads ─────────────────────────────────────────────────────────────────
+
+void WebContent::start_download(const std::string& url)
+{
+    // Phase B stub: log and no-op.
+    // Phase C: trigger the Ladybird download manager for `url`.
+    // TODO(phase-c): wire to real Ladybird download infra.
+    (void)url;
+}
+
+// ── Loading state ─────────────────────────────────────────────────────────────
+
+bool WebContent::is_loading() const
+{
+    // Phase B stub: no async load tracking — return false.
+    // Phase C: reflect real Ladybird page-load state via WebContent IPC.
+    return false;
+}
+
 // ── Free-function entry points (called from cxx bridge) ─────────────────────
 
 ::std::unique_ptr<WebContent> webcontent_new(rust::Str initial_url, uint32_t width, uint32_t height)
@@ -277,6 +351,25 @@ void webcontent_eval_main_frame_js(WebContent& wc, rust::Str code, rust::Str url
 {
     wc.eval_main_frame_js(code, url);
 }
+
+// Edit IPC helpers
+void webcontent_edit_attach(WebContent& wc, const std::string& field_id)     { wc.edit_attach(field_id); }
+void webcontent_edit_cycle(WebContent& wc, bool forward)                      { wc.edit_cycle(forward); }
+void webcontent_edit_detach(WebContent& wc, const std::string& field_id)     { wc.edit_detach(field_id); }
+void webcontent_edit_focus(WebContent& wc, const std::string& field_id)      { wc.edit_focus(field_id); }
+
+// Audio / video activity
+bool webcontent_any_audio_active(const WebContent& wc)  { return wc.any_audio_active(); }
+bool webcontent_any_video_active(const WebContent& wc)  { return wc.any_video_active(); }
+
+// Sleep / wake
+void webcontent_set_sleep(WebContent& wc, bool sleep)   { wc.set_sleep(sleep); }
+
+// Downloads
+void webcontent_start_download(WebContent& wc, const std::string& url)       { wc.start_download(url); }
+
+// Loading state
+bool webcontent_is_loading(const WebContent& wc)        { return wc.is_loading(); }
 
 } // namespace ladybird
 } // namespace buffr

@@ -87,6 +87,40 @@ public:
     void eval_js(rust::Str code);
     void eval_main_frame_js(rust::Str code, rust::Str url);
 
+    // Edit IPC helpers
+    //
+    // Phase B stub: log and no-op.
+    // Phase C: forward to LibWeb focused-element JS IPC.
+    void edit_attach(const std::string& field_id);
+    void edit_cycle(bool forward);
+    void edit_detach(const std::string& field_id);
+    void edit_focus(const std::string& field_id);
+
+    // Audio / video activity
+    //
+    // Phase B stub: returns false.
+    // Phase C: query real Ladybird media-activity state.
+    bool any_audio_active() const;
+    bool any_video_active() const;
+
+    // Sleep / wake
+    //
+    // Phase B stub: log and no-op.
+    // Phase C: Ladybird WebContent visibility / suspend IPC.
+    void set_sleep(bool sleep);
+
+    // Downloads
+    //
+    // Phase B stub: log and no-op.
+    // Phase C: trigger the Ladybird download manager.
+    void start_download(const std::string& url);
+
+    // Loading state
+    //
+    // Phase B stub: returns false.
+    // Phase C: reflects real Ladybird page-load state.
+    bool is_loading() const;
+
 private:
     std::string m_url;
     std::string m_title;
@@ -134,6 +168,25 @@ void webcontent_ime_cancel(WebContent& wc);
 // JS evaluation
 void webcontent_eval_js(WebContent& wc, rust::Str code);
 void webcontent_eval_main_frame_js(WebContent& wc, rust::Str code, rust::Str url);
+
+// Edit IPC helpers
+void webcontent_edit_attach(WebContent& wc, const std::string& field_id);
+void webcontent_edit_cycle(WebContent& wc, bool forward);
+void webcontent_edit_detach(WebContent& wc, const std::string& field_id);
+void webcontent_edit_focus(WebContent& wc, const std::string& field_id);
+
+// Audio / video activity
+bool webcontent_any_audio_active(const WebContent& wc);
+bool webcontent_any_video_active(const WebContent& wc);
+
+// Sleep / wake
+void webcontent_set_sleep(WebContent& wc, bool sleep);
+
+// Downloads
+void webcontent_start_download(WebContent& wc, const std::string& url);
+
+// Loading state
+bool webcontent_is_loading(const WebContent& wc);
 
 } // namespace ladybird
 } // namespace buffr

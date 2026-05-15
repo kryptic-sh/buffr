@@ -149,5 +149,61 @@ pub(crate) mod bridge {
         /// `url` is used as the script origin in DevTools / error stacks.
         /// Phase B stub: `url` is logged but otherwise ignored.
         fn webcontent_eval_main_frame_js(wc: Pin<&mut WebContent>, code: &str, url: &str);
+
+        // ── Edit IPC helpers ──────────────────────────────────────────────────
+        //
+        // Phase B: C++ stubs log the call and no-op.
+        // Phase C: forward to LibWeb's focused-element JS IPC.
+        //
+        // TODO(phase-c): wire to real LibWeb edit dispatch.
+
+        /// Attach the edit-active CSS class to `field_id`.
+        fn webcontent_edit_attach(wc: Pin<&mut WebContent>, field_id: &CxxString);
+
+        /// Cycle focus to the next (`forward=true`) or previous visible input.
+        fn webcontent_edit_cycle(wc: Pin<&mut WebContent>, forward: bool);
+
+        /// Detach the edit-active CSS class from `field_id`.
+        fn webcontent_edit_detach(wc: Pin<&mut WebContent>, field_id: &CxxString);
+
+        /// Re-focus the element identified by `field_id`.
+        fn webcontent_edit_focus(wc: Pin<&mut WebContent>, field_id: &CxxString);
+
+        // ── Audio / video activity ────────────────────────────────────────────
+        //
+        // Phase B: C++ stubs return false.
+        // Phase C: query real Ladybird media-activity state.
+
+        /// Whether the WebContent instance has an active audio stream.
+        fn webcontent_any_audio_active(wc: &WebContent) -> bool;
+
+        /// Whether the WebContent instance has an active video stream.
+        fn webcontent_any_video_active(wc: &WebContent) -> bool;
+
+        // ── Sleep / wake ──────────────────────────────────────────────────────
+        //
+        // Phase B: C++ stub logs and no-ops.
+        // Phase C: maps to Ladybird WebContent visibility / suspend IPC.
+
+        /// Put the WebContent to sleep (`sleep=true`) or wake it.
+        fn webcontent_set_sleep(wc: Pin<&mut WebContent>, sleep: bool);
+
+        // ── Downloads ─────────────────────────────────────────────────────────
+        //
+        // Phase B: C++ stub logs the URL and no-ops.
+        // Phase C: trigger the Ladybird download manager.
+        //
+        // TODO(phase-c): wire to real Ladybird download infra.
+
+        /// Start a managed browser download for `url`.
+        fn webcontent_start_download(wc: Pin<&mut WebContent>, url: &CxxString);
+
+        // ── Loading state ─────────────────────────────────────────────────────
+        //
+        // Phase B: C++ stub returns false.
+        // Phase C: reflects real Ladybird page-load state.
+
+        /// Whether the WebContent is currently loading a document.
+        fn webcontent_is_loading(wc: &WebContent) -> bool;
     }
 }

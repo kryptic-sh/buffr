@@ -43,8 +43,9 @@
 use std::sync::{Arc, Mutex};
 
 use buffr_engine::{
-    BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
-    NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    BackendOpenOptions, BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus,
+    MouseButton, NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState,
+    TabId, TabSummary,
     engine_id::EngineId,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
@@ -305,14 +306,15 @@ impl BrowserEngine for LadybirdEngine {
 
     // ── Loading state ────────────────────────────────────────────────────────
 
-    /// Ladybird Phase B uses a C++ stub (`webcontent_navigate` is synchronous
-    /// at the FFI boundary).  No async load event is wired; always `false`.
+    /// Ladybird Phase B uses a C++ stub (`webcontent_is_loading` always returns
+    /// false — no async load event is wired).
     ///
-    /// TODO(ladybird-phase-c): add `webcontent_is_loading() -> bool` to the
-    /// cxx bridge (`ffi.rs`) and delegate to it here once real Ladybird IPC
-    /// (out-of-process WebContentServer) is connected.
+    /// TODO(ladybird-phase-c): wire to real Ladybird page-load state once the
+    /// out-of-process WebContentServer IPC surface is connected.
     fn is_loading(&self) -> bool {
-        false
+        self.worker
+            .call(|reply| Command::QueryIsLoading { reply })
+            .unwrap_or(false)
     }
 
     fn can_go_back(&self) -> bool {
@@ -439,7 +441,8 @@ impl BrowserEngine for LadybirdEngine {
     }
 
     fn osr_sleep(&self, sleep: bool) {
-        tracing::debug!("ladybird: osr_sleep({sleep}) — no-op");
+        tracing::debug!("ladybird: osr_sleep({sleep})");
+        self.worker.send(Command::SetSleep { sleep });
     }
 
     fn osr_invalidate_view(&self) {
@@ -499,21 +502,58 @@ impl BrowserEngine for LadybirdEngine {
         Ok(())
     }
 
+    // ── Edit IPC helpers (Phase 6c, #95) ─────────────────────────────────────
+    //
+    // Delegates to the cxx FFI shim via the worker thread.
+    //
+    // Phase B: the C++ stubs log and no-op.
+    // Phase C: wire to real LibWeb focused-element JS IPC.
+
+    fn run_edit_attach(&self, field_id: &str) {
+        tracing::debug!("ladybird: run_edit_attach field_id={field_id}");
+        self.worker.send(Command::EditAttach {
+            field_id: field_id.to_owned(),
+        });
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        tracing::debug!("ladybird: run_edit_cycle forward={forward}");
+        self.worker.send(Command::EditCycle { forward });
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        tracing::debug!("ladybird: run_edit_detach field_id={field_id}");
+        self.worker.send(Command::EditDetach {
+            field_id: field_id.to_owned(),
+        });
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        tracing::debug!("ladybird: run_edit_focus field_id={field_id}");
+        self.worker.send(Command::EditFocus {
+            field_id: field_id.to_owned(),
+        });
+    }
+
     // ── Downloads (Phase 6c, #95) ────────────────────────────────────────────
 
-    /// Inject a link-click download trigger via `run_js`.
+    /// Trigger a managed browser download for `url` via the explicit FFI stub.
     ///
-    /// The JS reaches the C++ stub (`EvalJs` command) and is dropped until
-    /// phase C lands (real LibJS dispatch via the Ladybird WebContentServer IPC).
+    /// Phase B: the C++ stub (`webcontent_start_download`) logs the URL and
+    /// no-ops. Phase C: wire to real Ladybird download-manager IPC so the
+    /// browser handles the download directly without a JS detour.
+    ///
+    /// We deliberately bypass `run_js` here: downloads need browser-managed
+    /// download infrastructure, not a JS anchor-click hack that Phase C would
+    /// have to untangle. `run_js` wiring is preserved separately for its own
+    /// users (media-probe, edit IPC, etc.).
+    ///
+    /// TODO(phase-c): wire to real Ladybird download infra.
     fn start_download(&self, url: &str) {
         tracing::debug!("ladybird: start_download url={url}");
-        let url_json = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
-        let js = format!(
-            "(() => {{ const a = document.createElement('a'); \
-             a.href = {url_json}; a.download = ''; \
-             document.body.appendChild(a); a.click(); a.remove(); }})();"
-        );
-        let _ = self.run_js(&js);
+        self.worker.send(Command::StartDownload {
+            url: url.to_owned(),
+        });
     }
 
     fn zoom_in(&self) {
@@ -538,11 +578,15 @@ impl BrowserEngine for LadybirdEngine {
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
-        false
+        self.worker
+            .call(|reply| Command::QueryAnyAudioActive { reply })
+            .unwrap_or(false)
     }
 
     fn any_video_active(&self) -> bool {
-        false
+        self.worker
+            .call(|reply| Command::QueryAnyVideoActive { reply })
+            .unwrap_or(false)
     }
 
     // ── Popup stubs ──────────────────────────────────────────────────────────
@@ -658,5 +702,28 @@ impl BrowserEngine for LadybirdEngine {
     fn ime_cancel(&self) {
         tracing::debug!("ladybird: ime_cancel");
         self.worker.send(crate::state::Command::ImeCancel);
+    }
+
+    // ── Favicon (Gap 6) ──────────────────────────────────────────────────────
+    //
+    // Favicon push notifications are a C++-to-Rust callback that Phase C will
+    // wire via a shared queue populated by an `on_favicon_change` Ladybird
+    // callback.  For now the worker has no favicon state to drain.
+
+    fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
+        self.worker
+            .call(|reply| Command::DrainFavicons { reply })
+            .unwrap_or_default()
+    }
+
+    // ── Cursor (Gap 3) ───────────────────────────────────────────────────────
+    //
+    // TODO(phase-c): wire to a `SharedCursorState` populated by a Ladybird
+    // `on_cursor_change` callback.  Phase B has no cursor tracking.
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        // Phase B stub: no cursor tracking — return None.
+        // TODO(phase-c): query a SharedCursorState set by on_cursor_change.
+        None
     }
 }
