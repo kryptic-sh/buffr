@@ -423,15 +423,15 @@ impl TabEntry {
                         // refresh its favicon cache.  Pixels are empty — the
                         // URL is logged above; a future phase can fetch and
                         // decode the favicon image.
-                        if let Ok(guard) = state_favicon.lock() {
-                            if let Ok(mut fav) = guard.favicon_updates.lock() {
-                                fav.push(buffr_engine::FaviconUpdate {
-                                    browser_id: id.0 as i32,
-                                    width: 0,
-                                    height: 0,
-                                    pixels: Vec::new(),
-                                });
-                            }
+                        if let Ok(guard) = state_favicon.lock()
+                            && let Ok(mut fav) = guard.favicon_updates.lock()
+                        {
+                            fav.push(buffr_engine::FaviconUpdate {
+                                browser_id: id.0 as i32,
+                                width: 0,
+                                height: 0,
+                                pixels: Vec::new(),
+                            });
                         }
                         Ok(())
                     })),
