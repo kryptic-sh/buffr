@@ -616,7 +616,7 @@ impl StaRuntime {
         {
             if let Some(idx) = self.active_idx {
                 let controller = &self.tabs[idx].controller;
-                let visible = windows::core::BOOL(!sleep as i32);
+                let visible = !sleep;
                 // SAFETY: SetIsVisible is an STA COM method on a valid
                 // ICoreWebView2Controller owned by this thread.
                 if let Err(e) = unsafe { controller.SetIsVisible(visible) } {
@@ -872,8 +872,7 @@ impl StaRuntime {
                 // ShouldMatchWord and IsCaseSensitive left at their defaults (false).
 
                 // Fire the start — completion handler is a no-op (fire-and-forget).
-                let handler =
-                    FindStartCompletedHandler::create(Box::new(|_hr, _active_idx| Ok(())));
+                let handler = FindStartCompletedHandler::create(Box::new(|_hr| Ok(())));
                 // SAFETY: Start is an STA COM method.
                 let _ = unsafe { find_iface.Start(&opts, &handler) };
 
