@@ -133,6 +133,13 @@ pub(crate) enum Command {
     Stop,
     /// Set the active tab's zoom level. Clamped to [0.25, 5.0].
     SetZoom(f64),
+    /// Start an in-page find. `forward = false` searches backwards.
+    StartFind {
+        query: String,
+        forward: bool,
+    },
+    /// Cancel the active find session.
+    StopFind,
     Resize {
         width: u32,
         height: u32,
@@ -363,6 +370,35 @@ impl GtkRuntime {
         }
     }
 
+    fn start_find(&mut self, query: &str, forward: bool) {
+        use webkit6::prelude::WebViewExt;
+        const CASE_INSENSITIVE: u32 = 1;
+        const BACKWARDS: u32 = 8;
+        let Some(active_idx) = self.active_idx else {
+            return;
+        };
+        let Some(fc) = self.tabs[active_idx].web_view.find_controller() else {
+            tracing::warn!("webkitgtk: no FindController on active WebView");
+            return;
+        };
+        let opts = if forward {
+            CASE_INSENSITIVE
+        } else {
+            CASE_INSENSITIVE | BACKWARDS
+        };
+        fc.search(query, opts, u32::MAX);
+    }
+
+    fn stop_find(&mut self) {
+        use webkit6::prelude::WebViewExt;
+        let Some(active_idx) = self.active_idx else {
+            return;
+        };
+        if let Some(fc) = self.tabs[active_idx].web_view.find_controller() {
+            fc.search_finish();
+        }
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         {
             let mut st = self.engine_state.lock().unwrap();
@@ -441,6 +477,12 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         }
         Command::SetZoom(level) => {
             rt.set_zoom(level);
+        }
+        Command::StartFind { query, forward } => {
+            rt.start_find(&query, forward);
+        }
+        Command::StopFind => {
+            rt.stop_find();
         }
         Command::Resize { width, height } => {
             rt.resize(width, height);

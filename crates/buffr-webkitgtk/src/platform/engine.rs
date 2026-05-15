@@ -399,12 +399,15 @@ impl BrowserEngine for WebKitGtkEngine {
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("webkitgtk: start_find — no-op in Phase B");
+    fn start_find(&self, query: &str, forward: bool) {
+        self.worker.send(Command::StartFind {
+            query: query.to_owned(),
+            forward,
+        });
     }
 
     fn stop_find(&self) {
-        tracing::debug!("webkitgtk: stop_find — no-op in Phase B");
+        self.worker.send(Command::StopFind);
     }
 
     fn active_zoom_level(&self) -> f64 {
