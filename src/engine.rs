@@ -751,18 +751,19 @@ pub trait BrowserEngine: Send + Sync {
     /// Used to drive the enabled state of back-navigation UI (e.g.
     /// context-menu `HistoryBack { enabled }`).
     ///
-    /// Default: `true` (conservative — shows the item as enabled; backends
-    /// that track history accurately override this). CEF overrides via
-    /// `CefBrowser::CanGoBack`.
+    /// Default: `false` — backends that track history accurately override this.
+    /// CEF overrides via `CefBrowser::CanGoBack`; blink-cdp uses its nav_count
+    /// heuristic. Defaulting to `true` was wrong: a newly-opened tab has no
+    /// history, so the back-button would incorrectly appear enabled.
     fn can_go_back(&self) -> bool {
-        true
+        false
     }
 
     /// `true` when the active tab can navigate forwards.
     ///
-    /// Default: `true` (same conservative default as [`Self::can_go_back`]).
+    /// Default: `false` (same safe default as [`Self::can_go_back`]).
     fn can_go_forward(&self) -> bool {
-        true
+        false
     }
 
     // ── Action dispatch (Phase 6f, #95) ──────────────────────────────────────

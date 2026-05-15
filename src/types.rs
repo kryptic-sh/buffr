@@ -1,6 +1,7 @@
 //! Neutral event and state types surfaced by the engine to the apps layer.
 
 /// Page load state.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState {
     Idle,
@@ -29,6 +30,7 @@ pub struct AudioEvent {
 }
 
 /// Cursor icon changed. Neutral representation of a platform cursor.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorKind {
     Default,
@@ -80,6 +82,7 @@ pub struct ContextMenuRequest {
 }
 
 /// What kind of content is under the context-menu cursor.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
     None,

@@ -10,6 +10,7 @@
 /// Phase 1 note: these are not yet used via a channel — the existing sink
 /// types (address_sink, find_sink, etc.) in `buffr-cef` carry the data
 /// directly. This enum exists for documentation + future migration.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     /// A tab's URL or load state changed.
