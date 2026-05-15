@@ -5,46 +5,51 @@
 //! WKWebView **must** live on the main thread (AppKit run loop). Buffr's
 //! `BrowserEngine` methods are called from any thread.
 //!
-//! Solution chosen: **dedicated `std::thread` + `performSelectorOnMainThread`**.
+//! Solution: **dedicated `std::thread`** that receives `Command` values from an
+//! `mpsc` channel and dispatches closures to the GCD main queue for each.
 //!
-//! A background worker thread owns an `mpsc::Receiver<Command>`. For each
-//! command it either:
-//! - Handles synchronous queries (e.g. `QueryTabs`) directly from `EngineState`
-//!   (a `Mutex` readable from any thread), or
-//! - Dispatches a closure to the main queue via
-//!   `dispatch_async(dispatch_get_main_queue(), …)` (from `dispatch2 0.3`).
+//! The main queue closures own an `Arc<Mutex<RuntimeState>>` and carry a
+//! `SyncSender<T>` for synchronous-reply commands.
 //!
-//! The main queue closures own a `Rc<RefCell<RuntimeState>>` (main-thread-only)
-//! and carry a `Sender<T>` for synchronous-reply commands.
+//! # API verification notes (grepped from registry crate source)
 //!
-//! On Linux (stub path) this entire module compiles to an empty shell because
-//! everything is inside `#[cfg(target_os = "macos")]`.
+//! ## dispatch2 0.3.1 — DispatchQueue
 //!
-//! # TODO(verify-on-mac)
+//! `Queue` is a deprecated type alias for `DispatchQueue`.
+//! Confirmed: dispatch2-0.3.1/src/lib.rs:123-125.
 //!
-//! - Confirm `dispatch2::Queue::main()` is the correct API in dispatch2 0.3.
-//! - Confirm `Queue::exec_async(…)` accepts a `move` closure without
-//!   requiring `block2`.
-//! - The `Rc<RefCell<RuntimeState>>` pattern inside GCD closures is safe only
-//!   because GCD guarantees serial execution on the main queue. If dispatch2
-//!   uses `block2::StackBlock` + `move`, the captured `Rc` must be wrapped in
-//!   an `UnsafeCell`. See the comment at each dispatch site.
+//! **Correct type to use:** `dispatch2::DispatchQueue`.
+//!
+//! `DispatchQueue::main()` returns `&'static DispatchQueue`.
+//! Confirmed: dispatch2-0.3.1/src/queue.rs:108-114.
+//!
+//! `DispatchQueue::exec_async<F: FnOnce() + Send + 'static>(f: F)`
+//! accepts a `move` closure that is `Send + 'static`. No `block2` required.
+//! Confirmed: dispatch2-0.3.1/src/queue.rs:134-143.
+//!
+//! ## RuntimeState Send requirement
+//!
+//! GCD's `exec_async` requires the closure to be `Send`. `RuntimeState`
+//! contains `Arc<Mutex<…>>` which is `Send`. We use `Arc<Mutex<RuntimeState>>`
+//! (not `Rc<RefCell<…>>`) so the closures are `Send`.
+//!
+//! The GCD main queue is serial, so `Mutex` guard contention is impossible
+//! in practice (only one closure runs at a time). The `Mutex` cost is the
+//! price of `Send`-safety across the thread boundary.
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::*;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos {
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
-    use buffr_engine::{
-        OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
-    };
+    use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+
+    use dispatch2::DispatchQueue;
 
     use super::super::error::WebKitCocoaError;
     use super::super::runtime::macos::{TabEntry, TabState};
@@ -91,11 +96,11 @@ pub(crate) mod macos {
 
     // ── RuntimeState (main-thread only) ───────────────────────────────────────
 
-    /// Mutable per-tab WKWebView table. Lives exclusively on the main queue.
+    /// Mutable per-tab WKWebView table. Accessed only from the GCD main queue.
     ///
-    /// TODO(verify-on-mac): `Rc<RefCell<RuntimeState>>` is the right pattern
-    /// because GCD's main queue is serial. If `dispatch2` requires `Send`
-    /// closures, wrap in `Arc<Mutex<…>>` instead.
+    /// Wrapped in `Arc<Mutex<…>>` (not `Rc<RefCell<…>>`) because
+    /// `dispatch2::DispatchQueue::exec_async` requires `Send` closures.
+    /// The GCD main queue is serial so the `Mutex` is never contended.
     struct RuntimeState {
         tabs: Vec<TabEntry>,
         active_idx: Option<usize>,
@@ -433,16 +438,33 @@ pub(crate) mod macos {
         }
     }
 
+    // ── dispatch helpers ──────────────────────────────────────────────────────
+
+    /// Dispatch a closure to the macOS main queue asynchronously.
+    ///
+    /// `DispatchQueue::main()` returns `&'static DispatchQueue`.
+    /// Confirmed: dispatch2-0.3.1/src/queue.rs:108-114.
+    ///
+    /// `DispatchQueue::exec_async<F: FnOnce() + Send + 'static>` confirmed:
+    /// dispatch2-0.3.1/src/queue.rs:134-143.
+    ///
+    /// # Safety
+    ///
+    /// The closure must be `Send + 'static`. All captures must be `Send`
+    /// (i.e. `Arc<Mutex<…>>` rather than `Rc<RefCell<…>>`).
+    fn dispatch_main_async<F: FnOnce() + Send + 'static>(f: F) {
+        // DispatchQueue::main() confirmed: dispatch2/src/queue.rs:108.
+        // exec_async confirmed: dispatch2/src/queue.rs:134.
+        DispatchQueue::main().exec_async(f);
+    }
+
     // ── Worker thread ─────────────────────────────────────────────────────────
 
     /// Spawn the background worker thread.
     ///
-    /// The worker receives `Command`s from the engine. Synchronous queries are
-    /// resolved directly from `EngineState`. Mutations are submitted to the
-    /// main GCD queue via `dispatch_async`.
-    ///
-    /// TODO(verify-on-mac): Confirm `dispatch2::Queue::main()` and
-    /// `Queue::exec_async(…)` API in dispatch2 0.3.
+    /// The worker receives `Command`s from the engine and either:
+    /// - Handles synchronous queries directly from `EngineState` (under Mutex), or
+    /// - Dispatches closures to the GCD main queue for WKWebView mutations.
     pub(crate) fn spawn(
         initial_url: &str,
         width: u32,
@@ -454,48 +476,26 @@ pub(crate) mod macos {
         let (tx, rx) = mpsc::sync_channel::<Command>(64);
         let initial_url = initial_url.to_owned();
 
-        // The `RuntimeState` lives on the main queue. We use a one-shot
-        // mpsc channel to pass it from the main-queue init closure to the
-        // worker thread (which then submits further closures to the main queue).
-        //
-        // TODO(verify-on-mac): This approach assumes that `dispatch_async` on
-        // the main queue executes closures in submission order. GCD guarantees
-        // this for a serial queue. The main queue is always serial.
-        let frame_c = Arc::clone(&frame);
-        let view_c = Arc::clone(&view);
-        let engine_state_c = Arc::clone(&engine_state);
-
-        // Wrap RuntimeState in a thread-safe container for the initial transfer.
-        // After the first dispatch, it lives only in main-queue closures.
-        //
-        // TODO(verify-on-mac): `Rc<RefCell<…>>` is not Send. If dispatch2
-        // requires `Send` closures, switch to `Arc<Mutex<RuntimeState>>`.
-        // The `Rc` pattern is cheaper when the main queue is always serial.
-        // Using a raw pointer transfer (Box::into_raw / Box::from_raw) across
-        // the initial thread boundary is another option. For now we use Arc.
         let rt = Arc::new(Mutex::new(RuntimeState::new(
-            frame_c,
-            view_c,
-            engine_state_c,
+            frame,
+            view,
+            Arc::clone(&engine_state),
         )));
 
         // Submit the initial open_tab to the main queue.
-        // TODO(verify-on-mac): Confirm dispatch2::Queue::main().exec_async(…) API.
         {
             let rt_init = Arc::clone(&rt);
             let url_init = initial_url.clone();
-            unsafe {
-                dispatch_main_async(move || {
-                    if let Ok(mut rt) = rt_init.lock() {
-                        if let Err(e) = rt.open_tab(&url_init) {
-                            tracing::error!("webkit-cocoa worker: initial open_tab failed: {e}");
-                        }
+            dispatch_main_async(move || {
+                if let Ok(mut rt) = rt_init.lock() {
+                    if let Err(e) = rt.open_tab(&url_init) {
+                        tracing::error!("webkit-cocoa worker: initial open_tab failed: {e}");
                     }
-                });
-            }
+                }
+            });
         }
 
-        // Spawn the worker thread that feeds commands to the main queue.
+        // Spawn the worker thread.
         thread::Builder::new()
             .name("buffr-webkit-cocoa-worker".into())
             .spawn(move || {
@@ -520,25 +520,13 @@ pub(crate) mod macos {
         Ok(WorkerHandle { tx })
     }
 
-    /// Dispatch a closure to the macOS main queue.
-    ///
-    /// TODO(verify-on-mac): Confirm that `dispatch2::Queue::main().exec_async`
-    /// accepts a `FnOnce + Send` closure in dispatch2 0.3. If the API uses
-    /// `block2::RcBlock`, the call site changes slightly.
-    unsafe fn dispatch_main_async<F: FnOnce() + Send + 'static>(f: F) {
-        // TODO(verify-on-mac): Replace this placeholder with the real
-        // dispatch2 0.3 API. The call below is a best-guess based on the
-        // dispatch2 README and crate API surface.
-        dispatch2::Queue::main().exec_async(f); // TODO(verify-on-mac)
-    }
-
     fn handle_command(
         cmd: Command,
         rt: &Arc<Mutex<RuntimeState>>,
         engine_state: &Arc<Mutex<EngineState>>,
     ) -> bool {
         match cmd {
-            // ── Synchronous queries read from EngineState ─────────────────────
+            // ── Synchronous queries ───────────────────────────────────────────
             Command::QueryCanGoBack { reply } => {
                 let v = rt.lock().is_ok_and(|r| r.can_go_back());
                 let _ = reply.send(v);
@@ -554,147 +542,119 @@ pub(crate) mod macos {
             // ── Mutations dispatched to main queue ────────────────────────────
             Command::OpenTab { url, reply } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        let result = rt2
-                            .lock()
-                            .map_err(|_| WebKitCocoaError::WorkerGone)
-                            .and_then(|mut r| r.open_tab(&url));
-                        let _ = reply.send(result);
-                    });
-                }
+                dispatch_main_async(move || {
+                    let result = rt2
+                        .lock()
+                        .map_err(|_| WebKitCocoaError::WorkerGone)
+                        .and_then(|mut r| r.open_tab(&url));
+                    let _ = reply.send(result);
+                });
             }
             Command::CloseTab { id, reply } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        let result = rt2
-                            .lock()
-                            .map_err(|_| WebKitCocoaError::WorkerGone)
-                            .and_then(|mut r| r.close_tab(id));
-                        let _ = reply.send(result);
-                    });
-                }
+                dispatch_main_async(move || {
+                    let result = rt2
+                        .lock()
+                        .map_err(|_| WebKitCocoaError::WorkerGone)
+                        .and_then(|mut r| r.close_tab(id));
+                    let _ = reply.send(result);
+                });
             }
             Command::CloseAll => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.close_all();
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.close_all();
+                    }
+                });
             }
             Command::SelectTab { id } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.select_tab(id);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.select_tab(id);
+                    }
+                });
             }
             Command::CycleTab { forward } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.cycle_tab(forward);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.cycle_tab(forward);
+                    }
+                });
             }
             Command::Navigate { url } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.navigate(&url);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.navigate(&url);
+                    }
+                });
             }
             Command::GoBack => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.go_back();
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.go_back();
+                    }
+                });
             }
             Command::GoForward => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.go_forward();
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.go_forward();
+                    }
+                });
             }
             Command::Reload => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.reload();
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.reload();
+                    }
+                });
             }
             Command::Stop => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.stop();
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.stop();
+                    }
+                });
             }
             Command::Resize { width, height } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(mut r) = rt2.lock() {
-                            r.resize(width, height);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.resize(width, height);
+                    }
+                });
             }
             Command::ForcePaint => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(r) = rt2.lock() {
-                            r.request_active_snapshot();
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.request_active_snapshot();
+                    }
+                });
             }
             Command::KeyEvent { event } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(r) = rt2.lock() {
-                            r.dispatch_key_event(event);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.dispatch_key_event(event);
+                    }
+                });
             }
             Command::MouseMove { x, y, modifiers } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(r) = rt2.lock() {
-                            r.dispatch_mouse_move(x, y, modifiers);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.dispatch_mouse_move(x, y, modifiers);
+                    }
+                });
             }
             Command::MouseClick {
                 x,
@@ -705,13 +665,11 @@ pub(crate) mod macos {
                 modifiers,
             } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(r) = rt2.lock() {
-                            r.dispatch_mouse_click(x, y, button, mouse_up, click_count, modifiers);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.dispatch_mouse_click(x, y, button, mouse_up, click_count, modifiers);
+                    }
+                });
             }
             Command::MouseWheel {
                 x,
@@ -721,13 +679,11 @@ pub(crate) mod macos {
                 modifiers,
             } => {
                 let rt2 = Arc::clone(rt);
-                unsafe {
-                    dispatch_main_async(move || {
-                        if let Ok(r) = rt2.lock() {
-                            r.dispatch_mouse_wheel(x, y, delta_x, delta_y, modifiers);
-                        }
-                    });
-                }
+                dispatch_main_async(move || {
+                    if let Ok(r) = rt2.lock() {
+                        r.dispatch_mouse_wheel(x, y, delta_x, delta_y, modifiers);
+                    }
+                });
             }
         }
         false

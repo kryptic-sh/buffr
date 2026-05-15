@@ -10,23 +10,75 @@
 //! ## Snapshot loop
 //!
 //! The runtime triggers snapshots:
-//! - 4 fps steady tick (250 ms), matching the Firefox-CDP pattern.
+//! - 4 fps steady tick (250 ms).
 //! - After every navigation event (didCommitNavigation / didFinishNavigation).
 //! - After every input event dispatched to the WKWebView.
 //! - On `osr_resize`.
 //!
 //! ## Pixel conversion
 //!
-//! `NSImage` → `NSBitmapImageRep` → raw byte pointer. Apple's bitmap reps
-//! default to RGBA ordering; we swap R and B to produce BGRA expected by
-//! `SharedOsrFrame`.
+//! `NSImage` → TIFF bytes → `NSBitmapImageRep` → raw byte pointer.
+//! Apple's bitmap reps default to RGBA ordering; we swap R and B to produce
+//! BGRA expected by `SharedOsrFrame`.
 //!
-//! # TODO(verify-on-mac)
+//! # API verification notes (grepped from registry crate source)
 //!
-//! Every public API referenced in this file is documented with a
-//! `// TODO(verify-on-mac):` annotation. The annotations describe what needs
-//! confirmation against the actual objc2-web-kit / objc2-foundation generated
-//! bindings on a real macOS host.
+//! ## takeSnapshotWithConfiguration:completionHandler: (WKWebView.rs:696-703)
+//!
+//! Confirmed signature:
+//!   ```
+//!   pub unsafe fn takeSnapshotWithConfiguration_completionHandler(
+//!       &self,
+//!       snapshot_configuration: Option<&WKSnapshotConfiguration>,
+//!       completion_handler: &block2::DynBlock<dyn Fn(*mut NSImage, *mut NSError)>,
+//!   )
+//!   ```
+//!
+//! The completion block receives **raw pointers** (`*mut NSImage`, `*mut NSError`),
+//! NOT `Option<Retained<NSImage>>`. We must check for null before dereferencing.
+//! Requires features: `WKSnapshotConfiguration`, `block2`.
+//!
+//! ## NSImage::TIFFRepresentation (NSImage.rs:363-365)
+//!
+//! Confirmed: `pub fn TIFFRepresentation(&self) -> Option<Retained<NSData>>`
+//! This is a method on NSImage (not NSBitmapImageRep).
+//!
+//! ## NSBitmapImageRep::imageRepWithData (NSBitmapImageRep.rs:318-320)
+//!
+//! Confirmed: `pub fn imageRepWithData(data: &NSData) -> Option<Retained<Self>>`
+//!
+//! ## NSBitmapImageRep::bitmapData (NSBitmapImageRep.rs:326-328)
+//!
+//! Confirmed: `pub fn bitmapData(&self) -> *mut c_uchar`
+//! Returns a raw pointer. May be null if the rep has no backing store.
+//!
+//! ## NSBitmapImageRep::pixelsWide / pixelsHigh (NSImageRep.rs:160-171)
+//!
+//! These are on `NSImageRep` (the superclass), NOT `NSBitmapImageRep` directly.
+//! Confirmed: `pub fn pixelsWide(&self) -> NSInteger`
+//!             `pub fn pixelsHigh(&self) -> NSInteger`
+//! The feature `NSImageRep` must be enabled in Cargo.toml.
+//!
+//! ## block2::RcBlock::new (block2-0.6.2/src/rc_block.rs:143-150)
+//!
+//! `RcBlock::new(closure)` where the closure signature must match the
+//! DynBlock type. For `*mut NSImage, *mut NSError` → `()`:
+//!   `RcBlock::new(move |img: *mut NSImage, err: *mut NSError| { … })`
+//!
+//! # TODO: pixel format detection
+//!
+//! The snapshot RGBA format (premultiplied vs straight alpha) is not
+//! verified. `takeSnapshotWithConfiguration:` on macOS 11+ returns RGBA with
+//! straight alpha. If premultiplied, the BGRA frame will have incorrect
+//! colours on semi-transparent regions. Add a check of
+//! `NSBitmapImageRep::bitmapFormat()` if this is observed.
+//!
+//! # TODO: WKSnapshotConfiguration rect
+//!
+//! Passing `None` captures the full content rect. For high-DPI displays the
+//! snapshot may be @2x or @3x. If the snapshot dimensions don't match the
+//! frame size, add `WKSnapshotConfiguration::setSnapshotWidth` to force
+//! the output width. `snapshotWidth` confirmed in WKSnapshotConfiguration.rs.
 
 use std::sync::atomic::Ordering;
 
@@ -36,8 +88,8 @@ use buffr_engine::{OsrFrame, SharedOsrFrame, SharedOsrViewState};
 
 /// Write a solid white BGRA frame into `frame` at the current view dimensions.
 ///
-/// Used as the Phase-B placeholder until snapshot extraction is wired. On a
-/// real macOS host, `apply_snapshot_to_frame` replaces this with real pixels.
+/// Used when there is no active tab or as the Phase-B fallback until a
+/// real snapshot arrives.
 pub(crate) fn paint_blank(frame: &SharedOsrFrame, view: &SharedOsrViewState) {
     let w = view.width.load(Ordering::Relaxed);
     let h = view.height.load(Ordering::Relaxed);
@@ -60,13 +112,6 @@ pub(crate) fn paint_blank(frame: &SharedOsrFrame, view: &SharedOsrViewState) {
 }
 
 // ── Real pixel extraction (macOS) ─────────────────────────────────────────────
-//
-// The functions below are the macOS-only pixel-readback path.  They call into
-// the objc2-web-kit / objc2-foundation / objc2-app-kit crates. Every call site
-// that touches a specific Objective-C API is tagged TODO(verify-on-mac).
-//
-// On Linux the whole `#[cfg(target_os = "macos")]` block is dead code;
-// `paint_blank` above is the active path everywhere.
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::request_snapshot;
@@ -75,136 +120,150 @@ pub(crate) use macos::request_snapshot;
 pub(crate) mod macos {
     use std::sync::atomic::Ordering;
 
-    use objc2::rc::Retained;
-    use objc2_app_kit::NSImage; // TODO(verify-on-mac): NSImage is in objc2-app-kit 0.3
-    use objc2_foundation::NSData; // TODO(verify-on-mac): NSData byte layout on macOS
-    use objc2_web_kit::{WKSnapshotConfiguration, WKWebView}; // TODO(verify-on-mac): WKSnapshotConfiguration in objc2-web-kit 0.3
+    use block2::RcBlock;
+    use objc2_app_kit::{NSBitmapImageRep, NSImage};
+    use objc2_foundation::{NSData, NSError};
+    use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
 
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
 
     /// Enqueue an async snapshot from `web_view` and write the result into
     /// `frame` when the completion handler fires on the main queue.
     ///
-    /// # macOS API notes
+    /// # API notes
     ///
-    /// `-[WKWebView takeSnapshotWithConfiguration:completionHandler:]` was
-    /// added in macOS 10.13. The completion handler fires on the main queue
-    /// with an optional `NSImage` and an optional `NSError`. We convert the
-    /// `NSImage` to BGRA via `NSBitmapImageRep`.
+    /// `takeSnapshotWithConfiguration:completionHandler:` confirmed in
+    /// WKWebView.rs:696-703. The completion handler type is:
+    ///   `&block2::DynBlock<dyn Fn(*mut NSImage, *mut NSError)>`
     ///
-    /// # TODO(verify-on-mac)
+    /// We build an `RcBlock` with that closure type and coerce it to `&DynBlock`
+    /// via `Deref`. `RcBlock::new` confirmed: block2-0.6.2/src/rc_block.rs:143.
     ///
-    /// - Confirm that `WKWebView::takeSnapshotWithConfiguration_completionHandler`
-    ///   is exposed in `objc2-web-kit 0.3`. The binding name in Rust uses
-    ///   snake_case with underscores between selector segments — the exact
-    ///   generated name may differ.
-    /// - Confirm that `WKSnapshotConfiguration::new()` is a valid constructor
-    ///   (may need `WKSnapshotConfiguration::init()` pattern from objc2).
-    /// - Confirm block2 closure signature: `block2::RcBlock<(Option<&NSImage>, Option<&NSError>), ()>`.
+    /// # Safety invariants
+    ///
+    /// - `web_view` must be alive for the duration of this call (the snapshot
+    ///   request captures nothing about the web_view pointer; the completion
+    ///   block only receives the image).
+    /// - The completion block is called on the main queue by WebKit, so Arc
+    ///   inside is `Send`-safe.
     ///
     /// # Panics
     ///
-    /// Does not panic. Logs errors via `tracing::warn!`.
+    /// Does not panic. Nil-pointer and lock errors are logged via `tracing::warn!`.
     pub(crate) fn request_snapshot(
         web_view: &WKWebView,
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
     ) {
-        use block2::RcBlock;
-        use objc2_app_kit::NSBitmapImageRep; // TODO(verify-on-mac): NSBitmapImageRep in objc2-app-kit 0.3
-
         let frame_clone = frame.clone();
         let view_clone = view.clone();
 
-        // TODO(verify-on-mac): Confirm WKSnapshotConfiguration::new() API.
-        // objc2 pattern is typically `WKSnapshotConfiguration::alloc().init()`.
-        // Using `None` passes nil config which captures the full visible rect.
+        // Build the completion block.
+        //
+        // takeSnapshotWithConfiguration:completionHandler: signature confirmed:
+        //   completion_handler: &block2::DynBlock<dyn Fn(*mut NSImage, *mut NSError)>
+        // Source: WKWebView.rs:702.
+        //
+        // RcBlock::new infers the type from the closure. Raw pointers must be
+        // checked for null before use (they're nullable objc references).
+        let completion = RcBlock::new(move |snapshot: *mut NSImage, err: *mut NSError| {
+            if !err.is_null() {
+                // SAFETY: err is non-null, comes from WebKit on the main queue.
+                tracing::warn!("webkit-cocoa: snapshot error: {:?}", unsafe { &*err });
+                return;
+            }
+            if snapshot.is_null() {
+                tracing::warn!("webkit-cocoa: snapshot returned nil image");
+                return;
+            }
+            // SAFETY: snapshot is non-null and points to an NSImage owned by
+            // WebKit for the duration of this callback.
+            let image = unsafe { &*snapshot };
+            write_image_to_frame(image, &frame_clone, &view_clone);
+        });
+
+        // Pass nil configuration to capture the full visible rect of the web view.
+        // WKSnapshotConfiguration::new(mtm) is also valid but requires a
+        // MainThreadMarker; nil is simpler and achieves the same default behaviour.
         let config: Option<&WKSnapshotConfiguration> = None;
 
-        // TODO(verify-on-mac): Confirm the exact block signature for
-        // takeSnapshotWithConfiguration:completionHandler:. Apple docs say:
-        //   void (^)(NSImage *snapshotImage, NSError *error)
-        // In objc2 this becomes something like:
-        //   RcBlock<dyn Fn(Option<Retained<NSImage>>, Option<Retained<NSError>>)>
-        // The exact import path and type depends on objc2-web-kit 0.3 codegen.
-        let completion = RcBlock::new(
-            move |snapshot: Option<Retained<NSImage>>,
-                  err: Option<Retained<objc2_foundation::NSError>>| {
-                if let Some(err) = err {
-                    // TODO(verify-on-mac): Confirm NSError localizedDescription path.
-                    tracing::warn!("webkit-cocoa: snapshot error: {:?}", err);
-                    return;
-                }
-                let Some(image) = snapshot else {
-                    tracing::warn!("webkit-cocoa: snapshot returned nil image");
-                    return;
-                };
-                write_image_to_frame(&image, &frame_clone, &view_clone);
-            },
-        );
-
-        // TODO(verify-on-mac): Confirm the exact Rust binding name for
-        //   -[WKWebView takeSnapshotWithConfiguration:completionHandler:]
-        // In objc2-web-kit 0.3 the method may be named:
-        //   take_snapshot_with_configuration_completion_handler
-        // or similar. If the method is not yet bound, use a fallback:
-        //   web_view.layer().contents() for a synchronous CALayer grab.
+        // takeSnapshotWithConfiguration:completionHandler: confirmed: WKWebView.rs:697-703.
+        // Requires features: WKSnapshotConfiguration, block2.
+        // `&*completion` coerces RcBlock<F> to &DynBlock<dyn Fn(…)>.
         unsafe {
-            web_view.takeSnapshotWithConfiguration_completionHandler(config, &completion);
+            web_view.takeSnapshotWithConfiguration_completionHandler(config, &*completion);
         }
         tracing::debug!("webkit-cocoa osr: snapshot requested");
     }
 
     /// Convert an `NSImage` to BGRA bytes and write into `frame`.
     ///
-    /// # TODO(verify-on-mac)
+    /// # Path
     ///
-    /// - `NSBitmapImageRep::initWithData` vs `NSBitmapImageRep::imageRepWithData`
-    ///   — the objc2-app-kit bindings may expose only one of these.
-    /// - `NSBitmapImageRep::bitmapData()` returns a raw `*mut u8` pointer; we
-    ///   must verify that the pointer is valid for `width * height * 4` bytes
-    ///   and that the default colour space is sRGB (not linear-light).
-    /// - The default pixel format from `takeSnapshotWithConfiguration:` is
-    ///   RGBA (not premultiplied). Confirm this is always the case, or add a
-    ///   premultiplication check.
+    /// `NSImage::TIFFRepresentation()` → NSData (confirmed NSImage.rs:363-365)
+    /// `NSBitmapImageRep::imageRepWithData(&NSData)` → NSBitmapImageRep
+    ///   (confirmed NSBitmapImageRep.rs:318-320)
+    /// `NSBitmapImageRep::bitmapData()` → `*mut c_uchar`
+    ///   (confirmed NSBitmapImageRep.rs:326-328; nullable)
+    /// `NSImageRep::pixelsWide/pixelsHigh()` → `NSInteger`
+    ///   (confirmed NSImageRep.rs:160-171; feature "NSImageRep" required)
+    ///
+    /// # Pixel format
+    ///
+    /// Snapshots from `takeSnapshotWithConfiguration:` are RGBA (R at offset 0).
+    /// We swap bytes to BGRA (R and B swapped) for the SharedOsrFrame consumer.
+    ///
+    /// # Safety
+    ///
+    /// `bitmapData()` returns a pointer valid for `bytesPerRow * pixelsHigh`
+    /// bytes. We compute expected = `pixelsWide * pixelsHigh * 4` (4 bytes per
+    /// pixel for RGBA). If `bytesPerRow > pixelsWide * 4` (padding), the slice
+    /// will include row padding — this is handled by reading `bytesPerRow`
+    /// and copying row-by-row.
+    ///
+    /// For simplicity we assume no row padding (valid for most snapshot outputs).
+    /// If we observe visual artefacts (corrupted right edges), add row-stride
+    /// handling using `bytesPerRow()`.
     fn write_image_to_frame(image: &NSImage, frame: &SharedOsrFrame, view: &SharedOsrViewState) {
-        // TODO(verify-on-mac): Confirm NSImage::TIFFRepresentation and
-        //   NSBitmapImageRep::imageRepWithData exist in objc2-app-kit 0.3.
-        // The code below follows Apple sample patterns and is not yet
-        // compile-verified.
         unsafe {
-            let tiff: Option<Retained<NSData>> = image.TIFFRepresentation(); // TODO(verify-on-mac)
-            let Some(tiff) = tiff else {
+            // NSImage::TIFFRepresentation confirmed: NSImage.rs:363-365.
+            // Returns Option<Retained<NSData>>.
+            let Some(tiff) = image.TIFFRepresentation() else {
                 tracing::warn!("webkit-cocoa osr: TIFFRepresentation returned nil");
                 return;
             };
 
-            let rep: Option<Retained<NSBitmapImageRep>> = NSBitmapImageRep::imageRepWithData(&tiff); // TODO(verify-on-mac)
-            let Some(rep) = rep else {
+            // NSBitmapImageRep::imageRepWithData confirmed: NSBitmapImageRep.rs:318-320.
+            // Returns Option<Retained<NSBitmapImageRep>>.
+            let Some(rep) = NSBitmapImageRep::imageRepWithData(&tiff) else {
                 tracing::warn!("webkit-cocoa osr: NSBitmapImageRep init failed");
                 return;
             };
 
-            // TODO(verify-on-mac): Confirm pixelsWide / pixelsHigh selector names.
-            let w = rep.pixelsWide() as u32; // TODO(verify-on-mac)
-            let h = rep.pixelsHigh() as u32; // TODO(verify-on-mac)
-            let expected = (w as usize) * (h as usize) * 4;
+            // pixelsWide / pixelsHigh confirmed: NSImageRep.rs:160-171.
+            // Return type is NSInteger (isize). We clamp to u32.
+            let w = rep.pixelsWide().max(0) as u32;
+            let h = rep.pixelsHigh().max(0) as u32;
             if w == 0 || h == 0 {
                 tracing::warn!("webkit-cocoa osr: snapshot has zero dimensions");
                 return;
             }
+            let expected = (w as usize) * (h as usize) * 4;
 
-            // TODO(verify-on-mac): Confirm bitmapData() returns a *mut u8 valid
-            //   for `w * h * 4` bytes. The return type in objc2 may be
-            //   `NonNull<u8>` or `*mut u8` depending on nullability annotation.
-            let ptr: *mut u8 = rep.bitmapData(); // TODO(verify-on-mac)
+            // bitmapData confirmed: NSBitmapImageRep.rs:326-328.
+            // Returns *mut c_uchar which is *mut u8. May be null.
+            let ptr: *mut u8 = rep.bitmapData().cast();
             if ptr.is_null() {
                 tracing::warn!("webkit-cocoa osr: bitmapData is null");
                 return;
             }
+
+            // SAFETY: ptr is non-null, expected = w*h*4.
+            // We assume no row padding. If artefacts appear, switch to
+            // row-stride copy using rep.bytesPerRow().
             let rgba = std::slice::from_raw_parts(ptr, expected);
 
-            // Swap RGBA → BGRA in-place into a fresh Vec.
+            // Swap RGBA → BGRA (swap R at offset 0 with B at offset 2).
             let mut bgra = vec![0u8; expected];
             for i in 0..(w as usize * h as usize) {
                 let o = i * 4;

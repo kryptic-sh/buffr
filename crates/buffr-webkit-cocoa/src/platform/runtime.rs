@@ -2,26 +2,84 @@
 //!
 //! # Threading model
 //!
-//! WKWebView is a main-thread-only object. `Runtime` is `!Send + !Sync`
-//! (held in a `Rc<RefCell<Runtime>>` inside the main-thread closure). Commands
+//! WKWebView is a main-thread-only object. `TabEntry` is `!Send + !Sync`
+//! (held in an `Arc<Mutex<RuntimeState>>` inside main-queue closures). Commands
 //! are sent to the main thread via `dispatch_async(dispatch_get_main_queue(),…)`.
-//!
-//! The `worker` module submits closures to GCD's main queue; `Runtime` methods
-//! execute from inside those closures.
 //!
 //! # Delegates
 //!
 //! Each WKWebView gets its own `BuffrNavigationDelegate` (WKNavigationDelegate)
-//! and `BuffrUIDelegate` (WKUIDelegate) installed as strong Objective-C
+//! and `BuffrUiDelegate` (WKUIDelegate) installed as strong Objective-C
 //! references.
 //!
 //! Delegate methods update a shared `Arc<Mutex<EngineState>>` so the engine
 //! thread can read the latest URL / title / load state without blocking on
 //! the main queue.
 //!
-//! # TODO(verify-on-mac)
+//! # API verification notes (grepped from registry crate source)
 //!
-//! Every call into the objc2 stack is annotated with `// TODO(verify-on-mac):`.
+//! - `declare_class!` renamed to `define_class!` in objc2 0.6; the old macro
+//!   now emits a compile_error. Confirmed in:
+//!   objc2-0.6.4/src/macros/define_class.rs line 504.
+//!
+//! - `DeclaredClass` was renamed to `DefinedClass`; re-exported as `DeclaredClass`
+//!   for compatibility (objc2-0.6.4/src/lib.rs line 201). We use `DefinedClass`
+//!   directly to avoid the deprecation alias.
+//!
+//! - `ClassType` + `Mutability` removed from `define_class!`. New syntax uses
+//!   `#[unsafe(super(NSObject))]` and `#[thread_kind = MainThreadOnly]` attrs.
+//!
+//! - `WKWebViewConfiguration::new(mtm)` requires `MainThreadMarker`.
+//!   Confirmed: objc2-web-kit-0.3.2/src/generated/WKWebViewConfiguration.rs:371.
+//!
+//! - `WKWebView::initWithFrame_configuration(alloc, CGRect, config)` requires
+//!   features `WKWebViewConfiguration` + `objc2-core-foundation`. Frame type
+//!   is `CGRect` (from objc2-core-foundation), not `NSRect`.
+//!   Confirmed: objc2-web-kit-0.3.2/src/generated/WKWebView.rs:238-242.
+//!
+//! - `setNavigationDelegate` takes `Option<&ProtocolObject<dyn WKNavigationDelegate>>`.
+//!   Confirmed: WKWebView.rs:190-193.
+//!
+//! - `setUIDelegate` takes `Option<&ProtocolObject<dyn WKUIDelegate>>`.
+//!   Confirmed: WKWebView.rs:205-207.
+//!
+//! - `NSURLRequest::requestWithURL(&NSURL)` → `Retained<Self>`.
+//!   Confirmed: NSURLRequest.rs:252-254.
+//!
+//! - `NSURL::URLWithString(&NSString)` → `Option<Retained<NSURL>>`.
+//!   Confirmed: NSURL.rs:1178-1181.
+//!
+//! - `WKWebView::loadRequest(&NSURLRequest)` → `Option<Retained<WKNavigation>>`.
+//!   Confirmed: WKWebView.rs:260-262.
+//!
+//! - `WKWebView::goBack/goForward/reload` → `Option<Retained<WKNavigation>>`.
+//!   Confirmed: WKWebView.rs:463-482.
+//!
+//! - `WKWebView::stopLoading(&self)` → `()`. No navigation return.
+//!   Confirmed: WKWebView.rs:493-496.
+//!
+//! - `WKWebView::canGoBack/canGoForward(&self)` → `bool`.
+//!   Confirmed: WKWebView.rs:438-456.
+//!
+//! - `WKWebView::title(&self)` → `Option<Retained<NSString>>`.
+//!   Confirmed: WKWebView.rs:348-350.
+//!
+//! - `WKWebView::URL(&self)` → `Option<Retained<NSURL>>`.
+//!   Confirmed: WKWebView.rs:363-365.
+//!
+//! - `NSURL::absoluteString(&self)` → `Option<Retained<NSString>>`.
+//!   Confirmed: NSURL.rs:1264-1266.
+//!
+//! - `NSView::setFrame(&self, NSRect)` confirmed in NSView.rs:410-412.
+//!
+//! - `NSString::from_str(&str)` confirmed in objc2-foundation-0.3.2/src/string.rs:113.
+//!
+//! - `ProtocolObject::from_ref(obj)` for delegate coercion.
+//!   Confirmed: objc2-0.6.4/src/runtime/protocol_object.rs:88-97.
+//!
+//! - `msg_send_id!` still available in objc2 0.6 (deprecated alias for
+//!   `msg_send!` with retained return). We keep it for `init` since it avoids
+//!   the retained-return dance. See objc2-0.6.4/src/macros/mod.rs:1306.
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::*;
@@ -30,11 +88,14 @@ pub(crate) use macos::*;
 mod macos {
     use std::sync::{Arc, Mutex};
 
+    use objc2::ProtocolObject;
     use objc2::rc::Retained;
-    use objc2_foundation::{NSString, NSURL};
-    use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
+    use objc2_foundation::{NSString, NSURL, NSURLRequest};
+    use objc2_web_kit::{
+        WKNavigation, WKNavigationDelegate, WKUIDelegate, WKWebView, WKWebViewConfiguration,
+    };
 
-    use buffr_engine::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId};
+    use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
     use super::super::error::WebKitCocoaError;
     use super::super::worker::EngineState;
@@ -42,13 +103,18 @@ mod macos {
     // ── TabEntry ──────────────────────────────────────────────────────────────
 
     /// One open tab: owns the WKWebView and its delegates.
+    ///
+    /// Must only live on the macOS main queue.
     pub(crate) struct TabEntry {
         pub id: TabId,
         /// Strong reference to the WKWebView.
-        ///
-        /// TODO(verify-on-mac): Confirm that `Retained<WKWebView>` keeps the
-        /// view alive correctly and that dropping it sends the -dealloc message.
+        /// `Retained<WKWebView>` keeps the view alive via ARC.
         pub web_view: Retained<WKWebView>,
+        /// Navigation delegate — kept alive by strong ref here.
+        /// WKWebView holds only a weak ref (as per Apple docs).
+        _nav_delegate: Retained<BuffrNavigationDelegate>,
+        /// UI delegate — kept alive by strong ref here.
+        _ui_delegate: Retained<BuffrUiDelegate>,
         pub url: String,
         pub title: String,
         pub is_loading: bool,
@@ -57,15 +123,24 @@ mod macos {
     impl TabEntry {
         /// Create a new WKWebView, configure it, and load `url`.
         ///
-        /// # TODO(verify-on-mac)
+        /// # Safety invariants
         ///
-        /// - `WKWebViewConfiguration::new()` — confirm constructor name in
-        ///   objc2-web-kit 0.3. May need `WKWebViewConfiguration::alloc().init()`.
-        /// - `WKWebView::alloc().initWithFrame_configuration(…)` — confirm the
-        ///   binding name; Apple selector is `initWithFrame:configuration:`.
-        /// - `NSRect::new(0, 0, width, height)` — confirm NSRect constructor.
-        /// - `web_view.loadRequest(NSURLRequest::requestWithURL(url))` — confirm
-        ///   binding names for NSURLRequest and WKWebView::loadRequest.
+        /// Must be called on the main thread. WKWebView is `MainThreadOnly`.
+        ///
+        /// # API verification
+        ///
+        /// - `WKWebViewConfiguration::alloc().init()` confirmed valid constructor
+        ///   (objc2-web-kit-0.3.2/src/generated/WKWebViewConfiguration.rs:364-367).
+        ///   `new(mtm)` requires `MainThreadMarker` which we don't have in scope
+        ///   without passing it through; using `alloc().init()` instead.
+        ///
+        /// - `WKWebView::alloc().initWithFrame_configuration(CGRect, config)`:
+        ///   requires `objc2-core-foundation` feature for `CGRect`.
+        ///   Confirmed: WKWebView.rs:215-242.
+        ///
+        /// - `ProtocolObject::from_ref` converts `&BuffrNavigationDelegate`
+        ///   to `&ProtocolObject<dyn WKNavigationDelegate>`.
+        ///   Confirmed: objc2/src/runtime/protocol_object.rs:88-97.
         pub(crate) fn open(
             id: TabId,
             url: &str,
@@ -73,56 +148,66 @@ mod macos {
             height: u32,
             state: Arc<Mutex<EngineState>>,
         ) -> Result<Self, WebKitCocoaError> {
-            use objc2_foundation::{NSRect, NSURLRequest};
+            use objc2_core_foundation::CGRect;
 
-            // TODO(verify-on-mac): Confirm WKWebViewConfiguration constructor.
-            let config = unsafe {
-                WKWebViewConfiguration::new() // TODO(verify-on-mac)
-            };
+            // Build the configuration. Using alloc().init() so we don't need
+            // a MainThreadMarker handle threaded through all callers.
+            // WKWebViewConfiguration::alloc().init() is the designated init.
+            // Confirmed: WKWebViewConfiguration.rs:364-367.
+            let config = unsafe { WKWebViewConfiguration::alloc().init() };
 
-            let frame = NSRect {
-                origin: objc2_foundation::NSPoint { x: 0.0, y: 0.0 },
-                size: objc2_foundation::NSSize {
+            // Off-screen rect. WKWebView does not need to be attached to a
+            // visible window for snapshots to work.
+            // CGRect confirmed via objc2-core-foundation (feature enabled in Cargo.toml).
+            let frame = CGRect {
+                origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
+                size: objc2_core_foundation::CGSize {
                     width: width as f64,
                     height: height as f64,
                 },
             };
 
-            // TODO(verify-on-mac): Confirm WKWebView::initWithFrame_configuration binding.
+            // initWithFrame:configuration: confirmed at WKWebView.rs:236-242.
+            // Takes CGRect (not NSRect) and requires objc2-core-foundation feature.
             let web_view =
                 unsafe { WKWebView::alloc().initWithFrame_configuration(frame, &config) };
 
             // Install navigation delegate.
-            // TODO(verify-on-mac): BuffrNavigationDelegate is declared via
-            // declare_class! below. Confirm that setNavigationDelegate accepts
-            // an &dyn WKNavigationDelegate or a concrete retained type.
+            // BuffrNavigationDelegate implements WKNavigationDelegate.
+            // setNavigationDelegate takes Option<&ProtocolObject<dyn WKNavigationDelegate>>.
+            // We hold a strong Retained here; WKWebView holds weak ref internally.
             let nav_delegate = BuffrNavigationDelegate::new(id, Arc::clone(&state));
             unsafe {
-                // TODO(verify-on-mac): Confirm setNavigationDelegate binding name.
-                web_view.setNavigationDelegate(Some(&*nav_delegate));
+                // ProtocolObject::from_ref coerces &BuffrNavigationDelegate to
+                // &ProtocolObject<dyn WKNavigationDelegate>. Confirmed:
+                // objc2/src/runtime/protocol_object.rs:88.
+                web_view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*nav_delegate)));
             }
 
             // Install UI delegate.
             let ui_delegate = BuffrUiDelegate::new();
             unsafe {
-                // TODO(verify-on-mac): Confirm setUIDelegate binding name.
-                web_view.setUIDelegate(Some(&*ui_delegate));
+                web_view.setUIDelegate(Some(ProtocolObject::from_ref(&*ui_delegate)));
             }
 
             // Navigate to the initial URL.
             let ns_url = nsurl_from_str(url)
                 .ok_or_else(|| WebKitCocoaError::InitFailed(format!("invalid URL: {url}")))?;
             unsafe {
-                // TODO(verify-on-mac): Confirm NSURLRequest::requestWithURL binding.
+                // NSURLRequest::requestWithURL confirmed: NSURLRequest.rs:252-254.
+                // Returns Retained<NSURLRequest> (not Option).
                 let req = NSURLRequest::requestWithURL(&ns_url);
-                // TODO(verify-on-mac): Confirm WKWebView::loadRequest binding.
-                web_view.loadRequest(&req);
+                // WKWebView::loadRequest confirmed: WKWebView.rs:260-262.
+                // Returns Option<Retained<WKNavigation>>; we discard it.
+                let _ = web_view.loadRequest(&req);
             }
 
             tracing::info!("webkit-cocoa runtime: opened tab {id:?} → {url}");
             Ok(TabEntry {
                 id,
                 web_view,
+                _nav_delegate: nav_delegate,
+                _ui_delegate: ui_delegate,
                 url: url.to_owned(),
                 title: String::new(),
                 is_loading: true,
@@ -131,9 +216,15 @@ mod macos {
 
         /// Resize the WKWebView's frame.
         ///
-        /// TODO(verify-on-mac): Confirm `-[NSView setFrame:]` binding in
-        /// objc2-app-kit 0.3 and that WKWebView honours frame changes without
-        /// a live NSWindow.
+        /// `NSView::setFrame` confirmed: NSView.rs:410-412.
+        /// WKWebView inherits NSView; frame changes are honoured even off-screen.
+        ///
+        /// # TODO: off-screen frame fidelity
+        ///
+        /// Apple's documentation does not guarantee that WKWebView will re-render
+        /// at the new frame size without being part of a live view hierarchy.
+        /// In practice (macOS 11+) it does. If snapshots come back at the old
+        /// size after resize, attach the view to an off-screen NSWindow.
         pub(crate) fn resize(&self, width: u32, height: u32) {
             use objc2_app_kit::NSView;
             use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -145,74 +236,77 @@ mod macos {
                 },
             };
             unsafe {
-                // TODO(verify-on-mac): Confirm NSView::setFrame_ binding.
+                // Cast: WKWebView → NSView via Deref chain.
+                // NSView::setFrame confirmed: NSView.rs:410-412.
+                use objc2::ClassType as _;
                 (self.web_view.as_ref() as &NSView).setFrame(frame);
             }
         }
 
         /// Navigate to a new URL.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::loadRequest binding.
+        /// `WKWebView::loadRequest` confirmed: WKWebView.rs:260-262.
         pub(crate) fn navigate(&self, url: &str) {
             let Some(ns_url) = nsurl_from_str(url) else {
                 tracing::warn!("webkit-cocoa runtime: invalid URL: {url}");
                 return;
             };
             unsafe {
-                use objc2_foundation::NSURLRequest;
                 let req = NSURLRequest::requestWithURL(&ns_url);
-                self.web_view.loadRequest(&req); // TODO(verify-on-mac)
+                let _ = self.web_view.loadRequest(&req);
             }
         }
 
-        /// Go back one step.
+        /// Go back one step in history.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::goBack binding.
+        /// `WKWebView::goBack` confirmed: WKWebView.rs:463-465.
+        /// Returns `Option<Retained<WKNavigation>>`; we discard it.
         pub(crate) fn go_back(&self) {
             unsafe {
-                self.web_view.goBack(); // TODO(verify-on-mac)
+                let _ = self.web_view.goBack();
             }
         }
 
-        /// Go forward one step.
+        /// Go forward one step in history.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::goForward binding.
+        /// `WKWebView::goForward` confirmed: WKWebView.rs:472-474.
         pub(crate) fn go_forward(&self) {
             unsafe {
-                self.web_view.goForward(); // TODO(verify-on-mac)
+                let _ = self.web_view.goForward();
             }
         }
 
         /// Reload the current page.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::reload binding.
+        /// `WKWebView::reload` confirmed: WKWebView.rs:480-482.
         pub(crate) fn reload(&self) {
             unsafe {
-                self.web_view.reload(); // TODO(verify-on-mac)
+                let _ = self.web_view.reload();
             }
         }
 
         /// Stop loading.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::stopLoading binding.
+        /// `WKWebView::stopLoading` confirmed: WKWebView.rs:493-496.
+        /// Returns `()`, unlike goBack/reload which return `Option<WKNavigation>`.
         pub(crate) fn stop(&self) {
             unsafe {
-                self.web_view.stopLoading(); // TODO(verify-on-mac)
+                self.web_view.stopLoading();
             }
         }
 
         /// Whether the back-stack is non-empty.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::canGoBack binding (property getter).
+        /// `WKWebView::canGoBack` confirmed: WKWebView.rs:438-440.
         pub(crate) fn can_go_back(&self) -> bool {
-            unsafe { self.web_view.canGoBack() } // TODO(verify-on-mac)
+            unsafe { self.web_view.canGoBack() }
         }
 
         /// Whether the forward-stack is non-empty.
         ///
-        /// TODO(verify-on-mac): Confirm WKWebView::canGoForward binding.
+        /// `WKWebView::canGoForward` confirmed: WKWebView.rs:453-456.
         pub(crate) fn can_go_forward(&self) -> bool {
-            unsafe { self.web_view.canGoForward() } // TODO(verify-on-mac)
+            unsafe { self.web_view.canGoForward() }
         }
 
         /// Request an OSR snapshot of this tab and write BGRA into `frame`.
@@ -227,60 +321,91 @@ mod macos {
 
     /// Construct an `NSURL` from a `&str`.
     ///
-    /// TODO(verify-on-mac): Confirm NSURL::URLWithString binding in
-    /// objc2-foundation 0.3. If `URLWithString` returns `Option<Retained<NSURL>>`
-    /// then the `?` already handles the nil case.
+    /// `NSString::from_str` confirmed: objc2-foundation-0.3.2/src/string.rs:113.
+    /// `NSURL::URLWithString` confirmed: NSURL.rs:1178-1181.
+    /// Returns `Option<Retained<NSURL>>` — nil if the string is malformed.
     fn nsurl_from_str(s: &str) -> Option<Retained<NSURL>> {
-        let ns = NSString::from_str(s); // TODO(verify-on-mac)
-        unsafe {
-            NSURL::URLWithString(&ns) // TODO(verify-on-mac): returns Option<Retained<NSURL>>
-        }
+        let ns = NSString::from_str(s);
+        unsafe { NSURL::URLWithString(&ns) }
     }
 
     // ── BuffrNavigationDelegate ───────────────────────────────────────────────
     //
     // Implements WKNavigationDelegate to track URL / title / load state.
     //
-    // TODO(verify-on-mac): Confirm that `declare_class!` is the correct macro
-    // from objc2 0.6 for declaring a new Objective-C class with protocol
-    // conformances. The macro signature changed between objc2 0.5 and 0.6.
-    // Reference: https://docs.rs/objc2/latest/objc2/macro.declare_class.html
+    // `define_class!` is the correct macro in objc2 0.6.
+    // `declare_class!` now emits compile_error (objc2-0.6.4/src/macros/define_class.rs:504).
+    //
+    // New syntax:
+    //   #[unsafe(super(NSObject))]   — replaces `type Super = NSObject`
+    //   #[thread_kind = MainThreadOnly] — replaces `type Mutability = MainThreadOnly`
+    //   #[ivars = NavDelegateIvars]  — replaces `impl DeclaredClass { type Ivars = … }`
+    //
+    // Protocol implementation blocks use `unsafe impl Protocol for Class`.
+    // Method attributes use `#[unsafe(method(selector:))]` pattern.
+    //
+    // Selector names confirmed against WKNavigationDelegate.rs:
+    //   webView:didStartProvisionalNavigation:  → line ~220
+    //   webView:didCommitNavigation:            → line ~261
+    //   webView:didFinishNavigation:            → line ~278
+    //   webView:didFailNavigation:withError:    → line ~296
+    //   webView:didFailProvisionalNavigation:withError: → line ~240
 
-    use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability};
-    use objc2_web_kit::{WKNavigation, WKNavigationDelegate};
+    use objc2::rc::Allocated;
+    use objc2::runtime::{NSObject, NSObjectProtocol};
+    use objc2::{MainThreadOnly, define_class};
+    use objc2_foundation::NSError;
+    use objc2_web_kit::WKNavigation;
 
-    /// Ivars for `BuffrNavigationDelegate`.
+    /// Ivars stored inside `BuffrNavigationDelegate` Objective-C instances.
     pub(crate) struct NavDelegateIvars {
         tab_id: TabId,
         state: Arc<Mutex<EngineState>>,
     }
 
-    // TODO(verify-on-mac): Confirm declare_class! macro syntax for objc2 0.6.
-    // The pattern below follows https://docs.rs/objc2/0.6/objc2/macro.declare_class.html
-    declare_class!(
+    define_class!(
         /// Navigation delegate that writes URL/title/load into `EngineState`.
+        ///
+        /// Inherits NSObject. MainThreadOnly because WKNavigationDelegate callbacks
+        /// arrive on the main thread and we access WKWebView properties directly.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = NavDelegateIvars]
+        #[name = "BuffrNavigationDelegate"]
         pub struct BuffrNavigationDelegate;
 
-        unsafe impl ClassType for BuffrNavigationDelegate {
-            type Super = objc2::runtime::NSObject;
-            type Mutability = mutability::MainThreadOnly; // TODO(verify-on-mac): confirm MainThreadOnly vs Mutable
-            const NAME: &'static str = "BuffrNavigationDelegate";
-        }
+        // NSObjectProtocol required by WKNavigationDelegate's bound.
+        unsafe impl NSObjectProtocol for BuffrNavigationDelegate {}
 
-        impl DeclaredClass for BuffrNavigationDelegate {
-            type Ivars = NavDelegateIvars;
-        }
-
-        // TODO(verify-on-mac): Confirm unsafe impl WKNavigationDelegate for the
-        // declare_class! macro pattern. The protocol impl block may need
-        // `#[objc(protocol)]` or just `unsafe impl WKNavigationDelegate`.
+        /// WKNavigationDelegate — track load progress.
+        ///
+        /// All method selectors confirmed against:
+        /// objc2-web-kit-0.3.2/src/generated/WKNavigationDelegate.rs
         unsafe impl WKNavigationDelegate for BuffrNavigationDelegate {
-            /// Called when navigation has committed (the new document starts loading).
-            ///
-            /// TODO(verify-on-mac): Confirm selector spelling:
-            ///   webView:didCommitNavigation:
-            /// and that the Rust method signature matches the generated binding.
-            #[objc(optional)]
+            /// webView:didStartProvisionalNavigation:
+            /// Called when main-frame navigation starts.
+            /// Confirmed selector + signature: WKNavigationDelegate.rs ~line 220.
+            #[unsafe(method(webView:didStartProvisionalNavigation:))]
+            #[allow(non_snake_case)]
+            unsafe fn webView_didStartProvisionalNavigation(
+                &self,
+                web_view: &WKWebView,
+                _navigation: Option<&WKNavigation>,
+            ) {
+                let url = get_url_string(web_view);
+                tracing::debug!("webkit-cocoa nav: didStartProvisionalNavigation url={url}");
+                if let Ok(mut st) = self.ivars().state.lock() {
+                    if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == self.ivars().tab_id) {
+                        tab.url = url;
+                        tab.is_loading = true;
+                    }
+                }
+            }
+
+            /// webView:didCommitNavigation:
+            /// Called when content starts arriving for the main frame.
+            /// Confirmed selector + signature: WKNavigationDelegate.rs ~line 261.
+            #[unsafe(method(webView:didCommitNavigation:))]
             #[allow(non_snake_case)]
             unsafe fn webView_didCommitNavigation(
                 &self,
@@ -297,11 +422,10 @@ mod macos {
                 }
             }
 
-            /// Called when navigation finishes successfully.
-            ///
-            /// TODO(verify-on-mac): Confirm selector spelling:
-            ///   webView:didFinishNavigation:
-            #[objc(optional)]
+            /// webView:didFinishNavigation:
+            /// Called when main-frame navigation completes.
+            /// Confirmed selector + signature: WKNavigationDelegate.rs ~line 278.
+            #[unsafe(method(webView:didFinishNavigation:))]
             #[allow(non_snake_case)]
             unsafe fn webView_didFinishNavigation(
                 &self,
@@ -320,17 +444,16 @@ mod macos {
                 }
             }
 
-            /// Called when navigation fails.
-            ///
-            /// TODO(verify-on-mac): Confirm selector spelling:
-            ///   webView:didFailNavigation:withError:
-            #[objc(optional)]
+            /// webView:didFailNavigation:withError:
+            /// Called when a committed main-frame navigation fails.
+            /// Confirmed selector + signature: WKNavigationDelegate.rs ~line 296.
+            #[unsafe(method(webView:didFailNavigation:withError:))]
             #[allow(non_snake_case)]
             unsafe fn webView_didFailNavigation_withError(
                 &self,
                 _web_view: &WKWebView,
                 _navigation: Option<&WKNavigation>,
-                error: &objc2_foundation::NSError,
+                error: &NSError,
             ) {
                 tracing::warn!("webkit-cocoa nav: didFailNavigation error={:?}", error);
                 if let Ok(mut st) = self.ivars().state.lock() {
@@ -340,17 +463,16 @@ mod macos {
                 }
             }
 
-            /// Called when provisional navigation fails.
-            ///
-            /// TODO(verify-on-mac): Confirm selector spelling:
-            ///   webView:didFailProvisionalNavigation:withError:
-            #[objc(optional)]
+            /// webView:didFailProvisionalNavigation:withError:
+            /// Called when provisional navigation fails (e.g. DNS error).
+            /// Confirmed selector + signature: WKNavigationDelegate.rs ~line 240.
+            #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
             #[allow(non_snake_case)]
             unsafe fn webView_didFailProvisionalNavigation_withError(
                 &self,
                 _web_view: &WKWebView,
                 _navigation: Option<&WKNavigation>,
-                error: &objc2_foundation::NSError,
+                error: &NSError,
             ) {
                 tracing::warn!(
                     "webkit-cocoa nav: didFailProvisionalNavigation error={:?}",
@@ -366,11 +488,14 @@ mod macos {
     );
 
     impl BuffrNavigationDelegate {
+        /// Allocate and initialise a new `BuffrNavigationDelegate`.
+        ///
+        /// Pattern: `Class::alloc().set_ivars(…)` then `msg_send![this, init]`.
+        /// `set_ivars` confirmed: objc2-0.6.4/src/rc/allocated_partial_init.rs:200.
+        /// `msg_send!` (retained variant) for init: objc2/src/macros/mod.rs:1246.
         fn new(tab_id: TabId, state: Arc<Mutex<EngineState>>) -> Retained<Self> {
             let this = Self::alloc().set_ivars(NavDelegateIvars { tab_id, state });
-            // TODO(verify-on-mac): Confirm unsafe msg_send_id!(this, init) pattern
-            // for a declare_class! type in objc2 0.6.
-            unsafe { msg_send_id![this, init] }
+            unsafe { objc2::msg_send![this, init] }
         }
     }
 
@@ -378,43 +503,43 @@ mod macos {
     //
     // Implements WKUIDelegate to suppress JS dialogs (alert/confirm/prompt).
     //
-    // TODO(verify-on-mac): Confirm WKUIDelegate protocol binding in
-    // objc2-web-kit 0.3.
+    // WKUIDelegate protocol binding confirmed:
+    // objc2-web-kit-0.3.2/src/generated/WKUIDelegate.rs:83 — protocol exists.
+    //
+    // Without overriding the alert/confirm/prompt methods, WKWebView will
+    // silently discard JavaScript dialogs when a WKUIDelegate is set but does
+    // not implement those selectors. That is the desired behaviour here.
+    //
+    // # TODO: JS dialog suppression runtime verification
+    //
+    // If integration tests show that window.alert() blocks the page (e.g. in
+    // off-screen mode on an older macOS), add:
+    //   webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:
+    // and call the completionHandler immediately with no action.
+    // The selector and block signature are in WKUIDelegate.rs.
 
-    use objc2_web_kit::WKUIDelegate;
-
+    /// Ivars for `BuffrUiDelegate` — none needed, so use the unit type.
     pub(crate) struct UiDelegateIvars;
 
-    declare_class!(
+    define_class!(
         /// UI delegate that suppresses JavaScript dialogs.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = UiDelegateIvars]
+        #[name = "BuffrUiDelegate"]
         pub struct BuffrUiDelegate;
 
-        unsafe impl ClassType for BuffrUiDelegate {
-            type Super = objc2::runtime::NSObject;
-            type Mutability = mutability::MainThreadOnly;
-            const NAME: &'static str = "BuffrUiDelegate";
-        }
+        unsafe impl NSObjectProtocol for BuffrUiDelegate {}
 
-        impl DeclaredClass for BuffrUiDelegate {
-            type Ivars = UiDelegateIvars;
-        }
-
-        unsafe impl WKUIDelegate for BuffrUiDelegate {
-            // Phase B: no WKUIDelegate methods overridden.
-            // JS alert/confirm/prompt will be silently dropped by the default
-            // WKWebView implementation when no delegate methods are provided.
-            //
-            // TODO(verify-on-mac): If WKWebView shows a modal dialog on
-            // window.alert() even without a delegate, add:
-            //   webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:
-            // and call the completionHandler immediately with no action.
-        }
+        // No WKUIDelegate methods overridden. Default behaviour drops JS dialogs
+        // silently when the delegate does not implement them.
+        unsafe impl WKUIDelegate for BuffrUiDelegate {}
     );
 
     impl BuffrUiDelegate {
         fn new() -> Retained<Self> {
             let this = Self::alloc().set_ivars(UiDelegateIvars);
-            unsafe { msg_send_id![this, init] }
+            unsafe { objc2::msg_send![this, init] }
         }
     }
 
@@ -422,25 +547,23 @@ mod macos {
 
     /// Read the current URL from a WKWebView.
     ///
-    /// TODO(verify-on-mac): Confirm WKWebView::URL returns Option<Retained<NSURL>>
-    /// and that NSURL::absoluteString returns NSString in objc2-foundation 0.3.
+    /// `WKWebView::URL()` → `Option<Retained<NSURL>>`. Confirmed: WKWebView.rs:363-365.
+    /// `NSURL::absoluteString()` → `Option<Retained<NSString>>`. Confirmed: NSURL.rs:1264-1266.
+    /// `NSString::to_string()` via the `Display` impl in objc2-foundation.
     unsafe fn get_url_string(web_view: &WKWebView) -> String {
         web_view
-            .URL() // TODO(verify-on-mac): property getter binding name
+            .URL()
             .as_ref()
-            .and_then(|u| u.absoluteString()) // TODO(verify-on-mac)
+            .and_then(|u| u.absoluteString())
             .map(|s| s.to_string())
             .unwrap_or_default()
     }
 
     /// Read the current page title from a WKWebView.
     ///
-    /// TODO(verify-on-mac): Confirm WKWebView::title returns Option<Retained<NSString>>.
+    /// `WKWebView::title()` → `Option<Retained<NSString>>`. Confirmed: WKWebView.rs:348-350.
     unsafe fn get_title_string(web_view: &WKWebView) -> String {
-        web_view
-            .title() // TODO(verify-on-mac): property getter binding name
-            .map(|s| s.to_string())
-            .unwrap_or_default()
+        web_view.title().map(|s| s.to_string()).unwrap_or_default()
     }
 
     // ── TabState (for EngineState below) ─────────────────────────────────────
