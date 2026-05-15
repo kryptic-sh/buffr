@@ -799,15 +799,19 @@
         <div class="badges">
           <span class="badge live">● __VERSION__</span>
           <span class="badge">MIT</span>
-          <span class="badge">Rust + CEF</span>
+          <span class="badge">Rust + CEF + blink-cdp</span>
         </div>
         <h1>
           Vim-inspired<br />
           <span class="grad">browser.</span>
         </h1>
-        <p class="tagline">Native, GPU-accelerated. Rust + CEF.</p>
+        <p class="tagline">
+          Native, GPU-accelerated. Rust on top of CEF or headless Chromium —
+          your choice, per domain.
+        </p>
         <p class="tagline" style="color: var(--fg-muted); font-size: 16px">
-          Chromium rendering without an Electron-shaped layer above it.
+          Chromium rendering without an Electron-shaped layer above it. Two
+          backends behind one <code>BrowserEngine</code> trait, picked per tab.
         </p>
 
         <div class="cta">
@@ -888,11 +892,14 @@
             </p>
           </div>
           <div class="feat">
-            <div class="icon">03 — RENDER</div>
-            <h4>Rust + CEF</h4>
+            <div class="icon">03 — ENGINE</div>
+            <h4>Two backends, one trait</h4>
             <p>
-              Chromium rendering, native window, native fonts. No Electron, no
-              JVM, no webview wrapper.
+              <code>buffr-engine</code> defines the
+              <code>BrowserEngine</code> trait; <code>buffr-cef</code> wraps
+              Chromium Embedded Framework, <code>buffr-blink-cdp</code> drives
+              headless Chromium over CDP. Per-domain rules pick the engine per
+              tab — tab-strip badge shows <code>BL</code> or <code>CE</code>.
             </p>
           </div>
           <div class="feat">
@@ -900,11 +907,34 @@
             <h4>GPU-accelerated</h4>
             <p>
               Compositing on the GPU. Smooth scroll, fast paint, low-latency
-              input.
+              input. Async render thread keeps Wayland resize backpressure
+              honest.
             </p>
           </div>
           <div class="feat">
-            <div class="icon">05 — INTERACTION</div>
+            <div class="icon">05 — ISOLATION</div>
+            <h4>Per-engine on-disk layout</h4>
+            <p>
+              Each engine instance gets its own
+              <code>~/.cache/buffr/engines/&lt;id&gt;/</code> +
+              <code>~/.local/share/buffr/engines/&lt;id&gt;/profile/</code>.
+              Distinct cookies, cache, IndexedDB. Auto-migrates pre-0.11
+              profiles on first launch.
+            </p>
+          </div>
+          <div class="feat">
+            <div class="icon">06 — PARITY</div>
+            <h4>Permissions · downloads · find · IME · PiP</h4>
+            <p>
+              blink-cdp tabs handle geolocation/notifications/mic/camera
+              prompts, downloads with progress, <code>/</code> find-in-page,
+              context-menu hit-test, IME composition, and
+              <code>HTMLVideoElement.requestPictureInPicture</code> — same
+              status-line UX as CEF.
+            </p>
+          </div>
+          <div class="feat">
+            <div class="icon">07 — INTERACTION</div>
             <h4>Mouse + keyboard</h4>
             <p>
               Both, always. Power users get keys. Everyone else gets mice.
@@ -912,9 +942,13 @@
             </p>
           </div>
           <div class="feat">
-            <div class="icon">06 — PRIVACY</div>
+            <div class="icon">08 — PRIVACY</div>
             <h4>Zero telemetry</h4>
-            <p>No analytics. No phone-home. Your browsing, your business.</p>
+            <p>
+              No analytics. No phone-home.
+              <code>--private</code> mode tears down all engine profiles into a
+              per-pid temp tree on exit.
+            </p>
           </div>
         </div>
       </section>
