@@ -21,6 +21,9 @@ path = "src/main.rs"
 buffr-engine.workspace = true
 buffr-cef.workspace = true
 buffr-blink-cdp.workspace = true
+buffr-firefox-cdp.workspace = true
+buffr-blitz.workspace = true
+buffr-ladybird.workspace = true
 buffr-core.workspace = true
 buffr-history.workspace = true
 buffr-bookmarks.workspace = true
@@ -61,7 +64,14 @@ proptest = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+buffr-webkitgtk.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+buffr-webkit-cocoa.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+buffr-webview2.workspace = true
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

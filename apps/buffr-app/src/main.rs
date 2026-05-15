@@ -458,6 +458,13 @@ struct Cli {
     #[cfg(target_os = "linux")]
     #[arg(long)]
     x11: bool,
+    /// Override the default engine backend for this run. Synthesises a single
+    /// instance with the chosen backend and routes every tab through it,
+    /// ignoring `[engines]` config. Valid values: cef, blink-cdp, firefox-cdp,
+    /// webkit-cocoa (macOS only), webkitgtk (Linux only), webview2 (Windows
+    /// only), blitz, ladybird.
+    #[arg(long, value_name = "NAME")]
+    engine: Option<String>,
     /// URLs to open. Each becomes a new tab. When another buffr instance is
     /// already running on the same profile, these are forwarded to it and
     /// this process exits 0. Combined with `--new-tab` URLs for forwarding.
@@ -508,6 +515,33 @@ fn main() -> Result<()> {
     let backend: Arc<dyn Backend> = Arc::new(cef_backend);
 
     let cli = Cli::parse();
+
+    // -------- --engine validation (before CEF init) ------------------
+    if let Some(raw) = cli.engine.as_deref() {
+        const VALID: &[&str] = &[
+            "cef",
+            "blink-cdp",
+            "firefox-cdp",
+            "webkit-cocoa",
+            "webkitgtk",
+            "webview2",
+            "blitz",
+            "ladybird",
+        ];
+        let chosen = raw.to_lowercase();
+        if chosen == "servo" {
+            anyhow::bail!(
+                "--engine servo: servo is outside the workspace and cannot be used from buffr-app"
+            );
+        }
+        if !VALID.contains(&chosen.as_str()) {
+            anyhow::bail!(
+                "--engine {}: unknown backend. Valid values: {}",
+                chosen,
+                VALID.join(", ")
+            );
+        }
+    }
 
     // -------- short-circuit modes (no CEF init) ----------------------
     if cli.check_config {
@@ -970,7 +1004,28 @@ fn main() -> Result<()> {
     });
 
     let search_config = Arc::new(config.search.clone());
-    let engines_config = Arc::new(config.engines.clone());
+
+    // -------- --engine override ----------------------------------------
+    //
+    // When the user passes `--engine <NAME>`, throw away the on-disk
+    // `[engines]` config and synthesise a single instance with the chosen
+    // backend. Rules are cleared — the override is exclusive. Validation
+    // already happened early; cli.engine here is guaranteed valid.
+    let engines_config: Arc<buffr_config::Engines> = if let Some(raw) = cli.engine.as_deref() {
+        let chosen = raw.to_lowercase();
+        info!(backend = %chosen, "--engine override: ignoring [engines] config");
+        Arc::new(buffr_config::Engines {
+            default: chosen.clone(),
+            instances: vec![buffr_config::EngineInstance {
+                id: chosen.clone(),
+                backend: chosen,
+                data_dir: None,
+            }],
+            rules: Vec::new(),
+        })
+    } else {
+        Arc::new(config.engines.clone())
+    };
 
     // -------- session restore -----------------------------------------
     //
@@ -7220,6 +7275,301 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             warn!(engine_id = %inst.id, error = %err, "failed to create blink-cdp engine");
                         }
                     }
+                }
+                "firefox-cdp" => {
+                    let profile_dir = inst
+                        .data_dir
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                        });
+                    tracing::debug!(?profile_dir, "firefox-cdp profile dir");
+                    match buffr_firefox_cdp::FirefoxCdpEngine::new(&profile_dir, self.private) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "firefox-cdp engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create firefox-cdp engine");
+                        }
+                    }
+                }
+                "blitz" => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => {
+                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                            }
+                        });
+                    let options = buffr_engine::BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
+                        find_sink: None,
+                        sinks: Box::new(()),
+                    };
+                    match buffr_blitz::BlitzEngine::new(&options) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "blitz engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create blitz engine");
+                        }
+                    }
+                }
+                "ladybird" => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => {
+                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                            }
+                        });
+                    let options = buffr_engine::BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
+                        find_sink: None,
+                        sinks: Box::new(()),
+                    };
+                    match buffr_ladybird::LadybirdEngine::new(&options) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "ladybird engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create ladybird engine");
+                        }
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                "webkitgtk" => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => {
+                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                            }
+                        });
+                    let options = buffr_engine::BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
+                        find_sink: None,
+                        sinks: Box::new(()),
+                    };
+                    match buffr_webkitgtk::WebKitGtkEngine::new(&options) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "webkitgtk engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create webkitgtk engine");
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                "webkitgtk" => {
+                    warn!(engine_id = %inst.id, "webkitgtk is only supported on Linux — skipping");
+                }
+                #[cfg(target_os = "macos")]
+                "webkit-cocoa" => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => {
+                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                            }
+                        });
+                    let options = buffr_engine::BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
+                        find_sink: None,
+                        sinks: Box::new(()),
+                    };
+                    match buffr_webkit_cocoa::WebKitCocoaEngine::new(&options) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "webkit-cocoa engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create webkit-cocoa engine");
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                "webkit-cocoa" => {
+                    warn!(engine_id = %inst.id, "webkit-cocoa is only supported on macOS — skipping");
+                }
+                #[cfg(target_os = "windows")]
+                "webview2" => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => {
+                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                            }
+                        });
+                    let options = buffr_engine::BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
+                        find_sink: None,
+                        sinks: Box::new(()),
+                    };
+                    match buffr_webview2::WebView2Engine::new(&options) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "webview2 engine created");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create webview2 engine");
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                "webview2" => {
+                    warn!(engine_id = %inst.id, "webview2 is only supported on Windows — skipping");
                 }
                 other => {
                     warn!(backend = %other, engine_id = %inst.id, "unknown engine backend — skipping");
