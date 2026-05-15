@@ -33,6 +33,44 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+/// Maximum number of URLs accepted in a single [`ForwardPayload`].
+const MAX_FORWARD_URLS: usize = 100;
+/// Maximum byte length of a single forwarded URL.
+const MAX_FORWARD_URL_LEN: usize = 1024;
+
+/// URL schemes that are safe to forward from an external process invocation.
+///
+/// `javascript:` and `data:` are excluded: they could be used to trigger
+/// script execution or navigate to attacker-controlled content via the IPC
+/// socket. Programmatic navigations from within the app are not routed
+/// through this path.
+const ALLOWED_FORWARD_SCHEMES: &[&str] = &[
+    "http",
+    "https",
+    "file",
+    "ftp",
+    "ftps",
+    "about",
+    "chrome",
+    "view-source",
+    "mailto",
+    "buffr",
+];
+
+/// Validate a single URL received over the IPC socket.
+///
+/// Returns `true` when the URL is safe to forward to the running instance.
+fn is_safe_forward_url(url: &str) -> bool {
+    if url.len() > MAX_FORWARD_URL_LEN {
+        return false;
+    }
+    match url::Url::parse(url) {
+        Ok(parsed) => ALLOWED_FORWARD_SCHEMES.contains(&parsed.scheme()),
+        // Unparseable URLs are rejected.
+        Err(_) => false,
+    }
+}
+
 /// Payload sent from a forwarding (secondary) invocation to the singleton.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ForwardPayload {
@@ -288,10 +326,26 @@ pub fn spawn_accept_thread(
                     count = payload.urls.len(),
                     "single_instance: received forwarded URLs"
                 );
+                // Enforce caps and scheme allow-list before forwarding.
+                let capped: Vec<String> = payload.urls.into_iter().take(MAX_FORWARD_URLS).collect();
+                let safe_urls: Vec<String> = capped
+                    .into_iter()
+                    .filter(|u| {
+                        if is_safe_forward_url(u) {
+                            true
+                        } else {
+                            warn!(url = %u, "single_instance: dropping forwarded URL with disallowed scheme or length");
+                            false
+                        }
+                    })
+                    .collect();
+                if safe_urls.is_empty() {
+                    warn!("single_instance: all forwarded URLs were rejected — skipping event");
+                    let _ = stream.write_all(b"OK\n");
+                    continue;
+                }
                 // Send event to the winit loop.
-                if let Err(e) =
-                    proxy.send_event(crate::BuffrUserEvent::OpenUrls(payload.urls))
-                {
+                if let Err(e) = proxy.send_event(crate::BuffrUserEvent::OpenUrls(safe_urls)) {
                     warn!(error = %e, "single_instance: proxy.send_event failed (loop closed?)");
                 }
                 // Ack.
@@ -308,7 +362,7 @@ pub fn spawn_accept_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::profile_id_from;
+    use super::{MAX_FORWARD_URL_LEN, is_safe_forward_url, profile_id_from};
 
     // ---- Group 2: profile_id sha256 derivation ------------------------------
     //
@@ -371,5 +425,52 @@ mod tests {
             id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
             "non-hex char in long-path id: {id}"
         );
+    }
+
+    // ── Security: IPC URL validation ─────────────────────────────────────────
+
+    #[test]
+    fn safe_forward_url_allows_http_and_https() {
+        assert!(is_safe_forward_url("https://example.com/page"));
+        assert!(is_safe_forward_url("http://localhost:3000"));
+        assert!(is_safe_forward_url("http://192.168.1.1:8080/path"));
+    }
+
+    #[test]
+    fn safe_forward_url_rejects_javascript_scheme() {
+        assert!(
+            !is_safe_forward_url("javascript:alert(1)"),
+            "javascript: must be rejected"
+        );
+        assert!(!is_safe_forward_url("javascript:void(0)"));
+    }
+
+    #[test]
+    fn safe_forward_url_rejects_data_scheme() {
+        assert!(
+            !is_safe_forward_url("data:text/html,<script>xss</script>"),
+            "data: must be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_forward_url_rejects_overlong_urls() {
+        let long = format!("https://example.com/{}", "a".repeat(MAX_FORWARD_URL_LEN));
+        assert!(
+            !is_safe_forward_url(&long),
+            "URLs over MAX_FORWARD_URL_LEN must be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_forward_url_rejects_unparseable() {
+        assert!(!is_safe_forward_url("not a url at all"));
+        assert!(!is_safe_forward_url(""));
+    }
+
+    #[test]
+    fn safe_forward_url_allows_file_and_mailto() {
+        assert!(is_safe_forward_url("file:///etc/hosts"));
+        assert!(is_safe_forward_url("mailto:user@example.com"));
     }
 }

@@ -2825,6 +2825,7 @@ impl AppState {
         let target_id = match verdict {
             engine_router::NavigationVerdict::SameEngine => return,
             engine_router::NavigationVerdict::CrossEngine { target } => target,
+            engine_router::NavigationVerdict::DisallowedScheme => return,
         };
         tracing::debug!(
             url = %url,
@@ -7900,7 +7901,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
 
-                let host = self.active_engine_dyn().unwrap();
+                let Some(host) = self.active_engine_dyn() else {
+                    // No active engine yet (startup race) — silently discard the event.
+                    return;
+                };
                 let (dx, dy, is_pixel) = winit_wheel_to_cef_delta(&delta);
                 if is_pixel {
                     // Track velocity only for high-res input; discrete
