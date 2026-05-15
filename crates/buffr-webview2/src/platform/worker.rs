@@ -58,7 +58,7 @@ use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebView2Error;
 use super::input::WebView2InputEvent;
-use super::osr::paint_blank;
+use super::osr::{paint_blank, request_capture};
 use super::runtime::TabEntry;
 
 // ── EngineState (thread-safe snapshot) ────────────────────────────────────────
@@ -98,6 +98,12 @@ impl EngineState {
         self.tabs.iter().map(|t| t.to_summary()).collect()
     }
 }
+
+/// Shared in-flight flag for `CapturePreview` — prevents overlapping captures.
+///
+/// Cloned into the `CapturePreviewCompletedHandler` closure in `osr.rs` and
+/// also held by `StaRuntime`. Both sides share the same `Arc<Mutex<bool>>`.
+pub(crate) type CaptureInFlight = std::sync::Arc<std::sync::Mutex<bool>>;
 
 /// Lightweight per-tab info mirrored from the STA thread.
 #[derive(Clone)]
@@ -157,6 +163,12 @@ pub(crate) enum Command {
         height: u32,
     },
     ForcePaint,
+    /// Trigger a `CapturePreview` on the active tab's webview (fire-and-forget).
+    ///
+    /// Posted by the NavigationCompleted event handler after a page load finishes.
+    /// The STA worker calls `request_capture` on the active tab if available and
+    /// no capture is already in-flight.
+    TriggerCapture,
     /// Dispatch an input event on the STA thread.
     ///
     /// Fire-and-forget: no reply channel. Input events return `()` on the
@@ -210,10 +222,18 @@ struct StaRuntime {
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
     engine_state: Arc<Mutex<EngineState>>,
+    /// Sender half of the STA command channel. Passed into `TabEntry::new` so
+    /// that event handlers (e.g. NavigationCompleted) can post `TriggerCapture`
+    /// back to the STA worker loop.
+    cmd_tx: mpsc::SyncSender<Command>,
     /// Shared WebView2 environment. Constructed once at worker startup via
     /// `CreateCoreWebView2EnvironmentWithOptions`.
     #[cfg(target_os = "windows")]
     environment: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+    /// In-flight guard for `CapturePreview` — shared with the completion handler
+    /// closure in `osr.rs`. `true` while a capture is pending; cleared by the
+    /// completion handler regardless of success or failure.
+    capture_in_flight: CaptureInFlight,
 }
 
 impl StaRuntime {
@@ -236,7 +256,7 @@ impl StaRuntime {
             st.next_tab_id()
         };
         #[cfg(target_os = "windows")]
-        let entry = TabEntry::new(id, url, &self.engine_state, &self.environment)?;
+        let entry = TabEntry::new(id, url, &self.engine_state, &self.environment, &self.cmd_tx)?;
         #[cfg(not(target_os = "windows"))]
         let entry = TabEntry::new(id, url, &self.engine_state);
         self.tabs.push(entry);
@@ -343,6 +363,21 @@ impl StaRuntime {
     }
 
     fn paint(&self) {
+        // On Windows: if there is an active tab with a ready webview, request
+        // a CapturePreview screenshot. Fall back to paint_blank when no tab is
+        // available or when running on a non-Windows host (stub path).
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(tab) = self.active_tab() {
+                request_capture(
+                    tab.webview(),
+                    Arc::clone(&self.frame),
+                    Arc::clone(&self.view),
+                    Arc::clone(&self.capture_in_flight),
+                );
+                return;
+            }
+        }
         paint_blank(&self.frame, &self.view);
     }
 
@@ -399,6 +434,9 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
             rt.resize(width, height);
         }
         Command::ForcePaint => {
+            rt.paint();
+        }
+        Command::TriggerCapture => {
             rt.paint();
         }
         Command::SendInput(event) => {
@@ -652,6 +690,9 @@ pub(crate) fn spawn(
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<WorkerHandle, WebView2Error> {
     let (tx, rx) = mpsc::sync_channel::<Command>(64);
+    // Clone before the closure captures `tx` so the WorkerHandle can hold a
+    // sender to the same channel.
+    let tx_for_handle = tx.clone();
     let initial_url = initial_url.to_owned();
 
     // Report startup errors back to the calling thread via a oneshot.
@@ -740,7 +781,9 @@ pub(crate) fn spawn(
                 frame: Arc::clone(&frame),
                 view: Arc::clone(&view),
                 engine_state: Arc::clone(&engine_state),
+                cmd_tx: tx.clone(),
                 environment,
+                capture_in_flight: std::sync::Arc::new(std::sync::Mutex::new(false)),
             };
 
             #[cfg(not(target_os = "windows"))]
@@ -779,13 +822,17 @@ pub(crate) fn spawn(
                     TranslateMessage, WM_QUIT, WM_TIMER,
                 };
 
-                // WM_TIMER ID used to trigger command draining.
+                // WM_TIMER ID for 10 ms command-drain tick.
                 const CMD_TIMER_ID: usize = 1;
-                // A synthetic HWND=None routes the timer message to the thread
-                // queue rather than a window proc.
-                // SAFETY: SetTimer with HWND(0) posts WM_TIMER to the thread
-                // message queue. Interval is 10 ms.
+                // WM_TIMER ID for 250 ms OSR CapturePreview tick.
+                const OSR_TIMER_ID: usize = 2;
+
+                // SAFETY: SetTimer with HWND(None) posts WM_TIMER to the
+                // thread message queue. CMD_TIMER_ID fires every 10 ms to drain
+                // the command channel. OSR_TIMER_ID fires every 250 ms (4 fps
+                // steady tick) to trigger CapturePreview captures.
                 unsafe { SetTimer(None, CMD_TIMER_ID, 10, None) };
+                unsafe { SetTimer(None, OSR_TIMER_ID, 250, None) };
 
                 let mut msg = MSG::default();
                 'pump: loop {
@@ -824,8 +871,11 @@ pub(crate) fn spawn(
                                         }
                                     }
                                 }
-                                // 250 ms blank-frame tick (every 25 timer iters).
-                                // TODO(osr-capture): replace with CapturePreview.
+                            } else if msg.message == WM_TIMER && msg.wParam.0 == OSR_TIMER_ID {
+                                // 250 ms CapturePreview steady tick.
+                                // `paint()` calls `request_capture` on the active
+                                // tab if one is ready; in-flight flag prevents
+                                // overlapping captures.
                                 runtime.paint();
                             } else if msg.message == WM_QUIT {
                                 break 'pump;
@@ -842,10 +892,9 @@ pub(crate) fn spawn(
                 }
 
                 // SAFETY: KillTimer paired with SetTimer above.
-                // SAFETY: KillTimer paired with SetTimer above. Return value is
-                // a success boolean; we ignore it as there's nothing to recover.
                 unsafe {
                     let _ = KillTimer(None, CMD_TIMER_ID);
+                    let _ = KillTimer(None, OSR_TIMER_ID);
                 };
             }
 
@@ -860,5 +909,5 @@ pub(crate) fn spawn(
         .recv_timeout(Duration::from_secs(30))
         .map_err(|_| WebView2Error::InitFailed("worker init timed out".into()))??;
 
-    Ok(WorkerHandle { tx })
+    Ok(WorkerHandle { tx: tx_for_handle })
 }

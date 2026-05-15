@@ -998,6 +998,7 @@ name = "buffr-webview2"
 version = "0.1.0"
 dependencies = [
  "buffr-engine",
+ "image",
  "thiserror 2.0.18",
  "tracing",
  "webview2-com",

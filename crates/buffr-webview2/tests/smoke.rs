@@ -237,6 +237,44 @@ fn osr_input_dispatch_stub_path_no_panic() {
     assert!(result.is_err(), "stub must return Err on non-Windows");
 }
 
+/// OSR frame must contain at least one non-white pixel after CapturePreview
+/// has had time to run on a page with a non-white background.
+///
+/// Opens a real WebView2 engine on `data:text/html,<body style="background:lime">`,
+/// waits 1 second for the 250 ms OSR timer and NavigationCompleted trigger to
+/// fire at least once, then asserts that at least one BGRA pixel is not solid
+/// white `(0xff, 0xff, 0xff, 0xff)`.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires WebView2 Runtime + Windows host"]
+fn osr_frame_not_all_white_after_capture() {
+    use buffr_engine::BrowserEngine;
+    use std::sync::Arc;
+
+    let backend = WebView2Backend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("data:text/html,<body style=\"background:lime\">"))
+        .expect("open_engine");
+
+    // Allow the NavigationCompleted trigger and at least two 250 ms OSR ticks
+    // to fire, giving CapturePreview time to complete.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let frame = engine.osr_frame();
+    let guard = frame.lock().expect("osr_frame lock");
+    let has_non_white = guard
+        .pixels
+        .chunks_exact(4)
+        .any(|px| px != [0xff, 0xff, 0xff, 0xff]);
+
+    assert!(
+        has_non_white,
+        "OSR frame must contain at least one non-white BGRA pixel after CapturePreview; \
+         frame size: {}×{}, generation: {}",
+        guard.width, guard.height, guard.generation
+    );
+}
+
 /// `navigate` errors propagate via the reply channel — not silently discarded.
 /// Drop the engine (which shuts down the worker) then verify that a navigate
 /// call on a freshly-killed worker is an Err, not a silent Ok.
