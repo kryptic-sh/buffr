@@ -37,6 +37,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use buffr_core::hint::{
+    DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HintAlphabet, HintSession, build_inject_script,
+    take_hint_event,
+};
 use buffr_engine::{
     BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus, MouseButton,
     NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
@@ -54,8 +58,8 @@ use crate::cdp::{
 use crate::error::FirefoxError;
 use crate::subprocess::{find_firefox, init_profile, pick_free_port, probe_ws_url, spawn_headless};
 use crate::worker::{
-    Command, FaviconSink, TitleMap, UrlUpdateSink, new_favicon_sink, new_title_map,
-    new_url_update_sink, run,
+    Command, FaviconSink, HintEventSink, TitleMap, UrlUpdateSink, new_favicon_sink,
+    new_hint_event_sink, new_title_map, new_url_update_sink, run,
 };
 use crate::ws::WsClient;
 
@@ -184,6 +188,12 @@ pub struct FirefoxCdpEngine {
     /// Favicon updates populated by the worker from `Page.frameNavigated`
     /// `frame.faviconUrl` events.  Drained by `drain_favicon_updates`.
     favicon_sink: FaviconSink,
+    /// Hint mode alphabet. Defaults to `DEFAULT_HINT_ALPHABET`.
+    hint_alphabet: HintAlphabet,
+    /// One-slot mailbox shared with the worker for hint console events.
+    hint_sink: HintEventSink,
+    /// Active hint session. `None` when hint mode is off.
+    hint_session: Mutex<Option<HintSession>>,
 }
 
 impl FirefoxCdpEngine {
@@ -232,6 +242,8 @@ impl FirefoxCdpEngine {
         let worker_nav = Arc::clone(&nav_count);
         let worker_title = Arc::clone(&title_map);
         let worker_favicon = Arc::clone(&favicon_sink);
+        let hint_sink = new_hint_event_sink();
+        let worker_hint_sink = Arc::clone(&hint_sink);
 
         let worker = std::thread::Builder::new()
             .name("firefox-cdp-worker".to_owned())
@@ -246,6 +258,7 @@ impl FirefoxCdpEngine {
                     worker_nav,
                     worker_title,
                     worker_favicon,
+                    worker_hint_sink,
                 )
             })
             .map_err(FirefoxError::SpawnFailed)?;
@@ -267,6 +280,10 @@ impl FirefoxCdpEngine {
             nav_history_cache: Mutex::new(HashMap::new()),
             find_query: Mutex::new(None),
             favicon_sink,
+            hint_alphabet: HintAlphabet::from_str(DEFAULT_HINT_ALPHABET)
+                .expect("DEFAULT_HINT_ALPHABET is always valid"),
+            hint_sink,
+            hint_session: Mutex::new(None),
         })
     }
 
@@ -567,6 +584,46 @@ impl FirefoxCdpEngine {
             v.width.load(Ordering::Relaxed).max(1),
             v.height.load(Ordering::Relaxed).max(1),
         )
+    }
+
+    // ── Hint mode helpers ─────────────────────────────────────────────────────
+
+    /// Fire-and-forget JS evaluation tagged for hint-mode use.
+    fn run_hint_js(&self, code: &str) {
+        let session_id = {
+            let state = self.lock_state();
+            state.active_tab().map(|t| t.session_id.clone())
+        };
+        if let Some(sess) = session_id {
+            let _ = self.session_cmd(
+                &sess,
+                "Runtime.evaluate",
+                serde_json::json!({ "expression": code }),
+            );
+        }
+    }
+
+    /// Inject `hint.js` into the active tab and create a [`HintSession`].
+    fn enter_hint_mode(&self, background: bool) {
+        const LABEL_BUDGET: usize = 1024;
+        let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
+        let alphabet_str = self.hint_alphabet.as_string();
+        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
+        let alphabet = self.hint_alphabet.clone();
+
+        *self.hint_session.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(HintSession::new(alphabet, Vec::new(), background));
+
+        if let Err(e) = self.run_js(&script) {
+            tracing::warn!(error = %e, "firefox-cdp: enter_hint_mode: JS injection failed");
+            self.cancel_hint();
+            return;
+        }
+        tracing::info!(
+            background,
+            label_budget = LABEL_BUDGET,
+            "firefox-cdp: hint mode injected"
+        );
     }
 }
 
@@ -1416,26 +1473,119 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn is_hint_mode(&self) -> bool {
-        false
+        self.hint_session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     fn hint_status(&self) -> Option<HintStatus> {
-        None
+        let guard = self.hint_session.lock().unwrap_or_else(|p| p.into_inner());
+        let s = guard.as_ref()?;
+        Some(HintStatus {
+            typed: s.typed.clone(),
+            match_count: s.match_count(),
+            background: s.background,
+        })
     }
 
     fn pump_hint_events(&self) -> bool {
-        false
+        let Some(event) = take_hint_event(&self.hint_sink) else {
+            return false;
+        };
+        match event {
+            buffr_core::hint::HintConsoleEvent::Ready { hints, alphabet: _ } => {
+                let alphabet = self.hint_alphabet.clone();
+                let mut guard = self.hint_session.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(existing) = guard.as_mut() {
+                    let background = existing.background;
+                    *existing = HintSession::new(alphabet, hints, background);
+                }
+                true
+            }
+            buffr_core::hint::HintConsoleEvent::Error { message } => {
+                tracing::warn!(message, "firefox-cdp: hint mode — renderer reported error");
+                self.cancel_hint();
+                true
+            }
+        }
     }
 
-    fn feed_hint_key(&self, _c: char) -> Option<HintAction> {
-        None
+    fn feed_hint_key(&self, c: char) -> Option<HintAction> {
+        let mut commit_id: Option<u32> = None;
+        let mut filter_typed: Option<String> = None;
+        let mut clear = false;
+        let mut cancel = false;
+
+        let action = {
+            let mut guard = self.hint_session.lock().unwrap_or_else(|p| p.into_inner());
+            let session = guard.as_mut()?;
+            let action = session.feed(c);
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Click(id) | HintAction::OpenInBackground(id) => {
+                    commit_id = Some(*id);
+                    clear = true;
+                }
+                HintAction::Cancel => cancel = true,
+            }
+            action
+        };
+
+        if let Some(typed) = filter_typed {
+            self.run_hint_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                json_string_literal(&typed)
+            ));
+        }
+        if let Some(id) = commit_id {
+            self.run_hint_js(&format!(
+                "if (window.__buffrHintCommit) window.__buffrHintCommit({id})"
+            ));
+        }
+        if clear {
+            *self.hint_session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
     fn backspace_hint(&self) -> Option<HintAction> {
-        None
+        let mut filter_typed: Option<String> = None;
+        let mut cancel = false;
+
+        let action = {
+            let mut guard = self.hint_session.lock().unwrap_or_else(|p| p.into_inner());
+            let session = guard.as_mut()?;
+            let action = session.backspace();
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Cancel => cancel = true,
+                _ => {}
+            }
+            action
+        };
+
+        if let Some(typed) = filter_typed {
+            self.run_hint_js(&format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                json_string_literal(&typed)
+            ));
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
-    fn cancel_hint(&self) {}
+    fn cancel_hint(&self) {
+        self.run_hint_js("if (window.__buffrHintCancel) window.__buffrHintCancel()");
+        *self.hint_session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 
     // ── Frame editing (Phase 6c, #95) ────────────────────────────────────────
 
@@ -1618,6 +1768,16 @@ impl BrowserEngine for FirefoxCdpEngine {
             A::ZoomIn => self.zoom_in(),
             A::ZoomOut => self.zoom_out(),
             A::ZoomReset => self.zoom_reset(),
+
+            // ── Hint mode ─────────────────────────────────────────────────────
+            A::EnterHintMode => {
+                tracing::debug!("firefox-cdp: dispatch EnterHintMode");
+                self.enter_hint_mode(false);
+            }
+            A::EnterHintModeBackground => {
+                tracing::debug!("firefox-cdp: dispatch EnterHintModeBackground");
+                self.enter_hint_mode(true);
+            }
 
             other => {
                 tracing::debug!(
@@ -1887,4 +2047,31 @@ impl BrowserEngine for FirefoxCdpEngine {
         // dedicated timeout, but that is out of scope for Phase B.
         None
     }
+}
+
+// ── Hint JS helpers ───────────────────────────────────────────────────────────
+
+/// Format a string as a JS double-quoted literal, escaping every non-ASCII
+/// codepoint to `\uXXXX`. Used for inline hint filter/commit calls.
+fn json_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c => {
+                let mut buf = [0u16; 2];
+                for unit in c.encode_utf16(&mut buf).iter() {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
 }

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as B64Engine;
 use serde_json::Value;
 
+use buffr_core::hint::parse_console_event;
 use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState};
 
 use crate::cdp::{
@@ -51,6 +52,15 @@ pub const WORKER_CMD_CHANNEL_CAP: usize = 256;
 
 /// Timeout for stale pending commands — prevents unbounded accumulation.
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ── Hint event sink ───────────────────────────────────────────────────────────
+
+pub use buffr_core::hint::HintEventSink;
+
+/// Create a fresh hint event sink.
+pub fn new_hint_event_sink() -> HintEventSink {
+    buffr_core::hint::new_hint_event_sink()
+}
 
 // ── URL update sink ───────────────────────────────────────────────────────────
 
@@ -156,6 +166,7 @@ pub fn run(
     nav_count: Arc<Mutex<HashMap<String, usize>>>,
     title_map: TitleMap,
     favicon_sink: FaviconSink,
+    hint_sink: HintEventSink,
 ) {
     let mut pending: HashMap<u64, PendingEntry> = HashMap::new();
     let mut active_session: Option<String> = None;
@@ -310,6 +321,7 @@ pub fn run(
                         &nav_count,
                         &title_map,
                         &favicon_sink,
+                        &hint_sink,
                     );
                 }
             },
@@ -330,6 +342,7 @@ fn dispatch_message(
     nav_count: &Arc<Mutex<HashMap<String, usize>>>,
     title_map: &TitleMap,
     favicon_sink: &FaviconSink,
+    hint_sink: &HintEventSink,
 ) {
     // Command response — may be a screenshot reply or a normal reply.
     if let Some(id) = msg.id {
@@ -453,6 +466,36 @@ fn dispatch_message(
                     );
                     if let Ok(mut map) = title_map.lock() {
                         map.insert(target_id, title);
+                    }
+                }
+            }
+        }
+        "Runtime.consoleAPICalled" => {
+            // Hint-mode IPC: JS injected by enter_hint_mode emits
+            // `console.log("__buffr_hint__:" + JSON.stringify({...}))`.
+            if let Some(ref params) = msg.params
+                && let Some(args) = params.get("args").and_then(|v| v.as_array())
+            {
+                for arg in args {
+                    let value_str = arg.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    if value_str.is_empty() {
+                        continue;
+                    }
+                    match parse_console_event(value_str) {
+                        Some(Ok(event)) => {
+                            tracing::debug!(?event, "firefox-cdp: hint console event");
+                            if let Ok(mut guard) = hint_sink.lock() {
+                                *guard = Some(event);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!(
+                                error = %e,
+                                line = value_str,
+                                "firefox-cdp: hint console event parse error"
+                            );
+                        }
+                        None => {}
                     }
                 }
             }
