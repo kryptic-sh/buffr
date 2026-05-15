@@ -104,6 +104,8 @@ pub(crate) enum Command {
     },
     Reload,
     Stop,
+    /// Set the active tab's CSS zoom level. Clamped to [0.25, 5.0].
+    SetZoom(f64),
     Resize {
         width: u32,
         height: u32,
@@ -122,6 +124,10 @@ pub(crate) enum Command {
     },
     QueryCanGoForward {
         reply: mpsc::SyncSender<bool>,
+    },
+    /// Query the active tab's zoom multiplier (defaults 1.0).
+    QueryActiveZoom {
+        reply: mpsc::SyncSender<f64>,
     },
     Shutdown,
 }
@@ -329,6 +335,16 @@ impl Worker {
             .unwrap_or(false)
     }
 
+    /// Set the active tab's CSS zoom level. Clamped to [0.25, 5.0].
+    /// Triggers a repaint so the change is visible immediately.
+    fn set_zoom(&mut self, level: f64) {
+        let clamped = level.clamp(0.25, 5.0);
+        if let Some(idx) = self.active_idx {
+            self.tabs[idx].zoom = clamped;
+            self.paint();
+        }
+    }
+
     /// Rasterise the active tab into `SharedOsrFrame`.
     ///
     /// Uses the CPU Vello renderer via [`render_doc_into_frame`].  If there is
@@ -340,7 +356,9 @@ impl Worker {
         let scale = self.view.scale();
 
         if let Some(idx) = self.active_idx {
-            render_doc_into_frame(&self.tabs[idx].doc, &self.frame, w, h, scale as f64);
+            // Final paint scale = device-pixel-ratio × per-tab CSS zoom.
+            let paint_scale = scale as f64 * self.tabs[idx].zoom;
+            render_doc_into_frame(&self.tabs[idx].doc, &self.frame, w, h, paint_scale);
         } else {
             write_white_fill(&self.frame, w, h);
         }
@@ -397,6 +415,9 @@ impl Worker {
             Command::Stop => {
                 self.stop();
             }
+            Command::SetZoom(level) => {
+                self.set_zoom(level);
+            }
             Command::Resize { width, height } => {
                 self.resize(width, height);
             }
@@ -414,6 +435,10 @@ impl Worker {
             }
             Command::QueryCanGoForward { reply } => {
                 let _ = reply.send(self.active_can_go_forward());
+            }
+            Command::QueryActiveZoom { reply } => {
+                let z = self.active_idx.map(|i| self.tabs[i].zoom).unwrap_or(1.0);
+                let _ = reply.send(z);
             }
             Command::Shutdown => {
                 return true;

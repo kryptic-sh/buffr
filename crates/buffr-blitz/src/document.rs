@@ -32,6 +32,10 @@ pub(crate) struct BlitzTab {
     pub title: String,
     /// `true` while the initial HTML fetch is in progress.
     pub is_loading: bool,
+    /// CSS-zoom multiplier on the paint scale. Default 1.0; clamped to
+    /// [0.25, 5.0]. Read by the worker's paint() to combine with the
+    /// device pixel ratio at render time.
+    pub zoom: f64,
     /// Back-navigation stack (oldest → newest, current NOT included).
     back_stack: Vec<HistEntry>,
     /// Forward-navigation stack (popped on navigate, refilled by go_back).
@@ -52,6 +56,7 @@ impl BlitzTab {
             url: url.to_owned(),
             title,
             is_loading: false,
+            zoom: 1.0,
             back_stack: Vec::new(),
             fwd_stack: Vec::new(),
         })
