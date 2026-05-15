@@ -702,11 +702,11 @@ impl BrowserEngine for WebView2Engine {
         match event {
             buffr_core::hint::HintConsoleEvent::Ready { hints, alphabet: _ } => {
                 let alphabet = self.hint_alphabet.clone();
-                if let Ok(mut guard) = self.hint_session.lock() {
-                    if let Some(existing) = guard.as_mut() {
-                        let background = existing.background;
-                        *existing = HintSession::new(alphabet, hints, background);
-                    }
+                if let Ok(mut guard) = self.hint_session.lock()
+                    && let Some(existing) = guard.as_mut()
+                {
+                    let background = existing.background;
+                    *existing = HintSession::new(alphabet, hints, background);
                 }
                 true
             }
@@ -749,10 +749,8 @@ impl BrowserEngine for WebView2Engine {
                 "if (window.__buffrHintCommit) window.__buffrHintCommit({id})"
             ));
         }
-        if clear {
-            if let Ok(mut guard) = self.hint_session.lock() {
-                *guard = None;
-            }
+        if clear && let Ok(mut guard) = self.hint_session.lock() {
+            *guard = None;
         }
         if cancel {
             self.cancel_hint();

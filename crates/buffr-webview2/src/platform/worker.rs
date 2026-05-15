@@ -1474,6 +1474,7 @@ fn create_environment(
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     initial_url: &str,
     _width: u32,
