@@ -256,6 +256,48 @@ fn osr_frame_not_all_white_after_snapshot() {
     );
 }
 
+/// Phase C input dispatch smoke test.
+///
+/// Opens an engine on a `data:` URL with an autofocused `<input>`, sends a
+/// key event for 'X' (VK 88), waits 200 ms for the GTK worker to drain the
+/// command channel and fire the `evaluate_javascript` callback. Asserts no
+/// panic and that the tab is still alive.
+///
+/// DOM-level assertion (checking the input value via a second JS evaluation)
+/// is omitted; that belongs to Phase D. The goal here is to confirm the full
+/// JS injection path is wired end-to-end without panic.
+#[test]
+#[ignore = "requires display server and WebKitGTK 6.0"]
+fn osr_input_dispatch_evaluates_js() {
+    use buffr_engine::{BrowserEngine, KeyEventKind, NeutralKeyEvent};
+    use std::sync::Arc;
+
+    let backend = WebKitGtkBackend::new();
+    let engine: Arc<dyn BrowserEngine> = backend
+        .open_engine(make_opts("data:text/html,<input id=x autofocus>"))
+        .expect("open_engine on autofocus input URL");
+
+    // Allow the GTK worker to create the WebView and load the data: URL.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Send a key event for 'X' (VK 88). The worker maps it to JS and calls
+    // evaluate_javascript on the active WebView — fire-and-forget.
+    engine.osr_key_event(NeutralKeyEvent {
+        kind: KeyEventKind::RawDown,
+        windows_key_code: 88, // VK for 'X' / 'x'
+        character: b'x' as u16,
+        ..Default::default()
+    });
+
+    // Wait for the GTK 10 ms poll tick + evaluate_javascript async callback.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    assert!(
+        engine.tab_count() >= 1,
+        "tab must still be open after JS input dispatch"
+    );
+}
+
 /// `navigate` errors propagate via the reply channel — not silently discarded.
 /// Drop the engine (which shuts down the worker) then verify that a navigate
 /// call on a freshly-killed worker surface is an Err, not a silent Ok.

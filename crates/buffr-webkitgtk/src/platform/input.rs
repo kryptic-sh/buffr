@@ -1,31 +1,27 @@
 //! Neutral input event translation for the WebKitGTK backend.
 //!
-//! # Phase B status
+//! # Phase C status
 //!
-//! WebKitGTK / GTK4 input synthesis requires building `gdk4::Event` objects
-//! and dispatching them via `WebView::send_input_event()` or equivalent.
-//! The exact API depends on whether the GTK4 `gdk4` Rust crate exposes a
-//! public constructor for synthetic events.
+//! GTK4 / gdk4 0.11 does not expose safe Rust constructors for synthetic
+//! `GdkEvent`. Instead, Phase C dispatches input via JS injection through
+//! `WebView::evaluate_javascript`. See `input_js.rs` for the snippet builders.
 //!
-//! In `gtk4 0.11` / `gdk4 0.11`, synthetic event construction is not directly
-//! exposed in safe Rust. Dispatch via `WebView::event()` (which takes a
-//! `&gdk4::Event`) requires a fully constructed `GdkEvent` which cannot be
-//! built without unsafe FFI at this crate version.
+//! # Phase D note
 //!
-//! The structural plumbing (translators → `GtkInputEvent` → `Command::SendInput`
-//! → worker) is complete. The worker logs each event at `debug` level. Actual
-//! GTK4 dispatch lands when safe constructors are available (gdk4 >= 0.12).
-//!
-//! # TODO markers
-//!
-//! - TODO(input-key): wire `gdk4` synthetic key event when safe constructors
-//!   are available in gdk4 >= 0.12 or via unsafe FFI.
-//! - TODO(input-mouse): wire `gdk4` synthetic pointer/scroll events.
+//! Once gdk4 >= 0.12 exposes synthetic event constructors, replace the JS
+//! injection path with `WebView::event()` for full native-action coverage
+//! (Tab focus traversal, form submit, etc.).
 
 use buffr_engine::{MouseButton, NeutralKeyEvent};
 
-/// Translated key event — Phase B placeholder.
+/// Translated key event.
+///
+/// Carries the Windows VK code (for JS key mapping) and a human-readable
+/// description (for debug logging when the VK is unmapped).
 pub(crate) struct GtkKeyEvent {
+    /// Windows VK_* code used for JS KeyboardEvent dispatch.
+    pub windows_key_code: i32,
+    /// Human-readable description for debug logging.
     pub description: String,
 }
 
@@ -37,38 +33,52 @@ pub(crate) struct GtkMouseEvent {
     pub kind: GtkMouseKind,
 }
 
-#[allow(dead_code)]
 pub(crate) enum GtkMouseKind {
     Move,
     ButtonPress(GtkMouseButton),
     ButtonRelease(GtkMouseButton),
     Leave,
-    Scroll { delta_x: f64, delta_y: f64 },
+    /// Wheel scroll stored separately as `GtkWheelEvent`; this variant is
+    /// retained for structural symmetry but the worker matches on `Wheel`.
+    #[allow(dead_code)]
+    Scroll {
+        delta_x: f64,
+        delta_y: f64,
+    },
 }
 
-#[allow(dead_code)]
 pub(crate) enum GtkMouseButton {
     Left,
     Middle,
     Right,
 }
 
+/// Translated wheel event carrying position and pixel deltas.
+pub(crate) struct GtkWheelEvent {
+    pub x: f64,
+    pub y: f64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+}
+
 // ── Neutral wrapper sent over the worker command channel ──────────────────────
 
 /// A translated GTK input event ready to be routed to the worker.
 ///
-/// The worker receives this on the GTK main thread. Phase B: logs at debug
-/// level. Phase C: synthesises a real `gdk4::Event` and dispatches via
-/// `WebView::event()` when safe `gdk4` constructors are available (>= 0.12).
+/// The worker receives this on the GTK main thread. Phase C dispatches via
+/// JS injection through `WebView::evaluate_javascript`. Phase D may switch
+/// to native `gdk4::Event` dispatch once safe constructors are available.
 pub(crate) enum GtkInputEvent {
     Key(GtkKeyEvent),
     Mouse(GtkMouseEvent),
+    Wheel(GtkWheelEvent),
 }
 
 // ── Translators ───────────────────────────────────────────────────────────────
 
 pub(crate) fn neutral_key_to_gtk(event: &NeutralKeyEvent) -> GtkInputEvent {
     GtkInputEvent::Key(GtkKeyEvent {
+        windows_key_code: event.windows_key_code,
         description: format!(
             "key vk={} char={} kind={:?}",
             event.windows_key_code, event.character, event.kind
@@ -115,12 +125,10 @@ pub(crate) fn neutral_leave_to_gtk() -> GtkInputEvent {
 }
 
 pub(crate) fn neutral_scroll_to_gtk(x: i32, y: i32, dx: i32, dy: i32) -> GtkInputEvent {
-    GtkInputEvent::Mouse(GtkMouseEvent {
+    GtkInputEvent::Wheel(GtkWheelEvent {
         x: x as f64,
         y: y as f64,
-        kind: GtkMouseKind::Scroll {
-            delta_x: dx as f64,
-            delta_y: dy as f64,
-        },
+        delta_x: dx as f64,
+        delta_y: dy as f64,
     })
 }

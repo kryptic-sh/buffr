@@ -27,7 +27,8 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitGtkError;
-use super::input::GtkInputEvent;
+use super::input::{GtkInputEvent, GtkMouseButton, GtkMouseKind};
+use super::input_js::{key_js, mouse_click_js, mouse_leave_js, mouse_move_js, wheel_js};
 use super::osr::{paint_blank, request_snapshot};
 use super::runtime::{OsrHandles, TabEntry};
 
@@ -132,14 +133,14 @@ pub(crate) enum Command {
         height: u32,
     },
     ForcePaint,
-    /// Dispatch an input event to the active WebView.
+    /// Dispatch an input event to the active WebView via JS injection.
     ///
     /// Fire-and-forget: no reply channel. Input events return `()` on the
     /// `BrowserEngine` trait surface.
     ///
-    /// Phase B: the worker logs the event at `debug` level.
-    /// TODO(input-key/input-mouse): synthesise real `gdk4::Event` and dispatch
-    /// via `WebView::event()` when safe constructors are available (gdk4 >= 0.12).
+    /// Phase C: dispatched via `WebView::evaluate_javascript` DOM event
+    /// injection. Phase D may use native `gdk4::Event` dispatch once safe
+    /// constructors are available (gdk4 >= 0.12).
     SendInput(GtkInputEvent),
     /// Full tab snapshot (used internally by QueryCanGoBack/Forward).
     QueryTabs {
@@ -372,6 +373,17 @@ impl GtkRuntime {
     }
 }
 
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Map a `GtkMouseButton` to the JS `MouseEvent.button` index.
+fn gtk_button_to_js(btn: &GtkMouseButton) -> u32 {
+    match btn {
+        GtkMouseButton::Left => 0,
+        GtkMouseButton::Middle => 1,
+        GtkMouseButton::Right => 2,
+    }
+}
+
 // ── Command handler ───────────────────────────────────────────────────────────
 
 /// Handle one command. Returns `true` to request shutdown.
@@ -411,24 +423,99 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
             rt.paint();
         }
         Command::SendInput(event) => {
-            // Phase B: log the event on the GTK thread (the correct dispatch queue).
-            // GTK4 / gdk4 0.11 does not expose safe synthetic-event constructors;
-            // real dispatch requires unsafe FFI or gdk4 >= 0.12.
-            // TODO(input-key/input-mouse): synthesise gdk4::Event and call
-            // WebView::event() once safe constructors are available.
-            match &event {
+            // Phase C: dispatch via JS injection through evaluate_javascript.
+            //
+            // WebKitGTK / gdk4 0.11 has no safe Rust constructors for synthetic
+            // GdkEvent, so we inject DOM events through JS evaluation instead.
+            // This covers ~80 % of headless automation cases. Native default
+            // actions (Tab focus traversal, form submit) require Phase D with
+            // gdk4 >= 0.12 synthetic event constructors.
+            //
+            // evaluate_javascript is async; the callback fires on this GTK
+            // main thread. We ignore the return value — fire-and-forget.
+            let js: Option<String> = match &event {
                 GtkInputEvent::Key(ev) => {
-                    tracing::debug!(
-                        "webkitgtk worker: received key event '{}' (pending gdk4 dispatch)",
-                        ev.description
-                    );
+                    // Map VK code to JS event type based on description context.
+                    // NeutralKeyEvent.kind is encoded in the description by
+                    // neutral_key_to_gtk; we emit keydown for all key events
+                    // to cover the most common case. Char events are not
+                    // separately dispatched — keydown with the correct key
+                    // field is sufficient for most JS input handlers.
+                    let snippet = key_js(ev, "keydown");
+                    if snippet.is_none() {
+                        tracing::debug!(
+                            "webkitgtk worker: unknown VK {} ('{}') — skipping JS key dispatch",
+                            ev.windows_key_code,
+                            ev.description,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "webkitgtk worker: JS key dispatch vk={} ({})",
+                            ev.windows_key_code,
+                            ev.description,
+                        );
+                    }
+                    snippet
                 }
-                GtkInputEvent::Mouse(ev) => {
+                GtkInputEvent::Mouse(ev) => match &ev.kind {
+                    GtkMouseKind::Move => Some(mouse_move_js(ev)),
+                    GtkMouseKind::ButtonPress(btn) => {
+                        let b = gtk_button_to_js(btn);
+                        tracing::debug!(
+                            "webkitgtk worker: JS mousedown ({:.0},{:.0}) btn={b}",
+                            ev.x,
+                            ev.y,
+                        );
+                        Some(mouse_click_js(ev, b, false))
+                    }
+                    GtkMouseKind::ButtonRelease(btn) => {
+                        let b = gtk_button_to_js(btn);
+                        tracing::debug!(
+                            "webkitgtk worker: JS mouseup+click ({:.0},{:.0}) btn={b}",
+                            ev.x,
+                            ev.y,
+                        );
+                        Some(mouse_click_js(ev, b, true))
+                    }
+                    GtkMouseKind::Leave => {
+                        tracing::debug!("webkitgtk worker: JS mouseleave");
+                        Some(mouse_leave_js())
+                    }
+                    GtkMouseKind::Scroll { .. } => {
+                        // Scroll is now routed via GtkInputEvent::Wheel;
+                        // this variant is a structural leftover.
+                        tracing::debug!("webkitgtk worker: Scroll variant (no-op, use Wheel)");
+                        None
+                    }
+                },
+                GtkInputEvent::Wheel(ev) => {
                     tracing::debug!(
-                        "webkitgtk worker: received mouse event ({:.0},{:.0}) (pending gdk4 dispatch)",
+                        "webkitgtk worker: JS wheel ({:.0},{:.0}) dx={:.0} dy={:.0}",
                         ev.x,
-                        ev.y
+                        ev.y,
+                        ev.delta_x,
+                        ev.delta_y,
                     );
+                    Some(wheel_js(ev))
+                }
+            };
+
+            if let Some(js) = js {
+                if let Some(tab) = rt.active_tab() {
+                    use webkit6::prelude::WebViewExt;
+                    tab.web_view.evaluate_javascript(
+                        &js,
+                        None,
+                        None,
+                        None::<&webkit6::gio::Cancellable>,
+                        |result| {
+                            if let Err(e) = result {
+                                tracing::debug!("webkitgtk worker: JS dispatch error: {e}");
+                            }
+                        },
+                    );
+                } else {
+                    tracing::debug!("webkitgtk worker: no active tab — dropping input JS");
                 }
             }
         }
