@@ -65,6 +65,10 @@ struct FfTab {
     session_id: String,
     url: String,
     title: String,
+    /// CSS-zoom level (multiplier on `document.body.style.zoom`). Phase C
+    /// uses JS injection — Firefox CDP exposes no native page-scale API
+    /// equivalent to Chromium's `Emulation.setPageScaleFactor` for headless.
+    zoom: f64,
 }
 
 // ── Navigation-history cache ──────────────────────────────────────────────────
@@ -440,6 +444,7 @@ impl FirefoxCdpEngine {
             session_id: session_id.clone(),
             url: url.to_owned(),
             title: url.to_owned(),
+            zoom: 1.0,
         };
         match insert_idx {
             Some(idx) => {
@@ -495,6 +500,39 @@ impl FirefoxCdpEngine {
         }
 
         Some(history)
+    }
+
+    /// Apply a CSS zoom level to the active tab via Runtime.evaluate.
+    ///
+    /// Firefox CDP exposes no Emulation.setPageScaleFactor for headless
+    /// pages, so we inject `document.body.style.zoom` over the wire.
+    /// Updates the cached `FfTab.zoom` on success so `active_zoom_level`
+    /// reads it without round-tripping CDP.
+    fn apply_zoom(&self, level: f64) -> Result<(), FirefoxError> {
+        let clamped = level.clamp(0.25, 5.0);
+        let Some((tab_id, session_id)) = ({
+            let state = self.lock_state();
+            state
+                .active
+                .and_then(|id| state.tabs.iter().find(|t| t.id == id).cloned())
+                .map(|t| (t.id, t.session_id))
+        }) else {
+            return Ok(());
+        };
+        self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": format!("document.body.style.zoom = '{clamped}'"),
+                "returnByValue": true,
+            }),
+        )?;
+        // Mirror into cache.
+        let mut state = self.lock_state();
+        if let Some(t) = state.tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.zoom = clamped;
+        }
+        Ok(())
     }
 
     /// Invalidate the nav-history cache for the given session.
@@ -1155,7 +1193,26 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn active_zoom_level(&self) -> f64 {
-        1.0
+        let state = self.lock_state();
+        state
+            .active
+            .and_then(|id| state.tabs.iter().find(|t| t.id == id))
+            .map(|t| t.zoom)
+            .unwrap_or(1.0)
+    }
+
+    fn zoom_in(&self) {
+        let next = (self.active_zoom_level() + 0.1).min(5.0);
+        let _ = self.apply_zoom(next);
+    }
+
+    fn zoom_out(&self) {
+        let next = (self.active_zoom_level() - 0.1).max(0.25);
+        let _ = self.apply_zoom(next);
+    }
+
+    fn zoom_reset(&self) {
+        let _ = self.apply_zoom(1.0);
     }
 
     fn any_audio_active(&self) -> bool {
