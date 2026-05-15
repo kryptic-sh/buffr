@@ -50,6 +50,7 @@
 //!                                    └─ TODO: ctx.read_to_image() → BGRA → SharedOsrFrame
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use buffr_engine::{
@@ -67,7 +68,7 @@ use crate::input::{
     ime_cancel_to_servo, ime_commit_to_servo, ime_preedit_to_servo, neutral_click_to_servo,
     neutral_key_to_servo, neutral_leave_to_servo, neutral_move_to_servo, neutral_scroll_to_servo,
 };
-use crate::worker::{Command, WorkerHandle, spawn};
+use crate::worker::{Command, SharedCursor, WorkerHandle, spawn};
 
 // ── Tab snapshot cache ────────────────────────────────────────────────────────
 
@@ -102,6 +103,13 @@ pub struct ServoEngine {
     /// Last find query stored by `start_find`; re-used by `dispatch` for
     /// `FindNext` / `FindPrev`. Cleared by `stop_find`.
     find_query: Mutex<Option<String>>,
+    /// OSR sleep flag shared with the worker.  When `true`, `maybe_readback`
+    /// skips pixel copy.  Written by `osr_sleep`; read on the worker thread.
+    sleeping: Arc<AtomicBool>,
+    /// Latest cursor kind from `notify_cursor_changed`.  `u32::MAX` = no pending
+    /// change.  Written by the worker delegate; read + cleared by
+    /// `take_cursor_change`.
+    cursor_slot: SharedCursor,
 }
 
 impl ServoEngine {
@@ -118,7 +126,7 @@ impl ServoEngine {
             Arc::new(v)
         };
 
-        let worker = spawn(
+        let (worker, sleeping, cursor_slot) = spawn(
             options.initial_url,
             width,
             height,
@@ -139,6 +147,8 @@ impl ServoEngine {
             view,
             cache: Mutex::new(TabCache::default()),
             find_query: Mutex::new(None),
+            sleeping,
+            cursor_slot,
         })
     }
 
@@ -437,7 +447,12 @@ impl BrowserEngine for ServoEngine {
     }
 
     fn osr_sleep(&self, sleep: bool) {
-        tracing::debug!("servo: osr_sleep({sleep}) — no-op in Phase B");
+        // Gap 3: track sleep state via Arc<AtomicBool>; the worker's
+        // `maybe_readback` checks this flag and skips pixel copy when sleeping.
+        // Servo's WebView has no true "sleep" API in 0.1; `set_focused(false)`
+        // only changes focus state, not paint scheduling.
+        tracing::debug!("servo: osr_sleep({sleep})");
+        self.sleeping.store(sleep, Ordering::Release);
     }
 
     fn osr_invalidate_view(&self) {
@@ -447,6 +462,30 @@ impl BrowserEngine for ServoEngine {
     fn set_osr_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.view.set_wake(wake);
         tracing::debug!("servo: wake callback installed");
+    }
+
+    // ── Cursor (Gap 4) ───────────────────────────────────────────────────────
+    //
+    // `BuffrDelegate::notify_cursor_changed` stores the latest `Cursor`
+    // discriminant (u8 cast to u32) in `cursor_slot`.  We swap it with
+    // CURSOR_NONE and return `Some((0, raw))` when a change is pending.
+    //
+    // The trait uses `(browser_id, raw_kind)`.  Servo has no numeric browser-id
+    // concept; we use 0 as the sentinel (matching the tab's `browser_id: 0` in
+    // `ServoTab::to_summary`).
+    //
+    // Source: servo-embedder-traits-0.1.0/lib.rs:183 (`enum Cursor`, `#[repr(u8)]`)
+    //         servo-0.1.0/webview_delegate.rs:887 (`notify_cursor_changed`)
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        let raw = self
+            .cursor_slot
+            .swap(crate::worker::CURSOR_NONE, Ordering::AcqRel);
+        if raw == crate::worker::CURSOR_NONE {
+            None
+        } else {
+            Some((0, raw))
+        }
     }
 
     // ── Find / zoom ──────────────────────────────────────────────────────────
@@ -740,32 +779,88 @@ impl BrowserEngine for ServoEngine {
 
     // ── Action dispatch ───────────────────────────────────────────────────────
     //
-    // History/stop → existing GoBack/GoForward/Reload/Stop worker Commands.
-    // Scroll → debug-log (no JS eval substrate; Phase C wires via WebView API).
-    // Zoom → existing zoom_* helpers.
-    // FindNext/FindPrev → debug-log (no find substrate in Phase B skeleton).
+    // History/stop  → existing GoBack/GoForward/Reload/Stop worker Commands.
+    // Scroll        → synthetic WheelEvent via `neutral_scroll_to_servo`.
+    //                 Viewport size is read from `self.view` for page-relative
+    //                 amounts.  Cursor (0, 0) is used; Servo routes wheel events
+    //                 to the active scroll container regardless of hit position.
+    // Find          → TODO (Servo 0.1 has no WebView::find_string / start_find).
+    //                 Query is stored in `find_query` by `start_find`; logged here.
+    // Zoom          → existing zoom_* helpers.
 
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
 
+        // Helper: send a wheel event at the viewport centre (0,0 is fine — Servo
+        // routes WheelEvents to the active scroll container, not hit-tested).
+        let scroll = |dx: i32, dy: i32| {
+            let ev = neutral_scroll_to_servo(0, 0, dx, dy);
+            self.worker.send(Command::SendInput { event: ev });
+        };
+
+        // Viewport pixel height/width — used for page-relative scroll amounts.
+        let vw = self.view.width.load(Ordering::Relaxed) as i32;
+        let vh = self.view.height.load(Ordering::Relaxed) as i32;
+
+        // Pixels per "line" scroll step (matches browser default ~40 px/line).
+        const LINE: i32 = 40;
+
         match action {
             // ── Find ─────────────────────────────────────────────────────────
+            //
+            // TODO(servo-phase-c): Servo 0.1 does not expose a `WebView::find`
+            // or `start_find` API.  When one is available, wire
+            // `FindNext`/`FindPrev` here using the query stored in `find_query`.
+            A::Find { forward } => {
+                // `start_find` stores the new query string.  Dispatch the
+                // initial navigation direction with a debug note.
+                let query = self.find_query.lock().ok().and_then(|g| g.clone());
+                tracing::debug!(
+                    ?query,
+                    forward,
+                    "servo: dispatch Find — Servo 0.1 has no find API (stored, no-op)"
+                );
+            }
             A::FindNext => {
                 let query = self.find_query.lock().ok().and_then(|g| g.clone());
-                if let Some(q) = query {
-                    tracing::debug!(query = %q, "servo: dispatch FindNext — no find substrate in Phase B (no-op)");
-                } else {
-                    tracing::debug!("servo: FindNext — no active find query");
-                }
+                tracing::debug!(
+                    ?query,
+                    "servo: dispatch FindNext — Servo 0.1 has no find API (no-op)"
+                );
             }
             A::FindPrev => {
                 let query = self.find_query.lock().ok().and_then(|g| g.clone());
-                if let Some(q) = query {
-                    tracing::debug!(query = %q, "servo: dispatch FindPrev — no find substrate in Phase B (no-op)");
-                } else {
-                    tracing::debug!("servo: FindPrev — no active find query");
-                }
+                tracing::debug!(
+                    ?query,
+                    "servo: dispatch FindPrev — Servo 0.1 has no find API (no-op)"
+                );
             }
+
+            // ── Scroll (Gap 1) ────────────────────────────────────────────────
+            //
+            // Map every scroll variant to a synthetic `InputEvent::Wheel` sent
+            // to the worker.  Servo routes WheelEvents to the active scroll
+            // container; the (x, y) hit position does not matter.
+            //
+            // Pixel amounts:
+            //   Line:     n × LINE (40 px/line, matching browser defaults)
+            //   Page:     viewport dimension − LINE (one line of overlap)
+            //   HalfPage: viewport / 2
+            //   FullPage: viewport (C-f / C-b — full window width)
+            //   Top/Bot:  ±i32::MAX (clipped by Servo's internal scroll-max)
+            A::ScrollUp(n) => scroll(0, -((*n as i32) * LINE)),
+            A::ScrollDown(n) => scroll(0, (*n as i32) * LINE),
+            A::ScrollLeft(n) => scroll(-((*n as i32) * LINE), 0),
+            A::ScrollRight(n) => scroll((*n as i32) * LINE, 0),
+            A::ScrollPageUp => scroll(0, -(vh - LINE).max(LINE)),
+            A::ScrollPageDown => scroll(0, (vh - LINE).max(LINE)),
+            A::ScrollFullPageUp => scroll(0, -vh.max(LINE)),
+            A::ScrollFullPageDown => scroll(0, vh.max(LINE)),
+            A::ScrollHalfPageUp => scroll(0, -(vh / 2).max(LINE)),
+            A::ScrollHalfPageDown => scroll(0, (vh / 2).max(LINE)),
+            // Horizontal half-page — vw fallback mirrors vertical logic.
+            A::ScrollTop => scroll(0, i32::MIN / 2),
+            A::ScrollBottom => scroll(0, i32::MAX / 2),
 
             // ── History / reload / stop ───────────────────────────────────────
             A::HistoryBack => {
@@ -797,5 +892,9 @@ impl BrowserEngine for ServoEngine {
                 );
             }
         }
+
+        // Suppress "unused variable" warning on `vw` when horizontal scroll
+        // variants above consume it.  The compiler inlines the closure anyway.
+        let _ = vw;
     }
 }

@@ -16,7 +16,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
@@ -24,8 +24,8 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 use dpi::PhysicalSize;
 use servo::{
-    LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder,
-    WebViewDelegate,
+    Cursor, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext, WebView,
+    WebViewBuilder, WebViewDelegate,
 };
 // webrender_api::units are re-exported by servo at the root level
 use servo::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
@@ -33,6 +33,19 @@ use url::Url;
 
 use crate::error::ServoError;
 use crate::input::ServoInputEvent;
+
+// ── Shared cross-thread cursor state ─────────────────────────────────────────
+//
+// `Cursor` is `#[repr(u8)]`; we store it as u32 (matching the trait surface
+// `take_cursor_change → Option<(i32, u32)>`). u32::MAX is the sentinel for
+// "no pending change".
+
+/// Sentinel value meaning "no cursor change pending".
+pub(crate) const CURSOR_NONE: u32 = u32::MAX;
+
+/// Shared cursor-kind slot.  Worker writes the latest Cursor discriminant
+/// whenever `notify_cursor_changed` fires; the engine reads and resets it.
+pub(crate) type SharedCursor = Arc<AtomicU32>;
 
 // ── Delegate shared state ─────────────────────────────────────────────────────
 
@@ -43,15 +56,19 @@ pub(crate) struct TabMeta {
     pub url: String,
     pub title: String,
     pub is_loading: bool,
-    /// Set to `true` by `notify_new_frame_ready`; consumed by `maybe_paint`.
+    /// Set to `true` by `notify_new_frame_ready`; consumed by `maybe_readback`.
     pub frame_ready: bool,
 }
 
 // ── WebViewDelegate impl ──────────────────────────────────────────────────────
 
-/// Per-tab delegate.  Holds a shared ref to the tab's `TabMeta` cell.
+/// Per-tab delegate.  Holds a shared ref to the tab's `TabMeta` cell and
+/// the engine-wide cursor slot (written on `notify_cursor_changed`).
 struct BuffrDelegate {
     meta: Rc<RefCell<TabMeta>>,
+    /// Engine-wide cursor slot.  Written here so the engine can poll it via
+    /// `take_cursor_change` without a round-trip command.
+    cursor_slot: SharedCursor,
 }
 
 impl WebViewDelegate for BuffrDelegate {
@@ -87,6 +104,15 @@ impl WebViewDelegate for BuffrDelegate {
     fn request_navigation(&self, _webview: WebView, navigation_request: servo::NavigationRequest) {
         // Allow all navigations by default.
         navigation_request.allow();
+    }
+
+    /// Store the new cursor kind in the shared slot so the engine can poll it.
+    ///
+    /// `Cursor` is `#[repr(u8)]`; cast to u32 matches the trait surface.
+    /// Source: servo-embedder-traits-0.1.0/lib.rs:183 (`enum Cursor`)
+    fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+        self.cursor_slot.store(cursor as u32, Ordering::Release);
+        tracing::debug!("servo: cursor changed → {cursor:?}");
     }
 }
 
@@ -241,9 +267,17 @@ struct Worker {
     view: SharedOsrViewState,
     width: u32,
     height: u32,
+    /// Sleep flag — set by `osr_sleep(true)`, cleared by `osr_sleep(false)`.
+    /// When set, `maybe_readback` skips the pixel copy to avoid wasting CPU
+    /// while the tab is hidden.  Shared with `ServoEngine` via `Arc`.
+    sleeping: Arc<AtomicBool>,
+    /// Cursor slot — written by `BuffrDelegate::notify_cursor_changed`.
+    /// Shared with `ServoEngine`; engine polls via `take_cursor_change`.
+    cursor_slot: SharedCursor,
 }
 
 impl Worker {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         servo: servo::Servo,
         ctx: Rc<SoftwareRenderingContext>,
@@ -251,6 +285,8 @@ impl Worker {
         view: SharedOsrViewState,
         width: u32,
         height: u32,
+        sleeping: Arc<AtomicBool>,
+        cursor_slot: SharedCursor,
     ) -> Self {
         Worker {
             servo,
@@ -262,6 +298,8 @@ impl Worker {
             view,
             width,
             height,
+            sleeping,
+            cursor_slot,
         }
     }
 
@@ -294,6 +332,7 @@ impl Worker {
 
         let delegate = Rc::new(BuffrDelegate {
             meta: Rc::clone(&meta),
+            cursor_slot: Arc::clone(&self.cursor_slot),
         });
 
         let webview = WebViewBuilder::new(
@@ -435,7 +474,14 @@ impl Worker {
     ///
     /// `notify_new_frame_ready` already called `webview.paint()`, so the
     /// `SoftwareRenderingContext` has fresh pixels.  We just need to readback.
+    ///
+    /// Skipped when `sleeping` is `true` — avoids wasting CPU while the tab
+    /// is hidden (Gap 3: osr_sleep).
     fn maybe_readback(&self) {
+        if self.sleeping.load(Ordering::Acquire) {
+            return;
+        }
+
         let Some(idx) = self.active_idx else { return };
         let Some(entry) = self.tabs.get(idx) else {
             return;
@@ -641,6 +687,11 @@ impl Worker {
 /// Constructs `SoftwareRenderingContext`, `ServoBuilder::default().build()`,
 /// and opens the initial URL in a new `WebView`.
 ///
+/// Returns a [`WorkerHandle`] plus two shared atomics:
+///   - `sleeping`: toggled by `osr_sleep`; skips readback when set.
+///   - `cursor_slot`: written by the delegate on cursor change; polled by the
+///     engine via `take_cursor_change`.
+///
 /// # Errors
 ///
 /// Returns `ServoError::InitFailed` if:
@@ -654,11 +705,17 @@ pub(crate) fn spawn(
     height: u32,
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
-) -> Result<WorkerHandle, ServoError> {
+) -> Result<(WorkerHandle, Arc<AtomicBool>, SharedCursor), ServoError> {
     let (tx, rx): (SyncSender<Command>, Receiver<Command>) = mpsc::sync_channel(64);
     let initial_url = initial_url.to_owned();
 
+    let sleeping: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let cursor_slot: SharedCursor = Arc::new(AtomicU32::new(CURSOR_NONE));
+
     let handle = WorkerHandle { tx };
+
+    let sleeping_worker = Arc::clone(&sleeping);
+    let cursor_worker = Arc::clone(&cursor_slot);
 
     // All Servo / WebView state must be created on the worker thread because
     // both types are !Send (they wrap Rc<…> internally).
@@ -693,6 +750,8 @@ pub(crate) fn spawn(
                 Arc::clone(&view),
                 width,
                 height,
+                sleeping_worker,
+                cursor_worker,
             );
 
             // 4. Open initial tab.
@@ -706,5 +765,5 @@ pub(crate) fn spawn(
         })
         .map_err(|e| ServoError::InitFailed(e.to_string()))?;
 
-    Ok(handle)
+    Ok((handle, sleeping, cursor_slot))
 }
