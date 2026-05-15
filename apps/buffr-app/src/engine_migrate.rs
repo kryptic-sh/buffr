@@ -269,24 +269,54 @@ mod tests {
     }
 
     #[test]
-    fn migration_is_idempotent() {
+    fn migration_is_idempotent_when_no_old_dir_present() {
+        // Existing behaviour: no old dir → noop on second run.
         let tmp = TempDir::new().unwrap();
         let data_root = tmp.path();
 
         setup_old_blink_cdp(data_root);
 
-        // First run — moves the profile.
         migrate_engine_layout(data_root, data_root);
+        migrate_engine_layout(data_root, data_root); // should not panic or error
 
-        // Second run — new path already exists; must not panic or error.
-        migrate_engine_layout(data_root, data_root);
-
-        // Content still intact.
         let new_profile = compute_blink_cdp_default(data_root, "eng1");
         assert!(new_profile.exists());
         assert_eq!(
             std::fs::read(new_profile.join("Cookies")).unwrap(),
             b"cookie-data"
+        );
+    }
+
+    #[test]
+    fn migration_skips_when_new_path_already_exists() {
+        // Both old AND new exist (e.g. from a previous partial migration or
+        // user manual setup). New must be preserved; old must remain in place
+        // (NOT overwritten).
+        let tmp = TempDir::new().unwrap();
+        let data_root = tmp.path();
+
+        // Pre-existing new layout with different content.
+        let new_profile = compute_blink_cdp_default(data_root, "eng1");
+        std::fs::create_dir_all(&new_profile).unwrap();
+        std::fs::write(new_profile.join("Cookies"), b"new-cookies").unwrap();
+
+        // Old layout with stale content alongside.
+        setup_old_blink_cdp(data_root); // writes b"cookie-data" to old/Cookies
+
+        migrate_engine_layout(data_root, data_root);
+
+        // New content preserved (NOT overwritten by old).
+        assert_eq!(
+            std::fs::read(new_profile.join("Cookies")).unwrap(),
+            b"new-cookies",
+            "migration must not overwrite existing new-layout content"
+        );
+
+        // Old still in place because new existed (we skipped the rename).
+        let old_dir = data_root.join("blink-cdp").join("eng1");
+        assert!(
+            old_dir.exists(),
+            "old dir should remain because new already existed"
         );
     }
 
