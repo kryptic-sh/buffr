@@ -82,10 +82,19 @@ struct TabSignalCtx {
 }
 
 impl TabSignalCtx {
+    /// Mutate the per-tab info under `engine_state`. Uses `try_lock` so a
+    /// signal handler running on the worker thread never blocks waiting
+    /// for the main thread to release the lock — the main thread is
+    /// continuously hitting `engine_state` (for `active_tab_live_url`,
+    /// `tabs_summary`, etc.) and a contended `lock()` here can park the
+    /// worker for long enough that the app feels frozen. A dropped
+    /// signal update is recoverable: the next notify::* fires before
+    /// the user notices.
     fn with_tab_info<F: FnOnce(&mut TabInfo)>(&self, f: F) {
-        if let Ok(mut st) = self.engine_state.lock()
-            && let Some(info) = st.tabs.iter_mut().find(|t| t.id == self.tab_id)
-        {
+        let Ok(mut st) = self.engine_state.try_lock() else {
+            return;
+        };
+        if let Some(info) = st.tabs.iter_mut().find(|t| t.id == self.tab_id) {
             f(info);
             st.address_changed = true;
         }
@@ -176,16 +185,17 @@ unsafe extern "C" fn on_notify_title(
     ctx.with_tab_info(|info| info.title = title);
 }
 
-/// Free a `*mut TabSignalCtx` previously stashed via `Box::into_raw`.
-/// GLib invokes this as `GClosureNotify` when the last signal handler
-/// using the user_data is disconnected.
+/// GLib `GClosureNotify` for the per-connection `Arc<TabSignalCtx>`
+/// pointer we leak in TabEntry::new. Each signal connection holds one
+/// Arc clone; this fires once per disconnect, decrementing the Arc.
+/// The last decrement frees the `TabSignalCtx`.
 unsafe extern "C" fn drop_tab_signal_ctx(
     user_data: *mut std::os::raw::c_void,
     _closure: *mut _GClosure,
 ) {
     if !user_data.is_null() {
-        // SAFETY: user_data was produced by Box::into_raw in TabEntry::new.
-        drop(unsafe { Box::from_raw(user_data as *mut TabSignalCtx) });
+        // SAFETY: user_data was produced by Arc::into_raw in TabEntry::new.
+        drop(unsafe { Arc::from_raw(user_data as *const TabSignalCtx) });
     }
 }
 
@@ -276,25 +286,32 @@ impl TabEntry {
         //     the URL it ended up on after redirects / pushState.
         //   - tab pills keep the URL placeholder until they're reopened.
         //
-        // The handler closure captures an engine_state Arc clone through a
-        // Boxed TabSignalCtx; GLib frees the Box via drop_tab_signal_ctx
-        // when the signal is disconnected at TabEntry::drop.
-        let ctx = Box::into_raw(Box::new(TabSignalCtx {
+        // Shared per-tab handler context. Each signal connection holds
+        // one Arc clone (leaked into a raw pointer) and the matching
+        // GClosureNotify drops it on disconnect. Using Arc instead of a
+        // single Box prevents a double-free: 3 signals × 1 destroy_notify
+        // each = 3 drops, which on a Box would tear up the same allocation
+        // three times.
+        let ctx = Arc::new(TabSignalCtx {
             tab_id: id,
             engine_state,
-        }));
+        });
         let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
             let signal_c = CString::new(signal).unwrap();
+            // Hand WebKit a per-connection Arc clone via Arc::into_raw;
+            // GLib calls drop_tab_signal_ctx on disconnect which
+            // reconstitutes + drops it.
+            let arc_clone = Arc::clone(&ctx);
+            let user_data = Arc::into_raw(arc_clone) as *mut std::os::raw::c_void;
             // SAFETY: web_view is a live WebKitWebView; signal_c lives
             // until the end of this block; cb is a 'static C fn pointer;
-            // ctx is leaked into a Box::into_raw and freed by
-            // drop_tab_signal_ctx on disconnect.
+            // user_data is leaked + freed via drop_tab_signal_ctx.
             unsafe {
                 g_signal_connect_data(
                     web_view as *mut _,
                     signal_c.as_ptr(),
                     Some(cb),
-                    ctx as *mut _,
+                    user_data,
                     Some(drop_tab_signal_ctx),
                     0,
                 )
