@@ -836,7 +836,7 @@ pub(crate) mod macos {
                 _configuration: &WKWebViewConfiguration,
                 navigation_action: &WKNavigationAction,
                 _window_features: &WKWindowFeatures,
-            ) -> Option<Retained<WKWebView>> {
+            ) -> *mut WKWebView {
                 // Extract the target URL from the navigation action's request.
                 // request() → Retained<NSURLRequest> (confirmed: WKNavigationAction.rs:80)
                 // URL() → Option<Retained<NSURL>> (NSURLRequest binding)
@@ -866,7 +866,7 @@ pub(crate) mod macos {
                 }
 
                 // Return nil — suppress the native popup window entirely.
-                None
+                std::ptr::null_mut()
             }
         }
     );

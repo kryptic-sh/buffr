@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use buffr_core::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue};
+use buffr_core::download_notice::DownloadNoticeQueue;
 use buffr_core::find::{FindResult, FindResultSink};
 use buffr_core::hint::HintEventSink;
 use buffr_engine::{
