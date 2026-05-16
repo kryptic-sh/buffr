@@ -1132,6 +1132,15 @@ pub(crate) fn spawn(
             tracing::info!("webkitgtk worker: starting");
 
             // Build the GLib main loop on this thread's default context.
+            // NOTE: webkit6 WebView is bound to its build-time context. When
+            // the main thread already owns the default context (Wayland + GTK
+            // session does), the worker can't take ownership, and any async
+            // call (load_uri, run_javascript) panics with 'Async operations
+            // only allowed if the thread is owning the MainContext'. Fixing
+            // this needs either moving WebView ops to the main thread or
+            // restructuring to never let the main thread acquire the default
+            // ctx. Tracked as a known issue; CEF-skip path lets dev work
+            // proceed without webkitgtk rendering.
             let main_loop = glib::MainLoop::new(None, false);
 
             // Wrap GtkRuntime in an Rc<RefCell<>> so it can be shared

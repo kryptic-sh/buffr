@@ -908,11 +908,28 @@ fn main() -> Result<()> {
     }
 
     // -------- backend initialize --------
-    let cache_path = paths.cache.to_string_lossy().into_owned();
-    backend
-        .initialize(&cache_path)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    info!("cef initialized");
+    //
+    // CEF init pulls in libnss3 → libsoftokn3 → libsqlite3 which can SIGSEGV
+    // on systems with an ABI-mismatched NSS/sqlite combo (Arch 2026-05).
+    // Skip when --engine targets a non-CEF backend so dev work isn't blocked
+    // by an unrelated system bug.
+    let cli_uses_cef = cli
+        .engine
+        .as_deref()
+        .map(|e| e.eq_ignore_ascii_case("cef"))
+        .unwrap_or(true);
+    if cli_uses_cef {
+        let cache_path = paths.cache.to_string_lossy().into_owned();
+        backend
+            .initialize(&cache_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        info!("cef initialized");
+    } else {
+        info!(
+            engine = cli.engine.as_deref().unwrap_or("?"),
+            "cef init skipped — non-CEF --engine selected"
+        );
+    }
 
     // Phase 6 telemetry: count the successful CEF init as one
     // `app_starts` event. No-op when disabled. We tick *after*
