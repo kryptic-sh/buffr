@@ -336,12 +336,39 @@ impl BrowserEngine for WebKitEngine {
             .unwrap_or(false))
     }
 
-    fn select_tab(&self, _id: TabId) {
-        tracing::debug!("webkit: select_tab stub");
+    fn select_tab(&self, id: TabId) {
+        self.send(Command::SelectTab { id });
     }
 
-    fn next_tab(&self) {}
-    fn prev_tab(&self) {}
+    fn next_tab(&self) {
+        let next = self.worker.engine_state.lock().ok().and_then(|st| {
+            let idx = st.active_idx?;
+            let len = st.tabs.len();
+            if len == 0 {
+                return None;
+            }
+            let new_idx = (idx + 1) % len;
+            st.tabs.get(new_idx).map(|t| t.id)
+        });
+        if let Some(id) = next {
+            self.send(Command::SelectTab { id });
+        }
+    }
+
+    fn prev_tab(&self) {
+        let prev = self.worker.engine_state.lock().ok().and_then(|st| {
+            let idx = st.active_idx?;
+            let len = st.tabs.len();
+            if len == 0 {
+                return None;
+            }
+            let new_idx = if idx == 0 { len - 1 } else { idx - 1 };
+            st.tabs.get(new_idx).map(|t| t.id)
+        });
+        if let Some(id) = prev {
+            self.send(Command::SelectTab { id });
+        }
+    }
 
     fn move_tab(&self, _from: usize, _to: usize) {}
 

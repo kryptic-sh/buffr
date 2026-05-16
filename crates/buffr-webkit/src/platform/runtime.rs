@@ -81,6 +81,13 @@ pub(crate) struct TabSignalCtx {
     tab_id: TabId,
     engine_state: Arc<Mutex<EngineState>>,
     is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-tab active flag, shared with this tab's `ViewCtx`. Inactive
+    /// tabs must not write to the runtime-wide `is_loading_atomic` —
+    /// otherwise a background tab finishing a navigation would clear
+    /// the splash overlay while the foreground tab is still loading.
+    /// TabInfo.is_loading still updates so the tabstrip's per-tab
+    /// progress badge stays accurate for hidden tabs.
+    is_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TabSignalCtx {
@@ -132,10 +139,15 @@ unsafe extern "C" fn on_load_changed(
         || event == WebKitLoadEvent_WEBKIT_LOAD_FINISHED;
     let finished = event == WebKitLoadEvent_WEBKIT_LOAD_FINISHED;
     use std::sync::atomic::Ordering;
-    if started {
-        ctx.is_loading_atomic.store(true, Ordering::SeqCst);
-    } else if revealed {
-        ctx.is_loading_atomic.store(false, Ordering::SeqCst);
+    // Only the active tab drives the runtime-wide splash gate. Background
+    // tabs still emit load-changed (LOAD_STARTED on background nav, etc.)
+    // but their state lives in TabInfo, not on the shared atomic.
+    if ctx.is_active.load(Ordering::Relaxed) {
+        if started {
+            ctx.is_loading_atomic.store(true, Ordering::SeqCst);
+        } else if revealed {
+            ctx.is_loading_atomic.store(false, Ordering::SeqCst);
+        }
     }
     tracing::debug!(
         ?event,
@@ -238,7 +250,6 @@ unsafe extern "C" fn drop_tab_signal_ctx(
 /// only — the WebView itself retains its own ref on the display, so it
 /// stays alive for the WebView's lifetime even if WpeRuntime races a drop.
 pub(crate) struct TabEntry {
-    #[allow(dead_code)]
     pub id: TabId,
     pub web_view: *mut WebKitWebView,
     /// Borrowed WPEView pointer that BuffrDisplay handed to WebKit. Owned
@@ -247,6 +258,10 @@ pub(crate) struct TabEntry {
     load_changed_id: u64,
     notify_title_id: u64,
     notify_uri_id: u64,
+    /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
+    /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
+    /// `WpeRuntime` so it can flip the active tab via `select_tab`.
+    pub is_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // SAFETY: TabEntry owns C pointers that are used only on the worker thread.
@@ -270,6 +285,7 @@ impl TabEntry {
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
         is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
+        is_active: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -306,6 +322,7 @@ impl TabEntry {
                 frame,
                 view,
                 last_ingest_us: std::sync::atomic::AtomicU64::new(0),
+                is_active: Arc::clone(&is_active),
             },
         );
         tracing::info!("webkit: ViewCtx attached to WPEView");
@@ -329,6 +346,7 @@ impl TabEntry {
             tab_id: id,
             engine_state,
             is_loading_atomic,
+            is_active: Arc::clone(&is_active),
         });
         let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
             let signal_c = CString::new(signal).unwrap();
@@ -392,6 +410,7 @@ impl TabEntry {
             load_changed_id,
             notify_title_id,
             notify_uri_id,
+            is_active,
         })
     }
 
@@ -463,7 +482,15 @@ impl Drop for TabEntry {
 /// tab(s), the worker-thread EGL display, and the single shared
 /// BuffrDisplay that every WebView is constructed against.
 pub(crate) struct WpeRuntime {
-    pub tab: Option<TabEntry>,
+    /// All open tabs in strip order. Mirrors `EngineState.tabs` and uses
+    /// the same `TabId` for cross-referencing. At most one is "active"
+    /// (its `is_active` flag is true) — that's the tab whose paints
+    /// reach the shared `OsrFrame` and whose load-state drives the
+    /// runtime-wide splash gate.
+    pub tabs: Vec<TabEntry>,
+    /// Index into `tabs` of the active entry. `None` only between
+    /// `close_active` and the next `open_tab`.
+    pub active_idx: Option<usize>,
     pub engine_state: Arc<Mutex<EngineState>>,
     pub frame: SharedOsrFrame,
     pub view: SharedOsrViewState,
@@ -518,7 +545,8 @@ impl WpeRuntime {
         tracing::info!("webkit: BuffrDisplay created + connected (shared)");
 
         Ok(Self {
-            tab: None,
+            tabs: Vec::new(),
+            active_idx: None,
             engine_state,
             frame,
             view,
@@ -526,6 +554,11 @@ impl WpeRuntime {
             display,
             is_loading_atomic,
         })
+    }
+
+    /// The currently active tab, if any.
+    fn active_tab(&self) -> Option<&TabEntry> {
+        self.active_idx.and_then(|i| self.tabs.get(i))
     }
 
     pub(crate) fn open_tab(&mut self, url: &str) -> Result<TabId, String> {
@@ -539,24 +572,39 @@ impl WpeRuntime {
             id
         };
 
-        self.tab = None;
+        // Deactivate the current active tab BEFORE creating the new
+        // WebView. WebKit emits LOAD_STARTED + initial paint events
+        // synchronously from webkit_web_view_load_uri inside
+        // TabEntry::new — if the previous tab is still flagged active,
+        // its ViewCtx would still write pixels into the shared frame
+        // and its TabSignalCtx would still clobber is_loading_atomic
+        // while we're trying to switch.
+        if let Some(prev) = self.active_tab() {
+            prev.is_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
 
         // TabInfo must exist before signal handlers fire — load-changed
         // can race the return from TabEntry::new because webkit_web_view_load_uri
         // emits LOAD_STARTED synchronously.
         let info = TabInfo::new(id, url);
         if let Ok(mut st) = self.engine_state.lock() {
-            st.tabs.clear();
             st.tabs.push(info);
-            st.active_idx = Some(0);
+            st.active_idx = Some(st.tabs.len() - 1);
         }
 
         // Reset the loading flag here on the worker thread so the
         // signal handler doesn't have to win the race against the main
-        // thread observing is_loading=false from a previous tab.
+        // thread observing is_loading=false from a previous tab. Also
+        // force the renderer to wait for the new tab's first paint
+        // instead of compositing the previous tab's last frame.
         self.is_loading_atomic
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.needs_fresh = true;
+        }
 
+        let is_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let entry = TabEntry::new(
             id,
             url,
@@ -565,29 +613,102 @@ impl WpeRuntime {
             Arc::clone(&self.view),
             Arc::clone(&self.engine_state),
             Arc::clone(&self.is_loading_atomic),
+            is_active,
         )
         .ok_or_else(|| "TabEntry::new returned None".to_string())?;
 
-        self.tab = Some(entry);
+        self.tabs.push(entry);
+        self.active_idx = Some(self.tabs.len() - 1);
         Ok(id)
     }
 
-    /// Close the active tab. Returns true if a tab was actually closed.
-    /// Drops the WebView (which releases its display ref) and clears the
-    /// tab list on the shared engine_state.
-    pub(crate) fn close_active(&mut self) -> bool {
-        if self.tab.take().is_none() {
+    /// Switch the active tab to the one with `id`. No-op if `id` isn't
+    /// open or is already active. On switch, the previous active tab's
+    /// `is_active` flag flips to false (its paints stop reaching the
+    /// shared frame); the new active tab's flag flips to true and
+    /// `frame.needs_fresh=true` makes the renderer wait for its first
+    /// paint instead of compositing the previous tab's last frame.
+    pub(crate) fn select_tab(&mut self, id: TabId) -> bool {
+        let Some(new_idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return false;
+        };
+        if self.active_idx == Some(new_idx) {
             return false;
         }
+        if let Some(prev) = self.active_tab() {
+            prev.is_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.tabs[new_idx]
+            .is_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.active_idx = Some(new_idx);
         if let Ok(mut st) = self.engine_state.lock() {
-            st.tabs.clear();
-            st.active_idx = None;
+            st.active_idx = Some(new_idx);
+        }
+        // Re-snapshot the runtime-wide is_loading from the newly active
+        // tab's TabInfo so the splash gate reflects the new tab, not the
+        // one we just left. Bump needs_fresh so the renderer holds the
+        // animation until the new view paints.
+        let new_is_loading = self
+            .engine_state
+            .lock()
+            .ok()
+            .and_then(|st| st.tabs.get(new_idx).map(|t| t.is_loading))
+            .unwrap_or(false);
+        self.is_loading_atomic
+            .store(new_is_loading, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.needs_fresh = true;
+        }
+        tracing::info!(?id, new_idx, "webkit: select_tab");
+        true
+    }
+
+    /// Close the active tab. Returns true if a tab was actually closed.
+    /// Drops the WebView (which releases its display ref) and reassigns
+    /// active to the previous tab (or none if this was the last).
+    pub(crate) fn close_active(&mut self) -> bool {
+        let Some(idx) = self.active_idx else {
+            return false;
+        };
+        if idx >= self.tabs.len() {
+            return false;
+        }
+        // Drop the WebView (disconnects signals + g_object_unref).
+        let _ = self.tabs.remove(idx);
+
+        // Pick a new active: prefer the tab now at the same index
+        // (the one that used to be after us); if we removed the last,
+        // fall back to the new last.
+        let new_idx = if self.tabs.is_empty() {
+            None
+        } else if idx < self.tabs.len() {
+            Some(idx)
+        } else {
+            Some(self.tabs.len() - 1)
+        };
+        self.active_idx = new_idx;
+        if let Some(i) = new_idx {
+            self.tabs[i]
+                .is_active
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        if let Ok(mut st) = self.engine_state.lock() {
+            if idx < st.tabs.len() {
+                st.tabs.remove(idx);
+            }
+            st.active_idx = new_idx;
+        }
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.needs_fresh = true;
         }
         true
     }
 
     pub(crate) fn navigate(&mut self, url: &str) {
-        if let Some(tab) = &self.tab {
+        if let Some(tab) = self.active_tab() {
             tab.load_uri(url);
         }
         if let Ok(mut st) = self.engine_state.lock() {
@@ -605,7 +726,10 @@ impl WpeRuntime {
             st.width = width;
             st.height = height;
         }
-        if let Some(tab) = &self.tab {
+        // Resize every tab's toplevel — hidden tabs need correct dims
+        // so when they're activated their next paint matches the
+        // shared frame's size (otherwise is_osr_frame_fresh rejects).
+        for tab in &self.tabs {
             tab.resize(width, height);
         }
         if let Ok(mut frame) = self.frame.lock() {
@@ -634,7 +758,7 @@ impl WpeRuntime {
     where
         F: FnOnce(*mut WPEView, u32) -> *mut WPEEvent,
     {
-        let Some(tab) = &self.tab else {
+        let Some(tab) = self.active_tab() else {
             return;
         };
         let view = tab.wpe_view;
@@ -662,7 +786,7 @@ impl WpeRuntime {
     /// we don't currently consume. Used by `WebKitEngine::dispatch` to
     /// implement vim-style scrolling and any other catch-all action.
     pub(crate) fn eval_js(&self, script: &str) {
-        let Some(tab) = &self.tab else {
+        let Some(tab) = self.active_tab() else {
             return;
         };
         if tab.web_view.is_null() {
@@ -794,6 +918,6 @@ impl WpeRuntime {
     }
 
     pub(crate) fn any_audio_active(&self) -> bool {
-        self.tab.as_ref().map(|t| t.is_playing_audio()).unwrap_or(false)
+        self.tabs.iter().any(|t| t.is_playing_audio())
     }
 }

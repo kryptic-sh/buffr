@@ -14,7 +14,7 @@
 
 use std::ffi::{CStr, c_void};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
@@ -72,6 +72,11 @@ pub(crate) struct ViewCtx {
     /// use an atomic so future input dispatch paths can read it without a
     /// mutex.
     pub last_ingest_us: AtomicU64,
+    /// Per-tab gate: when false, this view's paints are dropped (ack only)
+    /// so an inactive tab can't overwrite the shared OsrFrame with its own
+    /// pixels. WpeRuntime flips the active tab's flag to true on
+    /// select_tab and clears all others.
+    pub is_active: Arc<AtomicBool>,
 }
 
 /// Process-start instant — used as the epoch for `ViewCtx::last_ingest_us`.
@@ -139,6 +144,18 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
         }
         return;
     };
+
+    // Per-tab active gate. Inactive tabs still produce paints (WebKit
+    // doesn't stop rendering when a view goes off-screen unless we call
+    // was_hidden); ack the buffer so WPE doesn't stall, but don't write
+    // pixels into the shared OsrFrame — otherwise a background tab's
+    // content would clobber the active tab's display.
+    if !ctx.is_active.load(Ordering::Relaxed) {
+        unsafe {
+            wpe_view_buffer_rendered(view, buffer);
+        }
+        return;
+    }
 
     // Throttle ingest to the view's target frame rate. WebKit will keep
     // re-rendering as fast as we ack, so without a gate the
@@ -340,6 +357,7 @@ pub(crate) fn make_view_ctx(frame: SharedOsrFrame, view: SharedOsrViewState) -> 
         frame,
         view,
         last_ingest_us: AtomicU64::new(0),
+        is_active: Arc::new(AtomicBool::new(true)),
     }
 }
 
