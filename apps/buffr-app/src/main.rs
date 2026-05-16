@@ -3460,6 +3460,7 @@ impl AppState {
                 let summaries = host.tabs_summary();
                 if let Some(tab) = summaries.get(idx) {
                     host.select_tab(tab.id);
+                    self.on_tab_switch();
                 }
             }
             // CLI `--new-tab` URLs append after the session.
@@ -4488,6 +4489,24 @@ impl AppState {
         }
     }
 
+    /// Reset the OSR freshness state after every tab switch so the renderer
+    /// waits for the newly-active tab's first paint instead of showing the
+    /// previous tab's frozen frame.
+    ///
+    /// `last_osr_dims = None` causes `should_show_loading_anim` to return
+    /// `true`, which overlays the loading animation until the incoming
+    /// tab's first `render_buffer` lands and passes `is_osr_frame_fresh`.
+    ///
+    /// `last_osr_generation = 0` resets the freshness gate: after a tab
+    /// switch the new tab's first paint will always have a generation ≠ 0
+    /// (guaranteed by the generation counter monotonically incrementing),
+    /// so `is_osr_frame_fresh` accepts it even if the dimensions happen to
+    /// match whatever the previous tab last painted.
+    fn on_tab_switch(&mut self) {
+        self.last_osr_dims = None;
+        self.last_osr_generation = 0;
+    }
+
     fn open_command_line(&mut self) {
         self.overlay = Some(OverlayState::Command(InputBar::with_prefix(":")));
         self.refresh_overlay_suggestions();
@@ -5057,6 +5076,7 @@ impl AppState {
                 {
                     // Focus the tab first so the active-tab reload hits it.
                     host.select_tab(id);
+                    self.on_tab_switch();
                     self.close_overlay();
                     self.refresh_tab_strip();
                     self.dispatch_action(&buffr_modal::PageAction::Reload);
@@ -5150,6 +5170,7 @@ impl AppState {
                             let _ = host.close_tab(id);
                         }
                         host.select_tab(keep_id);
+                        self.on_tab_switch();
                     }
                     self.refresh_tab_strip();
                     self.mark_session_dirty();
@@ -8249,6 +8270,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 {
                     if let Some(host) = self.active_engine_dyn() {
                         host.select_tab(self.tab_ids[idx]);
+                        self.on_tab_switch();
                     }
                     // Tab switch implies the user moved focus away from
                     // whatever they were typing in the overlay (omnibar /
