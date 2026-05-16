@@ -1117,11 +1117,16 @@ wrap_download_handler! {
             suggested_name: Option<&CefString>,
             callback: Option<&mut BeforeDownloadCallback>,
         ) -> ::std::os::raw::c_int {
+            tracing::info!("downloads: on_before_download fired");
             // Resolve a target path under the configured default_dir
             // and continue the download. Without `cont`, CEF cancels
             // the download silently.
-            let Some(callback) = callback else { return 0; };
+            let Some(callback) = callback else {
+                tracing::warn!("downloads: on_before_download: callback is None");
+                return 0;
+            };
             let Some(item) = download_item else {
+                tracing::warn!("downloads: on_before_download: download_item is None — falling back to CEF default path");
                 // No item → can't record. Tell CEF to use its
                 // built-in default path so the user still gets the
                 // file.
@@ -1177,6 +1182,12 @@ wrap_download_handler! {
                 );
             }
 
+            tracing::info!(
+                url = %url,
+                target = %target_path.display(),
+                show_dialog,
+                "downloads: continuing download to target"
+            );
             callback.cont(Some(&target_cef), show_dialog);
             0
         }
@@ -1187,7 +1198,10 @@ wrap_download_handler! {
             download_item: Option<&mut DownloadItem>,
             _callback: Option<&mut DownloadItemCallback>,
         ) {
-            let Some(item) = download_item else { return };
+            let Some(item) = download_item else {
+                tracing::trace!("downloads: on_download_updated: download_item is None");
+                return;
+            };
             let cef_id = item.id();
             let row = match self.downloads.get_by_cef_id(cef_id) {
                 Ok(Some(r)) => r,
@@ -1217,6 +1231,11 @@ wrap_download_handler! {
             if item.is_complete() != 0 {
                 let path_str = CefStringUtf16::from(&item.full_path()).to_string();
                 let path = PathBuf::from(&path_str);
+                tracing::info!(
+                    path = %path.display(),
+                    received = received,
+                    "downloads: completed"
+                );
                 if let Err(err) = self.downloads.record_completed(row.id, &path) {
                     tracing::warn!(error = %err, "downloads: record_completed failed");
                     return;
