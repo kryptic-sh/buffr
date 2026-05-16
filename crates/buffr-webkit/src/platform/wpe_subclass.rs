@@ -255,7 +255,16 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
             if view_h != h {
                 ctx.view.height.store(h, Ordering::Relaxed);
             }
-            if frame.width != w || frame.height != h {
+            // Resize pixels whenever len doesn't match need, not just on
+            // dim change. The consumer in buffr-app swaps `frame.pixels`
+            // with its own `osr_scratch` (initially `Vec::new()`, len=0)
+            // on every fresh-frame read. Once swap puts an empty Vec
+            // into `frame.pixels`, dims still match w/h so the
+            // dim-changed branch is skipped, but the copy below bails
+            // on `frame.pixels.len() >= need` → generation never
+            // increments → consumer's freshness gate rejects every
+            // subsequent frame → viewport freezes on the first paint.
+            if frame.width != w || frame.height != h || frame.pixels.len() < need {
                 frame.width = w;
                 frame.height = h;
                 frame.pixels.resize(need, 0);
