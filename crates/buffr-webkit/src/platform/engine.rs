@@ -661,6 +661,72 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn cancel_hint(&self) {}
+
+    /// Vim-style PageAction dispatcher. CEF implements this as a big
+    /// match that pokes the browser host directly. For WPE we route the
+    /// few user-visible variants (scrolling, history, reload) through
+    /// methods we already have (`Navigate`, `EvalJs`, `webkit_web_view_*`).
+    /// Anything we don't recognise stays a no-op — the buffr-app side
+    /// already routes Tab*, Zoom*, OpenDevTools, EnterMode etc. through
+    /// dedicated trait methods.
+    fn dispatch(&self, action: &buffr_modal::PageAction) {
+        use buffr_modal::PageAction as A;
+        // Per-action JS snippet. `n` is the count multiplier from the
+        // keymap engine (e.g. `5j` → ScrollDown(5)). Pixel-per-line and
+        // page fraction match Chromium / Firefox defaults so user
+        // muscle memory carries over.
+        let script: Option<String> = match action {
+            A::ScrollDown(n) => Some(format!("window.scrollBy(0, {});", scroll_lines_to_px(*n))),
+            A::ScrollUp(n) => Some(format!("window.scrollBy(0, -{});", scroll_lines_to_px(*n))),
+            A::ScrollRight(n) => Some(format!("window.scrollBy({}, 0);", scroll_lines_to_px(*n))),
+            A::ScrollLeft(n) => Some(format!("window.scrollBy(-{}, 0);", scroll_lines_to_px(*n))),
+            A::ScrollPageDown => Some("window.scrollBy(0, window.innerHeight - 60);".into()),
+            A::ScrollPageUp => Some("window.scrollBy(0, -(window.innerHeight - 60));".into()),
+            A::ScrollFullPageDown => Some("window.scrollBy(0, window.innerHeight);".into()),
+            A::ScrollFullPageUp => Some("window.scrollBy(0, -window.innerHeight);".into()),
+            A::ScrollHalfPageDown => Some("window.scrollBy(0, window.innerHeight / 2);".into()),
+            A::ScrollHalfPageUp => Some("window.scrollBy(0, -window.innerHeight / 2);".into()),
+            A::ScrollTop => Some("window.scrollTo(window.scrollX, 0);".into()),
+            A::ScrollBottom => Some(
+                "window.scrollTo(window.scrollX, document.documentElement.scrollHeight);".into(),
+            ),
+            _ => None,
+        };
+        if let Some(script) = script {
+            self.send(Command::EvalJs { script });
+            return;
+        }
+        // History + reload have dedicated WebKit API on the WebView,
+        // but they're set on the worker thread so route via a new
+        // EvalJs that calls history.go(). Saves a Command variant per
+        // history slot and keeps semantics identical to the page's own
+        // `back` button.
+        match action {
+            A::HistoryBack => self.send(Command::EvalJs {
+                script: "history.back();".into(),
+            }),
+            A::HistoryForward => self.send(Command::EvalJs {
+                script: "history.forward();".into(),
+            }),
+            A::Reload => self.send(Command::EvalJs {
+                script: "location.reload();".into(),
+            }),
+            A::ReloadHard => self.send(Command::EvalJs {
+                script: "location.reload();".into(),
+            }),
+            A::StopLoading => self.send(Command::EvalJs {
+                script: "window.stop();".into(),
+            }),
+            _ => tracing::debug!(?action, "webkit: dispatch: no mapping yet"),
+        }
+    }
+}
+
+/// 60 px per "line" of vim-style scroll, matching Chromium/Firefox
+/// default `Smooth Scrolling` wheel deltas. Bound to a sensible minimum
+/// so `5j` always feels responsive even on tall pages.
+fn scroll_lines_to_px(count: u32) -> u32 {
+    count.saturating_mul(60).max(60)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -733,5 +799,34 @@ mod tests {
         let out = apply_display_overrides_pure(s.clone(), None);
         assert_eq!(out.url, s.url);
         assert_eq!(out.title, s.title);
+    }
+
+    // ── scroll_lines_to_px ───────────────────────────────────────────────
+
+    #[test]
+    fn scroll_lines_single_line() {
+        // `j` (count=1) scrolls one line — 60 px matches Chromium default.
+        assert_eq!(scroll_lines_to_px(1), 60);
+    }
+
+    #[test]
+    fn scroll_lines_multi_line() {
+        // `5j` → 5×60 = 300 px.
+        assert_eq!(scroll_lines_to_px(5), 300);
+    }
+
+    #[test]
+    fn scroll_lines_zero_count_floors_to_one_line() {
+        // Defensive: keymap engine never sends 0, but if it does we still
+        // want a visible nudge. Floor matches the single-line case.
+        assert_eq!(scroll_lines_to_px(0), 60);
+    }
+
+    #[test]
+    fn scroll_lines_saturates_on_overflow() {
+        // u32::MAX * 60 would overflow; saturating_mul caps at u32::MAX
+        // then .max(60) is a no-op. Confirms no panic on attacker-typed
+        // huge prefix counts.
+        assert_eq!(scroll_lines_to_px(u32::MAX), u32::MAX);
     }
 }

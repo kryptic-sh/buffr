@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 buffr-core.workspace = true
 buffr-engine.workspace = true
+buffr-modal = "0.1"
 buffr-history.workspace = true
 buffr-downloads.workspace = true
 buffr-config.workspace = true

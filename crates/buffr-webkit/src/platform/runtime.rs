@@ -405,6 +405,40 @@ impl WpeRuntime {
         }
     }
 
+    /// Run `script` in the active tab's main JavaScript world. Fire and
+    /// forget: WebKit posts the call to its UI process and returns
+    /// immediately; the result (if any) lands on an async callback that
+    /// we don't currently consume. Used by `WebKitEngine::dispatch` to
+    /// implement vim-style scrolling and any other catch-all action.
+    pub(crate) fn eval_js(&self, script: &str) {
+        let Some(tab) = &self.tab else {
+            return;
+        };
+        if tab.web_view.is_null() {
+            return;
+        }
+        let Ok(script_c) = CString::new(script) else {
+            tracing::warn!("webkit: eval_js: script contained NUL byte");
+            return;
+        };
+        // SAFETY: web_view is held by TabEntry for the tab's lifetime;
+        // script_c lives until the end of this call (length=-1 means
+        // strlen, so WebKit reads up to the NUL terminator). All other
+        // ptrs are NULL (default JS world, no source URI, no callback).
+        unsafe {
+            webkit_web_view_evaluate_javascript(
+                tab.web_view,
+                script_c.as_ptr(),
+                -1,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
     pub(crate) fn dispatch_keyboard(&self, key_code: u32, pressed: bool, modifiers: u32) {
         let event_type = if pressed {
             WPEEventType_WPE_EVENT_KEYBOARD_KEY_DOWN

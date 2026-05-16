@@ -122,6 +122,12 @@ pub(crate) enum Command {
     CloseActive {
         reply: mpsc::SyncSender<bool>,
     },
+    /// Run a JavaScript snippet in the active tab's main world. Used
+    /// by `WebKitEngine::dispatch` to implement vim-style scrolling
+    /// (`window.scrollBy(...)`) and other catch-all PageActions.
+    EvalJs {
+        script: String,
+    },
     Shutdown,
 }
 
@@ -361,6 +367,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         Command::CloseActive { reply } => {
             let closed = rt.close_active();
             let _ = reply.try_send(closed);
+        }
+        Command::EvalJs { script } => {
+            rt.eval_js(&script);
         }
         Command::Shutdown => {
             ml.quit();
