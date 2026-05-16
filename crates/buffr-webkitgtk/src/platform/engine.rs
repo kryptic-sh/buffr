@@ -120,6 +120,10 @@ pub struct WebKitGtkEngine {
     /// Find-result sink — written from FindController signal handlers.
     #[allow(dead_code)]
     find_sink: FindResultSink,
+    /// Popup URL queue — URLs pushed by the WebView `create` signal handler
+    /// when JS calls `window.open(url)` or a link uses `target=_blank`.
+    /// Drained by the apps layer via `popup_queue()` to open new tabs.
+    popup_queue: PopupQueue,
 }
 
 impl WebKitGtkEngine {
@@ -179,6 +183,7 @@ impl WebKitGtkEngine {
             .unwrap_or_else(new_find_sink);
 
         let hint_sink = new_hint_event_sink();
+        let popup_queue = new_popup_queue();
 
         let worker = spawn(
             options.initial_url,
@@ -192,6 +197,7 @@ impl WebKitGtkEngine {
             downloads.clone(),
             notice_queue.clone(),
             find_sink.clone(),
+            Arc::clone(&popup_queue),
         )?;
 
         let hint_alphabet = HintAlphabet::from_str(buffr_core::hint::DEFAULT_HINT_ALPHABET)
@@ -220,6 +226,7 @@ impl WebKitGtkEngine {
             downloads,
             notice_queue,
             find_sink,
+            popup_queue,
         })
     }
 
@@ -653,16 +660,32 @@ impl BrowserEngine for WebKitGtkEngine {
         false
     }
 
-    // ── Popup stubs ──────────────────────────────────────────────────────────
+    // ── Popup ────────────────────────────────────────────────────────────────
 
+    /// Clone the shared popup URL queue.
+    ///
+    /// URLs are enqueued by the `WebView::create` signal handler when JS calls
+    /// `window.open(url)` or a link uses `target=_blank`. The apps layer drains
+    /// this queue and opens each URL as a new tab.
     fn popup_queue(&self) -> PopupQueue {
-        new_popup_queue()
+        Arc::clone(&self.popup_queue)
     }
 
+    /// Return an empty popup-create sink.
+    ///
+    /// WebKitGTK handles popup windows via the `create` signal (see
+    /// `popup_queue`). There are no OSR popup browsers and therefore no
+    /// `PopupCreated` events to surface. An empty sink is returned so the
+    /// apps layer does not need a special-case.
     fn popup_create_sink(&self) -> PopupCreateSink {
         new_popup_create_sink()
     }
 
+    /// Return an empty popup-close sink.
+    ///
+    /// WebKitGTK has no OSR popup browser concept; close events are not
+    /// generated. An empty sink is returned so the apps layer can drain it
+    /// safely without a special-case.
     fn popup_close_sink(&self) -> PopupCloseSink {
         new_popup_close_sink()
     }

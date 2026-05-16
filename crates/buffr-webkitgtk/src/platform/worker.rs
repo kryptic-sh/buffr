@@ -29,7 +29,7 @@ use buffr_core::DownloadNoticeQueue;
 use buffr_core::find::FindResultSink;
 use buffr_core::hint::HintEventSink;
 use buffr_downloads::Downloads;
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary, popup::PopupQueue};
 use buffr_history::History;
 
 use super::error::WebKitGtkError;
@@ -339,6 +339,9 @@ struct GtkRuntime {
     #[allow(dead_code)]
     notice_queue: Option<DownloadNoticeQueue>,
     find_sink: FindResultSink,
+    /// Shared popup URL queue — each new WebView wires its `create` signal to
+    /// push `window.open(url)` URLs here for rerouting as new tabs.
+    popup_queue: PopupQueue,
 }
 
 impl GtkRuntime {
@@ -352,6 +355,7 @@ impl GtkRuntime {
         downloads: Option<Arc<Downloads>>,
         notice_queue: Option<DownloadNoticeQueue>,
         find_sink: FindResultSink,
+        popup_queue: PopupQueue,
     ) -> Self {
         GtkRuntime {
             tabs: Vec::new(),
@@ -365,6 +369,7 @@ impl GtkRuntime {
             downloads,
             notice_queue,
             find_sink,
+            popup_queue,
         }
     }
 
@@ -401,6 +406,7 @@ impl GtkRuntime {
             TabSinks {
                 history: self.history.clone(),
                 find_sink: self.find_sink.clone(),
+                popup_queue: Arc::clone(&self.popup_queue),
             },
         );
         self.tabs.push(entry);
@@ -905,6 +911,7 @@ pub(crate) fn spawn(
     downloads: Option<Arc<Downloads>>,
     notice_queue: Option<DownloadNoticeQueue>,
     find_sink: FindResultSink,
+    popup_queue: PopupQueue,
 ) -> Result<WorkerHandle, WebKitGtkError> {
     // gtk4::init() must be called before any GTK widgets are created.
     // It is safe to call multiple times; subsequent calls are no-ops.
@@ -935,6 +942,7 @@ pub(crate) fn spawn(
                 downloads.clone(),
                 notice_queue.clone(),
                 find_sink.clone(),
+                Arc::clone(&popup_queue),
             );
 
             // ── NetworkSession download-started signal ────────────────────

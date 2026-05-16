@@ -49,6 +49,7 @@ pub(crate) mod macos {
 
     use buffr_core::find::FindResultSink;
     use buffr_core::hint::HintEventSink;
+    use buffr_engine::popup::PopupQueue;
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
     use dispatch2::{DispatchQueue, DispatchTime};
@@ -102,6 +103,9 @@ pub(crate) mod macos {
         /// Find-result sink. When `Some`, the `find_string` completion handler
         /// pushes a [`buffr_core::find::FindResult`] after each search.
         pub find_sink: Option<FindResultSink>,
+        /// Popup URL queue. URLs intercepted by WKUIDelegate `createWebView` are
+        /// pushed here so the apps layer can open them as new tabs.
+        pub popup_queue: PopupQueue,
     }
 
     impl EngineState {
@@ -115,6 +119,7 @@ pub(crate) mod macos {
                 osr_sleep: Arc::new(AtomicBool::new(false)),
                 history: None,
                 find_sink: None,
+                popup_queue: buffr_engine::popup::new_popup_queue(),
             }
         }
 
@@ -194,6 +199,10 @@ pub(crate) mod macos {
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
         hint_sink: HintEventSink,
+        /// Cloned from `EngineState::popup_queue`; passed into each new tab's
+        /// `BuffrUiDelegate` so the createWebView callback can push URLs directly
+        /// without locking the full EngineState.
+        popup_queue: PopupQueue,
     }
 
     impl RuntimeState {
@@ -202,6 +211,7 @@ pub(crate) mod macos {
             view: SharedOsrViewState,
             engine_state: Arc<Mutex<EngineState>>,
             hint_sink: HintEventSink,
+            popup_queue: PopupQueue,
         ) -> Self {
             RuntimeState {
                 tabs: Vec::new(),
@@ -211,6 +221,7 @@ pub(crate) mod macos {
                 view,
                 engine_state,
                 hint_sink,
+                popup_queue,
             }
         }
 
@@ -268,6 +279,7 @@ pub(crate) mod macos {
                 h,
                 Arc::clone(&self.engine_state),
                 Arc::clone(&self.hint_sink),
+                Arc::clone(&self.popup_queue),
             )?;
             self.tabs.push(entry);
             self.active_idx = Some(self.tabs.len() - 1);
@@ -791,12 +803,24 @@ pub(crate) mod macos {
         let (tx, rx) = mpsc::sync_channel::<Command>(64);
         let initial_url = initial_url.to_owned();
 
+        // Extract the popup_queue from engine_state so RuntimeState can clone it
+        // into each new tab's BuffrUiDelegate without locking the full engine_state.
+        let popup_queue_for_rt = engine_state
+            .lock()
+            .map(|g| Arc::clone(&g.popup_queue))
+            .unwrap_or_else(|_| buffr_engine::popup::new_popup_queue());
+
         // SAFETY: `MainQueueBox<RuntimeState>` is `Send` by our invariant —
         // all closures that touch `rt` are dispatched via `dispatch_main_async`
         // and run exclusively on the serial GCD main queue.
-        let rt: Arc<Mutex<MainQueueBox<RuntimeState>>> = Arc::new(Mutex::new(MainQueueBox(
-            RuntimeState::new(frame, view, Arc::clone(&engine_state), hint_sink),
-        )));
+        let rt: Arc<Mutex<MainQueueBox<RuntimeState>>> =
+            Arc::new(Mutex::new(MainQueueBox(RuntimeState::new(
+                frame,
+                view,
+                Arc::clone(&engine_state),
+                hint_sink,
+                popup_queue_for_rt,
+            ))));
 
         // Submit the initial open_tab to the main queue.
         {

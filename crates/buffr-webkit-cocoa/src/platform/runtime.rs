@@ -91,12 +91,13 @@ pub(crate) mod macos {
     use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
     use objc2_foundation::{NSError, NSString, NSURL, NSURLRequest};
     use objc2_web_kit::{
-        WKNavigation, WKNavigationDelegate, WKScriptMessage, WKScriptMessageHandler, WKUIDelegate,
-        WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView,
-        WKWebViewConfiguration,
+        WKNavigation, WKNavigationAction, WKNavigationDelegate, WKScriptMessage,
+        WKScriptMessageHandler, WKUIDelegate, WKUserContentController, WKUserScript,
+        WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
     };
 
     use buffr_core::hint::{HintEventSink, parse_console_event};
+    use buffr_engine::popup::PopupQueue;
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
     use buffr_history::Transition as HistoryTransition;
 
@@ -177,6 +178,7 @@ pub(crate) mod macos {
             height: u32,
             state: Arc<Mutex<EngineState>>,
             hint_sink: HintEventSink,
+            popup_queue: PopupQueue,
         ) -> Result<Self, WebKitCocoaError> {
             use objc2_core_foundation::CGRect;
 
@@ -261,7 +263,10 @@ pub(crate) mod macos {
             }
 
             // Install UI delegate.
-            let ui_delegate = BuffrUiDelegate::new(mtm);
+            // `BuffrUiDelegate` implements `createWebView:…` to intercept
+            // `window.open()` / `<a target="_blank">` and push the URL into
+            // `popup_queue` instead of opening a native popup window.
+            let ui_delegate = BuffrUiDelegate::new(mtm, popup_queue);
             unsafe {
                 web_view.setUIDelegate(Some(ProtocolObject::from_ref(&*ui_delegate)));
             }
@@ -665,28 +670,41 @@ pub(crate) mod macos {
 
     // ── BuffrUiDelegate ───────────────────────────────────────────────────────
     //
-    // Implements WKUIDelegate to suppress JS dialogs (alert/confirm/prompt).
+    // Implements WKUIDelegate to:
+    //   1. Intercept window.open() / <a target="_blank"> via createWebView:…
+    //      — extract the target URL and push it into popup_queue so the apps
+    //      layer opens it in a new tab. Return nil to suppress the popup window.
+    //   2. Suppress JS dialogs (alert/confirm/prompt) — without overriding those
+    //      methods, WKWebView silently discards them when a WKUIDelegate is set.
     //
-    // WKUIDelegate protocol binding confirmed:
-    // objc2-web-kit-0.3.2/src/generated/WKUIDelegate.rs:83 — protocol exists.
+    // WKUIDelegate protocol binding:
+    //   objc2-web-kit-0.3.2/src/generated/WKUIDelegate.rs:83
     //
-    // Without overriding the alert/confirm/prompt methods, WKWebView will
-    // silently discard JavaScript dialogs when a WKUIDelegate is set but does
-    // not implement those selectors. That is the desired behaviour here.
+    // createWebView selector confirmed:
+    //   WKUIDelegate.rs:110 — optional method gated on:
+    //     feature = "WKNavigationAction" + "WKWebView" + "WKWebViewConfiguration"
+    //     + "WKWindowFeatures" + "objc2-app-kit"
+    //   Signature: fn(web_view, configuration, navigation_action, window_features)
+    //              -> Option<Retained<WKWebView>>
     //
-    // # TODO: JS dialog suppression runtime verification
-    //
-    // If integration tests show that window.alert() blocks the page (e.g. in
-    // off-screen mode on an older macOS), add:
-    //   webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:
-    // and call the completionHandler immediately with no action.
-    // The selector and block signature are in WKUIDelegate.rs.
+    // WKNavigationAction::request() → Retained<NSURLRequest>
+    //   Confirmed: WKNavigationAction.rs:80.
+    // NSURLRequest::URL() → Option<Retained<NSURL>>
+    //   Confirmed: objc2-foundation NSURLRequest binding.
+    // NSURL::absoluteString() → Option<Retained<NSString>>
+    //   Confirmed: NSURL.rs:1264-1266.
 
-    /// Ivars for `BuffrUiDelegate` — none needed, so use the unit type.
-    pub struct UiDelegateIvars;
+    /// Ivars stored inside `BuffrUiDelegate`.
+    pub struct UiDelegateIvars {
+        /// Shared popup URL queue. Intercepted `window.open` / `_blank` URLs
+        /// are pushed here so the apps layer can open them as new tabs.
+        popup_queue: PopupQueue,
+    }
 
     define_class!(
-        /// UI delegate that suppresses JavaScript dialogs.
+        /// UI delegate that intercepts `window.open()` / `<a target="_blank">`
+        /// and reroutes them to the engine's popup URL queue, suppressing the
+        /// native popup window. Also silently discards JS alert/confirm/prompt.
         #[unsafe(super(NSObject))]
         #[thread_kind = MainThreadOnly]
         #[ivars = UiDelegateIvars]
@@ -695,14 +713,66 @@ pub(crate) mod macos {
 
         unsafe impl NSObjectProtocol for BuffrUiDelegate {}
 
-        // No WKUIDelegate methods overridden. Default behaviour drops JS dialogs
-        // silently when the delegate does not implement them.
-        unsafe impl WKUIDelegate for BuffrUiDelegate {}
+        /// WKUIDelegate — intercept window.open via createWebView.
+        ///
+        /// Feature gates match WKUIDelegate.rs:84-90:
+        ///   WKNavigationAction + WKWebView + WKWebViewConfiguration
+        ///   + WKWindowFeatures + objc2-app-kit (all enabled in Cargo.toml).
+        unsafe impl WKUIDelegate for BuffrUiDelegate {
+            /// webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:
+            ///
+            /// Called when web content requests a new window (window.open,
+            /// target="_blank"). We extract the URL, push it to popup_queue so
+            /// the apps layer opens it in a new tab, then return nil to tell
+            /// WebKit not to create a native popup window.
+            ///
+            /// Confirmed selector and return type: WKUIDelegate.rs:110-118.
+            #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
+            #[allow(non_snake_case)]
+            unsafe fn webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures(
+                &self,
+                _web_view: &WKWebView,
+                _configuration: &WKWebViewConfiguration,
+                navigation_action: &WKNavigationAction,
+                _window_features: &WKWindowFeatures,
+            ) -> Option<Retained<WKWebView>> {
+                // Extract the target URL from the navigation action's request.
+                // request() → Retained<NSURLRequest> (confirmed: WKNavigationAction.rs:80)
+                // URL() → Option<Retained<NSURL>> (NSURLRequest binding)
+                // absoluteString() → Option<Retained<NSString>> (NSURL.rs:1264)
+                // SAFETY: navigation_action is a live WKNavigationAction on the main thread.
+                let url_str: Option<String> = unsafe {
+                    navigation_action
+                        .request()
+                        .URL()
+                        .as_ref()
+                        .and_then(|u| u.absoluteString())
+                        .map(|s| s.to_string())
+                };
+
+                if let Some(url) = url_str {
+                    tracing::debug!(
+                        url = url.as_str(),
+                        "webkit-cocoa ui-delegate: intercepted window.open → popup_queue"
+                    );
+                    if let Ok(mut q) = self.ivars().popup_queue.lock() {
+                        q.push_back(url);
+                    }
+                } else {
+                    tracing::debug!(
+                        "webkit-cocoa ui-delegate: createWebView called with no URL (ignored)"
+                    );
+                }
+
+                // Return nil — suppress the native popup window entirely.
+                None
+            }
+        }
     );
 
     impl BuffrUiDelegate {
-        fn new(mtm: MainThreadMarker) -> Retained<Self> {
-            let this = Self::alloc(mtm).set_ivars(UiDelegateIvars);
+        fn new(mtm: MainThreadMarker, popup_queue: PopupQueue) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(UiDelegateIvars { popup_queue });
             unsafe { objc2::msg_send![super(this), init] }
         }
     }

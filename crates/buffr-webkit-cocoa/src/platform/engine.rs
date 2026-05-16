@@ -122,6 +122,9 @@ pub struct WebKitCocoaEngine {
     downloads: Option<Arc<buffr_downloads::Downloads>>,
     /// Find-result sink. When `Some`, find completions push a `FindResult`.
     find_sink: Option<FindResultSink>,
+    /// Popup URL queue — URLs intercepted by WKUIDelegate `createWebView` and
+    /// rerouted to the apps layer as new-tab requests.
+    popup_queue: PopupQueue,
 }
 
 impl WebKitCocoaEngine {
@@ -189,12 +192,18 @@ impl WebKitCocoaEngine {
                     )
                 });
 
-            // Store history and find_sink in EngineState so the navigation
-            // delegate and find completion handler can reach them from the
-            // GCD main queue without going back through the engine.
+            // Construct the popup URL queue. Cloned into EngineState so the
+            // WKUIDelegate `createWebView` callback (on the main queue) can push
+            // intercepted URLs without needing a back-channel to the engine.
+            let popup_queue = new_popup_queue();
+
+            // Store history, find_sink, and popup_queue in EngineState so the
+            // navigation delegate and UI delegate can reach them from the GCD
+            // main queue without going back through the engine.
             if let Ok(mut st) = engine_state.lock() {
                 st.history = history.clone();
                 st.find_sink = find_sink.clone();
+                st.popup_queue = Arc::clone(&popup_queue);
             }
 
             let worker = super::worker::macos::spawn(
@@ -230,6 +239,7 @@ impl WebKitCocoaEngine {
                 history,
                 downloads: wk_downloads,
                 find_sink,
+                popup_queue,
             });
         }
 
@@ -247,6 +257,7 @@ impl WebKitCocoaEngine {
             history,
             downloads: wk_downloads,
             find_sink,
+            popup_queue: new_popup_queue(),
         })
     }
 
@@ -808,17 +819,29 @@ impl BrowserEngine for WebKitCocoaEngine {
         false
     }
 
-    // ── Popup stubs ──────────────────────────────────────────────────────────
+    // ── Popup ────────────────────────────────────────────────────────────────
+    //
+    // WebKit intercepts `window.open()` / `<a target="_blank">` via the
+    // WKUIDelegate `createWebView:…` callback (implemented on `BuffrUiDelegate`
+    // in runtime.rs).  The callback pushes the target URL into `popup_queue`
+    // and returns `nil` to suppress the WebKit popup window.  The apps layer
+    // drains the queue via `popup_queue()` and opens a new tab.
+    //
+    // `popup_create_sink` / `popup_close_sink` return fresh empty sinks because
+    // WebKit handles the popup as a new-tab re-route via the createWebView
+    // delegate; there are no OSR sinks for popup browsers in this backend.
 
     fn popup_queue(&self) -> PopupQueue {
-        new_popup_queue()
+        Arc::clone(&self.popup_queue)
     }
 
     fn popup_create_sink(&self) -> PopupCreateSink {
+        // WebKit handles popup as new tab via createWebView delegate; no OSR sinks.
         new_popup_create_sink()
     }
 
     fn popup_close_sink(&self) -> PopupCloseSink {
+        // WebKit handles popup as new tab via createWebView delegate; no OSR sinks.
         new_popup_close_sink()
     }
 

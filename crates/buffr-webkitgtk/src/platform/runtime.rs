@@ -19,7 +19,7 @@ use webkit6::{LoadEvent, WebView};
 
 use buffr_core::find::{FindResult, FindResultSink};
 use buffr_core::hint::{HintEventSink, parse_console_event};
-use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId};
+use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId, popup::PopupQueue};
 use buffr_history::{History, Transition};
 
 use super::osr::request_snapshot;
@@ -65,6 +65,9 @@ pub(crate) struct TabSinks {
     /// Find-result sink — receives `FindResult` updates from the
     /// WebView's `FindController` signals.
     pub find_sink: FindResultSink,
+    /// Popup URL queue — receives URLs from `window.open()` / target=_blank
+    /// via the WebView `create` signal, for rerouting as new tabs.
+    pub popup_queue: PopupQueue,
 }
 
 /// One open browser tab. Owns a `WebView` and its signal handler IDs.
@@ -100,6 +103,7 @@ impl TabEntry {
     ) -> Self {
         let history = sinks.history;
         let find_sink = sinks.find_sink;
+        let popup_queue = sinks.popup_queue;
         use webkit6::{
             UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime,
         };
@@ -341,6 +345,37 @@ impl TabEntry {
                     *slot = Some((0, raw_kind));
                 }
                 tracing::debug!(raw_kind, "webkitgtk runtime: cursor changed");
+            });
+        }
+
+        // ── create signal (popup / window.open interception) ─────────────────
+        //
+        // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
+        // WebKitGTK handles popup as new tab via the create signal; no OSR sinks
+        // are needed for popup browsers. We extract the URL from the navigation
+        // action, push it to the shared PopupQueue, and return `None` to suppress
+        // the native popup WebView.
+        {
+            let pq = Arc::clone(&popup_queue);
+            web_view.connect_create(move |_wv, nav_action| {
+                let uri = nav_action
+                    .request()
+                    .and_then(|r| r.uri())
+                    .map(|u| u.to_string());
+                if let Some(url) = uri {
+                    tracing::debug!(
+                        url,
+                        "webkitgtk runtime: window.open intercepted → popup_queue"
+                    );
+                    if let Ok(mut q) = pq.lock() {
+                        q.push_back(url);
+                    }
+                } else {
+                    tracing::debug!(
+                        "webkitgtk runtime: create signal with no URI — suppressing popup"
+                    );
+                }
+                None
             });
         }
 
