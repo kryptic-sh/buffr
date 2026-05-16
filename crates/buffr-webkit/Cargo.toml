@@ -1,0 +1,28 @@
+[package]
+name = "buffr-webkit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "WPE WebKit (Linux native) backend for buffr-engine — phase 1 scaffold"
+publish = false
+
+[dependencies]
+buffr-core.workspace = true
+buffr-engine.workspace = true
+buffr-history.workspace = true
+buffr-downloads.workspace = true
+buffr-config.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+glib = "0.22"
+
+[build-dependencies]
+# pkg-config finds wpe-webkit-2.0 cflags/libs; bindgen generates FFI bindings.
+pkg-config = "0.3"
+bindgen = "0.71"

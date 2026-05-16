@@ -8,6 +8,7 @@ members = [
     "crates/buffr-firefox-cdp",
     "crates/buffr-ladybird",
     "crates/buffr-webkit-cocoa",
+    "crates/buffr-webkit",
     "crates/buffr-webkitgtk",
     "crates/buffr-webview2",
     "crates/buffr-core",
@@ -112,6 +113,7 @@ buffr-blitz = { path = "crates/buffr-blitz" }
 buffr-firefox-cdp = { path = "crates/buffr-firefox-cdp" }
 buffr-ladybird = { path = "crates/buffr-ladybird" }
 # buffr-servo is intentionally absent — see [workspace.exclude] above.
+buffr-webkit = { path = "crates/buffr-webkit" }
 buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
 buffr-webkitgtk = { path = "crates/buffr-webkitgtk" }
 buffr-webview2 = { path = "crates/buffr-webview2" }

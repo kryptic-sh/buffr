@@ -461,8 +461,8 @@ struct Cli {
     /// Override the default engine backend for this run. Synthesises a single
     /// instance with the chosen backend and routes every tab through it,
     /// ignoring `[engines]` config. Valid values: cef, blink-cdp, firefox-cdp,
-    /// webkit-cocoa (macOS only), webkitgtk (Linux only), webview2 (Windows
-    /// only), blitz, ladybird.
+    /// webkit (WPE, Linux only), webkit-cocoa (macOS only), webkitgtk (Linux
+    /// only), webview2 (Windows only), blitz, ladybird.
     #[arg(long, value_name = "NAME")]
     engine: Option<String>,
     /// URLs to open. Each becomes a new tab. When another buffr instance is
@@ -522,6 +522,7 @@ fn main() -> Result<()> {
             "cef",
             "blink-cdp",
             "firefox-cdp",
+            "webkit",
             "webkit-cocoa",
             "webkitgtk",
             "webview2",
@@ -7494,6 +7495,61 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 #[cfg(not(target_os = "linux"))]
                 "webkitgtk" => {
                     warn!(engine_id = %inst.id, "webkitgtk is only supported on Linux — skipping");
+                }
+                #[cfg(target_os = "linux")]
+                "webkit" => {
+                    let data_dir_buf: Option<std::path::PathBuf> =
+                        Some(match inst.data_dir.as_deref() {
+                            Some(explicit) => std::path::PathBuf::from(explicit),
+                            None => {
+                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
+                            }
+                        });
+                    let options = buffr_engine::BackendOpenOptions {
+                        engine_id: buffr_engine::EngineId::new(&inst.id),
+                        data_dir: data_dir_buf.as_deref(),
+                        cache_dir: None,
+                        initial_url: &self.homepage,
+                        frame_rate: display_hz as i32,
+                        device_scale: effective_scale as f64,
+                        initial_size: (cef_w, cef_h),
+                        private: self.private,
+                        history: None,
+                        download_dir: None,
+                        downloads: None,
+                        notice_queue: None,
+                        find_sink: None,
+                        sinks: Box::new(()),
+                    };
+                    match buffr_webkit::WebKitEngine::new(&options) {
+                        Ok(engine) => {
+                            info!(engine_id = %inst.id, "webkit (WPE) engine created (phase 1 stub)");
+                            let proxy = self.event_proxy.clone();
+                            buffr_engine::BrowserEngine::set_osr_wake(
+                                &engine,
+                                Arc::new(move || {
+                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
+                                }),
+                            );
+                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            let engine_id = buffr_engine::EngineId::new(&inst.id);
+                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
+                            router_builder =
+                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
+                            self.engines.insert(engine_id.clone(), dyn_engine);
+                            if first_instance {
+                                self.active_engine = engine_id;
+                            }
+                            first_instance = false;
+                        }
+                        Err(err) => {
+                            warn!(engine_id = %inst.id, error = %err, "failed to create webkit (WPE) engine");
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                "webkit" => {
+                    warn!(engine_id = %inst.id, "webkit (WPE) is only supported on Linux — skipping");
                 }
                 #[cfg(target_os = "macos")]
                 "webkit-cocoa" => {
