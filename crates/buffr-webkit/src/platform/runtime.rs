@@ -74,15 +74,14 @@ unsafe extern "C" {
 
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
-/// One open browser tab. Owns the WebKitWebView GObject + the BuffrDisplay
-/// it was constructed against. Drop order: disconnect signals → unref view
-/// → drop BuffrDisplayHandle.
+/// One open browser tab. Owns the WebKitWebView GObject. The shared
+/// BuffrDisplay lives on `WpeRuntime`; tabs hold a borrowed raw pointer
+/// only — the WebView itself retains its own ref on the display, so it
+/// stays alive for the WebView's lifetime even if WpeRuntime races a drop.
 pub(crate) struct TabEntry {
     #[allow(dead_code)]
     pub id: TabId,
     pub web_view: *mut WebKitWebView,
-    #[allow(dead_code)]
-    display: BuffrDisplayHandle,
     /// Borrowed WPEView pointer that BuffrDisplay handed to WebKit. Owned
     /// by the WebView; we only keep it for input dispatch / lookup.
     pub wpe_view: *mut WPEView,
@@ -100,56 +99,40 @@ impl TabEntry {
     /// WebView with the `display` property. WebKit calls our display's
     /// `create_view` vmethod, which we then attach the per-frame ViewCtx
     /// to so the render callback can find the shared OsrFrame.
+    /// Construct a WebView bound to the shared BuffrDisplay owned by
+    /// [`WpeRuntime`]. The display ref count is bumped by WebKit (one ref
+    /// per WebView via the `display` construct property), and dropped when
+    /// the WebView is unreffed — independent of WpeRuntime's own ref.
     pub(crate) fn new(
         id: TabId,
         url: &str,
-        width: u32,
-        height: u32,
+        display: *mut WPEDisplay,
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
-        egl: &EglWorker,
-        _engine_state: Arc<Mutex<EngineState>>,
     ) -> Option<Self> {
-        // 1. BuffrDisplay: hands WebKit our EGL display + viewport.
-        let display = BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, 60)?;
-
-        // Explicitly connect — our vmethod returns TRUE no-op, but WebKit's
-        // internal state machine still expects `wpe_display_connect` to
-        // have been called before WebView creation. Also publish it as
-        // primary so any WebKit code path that calls wpe_display_get_primary
-        // resolves to ours instead of falling back to a registered backend.
-        unsafe {
-            let mut error: *mut GError = std::ptr::null_mut();
-            let ok = wpe_display_connect(display.raw, &mut error);
-            if ok == 0 {
-                tracing::error!("webkit: wpe_display_connect failed");
-                return None;
-            }
-            wpe_display_set_primary(display.raw);
+        if display.is_null() {
+            tracing::error!("webkit: TabEntry::new called with NULL display");
+            return None;
         }
-        tracing::info!("webkit: BuffrDisplay created + connected");
 
-        // 2. WebKitWebView via the platform path (no backend property).
+        // WebKitWebView via the platform path. WebKit calls our display's
+        // create_view vmethod during construction; we recover the view
+        // pointer via the stash below.
         let web_view = unsafe {
             let key = CString::new("display").unwrap();
-            let raw_display = display.raw;
-            // g_object_new with one ("display", BuffrDisplay*) construct
-            // property, NULL-terminated. Cast to WebKitWebView*.
-            let view = g_object_new(
+            let view_obj = g_object_new(
                 webkit_web_view_get_type(),
                 key.as_ptr(),
-                raw_display,
+                display,
                 std::ptr::null::<u8>(),
             );
-            if view.is_null() {
+            if view_obj.is_null() {
                 tracing::error!("webkit: g_object_new(WebKitWebView, display=…) returned NULL");
                 return None;
             }
-            view as *mut WebKitWebView
+            view_obj as *mut WebKitWebView
         };
 
-        // 3. Recover the WPEView our display just created so we can attach
-        // the ViewCtx with the shared OsrFrame.
         let wpe_view = unsafe { buffr_display_take_last_view() };
         if wpe_view.is_null() {
             tracing::error!("webkit: BuffrDisplay never called create_view");
@@ -166,7 +149,6 @@ impl TabEntry {
         );
         tracing::info!("webkit: ViewCtx attached to WPEView");
 
-        // 4. Load initial URL.
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -174,7 +156,6 @@ impl TabEntry {
         Some(TabEntry {
             id,
             web_view,
-            display,
             wpe_view,
             load_changed_id: 0,
             notify_title_id: 0,
@@ -247,13 +228,17 @@ impl Drop for TabEntry {
 // ── WpeRuntime ────────────────────────────────────────────────────────────────
 
 /// Top-level runtime that lives on the GLib worker thread. Owns the active
-/// tab(s) plus the worker-thread EGL display that BuffrDisplay hands WebKit.
+/// tab(s), the worker-thread EGL display, and the single shared
+/// BuffrDisplay that every WebView is constructed against.
 pub(crate) struct WpeRuntime {
     pub tab: Option<TabEntry>,
     pub engine_state: Arc<Mutex<EngineState>>,
     pub frame: SharedOsrFrame,
     pub view: SharedOsrViewState,
     pub egl: EglWorker,
+    /// Shared display. Lives for the runtime's lifetime; each WebView
+    /// bumps its ref via the `display` construct property.
+    display: BuffrDisplayHandle,
 }
 
 impl WpeRuntime {
@@ -262,14 +247,45 @@ impl WpeRuntime {
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
         egl: EglWorker,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let (width, height, hz) = {
+            let st = engine_state
+                .lock()
+                .map_err(|e| format!("mutex poison: {e}"))?;
+            (
+                st.width,
+                st.height,
+                view.frame_rate_hz
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1),
+            )
+        };
+
+        let display =
+            BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, hz).ok_or_else(|| {
+                "BuffrDisplayHandle::new returned None".to_string()
+            })?;
+
+        // Connect + publish as primary once. wpe_display_get_primary calls
+        // inside WebKit now resolve here for the whole runtime lifetime.
+        unsafe {
+            let mut error: *mut GError = std::ptr::null_mut();
+            let ok = wpe_display_connect(display.raw, &mut error);
+            if ok == 0 {
+                return Err("wpe_display_connect failed".into());
+            }
+            wpe_display_set_primary(display.raw);
+        }
+        tracing::info!("webkit: BuffrDisplay created + connected (shared)");
+
+        Ok(Self {
             tab: None,
             engine_state,
             frame,
             view,
             egl,
-        }
+            display,
+        })
     }
 
     pub(crate) fn open_tab(&mut self, url: &str) -> Result<TabId, String> {
@@ -283,25 +299,14 @@ impl WpeRuntime {
             id
         };
 
-        let (width, height) = {
-            let st = self
-                .engine_state
-                .lock()
-                .map_err(|e| format!("mutex: {e}"))?;
-            (st.width, st.height)
-        };
-
         self.tab = None;
 
         let entry = TabEntry::new(
             id,
             url,
-            width,
-            height,
+            self.display.raw,
             Arc::clone(&self.frame),
             Arc::clone(&self.view),
-            &self.egl,
-            Arc::clone(&self.engine_state),
         )
         .ok_or_else(|| "TabEntry::new returned None".to_string())?;
 

@@ -196,12 +196,19 @@ pub(crate) fn spawn(
             use std::cell::RefCell;
             use std::rc::Rc;
 
-            let runtime_rc = Rc::new(RefCell::new(WpeRuntime::new(
+            let runtime = match WpeRuntime::new(
                 Arc::clone(&frame),
                 Arc::clone(&view),
                 Arc::clone(&es),
                 egl,
-            )));
+            ) {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("webkit worker: WpeRuntime::new failed: {e}");
+                    return;
+                }
+            };
+            let runtime_rc = Rc::new(RefCell::new(runtime));
 
             // ── Initial tab: open inside the main loop via idle callback ──
             //
