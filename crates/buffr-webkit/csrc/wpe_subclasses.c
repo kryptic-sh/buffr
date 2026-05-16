@@ -237,6 +237,16 @@ static WPEScreen *buffr_display_get_screen_vfunc(WPEDisplay *display, guint inde
         wpe_screen_set_size(WPE_SCREEN(self->screen), self->viewport_w, self->viewport_h);
         wpe_screen_set_scale(WPE_SCREEN(self->screen), self->scale);
         wpe_screen_set_refresh_rate(WPE_SCREEN(self->screen), self->refresh_hz * 1000);
+        /* WebKit's ScreenManager::collectScreenProperties divides by the
+         * screen's physical diagonal-in-mm to compute DPI; if both physical
+         * dimensions are zero the result is +inf and WTFCrash fires from
+         * inside WebPageProxy::launchProcess. Pick a 96-DPI-equivalent size
+         * derived from the pixel viewport so the DPI math lands at 96. */
+        int phys_w_mm = (int)(self->viewport_w * 25.4 / 96.0);
+        int phys_h_mm = (int)(self->viewport_h * 25.4 / 96.0);
+        if (phys_w_mm <= 0) phys_w_mm = 300;
+        if (phys_h_mm <= 0) phys_h_mm = 200;
+        wpe_screen_set_physical_size(WPE_SCREEN(self->screen), phys_w_mm, phys_h_mm);
     }
     return WPE_SCREEN(self->screen);
 }
@@ -267,9 +277,15 @@ static void buffr_display_class_init(BuffrDisplayClass *klass) {
     display_class->create_view = buffr_display_create_view_vfunc;
     display_class->create_toplevel = buffr_display_create_toplevel_vfunc;
     display_class->get_egl_display = buffr_display_get_egl_vfunc;
-    display_class->get_n_screens = buffr_display_get_n_screens_vfunc;
-    display_class->get_screen = buffr_display_get_screen_vfunc;
     display_class->get_drm_device = buffr_display_get_drm_device_vfunc;
+    /* Intentionally NOT overriding get_n_screens / get_screen — WPE
+     * WebKit's ScreenManager::collectScreenProperties divides by the
+     * screen's physical-mm diagonal, so any screen we expose must carry
+     * non-zero physical size. WPEDisplayHeadless takes the same shortcut:
+     * return zero screens, let WebKit's ScreenManager fall back to
+     * defaults (primary display ID = 0, empty map). The active view's
+     * display ID then comes from ViewPlatform's `ScreenManager::primaryDisplayID()`
+     * branch when wpe_view_get_screen() returns NULL. */
 }
 
 /* Public constructor exposed to Rust. */
