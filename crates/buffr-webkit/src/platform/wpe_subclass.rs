@@ -221,8 +221,15 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
                 frame.width = w;
                 frame.height = h;
                 frame.pixels.resize(need, 0);
-                frame.needs_fresh = false;
             }
+            // Clear needs_fresh on every successful ingest, not only on
+            // dim change. WpeRuntime::resize sets needs_fresh=true and
+            // pre-sets frame.width/height to the new dims; the next WPE
+            // frame arrives already matching those dims so the
+            // dim-changed branch above is skipped. Without clearing here,
+            // needs_fresh stays true forever and is_osr_frame_fresh
+            // rejects every frame — UI freezes on the last accepted one.
+            frame.needs_fresh = false;
             if frame.pixels.len() >= need {
                 let dst = frame.pixels.as_mut_ptr();
                 for row in 0..(h as usize) {
