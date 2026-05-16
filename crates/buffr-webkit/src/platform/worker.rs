@@ -186,6 +186,7 @@ pub(crate) fn spawn(
     height: u32,
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
+    is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -240,6 +241,7 @@ pub(crate) fn spawn(
                 Arc::clone(&view),
                 Arc::clone(&es),
                 egl,
+                Arc::clone(&is_loading_atomic),
             ) {
                 Ok(rt) => rt,
                 Err(e) => {

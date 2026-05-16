@@ -74,11 +74,13 @@ unsafe extern "C" {
 
 /// Per-tab heap context handed to WebKit's signal handlers via `user_data`.
 /// Keeps an Arc clone of the shared engine state so handlers running on the
-/// worker thread can flip the loading flag / update URL / title without
-/// touching TabEntry directly.
-struct TabSignalCtx {
+/// worker thread can update URL / title; loading state is tracked via a
+/// dedicated lock-free flag (`is_loading_atomic`) so the load-finished
+/// signal can never be lost to mutex contention with the main thread.
+pub(crate) struct TabSignalCtx {
     tab_id: TabId,
     engine_state: Arc<Mutex<EngineState>>,
+    is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TabSignalCtx {
@@ -114,13 +116,29 @@ unsafe extern "C" fn on_load_changed(
     if user_data.is_null() {
         return;
     }
-    // SAFETY: user_data is a `*mut TabSignalCtx` we stash via
-    // `Box::into_raw` when connecting the signal; lives until the matching
-    // Box::from_raw fires in TabEntry::drop.
+    // SAFETY: user_data is a `*const TabSignalCtx` we stash via
+    // `Arc::into_raw` when connecting the signal; lives until the
+    // matching Arc::from_raw fires in drop_tab_signal_ctx.
     let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
-    let started =
-        event == WebKitLoadEvent_WEBKIT_LOAD_STARTED || event == WebKitLoadEvent_WEBKIT_LOAD_REDIRECTED;
+    let started = event == WebKitLoadEvent_WEBKIT_LOAD_STARTED
+        || event == WebKitLoadEvent_WEBKIT_LOAD_REDIRECTED;
     let finished = event == WebKitLoadEvent_WEBKIT_LOAD_FINISHED;
+    use std::sync::atomic::Ordering;
+    if started {
+        ctx.is_loading_atomic.store(true, Ordering::SeqCst);
+    } else if finished {
+        ctx.is_loading_atomic.store(false, Ordering::SeqCst);
+    }
+    tracing::debug!(
+        ?event,
+        started,
+        finished,
+        "webkit: load-changed signal"
+    );
+    // Mirror into TabInfo on a best-effort basis for tab-summary readers
+    // (progress bar, etc.). Skipping when the main thread holds the lock
+    // is fine — the next paint reads is_loading_atomic which is the
+    // load-bearing input to the animation gate.
     ctx.with_tab_info(|info| {
         if started {
             info.is_loading = true;
@@ -237,6 +255,7 @@ impl TabEntry {
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
+        is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -295,6 +314,7 @@ impl TabEntry {
         let ctx = Arc::new(TabSignalCtx {
             tab_id: id,
             engine_state,
+            is_loading_atomic,
         });
         let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
             let signal_c = CString::new(signal).unwrap();
@@ -437,6 +457,12 @@ pub(crate) struct WpeRuntime {
     /// Shared display. Lives for the runtime's lifetime; each WebView
     /// bumps its ref via the `display` construct property.
     display: BuffrDisplayHandle,
+    /// Cross-thread flag for the active tab's load state. The
+    /// load-changed signal handler stores into this; `WebKitEngine`'s
+    /// `BrowserEngine::is_loading` impl reads it. Kept outside the
+    /// engine_state mutex so worker-thread signal handlers never race
+    /// (or worse, drop the update) against main-thread reads.
+    pub is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WpeRuntime {
@@ -445,6 +471,7 @@ impl WpeRuntime {
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
         egl: EglWorker,
+        is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -483,6 +510,7 @@ impl WpeRuntime {
             view,
             egl,
             display,
+            is_loading_atomic,
         })
     }
 
@@ -509,6 +537,12 @@ impl WpeRuntime {
             st.active_idx = Some(0);
         }
 
+        // Reset the loading flag here on the worker thread so the
+        // signal handler doesn't have to win the race against the main
+        // thread observing is_loading=false from a previous tab.
+        self.is_loading_atomic
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
         let entry = TabEntry::new(
             id,
             url,
@@ -516,6 +550,7 @@ impl WpeRuntime {
             Arc::clone(&self.frame),
             Arc::clone(&self.view),
             Arc::clone(&self.engine_state),
+            Arc::clone(&self.is_loading_atomic),
         )
         .ok_or_else(|| "TabEntry::new returned None".to_string())?;
 

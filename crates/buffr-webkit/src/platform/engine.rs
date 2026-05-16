@@ -4,7 +4,7 @@
 //! Tab state is read from the shared `Arc<Mutex<EngineState>>`.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use buffr_engine::{
@@ -58,6 +58,12 @@ pub struct WebKitEngine {
     /// (e.g. `buffr://new`). Tracked separately from the translated URL
     /// actually loaded into WebKit so the omnibar shows the human URL.
     display_urls: Mutex<HashMap<TabId, String>>,
+    /// Shared with `WpeRuntime` + every `TabSignalCtx`. Toggled to true
+    /// in `open_tab` / `navigate` and back to false by the worker's
+    /// `load-changed` signal handler on `WEBKIT_LOAD_FINISHED`. Read by
+    /// `is_loading` below — never goes through the engine_state mutex
+    /// so the host's animation gate can't get stuck.
+    is_loading_atomic: Arc<AtomicBool>,
 }
 
 impl WebKitEngine {
@@ -112,12 +118,20 @@ impl WebKitEngine {
                 .store(options.frame_rate as u32, Ordering::Relaxed);
         }
 
+        // Start as `true` — the initial open_tab the worker fires from
+        // its idle handler is a load in progress until WebKit reports
+        // WEBKIT_LOAD_FINISHED. Without this the host's animation gate
+        // would briefly observe is_loading=false at startup before the
+        // signal flips it to true, which can race a paint.
+        let is_loading_atomic = Arc::new(AtomicBool::new(true));
+
         let worker = spawn(
             initial_url,
             width,
             height,
             Arc::clone(&frame),
             Arc::clone(&view),
+            Arc::clone(&is_loading_atomic),
         )?;
 
         Ok(Self {
@@ -141,6 +155,7 @@ impl WebKitEngine {
                 m.insert(TabId(1), options.initial_url.to_owned());
                 m
             }),
+            is_loading_atomic,
         })
     }
 
@@ -387,7 +402,18 @@ impl BrowserEngine for WebKitEngine {
 
     // ── Navigation ────────────────────────────────────────────────────────────
 
+    fn is_loading(&self) -> bool {
+        // Read the atomic the worker thread flips on load-changed.
+        // Bypasses engine_state so the buffr-app animation gate can't
+        // get pinned to true by mutex contention.
+        self.is_loading_atomic.load(Ordering::SeqCst)
+    }
+
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
+        // Mark loading immediately so the next paint sees the loading
+        // animation while the new page fetches. The load-changed signal
+        // will flip it back to false on WEBKIT_LOAD_FINISHED.
+        self.is_loading_atomic.store(true, Ordering::SeqCst);
         // Update the per-tab display-URL stash before dispatching so the
         // omnibar reads the human-readable URL even if the navigation is
         // still in flight when the next paint queries us.
