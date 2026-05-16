@@ -482,33 +482,41 @@ impl TabEntry {
 
     /// Activate this tab at the WebKit level.
     ///
-    /// 1. Ack any buffer that `buffr_rust_render_buffer` parked while
-    ///    the tab was inactive. This unblocks WebKit's emission loop —
-    ///    WPE can recycle the pool slot and schedule a new paint.
-    /// 2. Call `wpe_view_set_visible(true)` + `wpe_view_resized` as a
-    ///    defensive scheduler kick. Useful for tabs that were created in
-    ///    the background and never produced their initial paint (where
-    ///    there's no parked buffer to ack), so we still poke WebKit to
-    ///    render once.
+    /// Three-step kick:
+    /// 1. Ack any buffer that `buffr_rust_render_buffer` parked while the
+    ///    tab was inactive. Unblocks WebKit's emission loop — WPE recycles
+    ///    the pool slot and schedules a new paint.
+    /// 2. `wpe_view_set_visible(true)` — idempotent for tabs we kept
+    ///    visible at the WebKit level, but cheap.
+    /// 3. Resize-wiggle: `wpe_view_resized(w, h-1)` then `wpe_view_resized(w, h)`.
+    ///    A same-dim resize is a no-op in WPE 2.52, so for a static page
+    ///    whose last paint was acked long ago (no parked buffer to ack and
+    ///    no scheduled work), the activate path would otherwise produce
+    ///    zero new frames and the shared OsrFrame stays frozen on the
+    ///    previous tab's pixels. The 1-pixel intermediate dim forces
+    ///    WebKit's AcceleratedBackingStore to reflow + repaint, yielding
+    ///    a fresh render_buffer on the way back to the original dim.
     pub(crate) fn show(&self, width: u32, height: u32) {
         if self.wpe_view.is_null() {
             return;
         }
-        // (1) Release any parked buffer — WebKit was blocked on this ack.
+        // (1) Release any parked buffer.
         let acked = ack_pending_buffer(self.wpe_view);
-        // (2) Defensive kick for tabs with no parked buffer (e.g. background-
-        // opened tabs whose initial paint hadn't fired yet).
+        // (2) + (3) — visible + resize-wiggle to force a fresh paint
+        // for static pages that have nothing else to render.
+        let wiggle_h = (height.saturating_sub(1)).max(1);
         // SAFETY: wpe_view is a live WPEView owned by the WebView; calls
         // are thread-bound to the GLib worker thread.
         unsafe {
             wpe_view_set_visible(self.wpe_view, 1);
+            wpe_view_resized(self.wpe_view, width as i32, wiggle_h as i32);
             wpe_view_resized(self.wpe_view, width as i32, height as i32);
         }
         tracing::debug!(
             width,
             height,
             acked_pending = acked,
-            "webkit: show — ack pending buffer + resize kick"
+            "webkit: show — ack + resize-wiggle kick"
         );
     }
 }
