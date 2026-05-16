@@ -338,9 +338,16 @@ impl BrowserEngine for WebView2Engine {
         Ok(id)
     }
 
-    fn open_tab_at(&self, url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        tracing::debug!("webview2: open_tab_at {url} (insert_idx ignored in Phase B)");
-        self.open_tab(url)
+    fn open_tab_at(&self, url: &str, insert_idx: usize) -> Result<TabId, EngineError> {
+        tracing::debug!("webview2: open_tab_at {url} insert_idx={insert_idx}");
+        self.worker
+            .call(|reply| Command::OpenTabAt {
+                url: url.to_owned(),
+                insert_idx,
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
@@ -372,27 +379,35 @@ impl BrowserEngine for WebView2Engine {
         self.worker.send(Command::CycleTab { forward: false });
     }
 
-    fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::debug!("webview2: move_tab not implemented in Phase B");
+    fn move_tab(&self, from: usize, to: usize) {
+        tracing::debug!("webview2: move_tab {from} → {to}");
+        self.worker.send(Command::MoveTab { from, to });
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "duplicate_active",
-        })
+        tracing::debug!("webview2: duplicate_active");
+        let url = self.active_tab().map(|t| t.url).unwrap_or_default();
+        let target = if url.is_empty() {
+            "about:blank".to_string()
+        } else {
+            url
+        };
+        self.open_tab(&target)
     }
 
     fn toggle_pin_active(&self) {}
     fn set_pinned(&self, _id: TabId, _pinned: bool) {}
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "reopen_closed_tab",
-        })
+        tracing::debug!("webview2: reopen_closed_tab");
+        self.worker
+            .call(|reply| Command::ReopenClosed { reply })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn closed_stack_len(&self) -> usize {
-        0
+        self.with_state(|st| st.closed_stack.len())
     }
 
     fn active_tab(&self) -> Option<TabSummary> {

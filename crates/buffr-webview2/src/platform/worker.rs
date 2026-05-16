@@ -67,6 +67,19 @@ use super::input::WebView2InputEvent;
 use super::osr::{paint_blank, request_capture};
 use super::runtime::TabEntry;
 
+// ── Closed-tab undo stack entry ───────────────────────────────────────────────
+
+/// One entry on the recently-closed tab undo stack.
+///
+/// URL-only restoration: the WebView2 controller is released on close; reopen
+/// triggers a fresh load at the original strip position. History / scroll state
+/// are not preserved (acceptable trade-off for the WebView2 backend).
+#[derive(Debug, Clone)]
+pub(crate) struct ClosedEntry {
+    pub url: String,
+    pub original_idx: usize,
+}
+
 // ── EngineState (thread-safe snapshot) ────────────────────────────────────────
 
 /// Thread-safe tab snapshot. Updated by the STA thread; read from any thread.
@@ -115,6 +128,12 @@ pub(crate) struct EngineState {
     /// URLs queued by the `NewWindowRequested` event handler (window.open
     /// intercept). Drained from any thread by `BrowserEngine::popup_queue()`.
     pub popup_queue: PopupQueue,
+    /// Stack of recently closed tabs (most-recent last).
+    ///
+    /// Pushed by `StaRuntime::close_tab` with the URL and original strip
+    /// position; popped by `Command::ReopenClosed` which opens a fresh tab at
+    /// the original index (clamped to the current strip length).
+    pub closed_stack: Vec<ClosedEntry>,
 }
 
 impl EngineState {
@@ -132,6 +151,7 @@ impl EngineState {
             loading_active: Arc::new(AtomicBool::new(false)),
             favicon_updates: Arc::new(Mutex::new(Vec::new())),
             popup_queue: new_popup_queue(),
+            closed_stack: Vec::new(),
         }
     }
 
@@ -203,6 +223,12 @@ pub(crate) enum Command {
         url: String,
         reply: mpsc::SyncSender<Result<TabId, WebView2Error>>,
     },
+    /// Open a new tab at `insert_idx` in the strip. Clamps OOB.
+    OpenTabAt {
+        url: String,
+        insert_idx: usize,
+        reply: mpsc::SyncSender<Result<TabId, WebView2Error>>,
+    },
     CloseTab {
         id: TabId,
         reply: mpsc::SyncSender<Result<bool, WebView2Error>>,
@@ -212,6 +238,16 @@ pub(crate) enum Command {
     },
     CycleTab {
         forward: bool,
+    },
+    /// Move the tab at `from` to position `to`. Clamps OOB. No-op on same-pos.
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
+    /// Reopen the most-recently-closed tab. Reply is the new `TabId`, or
+    /// `None` when the closed stack is empty.
+    ReopenClosed {
+        reply: mpsc::SyncSender<Result<Option<TabId>, WebView2Error>>,
     },
     Navigate {
         url: String,
@@ -453,10 +489,17 @@ impl StaRuntime {
         let idx = self
             .tab_index_by_id(id)
             .ok_or(WebView2Error::TabNotFound(id))?;
-        self.tabs.remove(idx);
+        // Push to closed stack before releasing the WebView2 controller.
+        // URL-only restoration — controller is not kept alive.
+        let closed_url = self.tabs[idx].url.clone();
         if let Ok(mut st) = self.engine_state.lock() {
+            st.closed_stack.push(ClosedEntry {
+                url: closed_url,
+                original_idx: idx,
+            });
             st.tabs.retain(|t| t.id != id);
         }
+        self.tabs.remove(idx);
         match self.active_idx {
             Some(a) if a == idx => {
                 self.active_idx = if self.tabs.is_empty() {
@@ -473,6 +516,73 @@ impl StaRuntime {
         self.sync_active_idx();
         self.paint();
         Ok(!self.tabs.is_empty())
+    }
+
+    /// Open a new tab and insert it at `insert_idx` in the strip.
+    ///
+    /// Out-of-bounds indices clamp to the end. The new tab becomes active.
+    fn open_tab_at(&mut self, url: &str, insert_idx: usize) -> Result<TabId, WebView2Error> {
+        let id = self.open_tab(url)?;
+        // `open_tab` appended and set active to len-1.
+        let appended_idx = self.tabs.len() - 1;
+        let clamped = insert_idx.min(appended_idx);
+        if clamped != appended_idx {
+            let tab = self.tabs.remove(appended_idx);
+            self.tabs.insert(clamped, tab);
+            // Fix active_idx: shift indices in [clamped, appended_idx) up by one.
+            if let Some(a) = self.active_idx {
+                if a >= clamped && a < appended_idx {
+                    self.active_idx = Some(a + 1);
+                }
+            }
+            // New tab is at clamped; make it active.
+            self.active_idx = Some(clamped);
+            // Mirror strip reorder into EngineState.tabs.
+            if let Ok(mut st) = self.engine_state.lock() {
+                let tab_info = st.tabs.remove(appended_idx);
+                st.tabs.insert(clamped, tab_info);
+                st.active_idx = self.active_idx;
+            }
+            self.paint();
+        }
+        Ok(id)
+    }
+
+    /// Move the tab at `from` to position `to`. Clamp to valid range.
+    /// Same-position is a no-op. Fixes `active_idx` after the move.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let len = self.tabs.len();
+        if len == 0 || from >= len || from == to {
+            return;
+        }
+        let to = to.min(len - 1);
+        if to == from {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        // Fix active_idx so it still points at the same tab.
+        if let Some(a) = self.active_idx {
+            let new_a = if a == from {
+                to
+            } else if from < a && to >= a {
+                a - 1
+            } else if from > a && to <= a {
+                a + 1
+            } else {
+                a
+            };
+            self.active_idx = Some(new_a);
+        }
+        // Mirror strip reorder into EngineState.
+        if let Ok(mut st) = self.engine_state.lock() {
+            if from < st.tabs.len() {
+                let tab_info = st.tabs.remove(from);
+                let insert_at = to.min(st.tabs.len());
+                st.tabs.insert(insert_at, tab_info);
+            }
+            st.active_idx = self.active_idx;
+        }
     }
 
     fn select_tab(&mut self, id: TabId) {
@@ -1107,6 +1217,29 @@ fn handle_command(cmd: Command, rt: &mut StaRuntime) -> bool {
     match cmd {
         Command::OpenTab { url, reply } => {
             let _ = reply.send(rt.open_tab(&url));
+        }
+        Command::OpenTabAt {
+            url,
+            insert_idx,
+            reply,
+        } => {
+            let _ = reply.send(rt.open_tab_at(&url, insert_idx));
+        }
+        Command::MoveTab { from, to } => {
+            rt.move_tab(from, to);
+        }
+        Command::ReopenClosed { reply } => {
+            // Pop the last closed entry from EngineState's closed_stack.
+            let entry = rt
+                .engine_state
+                .lock()
+                .ok()
+                .and_then(|mut st| st.closed_stack.pop());
+            let result = match entry {
+                None => Ok(None),
+                Some(e) => rt.open_tab_at(&e.url, e.original_idx).map(Some),
+            };
+            let _ = reply.send(result);
         }
         Command::CloseTab { id, reply } => {
             let _ = reply.send(rt.close_tab(id));
