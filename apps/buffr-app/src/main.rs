@@ -1276,7 +1276,19 @@ fn main() -> Result<()> {
     // profile root tree.
     drop(_private_tmp);
     info!("shutdown: complete");
-    Ok(())
+    // Bypass libc atexit + static destructors. We've already torn down
+    // every long-lived resource explicitly (engines, renderer, backend,
+    // private tempdir). What remains are library-internal destructors —
+    // notably WPE WebKit's, which SIGABRT in its WTF runtime cleanup
+    // because Igalia treats process-teardown ordering as the embedder's
+    // problem and assumes WebKit was the last thing initialised. We've
+    // joined the worker thread, so there's no thread-safety risk; flush
+    // stderr before bailing so any in-flight tracing output isn't lost.
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    // SAFETY: _exit is async-signal-safe and takes no Rust state. Skipping
+    // atexit handlers is intentional — see comment above.
+    unsafe { libc::_exit(0) };
 }
 
 fn run_check_config(path: Option<&std::path::Path>) -> Result<()> {
