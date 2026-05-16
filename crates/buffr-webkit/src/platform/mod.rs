@@ -2,6 +2,7 @@
 
 pub(crate) mod egl;
 pub(crate) mod ffi;
+pub(crate) mod wpe_subclass;
 
 pub mod backend;
 pub mod engine;

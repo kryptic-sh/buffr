@@ -96,4 +96,26 @@ fn build_linux() {
     println!(
         "cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h"
     );
+
+    // ── Compile the C bridge ────────────────────────────────────────────────
+    //
+    // wpe_subclasses.c defines BuffrDisplay/View/Toplevel/Screen as final
+    // GObject subclasses using upstream's G_DEFINE_FINAL_TYPE machinery. We
+    // do this in C because bindgen emits the *Class structs as opaque
+    // (`_address: u8`) and rolling the layouts by hand in Rust is brittle.
+    let mut build = cc::Build::new();
+    build
+        .file("csrc/wpe_subclasses.c")
+        .flag("-Wno-unused-parameter")
+        .flag("-Wno-cast-function-type");
+    for path in platform_lib
+        .include_paths
+        .iter()
+        .chain(webkit_lib.include_paths.iter())
+    {
+        build.include(path);
+    }
+    build.compile("buffr_wpe_subclasses");
+
+    println!("cargo:rerun-if-changed=csrc/wpe_subclasses.c");
 }

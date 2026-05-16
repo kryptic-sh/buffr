@@ -163,7 +163,34 @@ pub(crate) fn spawn(
         .spawn(move || {
             tracing::info!("webkit worker: starting GLib main loop");
 
-            // Build the GLib main loop bound to this thread's default context.
+            // EGL display + GLES context, bound to this worker thread.
+            // BuffrDisplay hands the raw EGLDisplay to WebKit via its
+            // get_egl_display vmethod.
+            let egl = match super::egl::EglWorker::new() {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("webkit worker: EGL init failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = egl.make_current() {
+                tracing::error!("webkit worker: eglMakeCurrent failed: {e}");
+                return;
+            }
+            tracing::info!("webkit worker: EGL ready");
+
+            // Acquire the default GMainContext on this thread (the app's
+            // main thread never pumps any GMainContext, so we own it).
+            let main_context = glib::MainContext::default();
+            let _ctx_guard = match main_context.acquire() {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::error!("webkit worker: cannot acquire default GMainContext: {e}");
+                    return;
+                }
+            };
+
+            // Build the GLib main loop bound to the default context.
             let main_loop = glib::MainLoop::new(None, false);
 
             use std::cell::RefCell;
@@ -173,6 +200,7 @@ pub(crate) fn spawn(
                 Arc::clone(&frame),
                 Arc::clone(&view),
                 Arc::clone(&es),
+                egl,
             )));
 
             // ── Initial tab: open inside the main loop via idle callback ──

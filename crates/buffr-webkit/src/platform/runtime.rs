@@ -11,12 +11,17 @@
 //! Until those subclasses land, `TabEntry::new` returns `None` and tabs
 //! fail to open.
 
-use std::sync::Mutex;
+use std::ffi::CString;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
+use super::egl::EglWorker;
 use super::ffi::*;
+use super::wpe_subclass::{
+    BuffrDisplayHandle, ViewCtx, attach_view_ctx, buffr_display_take_last_view,
+};
 use super::worker::EngineState;
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────
@@ -69,11 +74,18 @@ unsafe extern "C" {
 
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
-/// One open browser tab. Placeholder until the BuffrDisplay/BuffrView
-/// subclass machinery lands.
+/// One open browser tab. Owns the WebKitWebView GObject + the BuffrDisplay
+/// it was constructed against. Drop order: disconnect signals → unref view
+/// → drop BuffrDisplayHandle.
 pub(crate) struct TabEntry {
+    #[allow(dead_code)]
     pub id: TabId,
     pub web_view: *mut WebKitWebView,
+    #[allow(dead_code)]
+    display: BuffrDisplayHandle,
+    /// Borrowed WPEView pointer that BuffrDisplay handed to WebKit. Owned
+    /// by the WebView; we only keep it for input dispatch / lookup.
+    pub wpe_view: *mut WPEView,
     load_changed_id: u64,
     notify_title_id: u64,
     notify_uri_id: u64,
@@ -83,26 +95,91 @@ pub(crate) struct TabEntry {
 unsafe impl Send for TabEntry {}
 
 impl TabEntry {
-    /// Stub: returns `None` until the wpe-platform display + view subclasses
-    /// are wired. The full body lands in a follow-up commit.
+    /// Build a WebView through the wpe-platform path: create a BuffrDisplay
+    /// (hands WebKit our EGL display + a fake screen), then construct the
+    /// WebView with the `display` property. WebKit calls our display's
+    /// `create_view` vmethod, which we then attach the per-frame ViewCtx
+    /// to so the render callback can find the shared OsrFrame.
     pub(crate) fn new(
-        _id: TabId,
-        _url: &str,
-        _width: u32,
-        _height: u32,
-        _frame: SharedOsrFrame,
-        _view: SharedOsrViewState,
+        id: TabId,
+        url: &str,
+        width: u32,
+        height: u32,
+        frame: SharedOsrFrame,
+        view: SharedOsrViewState,
+        egl: &EglWorker,
         _engine_state: Arc<Mutex<EngineState>>,
     ) -> Option<Self> {
-        tracing::warn!(
-            "webkit: TabEntry::new is a stub — wpe-platform subclasses not wired yet"
-        );
-        None
+        // 1. BuffrDisplay: hands WebKit our EGL display + viewport.
+        let display = BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, 60)?;
+
+        // Explicitly connect — our vmethod returns TRUE no-op, but WebKit's
+        // internal state machine still expects `wpe_display_connect` to
+        // have been called before WebView creation. Also publish it as
+        // primary so any WebKit code path that calls wpe_display_get_primary
+        // resolves to ours instead of falling back to a registered backend.
+        unsafe {
+            let mut error: *mut GError = std::ptr::null_mut();
+            let ok = wpe_display_connect(display.raw, &mut error);
+            if ok == 0 {
+                tracing::error!("webkit: wpe_display_connect failed");
+                return None;
+            }
+            wpe_display_set_primary(display.raw);
+        }
+        tracing::info!("webkit: BuffrDisplay created + connected");
+
+        // 2. WebKitWebView via the platform path (no backend property).
+        let web_view = unsafe {
+            let key = CString::new("display").unwrap();
+            let raw_display = display.raw;
+            // g_object_new with one ("display", BuffrDisplay*) construct
+            // property, NULL-terminated. Cast to WebKitWebView*.
+            let view = g_object_new(
+                webkit_web_view_get_type(),
+                key.as_ptr(),
+                raw_display,
+                std::ptr::null::<u8>(),
+            );
+            if view.is_null() {
+                tracing::error!("webkit: g_object_new(WebKitWebView, display=…) returned NULL");
+                return None;
+            }
+            view as *mut WebKitWebView
+        };
+
+        // 3. Recover the WPEView our display just created so we can attach
+        // the ViewCtx with the shared OsrFrame.
+        let wpe_view = unsafe { buffr_display_take_last_view() };
+        if wpe_view.is_null() {
+            tracing::error!("webkit: BuffrDisplay never called create_view");
+            unsafe { g_object_unref(web_view as *mut _) };
+            return None;
+        }
+        attach_view_ctx(wpe_view, ViewCtx { frame, view });
+        tracing::info!("webkit: ViewCtx attached to WPEView");
+
+        // 4. Load initial URL.
+        let url_c = CString::new(url).unwrap_or_default();
+        unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
+        tracing::info!("webkit: created WebView id={id:?} url={url}");
+
+        Some(TabEntry {
+            id,
+            web_view,
+            display,
+            wpe_view,
+            load_changed_id: 0,
+            notify_title_id: 0,
+            notify_uri_id: 0,
+        })
     }
 
-    /// Navigate to a new URL. No-op until [`Self::new`] is real.
+    /// Navigate to a new URL.
     pub(crate) fn load_uri(&self, url: &str) {
-        let _ = url;
+        let c = CString::new(url).unwrap_or_default();
+        // SAFETY: web_view is valid for the tab's lifetime; c is null-terminated.
+        unsafe { webkit_web_view_load_uri(self.web_view, c.as_ptr()) };
     }
 
     /// Resize. No-op until the platform path is wired.
@@ -151,12 +228,13 @@ impl Drop for TabEntry {
 // ── WpeRuntime ────────────────────────────────────────────────────────────────
 
 /// Top-level runtime that lives on the GLib worker thread. Owns the active
-/// tab(s) once tab creation comes online.
+/// tab(s) plus the worker-thread EGL display that BuffrDisplay hands WebKit.
 pub(crate) struct WpeRuntime {
     pub tab: Option<TabEntry>,
     pub engine_state: Arc<Mutex<EngineState>>,
     pub frame: SharedOsrFrame,
     pub view: SharedOsrViewState,
+    pub egl: EglWorker,
 }
 
 impl WpeRuntime {
@@ -164,12 +242,14 @@ impl WpeRuntime {
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
+        egl: EglWorker,
     ) -> Self {
         Self {
             tab: None,
             engine_state,
             frame,
             view,
+            egl,
         }
     }
 
@@ -201,9 +281,10 @@ impl WpeRuntime {
             height,
             Arc::clone(&self.frame),
             Arc::clone(&self.view),
+            &self.egl,
             Arc::clone(&self.engine_state),
         )
-        .ok_or_else(|| "TabEntry::new returned None (wpe-platform subclasses pending)".to_string())?;
+        .ok_or_else(|| "TabEntry::new returned None".to_string())?;
 
         let info = TabInfo::new(id, url);
         if let Ok(mut st) = self.engine_state.lock() {
