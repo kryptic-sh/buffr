@@ -172,17 +172,24 @@ fn migrate_blink_cdp(data_root: &Path) {
 
 fn warn_cef_flat_spill(cache_root: &Path) {
     let old_default = cache_root.join("Default");
-    if old_default.exists() {
-        warn!(
-            path = %old_default.display(),
-            "engine_migrate: detected pre-Phase-11a CEF state at flat cache root. \
-             CEF will now use ~/.cache/buffr/engines/<id>/ for new state. \
-             Old files (Default/, Cache/, ShaderCache/, etc.) were NOT deleted — \
-             you can clean them manually: \
-             `rm -rf ~/.cache/buffr/Default ~/.cache/buffr/Cache \
-             ~/.cache/buffr/ShaderCache ~/.cache/buffr/chrome_debug.log`"
-        );
+    let new_engines = cache_root.join("engines");
+    // Only warn when BOTH the flat layout (Default/) AND the new
+    // engines/<id>/ layout exist — i.e. the user has migrated to the new
+    // layout but didn't clean up the pre-migration spill. A fresh install
+    // only has engines/; a never-migrated install only has Default/.
+    if !old_default.exists() || !new_engines.exists() {
+        return;
     }
+    let root = cache_root.display();
+    warn!(
+        path = %old_default.display(),
+        "engine_migrate: detected pre-Phase-11a CEF state at flat cache root. \
+         CEF will now use {root}/engines/<id>/ for new state. \
+         Old files (Default/, Cache/, ShaderCache/, etc.) were NOT deleted — \
+         you can clean them manually: \
+         `rm -rf {root}/Default {root}/Cache \
+         {root}/ShaderCache {root}/chrome_debug.log`"
+    );
 }
 
 #[cfg(test)]
