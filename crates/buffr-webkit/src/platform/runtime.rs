@@ -122,16 +122,25 @@ unsafe extern "C" fn on_load_changed(
     let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
     let started = event == WebKitLoadEvent_WEBKIT_LOAD_STARTED
         || event == WebKitLoadEvent_WEBKIT_LOAD_REDIRECTED;
+    // Flip false on COMMITTED, not just FINISHED. WEBKIT_LOAD_FINISHED
+    // never fires on pages with long-poll XHRs (google.com keeps an
+    // open connection for instant-search), so a FINISHED-only gate
+    // pins the splash overlay forever. COMMITTED = main resource
+    // headers received and first paint is imminent — that's when
+    // the user should see the page.
+    let revealed = event == WebKitLoadEvent_WEBKIT_LOAD_COMMITTED
+        || event == WebKitLoadEvent_WEBKIT_LOAD_FINISHED;
     let finished = event == WebKitLoadEvent_WEBKIT_LOAD_FINISHED;
     use std::sync::atomic::Ordering;
     if started {
         ctx.is_loading_atomic.store(true, Ordering::SeqCst);
-    } else if finished {
+    } else if revealed {
         ctx.is_loading_atomic.store(false, Ordering::SeqCst);
     }
     tracing::debug!(
         ?event,
         started,
+        revealed,
         finished,
         "webkit: load-changed signal"
     );
@@ -146,6 +155,11 @@ unsafe extern "C" fn on_load_changed(
         } else if finished {
             info.is_loading = false;
             info.progress = 1.0;
+        } else if revealed {
+            // COMMITTED: page begin paint, progress ~50%. Keep
+            // is_loading=true so progress bar stays visible until
+            // FINISHED, but overlay drops via atomic.
+            info.progress = 0.5;
         }
     });
 }
