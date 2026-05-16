@@ -314,12 +314,16 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
-        tracing::debug!(
-            ?id,
-            "webkit: close_tab (single-tab phase, routes through close_active)"
-        );
+        tracing::debug!(?id, "webkit: close_tab");
         self.forget_display_url(id);
-        self.close_active()
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.send(Command::CloseTab {
+            id,
+            reply: reply_tx,
+        });
+        Ok(reply_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or(false))
     }
 
     fn close_active(&self) -> Result<bool, EngineError> {

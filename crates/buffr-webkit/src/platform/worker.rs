@@ -125,6 +125,13 @@ pub(crate) enum Command {
     CloseActive {
         reply: mpsc::SyncSender<bool>,
     },
+    /// Close the tab with the given id. If it's not the active tab, just
+    /// removes it and adjusts active_idx. If it is active, falls back like
+    /// close_active (picks the next tab in strip order).
+    CloseTab {
+        id: TabId,
+        reply: mpsc::SyncSender<bool>,
+    },
     /// Switch the active tab to the one with this id. Flips the per-tab
     /// is_active flags so only the new active tab's paints / load-state
     /// updates reach the shared frame and the runtime is_loading atomic.
@@ -381,6 +388,10 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::CloseActive { reply } => {
             let closed = rt.close_active();
+            let _ = reply.try_send(closed);
+        }
+        Command::CloseTab { id, reply } => {
+            let closed = rt.close_tab(id);
             let _ = reply.try_send(closed);
         }
         Command::SelectTab { id } => {

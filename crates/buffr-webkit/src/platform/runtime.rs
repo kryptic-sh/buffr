@@ -798,6 +798,51 @@ impl WpeRuntime {
         true
     }
 
+    /// Close the tab identified by `id`. Unlike `close_active` this correctly
+    /// handles closing a background tab without disturbing the active one.
+    ///
+    /// - If the closed tab IS active: fall back to `close_active` logic
+    ///   (pick the next tab in strip order as the new active).
+    /// - If the closed tab is NOT active but has a lower index than
+    ///   `active_idx`: decrement `active_idx` by one so it keeps pointing at
+    ///   the same logical tab after the removal shifts everything left.
+    /// - If it doesn't exist: return false.
+    pub(crate) fn close_tab(&mut self, id: TabId) -> bool {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return false;
+        };
+        let was_active = self.active_idx == Some(idx);
+        if was_active {
+            // Delegate to the existing close_active logic which handles
+            // picking the replacement tab and waking it.
+            return self.close_active();
+        }
+        // Closing a background tab: drop the entry, leave the active tab
+        // untouched, and adjust active_idx if needed.
+        let _ = self.tabs.remove(idx);
+        // If the closed index was below the active index, the active entry
+        // has shifted left by one — correct for that.
+        if let Some(ref mut active) = self.active_idx {
+            if idx < *active {
+                *active -= 1;
+            }
+        }
+        // Mirror removal into engine_state.
+        if let Ok(mut st) = self.engine_state.lock() {
+            if idx < st.tabs.len() {
+                st.tabs.remove(idx);
+            }
+            // Adjust engine_state.active_idx by the same rule.
+            if let Some(ref mut a) = st.active_idx {
+                if idx < *a {
+                    *a -= 1;
+                }
+            }
+        }
+        tracing::info!(?id, idx, "webkit: close_tab (background tab)");
+        true
+    }
+
     pub(crate) fn navigate(&mut self, url: &str) {
         if let Some(tab) = self.active_tab() {
             tab.load_uri(url);
