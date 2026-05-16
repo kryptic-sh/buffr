@@ -110,6 +110,9 @@ pub(crate) mod macos {
         /// calls [`buffr_history::History::record_visit`] on each
         /// `didFinishNavigation` callback.
         pub history: Option<Arc<buffr_history::History>>,
+        /// Shared downloads store. When `Some`, the WKDownload delegate records
+        /// downloads started, completed, or failed.
+        pub downloads: Option<Arc<buffr_downloads::Downloads>>,
         /// Find-result sink. When `Some`, the `find_string` completion handler
         /// pushes a [`buffr_core::find::FindResult`] after each search.
         pub find_sink: Option<FindResultSink>,
@@ -130,6 +133,7 @@ pub(crate) mod macos {
                 video_active: Arc::new(AtomicBool::new(false)),
                 cursor_change: Arc::new(Mutex::new(None)),
                 history: None,
+                downloads: None,
                 find_sink: None,
                 popup_queue: buffr_engine::popup::new_popup_queue(),
             }

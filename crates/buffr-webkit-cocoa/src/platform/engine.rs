@@ -222,11 +222,12 @@ impl WebKitCocoaEngine {
             // intercepted URLs without needing a back-channel to the engine.
             let popup_queue = new_popup_queue();
 
-            // Store history, find_sink, and popup_queue in EngineState so the
+            // Store history, downloads, find_sink, and popup_queue in EngineState so the
             // navigation delegate and UI delegate can reach them from the GCD
             // main queue without going back through the engine.
             if let Ok(mut st) = engine_state.lock() {
                 st.history = history.clone();
+                st.downloads = wk_downloads.clone();
                 st.find_sink = find_sink.clone();
                 st.popup_queue = Arc::clone(&popup_queue);
             }

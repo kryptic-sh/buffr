@@ -703,6 +703,49 @@ pub(crate) mod macos {
                     st.sync_loading_active();
                 }
             }
+
+            /// webView:navigationResponse:didBecomeDownload:
+            /// Called when WebKit decides a navigation response should be a download.
+            /// We install `BuffrDownloadDelegate` so the file is saved and recorded.
+            ///
+            /// Feature-gated: requires WKDownload + WKNavigationResponse + objc2-app-kit.
+            #[cfg(all(
+                feature = "WKDownload",
+                feature = "WKNavigationResponse",
+                feature = "objc2-app-kit"
+            ))]
+            #[cfg(target_os = "macos")]
+            #[unsafe(method(webView:navigationResponse:didBecomeDownload:))]
+            #[allow(non_snake_case)]
+            unsafe fn webView_navigationResponse_didBecomeDownload(
+                &self,
+                _web_view: &WKWebView,
+                _navigation_response: &objc2_web_kit::WKNavigationResponse,
+                download: &WKDownload,
+            ) {
+                tracing::debug!("webkit-cocoa nav: navigationResponse didBecomeDownload");
+                let downloads = self
+                    .ivars()
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.downloads.clone());
+
+                // SAFETY: This callback arrives on the main thread.
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                let delegate = BuffrDownloadDelegate::new(mtm, downloads);
+                unsafe {
+                    download.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+                }
+                // Retain the delegate for the lifetime of this download by leaking
+                // the Retained — WKDownload holds a weak ref, so we must keep the
+                // object alive. Leaking is safe: the object lives until the process
+                // exits or the download finishes, which is acceptable for the phase.
+                //
+                // TODO(phase-e): use a proper retain strategy (e.g. store in a
+                // slab keyed by download pointer).
+                let _ = Retained::into_raw(delegate);
+            }
         }
     );
 
@@ -1134,6 +1177,166 @@ pub(crate) mod macos {
     unsafe fn get_title_string(web_view: &WKWebView) -> String {
         // SAFETY: caller guarantees web_view is a live WKWebView on the main thread.
         unsafe { web_view.title().map(|s| s.to_string()).unwrap_or_default() }
+    }
+
+    // ── WKDownload delegate ───────────────────────────────────────────────────
+    //
+    // Implements `WKDownloadDelegate` to wire the `buffr-downloads` store.
+    //
+    // Required method: `decideDestinationUsingResponse:suggestedFilename:completionHandler:`
+    // — we save to `~/Downloads/<suggested_filename>`.
+    //
+    // Optional methods: `downloadDidFinish:` / `download:didFailWithError:resumeData:`
+    // — update the row in the downloads store.
+
+    pub struct DownloadDelegateIvars {
+        downloads: Option<Arc<buffr_downloads::Downloads>>,
+        /// Row id inserted by `decideDestination`; used by finish/fail callbacks.
+        download_id: Mutex<Option<buffr_downloads::DownloadId>>,
+        /// Destination path set by `decideDestination`; used by `downloadDidFinish`.
+        dest_path: Mutex<Option<std::path::PathBuf>>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = DownloadDelegateIvars]
+        #[name = "BuffrDownloadDelegate"]
+        pub struct BuffrDownloadDelegate;
+
+        unsafe impl NSObjectProtocol for BuffrDownloadDelegate {}
+
+        unsafe impl WKDownloadDelegate for BuffrDownloadDelegate {
+            /// Required — decide where to save the download.
+            #[cfg(all(feature = "WKDownload", feature = "block2"))]
+            #[unsafe(method(download:decideDestinationUsingResponse:suggestedFilename:completionHandler:))]
+            #[allow(non_snake_case)]
+            unsafe fn download_decideDestinationUsingResponse_suggestedFilename_completionHandler(
+                &self,
+                _download: &WKDownload,
+                response: &NSURLResponse,
+                suggested_filename: &NSString,
+                completion_handler: &block2::DynBlock<dyn Fn(*mut NSURL)>,
+            ) {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                use std::path::PathBuf;
+
+                let filename = suggested_filename.to_string();
+                let url_str: String = unsafe {
+                    response
+                        .URL()
+                        .as_ref()
+                        .and_then(|u| u.absoluteString())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                };
+
+                // Build destination: ~/Downloads/<filename>
+                let downloads_dir: PathBuf = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("Downloads");
+                let dest = downloads_dir.join(&filename);
+
+                // Record in downloads store using a hash of the URL as pseudo-id.
+                if let Some(store) = self.ivars().downloads.as_ref() {
+                    let mut hasher = DefaultHasher::new();
+                    url_str.hash(&mut hasher);
+                    let pseudo_id = hasher.finish() as u32;
+                    match store.record_started(pseudo_id, &url_str, &filename, None, None) {
+                        Ok(id) => {
+                            if let Ok(mut g) = self.ivars().download_id.lock() {
+                                *g = Some(id);
+                            }
+                            if let Ok(mut g) = self.ivars().dest_path.lock() {
+                                *g = Some(dest.clone());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                url = url_str.as_str(),
+                                "webkit-cocoa: downloads record_started failed"
+                            );
+                        }
+                    }
+                }
+
+                tracing::debug!(
+                    url = url_str.as_str(),
+                    dest = %dest.display(),
+                    "webkit-cocoa: WKDownload decideDestination"
+                );
+
+                // Pass destination as a file:// URL to WebKit.
+                let dest_url_str = format!("file://{}", dest.to_string_lossy());
+                if let Some(ns_dest) = nsurl_from_str(&dest_url_str) {
+                    let raw_ptr: *mut NSURL = Retained::into_raw(ns_dest);
+                    completion_handler.call((raw_ptr,));
+                } else {
+                    // Null → WebKit cancels the download.
+                    completion_handler.call((std::ptr::null_mut(),));
+                }
+            }
+
+            #[cfg(feature = "WKDownload")]
+            #[unsafe(method(downloadDidFinish:))]
+            #[allow(non_snake_case)]
+            unsafe fn downloadDidFinish(&self, _download: &WKDownload) {
+                tracing::debug!("webkit-cocoa: WKDownload finished");
+                if let Some(store) = self.ivars().downloads.as_ref() {
+                    let id = self.ivars().download_id.lock().ok().and_then(|g| *g);
+                    let path = self.ivars().dest_path.lock().ok().and_then(|g| g.clone());
+                    if let (Some(id), Some(path)) = (id, path) {
+                        if let Err(e) = store.record_completed(id, &path) {
+                            tracing::warn!(
+                                error = %e,
+                                "webkit-cocoa: downloads record_completed failed"
+                            );
+                        }
+                    }
+                }
+            }
+
+            #[cfg(feature = "WKDownload")]
+            #[unsafe(method(download:didFailWithError:resumeData:))]
+            #[allow(non_snake_case)]
+            unsafe fn download_didFailWithError_resumeData(
+                &self,
+                _download: &WKDownload,
+                error: &NSError,
+                _resume_data: Option<&NSData>,
+            ) {
+                let reason = format!("{error:?}");
+                tracing::warn!(reason, "webkit-cocoa: WKDownload failed");
+                if let Some(store) = self.ivars().downloads.as_ref() {
+                    let id = self.ivars().download_id.lock().ok().and_then(|g| *g);
+                    if let Some(id) = id {
+                        if let Err(e) = store.record_failed(id, &reason) {
+                            tracing::warn!(
+                                error = %e,
+                                "webkit-cocoa: downloads record_failed failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    );
+
+    impl BuffrDownloadDelegate {
+        pub(crate) fn new(
+            mtm: MainThreadMarker,
+            downloads: Option<Arc<buffr_downloads::Downloads>>,
+        ) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(DownloadDelegateIvars {
+                downloads,
+                download_id: Mutex::new(None),
+                dest_path: Mutex::new(None),
+            });
+            unsafe { objc2::msg_send![super(this), init] }
+        }
     }
 
     // ── TabState (for EngineState below) ─────────────────────────────────────
