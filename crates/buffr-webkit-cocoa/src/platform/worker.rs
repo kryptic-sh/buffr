@@ -57,6 +57,19 @@ pub(crate) mod macos {
     use super::super::error::WebKitCocoaError;
     use super::super::runtime::macos::{TabEntry, TabState};
 
+    // ── Closed-tab undo stack entry ───────────────────────────────────────────
+
+    /// One entry on the recently-closed tab undo stack.
+    ///
+    /// URL-only restoration: WKWebView is released on close; reopen triggers a
+    /// fresh load at the original strip position. History / scroll state are
+    /// not preserved (acceptable trade-off for the macOS WebKit backend).
+    #[derive(Debug, Clone)]
+    pub(crate) struct ClosedEntry {
+        pub url: String,
+        pub original_idx: usize,
+    }
+
     // ── EngineState (thread-safe snapshot) ────────────────────────────────────
 
     /// Shared tab snapshot. Updated by main-thread delegate callbacks;
@@ -119,6 +132,12 @@ pub(crate) mod macos {
         /// Popup URL queue. URLs intercepted by WKUIDelegate `createWebView` are
         /// pushed here so the apps layer can open them as new tabs.
         pub popup_queue: PopupQueue,
+        /// Stack of recently closed tabs (most-recent last).
+        ///
+        /// Pushed by `RuntimeState::close_tab` with the URL and original strip
+        /// position; popped by `reopen_closed_tab` which opens a fresh tab at
+        /// the original index (clamped to the current strip length).
+        pub closed_stack: Vec<ClosedEntry>,
     }
 
     impl EngineState {
@@ -136,6 +155,7 @@ pub(crate) mod macos {
                 downloads: None,
                 find_sink: None,
                 popup_queue: buffr_engine::popup::new_popup_queue(),
+                closed_stack: Vec::new(),
             }
         }
 
@@ -304,10 +324,74 @@ pub(crate) mod macos {
             Ok(id)
         }
 
+        /// Open a new tab and insert it at `insert_idx` in the strip.
+        ///
+        /// Out-of-bounds indices clamp to the end. The new tab becomes active.
+        fn open_tab_at(&mut self, url: &str, insert_idx: usize) -> Result<TabId, WebKitCocoaError> {
+            let id = self.open_tab(url)?;
+            // `open_tab` appended and set active to len-1.
+            let appended_idx = self.tabs.len() - 1;
+            let clamped = insert_idx.min(appended_idx);
+            if clamped != appended_idx {
+                let tab = self.tabs.remove(appended_idx);
+                self.tabs.insert(clamped, tab);
+                // Fix active_idx: removal from appended_idx then insert at clamped
+                // shifts indices in [clamped, appended_idx) up by one.
+                if let Some(a) = self.active_idx {
+                    if a >= clamped && a < appended_idx {
+                        self.active_idx = Some(a + 1);
+                    }
+                }
+                // New tab is at clamped; make it active.
+                self.active_idx = Some(clamped);
+                self.snapshot_to_engine_state();
+                self.request_active_snapshot();
+            }
+            Ok(id)
+        }
+
+        /// Move the tab at `from` to position `to`. Clamp to valid range.
+        /// Same-position is a no-op. Fixes `active_idx` after the move.
+        fn move_tab(&mut self, from: usize, to: usize) {
+            let len = self.tabs.len();
+            if len == 0 || from >= len || from == to {
+                return;
+            }
+            let to = to.min(len - 1);
+            if to == from {
+                return;
+            }
+            let tab = self.tabs.remove(from);
+            self.tabs.insert(to, tab);
+            // Fix active_idx so it still points at the same tab.
+            if let Some(a) = self.active_idx {
+                let new_a = if a == from {
+                    to
+                } else if from < a && to >= a {
+                    a - 1
+                } else if from > a && to <= a {
+                    a + 1
+                } else {
+                    a
+                };
+                self.active_idx = Some(new_a);
+            }
+            self.snapshot_to_engine_state();
+        }
+
         fn close_tab(&mut self, id: TabId) -> Result<bool, WebKitCocoaError> {
             let idx = self
                 .tab_index_by_id(id)
                 .ok_or(WebKitCocoaError::TabNotFound(id))?;
+            // Push to closed stack before releasing the WKWebView.
+            // URL-only restoration — WKWebView is not kept alive.
+            let closed_url = self.tabs[idx].url.clone();
+            if let Ok(mut st) = self.engine_state.lock() {
+                st.closed_stack.push(ClosedEntry {
+                    url: closed_url,
+                    original_idx: idx,
+                });
+            }
             self.tabs.remove(idx);
             match self.active_idx {
                 Some(a) if a == idx => {
@@ -664,11 +748,27 @@ pub(crate) mod macos {
             url: String,
             reply: mpsc::SyncSender<Result<TabId, WebKitCocoaError>>,
         },
+        /// Open a new tab at `insert_idx` in the strip. Clamps OOB.
+        OpenTabAt {
+            url: String,
+            insert_idx: usize,
+            reply: mpsc::SyncSender<Result<TabId, WebKitCocoaError>>,
+        },
         CloseTab {
             id: TabId,
             reply: mpsc::SyncSender<Result<bool, WebKitCocoaError>>,
         },
         CloseAll,
+        /// Move the tab at `from` to position `to`. Clamps OOB. No-op on same-pos.
+        MoveTab {
+            from: usize,
+            to: usize,
+        },
+        /// Reopen the most-recently-closed tab. Reply is the new `TabId`, or
+        /// `None` when the closed stack is empty.
+        ReopenClosed {
+            reply: mpsc::SyncSender<Result<Option<TabId>, WebKitCocoaError>>,
+        },
         SelectTab {
             id: TabId,
         },
@@ -975,6 +1075,48 @@ pub(crate) mod macos {
                         .lock()
                         .map_err(|_| WebKitCocoaError::WorkerGone)
                         .and_then(|mut r| r.0.open_tab(&url));
+                    let _ = reply.send(result);
+                });
+            }
+            Command::OpenTabAt {
+                url,
+                insert_idx,
+                reply,
+            } => {
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    let result = rt2
+                        .lock()
+                        .map_err(|_| WebKitCocoaError::WorkerGone)
+                        .and_then(|mut r| r.0.open_tab_at(&url, insert_idx));
+                    let _ = reply.send(result);
+                });
+            }
+            Command::MoveTab { from, to } => {
+                let rt2 = Arc::clone(rt);
+                dispatch_main_async(move || {
+                    if let Ok(mut r) = rt2.lock() {
+                        r.0.move_tab(from, to);
+                    }
+                });
+            }
+            Command::ReopenClosed { reply } => {
+                let rt2 = Arc::clone(rt);
+                let engine_state2 = Arc::clone(_engine_state);
+                dispatch_main_async(move || {
+                    // Pop the last closed entry from the engine_state closed_stack.
+                    let entry = engine_state2
+                        .lock()
+                        .ok()
+                        .and_then(|mut st| st.closed_stack.pop());
+                    let result = match entry {
+                        None => Ok(None),
+                        Some(e) => rt2
+                            .lock()
+                            .map_err(|_| WebKitCocoaError::WorkerGone)
+                            .and_then(|mut r| r.0.open_tab_at(&e.url, e.original_idx))
+                            .map(Some),
+                    };
                     let _ = reply.send(result);
                 });
             }

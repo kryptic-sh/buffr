@@ -349,9 +349,23 @@ impl BrowserEngine for WebKitCocoaEngine {
         Ok(id)
     }
 
-    fn open_tab_at(&self, url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        tracing::debug!("webkit-cocoa: open_tab_at {url} (insert_idx ignored in Phase B)");
-        self.open_tab(url)
+    fn open_tab_at(&self, url: &str, insert_idx: usize) -> Result<TabId, EngineError> {
+        tracing::debug!("webkit-cocoa: open_tab_at {url} insert_idx={insert_idx}");
+        #[cfg(target_os = "macos")]
+        return self
+            .worker
+            .call(|reply| Command::OpenTabAt {
+                url: url.to_owned(),
+                insert_idx,
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from);
+
+        #[cfg(not(target_os = "macos"))]
+        Err(EngineError::Unimplemented {
+            method: "open_tab_at",
+        })
     }
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
@@ -394,26 +408,44 @@ impl BrowserEngine for WebKitCocoaEngine {
         self.worker.send(Command::CycleTab { forward: false });
     }
 
-    fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::debug!("webkit-cocoa: move_tab not implemented in Phase B");
+    fn move_tab(&self, from: usize, to: usize) {
+        tracing::debug!("webkit-cocoa: move_tab {from} → {to}");
+        #[cfg(target_os = "macos")]
+        self.worker.send(Command::MoveTab { from, to });
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "duplicate_active",
-        })
+        tracing::debug!("webkit-cocoa: duplicate_active");
+        let url = self.active_tab().map(|t| t.url).unwrap_or_default();
+        let target = if url.is_empty() {
+            "about:blank".to_string()
+        } else {
+            url
+        };
+        self.open_tab(&target)
     }
 
     fn toggle_pin_active(&self) {}
     fn set_pinned(&self, _id: TabId, _pinned: bool) {}
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "reopen_closed_tab",
-        })
+        tracing::debug!("webkit-cocoa: reopen_closed_tab");
+        #[cfg(target_os = "macos")]
+        return self
+            .worker
+            .call(|reply| Command::ReopenClosed { reply })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from);
+
+        #[cfg(not(target_os = "macos"))]
+        Ok(None)
     }
 
     fn closed_stack_len(&self) -> usize {
+        #[cfg(target_os = "macos")]
+        return self.with_state(|st| st.closed_stack.len());
+
+        #[cfg(not(target_os = "macos"))]
         0
     }
 
