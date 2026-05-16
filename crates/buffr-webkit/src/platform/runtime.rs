@@ -460,33 +460,29 @@ impl TabEntry {
         unsafe { webkit_web_view_is_playing_audio(self.web_view) != 0 }
     }
 
-    /// Hide this tab's WPEView. The view stops scheduling render-buffer
-    /// commits so inactive tabs don't clobber the shared OsrFrame.
+    /// Hide this tab. INTENTIONAL no-op on `wpe_view_set_visible(false)`:
+    /// once WebKit's AcceleratedBackingStore is told a view is hidden, the
+    /// matching `wpe_view_set_visible(true)` later does NOT reliably make
+    /// it resume emitting `render_buffer` — `wpe_view_resized` to the same
+    /// dimensions is also a no-op. The previously-painting tab goes silent
+    /// forever and the shared OsrFrame stays stuck on whatever the
+    /// last-active tab wrote.
+    ///
+    /// Instead, every tab stays visible to WebKit; the `ViewCtx::is_active`
+    /// gate in `buffr_rust_render_buffer` ack-and-discards pixels from
+    /// background tabs so they can't clobber the active tab's display. The
+    /// CPU cost is a hidden tab still rendering at its target frame rate,
+    /// but correctness is guaranteed.
     pub(crate) fn hide(&self) {
-        if self.wpe_view.is_null() {
-            return;
-        }
-        // SAFETY: wpe_view is a live WPEView owned by the WebView; the
-        // call is thread-bound to the worker, which is where TabEntry
-        // is mutated.
-        unsafe {
-            wpe_view_set_visible(self.wpe_view, 0);
-        }
+        // No-op by design. See doc comment.
     }
 
-    /// Show this tab's WPEView and force a fresh repaint.
-    ///
-    /// `wpe_view_set_visible(true)` alone does not reliably cause WPE to
-    /// emit a new `render_buffer` when the page DOM hasn't changed —
-    /// WebKit's compositor only schedules a new paint when it detects a
-    /// reason to. Calling `wpe_view_resized` immediately after tricks the
-    /// AcceleratedBackingStore into recompositing and emitting a fresh
-    /// buffer even when dimensions are unchanged.
-    ///
-    /// If `wpe_view_resized` deduplicates exact same-dimension calls, we
-    /// first issue a `(w, h-1)` nudge then restore `(w, h)` — the two-step
-    /// guarantees a true dim change is observed. In practice the single
-    /// call suffices on WPE WebKit 2.52.
+    /// Show this tab. Calls `wpe_view_set_visible(true)` (idempotent — we
+    /// never called false) and issues a `wpe_view_resized` nudge to bump
+    /// WebKit's render scheduler in case it had paused this view as an
+    /// optimization. Only meaningful for tabs created in the background
+    /// (`open_tab_background`) whose initial paint might otherwise be
+    /// dropped by the is_active gate and never re-emitted.
     pub(crate) fn show(&self, width: u32, height: u32) {
         if self.wpe_view.is_null() {
             return;
@@ -495,17 +491,12 @@ impl TabEntry {
         // are thread-bound to the GLib worker thread.
         unsafe {
             wpe_view_set_visible(self.wpe_view, 1);
-            // Force the AcceleratedBackingStore to recomposite and emit a
-            // fresh render_buffer. Without this, switching to a tab whose
-            // DOM hasn't changed since it was last hidden produces no new
-            // paint, leaving the shared OsrFrame stuck on whatever the
-            // previously-active tab last wrote.
             wpe_view_resized(self.wpe_view, width as i32, height as i32);
         }
         tracing::debug!(
             width,
             height,
-            "webkit: show+resized WPEView to force repaint"
+            "webkit: show+resized WPEView (active tab activation kick)"
         );
     }
 }
