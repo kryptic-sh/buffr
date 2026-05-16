@@ -23,6 +23,7 @@ thiserror.workspace = true
 glib = "0.22"
 
 [build-dependencies]
-# pkg-config finds wpe-webkit-2.0 cflags/libs; bindgen generates FFI bindings.
+# pkg-config finds wpe-webkit-2.0/wpe-1.0/wpebackend-fdo-1.0/wayland-server
+# cflags/libs; bindgen generates unified FFI bindings.
 pkg-config = "0.3"
 bindgen = "0.71"

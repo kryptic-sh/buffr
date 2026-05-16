@@ -1,5 +1,7 @@
 //! Real WPE WebKit implementation — compiled on Linux only.
 
+pub(crate) mod ffi;
+
 pub mod backend;
 pub mod engine;
 pub mod error;

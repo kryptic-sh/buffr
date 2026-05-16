@@ -1,12 +1,10 @@
-//! [`WebKitEngine`] — phase 1 stub [`BrowserEngine`] impl for WPE WebKit.
+//! [`WebKitEngine`] — Phase 2 [`BrowserEngine`] impl for WPE WebKit.
 //!
-//! Every method either no-ops (fire-and-forget) or returns a safe default.
-//! No actual WPE WebKit calls are made in this phase — the worker thread parks
-//! immediately and all OSR surfaces are empty but valid.
-//!
-//! Phase 2 will wire real WebView instances via the GLib worker thread.
+//! Engine methods send [`Command`]s to the GLib worker thread via mpsc.
+//! Tab state is read from the shared `Arc<Mutex<EngineState>>`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, mpsc};
 
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
@@ -19,84 +17,117 @@ use buffr_engine::{
 };
 
 use super::error::WebKitError;
-use super::worker::{WorkerHandle, spawn};
+use super::worker::{Command, WorkerHandle, WpeKeyEvent, spawn};
 
 // ── WebKitEngine ──────────────────────────────────────────────────────────────
 
-/// WPE WebKit browser engine (phase 1 — all methods are stubs).
+/// WPE WebKit browser engine.
 ///
-/// Implements [`BrowserEngine`] (`Send + Sync`) by holding thread-safe handles.
-/// The GLib worker thread parks immediately; real WPE init comes in Phase 2.
+/// `Send + Sync` — all mutable state is behind `Arc<Mutex<_>>` or sent as
+/// commands to the GLib worker thread.
 pub struct WebKitEngine {
     #[allow(dead_code)]
     engine_id: EngineId,
-    /// Shared OSR frame — empty/black in Phase 1.
+    /// Shared OSR frame — written by the FDO SHM callback on the worker thread.
     frame: SharedOsrFrame,
     /// Shared OSR viewport state.
     view: SharedOsrViewState,
-    /// Worker thread handle — parked in Phase 1.
-    #[allow(dead_code)]
+    /// Worker thread handle.
     worker: WorkerHandle,
-    /// OSR wake callback. Installed by apps layer; called on each paint.
-    wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Popup sinks — empty in Phase 1.
+    /// Popup sinks — empty in Phase 2.
     popup_queue: PopupQueue,
     popup_create_sink: PopupCreateSink,
     popup_close_sink: PopupCloseSink,
+    /// Current live URL (updated via `pump_address_changes`).
+    live_url: Mutex<String>,
 }
 
 impl WebKitEngine {
-    /// Construct a new (Phase 1 stub) engine.
+    /// Construct a new Phase 2 engine.
+    ///
+    /// Initialises the WPE loader, spawns the GLib worker thread, and opens
+    /// the initial tab at `options.initial_url`.
     pub fn new(options: &BackendOpenOptions<'_>) -> Result<Self, WebKitError> {
-        tracing::debug!("webkit: WebKitEngine::new (phase 1 stub)");
         let (width, height) = options.initial_size;
+        let initial_url = options.initial_url;
+
+        tracing::info!("webkit: WebKitEngine::new url={initial_url} {width}x{height}");
 
         let frame: SharedOsrFrame = Arc::new(Mutex::new(OsrFrame::new(width, height)));
-        let view: SharedOsrViewState = Arc::new(OsrViewState::default());
+        let view: SharedOsrViewState = Arc::new(OsrViewState::new());
 
-        let worker = spawn()?;
+        // Set initial viewport dims on the view state.
+        view.width.store(width, Ordering::Relaxed);
+        view.height.store(height, Ordering::Relaxed);
+
+        let worker = spawn(
+            initial_url,
+            width,
+            height,
+            Arc::clone(&frame),
+            Arc::clone(&view),
+        )?;
 
         Ok(Self {
             engine_id: options.engine_id.clone(),
             frame,
             view,
             worker,
-            wake: Mutex::new(None),
             popup_queue: new_popup_queue(),
             popup_create_sink: new_popup_create_sink(),
             popup_close_sink: new_popup_close_sink(),
+            live_url: Mutex::new(String::new()),
         })
+    }
+
+    /// Send a fire-and-forget command to the worker thread.
+    fn send(&self, cmd: Command) {
+        if let Err(e) = self.worker.cmd_tx.try_send(cmd) {
+            tracing::warn!("webkit: command send error: {e}");
+        }
+    }
+
+    /// Open a tab synchronously via a reply channel.
+    fn open_tab_sync(&self, url: &str) -> Result<TabId, EngineError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.send(Command::OpenTab {
+            url: url.to_owned(),
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| EngineError::Other("open_tab timed out".into()))?
+            .map_err(|e| EngineError::Other(e))
     }
 }
 
-// ── BrowserEngine impl — all stubs ────────────────────────────────────────────
+// ── BrowserEngine impl ────────────────────────────────────────────────────────
 
 impl BrowserEngine for WebKitEngine {
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     fn close_all_browsers(&self) {
-        tracing::debug!("webkit: close_all_browsers stub");
+        tracing::debug!("webkit: close_all_browsers — sending Shutdown");
+        self.send(Command::Shutdown);
     }
 
     // ── Tabs ──────────────────────────────────────────────────────────────────
 
-    fn open_tab(&self, _url: &str) -> Result<TabId, EngineError> {
-        tracing::debug!("webkit: open_tab stub");
-        Ok(TabId(0))
+    fn open_tab(&self, url: &str) -> Result<TabId, EngineError> {
+        self.open_tab_sync(url)
     }
 
-    fn open_tab_background(&self, _url: &str) -> Result<TabId, EngineError> {
-        tracing::debug!("webkit: open_tab_background stub");
-        Ok(TabId(0))
+    fn open_tab_background(&self, url: &str) -> Result<TabId, EngineError> {
+        // Phase 2: single tab — background = same as foreground.
+        self.open_tab(url)
     }
 
-    fn open_tab_at(&self, _url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        tracing::debug!("webkit: open_tab_at stub");
-        Ok(TabId(0))
+    fn open_tab_at(&self, url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
+        self.open_tab(url)
     }
 
     fn close_tab(&self, _id: TabId) -> Result<bool, EngineError> {
-        tracing::debug!("webkit: close_tab stub");
+        tracing::debug!("webkit: close_tab stub (single-tab phase)");
         Ok(true)
     }
 
@@ -109,33 +140,20 @@ impl BrowserEngine for WebKitEngine {
         tracing::debug!("webkit: select_tab stub");
     }
 
-    fn next_tab(&self) {
-        tracing::debug!("webkit: next_tab stub");
-    }
+    fn next_tab(&self) {}
+    fn prev_tab(&self) {}
 
-    fn prev_tab(&self) {
-        tracing::debug!("webkit: prev_tab stub");
-    }
-
-    fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::debug!("webkit: move_tab stub");
-    }
+    fn move_tab(&self, _from: usize, _to: usize) {}
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
-        tracing::debug!("webkit: duplicate_active stub");
-        Ok(TabId(0))
+        let url = self.active_tab_live_url();
+        self.open_tab(&url)
     }
 
-    fn toggle_pin_active(&self) {
-        tracing::debug!("webkit: toggle_pin_active stub");
-    }
-
-    fn set_pinned(&self, _id: TabId, _pinned: bool) {
-        tracing::debug!("webkit: set_pinned stub");
-    }
+    fn toggle_pin_active(&self) {}
+    fn set_pinned(&self, _id: TabId, _pinned: bool) {}
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
-        tracing::debug!("webkit: reopen_closed_tab stub");
         Ok(None)
     }
 
@@ -144,15 +162,25 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn active_tab(&self) -> Option<TabSummary> {
-        None
+        let st = self.worker.engine_state.lock().ok()?;
+        let info = st.active_tab_info()?;
+        Some(info.to_summary())
     }
 
     fn tabs_summary(&self) -> Vec<TabSummary> {
-        Vec::new()
+        self.worker
+            .engine_state
+            .lock()
+            .map(|st| st.tabs_summary())
+            .unwrap_or_default()
     }
 
     fn tab_count(&self) -> usize {
-        0
+        self.worker
+            .engine_state
+            .lock()
+            .map(|st| st.tabs.len())
+            .unwrap_or(0)
     }
 
     fn pinned_count(&self) -> usize {
@@ -160,78 +188,143 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn active_index(&self) -> Option<usize> {
-        None
+        self.worker
+            .engine_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_idx)
     }
 
     // ── Navigation ────────────────────────────────────────────────────────────
 
-    fn navigate(&self, _url: &str) -> Result<(), EngineError> {
-        tracing::debug!("webkit: navigate stub");
+    fn navigate(&self, url: &str) -> Result<(), EngineError> {
+        self.send(Command::Navigate {
+            url: url.to_owned(),
+        });
         Ok(())
     }
 
     fn active_tab_live_url(&self) -> String {
-        String::new()
+        self.worker
+            .engine_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_tab_info().map(|t| t.url.clone()))
+            .unwrap_or_default()
     }
 
     fn pump_address_changes(&self) -> bool {
-        false
+        let changed = self
+            .worker
+            .engine_state
+            .lock()
+            .map(|mut st| {
+                let c = st.address_changed;
+                st.address_changed = false;
+                c
+            })
+            .unwrap_or(false);
+        if changed {
+            let url = self.active_tab_live_url();
+            if let Ok(mut lu) = self.live_url.lock() {
+                *lu = url;
+            }
+        }
+        changed
     }
 
     // ── Viewport ──────────────────────────────────────────────────────────────
 
-    fn resize(&self, _width: u32, _height: u32) {
-        tracing::debug!("webkit: resize stub");
+    fn resize(&self, width: u32, height: u32) {
+        self.view.width.store(width, Ordering::Relaxed);
+        self.view.height.store(height, Ordering::Relaxed);
+        self.send(Command::Resize { width, height });
     }
 
-    fn set_device_scale(&self, _scale: f32) {
-        tracing::debug!("webkit: set_device_scale stub");
+    fn set_device_scale(&self, scale: f32) {
+        self.view.set_scale(scale);
     }
 
-    fn set_frame_rate(&self, _hz: u32) {
-        tracing::debug!("webkit: set_frame_rate stub");
+    fn set_frame_rate(&self, hz: u32) {
+        self.view.frame_rate_hz.store(hz, Ordering::Relaxed);
     }
 
-    fn notify_screen_info_changed(&self) {
-        tracing::debug!("webkit: notify_screen_info_changed stub");
-    }
+    fn notify_screen_info_changed(&self) {}
 
-    fn osr_resize(&self, _width: u32, _height: u32) {
-        tracing::debug!("webkit: osr_resize stub");
+    fn osr_resize(&self, width: u32, height: u32) {
+        self.view.width.store(width, Ordering::Relaxed);
+        self.view.height.store(height, Ordering::Relaxed);
+        self.send(Command::OsrResize { width, height });
     }
 
     // ── Input ─────────────────────────────────────────────────────────────────
 
-    fn osr_key_event(&self, _event: NeutralKeyEvent) {
-        tracing::debug!("webkit: osr_key_event stub");
+    fn osr_key_event(&self, event: NeutralKeyEvent) {
+        use buffr_engine::KeyEventKind;
+        // Map NeutralKeyEvent → WPE keyboard event.
+        // WPE doesn't distinguish RawDown vs Char — send pressed=true for both.
+        let pressed = event.kind != KeyEventKind::Up;
+        let ev = WpeKeyEvent {
+            // Use windows_key_code as key_code (WPE keysym).
+            // For proper xkb keysyms this would need a VK→XKB lookup table,
+            // but for Phase 2 this gives basic Latin character input.
+            key_code: event.windows_key_code as u32,
+            hardware_key_code: event.native_key_code as u32,
+            pressed,
+            modifiers: event.modifiers,
+        };
+        self.send(Command::KeyEvent { ev });
     }
 
-    fn osr_mouse_move(&self, _x: i32, _y: i32, _modifiers: u32) {
-        tracing::debug!("webkit: osr_mouse_move stub");
+    fn osr_mouse_move(&self, x: i32, y: i32, modifiers: u32) {
+        self.send(Command::MouseMove { x, y, modifiers });
     }
 
     fn osr_mouse_click(
         &self,
-        _x: i32,
-        _y: i32,
-        _button: MouseButton,
-        _mouse_up: bool,
+        x: i32,
+        y: i32,
+        button: MouseButton,
+        mouse_up: bool,
         _click_count: i32,
-        _modifiers: u32,
+        modifiers: u32,
     ) {
-        tracing::debug!("webkit: osr_mouse_click stub");
+        let btn = match button {
+            MouseButton::Left => 1,
+            MouseButton::Middle => 2,
+            MouseButton::Right => 3,
+            MouseButton::Other(n) => n as u32,
+        };
+        self.send(Command::MouseClick {
+            x,
+            y,
+            button: btn,
+            pressed: !mouse_up,
+            modifiers,
+        });
     }
 
     fn osr_mouse_leave(&self, _modifiers: u32) {
-        tracing::debug!("webkit: osr_mouse_leave stub");
+        // WPE has no explicit mouse-leave — send a motion to (-1, -1) convention.
+        self.send(Command::MouseMove {
+            x: -1,
+            y: -1,
+            modifiers: 0,
+        });
     }
 
-    fn osr_mouse_wheel(&self, _x: i32, _y: i32, _delta_x: i32, _delta_y: i32, _modifiers: u32) {
-        tracing::debug!("webkit: osr_mouse_wheel stub");
+    fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
+        self.send(Command::MouseWheel {
+            x,
+            y,
+            delta_x,
+            delta_y,
+            modifiers,
+        });
     }
 
-    fn osr_focus(&self, _focused: bool) {
-        tracing::debug!("webkit: osr_focus stub");
+    fn osr_focus(&self, focused: bool) {
+        self.send(Command::Focus { focused });
     }
 
     // ── OSR state ─────────────────────────────────────────────────────────────
@@ -244,36 +337,22 @@ impl BrowserEngine for WebKitEngine {
         Arc::clone(&self.view)
     }
 
-    fn force_repaint_active(&self) {
-        tracing::debug!("webkit: force_repaint_active stub");
+    fn force_repaint_active(&self) {}
+
+    fn osr_sleep(&self, sleep: bool) {
+        self.send(Command::OsrSleep { sleep });
     }
 
-    fn osr_sleep(&self, _sleep: bool) {
-        tracing::debug!("webkit: osr_sleep stub");
-    }
-
-    fn osr_invalidate_view(&self) {
-        tracing::debug!("webkit: osr_invalidate_view stub");
-    }
+    fn osr_invalidate_view(&self) {}
 
     fn set_osr_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
-        tracing::debug!("webkit: set_osr_wake stub");
-        if let Ok(mut guard) = self.wake.lock()
-            && guard.is_none()
-        {
-            *guard = Some(wake);
-        }
+        self.view.set_wake(wake);
     }
 
     // ── Find / zoom ───────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {
-        tracing::debug!("webkit: start_find stub");
-    }
-
-    fn stop_find(&self) {
-        tracing::debug!("webkit: stop_find stub");
-    }
+    fn start_find(&self, _query: &str, _forward: bool) {}
+    fn stop_find(&self) {}
 
     fn active_zoom_level(&self) -> f64 {
         1.0
@@ -282,7 +361,11 @@ impl BrowserEngine for WebKitEngine {
     // ── Audio / video ─────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
-        false
+        self.worker
+            .engine_state
+            .lock()
+            .map(|st| st.audio_active.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     fn any_video_active(&self) -> bool {
@@ -303,13 +386,8 @@ impl BrowserEngine for WebKitEngine {
         self.popup_close_sink.clone()
     }
 
-    fn popup_resize(&self, _browser_id: i32, _width: u32, _height: u32) {
-        tracing::debug!("webkit: popup_resize stub");
-    }
-
-    fn popup_close(&self, _browser_id: i32) {
-        tracing::debug!("webkit: popup_close stub");
-    }
+    fn popup_resize(&self, _browser_id: i32, _width: u32, _height: u32) {}
+    fn popup_close(&self, _browser_id: i32) {}
 
     fn popup_drain_address_changes(&self) -> Vec<(i32, String)> {
         Vec::new()
@@ -319,21 +397,10 @@ impl BrowserEngine for WebKitEngine {
         Vec::new()
     }
 
-    fn popup_history_back(&self, _browser_id: i32) {
-        tracing::debug!("webkit: popup_history_back stub");
-    }
-
-    fn popup_history_forward(&self, _browser_id: i32) {
-        tracing::debug!("webkit: popup_history_forward stub");
-    }
-
-    fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {
-        tracing::debug!("webkit: popup_osr_focus stub");
-    }
-
-    fn popup_osr_key_event(&self, _browser_id: i32, _event: NeutralKeyEvent) {
-        tracing::debug!("webkit: popup_osr_key_event stub");
-    }
+    fn popup_history_back(&self, _browser_id: i32) {}
+    fn popup_history_forward(&self, _browser_id: i32) {}
+    fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {}
+    fn popup_osr_key_event(&self, _browser_id: i32, _event: NeutralKeyEvent) {}
 
     fn popup_osr_mouse_click(
         &self,
@@ -345,12 +412,9 @@ impl BrowserEngine for WebKitEngine {
         _click_count: i32,
         _modifiers: u32,
     ) {
-        tracing::debug!("webkit: popup_osr_mouse_click stub");
     }
 
-    fn popup_osr_mouse_move(&self, _browser_id: i32, _x: i32, _y: i32, _modifiers: u32) {
-        tracing::debug!("webkit: popup_osr_mouse_move stub");
-    }
+    fn popup_osr_mouse_move(&self, _browser_id: i32, _x: i32, _y: i32, _modifiers: u32) {}
 
     fn popup_osr_mouse_wheel(
         &self,
@@ -361,10 +425,9 @@ impl BrowserEngine for WebKitEngine {
         _delta_y: i32,
         _modifiers: u32,
     ) {
-        tracing::debug!("webkit: popup_osr_mouse_wheel stub");
     }
 
-    // ── Hint mode ─────────────────────────────────────────────────────────────
+    // ── Hint mode — stub ──────────────────────────────────────────────────────
 
     fn is_hint_mode(&self) -> bool {
         false
@@ -386,7 +449,5 @@ impl BrowserEngine for WebKitEngine {
         None
     }
 
-    fn cancel_hint(&self) {
-        tracing::debug!("webkit: cancel_hint stub");
-    }
+    fn cancel_hint(&self) {}
 }
