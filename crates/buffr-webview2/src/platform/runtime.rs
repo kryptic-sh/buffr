@@ -55,6 +55,8 @@ use std::sync::{Arc, Mutex, mpsc};
 #[cfg(target_os = "windows")]
 use buffr_core::hint::{HINT_CONSOLE_SENTINEL, HintEventSink, parse_console_event};
 use buffr_engine::TabId;
+#[cfg(target_os = "windows")]
+use buffr_engine::popup::PopupQueue;
 
 use super::worker::{Command, EngineState, TabInfo};
 
@@ -125,6 +127,7 @@ impl TabEntry {
         history: Option<std::sync::Arc<buffr_history::History>>,
         downloads: Option<std::sync::Arc<buffr_downloads::Downloads>>,
         notice_queue: Option<buffr_core::download_notice::DownloadNoticeQueue>,
+        popup_queue: PopupQueue,
     ) -> Result<Self, WebView2Error> {
         use webview2_com::{
             AddScriptToExecuteOnDocumentCreatedCompletedHandler,
@@ -821,6 +824,65 @@ impl TabEntry {
                 tracing::warn!("webview2 runtime: add_WebMessageReceived failed: {e}");
             } else {
                 tracing::debug!("webview2 runtime: WebMessageReceived hint handler wired");
+            }
+        }
+
+        // ── NewWindowRequested (window.open intercept) ────────────────────────
+        //
+        // When web content calls `window.open(url)` WebView2 fires this event
+        // before creating a native popup.  We intercept it, mark it handled
+        // (suppressing the popup), and push the URL onto the shared `popup_queue`
+        // so the apps layer can open it as a new tab via `drain_popup_urls`.
+        //
+        // Note: WebView2 handles popup routing as a new-tab re-route here via
+        // NewWindowRequested; no OSR sinks are needed for popup frames.
+        //
+        // SAFETY: add_NewWindowRequested is an STA COM method on `webview`.
+        // The handler closure captures `popup_queue` (Arc<Mutex<…>> — Send)
+        // and is invoked on the STA thread by WebView2.
+        {
+            use webview2_com::NewWindowRequestedEventHandler;
+            let popup_queue_handler = Arc::clone(&popup_queue);
+            let mut new_window_token: i64 = 0;
+            if let Err(e) = unsafe {
+                webview.add_NewWindowRequested(
+                    &NewWindowRequestedEventHandler::create(Box::new(move |_sender, args| {
+                        let Some(args) = args else { return Ok(()) };
+
+                        // Extract the requested URI (CoTask-allocated PWSTR).
+                        let mut uri_pwstr = windows::core::PWSTR::null();
+                        let url_str = if args.Uri(&mut uri_pwstr).is_ok() && !uri_pwstr.is_null() {
+                            // SAFETY: uri_pwstr is a valid CoTask-allocated PWSTR.
+                            let s = uri_pwstr.to_string().unwrap_or_default();
+                            windows::Win32::System::Com::CoTaskMemFree(Some(uri_pwstr.0.cast()));
+                            s
+                        } else {
+                            String::new()
+                        };
+
+                        // Suppress the native popup window.
+                        // SAFETY: SetHandled is an STA COM method on a valid args pointer.
+                        let _ = args.SetHandled(true);
+
+                        if !url_str.is_empty() {
+                            tracing::debug!(
+                                tab_id = id.0,
+                                url = %url_str,
+                                "webview2 runtime: NewWindowRequested → popup_queue"
+                            );
+                            if let Ok(mut guard) = popup_queue_handler.lock() {
+                                guard.push_back(url_str);
+                            }
+                        }
+
+                        Ok(())
+                    })),
+                    &mut new_window_token,
+                )
+            } {
+                tracing::warn!("webview2 runtime: add_NewWindowRequested failed: {e}");
+            } else {
+                tracing::debug!("webview2 runtime: NewWindowRequested handler wired");
             }
         }
 

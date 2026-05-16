@@ -58,7 +58,9 @@ use std::time::Duration;
 use buffr_core::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue};
 use buffr_core::find::{FindResult, FindResultSink};
 use buffr_core::hint::HintEventSink;
-use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+use buffr_engine::{
+    FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary, popup::PopupQueue,
+};
 
 use super::error::WebView2Error;
 use super::input::WebView2InputEvent;
@@ -97,10 +99,14 @@ pub(crate) struct EngineState {
     /// Written by `FaviconChanged` event delegates on the STA thread.
     /// Drained from any thread by `BrowserEngine::drain_favicon_updates`.
     pub favicon_updates: Arc<Mutex<Vec<FaviconUpdate>>>,
+    /// URLs queued by the `NewWindowRequested` event handler (window.open
+    /// intercept). Drained from any thread by `BrowserEngine::popup_queue()`.
+    pub popup_queue: PopupQueue,
 }
 
 impl EngineState {
     pub(crate) fn new(width: u32, height: u32) -> Self {
+        use buffr_engine::popup::new_popup_queue;
         EngineState {
             tabs: Vec::new(),
             active_idx: None,
@@ -110,6 +116,7 @@ impl EngineState {
             audio_active: Arc::new(AtomicBool::new(false)),
             loading_active: Arc::new(AtomicBool::new(false)),
             favicon_updates: Arc::new(Mutex::new(Vec::new())),
+            popup_queue: new_popup_queue(),
         }
     }
 
@@ -369,6 +376,10 @@ struct StaRuntime {
     /// Find-result sink — one-slot mailbox for the UI thread's find statusline.
     /// `None` when not provided. Updated by `ICoreWebView2Find` events.
     find_sink: Option<FindResultSink>,
+    /// Shared popup URL queue.  Written by the `NewWindowRequested` event
+    /// handler on the STA thread (one entry per `window.open` call); drained
+    /// from any thread by `BrowserEngine::popup_queue()`.
+    popup_queue: PopupQueue,
 }
 
 impl StaRuntime {
@@ -401,6 +412,7 @@ impl StaRuntime {
             self.history.clone(),
             self.downloads.clone(),
             self.notice_queue.clone(),
+            Arc::clone(&self.popup_queue),
         )?;
         #[cfg(not(target_os = "windows"))]
         let entry = TabEntry::new(id, url, &self.engine_state);
@@ -1687,6 +1699,14 @@ pub(crate) fn spawn(
             let _ = init_tx.send(Ok(()));
 
             // ── Construct StaRuntime ──────────────────────────────────────────
+            // Extract the popup_queue Arc from EngineState so the STA runtime
+            // can clone it into each new TabEntry's NewWindowRequested handler.
+            #[cfg(target_os = "windows")]
+            let popup_queue_rt = engine_state
+                .lock()
+                .map(|g| Arc::clone(&g.popup_queue))
+                .unwrap_or_else(|_| buffr_engine::popup::new_popup_queue());
+
             #[cfg(target_os = "windows")]
             let mut runtime = StaRuntime {
                 tabs: Vec::new(),
@@ -1704,6 +1724,7 @@ pub(crate) fn spawn(
                 downloads,
                 notice_queue,
                 find_sink,
+                popup_queue: popup_queue_rt,
             };
 
             #[cfg(not(target_os = "windows"))]

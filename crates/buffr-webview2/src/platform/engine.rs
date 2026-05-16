@@ -53,7 +53,6 @@ use buffr_engine::{
     engine_id::EngineId,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
-        new_popup_queue,
     },
 };
 
@@ -110,6 +109,10 @@ pub struct WebView2Engine {
     /// Stored behind an `Arc<Mutex<…>>` so `pump_hint_events` (called from any
     /// thread) can mutate it without touching the STA thread.
     hint_session: Arc<Mutex<Option<HintSession>>>,
+    /// Shared popup URL queue.  Filled by the STA thread's `NewWindowRequested`
+    /// event handler (one URL per `window.open` call); cloned out by
+    /// `BrowserEngine::popup_queue()` so the apps layer can drain it each tick.
+    popup_queue: PopupQueue,
 }
 
 impl WebView2Engine {
@@ -129,20 +132,23 @@ impl WebView2Engine {
         // Clone Arc<AtomicBool>s and shared queues from inside EngineState so
         // the engine can read / drain them from any thread without locking the
         // Mutex on every call.
-        let (audio_active, loading_active, favicon_updates) = engine_state
+        let (audio_active, loading_active, favicon_updates, popup_queue) = engine_state
             .lock()
             .map(|g| {
                 (
                     Arc::clone(&g.audio_active),
                     Arc::clone(&g.loading_active),
                     Arc::clone(&g.favicon_updates),
+                    Arc::clone(&g.popup_queue),
                 )
             })
             .unwrap_or_else(|_| {
+                use buffr_engine::popup::new_popup_queue;
                 (
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(Mutex::new(Vec::new())),
+                    new_popup_queue(),
                 )
             });
 
@@ -215,6 +221,7 @@ impl WebView2Engine {
             hint_alphabet,
             hint_sink,
             hint_session,
+            popup_queue,
         })
     }
 
@@ -656,10 +663,17 @@ impl BrowserEngine for WebView2Engine {
         false
     }
 
-    // ── Popup stubs ──────────────────────────────────────────────────────────
+    // ── Popup ─────────────────────────────────────────────────────────────────
+    //
+    // WebView2 routes `window.open` through the `NewWindowRequested` event
+    // (wired per-tab in `runtime.rs`).  Intercepted URLs are pushed onto the
+    // shared `popup_queue`; the apps layer drains it each tick and calls
+    // `open_tab`.  OSR-based popup frames are not used — WebView2 handles popup
+    // creation as a new-tab re-route; `popup_create_sink` / `popup_close_sink`
+    // return fresh empty sinks.
 
     fn popup_queue(&self) -> PopupQueue {
-        new_popup_queue()
+        Arc::clone(&self.popup_queue)
     }
 
     fn popup_create_sink(&self) -> PopupCreateSink {
