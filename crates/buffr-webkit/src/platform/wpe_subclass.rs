@@ -14,6 +14,8 @@
 
 use std::ffi::{CStr, c_void};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
 
@@ -65,6 +67,17 @@ unsafe extern "C" {
 pub(crate) struct ViewCtx {
     pub frame: SharedOsrFrame,
     pub view: SharedOsrViewState,
+    /// Microseconds (since process start) at which we last ingested + acked
+    /// a frame on this view. Read/written from the GLib worker thread; we
+    /// use an atomic so future input dispatch paths can read it without a
+    /// mutex.
+    pub last_ingest_us: AtomicU64,
+}
+
+/// Process-start instant — used as the epoch for `ViewCtx::last_ingest_us`.
+fn process_epoch() -> Instant {
+    static ONCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(Instant::now)
 }
 
 const VIEW_CTX_KEY: &[u8] = b"buffr-view-ctx\0";
@@ -126,6 +139,27 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
         }
         return;
     };
+
+    // Throttle ingest to the view's target frame rate. WebKit will keep
+    // re-rendering as fast as we ack, so without a gate the
+    // queue.write_texture / staging-buffer pool builds up and wgpu hits
+    // OOM after ~3 s. Acking is the only backpressure signal WPE has, so
+    // we still ack every frame here — just skip the import + memcpy +
+    // wake when the previous ingest was too recent.
+    let now_us = process_epoch().elapsed().as_micros() as u64;
+    let hz = ctx.view.frame_rate_hz.load(Ordering::Relaxed).max(1).min(240);
+    let min_interval_us = 1_000_000u64 / hz as u64;
+    let last_us = ctx.last_ingest_us.load(Ordering::Relaxed);
+    // `last_us == 0` means we haven't ingested anything yet — let the first
+    // frame through unconditionally so a static page still paints once.
+    if last_us != 0 && now_us.saturating_sub(last_us) < min_interval_us {
+        // SAFETY: view + buffer are valid for the rest of the vmethod call.
+        unsafe {
+            wpe_view_buffer_rendered(view, buffer);
+        }
+        return;
+    }
+    ctx.last_ingest_us.store(now_us, Ordering::Relaxed);
 
     // SAFETY: buffer is non-null per the vmethod contract.
     let (w, h) = unsafe {
@@ -278,7 +312,11 @@ pub(crate) fn force_link_bridge() {
 /// Convenience: build a `ViewCtx` from the shared frame + view state.
 #[allow(dead_code)]
 pub(crate) fn make_view_ctx(frame: SharedOsrFrame, view: SharedOsrViewState) -> ViewCtx {
-    ViewCtx { frame, view }
+    ViewCtx {
+        frame,
+        view,
+        last_ingest_us: AtomicU64::new(0),
+    }
 }
 
 /// Used by the test compilation path to verify Arc construction; not part

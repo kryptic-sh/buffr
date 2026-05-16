@@ -156,7 +156,14 @@ impl TabEntry {
             unsafe { g_object_unref(web_view as *mut _) };
             return None;
         }
-        attach_view_ctx(wpe_view, ViewCtx { frame, view });
+        attach_view_ctx(
+            wpe_view,
+            ViewCtx {
+                frame,
+                view,
+                last_ingest_us: std::sync::atomic::AtomicU64::new(0),
+            },
+        );
         tracing::info!("webkit: ViewCtx attached to WPEView");
 
         // 4. Load initial URL.
