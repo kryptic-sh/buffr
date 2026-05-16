@@ -9753,12 +9753,22 @@ fn should_force_chrome_repaint(
 /// Unit tests pin the invariant so future refactors can't reintroduce
 /// the swap-out flicker (where reading empty `frame.pixels` was used as
 /// the gate).
+/// Pixel slack tolerated between the host's requested browser rect and the
+/// engine's actual delivery dims. WPE WebKit's AcceleratedBackingStore aligns
+/// the content area down to a tile boundary, so a requested 1272×623 routinely
+/// arrives as 1264×615 — an 8 px shortfall in each axis. Without tolerance the
+/// loading animation never deactivates because the gate compares exact pixels.
+const OSR_DIM_TOLERANCE: u32 = 32;
+
 fn should_show_loading_anim(
     last_osr_dims: Option<(u32, u32)>,
     browser_w: u32,
     browser_h: u32,
 ) -> bool {
-    last_osr_dims != Some((browser_w, browser_h))
+    let Some((lw, lh)) = last_osr_dims else {
+        return true;
+    };
+    lw.abs_diff(browser_w) > OSR_DIM_TOLERANCE || lh.abs_diff(browser_h) > OSR_DIM_TOLERANCE
 }
 
 #[cfg(test)]
@@ -9928,14 +9938,22 @@ mod tests {
     #[test]
     fn loading_anim_on_when_dims_drift() {
         // CEF painted at old size; chrome layout (e.g. notice expired)
-        // changed browser_h. Animation must re-arm.
-        assert!(should_show_loading_anim(Some((1500, 1050)), 1500, 1080));
+        // changed browser_h. Animation must re-arm (delta > tolerance).
+        assert!(should_show_loading_anim(Some((1500, 1050)), 1500, 1100));
     }
 
     #[test]
     fn loading_anim_on_when_width_drifts() {
-        // Width-only mismatch covers fractional-scale rounding edge cases.
-        assert!(should_show_loading_anim(Some((1499, 1050)), 1500, 1050));
+        // Width-only mismatch beyond the WPE block-alignment tolerance.
+        assert!(should_show_loading_anim(Some((1400, 1050)), 1500, 1050));
+    }
+
+    #[test]
+    fn loading_anim_off_within_tolerance() {
+        // WPE WebKit's AcceleratedBackingStore aligns the content area
+        // down to a tile boundary, so a requested 1272x623 often arrives
+        // as 1264x615 — within OSR_DIM_TOLERANCE; no animation.
+        assert!(!should_show_loading_anim(Some((1264, 615)), 1272, 623));
     }
 
     #[test]
