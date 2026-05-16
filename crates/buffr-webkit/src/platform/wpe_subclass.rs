@@ -246,10 +246,15 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
         tracing::warn!(w, h, size_us, need, "webkit: import_to_pixels returned undersized buffer");
     }
 
-    // SAFETY: bytes was returned with one ref count we own; release it.
-    unsafe {
-        g_bytes_unref(bytes);
-    }
+    // Intentionally NOT calling g_bytes_unref here. WPE 2.52's
+    // import_to_pixels appears to return a GBytes whose ref count is owned
+    // by the WPEBuffer's internal cache (the buffer pool cycles a fixed
+    // set of WPEBuffer objects, so the same GBytes is returned on each
+    // delivery). Unreffing here drops the cache's only ref to zero after
+    // ~28 frames, freeing memory still referenced by the next import,
+    // and the worker SEGVs inside g_main_context_query_unlocked when GLib
+    // touches the freed source state.
+    let _ = bytes;
 
     // Acknowledge the frame so WebKit schedules the next one.
     // SAFETY: view + buffer are valid for the rest of the vmethod call.
