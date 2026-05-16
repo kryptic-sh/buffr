@@ -13,9 +13,19 @@
 //! callback) when the view is finalised, which lets us free the box safely.
 
 use std::ffi::{CStr, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
+
+/// Send wrapper around `*mut WPEBuffer`. The pointer is only ever
+/// dereferenced on the GLib worker thread; the wrapper exists so that
+/// [`ViewCtx`] can carry a held buffer behind a `Mutex` (which requires
+/// `Send`). The buffer itself is a GLib-refcounted object owned by
+/// WebKit's buffer pool — holding the pointer keeps it alive until we
+/// call `wpe_view_buffer_rendered`, which releases our slot in the pool.
+#[repr(transparent)]
+pub(crate) struct WpeBufferPtr(pub(crate) *mut WPEBuffer);
+unsafe impl Send for WpeBufferPtr {}
 
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState};
 
@@ -71,11 +81,20 @@ pub(crate) struct ViewCtx {
     /// use an atomic so future input dispatch paths can read it without a
     /// mutex.
     pub last_ingest_us: AtomicU64,
-    /// Per-tab gate: when false, this view's paints are dropped (ack only)
-    /// so an inactive tab can't overwrite the shared OsrFrame with its own
-    /// pixels. WpeRuntime flips the active tab's flag to true on
-    /// select_tab and clears all others.
+    /// Per-tab gate: when false, the most-recent inbound buffer is parked
+    /// in `pending_buffer` (unacked) instead of being imported, which makes
+    /// WebKit's render scheduler stop emitting new frames for this view —
+    /// WPE waits for `wpe_view_buffer_rendered` before recycling pool slots.
+    /// WpeRuntime flips the active tab's flag to true on `select_tab` and
+    /// clears all others.
     pub is_active: Arc<AtomicBool>,
+    /// Holds the last buffer WebKit emitted while this view was inactive.
+    /// `buffr_rust_render_buffer` stashes the buffer here instead of acking;
+    /// `ack_pending_buffer` (called from `TabEntry::show`) acks it later so
+    /// WebKit can resume emission. At most one buffer is ever held — WPE's
+    /// pool semantics only emit one buffer at a time and waits for ack
+    /// before reusing the slot.
+    pub pending_buffer: Mutex<Option<WpeBufferPtr>>,
 }
 
 /// Process-start instant — used as the epoch for `ViewCtx::last_ingest_us`.
@@ -122,6 +141,30 @@ fn view_ctx<'a>(view: *mut WPEView) -> Option<&'a ViewCtx> {
     }
 }
 
+/// Ack any buffer parked by `buffr_rust_render_buffer` while this view
+/// was inactive. Called from `TabEntry::show` so WebKit can resume
+/// emitting fresh frames once the tab is foregrounded.
+///
+/// Returns true if a buffer was actually held + acked. No-op (returns
+/// false) if the view has no `ViewCtx` attached or no parked buffer.
+pub(crate) fn ack_pending_buffer(view: *mut WPEView) -> bool {
+    let Some(ctx) = view_ctx(view) else {
+        return false;
+    };
+    let Ok(mut pending) = ctx.pending_buffer.lock() else {
+        return false;
+    };
+    let Some(b) = pending.take() else {
+        return false;
+    };
+    // SAFETY: view + buffer were valid when we parked the buffer; WPE keeps
+    // the buffer alive until we ack via wpe_view_buffer_rendered.
+    unsafe {
+        wpe_view_buffer_rendered(view, b.0);
+    }
+    true
+}
+
 // ── Per-frame callback invoked by C ──────────────────────────────────────────
 
 /// Called by `buffr_view_render_buffer_vfunc` in `wpe_subclasses.c` on every
@@ -144,15 +187,26 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
         return;
     };
 
-    // Per-tab active gate. Inactive tabs still produce paints (WebKit
-    // doesn't stop rendering when a view goes off-screen unless we call
-    // was_hidden); ack the buffer so WPE doesn't stall, but don't write
-    // pixels into the shared OsrFrame — otherwise a background tab's
-    // content would clobber the active tab's display.
+    // Per-tab active gate. Inactive tabs park their newest buffer here
+    // WITHOUT acking — WPE's pool semantics make WebKit wait for the ack
+    // before emitting more frames, so the view goes truly idle (no CPU
+    // wasted on layout / paint). On reactivation, `ack_pending_buffer`
+    // releases the held buffer and WebKit resumes emission.
+    //
+    // If a previous unacked buffer is already parked (shouldn't happen in
+    // practice — WebKit waits for ack before reissuing — but defensive),
+    // ack it first to keep the pool balanced before stashing the new one.
     if !ctx.is_active.load(Ordering::Relaxed) {
-        unsafe {
-            wpe_view_buffer_rendered(view, buffer);
+        let mut pending = ctx
+            .pending_buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(prev) = pending.take() {
+            unsafe {
+                wpe_view_buffer_rendered(view, prev.0);
+            }
         }
+        *pending = Some(WpeBufferPtr(buffer));
         return;
     }
 
@@ -405,6 +459,7 @@ pub(crate) fn make_view_ctx(frame: SharedOsrFrame, view: SharedOsrViewState) -> 
         view,
         last_ingest_us: AtomicU64::new(0),
         is_active: Arc::new(AtomicBool::new(true)),
+        pending_buffer: Mutex::new(None),
     }
 }
 

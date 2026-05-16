@@ -21,7 +21,8 @@ use super::egl::EglWorker;
 use super::ffi::*;
 use super::worker::EngineState;
 use super::wpe_subclass::{
-    BuffrDisplayHandle, ViewCtx, attach_view_ctx, buffr_display_take_last_view,
+    BuffrDisplayHandle, ViewCtx, ack_pending_buffer, attach_view_ctx,
+    buffr_display_take_last_view,
 };
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────
@@ -323,6 +324,7 @@ impl TabEntry {
                 view,
                 last_ingest_us: std::sync::atomic::AtomicU64::new(0),
                 is_active: Arc::clone(&is_active),
+                pending_buffer: Mutex::new(None),
             },
         );
         tracing::info!("webkit: ViewCtx attached to WPEView");
@@ -460,33 +462,42 @@ impl TabEntry {
         unsafe { webkit_web_view_is_playing_audio(self.web_view) != 0 }
     }
 
-    /// Hide this tab. INTENTIONAL no-op on `wpe_view_set_visible(false)`:
-    /// once WebKit's AcceleratedBackingStore is told a view is hidden, the
-    /// matching `wpe_view_set_visible(true)` later does NOT reliably make
-    /// it resume emitting `render_buffer` — `wpe_view_resized` to the same
-    /// dimensions is also a no-op. The previously-painting tab goes silent
-    /// forever and the shared OsrFrame stays stuck on whatever the
-    /// last-active tab wrote.
+    /// Mark this tab inactive at the WebKit level.
     ///
-    /// Instead, every tab stays visible to WebKit; the `ViewCtx::is_active`
-    /// gate in `buffr_rust_render_buffer` ack-and-discards pixels from
-    /// background tabs so they can't clobber the active tab's display. The
-    /// CPU cost is a hidden tab still rendering at its target frame rate,
-    /// but correctness is guaranteed.
+    /// We deliberately do NOT call `wpe_view_set_visible(false)` — WPE's
+    /// AcceleratedBackingStore treats that as one-way (the matching
+    /// `set_visible(true)` does not reliably re-arm render emission).
+    /// Instead, the actual rendering pause is driven by the `is_active`
+    /// gate in `buffr_rust_render_buffer`: once a tab is flagged inactive,
+    /// the next buffer WebKit emits is parked in `ViewCtx::pending_buffer`
+    /// WITHOUT acking. WPE's pool semantics make WebKit block on the ack
+    /// before emitting more, so the view goes truly idle (no layout / no
+    /// paint scheduling, no CPU cost). This method exists for symmetry +
+    /// future hook surface; the flag flip is done by the caller.
     pub(crate) fn hide(&self) {
-        // No-op by design. See doc comment.
+        // No FFI work needed — pause is implicit via the is_active gate +
+        // parked-buffer mechanism. The caller has already flipped
+        // `self.is_active` to false before calling hide().
     }
 
-    /// Show this tab. Calls `wpe_view_set_visible(true)` (idempotent — we
-    /// never called false) and issues a `wpe_view_resized` nudge to bump
-    /// WebKit's render scheduler in case it had paused this view as an
-    /// optimization. Only meaningful for tabs created in the background
-    /// (`open_tab_background`) whose initial paint might otherwise be
-    /// dropped by the is_active gate and never re-emitted.
+    /// Activate this tab at the WebKit level.
+    ///
+    /// 1. Ack any buffer that `buffr_rust_render_buffer` parked while
+    ///    the tab was inactive. This unblocks WebKit's emission loop —
+    ///    WPE can recycle the pool slot and schedule a new paint.
+    /// 2. Call `wpe_view_set_visible(true)` + `wpe_view_resized` as a
+    ///    defensive scheduler kick. Useful for tabs that were created in
+    ///    the background and never produced their initial paint (where
+    ///    there's no parked buffer to ack), so we still poke WebKit to
+    ///    render once.
     pub(crate) fn show(&self, width: u32, height: u32) {
         if self.wpe_view.is_null() {
             return;
         }
+        // (1) Release any parked buffer — WebKit was blocked on this ack.
+        let acked = ack_pending_buffer(self.wpe_view);
+        // (2) Defensive kick for tabs with no parked buffer (e.g. background-
+        // opened tabs whose initial paint hadn't fired yet).
         // SAFETY: wpe_view is a live WPEView owned by the WebView; calls
         // are thread-bound to the GLib worker thread.
         unsafe {
@@ -496,13 +507,22 @@ impl TabEntry {
         tracing::debug!(
             width,
             height,
-            "webkit: show+resized WPEView (active tab activation kick)"
+            acked_pending = acked,
+            "webkit: show — ack pending buffer + resize kick"
         );
     }
 }
 
 impl Drop for TabEntry {
     fn drop(&mut self) {
+        // Release any buffer parked by the inactive-tab gate so WPE can
+        // return the pool slot. The view is still alive at this point
+        // (Drop runs before g_object_unref below); after unref the
+        // attached ViewCtx is finalised by drop_view_ctx, which would
+        // otherwise leak the held buffer ref.
+        if !self.wpe_view.is_null() {
+            ack_pending_buffer(self.wpe_view);
+        }
         // SAFETY: GLib owns the signal lifetime; disconnect before unref to
         // prevent callbacks firing on a freed object.
         unsafe {
