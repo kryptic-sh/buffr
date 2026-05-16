@@ -737,19 +737,15 @@ impl WpeRuntime {
         // re-render a page whose DOM is unchanged.
         new_tab.set_visible(true);
         self.active_idx = Some(new_idx);
-        if let Ok(mut st) = self.engine_state.lock() {
+        // Update active_idx and read is_loading in a single lock acquisition
+        // so the main thread never observes the new active_idx while the
+        // is_loading_atomic still reflects the previous tab's state.
+        let new_is_loading = if let Ok(mut st) = self.engine_state.lock() {
             st.active_idx = Some(new_idx);
-        }
-        // Re-snapshot the runtime-wide is_loading from the newly active
-        // tab's TabInfo so the splash gate reflects the new tab, not the
-        // one we just left. Bump needs_fresh so the renderer holds the
-        // animation until the new view paints.
-        let new_is_loading = self
-            .engine_state
-            .lock()
-            .ok()
-            .and_then(|st| st.tabs.get(new_idx).map(|t| t.is_loading))
-            .unwrap_or(false);
+            st.tabs.get(new_idx).map(|t| t.is_loading).unwrap_or(false)
+        } else {
+            false
+        };
         self.is_loading_atomic
             .store(new_is_loading, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut frame) = self.frame.lock() {
