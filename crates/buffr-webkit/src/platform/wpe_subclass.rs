@@ -161,10 +161,16 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     // `*mut u64`. Cast the returned gconstpointer to `*const u8`.
     let data_ptr = unsafe { g_bytes_get_data(bytes, &mut size as *mut u64) as *const u8 };
     let size_us = size as usize;
-    if !data_ptr.is_null() && size_us >= (w as usize) * (h as usize) * 4 {
+    let row_bytes = (w as usize) * 4;
+    let need = row_bytes * (h as usize);
+    if !data_ptr.is_null() && size_us >= need && h > 0 {
+        // import_to_pixels returns ARGB8888 but each row may be padded to a
+        // hardware-friendly stride (e.g. multiples of 64 / cache lines). Use
+        // the buffer's total size / height to recover the stride and copy
+        // each row tight into OsrFrame.
+        let src_stride = size_us / (h as usize);
         let mut generation = 0u64;
         if let Ok(mut frame) = ctx.frame.lock() {
-            let need = (w as usize) * (h as usize) * 4;
             if frame.width != w || frame.height != h {
                 frame.width = w;
                 frame.height = h;
@@ -172,20 +178,26 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
                 frame.needs_fresh = false;
             }
             if frame.pixels.len() >= need {
-                // SAFETY: src is `size` bytes, we copy at most `need`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data_ptr, frame.pixels.as_mut_ptr(), need);
+                let dst = frame.pixels.as_mut_ptr();
+                for row in 0..(h as usize) {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data_ptr.add(row * src_stride),
+                            dst.add(row * row_bytes),
+                            row_bytes,
+                        );
+                    }
                 }
                 frame.generation = frame.generation.wrapping_add(1);
                 generation = frame.generation;
             }
         }
-        tracing::debug!(w, h, generation, "webkit: frame ingested");
+        tracing::debug!(w, h, src_stride, row_bytes, generation, "webkit: frame ingested");
         if let Some(wake) = ctx.view.wake.get() {
             wake();
         }
     } else {
-        tracing::warn!(w, h, size_us, "webkit: import_to_pixels returned undersized buffer");
+        tracing::warn!(w, h, size_us, need, "webkit: import_to_pixels returned undersized buffer");
     }
 
     // SAFETY: bytes was returned with one ref count we own; release it.
