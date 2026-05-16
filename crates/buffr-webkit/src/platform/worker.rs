@@ -140,7 +140,36 @@ pub(crate) struct WpeKeyEvent {
 pub(crate) struct WorkerHandle {
     pub cmd_tx: mpsc::SyncSender<Command>,
     pub engine_state: Arc<Mutex<EngineState>>,
-    _thread: thread::JoinHandle<()>,
+    /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
+    /// until either `shutdown_and_join` is called explicitly or the
+    /// engine is dropped.
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    /// Send Command::Shutdown to the worker, then block until its GLib
+    /// main loop exits and the thread joins. Idempotent: a second call
+    /// returns immediately because the JoinHandle is already taken.
+    ///
+    /// Must be called before `std::process::exit` so WebKit's atexit
+    /// destructors don't WTFCrash unwinding a half-initialised state.
+    pub(crate) fn shutdown_and_join(&mut self) {
+        let Some(handle) = self.thread.take() else {
+            return;
+        };
+        // Best-effort: if the worker queue is full or already gone, the
+        // worker has crashed; we still try to join below.
+        let _ = self.cmd_tx.try_send(Command::Shutdown);
+        if let Err(e) = handle.join() {
+            tracing::warn!(?e, "webkit worker: thread panicked during shutdown");
+        }
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown_and_join();
+    }
 }
 
 /// Spawn the GLib worker thread and return a handle.
@@ -277,7 +306,7 @@ pub(crate) fn spawn(
     Ok(WorkerHandle {
         cmd_tx,
         engine_state,
-        _thread: thread,
+        thread: Some(thread),
     })
 }
 

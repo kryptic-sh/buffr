@@ -3205,10 +3205,19 @@ impl AppState {
                 // Phase 3: "last tab" exit must check across ALL engines.
                 let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
                 if !still_open || total_tabs == 0 {
-                    info!("tab_close: last tab gone (all engines) — saving session and exiting");
+                    info!("tab_close: last tab gone (all engines) — requesting graceful exit");
                     self.save_session_now();
                     self.mark_clean_shutdown();
-                    std::process::exit(0);
+                    // Signal the event loop to exit on the next `about_to_wait`
+                    // tick instead of `std::process::exit(0)`. Direct exit()
+                    // bypasses Rust `Drop` so the WPE WebKit worker thread keeps
+                    // running and WebKit's libc atexit destructors then SIGABRT
+                    // unwinding a half-initialised display. Routing through
+                    // `event_loop.exit()` runs the post-`run_app` shutdown
+                    // sequence (engine drops, backend.shutdown(), …) before
+                    // libc atexit fires.
+                    self.shutdown_flag.store(true, Ordering::SeqCst);
+                    self.request_redraw();
                 }
                 true
             }
@@ -3236,10 +3245,14 @@ impl AppState {
             // Phase 3: count across ALL engines for the exit decision.
             let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
             if total_tabs == 0 {
-                info!("tab_close: last tab gone (all engines) — saving session and exiting");
+                info!("tab_close: last tab gone (all engines) — requesting graceful exit");
                 self.save_session_now();
                 self.mark_clean_shutdown();
-                std::process::exit(0);
+                // See close_active_tab_or_exit for the rationale: signal
+                // the event loop so the post-run_app shutdown sequence
+                // tears down engines + workers before libc atexit fires.
+                self.shutdown_flag.store(true, Ordering::SeqCst);
+                self.request_redraw();
             }
             self.refresh_tab_strip();
             self.mark_session_dirty();
@@ -5051,7 +5064,9 @@ impl AppState {
                     if remaining == 0 {
                         self.save_session_now();
                         self.mark_clean_shutdown();
-                        std::process::exit(0);
+                        // Graceful exit — see close_active_tab_or_exit.
+                        self.shutdown_flag.store(true, Ordering::SeqCst);
+                        self.request_redraw();
                     }
                     self.mark_session_dirty();
                 }
