@@ -78,6 +78,9 @@ pub(crate) enum Command {
     OpenTab {
         url: String,
         reply: mpsc::SyncSender<Result<TabId, String>>,
+        /// When true, the new tab is created in the background: no active-tab
+        /// switch, no is_loading_atomic update, no needs_fresh reset.
+        background: bool,
     },
     Navigate {
         url: String,
@@ -267,7 +270,7 @@ pub(crate) fn spawn(
             {
                 let rt = Rc::clone(&runtime_rc);
                 glib::idle_add_local_once(move || {
-                    if let Err(e) = rt.borrow_mut().open_tab(&initial_url) {
+                    if let Err(e) = rt.borrow_mut().open_tab(&initial_url, false) {
                         tracing::error!("webkit worker: initial open_tab failed: {e}");
                     }
                 });
@@ -329,8 +332,12 @@ pub(crate) fn spawn(
 /// Returns `true` if the main loop should exit.
 fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> bool {
     match cmd {
-        Command::OpenTab { url, reply } => {
-            let res = rt.open_tab(&url).map_err(|e| e.to_string());
+        Command::OpenTab {
+            url,
+            reply,
+            background,
+        } => {
+            let res = rt.open_tab(&url, background).map_err(|e| e.to_string());
             let _ = reply.try_send(res);
         }
         Command::Navigate { url } => {

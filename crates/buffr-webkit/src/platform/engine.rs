@@ -241,12 +241,16 @@ impl WebKitEngine {
     /// Open a tab synchronously via a reply channel. Records the original
     /// (untranslated) URL against the minted [`TabId`] so omnibar reads
     /// stay in `buffr://` space.
-    fn open_tab_sync(&self, url: &str) -> Result<TabId, EngineError> {
+    ///
+    /// `background = true` creates the tab without switching to it (no
+    /// `active_idx` change, no `is_loading_atomic` update).
+    fn open_tab_sync(&self, url: &str, background: bool) -> Result<TabId, EngineError> {
         let original = url.to_owned();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.send(Command::OpenTab {
             url: self.resolve_url(url),
             reply: reply_tx,
+            background,
         });
         let tab_id = reply_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -275,9 +279,8 @@ pub(crate) fn apply_display_overrides_pure(
     let Some(display) = display else {
         return summary;
     };
-    let title_is_placeholder = summary.title.is_empty()
-        || summary.title == summary.url
-        || summary.title == display;
+    let title_is_placeholder =
+        summary.title.is_empty() || summary.title == summary.url || summary.title == display;
     summary.url = display.to_owned();
     if title_is_placeholder {
         summary.title = display.to_owned();
@@ -298,20 +301,23 @@ impl BrowserEngine for WebKitEngine {
     // ── Tabs ──────────────────────────────────────────────────────────────────
 
     fn open_tab(&self, url: &str) -> Result<TabId, EngineError> {
-        self.open_tab_sync(url)
+        self.open_tab_sync(url, false)
     }
 
     fn open_tab_background(&self, url: &str) -> Result<TabId, EngineError> {
-        // Phase 2: single tab — background = same as foreground.
-        self.open_tab(url)
+        self.open_tab_sync(url, true)
     }
 
     fn open_tab_at(&self, url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        self.open_tab(url)
+        // Known limitation: insert_idx is ignored; new tab is always appended.
+        self.open_tab_sync(url, false)
     }
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
-        tracing::debug!(?id, "webkit: close_tab (single-tab phase, routes through close_active)");
+        tracing::debug!(
+            ?id,
+            "webkit: close_tab (single-tab phase, routes through close_active)"
+        );
         self.forget_display_url(id);
         self.close_active()
     }
@@ -807,7 +813,11 @@ mod tests {
     fn override_swaps_url() {
         // The engine loaded http://127.0.0.1:.../<token>/new but the user
         // asked for buffr://new — the omnibar should show the buffr URL.
-        let s = summary(1, "http://127.0.0.1:1234/abc/new", "http://127.0.0.1:1234/abc/new");
+        let s = summary(
+            1,
+            "http://127.0.0.1:1234/abc/new",
+            "http://127.0.0.1:1234/abc/new",
+        );
         let out = apply_display_overrides_pure(s, Some("buffr://new"));
         assert_eq!(out.url, "buffr://new");
     }
@@ -816,7 +826,11 @@ mod tests {
     fn override_swaps_title_when_placeholder_equals_url() {
         // Default TabInfo.title == url right after open_tab; the tab pill
         // would otherwise show the long localhost URL.
-        let s = summary(1, "http://127.0.0.1:1234/abc/new", "http://127.0.0.1:1234/abc/new");
+        let s = summary(
+            1,
+            "http://127.0.0.1:1234/abc/new",
+            "http://127.0.0.1:1234/abc/new",
+        );
         let out = apply_display_overrides_pure(s, Some("buffr://new"));
         assert_eq!(out.title, "buffr://new");
     }

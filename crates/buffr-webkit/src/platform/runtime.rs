@@ -19,10 +19,10 @@ use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
 use super::egl::EglWorker;
 use super::ffi::*;
+use super::worker::EngineState;
 use super::wpe_subclass::{
     BuffrDisplayHandle, ViewCtx, attach_view_ctx, buffr_display_take_last_view,
 };
-use super::worker::EngineState;
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────
 
@@ -374,7 +374,11 @@ impl TabEntry {
             // by g_signal_connect_data (a callable C fn). The actual
             // arity-correct signature is enforced when WebKit invokes it.
             std::mem::transmute::<
-                unsafe extern "C" fn(*mut WebKitWebView, WebKitLoadEvent, *mut std::os::raw::c_void),
+                unsafe extern "C" fn(
+                    *mut WebKitWebView,
+                    WebKitLoadEvent,
+                    *mut std::os::raw::c_void,
+                ),
                 unsafe extern "C" fn(),
             >(on_load_changed)
         });
@@ -549,10 +553,8 @@ impl WpeRuntime {
             )
         };
 
-        let display =
-            BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, hz).ok_or_else(|| {
-                "BuffrDisplayHandle::new returned None".to_string()
-            })?;
+        let display = BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, hz)
+            .ok_or_else(|| "BuffrDisplayHandle::new returned None".to_string())?;
 
         // Connect + publish as primary once. wpe_display_get_primary calls
         // inside WebKit now resolve here for the whole runtime lifetime.
@@ -583,7 +585,22 @@ impl WpeRuntime {
         self.active_idx.and_then(|i| self.tabs.get(i))
     }
 
-    pub(crate) fn open_tab(&mut self, url: &str) -> Result<TabId, String> {
+    /// Open a new tab navigated to `url`.
+    ///
+    /// When `background` is true the current active tab is NOT deactivated,
+    /// `is_loading_atomic` and `frame.needs_fresh` are NOT touched, and
+    /// `active_idx` stays pointing at the existing tab. The new tab is
+    /// appended to both `self.tabs` and `engine_state.tabs` so it appears in
+    /// the tab strip, but its WPEView is created with `is_active = false` and
+    /// immediately hidden via `set_visible(false)`.
+    ///
+    /// **Ordering contract (CRITICAL #1 rollback):**
+    /// The `TabInfo` is pushed to `engine_state.tabs` *before* `TabEntry::new`
+    /// so that the `load-changed` signal (which fires synchronously from
+    /// `webkit_web_view_load_uri` inside `TabEntry::new`) can find the entry
+    /// via `with_tab_info`. If `TabEntry::new` fails, the pushed `TabInfo` and
+    /// any `active_idx` update are rolled back before returning an error.
+    pub(crate) fn open_tab(&mut self, url: &str, background: bool) -> Result<TabId, String> {
         let id = {
             let mut st = self
                 .engine_state
@@ -594,40 +611,40 @@ impl WpeRuntime {
             id
         };
 
-        // Deactivate the current active tab BEFORE creating the new
-        // WebView. WebKit emits LOAD_STARTED + initial paint events
-        // synchronously from webkit_web_view_load_uri inside
-        // TabEntry::new — if the previous tab is still flagged active,
-        // its ViewCtx would still write pixels into the shared frame
-        // and its TabSignalCtx would still clobber is_loading_atomic
-        // while we're trying to switch.
-        if let Some(prev) = self.active_tab() {
-            prev.is_active
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            prev.set_visible(false);
+        // For foreground tabs: deactivate the current active tab BEFORE
+        // creating the new WebView. WebKit emits LOAD_STARTED + initial paint
+        // events synchronously from webkit_web_view_load_uri inside
+        // TabEntry::new — if the previous tab is still flagged active its
+        // ViewCtx would clobber the shared frame and its TabSignalCtx would
+        // clobber is_loading_atomic during the switch.
+        let prev_active_idx = self.active_idx;
+        if !background {
+            if let Some(prev) = self.active_tab() {
+                prev.is_active
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                prev.set_visible(false);
+            }
         }
 
         // TabInfo must exist before signal handlers fire — load-changed
         // can race the return from TabEntry::new because webkit_web_view_load_uri
-        // emits LOAD_STARTED synchronously.
+        // emits LOAD_STARTED synchronously. Push it now; roll back on failure.
         let info = TabInfo::new(id, url);
-        if let Ok(mut st) = self.engine_state.lock() {
+        let pushed_es_idx = {
+            let mut st = self
+                .engine_state
+                .lock()
+                .map_err(|e| format!("mutex poison (push): {e}"))?;
             st.tabs.push(info);
-            st.active_idx = Some(st.tabs.len() - 1);
-        }
+            let pushed = st.tabs.len() - 1;
+            if !background {
+                st.active_idx = Some(pushed);
+            }
+            pushed
+        };
 
-        // Reset the loading flag here on the worker thread so the
-        // signal handler doesn't have to win the race against the main
-        // thread observing is_loading=false from a previous tab. Also
-        // force the renderer to wait for the new tab's first paint
-        // instead of compositing the previous tab's last frame.
-        self.is_loading_atomic
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut frame) = self.frame.lock() {
-            frame.needs_fresh = true;
-        }
-
-        let is_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let is_active_flag = !background;
+        let is_active = Arc::new(std::sync::atomic::AtomicBool::new(is_active_flag));
         let entry = TabEntry::new(
             id,
             url,
@@ -636,12 +653,59 @@ impl WpeRuntime {
             Arc::clone(&self.view),
             Arc::clone(&self.engine_state),
             Arc::clone(&self.is_loading_atomic),
-            is_active,
-        )
-        .ok_or_else(|| "TabEntry::new returned None".to_string())?;
+            Arc::clone(&is_active),
+        );
+
+        let entry = match entry {
+            Some(e) => e,
+            None => {
+                // ── Rollback ──────────────────────────────────────────────────
+                // Remove the TabInfo we pre-pushed and restore active_idx /
+                // previous-tab is_active so the state is exactly as it was
+                // before this call.
+                if let Ok(mut st) = self.engine_state.lock() {
+                    if pushed_es_idx < st.tabs.len() {
+                        st.tabs.remove(pushed_es_idx);
+                    }
+                    if !background {
+                        st.active_idx = prev_active_idx;
+                    }
+                }
+                // Re-activate the previous tab if we deactivated it.
+                if !background {
+                    if let Some(idx) = prev_active_idx {
+                        if let Some(prev) = self.tabs.get(idx) {
+                            prev.is_active
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            prev.set_visible(true);
+                        }
+                    }
+                }
+                return Err("TabEntry::new returned None".to_string());
+            }
+        };
+
+        // Only after successful TabEntry creation: update atomics + frame for
+        // foreground tabs.
+        if !background {
+            // Reset the loading flag so the signal handler doesn't have to win
+            // the race against the main thread observing is_loading=false from
+            // the previous tab.
+            self.is_loading_atomic
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut frame) = self.frame.lock() {
+                frame.needs_fresh = true;
+            }
+        } else {
+            // Background tab: hide its view immediately so it doesn't produce
+            // pixels into the shared frame.
+            entry.set_visible(false);
+        }
 
         self.tabs.push(entry);
-        self.active_idx = Some(self.tabs.len() - 1);
+        if !background {
+            self.active_idx = Some(self.tabs.len() - 1);
+        }
         Ok(id)
     }
 
@@ -918,14 +982,7 @@ impl WpeRuntime {
         });
     }
 
-    pub(crate) fn dispatch_axis(
-        &self,
-        x: i32,
-        y: i32,
-        delta_x: i32,
-        delta_y: i32,
-        modifiers: u32,
-    ) {
+    pub(crate) fn dispatch_axis(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
         // Pure horizontal+vertical zero → treat as "scroll stop" so WebKit
         // can release momentum state.
         let is_stop = (delta_x == 0 && delta_y == 0) as gboolean;
