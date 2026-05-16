@@ -45,9 +45,9 @@ unsafe extern "C" {
     /// Returns NULL if no view has been created since the last take.
     pub fn buffr_display_take_last_view() -> *mut WPEView;
 
-    // Tiny GLib helpers we link against directly. The bindgen surface
+    // Tiny GLib helpers we link against directly. The bindgeneration surface
     // already covers g_bytes_*, g_error_free, etc; we only redeclare
-    // qdata-related helpers since bindgen's allowlist skipped them.
+    // qdata-related helpers since bindgeneration's allowlist skipped them.
     fn g_object_set_data_full(
         object: *mut c_void,
         key: *const std::os::raw::c_char,
@@ -162,6 +162,7 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     let data_ptr = unsafe { g_bytes_get_data(bytes, &mut size as *mut u64) as *const u8 };
     let size_us = size as usize;
     if !data_ptr.is_null() && size_us >= (w as usize) * (h as usize) * 4 {
+        let mut generation = 0u64;
         if let Ok(mut frame) = ctx.frame.lock() {
             let need = (w as usize) * (h as usize) * 4;
             if frame.width != w || frame.height != h {
@@ -176,12 +177,15 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
                     std::ptr::copy_nonoverlapping(data_ptr, frame.pixels.as_mut_ptr(), need);
                 }
                 frame.generation = frame.generation.wrapping_add(1);
+                generation = frame.generation;
             }
         }
-        // Wake the host UI.
+        tracing::debug!(w, h, generation, "webkit: frame ingested");
         if let Some(wake) = ctx.view.wake.get() {
             wake();
         }
+    } else {
+        tracing::warn!(w, h, size_us, "webkit: import_to_pixels returned undersized buffer");
     }
 
     // SAFETY: bytes was returned with one ref count we own; release it.

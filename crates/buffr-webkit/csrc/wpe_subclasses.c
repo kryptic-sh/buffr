@@ -104,6 +104,7 @@ static gboolean buffr_view_render_buffer_vfunc(WPEView *view,
     (void)damage;
     (void)n_damage;
     (void)error;
+    g_debug("buffr: render_buffer view=%p buffer=%p", view, buffer);
     /* Forward to Rust for pixel ingestion. Rust calls
      * wpe_view_buffer_rendered itself once it's done. */
     buffr_rust_render_buffer(view, buffer);
@@ -114,15 +115,18 @@ static void buffr_view_on_notify_toplevel(WPEView *view, GParamSpec *pspec, gpoi
     (void)pspec;
     (void)user_data;
     WPEToplevel *toplevel = wpe_view_get_toplevel(view);
+    g_debug("buffr: notify::toplevel view=%p toplevel=%p", view, toplevel);
     if (!toplevel) {
         wpe_view_unmap(view);
         return;
     }
     int w, h;
     wpe_toplevel_get_size(toplevel, &w, &h);
+    g_debug("buffr: toplevel size=%dx%d", w, h);
     if (w > 0 && h > 0)
         wpe_view_resized(view, w, h);
     wpe_view_map(view);
+    g_debug("buffr: view mapped=%d", wpe_view_get_mapped(view));
 }
 
 static void buffr_view_constructed(GObject *object) {
@@ -233,7 +237,12 @@ static WPEScreen *buffr_display_get_screen_vfunc(WPEDisplay *display, guint inde
         return NULL;
     BuffrDisplay *self = BUFFR_DISPLAY(display);
     if (!self->screen) {
-        self->screen = g_object_new(BUFFR_TYPE_SCREEN, NULL);
+        /* `id` is a G_PARAM_CONSTRUCT_ONLY property on WPEScreen and reads
+         * back via wpe_screen_get_id. WebKit's ScreenManager keys a
+         * HashMap<uint32, ScreenData> off this id; HashTable<uint32, …>
+         * uses 0 as the empty-slot sentinel, so a screen reporting id=0
+         * trips a WTFCrash in HashTable.h on insert. Use a non-zero id. */
+        self->screen = g_object_new(BUFFR_TYPE_SCREEN, "id", (guint32)1, NULL);
         wpe_screen_set_size(WPE_SCREEN(self->screen), self->viewport_w, self->viewport_h);
         wpe_screen_set_scale(WPE_SCREEN(self->screen), self->scale);
         wpe_screen_set_refresh_rate(WPE_SCREEN(self->screen), self->refresh_hz * 1000);
@@ -278,14 +287,12 @@ static void buffr_display_class_init(BuffrDisplayClass *klass) {
     display_class->create_toplevel = buffr_display_create_toplevel_vfunc;
     display_class->get_egl_display = buffr_display_get_egl_vfunc;
     display_class->get_drm_device = buffr_display_get_drm_device_vfunc;
-    /* Intentionally NOT overriding get_n_screens / get_screen — WPE
-     * WebKit's ScreenManager::collectScreenProperties divides by the
-     * screen's physical-mm diagonal, so any screen we expose must carry
-     * non-zero physical size. WPEDisplayHeadless takes the same shortcut:
-     * return zero screens, let WebKit's ScreenManager fall back to
-     * defaults (primary display ID = 0, empty map). The active view's
-     * display ID then comes from ViewPlatform's `ScreenManager::primaryDisplayID()`
-     * branch when wpe_view_get_screen() returns NULL. */
+    /* Expose one screen w/ non-zero physical size so AcceleratedBackingStore
+     * can allocate frame buffers against it. The DPI-from-physical-mm WTFCrash
+     * in ScreenManager::collectScreenProperties is dodged by computing physical
+     * mm from the pixel viewport at 96 DPI in buffr_display_get_screen_vfunc. */
+    display_class->get_n_screens = buffr_display_get_n_screens_vfunc;
+    display_class->get_screen = buffr_display_get_screen_vfunc;
 }
 
 /* Public constructor exposed to Rust. */
