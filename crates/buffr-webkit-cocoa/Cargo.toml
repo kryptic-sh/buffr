@@ -16,13 +16,21 @@ buffr-downloads.workspace = true
 buffr-engine.workspace = true
 buffr-history.workspace = true
 buffr-modal.workspace = true
+hjkl-clipboard.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSURLRequest", "NSError"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSURL",
+    "NSURLRequest",
+    "NSURLResponse",
+    "NSData",
+    "NSError",
+] }
 objc2-app-kit = { version = "0.3", features = [
     "NSEvent",
     "NSGraphicsContext",
@@ -48,8 +56,18 @@ objc2-web-kit = { version = "0.3", features = [
     "WKScriptMessageHandler",
     "WKUserContentController",
     "WKUserScript",
+    "WKDownload",
+    "WKDownloadDelegate",
     "block2",
 ] }
 objc2-core-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+] }
+ureq = { version = "3", features = ["json"] }
+url = "2"

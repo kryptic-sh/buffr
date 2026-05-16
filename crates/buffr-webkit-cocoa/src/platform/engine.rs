@@ -117,14 +117,24 @@ pub struct WebKitCocoaEngine {
     // ── Apps-layer sinks (available on all platforms) ──────────────────────────
     /// Shared history store. When `Some`, navigation completions record a visit.
     history: Option<Arc<buffr_history::History>>,
-    /// Shared downloads store. Stubbed — WKDownload wiring is Phase D.
-    #[allow(dead_code)]
+    /// Shared downloads store. Wired to the WKDownload delegate.
     downloads: Option<Arc<buffr_downloads::Downloads>>,
     /// Find-result sink. When `Some`, find completions push a `FindResult`.
     find_sink: Option<FindResultSink>,
     /// Popup URL queue — URLs intercepted by WKUIDelegate `createWebView` and
     /// rerouted to the apps layer as new-tab requests.
     popup_queue: PopupQueue,
+    // ── Cross-platform fields (compile on Linux for cargo check) ──────────────
+    /// System clipboard handle via `hjkl-clipboard`. `None` when init fails.
+    clipboard: Option<Arc<hjkl_clipboard::Clipboard>>,
+    /// Cached "any video/audio active?" flag.
+    /// Written by the media probe JS sentinel via WKScriptMessageHandler.
+    /// On macOS: Arc cloned from EngineState. On non-macOS: standalone Arc.
+    video_active: Arc<AtomicBool>,
+    /// One-slot mailbox for cursor changes.
+    /// Written by cursor JS sentinel via WKScriptMessageHandler.
+    /// On macOS: Arc cloned from EngineState. On non-macOS: standalone Arc.
+    cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
 }
 
 impl WebKitCocoaEngine {
@@ -167,13 +177,24 @@ impl WebKitCocoaEngine {
             .and_then(|any| any.downcast_ref::<FindResultSink>())
             .cloned();
 
+        // ── Cross-platform fields ──────────────────────────────────────────────
+        let clipboard: Option<Arc<hjkl_clipboard::Clipboard>> =
+            hjkl_clipboard::Clipboard::new().ok().map(Arc::new);
+
         #[cfg(target_os = "macos")]
         {
             let engine_state = Arc::new(Mutex::new(EngineState::new()));
 
             // Clone Arc handles from inside EngineState so the engine can
             // read/write these flags from any thread without locking the Mutex.
-            let (audio_active, loading_active, favicon_updates, osr_sleep) = engine_state
+            let (
+                audio_active,
+                loading_active,
+                favicon_updates,
+                osr_sleep,
+                video_active,
+                cursor_change,
+            ) = engine_state
                 .lock()
                 .map(|g| {
                     (
@@ -181,6 +202,8 @@ impl WebKitCocoaEngine {
                         Arc::clone(&g.loading_active),
                         Arc::clone(&g.favicon_updates),
                         Arc::clone(&g.osr_sleep),
+                        Arc::clone(&g.video_active),
+                        Arc::clone(&g.cursor_change),
                     )
                 })
                 .unwrap_or_else(|_| {
@@ -189,6 +212,8 @@ impl WebKitCocoaEngine {
                         Arc::new(AtomicBool::new(false)),
                         Arc::new(Mutex::new(Vec::new())),
                         Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(Mutex::new(None)),
                     )
                 });
 
@@ -240,6 +265,9 @@ impl WebKitCocoaEngine {
                 downloads: wk_downloads,
                 find_sink,
                 popup_queue,
+                clipboard,
+                video_active,
+                cursor_change,
             });
         }
 
@@ -258,6 +286,9 @@ impl WebKitCocoaEngine {
             downloads: wk_downloads,
             find_sink,
             popup_queue: new_popup_queue(),
+            clipboard,
+            video_active: Arc::new(AtomicBool::new(false)),
+            cursor_change: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -708,18 +739,52 @@ impl BrowserEngine for WebKitCocoaEngine {
         let _ = self.run_js(&buffr_engine::media_js::copy_image_url(url));
     }
 
-    // ── Clipboard (Gap 6) ────────────────────────────────────────────────────
+    // ── Clipboard (Gap 1) ─────────────────────────────────────────────────────
     //
-    // NSPasteboard must be called on the macOS main thread.  `clipboard_text`
-    // dispatches a `ClipboardRead` command to the worker which round-trips
-    // through the GCD main queue and waits for a reply.
+    // Three-pronged implementation:
     //
-    // `clipboard_set_text` is fire-and-forget: the write command is dispatched
-    // and we return immediately without confirmation.
+    // 1. `clipboard_handle` — returns an `Arc<dyn ClipboardRead>` backed by
+    //    `hjkl_clipboard::Clipboard`. Safe to call from any thread; the handle
+    //    can be cloned into worker threads to avoid the Wayland self-deadlock.
     //
-    // Both methods are no-ops on non-macOS targets (stub compile path).
+    // 2. `clipboard_text` — reads via hjkl-clipboard (any thread).
+    //    Falls back to the NSPasteboard round-trip via the worker on macOS when
+    //    hjkl-clipboard is not available.
+    //
+    // 3. `clipboard_set_text` — writes via hjkl-clipboard (any thread).
+    //    Falls back to the NSPasteboard worker dispatch on macOS.
+
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        let cb = self.clipboard.clone()?;
+        Some(Arc::new(WkClipboardReader(cb)))
+    }
 
     fn clipboard_text(&self) -> Option<String> {
+        // Prefer hjkl-clipboard (works on any thread, macOS + Linux).
+        if let Some(cb) = self.clipboard.as_ref() {
+            use hjkl_clipboard::{MimeType, Selection};
+            match cb.get(Selection::Clipboard, MimeType::Text) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) if !s.is_empty() => return Some(s),
+                    Ok(_) => return None,
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            "webkit-cocoa: clipboard_text non-utf8"
+                        );
+                        return None;
+                    }
+                },
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "webkit-cocoa: clipboard_text hjkl-clipboard read failed; falling back"
+                    );
+                }
+            }
+        }
+
+        // Fallback: NSPasteboard via main-queue worker (macOS only).
         #[cfg(target_os = "macos")]
         return self
             .worker
@@ -732,6 +797,21 @@ impl BrowserEngine for WebKitCocoaEngine {
 
     fn clipboard_set_text(&self, text: &str) -> bool {
         tracing::debug!("webkit-cocoa: clipboard_set_text ({} bytes)", text.len());
+        // Prefer hjkl-clipboard (works on any thread).
+        if let Some(cb) = self.clipboard.as_ref() {
+            use hjkl_clipboard::{MimeType, Selection};
+            match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+                Ok(()) => return true,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "webkit-cocoa: clipboard_set_text hjkl-clipboard failed; falling back"
+                    );
+                }
+            }
+        }
+
+        // Fallback: NSPasteboard via main-queue worker (macOS only).
         #[cfg(target_os = "macos")]
         {
             self.worker.send(Command::ClipboardWrite {
@@ -777,10 +857,12 @@ impl BrowserEngine for WebKitCocoaEngine {
         self.worker.send(Command::SetZoom(1.0));
     }
 
-    // ── Favicon (Gap 1) ──────────────────────────────────────────────────────
+    // ── Favicon (Gap 3) ──────────────────────────────────────────────────────
     //
-    // Navigation-completion sentinel using the `<url>/favicon.ico` heuristic.
-    // Pixel data is empty; a future phase will perform an async URLSession fetch.
+    // The navigation delegate in runtime.rs spawns a background thread to fetch
+    // and decode `<page_origin>/favicon.ico` on each `didFinishNavigation` event.
+    // The decoded `FaviconUpdate` is pushed directly into `favicon_updates`.
+    // This method simply drains whatever is ready.
 
     fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
         #[cfg(target_os = "macos")]
@@ -790,14 +872,22 @@ impl BrowserEngine for WebKitCocoaEngine {
         Vec::new()
     }
 
-    // ── Cursor (Gap 2 — Stubbed) ──────────────────────────────────────────────
+    // ── Cursor (Gap 2) ────────────────────────────────────────────────────────
     //
-    // WKWebView does not expose cursor-change notifications via a public API.
-    // TODO(phase-d): investigate KVO on WKWebView._cursorType or
-    // NSCursorPopUpButton to surface cursor state.
+    // A WKUserScript injected at document-start (CURSOR_LISTENER_JS) fires
+    // `window.webkit.messageHandlers.__buffr.postMessage('__buffr_cursor__:' + css)`
+    // on every mousemove where the computed cursor changes.
+    //
+    // The `BuffrSentinelMessageHandler` in runtime.rs writes `(0, raw_kind)`
+    // into `cursor_change` (shared via `EngineState`).
+    //
+    // `take_cursor_change` drains the one-slot mailbox.
 
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
-        None
+        self.cursor_change
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 
     // ── DevTools ─────────────────────────────────────────────────────────────
@@ -816,7 +906,23 @@ impl BrowserEngine for WebKitCocoaEngine {
     }
 
     fn any_video_active(&self) -> bool {
-        false
+        self.video_active.load(Ordering::Relaxed)
+    }
+
+    // ── Media probe (Gap 4) ───────────────────────────────────────────────────
+    //
+    // Evaluates JS that checks for active media elements and emits
+    // `__buffr_media__:true/false` via the WKScriptMessageHandler sentinel.
+    // The handler in runtime.rs writes to `video_active` (shared via EngineState).
+
+    fn run_media_probe(&self) {
+        let js = "(() => { \
+            const active = Array.from(document.querySelectorAll('video,audio'))\
+              .some(el => !el.paused && !el.ended && el.currentTime > 0); \
+            try { window.webkit.messageHandlers.__buffr.postMessage('__buffr_media__:' + active); } \
+            catch(e) {} \
+        })();";
+        let _ = self.run_js(js);
     }
 
     // ── Popup ────────────────────────────────────────────────────────────────
@@ -1206,6 +1312,31 @@ impl WebKitCocoaEngine {
         );
     }
 }
+
+// ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
+
+/// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
+/// `ClipboardRead` trait. Identical in structure to `buffr-cef`'s and
+/// `buffr-firefox-cdp`'s clipboard readers.
+struct WkClipboardReader(Arc<hjkl_clipboard::Clipboard>);
+
+impl buffr_engine::ClipboardRead for WkClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        match self.0.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "webkit-cocoa: WkClipboardReader::read_text failed"
+                );
+                None
+            }
+        }
+    }
+}
+
+// ── History / loading controls ────────────────────────────────────────────────
 
 /// History / loading controls — NOT on the `BrowserEngine` trait.
 ///

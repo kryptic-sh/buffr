@@ -83,22 +83,25 @@
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
     use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
-    use objc2_foundation::{NSError, NSString, NSURL, NSURLRequest};
+    use objc2_foundation::{NSData, NSError, NSString, NSURL, NSURLRequest, NSURLResponse};
     use objc2_web_kit::{
-        WKNavigation, WKNavigationAction, WKNavigationDelegate, WKScriptMessage,
-        WKScriptMessageHandler, WKUIDelegate, WKUserContentController, WKUserScript,
-        WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
+        WKDownload, WKDownloadDelegate, WKNavigation, WKNavigationAction, WKNavigationDelegate,
+        WKScriptMessage, WKScriptMessageHandler, WKUIDelegate, WKUserContentController,
+        WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
+        WKWindowFeatures,
     };
 
     use buffr_core::hint::{HintEventSink, parse_console_event};
     use buffr_engine::popup::PopupQueue;
-    use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
+    use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId};
     use buffr_history::Transition as HistoryTransition;
 
     use super::super::error::WebKitCocoaError;
@@ -123,6 +126,22 @@ pub(crate) mod macos {
   };
 })();"#;
 
+    // ── Cursor-change listener JS injected at document start ──────────────────
+    //
+    // Fires `window.webkit.messageHandlers.__buffr.postMessage('__buffr_cursor__:' + css)`
+    // on every mousemove where the computed cursor CSS value changes.
+    // The `__buffr` handler is registered as `BuffrSentinelMessageHandler`.
+    const CURSOR_LISTENER_JS: &str = r#"(function() {
+  var __buffr_last_cursor = null;
+  document.addEventListener('mousemove', function(e) {
+    var c = getComputedStyle(e.target).cursor;
+    if (c !== __buffr_last_cursor) {
+      __buffr_last_cursor = c;
+      try { window.webkit.messageHandlers.__buffr.postMessage('__buffr_cursor__:' + c); } catch(ex) {}
+    }
+  }, true);
+})();"#;
+
     // ── TabEntry ──────────────────────────────────────────────────────────────
 
     /// One open tab: owns the WKWebView and its delegates.
@@ -141,6 +160,9 @@ pub(crate) mod macos {
         /// Hint script-message handler — kept alive by strong ref here.
         /// `WKUserContentController` holds only a weak ref internally.
         _hint_handler: Retained<BuffrHintMessageHandler>,
+        /// Sentinel message handler for `__buffr_cursor__:` and `__buffr_media__:`.
+        /// Registered as `window.webkit.messageHandlers.__buffr`.
+        _sentinel_handler: Retained<BuffrSentinelMessageHandler>,
         pub url: String,
         pub title: String,
         pub is_loading: bool,
@@ -206,7 +228,15 @@ pub(crate) mod macos {
             //   objc2-web-kit-0.3.2/src/generated/WKUserContentController.rs:44-50.
             // WKUserContentController::addScriptMessageHandler_name confirmed:
             //   objc2-web-kit-0.3.2/src/generated/WKUserContentController.rs:130-145.
+            // Clone cursor_change and video_active from EngineState for the sentinel handler.
+            let (cursor_change, video_active) = state
+                .lock()
+                .map(|g| (Arc::clone(&g.cursor_change), Arc::clone(&g.video_active)))
+                .unwrap_or_else(|_| (Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false))));
+
             let hint_handler = BuffrHintMessageHandler::new(mtm, hint_sink);
+            let sentinel_handler =
+                BuffrSentinelMessageHandler::new(mtm, cursor_change, video_active);
             unsafe {
                 let ucm = config.userContentController();
 
@@ -222,6 +252,16 @@ pub(crate) mod macos {
                 );
                 ucm.addUserScript(&bridge_script);
 
+                // Inject the cursor-change listener at document start, all frames.
+                let ns_cursor = NSString::from_str(CURSOR_LISTENER_JS);
+                let cursor_script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
+                    WKUserScript::alloc(mtm),
+                    &ns_cursor,
+                    WKUserScriptInjectionTime::AtDocumentStart,
+                    false, // inject into all frames
+                );
+                ucm.addUserScript(&cursor_script);
+
                 // Register the native message handler for "buffrHint".
                 // addScriptMessageHandler_name adds
                 //   window.webkit.messageHandlers.buffrHint.postMessage to all frames.
@@ -229,6 +269,14 @@ pub(crate) mod macos {
                 ucm.addScriptMessageHandler_name(
                     ProtocolObject::from_ref(&*hint_handler),
                     &handler_name,
+                );
+
+                // Register the sentinel message handler for "__buffr".
+                // Receives `__buffr_cursor__:<css>` and `__buffr_media__:<bool>`.
+                let sentinel_name = NSString::from_str("__buffr");
+                ucm.addScriptMessageHandler_name(
+                    ProtocolObject::from_ref(&*sentinel_handler),
+                    &sentinel_name,
                 );
             }
 
@@ -290,6 +338,7 @@ pub(crate) mod macos {
                 _nav_delegate: nav_delegate,
                 _ui_delegate: ui_delegate,
                 _hint_handler: hint_handler,
+                _sentinel_handler: sentinel_handler,
                 url: url.to_owned(),
                 title: String::new(),
                 is_loading: true,
@@ -558,23 +607,32 @@ pub(crate) mod macos {
                     }
                     st.sync_loading_active();
 
-                    // ── Favicon heuristic ────────────────────────────────────────
-                    // WKWebView does not expose a public favicon API. We push a
-                    // navigation-completion sentinel using the `/favicon.ico`
-                    // convention.  Pixel data is intentionally left empty
-                    // (width=0, height=0, pixels=[]) — the apps layer can use the
-                    // tab URL to initiate a separate fetch if desired.
-                    //
-                    // TODO(phase-d): perform an async URLSession fetch of
-                    //   `<url_origin>/favicon.ico`, decode to BGRA, and push a
-                    //   FaviconUpdate with real pixel data.
-                    if let Ok(mut fav) = st.favicon_updates.lock() {
-                        fav.push(buffr_engine::FaviconUpdate {
-                            browser_id: tab_id.0 as i32,
-                            width: 0,
-                            height: 0,
-                            pixels: Vec::new(),
-                        });
+                    // ── Favicon fetch ────────────────────────────────────────────
+                    // WKWebView does not expose a public favicon API. We construct
+                    // the heuristic URL `<origin>/favicon.ico` from the page URL,
+                    // then spawn a background thread to fetch and decode it.
+                    // The decoded FaviconUpdate is pushed into `favicon_updates`
+                    // so the next `drain_favicon_updates` call delivers real pixels.
+                    {
+                        let favicon_sink = Arc::clone(&st.favicon_updates);
+                        let browser_id = tab_id.0 as i32;
+                        // Build `<scheme>://<host>/favicon.ico` from the page URL.
+                        let favicon_url: Option<String> = (|| {
+                            let parsed = url::Url::parse(&url).ok()?;
+                            let mut u = parsed;
+                            u.set_path("/favicon.ico");
+                            u.set_query(None);
+                            u.set_fragment(None);
+                            Some(u.to_string())
+                        })();
+                        if let Some(fav_url) = favicon_url {
+                            thread::Builder::new()
+                                .name("buffr-favicon-fetch".to_owned())
+                                .spawn(move || {
+                                    fetch_and_push_favicon(&fav_url, browser_id, &favicon_sink);
+                                })
+                                .ok();
+                        }
                     }
 
                     // ── History recording ────────────────────────────────────────
@@ -877,6 +935,177 @@ pub(crate) mod macos {
         fn new(mtm: MainThreadMarker, sink: HintEventSink) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(HintMsgHandlerIvars { sink });
             unsafe { objc2::msg_send![super(this), init] }
+        }
+    }
+
+    // ── BuffrSentinelMessageHandler ───────────────────────────────────────────
+    //
+    // Receives `__buffr_cursor__:<css>` and `__buffr_media__:<bool>` messages
+    // from JS posted via `window.webkit.messageHandlers.__buffr.postMessage(...)`.
+    //
+    // Cursor messages → `css_cursor_to_cef_raw` → write into `cursor_change`.
+    // Media messages  → parse "true"/"false" → store in `video_active` AtomicBool.
+
+    /// Ivars stored inside `BuffrSentinelMessageHandler`.
+    pub struct SentinelMsgHandlerIvars {
+        cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
+        video_active: Arc<AtomicBool>,
+    }
+
+    define_class!(
+        /// Script-message handler for `__buffr_cursor__:` and `__buffr_media__:` sentinels.
+        ///
+        /// Registered as `window.webkit.messageHandlers.__buffr` on every tab's UCM.
+        /// MainThreadOnly because WKScriptMessageHandler callbacks arrive on the main
+        /// thread and WKScriptMessage is MainThreadOnly.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = SentinelMsgHandlerIvars]
+        #[name = "BuffrSentinelMessageHandler"]
+        pub struct BuffrSentinelMessageHandler;
+
+        unsafe impl NSObjectProtocol for BuffrSentinelMessageHandler {}
+
+        /// WKScriptMessageHandler — receive JS→native sentinel messages.
+        unsafe impl WKScriptMessageHandler for BuffrSentinelMessageHandler {
+            #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+            #[allow(non_snake_case)]
+            unsafe fn userContentController_didReceiveScriptMessage(
+                &self,
+                _controller: &WKUserContentController,
+                message: &WKScriptMessage,
+            ) {
+                use objc2::msg_send;
+
+                let body: Retained<AnyObject> = unsafe { message.body() };
+                let is_string: bool =
+                    unsafe { msg_send![&*body, isKindOfClass: NSString::class()] };
+                if !is_string {
+                    return;
+                }
+                let ns_str: Retained<NSString> = unsafe { Retained::cast_unchecked(body) };
+                let raw = ns_str.to_string();
+
+                if let Some(rest) = raw.strip_prefix("__buffr_cursor__:") {
+                    let raw_kind = css_cursor_to_cef_raw(rest.trim());
+                    // browser_id=0 — cocoa backend does not expose CEF browser IDs.
+                    if let Ok(mut guard) = self.ivars().cursor_change.lock() {
+                        *guard = Some((0_i32, raw_kind));
+                    }
+                    tracing::debug!(css = rest.trim(), raw_kind, "webkit-cocoa: cursor change");
+                } else if let Some(rest) = raw.strip_prefix("__buffr_media__:") {
+                    let active = rest.trim() == "true";
+                    self.ivars().video_active.store(active, Ordering::Relaxed);
+                    tracing::debug!(active, "webkit-cocoa: video_active updated");
+                } else {
+                    tracing::debug!(
+                        raw = raw.as_str(),
+                        "webkit-cocoa: __buffr unknown sentinel (ignored)"
+                    );
+                }
+            }
+        }
+    );
+
+    impl BuffrSentinelMessageHandler {
+        fn new(
+            mtm: MainThreadMarker,
+            cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
+            video_active: Arc<AtomicBool>,
+        ) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(SentinelMsgHandlerIvars {
+                cursor_change,
+                video_active,
+            });
+            unsafe { objc2::msg_send![super(this), init] }
+        }
+    }
+
+    // ── CSS cursor name → CEF raw cursor kind ─────────────────────────────────
+    //
+    // Mapping mirrors the task spec:
+    //   text→1, pointer→28, default→0, wait→13, crosshair→6, move→9,
+    //   not-allowed→12, grab→34, grabbing→35, help→8, _→0.
+    //
+    // CEF raw cursor constants are defined in `cef_cursor_type_t` (cef_types.h).
+
+    fn css_cursor_to_cef_raw(name: &str) -> u32 {
+        match name {
+            "text" | "vertical-text" => 1,
+            "pointer" => 28,
+            "wait" | "progress" => 13,
+            "crosshair" => 6,
+            "move" | "all-scroll" => 9,
+            "not-allowed" | "no-drop" => 12,
+            "grab" => 34,
+            "grabbing" => 35,
+            "help" => 8,
+            "default" | "auto" | "" => 0,
+            _ => 0,
+        }
+    }
+
+    // ── Favicon pixel fetch ───────────────────────────────────────────────────
+    //
+    // Called from a dedicated background thread spawned on `didFinishNavigation`.
+    // Issues a blocking HTTP GET for the favicon URL, decodes the image via the
+    // `image` crate, converts pixels to BGRA u32, and pushes a `FaviconUpdate`
+    // into `favicon_updates` so `drain_favicon_updates` delivers real pixels.
+    //
+    // On any error (network, decode, lock-poison) the function logs at debug
+    // level and returns without pushing anything — the apps layer will fall back
+    // to its default icon.
+
+    fn fetch_and_push_favicon(
+        url: &str,
+        browser_id: i32,
+        favicon_updates: &Arc<Mutex<Vec<FaviconUpdate>>>,
+    ) {
+        let bytes = match ureq::get(url).call() {
+            Ok(resp) => match resp.into_body().read_to_vec() {
+                Ok(buf) => buf,
+                Err(err) => {
+                    tracing::debug!(url, error = %err, "webkit-cocoa favicon: body read failed");
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::debug!(url, error = %err, "webkit-cocoa favicon: fetch failed");
+                return;
+            }
+        };
+
+        // Decode the image and convert to RGBA u32 pixels packed as 0xAARRGGBB.
+        let img = match image::load_from_memory(&bytes) {
+            Ok(img) => img.into_rgba8(),
+            Err(err) => {
+                tracing::debug!(url, error = %err, "webkit-cocoa favicon: decode failed");
+                return;
+            }
+        };
+
+        let width = img.width();
+        let height = img.height();
+        // Pack RGBA bytes as `0xAARRGGBB` u32 (matching CEF/firefox-cdp favicon layout).
+        let pixels: Vec<u32> = img
+            .chunks_exact(4)
+            .map(|c| {
+                let r = c[0] as u32;
+                let g = c[1] as u32;
+                let b = c[2] as u32;
+                let a = c[3] as u32;
+                (a << 24) | (r << 16) | (g << 8) | b
+            })
+            .collect();
+
+        if let Ok(mut guard) = favicon_updates.lock() {
+            guard.push(FaviconUpdate {
+                browser_id,
+                width,
+                height,
+                pixels,
+            });
+            tracing::debug!(url, width, height, "webkit-cocoa favicon: pushed update");
         }
     }
 

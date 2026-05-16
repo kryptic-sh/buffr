@@ -982,6 +982,8 @@ dependencies = [
  "buffr-history",
  "buffr-modal",
  "dispatch2",
+ "hjkl-clipboard",
+ "image",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -990,6 +992,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1019,10 +1023,12 @@ dependencies = [
  "buffr-engine",
  "buffr-history",
  "buffr-modal",
+ "hjkl-clipboard",
  "image",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "ureq",
  "webview2-com",
  "webview2-com-sys",
  "windows",

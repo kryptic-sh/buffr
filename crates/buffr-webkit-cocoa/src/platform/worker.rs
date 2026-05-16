@@ -96,6 +96,16 @@ pub(crate) mod macos {
         /// reduce CPU usage while the tab is backgrounded.  Set by
         /// `BrowserEngine::osr_sleep`; read by the recurring tick functions.
         pub osr_sleep: Arc<AtomicBool>,
+        /// Cached "any video/audio active?" flag.
+        ///
+        /// Written by the WKScriptMessageHandler when the JS media probe emits
+        /// `__buffr_media__:true/false`; read lock-free by `any_video_active`.
+        pub video_active: Arc<AtomicBool>,
+        /// One-slot mailbox for cursor changes.
+        ///
+        /// Written by the WKScriptMessageHandler when the JS cursor listener
+        /// emits `__buffr_cursor__:<css>`. Drained by `take_cursor_change`.
+        pub cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
         /// Shared browsing-history store. When `Some`, the navigation delegate
         /// calls [`buffr_history::History::record_visit`] on each
         /// `didFinishNavigation` callback.
@@ -117,6 +127,8 @@ pub(crate) mod macos {
                 loading_active: Arc::new(AtomicBool::new(false)),
                 favicon_updates: Arc::new(Mutex::new(Vec::new())),
                 osr_sleep: Arc::new(AtomicBool::new(false)),
+                video_active: Arc::new(AtomicBool::new(false)),
+                cursor_change: Arc::new(Mutex::new(None)),
                 history: None,
                 find_sink: None,
                 popup_queue: buffr_engine::popup::new_popup_queue(),
