@@ -41,6 +41,20 @@ use super::input_js::{
 use super::osr::{paint_blank, request_snapshot};
 use super::runtime::{OsrHandles, TabEntry, TabSinks};
 
+// ── Closed-tab undo stack ─────────────────────────────────────────────────────
+
+/// One entry on the closed-tab undo stack.
+///
+/// Mirrors the firefox-cdp pattern: URL-only restoration is sufficient for
+/// WebKitGTK (the WebView is dropped on close, so history is not preserved).
+/// `reopen_closed_tab` creates a fresh WebView at `url` inserted back at
+/// `original_idx` (clamped to the current strip length).
+#[derive(Debug, Clone)]
+pub(crate) struct ClosedEntry {
+    pub url: String,
+    pub original_idx: usize,
+}
+
 // ── EngineState (thread-safe snapshot) ────────────────────────────────────────
 
 /// Thread-safe tab snapshot. Updated by GTK signal handlers; read from any
@@ -56,6 +70,9 @@ pub(crate) struct EngineState {
     pub width: u32,
     /// Current viewport height (pixels).
     pub height: u32,
+    /// Length of the GTK-thread closed-tab stack, mirrored here so
+    /// `BrowserEngine::closed_stack_len` can read it without a GTK round-trip.
+    pub closed_stack_len: usize,
     /// Cached result of the 500 ms audio-activity poll.
     ///
     /// Written by `glib::timeout_add_local` on the GTK thread; read from any
@@ -105,6 +122,7 @@ impl EngineState {
             next_id: 1,
             width,
             height,
+            closed_stack_len: 0,
             audio_active: Arc::new(AtomicBool::new(false)),
             video_active: Arc::new(AtomicBool::new(false)),
             loading_active: Arc::new(AtomicBool::new(false)),
@@ -175,9 +193,28 @@ pub(crate) enum Command {
         url: String,
         reply: mpsc::SyncSender<Result<TabId, WebKitGtkError>>,
     },
+    /// Open a new tab at a specific strip position.
+    OpenTabAt {
+        url: String,
+        insert_idx: usize,
+        reply: mpsc::SyncSender<Result<TabId, WebKitGtkError>>,
+    },
     CloseTab {
         id: TabId,
         reply: mpsc::SyncSender<Result<bool, WebKitGtkError>>,
+    },
+    /// Move the tab at `from` to position `to` in the strip.
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
+    /// Duplicate the active tab (open new tab with the same URL).
+    DuplicateActive {
+        reply: mpsc::SyncSender<Result<TabId, WebKitGtkError>>,
+    },
+    /// Pop the most recently closed tab off the undo stack and reopen it.
+    ReopenClosedTab {
+        reply: mpsc::SyncSender<Result<Option<TabId>, WebKitGtkError>>,
     },
     SelectTab {
         id: TabId,
@@ -323,6 +360,11 @@ impl WorkerHandle {
 struct GtkRuntime {
     tabs: Vec<TabEntry>,
     active_idx: Option<usize>,
+    /// Closed-tab undo stack. Most-recently-closed is last (pop = peek end).
+    ///
+    /// Pushed by `close_tab`; popped by `reopen_closed_tab`. URL-only: WebView
+    /// GObjects are dropped on close, so back/forward history is not preserved.
+    closed_stack: Vec<ClosedEntry>,
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
     engine_state: Arc<Mutex<EngineState>>,
@@ -370,6 +412,7 @@ impl GtkRuntime {
         GtkRuntime {
             tabs: Vec::new(),
             active_idx: None,
+            closed_stack: Vec::new(),
             frame,
             view,
             engine_state,
@@ -432,10 +475,27 @@ impl GtkRuntime {
         let idx = self
             .tab_index_by_id(id)
             .ok_or(WebKitGtkError::TabNotFound(id))?;
+        // Capture URL before dropping the WebView.
+        let closed_url = {
+            if let Ok(st) = self.engine_state.lock() {
+                st.tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.url.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
+        self.closed_stack.push(ClosedEntry {
+            url: closed_url,
+            original_idx: idx,
+        });
         self.tabs.remove(idx);
-        // Also remove from engine_state.tabs.
+        // Also remove from engine_state.tabs and mirror closed_stack_len.
         if let Ok(mut st) = self.engine_state.lock() {
             st.tabs.retain(|t| t.id != id);
+            st.closed_stack_len = self.closed_stack.len();
         }
         match self.active_idx {
             Some(a) if a == idx => {
@@ -476,6 +536,118 @@ impl GtkRuntime {
         });
         self.sync_active_idx();
         self.paint();
+    }
+
+    /// Open a new tab and insert it at `insert_idx` (clamped to strip end).
+    fn open_tab_at(&mut self, url: &str, insert_idx: usize) -> Result<TabId, WebKitGtkError> {
+        // Open appended, then reorder.
+        let id = self.open_tab(url)?;
+        let appended_idx = self.tabs.len() - 1;
+        let clamped = insert_idx.min(appended_idx);
+        if clamped != appended_idx {
+            // Reorder GtkRuntime.tabs.
+            let entry = self.tabs.remove(appended_idx);
+            self.tabs.insert(clamped, entry);
+            // Fix up active_idx: removal + re-insert shifts [clamped, appended_idx).
+            if let Some(a) = self.active_idx
+                && a >= clamped
+                && a < appended_idx
+            {
+                self.active_idx = Some(a + 1);
+            }
+            // Reorder engine_state mirror (TabInfo vec must match).
+            if let Ok(mut st) = self.engine_state.lock() {
+                let info_appended = st.tabs.len() - 1;
+                if clamped < info_appended {
+                    let info = st.tabs.remove(info_appended);
+                    st.tabs.insert(clamped, info);
+                }
+                st.active_idx = self.active_idx;
+            }
+            // Make the new tab active at the clamped position.
+            self.active_idx = Some(clamped);
+            self.sync_active_idx();
+            self.paint();
+        }
+        Ok(id)
+    }
+
+    /// Move the tab at `from` to position `to`. Clamps; same-pos is no-op.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let len = self.tabs.len();
+        if len == 0 || from == to || from >= len {
+            return;
+        }
+        let to = to.min(len - 1);
+        if to == from {
+            return;
+        }
+        // Move in GtkRuntime strip.
+        let entry = self.tabs.remove(from);
+        self.tabs.insert(to, entry);
+        // Mirror move in EngineState.
+        if let Ok(mut st) = self.engine_state.lock()
+            && from < st.tabs.len()
+        {
+            let info = st.tabs.remove(from);
+            let clamped_to = to.min(st.tabs.len());
+            st.tabs.insert(clamped_to, info);
+        }
+        // Fix up active_idx.
+        if let Some(a) = self.active_idx {
+            let new_a = if a == from {
+                to
+            } else if from < a && to >= a {
+                a - 1
+            } else if from > a && to <= a {
+                a + 1
+            } else {
+                a
+            };
+            self.active_idx = Some(new_a);
+            self.sync_active_idx();
+        }
+    }
+
+    /// Duplicate the active tab — opens a new tab with the same URL.
+    fn duplicate_active(&mut self) -> Result<TabId, WebKitGtkError> {
+        let url = if let Ok(st) = self.engine_state.lock() {
+            st.active_idx
+                .and_then(|i| st.tabs.get(i))
+                .map(|t| t.url.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let target = if url.is_empty() {
+            "about:blank".to_owned()
+        } else {
+            url
+        };
+        self.open_tab(&target)
+    }
+
+    /// Pop the most recently closed tab and reopen it at its original position.
+    ///
+    /// Returns `Ok(None)` when the stack is empty (caller no-ops silently).
+    /// URL-only restoration: a fresh WebView is created, back/forward history
+    /// is not preserved.
+    fn reopen_closed_tab(&mut self) -> Result<Option<TabId>, WebKitGtkError> {
+        let entry = match self.closed_stack.pop() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // Mirror updated length.
+        if let Ok(mut st) = self.engine_state.lock() {
+            st.closed_stack_len = self.closed_stack.len();
+        }
+        let url = if entry.url.is_empty() {
+            "about:blank".to_owned()
+        } else {
+            entry.url
+        };
+        let id = self.open_tab_at(&url, entry.original_idx)?;
+        Ok(Some(id))
     }
 
     fn navigate(&mut self, url: &str) -> Result<(), WebKitGtkError> {
@@ -652,8 +824,24 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
         Command::OpenTab { url, reply } => {
             let _ = reply.send(rt.open_tab(&url));
         }
+        Command::OpenTabAt {
+            url,
+            insert_idx,
+            reply,
+        } => {
+            let _ = reply.send(rt.open_tab_at(&url, insert_idx));
+        }
         Command::CloseTab { id, reply } => {
             let _ = reply.send(rt.close_tab(id));
+        }
+        Command::MoveTab { from, to } => {
+            rt.move_tab(from, to);
+        }
+        Command::DuplicateActive { reply } => {
+            let _ = reply.send(rt.duplicate_active());
+        }
+        Command::ReopenClosedTab { reply } => {
+            let _ = reply.send(rt.reopen_closed_tab());
         }
         Command::SelectTab { id } => {
             rt.select_tab(id);

@@ -299,9 +299,16 @@ impl BrowserEngine for WebKitGtkEngine {
         Ok(id)
     }
 
-    fn open_tab_at(&self, url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        tracing::debug!("webkitgtk: open_tab_at {url} (insert_idx ignored in Phase B)");
-        self.open_tab(url)
+    fn open_tab_at(&self, url: &str, insert_idx: usize) -> Result<TabId, EngineError> {
+        tracing::debug!("webkitgtk: open_tab_at {url} at {insert_idx}");
+        self.worker
+            .call(|reply| Command::OpenTabAt {
+                url: url.to_owned(),
+                insert_idx,
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
@@ -334,27 +341,32 @@ impl BrowserEngine for WebKitGtkEngine {
         self.worker.send(Command::CycleTab { forward: false });
     }
 
-    fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::debug!("webkitgtk: move_tab not implemented in Phase B");
+    fn move_tab(&self, from: usize, to: usize) {
+        tracing::debug!("webkitgtk: move_tab {from} → {to}");
+        self.worker.send(Command::MoveTab { from, to });
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "duplicate_active",
-        })
+        tracing::debug!("webkitgtk: duplicate_active");
+        self.worker
+            .call(|reply| Command::DuplicateActive { reply })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn toggle_pin_active(&self) {}
     fn set_pinned(&self, _id: TabId, _pinned: bool) {}
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "reopen_closed_tab",
-        })
+        tracing::debug!("webkitgtk: reopen_closed_tab");
+        self.worker
+            .call(|reply| Command::ReopenClosedTab { reply })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn closed_stack_len(&self) -> usize {
-        0
+        self.with_state(|st| st.closed_stack_len)
     }
 
     fn active_tab(&self) -> Option<TabSummary> {
