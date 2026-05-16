@@ -16,6 +16,7 @@ buffr-downloads.workspace = true
 buffr-engine.workspace = true
 buffr-history.workspace = true
 buffr-modal.workspace = true
+hjkl-clipboard.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

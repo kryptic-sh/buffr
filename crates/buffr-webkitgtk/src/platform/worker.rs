@@ -63,6 +63,11 @@ pub(crate) struct EngineState {
     /// sufficient — no synchronisation is required between the writer and the
     /// reader.
     pub audio_active: Arc<AtomicBool>,
+    /// Set by `run_media_probe` via the `buffrMedia` script-message handler
+    /// when the active tab has a playing `<video>` or `<audio>` element.
+    /// Written on the GTK thread (UCM signal); read lock-free from any thread
+    /// by `BrowserEngine::any_video_active`.
+    pub video_active: Arc<AtomicBool>,
     /// Cached loading state of the **active** tab.
     ///
     /// Written by the `load-changed` GTK signal whenever the active tab's
@@ -101,6 +106,7 @@ impl EngineState {
             width,
             height,
             audio_active: Arc::new(AtomicBool::new(false)),
+            video_active: Arc::new(AtomicBool::new(false)),
             loading_active: Arc::new(AtomicBool::new(false)),
             osr_sleeping: Arc::new(AtomicBool::new(false)),
             favicon_updates: Arc::new(Mutex::new(Vec::new())),
@@ -329,6 +335,9 @@ struct GtkRuntime {
     /// Forwarded from the engine so every new `WebView` can register the
     /// `buffrHint` script-message handler and write events into it.
     hint_sink: HintEventSink,
+    /// Cloned from `EngineState::video_active` so the `buffrMedia` UCM handler
+    /// can flip it without locking `EngineState`.
+    video_active: Arc<AtomicBool>,
     /// Apps-layer sinks forwarded to each new `TabEntry`.
     history: Option<Arc<History>>,
     /// Kept alive so the `NetworkSession::download-started` closure can
@@ -351,6 +360,7 @@ impl GtkRuntime {
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
         hint_sink: HintEventSink,
+        video_active: Arc<AtomicBool>,
         history: Option<Arc<History>>,
         downloads: Option<Arc<Downloads>>,
         notice_queue: Option<DownloadNoticeQueue>,
@@ -365,6 +375,7 @@ impl GtkRuntime {
             engine_state,
             snapshot_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             hint_sink,
+            video_active,
             history,
             downloads,
             notice_queue,
@@ -403,6 +414,7 @@ impl GtkRuntime {
                 snapshot_in_flight: std::rc::Rc::clone(&self.snapshot_in_flight),
             },
             Arc::clone(&self.hint_sink),
+            Arc::clone(&self.video_active),
             TabSinks {
                 history: self.history.clone(),
                 find_sink: self.find_sink.clone(),
@@ -920,6 +932,12 @@ pub(crate) fn spawn(
     let (tx, rx) = mpsc::sync_channel::<Command>(64);
     let initial_url = initial_url.to_owned();
 
+    // Clone video_active Arc before moving engine_state into the thread closure.
+    let worker_video_active = engine_state
+        .lock()
+        .map(|g| Arc::clone(&g.video_active))
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+
     thread::Builder::new()
         .name("buffr-webkitgtk-worker".into())
         .spawn(move || {
@@ -938,6 +956,7 @@ pub(crate) fn spawn(
                 Arc::clone(&view),
                 Arc::clone(&engine_state),
                 Arc::clone(&hint_sink),
+                worker_video_active,
                 history,
                 downloads.clone(),
                 notice_queue.clone(),

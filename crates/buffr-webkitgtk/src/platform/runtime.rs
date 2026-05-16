@@ -12,6 +12,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use webkit6::prelude::*;
@@ -39,6 +40,9 @@ const HINT_CONSOLE_BRIDGE_JS: &str = r#"
     var msg = arguments[0];
     if (typeof msg === 'string' && msg.indexOf('__buffr_hint__:') === 0) {
       try { window.webkit.messageHandlers.buffrHint.postMessage(msg); } catch(e) {}
+    }
+    if (typeof msg === 'string' && msg.indexOf('__buffr_media__:') === 0) {
+      try { window.webkit.messageHandlers.buffrMedia.postMessage(msg); } catch(e) {}
     }
   };
 })();
@@ -99,6 +103,7 @@ impl TabEntry {
         engine_state: Arc<Mutex<EngineState>>,
         osr: OsrHandles,
         hint_sink: HintEventSink,
+        video_active: Arc<AtomicBool>,
         sinks: TabSinks,
     ) -> Self {
         let history = sinks.history;
@@ -146,6 +151,22 @@ impl TabEntry {
                 None => {
                     tracing::debug!("webkitgtk: buffrHint message missing sentinel (ignored)");
                 }
+            }
+        });
+
+        // Register the `buffrMedia` native handler.
+        // The console.log bridge (above) forwards `__buffr_media__:true/false` here.
+        ucm.register_script_message_handler("buffrMedia", None);
+        let va_clone = Arc::clone(&video_active);
+        ucm.connect_script_message_received(Some("buffrMedia"), move |_ucm, js_value| {
+            let gstr = js_value.to_str();
+            let raw: &str = &gstr;
+            tracing::debug!(raw, "webkitgtk: buffrMedia message received");
+            // Sentinel format: `__buffr_media__:true` or `__buffr_media__:false`.
+            if let Some(rest) = raw.strip_prefix("__buffr_media__:") {
+                let active = rest.trim() == "true";
+                va_clone.store(active, Ordering::Relaxed);
+                tracing::debug!(active, "webkitgtk: video_active updated");
             }
         });
 

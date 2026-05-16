@@ -1003,6 +1003,7 @@ dependencies = [
  "buffr-modal",
  "glib",
  "gtk4",
+ "hjkl-clipboard",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",

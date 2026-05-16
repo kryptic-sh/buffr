@@ -85,6 +85,11 @@ pub struct WebKitGtkEngine {
     /// Cached "any tab playing audio?" flag.  Written by the 500 ms GTK-thread
     /// poll tick; read from any thread by `any_audio_active()`.
     audio_active: Arc<AtomicBool>,
+    /// Set by `run_media_probe` via the `buffrMedia` UCM handler when the active
+    /// tab has a playing `<video>` or `<audio>` element.
+    video_active: Arc<AtomicBool>,
+    /// System clipboard handle.  `None` when `hjkl_clipboard::Clipboard::new()` fails.
+    clipboard: Option<std::sync::Arc<hjkl_clipboard::Clipboard>>,
     /// Cached loading state of the **active** tab.
     ///
     /// Written by the `load-changed` GTK signal (via `EngineState::sync_loading_active`)
@@ -142,11 +147,12 @@ impl WebKitGtkEngine {
 
         // Clone Arc<AtomicBool>s from inside EngineState so the engine can
         // read these flags from any thread without locking the Mutex.
-        let (audio_active, loading_active, osr_sleeping) = engine_state
+        let (audio_active, video_active, loading_active, osr_sleeping) = engine_state
             .lock()
             .map(|g| {
                 (
                     Arc::clone(&g.audio_active),
+                    Arc::clone(&g.video_active),
                     Arc::clone(&g.loading_active),
                     Arc::clone(&g.osr_sleeping),
                 )
@@ -156,8 +162,14 @@ impl WebKitGtkEngine {
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
                 )
             });
+
+        let clipboard = hjkl_clipboard::Clipboard::new()
+            .map(std::sync::Arc::new)
+            .map_err(|e| tracing::debug!(error = %e, "webkitgtk: clipboard init failed"))
+            .ok();
 
         // ── Downcast apps-layer sinks from BackendOpenOptions ─────────────────
         let history: Option<Arc<History>> = options
@@ -216,6 +228,7 @@ impl WebKitGtkEngine {
             worker,
             engine_state,
             audio_active,
+            video_active,
             loading_active,
             osr_sleeping,
             find_query: std::sync::Mutex::new(None),
@@ -227,6 +240,7 @@ impl WebKitGtkEngine {
             notice_queue,
             find_sink,
             popup_queue,
+            clipboard,
         })
     }
 
@@ -657,7 +671,20 @@ impl BrowserEngine for WebKitGtkEngine {
     }
 
     fn any_video_active(&self) -> bool {
-        false
+        self.video_active.load(Ordering::Relaxed)
+    }
+
+    fn run_media_probe(&self) {
+        // Evaluate JS that checks for active media elements and emits
+        // `__buffr_media__:true/false` via console.log.  The console.log
+        // bridge in runtime.rs forwards messages with that prefix to the
+        // `buffrMedia` UCM handler, which flips `video_active`.
+        let js = "(() => { \
+            const active = Array.from(document.querySelectorAll('video,audio'))\
+              .some(el => !el.paused && !el.ended && el.currentTime > 0); \
+            console.log('__buffr_media__:' + active); \
+        })();";
+        let _ = self.run_js(js);
     }
 
     // ── Popup ────────────────────────────────────────────────────────────────
@@ -893,25 +920,48 @@ impl BrowserEngine for WebKitGtkEngine {
     }
 
     // ── Clipboard (Gap 4) ─────────────────────────────────────────────────────
+    //
+    // Uses `hjkl-clipboard` for blocking synchronous reads and writes from any
+    // thread.  Falls back to the GDK4 worker path for `clipboard_set_text` when
+    // hjkl-clipboard is unavailable so the GTK display clipboard stays in sync.
 
-    /// Read the current clipboard contents as UTF-8 text.
-    ///
-    /// GDK4 clipboard reads are async — there is no synchronous API available
-    /// on the GTK thread without running a nested main loop. Returning `None`
-    /// here matches the trait default. Use `clipboard_handle()` on a worker
-    /// thread if a blocking read is required in a future phase.
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        let cb = self.clipboard.clone()?;
+        let reader = WkClipboardReader(cb);
+        Some(std::sync::Arc::new(reader))
+    }
+
     fn clipboard_text(&self) -> Option<String> {
-        // TODO(phase-d): implement via a Command + GDK4 read_text_async with a
-        // local GLib main loop spin to collect the result synchronously off the
-        // GTK thread.
-        None
+        use hjkl_clipboard::{MimeType, Selection};
+        let cb = self.clipboard.as_ref()?;
+        match cb.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::debug!(error = %err, "webkitgtk: clipboard_text non-utf8");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!(error = %err, "webkitgtk: clipboard_text read failed");
+                None
+            }
+        }
     }
 
     fn clipboard_set_text(&self, text: &str) -> bool {
         tracing::debug!("webkitgtk: clipboard_set_text ({} bytes)", text.len());
-        // GDK4 `Clipboard::set_text` is synchronous and fire-and-forget.
-        // We forward to the GTK thread (where GDK Display is valid) via the
-        // Command channel. No reply needed — the write either succeeds or logs.
+        use hjkl_clipboard::{MimeType, Selection};
+        if let Some(cb) = self.clipboard.as_ref() {
+            match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+                Ok(()) => return true,
+                Err(err) => {
+                    tracing::warn!(error = %err, "webkitgtk: clipboard_set_text hjkl write failed, falling back to GDK4");
+                }
+            }
+        }
+        // Fallback: forward to the GTK thread where GDK Display is valid.
         self.worker.send(Command::ClipboardSetText {
             text: text.to_owned(),
         });
@@ -1106,6 +1156,26 @@ impl BrowserEngine for WebKitGtkEngine {
                     action = ?other,
                     "webkitgtk: dispatch — action not handled by this backend (no-op)"
                 );
+            }
+        }
+    }
+}
+
+// ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
+
+/// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
+/// `ClipboardRead` trait.  Mirrors the pattern used by `buffr-firefox-cdp` and
+/// `buffr-cef`.
+struct WkClipboardReader(std::sync::Arc<hjkl_clipboard::Clipboard>);
+
+impl buffr_engine::ClipboardRead for WkClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        match self.0.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+            Err(err) => {
+                tracing::debug!(error = %err, "webkitgtk: WkClipboardReader::read_text failed");
+                None
             }
         }
     }
