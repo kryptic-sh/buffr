@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
-    NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
+    SharedOsrViewState, TabId, TabSummary,
     engine_id::EngineId,
+    newtab::{default_newtab_html, default_settings_html, translate_internal_url},
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
         new_popup_queue,
@@ -40,6 +42,10 @@ pub struct WebKitEngine {
     popup_close_sink: PopupCloseSink,
     /// Current live URL (updated via `pump_address_changes`).
     live_url: Mutex<String>,
+    /// `buffr://new` HTML provider. Wired by buffr-app at registration so
+    /// the page reflects current keybinds / palette / splash art. None
+    /// falls back to the raw template via [`default_newtab_html`].
+    newtab_html_provider: Mutex<Option<NewTabHtmlProvider>>,
 }
 
 impl WebKitEngine {
@@ -81,7 +87,30 @@ impl WebKitEngine {
             popup_create_sink: new_popup_create_sink(),
             popup_close_sink: new_popup_close_sink(),
             live_url: Mutex::new(String::new()),
+            newtab_html_provider: Mutex::new(None),
         })
+    }
+
+    /// Wire the host-side `buffr://new` HTML provider so future buffr:// loads
+    /// pick up live keybind / palette / splash content. Safe to call multiple
+    /// times — overrides the previous provider.
+    pub fn set_newtab_html_provider(&self, provider: NewTabHtmlProvider) {
+        if let Ok(mut guard) = self.newtab_html_provider.lock() {
+            *guard = Some(provider);
+        }
+    }
+
+    /// Translate a `buffr://` URL to a data: URL the engine can load.
+    /// Returns the input untouched for non-internal URLs.
+    fn resolve_url(&self, url: &str) -> String {
+        let newtab = || {
+            self.newtab_html_provider
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|p| p()))
+                .unwrap_or_else(default_newtab_html)
+        };
+        translate_internal_url(url, newtab, default_settings_html).unwrap_or_else(|| url.to_owned())
     }
 
     /// Send a fire-and-forget command to the worker thread.
@@ -95,7 +124,7 @@ impl WebKitEngine {
     fn open_tab_sync(&self, url: &str) -> Result<TabId, EngineError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.send(Command::OpenTab {
-            url: url.to_owned(),
+            url: self.resolve_url(url),
             reply: reply_tx,
         });
         reply_rx
@@ -206,7 +235,7 @@ impl BrowserEngine for WebKitEngine {
 
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
         self.send(Command::Navigate {
-            url: url.to_owned(),
+            url: self.resolve_url(url),
         });
         Ok(())
     }

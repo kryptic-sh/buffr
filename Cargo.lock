@@ -884,6 +884,7 @@ dependencies = [
 name = "buffr-engine"
 version = "0.1.4"
 dependencies = [
+ "base64",
  "buffr-modal",
  "buffr-permissions",
  "serde",

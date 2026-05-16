@@ -7533,6 +7533,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             );
                             buffr_engine::BrowserEngine::set_frame_rate(&engine, display_hz);
                             buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
+                            // Wire the buffr://new HTML provider so the page reflects
+                            // current keybinds / palette without a binary rebuild.
+                            let engine_for_newtab = Arc::clone(&self.engine);
+                            engine.set_newtab_html_provider(Arc::new(move || {
+                                render_new_tab_html(&engine_for_newtab)
+                            }));
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
                             let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
                             router_builder =
