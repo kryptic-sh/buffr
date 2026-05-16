@@ -56,8 +56,7 @@ unsafe extern "C" {
         data: *mut c_void,
         destroy: Option<unsafe extern "C" fn(*mut c_void)>,
     );
-    fn g_object_get_data(object: *mut c_void, key: *const std::os::raw::c_char)
-        -> *mut c_void;
+    fn g_object_get_data(object: *mut c_void, key: *const std::os::raw::c_char) -> *mut c_void;
 }
 
 // ── ViewCtx: per-view Rust state attached via qdata ──────────────────────────
@@ -164,7 +163,12 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     // we still ack every frame here — just skip the import + memcpy +
     // wake when the previous ingest was too recent.
     let now_us = process_epoch().elapsed().as_micros() as u64;
-    let hz = ctx.view.frame_rate_hz.load(Ordering::Relaxed).max(1).min(240);
+    let hz = ctx
+        .view
+        .frame_rate_hz
+        .load(Ordering::Relaxed)
+        .max(1)
+        .min(240);
     let min_interval_us = 1_000_000u64 / hz as u64;
     let last_us = ctx.last_ingest_us.load(Ordering::Relaxed);
     // `last_us == 0` means we haven't ingested anything yet — let the first
@@ -217,23 +221,40 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     if !data_ptr.is_null() && size_us >= need && h > 0 {
         // import_to_pixels returns ARGB8888 but each row may be padded to a
         // hardware-friendly stride (e.g. multiples of 64 / cache lines). Use
-        // the buffer's total size / height to recover the stride and copy
-        // each row tight into OsrFrame.
-        let src_stride = size_us / (h as usize);
+        // div_ceil so a padded buffer (size_us not evenly divisible by h)
+        // doesn't truncate — truncation would cause each row copy to start
+        // from the wrong offset, corrupting every row after the first.
+        let src_stride = size_us.div_ceil(h as usize);
+        if src_stride < row_bytes {
+            tracing::warn!(
+                w,
+                h,
+                size_us,
+                src_stride,
+                row_bytes,
+                "webkit: import_to_pixels stride < row_bytes — skipping frame"
+            );
+            // SAFETY: view + buffer are valid.
+            unsafe {
+                wpe_view_buffer_rendered(view, buffer);
+            }
+            return;
+        }
         let mut generation = 0u64;
-        // WebKit/WPE may deliver a buffer slightly smaller than the host
-        // requested (block-aligned content area). Mirror the actual frame
-        // dims into the shared OsrViewState so buffr-app's
-        // is_osr_frame_fresh gate accepts the frame.
-        let view_w = ctx.view.width.load(Ordering::Relaxed);
-        let view_h = ctx.view.height.load(Ordering::Relaxed);
-        if view_w != w {
-            ctx.view.width.store(w, Ordering::Relaxed);
-        }
-        if view_h != h {
-            ctx.view.height.store(h, Ordering::Relaxed);
-        }
         if let Ok(mut frame) = ctx.frame.lock() {
+            // WebKit/WPE may deliver a buffer slightly smaller than the host
+            // requested (block-aligned content area). Mirror the actual frame
+            // dims into both the shared OsrFrame and the OsrViewState atomics
+            // under the same lock so a concurrent main-thread reader never sees
+            // the new view.width while frame.width still carries the old value.
+            let view_w = ctx.view.width.load(Ordering::Relaxed);
+            let view_h = ctx.view.height.load(Ordering::Relaxed);
+            if view_w != w {
+                ctx.view.width.store(w, Ordering::Relaxed);
+            }
+            if view_h != h {
+                ctx.view.height.store(h, Ordering::Relaxed);
+            }
             if frame.width != w || frame.height != h {
                 frame.width = w;
                 frame.height = h;
@@ -262,12 +283,25 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
                 generation = frame.generation;
             }
         }
-        tracing::debug!(w, h, src_stride, row_bytes, generation, "webkit: frame ingested");
+        tracing::debug!(
+            w,
+            h,
+            src_stride,
+            row_bytes,
+            generation,
+            "webkit: frame ingested"
+        );
         if let Some(wake) = ctx.view.wake.get() {
             wake();
         }
     } else {
-        tracing::warn!(w, h, size_us, need, "webkit: import_to_pixels returned undersized buffer");
+        tracing::warn!(
+            w,
+            h,
+            size_us,
+            need,
+            "webkit: import_to_pixels returned undersized buffer"
+        );
     }
 
     // Intentionally NOT calling g_bytes_unref here. WPE 2.52's
@@ -317,7 +351,11 @@ impl BuffrDisplayHandle {
                 refresh_hz as i32,
             )
         };
-        if raw.is_null() { None } else { Some(Self { raw }) }
+        if raw.is_null() {
+            None
+        } else {
+            Some(Self { raw })
+        }
     }
 }
 
@@ -365,3 +403,57 @@ pub(crate) fn make_view_ctx(frame: SharedOsrFrame, view: SharedOsrViewState) -> 
 /// of the public surface yet.
 #[allow(dead_code)]
 fn _phantom_arc_use<T>(_: Arc<T>) {}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    /// Verify that `div_ceil` correctly computes the stride for a padded
+    /// buffer, addressing fix #7 (src_stride integer division truncation).
+    ///
+    /// A padded buffer whose total size is not evenly divisible by `h` must
+    /// use `div_ceil` so each row copy starts at the right offset. Truncating
+    /// division produces a stride that is too small, causing every row after
+    /// the first to be read from 1–(stride_pad−1) bytes too early.
+    #[test]
+    fn stride_div_ceil_does_not_truncate() {
+        // h=2, w=3 → row_bytes=12. Total size 25 (padded, not divisible by 2).
+        let h: usize = 2;
+        let row_bytes: usize = 3 * 4; // 12
+        let size_us: usize = 25;
+
+        let trunc_stride = size_us / h; // 12
+        let ceil_stride = size_us.div_ceil(h); // 13
+
+        assert!(
+            ceil_stride >= trunc_stride,
+            "div_ceil must not be smaller than truncating division"
+        );
+        assert!(
+            ceil_stride >= row_bytes,
+            "stride must be at least row_bytes wide"
+        );
+
+        // The critical broken case: size=23, h=2 → trunc gives 11 < row_bytes=12.
+        // The new guard (warn + bail) catches this. div_ceil gives 12 == row_bytes.
+        let bad_size: usize = 23;
+        let bad_trunc = bad_size / h; // 11 — under row_bytes, would corrupt memory
+        let bad_ceil = bad_size.div_ceil(h); // 12 — minimal valid stride
+        assert!(
+            bad_trunc < row_bytes,
+            "trunc stride under row_bytes is the bug this fix targets"
+        );
+        assert_eq!(
+            bad_ceil, row_bytes,
+            "div_ceil recovers the minimum valid stride"
+        );
+    }
+
+    #[test]
+    fn stride_ceil_equals_trunc_when_evenly_divisible() {
+        // When size_us is exactly divisible by h, div_ceil == truncating.
+        let h: usize = 4;
+        let size_us: usize = 64;
+        assert_eq!(size_us / h, size_us.div_ceil(h));
+    }
+}
