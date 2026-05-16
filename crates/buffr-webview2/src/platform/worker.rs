@@ -87,6 +87,19 @@ pub(crate) struct EngineState {
     /// `BrowserEngine::any_audio_active`.  `Relaxed` ordering is sufficient —
     /// no synchronisation is required between the writer and the reader.
     pub audio_active: Arc<AtomicBool>,
+    /// Set by `run_media_probe` via the `WebMessageReceived` handler when the
+    /// active page has a playing `<video>` or `<audio>` element.
+    ///
+    /// Written by the STA thread's `WebMessageReceived` handler when the
+    /// `__buffr_media__:true/false` sentinel arrives; read lock-free from any
+    /// thread by `BrowserEngine::any_video_active`.
+    pub video_active: Arc<AtomicBool>,
+    /// One-slot mailbox for cursor changes.
+    ///
+    /// Written by the STA thread's `WebMessageReceived` handler when a
+    /// `__buffr_cursor__:<css-cursor>` message arrives; drained from any
+    /// thread by `BrowserEngine::take_cursor_change`.
+    pub cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
     /// Cached loading state of the **active** tab.
     ///
     /// Written by `NavigationStarting` / `NavigationCompleted` event handlers
@@ -114,6 +127,8 @@ impl EngineState {
             width,
             height,
             audio_active: Arc::new(AtomicBool::new(false)),
+            video_active: Arc::new(AtomicBool::new(false)),
+            cursor_change: Arc::new(Mutex::new(None)),
             loading_active: Arc::new(AtomicBool::new(false)),
             favicon_updates: Arc::new(Mutex::new(Vec::new())),
             popup_queue: new_popup_queue(),
@@ -363,6 +378,15 @@ struct StaRuntime {
     /// round-trip.  `WebView2Engine::pump_hint_events` drains this from any
     /// thread.
     hint_sink: HintEventSink,
+    /// Shared video-active flag.  Written by the `WebMessageReceived` handler
+    /// when a `__buffr_media__:true/false` sentinel arrives; cloned from
+    /// `EngineState::video_active` so the handler can write it without a full
+    /// EngineState lock.
+    video_active: Arc<AtomicBool>,
+    /// Shared cursor-change mailbox.  Written by the `WebMessageReceived`
+    /// handler when a `__buffr_cursor__:<css>` sentinel arrives; cloned from
+    /// `EngineState::cursor_change`.
+    cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
     /// Shared browsing-history store. `None` when not provided (private mode,
     /// backends that don't wire history, etc.). Visits are recorded on the STA
     /// thread by the `NavigationCompleted` event handler.
@@ -409,6 +433,8 @@ impl StaRuntime {
             &self.environment,
             &self.cmd_tx,
             Arc::clone(&self.hint_sink),
+            Arc::clone(&self.video_active),
+            Arc::clone(&self.cursor_change),
             self.history.clone(),
             self.downloads.clone(),
             self.notice_queue.clone(),
@@ -1699,13 +1725,25 @@ pub(crate) fn spawn(
             let _ = init_tx.send(Ok(()));
 
             // ── Construct StaRuntime ──────────────────────────────────────────
-            // Extract the popup_queue Arc from EngineState so the STA runtime
-            // can clone it into each new TabEntry's NewWindowRequested handler.
+            // Extract shared Arcs from EngineState so the STA runtime
+            // can clone them into each new TabEntry's event handlers.
             #[cfg(target_os = "windows")]
-            let popup_queue_rt = engine_state
+            let (popup_queue_rt, video_active_rt, cursor_change_rt) = engine_state
                 .lock()
-                .map(|g| Arc::clone(&g.popup_queue))
-                .unwrap_or_else(|_| buffr_engine::popup::new_popup_queue());
+                .map(|g| {
+                    (
+                        Arc::clone(&g.popup_queue),
+                        Arc::clone(&g.video_active),
+                        Arc::clone(&g.cursor_change),
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    (
+                        buffr_engine::popup::new_popup_queue(),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(Mutex::new(None)),
+                    )
+                });
 
             #[cfg(target_os = "windows")]
             let mut runtime = StaRuntime {
@@ -1720,6 +1758,8 @@ pub(crate) fn spawn(
                 osr_sleeping: false,
                 find_session: None,
                 hint_sink: Arc::clone(&hint_sink),
+                video_active: video_active_rt,
+                cursor_change: cursor_change_rt,
                 history,
                 downloads,
                 notice_queue,

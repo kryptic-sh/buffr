@@ -63,6 +63,31 @@ use super::input::{
 };
 use super::worker::{Command, EngineState, WorkerHandle, spawn};
 
+// ── Cursor CSS → raw kind mapping ────────────────────────────────────────────
+
+/// Map a CSS cursor name to a CEF-compatible raw cursor kind integer.
+///
+/// Values match `cef_cursor_type_t` from the CEF API:
+/// <https://bitbucket.org/chromiumembedded/cef/src/master/include/internal/cef_types.h>
+///
+/// Used by `take_cursor_change` callers that share the same chrome-strip
+/// cursor-icon lookup table across all backends.
+pub(crate) fn css_cursor_to_cef_raw(name: &str) -> u32 {
+    match name {
+        "text" | "vertical-text" => 1,
+        "pointer" => 28,
+        "default" | "auto" | "" => 0,
+        "wait" | "progress" => 13,
+        "crosshair" => 6,
+        "move" | "all-scroll" => 9,
+        "not-allowed" | "no-drop" => 12,
+        "grab" => 34,
+        "grabbing" => 35,
+        "help" => 8,
+        _ => 0,
+    }
+}
+
 // ── WebView2Engine ────────────────────────────────────────────────────────────
 
 /// WebView2 browser engine (Windows only).
@@ -83,6 +108,20 @@ pub struct WebView2Engine {
     /// Cached "any tab playing audio?" flag.  Written by the 500 ms STA-thread
     /// `WM_TIMER` handler; read from any thread by `any_audio_active()`.
     audio_active: Arc<AtomicBool>,
+    /// Set by `run_media_probe` when the active page has a playing `<video>` or
+    /// `<audio>` element.  Written by the `WebMessageReceived` handler when the
+    /// `__buffr_media__:true/false` sentinel is received; read lock-free from
+    /// any thread by `any_video_active()`.
+    video_active: Arc<AtomicBool>,
+    /// One-slot mailbox for cursor changes. Written by the `WebMessageReceived`
+    /// handler on the STA thread when `__buffr_cursor__:<css-cursor>` is
+    /// received; drained from any thread by `take_cursor_change`.
+    /// Stores `(browser_id, raw_kind)` — `browser_id` is `tab_id.0 as i32`.
+    cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
+    /// System clipboard handle.  `None` when `hjkl_clipboard::Clipboard::new()`
+    /// fails (e.g. no display server on CI).  Clipboard operations fall back to
+    /// the STA worker Win32 path when `None`.
+    clipboard: Option<std::sync::Arc<hjkl_clipboard::Clipboard>>,
     /// Cached loading state of the **active** tab.
     ///
     /// Written by `NavigationStarting` / `NavigationCompleted` event handlers
@@ -132,14 +171,23 @@ impl WebView2Engine {
         // Clone Arc<AtomicBool>s and shared queues from inside EngineState so
         // the engine can read / drain them from any thread without locking the
         // Mutex on every call.
-        let (audio_active, loading_active, favicon_updates, popup_queue) = engine_state
+        let (
+            audio_active,
+            video_active,
+            loading_active,
+            favicon_updates,
+            popup_queue,
+            cursor_change,
+        ) = engine_state
             .lock()
             .map(|g| {
                 (
                     Arc::clone(&g.audio_active),
+                    Arc::clone(&g.video_active),
                     Arc::clone(&g.loading_active),
                     Arc::clone(&g.favicon_updates),
                     Arc::clone(&g.popup_queue),
+                    Arc::clone(&g.cursor_change),
                 )
             })
             .unwrap_or_else(|_| {
@@ -147,10 +195,17 @@ impl WebView2Engine {
                 (
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(Mutex::new(Vec::new())),
                     new_popup_queue(),
+                    Arc::new(Mutex::new(None)),
                 )
             });
+
+        let clipboard = hjkl_clipboard::Clipboard::new()
+            .map(std::sync::Arc::new)
+            .map_err(|e| tracing::debug!(error = %e, "webview2: clipboard init failed"))
+            .ok();
 
         let data_dir = options.data_dir.map(|p| p.to_path_buf());
 
@@ -215,6 +270,9 @@ impl WebView2Engine {
             worker,
             engine_state,
             audio_active,
+            video_active,
+            cursor_change,
+            clipboard,
             loading_active,
             find_query: Mutex::new(None),
             favicon_updates,
@@ -660,7 +718,20 @@ impl BrowserEngine for WebView2Engine {
     }
 
     fn any_video_active(&self) -> bool {
-        false
+        self.video_active.load(Ordering::Relaxed)
+    }
+
+    fn run_media_probe(&self) {
+        // Evaluate JS that checks for active media elements and emits
+        // `__buffr_media__:true/false` via window.chrome.webview.postMessage.
+        // The WebMessageReceived handler on the STA thread scrapes the sentinel
+        // and flips `video_active`.
+        let js = "(() => { \
+            const active = Array.from(document.querySelectorAll('video,audio'))\
+              .some(el => !el.paused && !el.ended && el.currentTime > 0); \
+            window.chrome.webview.postMessage('__buffr_media__:' + active); \
+        })();";
+        let _ = self.run_js(js);
     }
 
     // ── Popup ─────────────────────────────────────────────────────────────────
@@ -853,38 +924,80 @@ impl BrowserEngine for WebView2Engine {
 
     // ── Cursor (Gap 2) ────────────────────────────────────────────────────────
     //
-    // WebView2 does not expose cursor changes to the host via the HWND controller
-    // path.  The composition-controller path exposes `ICoreWebView2CompositionController::Cursor`
-    // but that path is not yet adopted (Phase C TODO).
-    //
-    // TODO(phase-c): implement via `ICoreWebView2CompositionController::Cursor`
-    // once the composition controller path lands.
+    // JS mousemove listener (injected via AddScriptToExecuteOnDocumentCreated
+    // in runtime.rs) emits `__buffr_cursor__:<css-cursor>` via
+    // window.chrome.webview.postMessage.  The WebMessageReceived handler
+    // writes the translated raw kind into `cursor_change`.  We drain the slot
+    // here.
 
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
-        None
+        self.cursor_change.lock().ok().and_then(|mut g| g.take())
     }
 
     // ── Clipboard (Gap 4) ─────────────────────────────────────────────────────
     //
-    // Win32 clipboard must be accessed from the thread that owns the clipboard
-    // window (or any thread for CF_UNICODETEXT without a window owner).  We
-    // dispatch reads and writes through the STA worker channel so they run on
-    // the STA thread alongside the HWND that owns the hidden controller windows.
+    // Primary path: `hjkl_clipboard::Clipboard` — synchronous, any-thread,
+    // matches the pattern used by buffr-firefox-cdp and buffr-webkitgtk.
+    // Fallback path: STA worker Win32 API (ClipboardRead / ClipboardWrite
+    // commands) — used when hjkl-clipboard fails to initialise (e.g. no
+    // display server on Windows CI).
+
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        let cb = self.clipboard.clone()?;
+        let reader = Wv2ClipboardReader(cb);
+        Some(std::sync::Arc::new(reader))
+    }
 
     fn clipboard_text(&self) -> Option<String> {
-        tracing::debug!("webview2: clipboard_text");
+        use hjkl_clipboard::{MimeType, Selection};
+        if let Some(cb) = self.clipboard.as_ref() {
+            tracing::debug!("webview2: clipboard_text (hjkl path)");
+            return match cb.get(Selection::Clipboard, MimeType::Text) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) if !s.is_empty() => Some(s),
+                    Ok(_) => None,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "webview2: clipboard_text non-utf8");
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::debug!(error = %err, "webview2: clipboard_text read failed");
+                    None
+                }
+            };
+        }
+        // Fallback: STA worker Win32 path.
+        tracing::debug!("webview2: clipboard_text (Win32 worker fallback)");
         self.worker
             .call(|reply| Command::ClipboardRead { reply })
             .unwrap_or(None)
     }
 
     fn clipboard_set_text(&self, text: &str) -> bool {
-        tracing::debug!("webview2: clipboard_set_text ({} chars)", text.len());
+        use hjkl_clipboard::{MimeType, Selection};
+        if let Some(cb) = self.clipboard.as_ref() {
+            tracing::debug!(
+                "webview2: clipboard_set_text ({} chars, hjkl path)",
+                text.len()
+            );
+            return match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(error = %err, "webview2: clipboard_set_text hjkl failed, falling back to Win32");
+                    // Fall through to worker path below.
+                    false
+                }
+            };
+        }
+        // Fallback: STA worker Win32 path (fire-and-forget, optimistically true).
+        tracing::debug!(
+            "webview2: clipboard_set_text ({} chars, Win32 worker fallback)",
+            text.len()
+        );
         self.worker.send(Command::ClipboardWrite {
             text: text.to_owned(),
         });
-        // Fire-and-forget: optimistically return true.
-        // The STA worker logs a warning on failure.
         true
     }
 
@@ -1177,6 +1290,28 @@ impl WebView2Engine {
         );
     }
 }
+
+// ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
+
+/// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
+/// `ClipboardRead` trait.  Mirrors the pattern used by `buffr-firefox-cdp` and
+/// `buffr-webkitgtk`.
+struct Wv2ClipboardReader(std::sync::Arc<hjkl_clipboard::Clipboard>);
+
+impl buffr_engine::ClipboardRead for Wv2ClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        match self.0.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+            Err(err) => {
+                tracing::debug!(error = %err, "webview2: Wv2ClipboardReader::read_text failed");
+                None
+            }
+        }
+    }
+}
+
+// ── JS string helpers ─────────────────────────────────────────────────────────
 
 /// Format a Rust string as a JS double-quoted literal with `\uXXXX` escaping
 /// for every non-ASCII codepoint.  Mirrors `json_string_literal` from the CEF

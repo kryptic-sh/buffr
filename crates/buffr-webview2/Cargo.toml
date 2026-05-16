@@ -16,6 +16,7 @@ buffr-downloads.workspace = true
 buffr-engine.workspace = true
 buffr-history.workspace = true
 buffr-modal.workspace = true
+hjkl-clipboard.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -23,7 +24,11 @@ tracing.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 # PNG decode for CapturePreview OSR pipeline — same version + features as
 # buffr-blink-cdp so the dep is deduplicated in the workspace build graph.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Also used to decode fetched favicon bytes into RGBA pixels.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "gif", "webp"] }
+# HTTP client for fetching favicon URLs from the STA thread's spawned worker.
+# Same version as buffr-cef to deduplicate in the workspace build graph.
+ureq = { version = "3", features = ["json"] }
 # Windows API bindings — feature set covers COM, WinRT, D3D11, DXGI, and
 # the Composition / Visual-layer APIs needed for composition-hosted WebView2.
 windows = { version = "0.62", features = [

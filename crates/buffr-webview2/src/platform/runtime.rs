@@ -50,6 +50,7 @@
 //! that unsafe context (Rust 2024 edition), so the closure bodies that call
 //! COM methods do not need a redundant inner `unsafe {}`.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(target_os = "windows")]
@@ -124,6 +125,8 @@ impl TabEntry {
         environment: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
         cmd_tx: &mpsc::SyncSender<Command>,
         hint_sink: HintEventSink,
+        video_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cursor_change: std::sync::Arc<Mutex<Option<(i32, u32)>>>,
         history: Option<std::sync::Arc<buffr_history::History>>,
         downloads: Option<std::sync::Arc<buffr_downloads::Downloads>>,
         notice_queue: Option<buffr_core::download_notice::DownloadNoticeQueue>,
@@ -452,25 +455,30 @@ impl TabEntry {
         // `add_FaviconChanged` lives on ICoreWebView2_15. We QI-cast and skip
         // gracefully if the runtime predates SDK 1.0.1369 (runtime ~107).
         //
-        // On each event we call `ICoreWebView2_15::FaviconUri` to read the URL
-        // (CoTask-allocated PWSTR), then push a `FaviconUpdate` sentinel with
-        // `browser_id = tab.id.0 as i32` and empty pixels into the shared
-        // `engine_state.favicon_updates` queue so `drain_favicon_updates` can
-        // surface it to the apps layer.
+        // On each event we call `ICoreWebView2_15::FaviconUri` to read the URL,
+        // then spawn a background thread that fetches the image with `ureq`,
+        // decodes it with the `image` crate, and pushes a `FaviconUpdate` with
+        // decoded RGBA pixels into the shared `favicon_updates` queue.
         //
-        // Pixel decoding (fetch URL → BGRA) is deferred to phase-c; the apps
-        // layer uses the `browser_id` to refresh its favicon cache trigger.
+        // The spawned thread is fire-and-forget; failures are debug-logged.
+        // This mirrors the CEF `BuffrDownloadImageCallback` pattern without
+        // the CEF-specific `download_image` round-trip.
         if let Ok(wv15) = windows::core::Interface::cast::<
             webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_15,
         >(&webview)
         {
             use webview2_com::FaviconChangedEventHandler;
-            let state_favicon = Arc::clone(engine_state);
+            // Clone the favicon_updates Arc directly so the spawned thread
+            // can push without holding the full EngineState lock.
+            let favicon_updates = engine_state
+                .lock()
+                .map(|g| Arc::clone(&g.favicon_updates))
+                .unwrap_or_else(|_| Arc::new(Mutex::new(Vec::new())));
             let wv15_fav = wv15.clone();
             let mut favicon_token: i64 = 0;
             // SAFETY: add_FaviconChanged is an STA COM method on `wv15`.
             // The handler closure captures:
-            //   - `Arc<Mutex<EngineState>>` which is Send,
+            //   - `Arc<Mutex<Vec<FaviconUpdate>>>` which is Send,
             //   - `ICoreWebView2_15` (COM STA pointer, valid on this thread),
             //   - `id` (Copy).
             // The closure is called by WebView2 on the STA thread.
@@ -497,20 +505,20 @@ impl TabEntry {
                             "webview2 runtime: FaviconChanged"
                         );
 
-                        // Push a FaviconUpdate sentinel so the apps layer can
-                        // refresh its favicon cache.  Pixels are empty — the
-                        // URL is logged above; a future phase can fetch and
-                        // decode the favicon image.
-                        if let Ok(guard) = state_favicon.lock()
-                            && let Ok(mut fav) = guard.favicon_updates.lock()
-                        {
-                            fav.push(buffr_engine::FaviconUpdate {
-                                browser_id: id.0 as i32,
-                                width: 0,
-                                height: 0,
-                                pixels: Vec::new(),
-                            });
+                        if uri_str.is_empty() {
+                            return Ok(());
                         }
+
+                        // Spawn a background thread to fetch and decode the favicon.
+                        // The STA thread must not block on network I/O.
+                        let browser_id = id.0 as i32;
+                        let favicon_sink = Arc::clone(&favicon_updates);
+                        std::thread::Builder::new()
+                            .name(format!("buffr-wv2-favicon-{browser_id}"))
+                            .spawn(move || {
+                                fetch_and_push_favicon(uri_str, browser_id, favicon_sink);
+                            })
+                            .ok();
                         Ok(())
                     })),
                     &mut favicon_token,
@@ -733,19 +741,28 @@ impl TabEntry {
             }
         }
 
-        // ── Hint-mode: console-log interceptor (AddScriptToExecuteOnDocumentCreated) ──
+        // ── AddScriptToExecuteOnDocumentCreated: hint + cursor intercept ─────────
         //
-        // Inject a tiny console.log wrapper on every document load so the hint
-        // JS can tunnel events back to Rust via `window.chrome.webview.postMessage`.
-        // The script is registered before the initial navigation so it fires even
-        // on the first page.  We ignore the returned ID (we never remove the script).
+        // Inject two scripts on every document load:
+        //
+        // 1. Hint-mode console.log wrapper: forwards `__buffr_hint__:…` lines
+        //    from the hint JS to Rust via `window.chrome.webview.postMessage`.
+        //
+        // 2. Cursor-change mousemove listener: on every mousemove where the CSS
+        //    cursor changes, emits `__buffr_cursor__:<css-value>` via postMessage.
+        //    The WebMessageReceived handler translates the CSS name to a raw CEF
+        //    kind integer and stores it in `cursor_change`.
+        //
+        // Both scripts are registered before the initial navigation so they fire
+        // even on the first page.  We ignore the returned IDs (never removed).
         //
         // SAFETY: AddScriptToExecuteOnDocumentCreated is an STA COM method on a
-        // valid ICoreWebView2 pointer. The handler closure is called on the STA
-        // thread by WebView2.
+        // valid ICoreWebView2 pointer. The completion handler closure is called on
+        // the STA thread by WebView2.
         {
             use windows::core::HSTRING;
-            const INTERCEPT_JS: &str = concat!(
+            // Script 1: hint console.log forwarder.
+            const HINT_INTERCEPT_JS: &str = concat!(
                 "(function(){",
                 "var _orig=console.log;",
                 "console.log=function(msg){",
@@ -756,35 +773,56 @@ impl TabEntry {
                 "};",
                 "})();"
             );
-            let js_wide = HSTRING::from(INTERCEPT_JS);
-            let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
-                |_hr, _id| Ok(()),
-            ));
-            // SAFETY: STA COM method; handler and js_wide are valid for the duration
-            // of this call.
-            if let Err(e) =
-                unsafe { webview.AddScriptToExecuteOnDocumentCreated(&js_wide, &handler) }
-            {
-                tracing::warn!("webview2 runtime: AddScriptToExecuteOnDocumentCreated failed: {e}");
-            } else {
-                tracing::debug!("webview2 runtime: hint console-log interceptor registered");
+            // Script 2: cursor-change mousemove listener.
+            const CURSOR_JS: &str = concat!(
+                "(function(){",
+                "var __buffr_last_cursor=null;",
+                "document.addEventListener('mousemove',function(e){",
+                "var c=getComputedStyle(e.target).cursor;",
+                "if(c!==__buffr_last_cursor){",
+                "__buffr_last_cursor=c;",
+                "window.chrome.webview.postMessage('__buffr_cursor__:'+c);",
+                "}",
+                "},true);",
+                "})();"
+            );
+            for (js_src, label) in [
+                (HINT_INTERCEPT_JS, "hint console-log interceptor"),
+                (CURSOR_JS, "cursor mousemove listener"),
+            ] {
+                let js_wide = HSTRING::from(js_src);
+                let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(
+                    Box::new(|_hr, _id| Ok(())),
+                );
+                // SAFETY: STA COM method; handler and js_wide are valid for the
+                // duration of this call.
+                if let Err(e) =
+                    unsafe { webview.AddScriptToExecuteOnDocumentCreated(&js_wide, &handler) }
+                {
+                    tracing::warn!(
+                        "webview2 runtime: AddScriptToExecuteOnDocumentCreated ({label}) failed: {e}"
+                    );
+                } else {
+                    tracing::debug!("webview2 runtime: {label} registered");
+                }
             }
         }
 
-        // ── Hint-mode: WebMessageReceived ─────────────────────────────────────
+        // ── WebMessageReceived: hint + cursor + media ─────────────────────────
         //
-        // Subscribe to web messages on this tab's webview.  When the injected
-        // console-log wrapper intercepts a `__buffr_hint__:…` line it calls
-        // `window.chrome.webview.postMessage(msg)`, which fires this handler on
-        // the STA thread.  We parse the JSON tail and write to `hint_sink`.
+        // Subscribe to web messages on this tab's webview.  The injected scripts
+        // call `window.chrome.webview.postMessage(msg)` for three sentinel types:
         //
-        // Approach (a) from the spec: lock the `Arc<Mutex<…>>` directly here on
-        // the STA thread — writes are cheap (a single `Option` swap) and the
-        // lock contention is negligible.
+        // - `__buffr_hint__:…`    → parse hint event, write to hint_sink.
+        // - `__buffr_cursor__:<css>` → translate CSS cursor name to raw kind,
+        //                            write (browser_id, kind) to cursor_change.
+        // - `__buffr_media__:true/false` → flip video_active atomic.
+        //
+        // All handlers run on the STA thread; writes to Arc<Mutex<…>> are cheap.
         {
             let mut web_msg_token: i64 = 0;
             // SAFETY: add_WebMessageReceived is an STA COM method.
-            // The handler closure captures `hint_sink` (Arc<Mutex<…>> — Send)
+            // The handler closure captures Send types (Arc<Mutex<…>>, Arc<AtomicBool>)
             // and is invoked on the STA thread by WebView2.
             if let Err(e) = unsafe {
                 webview.add_WebMessageReceived(
@@ -802,19 +840,28 @@ impl TabEntry {
                         let line = msg_pwstr.to_string().unwrap_or_default();
                         windows::Win32::System::Com::CoTaskMemFree(Some(msg_pwstr.0.cast()));
 
-                        if !line.contains(HINT_CONSOLE_SENTINEL) {
-                            return Ok(());
-                        }
-                        match parse_console_event(&line) {
-                            Some(Ok(event)) => {
-                                if let Ok(mut guard) = hint_sink.lock() {
-                                    *guard = Some(event);
+                        if line.starts_with(HINT_CONSOLE_SENTINEL) {
+                            match parse_console_event(&line) {
+                                Some(Ok(event)) => {
+                                    if let Ok(mut guard) = hint_sink.lock() {
+                                        *guard = Some(event);
+                                    }
                                 }
+                                Some(Err(e)) => {
+                                    tracing::warn!(
+                                        "webview2 runtime: malformed hint event JSON: {e}"
+                                    );
+                                }
+                                None => {}
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!("webview2 runtime: malformed hint event JSON: {e}");
+                        } else if let Some(css) = line.strip_prefix("__buffr_cursor__:") {
+                            let raw = super::engine::css_cursor_to_cef_raw(css);
+                            if let Ok(mut guard) = cursor_change.lock() {
+                                *guard = Some((id.0 as i32, raw));
                             }
-                            None => {}
+                        } else if let Some(val) = line.strip_prefix("__buffr_media__:") {
+                            let active = val.trim() == "true";
+                            video_active.store(active, Ordering::Relaxed);
                         }
                         Ok(())
                     })),
@@ -823,7 +870,7 @@ impl TabEntry {
             } {
                 tracing::warn!("webview2 runtime: add_WebMessageReceived failed: {e}");
             } else {
-                tracing::debug!("webview2 runtime: WebMessageReceived hint handler wired");
+                tracing::debug!("webview2 runtime: WebMessageReceived handler wired");
             }
         }
 
@@ -1126,4 +1173,81 @@ fn url_to_wide(url: &str) -> Vec<u16> {
     let mut v: Vec<u16> = OsStr::new(url).encode_wide().collect();
     v.push(0);
     v
+}
+
+/// Fetch a favicon URL, decode the image, and push a `FaviconUpdate` with RGBA
+/// pixels into `sink`.
+///
+/// Called on a dedicated background thread spawned by the `FaviconChanged` event
+/// handler so the STA thread is never blocked on network I/O.  Mirrors the CEF
+/// `BuffrDownloadImageCallback::on_download_image_finished` pixel-decode path.
+///
+/// Pixels are packed as `0xAA_RR_GG_BB` u32 — the same layout used by CEF and
+/// expected by the chrome-strip favicon blitter.
+#[cfg(target_os = "windows")]
+fn fetch_and_push_favicon(
+    url: String,
+    browser_id: i32,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<buffr_engine::FaviconUpdate>>>,
+) {
+    use image::GenericImageView;
+
+    tracing::debug!(browser_id, url = %url, "webview2 favicon: fetching");
+
+    let bytes = match ureq::get(&url).call() {
+        Ok(resp) => {
+            let mut buf = Vec::new();
+            if let Err(e) = std::io::Read::read_to_end(&mut resp.into_body().as_reader(), &mut buf)
+            {
+                tracing::debug!(browser_id, error = %e, "webview2 favicon: read failed");
+                return;
+            }
+            buf
+        }
+        Err(e) => {
+            tracing::debug!(browser_id, error = %e, "webview2 favicon: fetch failed");
+            return;
+        }
+    };
+
+    let img = match image::load_from_memory(&bytes) {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::debug!(browser_id, error = %e, "webview2 favicon: decode failed");
+            return;
+        }
+    };
+
+    // Scale down to 32×32 (nearest-neighbour) if larger to keep memory bounded.
+    let img = if img.width() > 64 || img.height() > 64 {
+        img.resize(32, 32, image::imageops::FilterType::Nearest)
+    } else {
+        img
+    };
+
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    // Convert to RGBA8 and pack as 0xAA_RR_GG_BB u32.
+    let rgba = img.to_rgba8();
+    let pixels: Vec<u32> = rgba
+        .pixels()
+        .map(|p| {
+            let [r, g, b, a] = p.0;
+            ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        })
+        .collect();
+
+    tracing::debug!(browser_id, width, height, "webview2 favicon: decoded");
+
+    if let Ok(mut guard) = sink.lock() {
+        guard.push(buffr_engine::FaviconUpdate {
+            browser_id,
+            width,
+            height,
+            pixels,
+        });
+    }
 }
