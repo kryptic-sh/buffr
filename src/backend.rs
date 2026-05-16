@@ -66,6 +66,10 @@ pub struct BackendOpenOptions<'a> {
     /// `Browser.setDownloadBehavior`. CEF backends manage their own
     /// download directory via the sinks' `DownloadsConfig`.
     pub download_dir: Option<&'a Path>,
+    /// Shared history store. webkitgtk and webview2 record visits here on
+    /// navigation-completed events. CEF and blink-cdp ignore this field
+    /// (they wire history through their own callbacks).
+    pub history: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Shared downloads store. blink-cdp writes to this directly when
     /// downloads start / progress / complete. CEF ignores this field
     /// (continues using its existing `CefEngineSinks` wiring).
@@ -75,7 +79,8 @@ pub struct BackendOpenOptions<'a> {
     pub notice_queue: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Find-result sink (P1-1). blink-cdp downcasts to `FindResultSink` and
     /// passes it to `BlinkCdpEngine::new`. CEF ignores this field (find results
-    /// are wired via `CefEngineSinks` inside `sinks`).
+    /// are wired via `CefEngineSinks` inside `sinks`). webview2 downcasts to
+    /// `FindResultSink` and writes match counts from `ICoreWebView2Find` events.
     pub find_sink: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Backend-specific sink handles, type-erased.
     ///
