@@ -285,6 +285,10 @@ impl FirefoxCdpEngine {
         let worker_favicon = Arc::clone(&favicon_sink);
         let hint_sink = new_hint_event_sink();
         let worker_hint_sink = Arc::clone(&hint_sink);
+        // Construct popup_queue before spawning the worker so the Arc can be
+        // cloned for both the worker (writes) and the engine (exposes via popup_queue()).
+        let popup_queue = new_popup_queue();
+        let worker_popup_queue = Arc::clone(&popup_queue);
 
         let worker = std::thread::Builder::new()
             .name("firefox-cdp-worker".to_owned())
@@ -300,6 +304,7 @@ impl FirefoxCdpEngine {
                     worker_title,
                     worker_favicon,
                     worker_hint_sink,
+                    worker_popup_queue,
                 )
             })
             .map_err(FirefoxError::SpawnFailed)?;
@@ -311,7 +316,7 @@ impl FirefoxCdpEngine {
             osr_view,
             worker: Some(worker),
             subprocess: Arc::new(Mutex::new(Some(child))),
-            popup_queue: new_popup_queue(),
+            popup_queue,
             popup_create_sink: new_popup_create_sink(),
             popup_close_sink: new_popup_close_sink(),
             url_update_sink,
@@ -1527,10 +1532,12 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn popup_create_sink(&self) -> PopupCreateSink {
+        // Firefox CDP popups reroute via popup_queue; no OSR sinks.
         Arc::clone(&self.popup_create_sink)
     }
 
     fn popup_close_sink(&self) -> PopupCloseSink {
+        // Firefox CDP popups reroute via popup_queue; no OSR sinks.
         Arc::clone(&self.popup_close_sink)
     }
 

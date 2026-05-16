@@ -22,10 +22,10 @@ use base64::Engine as B64Engine;
 use serde_json::Value;
 
 use buffr_core::hint::parse_console_event;
-use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState};
+use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, popup::PopupQueue};
 
 use crate::cdp::{
-    CaptureScreenshotParams, CdpCommand, CdpMessage, DispatchKeyEventParams,
+    CaptureScreenshotParams, CdpCommand, CdpMessage, CloseTargetParams, DispatchKeyEventParams,
     DispatchMouseEventParams, NavigateParams, SetDeviceMetricsParams,
 };
 use crate::error::FirefoxError;
@@ -167,6 +167,7 @@ pub fn run(
     title_map: TitleMap,
     favicon_sink: FaviconSink,
     hint_sink: HintEventSink,
+    popup_queue: PopupQueue,
 ) {
     let mut pending: HashMap<u64, PendingEntry> = HashMap::new();
     let mut active_session: Option<String> = None;
@@ -322,6 +323,7 @@ pub fn run(
                         &title_map,
                         &favicon_sink,
                         &hint_sink,
+                        &popup_queue,
                     );
                 }
             },
@@ -335,7 +337,7 @@ pub fn run(
 fn dispatch_message(
     msg: CdpMessage,
     pending: &mut HashMap<u64, PendingEntry>,
-    _ws: &mut WsClient,
+    ws: &mut WsClient,
     osr_frame: &SharedOsrFrame,
     url_update_sink: &UrlUpdateSink,
     loading_state: &Arc<Mutex<HashMap<String, bool>>>,
@@ -343,6 +345,7 @@ fn dispatch_message(
     title_map: &TitleMap,
     favicon_sink: &FaviconSink,
     hint_sink: &HintEventSink,
+    popup_queue: &PopupQueue,
 ) {
     // Command response — may be a screenshot reply or a normal reply.
     if let Some(id) = msg.id {
@@ -466,6 +469,57 @@ fn dispatch_message(
                     );
                     if let Ok(mut map) = title_map.lock() {
                         map.insert(target_id, title);
+                    }
+                }
+            }
+        }
+        "Target.targetCreated" => {
+            // Intercept window.open() popups: when a new "page" target arrives
+            // with an openerId, it was created by another page (i.e. a popup).
+            // Push the URL into the engine's popup_queue so the apps layer opens
+            // it as a new tab, then close the raw popup target so Firefox doesn't
+            // also open it as a native window.
+            if let Some(ref params) = msg.params
+                && let Some(info) = params.get("targetInfo")
+            {
+                let target_type = info.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let opener_id = info.get("openerId").and_then(|v| v.as_str()).unwrap_or("");
+                if target_type == "page" && !opener_id.is_empty() {
+                    let target_id = info
+                        .get("targetId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let url = info
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    tracing::debug!(
+                        target_id,
+                        opener_id,
+                        url,
+                        "firefox-cdp: Target.targetCreated popup — rerouting to popup_queue"
+                    );
+                    // Skip blank intermediary targets; the real URL arrives shortly
+                    // via a subsequent targetCreated or frameNavigated. If blank,
+                    // we still close the target but don't enqueue an empty URL.
+                    if !url.is_empty()
+                        && url != "about:blank"
+                        && let Ok(mut q) = popup_queue.lock()
+                    {
+                        q.push_back(url);
+                    }
+                    // Close the popup target so Firefox doesn't open a native window.
+                    if !target_id.is_empty() {
+                        let cmd = CdpCommand::new(
+                            "Target.closeTarget",
+                            CloseTargetParams {
+                                target_id: target_id.clone(),
+                            },
+                        );
+                        tracing::debug!(target_id, "firefox-cdp: closing popup target");
+                        let _ = ws.send_text(cmd.serialize());
                     }
                 }
             }
