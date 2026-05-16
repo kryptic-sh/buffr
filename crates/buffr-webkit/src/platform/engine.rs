@@ -208,6 +208,14 @@ impl WebKitEngine {
         self.display_urls.lock().ok()?.get(&tab_id).cloned()
     }
 
+    /// Apply our per-tab display URL on top of a worker-built [`TabSummary`].
+    /// See [`apply_display_overrides_pure`] for the substitution rules; this
+    /// method just wires the per-tab lookup.
+    fn apply_display_overrides(&self, summary: TabSummary) -> TabSummary {
+        let display = self.display_url_for(summary.id);
+        apply_display_overrides_pure(summary, display.as_deref())
+    }
+
     /// Send a fire-and-forget command to the worker thread.
     fn send(&self, cmd: Command) {
         if let Err(e) = self.worker.cmd_tx.try_send(cmd) {
@@ -232,6 +240,34 @@ impl WebKitEngine {
         self.record_display_url(tab_id, &original);
         Ok(tab_id)
     }
+}
+
+// ── Pure helpers (extracted for unit testing) ────────────────────────────────
+
+/// Apply a display URL on top of a [`TabSummary`].
+///
+/// Rules:
+/// - `display.is_none()`: return `summary` untouched.
+/// - `summary.url` is replaced with `display`.
+/// - `summary.title` is replaced with `display` *only* when it still looks
+///   like the engine-set placeholder (empty, equal to the previous
+///   loaded URL, or already equal to the display URL). Once WebKit's
+///   `notify::title` lands a real page title we keep it.
+pub(crate) fn apply_display_overrides_pure(
+    mut summary: TabSummary,
+    display: Option<&str>,
+) -> TabSummary {
+    let Some(display) = display else {
+        return summary;
+    };
+    let title_is_placeholder = summary.title.is_empty()
+        || summary.title == summary.url
+        || summary.title == display;
+    summary.url = display.to_owned();
+    if title_is_placeholder {
+        summary.title = display.to_owned();
+    }
+    summary
 }
 
 // ── BrowserEngine impl ────────────────────────────────────────────────────────
@@ -313,26 +349,20 @@ impl BrowserEngine for WebKitEngine {
     fn active_tab(&self) -> Option<TabSummary> {
         let st = self.worker.engine_state.lock().ok()?;
         let info = st.active_tab_info()?;
-        let mut summary = info.to_summary();
-        if let Some(display) = self.display_url_for(summary.id) {
-            summary.url = display;
-        }
-        Some(summary)
+        Some(self.apply_display_overrides(info.to_summary()))
     }
 
     fn tabs_summary(&self) -> Vec<TabSummary> {
-        let mut summaries: Vec<TabSummary> = self
+        let summaries: Vec<TabSummary> = self
             .worker
             .engine_state
             .lock()
             .map(|st| st.tabs_summary())
             .unwrap_or_default();
-        for summary in &mut summaries {
-            if let Some(display) = self.display_url_for(summary.id) {
-                summary.url = display;
-            }
-        }
         summaries
+            .into_iter()
+            .map(|s| self.apply_display_overrides(s))
+            .collect()
     }
 
     fn tab_count(&self) -> usize {
@@ -631,4 +661,77 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn cancel_hint(&self) {}
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buffr_engine::TabId;
+
+    fn summary(id: u64, url: &str, title: &str) -> TabSummary {
+        TabSummary {
+            id: TabId(id),
+            browser_id: id as i32,
+            title: title.to_owned(),
+            url: url.to_owned(),
+            progress: 0.0,
+            is_loading: false,
+            pinned: false,
+            private: false,
+        }
+    }
+
+    #[test]
+    fn override_swaps_url() {
+        // The engine loaded http://127.0.0.1:.../<token>/new but the user
+        // asked for buffr://new — the omnibar should show the buffr URL.
+        let s = summary(1, "http://127.0.0.1:1234/abc/new", "http://127.0.0.1:1234/abc/new");
+        let out = apply_display_overrides_pure(s, Some("buffr://new"));
+        assert_eq!(out.url, "buffr://new");
+    }
+
+    #[test]
+    fn override_swaps_title_when_placeholder_equals_url() {
+        // Default TabInfo.title == url right after open_tab; the tab pill
+        // would otherwise show the long localhost URL.
+        let s = summary(1, "http://127.0.0.1:1234/abc/new", "http://127.0.0.1:1234/abc/new");
+        let out = apply_display_overrides_pure(s, Some("buffr://new"));
+        assert_eq!(out.title, "buffr://new");
+    }
+
+    #[test]
+    fn override_swaps_title_when_empty() {
+        let s = summary(1, "http://127.0.0.1:1234/abc/new", "");
+        let out = apply_display_overrides_pure(s, Some("buffr://new"));
+        assert_eq!(out.title, "buffr://new");
+    }
+
+    #[test]
+    fn override_preserves_real_title() {
+        // WebKit eventually fires notify::title with "New Tab" — keep that
+        // human title, only swap the URL.
+        let s = summary(1, "http://127.0.0.1:1234/abc/new", "New Tab");
+        let out = apply_display_overrides_pure(s, Some("buffr://new"));
+        assert_eq!(out.title, "New Tab", "must not clobber a real title");
+        assert_eq!(out.url, "buffr://new");
+    }
+
+    #[test]
+    fn override_is_idempotent_when_title_already_matches_display() {
+        // Second pass shouldn't change anything.
+        let s = summary(1, "buffr://new", "buffr://new");
+        let out = apply_display_overrides_pure(s, Some("buffr://new"));
+        assert_eq!(out.url, "buffr://new");
+        assert_eq!(out.title, "buffr://new");
+    }
+
+    #[test]
+    fn no_display_returns_input_untouched() {
+        let s = summary(1, "https://example.com", "Example");
+        let out = apply_display_overrides_pure(s.clone(), None);
+        assert_eq!(out.url, s.url);
+        assert_eq!(out.title, s.title);
+    }
 }
