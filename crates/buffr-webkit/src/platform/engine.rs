@@ -55,9 +55,20 @@ impl WebKitEngine {
     /// the initial tab at `options.initial_url`.
     pub fn new(options: &BackendOpenOptions<'_>) -> Result<Self, WebKitError> {
         let (width, height) = options.initial_size;
-        let initial_url = options.initial_url;
+        // Translate `buffr://*` before the worker's idle handler loads the
+        // initial URL — the host-supplied newtab HTML provider isn't wired
+        // until after `new` returns, so we fall back to default templates
+        // here. Without this, the very first tab loads raw `buffr://new`
+        // and renders the "URL can't be shown" error page.
+        let initial_url_owned = translate_internal_url(
+            options.initial_url,
+            default_newtab_html,
+            default_settings_html,
+        )
+        .unwrap_or_else(|| options.initial_url.to_owned());
+        let initial_url = initial_url_owned.as_str();
 
-        tracing::info!("webkit: WebKitEngine::new url={initial_url} {width}x{height}");
+        tracing::info!("webkit: WebKitEngine::new {width}x{height}");
 
         let frame: SharedOsrFrame = Arc::new(Mutex::new(OsrFrame::new(width, height)));
         let view: SharedOsrViewState = Arc::new(OsrViewState::new());
