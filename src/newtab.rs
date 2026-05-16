@@ -80,3 +80,110 @@ pub fn default_settings_html() -> Vec<u8> {
 pub fn default_newtab_html() -> Vec<u8> {
     NEW_TAB_HTML_TEMPLATE.as_bytes().to_vec()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn newtab() -> Vec<u8> {
+        b"<html><body>NEWTAB</body></html>".to_vec()
+    }
+    fn settings() -> Vec<u8> {
+        b"<html><body>SETTINGS</body></html>".to_vec()
+    }
+
+    fn decode(data_url: &str) -> Vec<u8> {
+        let payload = data_url
+            .strip_prefix("data:text/html;base64,")
+            .expect("data:text/html;base64, prefix");
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("valid base64")
+    }
+
+    #[test]
+    fn translates_buffr_new_to_newtab_html() {
+        let url = translate_internal_url("buffr://new", newtab, settings).expect("translated");
+        assert_eq!(decode(&url), newtab());
+    }
+
+    #[test]
+    fn translates_buffr_newtab_alias_to_newtab_html() {
+        // `buffr://newtab` (anything past buffr:// that isn't settings) is
+        // funnelled into the newtab handler — historical config files use
+        // this spelling.
+        let url = translate_internal_url("buffr://newtab", newtab, settings).expect("translated");
+        assert_eq!(decode(&url), newtab());
+    }
+
+    #[test]
+    fn translates_buffr_settings_to_settings_html() {
+        let url =
+            translate_internal_url("buffr://settings", newtab, settings).expect("translated");
+        assert_eq!(decode(&url), settings());
+    }
+
+    #[test]
+    fn translates_buffr_settings_subpath_to_settings_html() {
+        // Anything starting with `buffr://settings` routes to settings —
+        // covers future `buffr://settings/engines` etc.
+        let url = translate_internal_url("buffr://settings/engines", newtab, settings)
+            .expect("translated");
+        assert_eq!(decode(&url), settings());
+    }
+
+    #[test]
+    fn external_https_url_returns_none() {
+        assert!(translate_internal_url("https://example.com", newtab, settings).is_none());
+    }
+
+    #[test]
+    fn external_http_url_returns_none() {
+        assert!(translate_internal_url("http://example.com", newtab, settings).is_none());
+    }
+
+    #[test]
+    fn other_scheme_returns_none() {
+        // file://, ftp://, custom schemes — only buffr:// is in our domain.
+        assert!(translate_internal_url("file:///tmp/x.html", newtab, settings).is_none());
+        assert!(translate_internal_url("about:blank", newtab, settings).is_none());
+    }
+
+    #[test]
+    fn default_newtab_html_matches_template() {
+        // Round-trip the embedded template; guards against accidental
+        // re-encoding by a CI that touches line endings.
+        assert_eq!(default_newtab_html(), NEW_TAB_HTML_TEMPLATE.as_bytes());
+    }
+
+    #[test]
+    fn default_settings_html_is_html_document() {
+        // Smoke: settings placeholder is at least a complete document so
+        // engines that try to render it before a provider is wired don't
+        // show the "URL can't be shown" error.
+        let bytes = default_settings_html();
+        let s = std::str::from_utf8(&bytes).expect("settings html is utf-8");
+        assert!(s.starts_with("<!DOCTYPE html>"), "want DOCTYPE, got: {s:.80}");
+        assert!(s.contains("<title>"), "settings html should set a title");
+    }
+
+    #[test]
+    fn translator_invokes_provider_on_each_call() {
+        // Providers must run per-request so a hot-reloaded keymap is
+        // reflected on the next visit. We pass a counting closure.
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        for _ in 0..3 {
+            let _ = translate_internal_url(
+                "buffr://new",
+                || {
+                    calls.set(calls.get() + 1);
+                    newtab()
+                },
+                settings,
+            );
+        }
+        assert_eq!(calls.get(), 3);
+    }
+}
