@@ -10,6 +10,7 @@ homepage = "https://buffr.kryptic.sh"
 authors = ["mxaddict <mxaddict@kryptic.sh>"]
 
 [dependencies]
+base64 = "0.22"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
