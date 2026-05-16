@@ -144,8 +144,7 @@ wrap_app! {
                 "AutofillServerCommunication,\
                  AutofillEnableAccountWalletStorage,\
                  PasswordManagerOnboarding,\
-                 AutofillAddressProfileSavePromptNicknameSupport,\
-                 Vulkan",
+                 AutofillAddressProfileSavePromptNicknameSupport",
             );
             append_switch(command_line, "disable-save-password-bubble");
             // GPU compositing: turn on the page compositor on the GPU even in
