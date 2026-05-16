@@ -267,6 +267,12 @@ pub(crate) enum Command {
         url: String,
         reply: mpsc::SyncSender<Result<TabId, LadybirdError>>,
     },
+    /// Open a tab and insert it at `insert_idx` (clamped to len).
+    OpenTabAt {
+        url: String,
+        insert_idx: usize,
+        reply: mpsc::SyncSender<Result<TabId, LadybirdError>>,
+    },
     CloseTab {
         id: TabId,
         reply: mpsc::SyncSender<Result<bool, LadybirdError>>,
@@ -276,6 +282,11 @@ pub(crate) enum Command {
     },
     CycleTab {
         forward: bool,
+    },
+    /// Move the tab at `from` to `to` (both clamped to current len).
+    MoveTab {
+        from: usize,
+        to: usize,
     },
     Navigate {
         url: String,
@@ -557,6 +568,39 @@ impl Worker {
         self.active_idx = Some(self.tabs.len() - 1);
         self.paint();
         Ok(id)
+    }
+
+    /// Open a tab at `insert_idx` (appended first, then rotated into position).
+    fn open_tab_at(&mut self, url: &str, insert_idx: usize) -> Result<TabId, LadybirdError> {
+        let id = self.open_tab(url)?;
+        let appended = self.tabs.len() - 1;
+        let clamped = insert_idx.min(appended);
+        if clamped != appended {
+            let tab = self.tabs.remove(appended);
+            self.tabs.insert(clamped, tab);
+            self.active_idx = Some(clamped);
+        }
+        self.paint();
+        Ok(id)
+    }
+
+    /// Move tab at `from` to `to` (clamped). Active index follows by TabId.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let len = self.tabs.len();
+        if len == 0 || from >= len || from == to {
+            return;
+        }
+        let clamped_to = to.min(len - 1);
+        if clamped_to == from {
+            return;
+        }
+        let active_id = self.active_idx.and_then(|i| self.tabs.get(i).map(|t| t.id));
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(clamped_to, tab);
+        if let Some(aid) = active_id {
+            self.active_idx = self.tabs.iter().position(|t| t.id == aid);
+        }
+        self.paint();
     }
 
     fn close_tab(&mut self, id: TabId) -> Result<bool, LadybirdError> {
@@ -900,6 +944,13 @@ impl Worker {
             Command::OpenTab { url, reply } => {
                 let _ = reply.send(self.open_tab(&url));
             }
+            Command::OpenTabAt {
+                url,
+                insert_idx,
+                reply,
+            } => {
+                let _ = reply.send(self.open_tab_at(&url, insert_idx));
+            }
             Command::CloseTab { id, reply } => {
                 let _ = reply.send(self.close_tab(id));
             }
@@ -908,6 +959,9 @@ impl Worker {
             }
             Command::CycleTab { forward } => {
                 self.cycle_tab(forward);
+            }
+            Command::MoveTab { from, to } => {
+                self.move_tab(from, to);
             }
             Command::Navigate { url, reply } => {
                 let _ = reply.send(self.navigate(&url));

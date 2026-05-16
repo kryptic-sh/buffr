@@ -63,6 +63,17 @@ use crate::state::{Command, TabCache, WorkerHandle, spawn};
 
 // ── LadybirdEngine ────────────────────────────────────────────────────────────
 
+/// One entry on the recently-closed tab undo stack.
+///
+/// Ladybird tabs are FFI-owned (`cxx::UniquePtr<WebContent>`); only the URL
+/// and original strip position are preserved so `reopen_closed_tab` can
+/// recreate the tab at (or near) its original position.
+#[derive(Debug, Clone)]
+struct ClosedEntry {
+    url: String,
+    original_idx: usize,
+}
+
 /// Ladybird browser engine.
 ///
 /// Implements [`BrowserEngine`] (`Send + Sync`) by delegating all WebContent
@@ -78,6 +89,11 @@ pub struct LadybirdEngine {
     view: SharedOsrViewState,
     /// Cached tab snapshot (Mutex for &self access).
     cache: Mutex<TabCache>,
+    /// Stack of recently-closed tabs (most-recent last).
+    ///
+    /// URL-only because Ladybird tabs are FFI-owned; the worker re-creates
+    /// the WebContent instance from the URL when the tab is reopened.
+    closed_stack: Mutex<Vec<ClosedEntry>>,
     /// System clipboard handle. `None` when hjkl-clipboard fails to init.
     clipboard: Option<std::sync::Arc<hjkl_clipboard::Clipboard>>,
 }
@@ -115,6 +131,7 @@ impl LadybirdEngine {
             frame,
             view,
             cache: Mutex::new(TabCache::default()),
+            closed_stack: Mutex::new(Vec::new()),
             clipboard: hjkl_clipboard::Clipboard::new()
                 .ok()
                 .map(std::sync::Arc::new),
@@ -190,17 +207,53 @@ impl BrowserEngine for LadybirdEngine {
         Ok(id)
     }
 
-    fn open_tab_at(&self, url: &str, _insert_idx: usize) -> Result<TabId, EngineError> {
-        tracing::debug!("ladybird: open_tab_at {url} (insert_idx ignored in Phase B)");
-        self.open_tab(url)
+    fn open_tab_at(&self, url: &str, insert_idx: usize) -> Result<TabId, EngineError> {
+        tracing::debug!(url, insert_idx, "ladybird: open_tab_at");
+        self.worker
+            .call(|reply| Command::OpenTabAt {
+                url: url.to_owned(),
+                insert_idx,
+                reply,
+            })
+            .map_err(EngineError::from)?
+            .map_err(EngineError::from)
     }
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
         tracing::debug!("ladybird: close_tab {id:?}");
-        self.worker
+        // Snapshot current tab list to record URL and position before removal.
+        self.refresh_cache();
+        let (closing_url, closing_idx) = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.summaries
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| s.id == id)
+                    .map(|(i, s)| (s.url.clone(), i))
+            })
+            .unwrap_or_default();
+
+        let result = self
+            .worker
             .call(|reply| Command::CloseTab { id, reply })
             .map_err(EngineError::from)?
-            .map_err(EngineError::from)
+            .map_err(EngineError::from);
+
+        // Push onto closed stack (skip internal-only URLs).
+        if !closing_url.is_empty()
+            && closing_url != "about:blank"
+            && let Ok(mut stack) = self.closed_stack.lock()
+        {
+            stack.push(ClosedEntry {
+                url: closing_url,
+                original_idx: closing_idx,
+            });
+        }
+
+        result
     }
 
     fn close_active(&self) -> Result<bool, EngineError> {
@@ -230,14 +283,29 @@ impl BrowserEngine for LadybirdEngine {
         self.worker.send(Command::CycleTab { forward: false });
     }
 
-    fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::debug!("ladybird: move_tab not implemented in Phase B");
+    fn move_tab(&self, from: usize, to: usize) {
+        tracing::debug!(from, to, "ladybird: move_tab");
+        self.worker.send(Command::MoveTab { from, to });
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "duplicate_active",
-        })
+        tracing::debug!("ladybird: duplicate_active");
+        self.refresh_cache();
+        let url = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.active_idx
+                    .and_then(|i| g.summaries.get(i).map(|s| s.url.clone()))
+            })
+            .unwrap_or_default();
+        let target = if url.is_empty() {
+            "about:blank".to_owned()
+        } else {
+            url
+        };
+        self.open_tab(&target)
     }
 
     fn toggle_pin_active(&self) {
@@ -249,13 +317,19 @@ impl BrowserEngine for LadybirdEngine {
     }
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
-        Err(EngineError::Unimplemented {
-            method: "reopen_closed_tab",
-        })
+        tracing::debug!("ladybird: reopen_closed_tab");
+        let entry = self.closed_stack.lock().ok().and_then(|mut s| s.pop());
+        match entry {
+            None => Ok(None),
+            Some(e) => {
+                let id = self.open_tab_at(&e.url, e.original_idx)?;
+                Ok(Some(id))
+            }
+        }
     }
 
     fn closed_stack_len(&self) -> usize {
-        0
+        self.closed_stack.lock().map(|s| s.len()).unwrap_or(0)
     }
 
     fn active_tab(&self) -> Option<TabSummary> {
