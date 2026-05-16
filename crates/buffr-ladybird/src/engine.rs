@@ -78,6 +78,8 @@ pub struct LadybirdEngine {
     view: SharedOsrViewState,
     /// Cached tab snapshot (Mutex for &self access).
     cache: Mutex<TabCache>,
+    /// System clipboard handle. `None` when hjkl-clipboard fails to init.
+    clipboard: Option<std::sync::Arc<hjkl_clipboard::Clipboard>>,
 }
 
 impl LadybirdEngine {
@@ -113,6 +115,9 @@ impl LadybirdEngine {
             frame,
             view,
             cache: Mutex::new(TabCache::default()),
+            clipboard: hjkl_clipboard::Clipboard::new()
+                .ok()
+                .map(std::sync::Arc::new),
         })
     }
 
@@ -575,6 +580,50 @@ impl BrowserEngine for LadybirdEngine {
     // TODO(devtools): Ladybird has a separate Inspector process, but our FFI is
     // a stub. Leave trait default until the FFI surface is fleshed out.
 
+    // ── Clipboard (Gap 5) ────────────────────────────────────────────────────
+    //
+    // Pure system clipboard via hjkl-clipboard — no FFI to ladybird needed.
+    // Mirrors the firefox-cdp `FfClipboardReader` / `clipboard_handle` pattern.
+
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        let cb = self.clipboard.clone()?;
+        let reader = LadybirdClipboardReader(cb);
+        Some(std::sync::Arc::new(reader))
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        let cb = self.clipboard.as_ref()?;
+        match cb.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::debug!(error = %err, "ladybird: clipboard_text non-utf8");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!(error = %err, "ladybird: clipboard_text read failed");
+                None
+            }
+        }
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        use hjkl_clipboard::{MimeType, Selection};
+        let Some(cb) = self.clipboard.as_ref() else {
+            return false;
+        };
+        match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "ladybird: clipboard_set_text write failed");
+                false
+            }
+        }
+    }
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
@@ -587,6 +636,15 @@ impl BrowserEngine for LadybirdEngine {
         self.worker
             .call(|reply| Command::QueryAnyVideoActive { reply })
             .unwrap_or(false)
+    }
+
+    /// Ladybird phase-C FFI eval is fire-and-forget (no return path); JS media
+    /// probe cannot be wired until the WebContentServer IPC exposes an async
+    /// result channel.  Explicit no-op so the debug message names this backend.
+    ///
+    /// TODO(phase-c): wire JS eval result path once Ladybird IPC stabilises.
+    fn run_media_probe(&self) {
+        tracing::debug!("ladybird: media probe deferred — FFI phase-C eval not yet exposed");
     }
 
     // ── Popup stubs ──────────────────────────────────────────────────────────
@@ -720,8 +778,27 @@ impl BrowserEngine for LadybirdEngine {
     // `on_cursor_change` callback.  Phase B has no cursor tracking.
 
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
-        // Phase B stub: no cursor tracking — return None.
-        // TODO(phase-c): query a SharedCursorState set by on_cursor_change.
+        // ladybird: cursor IPC deferred — FFI phase-C bridge not yet exposed
         None
+    }
+}
+
+// ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
+
+/// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
+/// `ClipboardRead` trait.  Identical in structure to `buffr-cef`'s and
+/// `buffr-firefox-cdp`'s `ClipboardReader` — lives here to avoid cross-crate deps.
+struct LadybirdClipboardReader(std::sync::Arc<hjkl_clipboard::Clipboard>);
+
+impl buffr_engine::ClipboardRead for LadybirdClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        match self.0.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+            Err(err) => {
+                tracing::debug!(error = %err, "ladybird: LadybirdClipboardReader::read_text failed");
+                None
+            }
+        }
     }
 }

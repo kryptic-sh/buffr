@@ -83,6 +83,8 @@ pub struct BlitzEngine {
     view: SharedOsrViewState,
     /// Cached tab snapshot (Mutex for &self access).
     cache: Mutex<TabCache>,
+    /// System clipboard handle. `None` when hjkl-clipboard fails to init.
+    clipboard: Option<Arc<hjkl_clipboard::Clipboard>>,
 }
 
 /// Cached snapshot of the worker's tab list.
@@ -125,6 +127,7 @@ impl BlitzEngine {
             frame,
             view,
             cache: Mutex::new(TabCache::default()),
+            clipboard: hjkl_clipboard::Clipboard::new().ok().map(Arc::new),
         })
     }
 
@@ -505,6 +508,12 @@ impl BrowserEngine for BlitzEngine {
         false
     }
 
+    fn run_media_probe(&self) {
+        // No-op: blitz has no JS engine to query `document.querySelectorAll('video,audio')`,
+        // so there is nothing to probe. any_video_active always returns false.
+        tracing::debug!("blitz: media probe is no-op — no media subsystem");
+    }
+
     // ── Popup stubs ──────────────────────────────────────────────────────────
 
     fn popup_queue(&self) -> PopupQueue {
@@ -676,9 +685,56 @@ impl BrowserEngine for BlitzEngine {
     // ── Cursor stub ───────────────────────────────────────────────────────────
 
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
-        // TODO: Blitz does not track hover/cursor state yet. Return None until
-        // blitz-traits exposes a cursor-change callback in the render pipeline.
+        // blitz lacks public hover cursor API; default no-op stands.
+        // blitz-traits 0.3.0-alpha.2 exposes `BlitzShell::set_cursor(CursorIcon)`
+        // but only as a *callback from* blitz into the host shell — there is no
+        // public API on `HtmlDocument` or `BaseDocument` to *read* the current
+        // hovered element's computed cursor style from the engine thread.
         None
+    }
+
+    // ── Clipboard ─────────────────────────────────────────────────────────────
+    //
+    // Uses `hjkl-clipboard` (system clipboard), giving blitz real copy/paste
+    // even though its JS substrate is absent.
+
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        let cb = self.clipboard.clone()?;
+        let reader = BlitzClipboardReader(cb);
+        Some(Arc::new(reader))
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        let cb = self.clipboard.as_ref()?;
+        match cb.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::debug!(error = %err, "blitz: clipboard_text non-utf8");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!(error = %err, "blitz: clipboard_text read failed");
+                None
+            }
+        }
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        use hjkl_clipboard::{MimeType, Selection};
+        let Some(cb) = self.clipboard.as_ref() else {
+            return false;
+        };
+        match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "blitz: clipboard_set_text write failed");
+                false
+            }
+        }
     }
 
     // ── IME composition (Phase 8d, #86) ──────────────────────────────────────
@@ -761,6 +817,26 @@ impl BrowserEngine for BlitzEngine {
                     action = ?other,
                     "blitz: dispatch — action not yet implemented for this backend (no-op)"
                 );
+            }
+        }
+    }
+}
+
+// ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
+
+/// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
+/// `ClipboardRead` trait. Mirrors the same wrapper in `buffr-firefox-cdp`
+/// (`FfClipboardReader`) and `buffr-cef` (`ClipboardReader`).
+struct BlitzClipboardReader(Arc<hjkl_clipboard::Clipboard>);
+
+impl buffr_engine::ClipboardRead for BlitzClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        match self.0.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+            Err(err) => {
+                tracing::debug!(error = %err, "blitz: BlitzClipboardReader::read_text failed");
+                None
             }
         }
     }
