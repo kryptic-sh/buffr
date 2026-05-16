@@ -81,6 +81,19 @@ struct FfTab {
     zoom: f64,
 }
 
+// ── Closed-tab undo stack entry ───────────────────────────────────────────────
+
+/// One entry on the recently-closed tab undo stack.
+///
+/// `original_idx` is the position the tab occupied in the strip at the moment
+/// it was closed. `reopen_closed_tab` inserts back at that position (clamped
+/// to the current strip length) so the user sees the tab return to where it was.
+#[derive(Debug, Clone)]
+struct ClosedEntry {
+    url: String,
+    original_idx: usize,
+}
+
 // ── Navigation-history cache ──────────────────────────────────────────────────
 
 /// Cached `Page.getNavigationHistory` result for a single session.
@@ -115,11 +128,12 @@ struct EngineState {
     debug_port: u16,
     /// Maps `target_id → original_url` for tabs navigated via internal schemes.
     original_urls: HashMap<String, String>,
-    /// Stack of URLs from recently closed tabs (most-recent last).
+    /// Stack of recently closed tabs (most-recent last).
     ///
-    /// Pushed by `close_tab`; popped by `reopen_closed_tab`. Mirrors the
-    /// browser's "recently closed" undo stack.
-    closed_stack: Vec<String>,
+    /// Pushed by `close_tab` with the URL and original strip position; popped
+    /// by `reopen_closed_tab` which inserts the tab back at its original index
+    /// (clamped to current strip length).
+    closed_stack: Vec<ClosedEntry>,
 }
 
 impl EngineState {
@@ -789,15 +803,17 @@ impl BrowserEngine for FirefoxCdpEngine {
 
     fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
         tracing::debug!(%id, "firefox-cdp: close_tab");
-        let (target_id, session_id, was_active, closing_url) = {
+        let (target_id, session_id, was_active, closing_url, closing_idx) = {
             let state = self.lock_state();
             let tab = state.tab_by_id(id).ok_or(EngineError::TabNotFound(id))?;
             let url = display_url_for(tab, &state.original_urls).to_owned();
+            let idx = state.tabs.iter().position(|t| t.id == id).unwrap_or(0);
             (
                 tab.target_id.clone(),
                 tab.session_id.clone(),
                 state.active == Some(id),
                 url,
+                idx,
             )
         };
 
@@ -824,10 +840,13 @@ impl BrowserEngine for FirefoxCdpEngine {
         state.tabs.retain(|t| t.id != id);
         state.original_urls.remove(&target_id);
 
-        // Push the closing URL onto the reopen stack (skip internal-only URLs).
+        // Push the closing tab onto the reopen stack (skip internal-only URLs).
         if !closing_url.is_empty() && closing_url != "about:blank" && closing_url != "about:newtab"
         {
-            state.closed_stack.push(closing_url);
+            state.closed_stack.push(ClosedEntry {
+                url: closing_url,
+                original_idx: closing_idx,
+            });
         }
 
         if was_active {
@@ -912,8 +931,21 @@ impl BrowserEngine for FirefoxCdpEngine {
         self.select_tab(id);
     }
 
-    fn move_tab(&self, _from: usize, _to: usize) {
-        tracing::warn!("firefox-cdp: move_tab not implemented in Phase B");
+    fn move_tab(&self, from: usize, to: usize) {
+        tracing::debug!(from, to, "firefox-cdp: move_tab");
+        let mut state = self.lock_state();
+        let len = state.tabs.len();
+        if len == 0 || from >= len || from == to {
+            return;
+        }
+        let clamped_to = to.min(len - 1);
+        if clamped_to == from {
+            return;
+        }
+        let tab = state.tabs.remove(from);
+        state.tabs.insert(clamped_to, tab);
+        // `active` is a TabId, not a positional index, so no fixup needed —
+        // `active_index()` recomputes position via `iter().position()`.
     }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
@@ -923,8 +955,13 @@ impl BrowserEngine for FirefoxCdpEngine {
             let tab = state.active_tab().ok_or(EngineError::NoActiveTab)?;
             display_url_for(tab, &state.original_urls).to_owned()
         };
+        let target = if url.is_empty() {
+            "about:blank".to_owned()
+        } else {
+            url
+        };
         // Open as a new foreground tab at the same URL.
-        self.open_tab_internal(&url, true, None)
+        self.open_tab_internal(&target, true, None)
     }
 
     fn toggle_pin_active(&self) {
@@ -937,14 +974,15 @@ impl BrowserEngine for FirefoxCdpEngine {
 
     fn reopen_closed_tab(&self) -> Result<Option<TabId>, EngineError> {
         tracing::debug!("firefox-cdp: reopen_closed_tab");
-        let url = {
+        let entry = {
             let mut state = self.lock_state();
             state.closed_stack.pop()
         };
-        match url {
+        match entry {
             None => Ok(None),
-            Some(u) => {
-                let tab_id = self.open_tab_internal(&u, true, None)?;
+            Some(e) => {
+                // Reopen at original position so the tab returns to where it was.
+                let tab_id = self.open_tab_internal(&e.url, true, Some(e.original_idx))?;
                 Ok(Some(tab_id))
             }
         }
