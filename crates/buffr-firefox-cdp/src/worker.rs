@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -168,6 +169,8 @@ pub fn run(
     favicon_sink: FaviconSink,
     hint_sink: HintEventSink,
     popup_queue: PopupQueue,
+    video_active: Arc<AtomicBool>,
+    cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
 ) {
     let mut pending: HashMap<u64, PendingEntry> = HashMap::new();
     let mut active_session: Option<String> = None;
@@ -324,6 +327,8 @@ pub fn run(
                         &favicon_sink,
                         &hint_sink,
                         &popup_queue,
+                        &video_active,
+                        &cursor_change,
                     );
                 }
             },
@@ -346,6 +351,8 @@ fn dispatch_message(
     favicon_sink: &FaviconSink,
     hint_sink: &HintEventSink,
     popup_queue: &PopupQueue,
+    video_active: &Arc<AtomicBool>,
+    cursor_change: &Arc<Mutex<Option<(i32, u32)>>>,
 ) {
     // Command response — may be a screenshot reply or a normal reply.
     if let Some(id) = msg.id {
@@ -525,14 +532,32 @@ fn dispatch_message(
             }
         }
         "Runtime.consoleAPICalled" => {
-            // Hint-mode IPC: JS injected by enter_hint_mode emits
-            // `console.log("__buffr_hint__:" + JSON.stringify({...}))`.
+            // Sentinel IPC: JS injected by buffr emits sentinel lines via
+            // `console.log`. We dispatch on the prefix:
+            //   `__buffr_hint__:`   — hint-mode events (JSON payload)
+            //   `__buffr_media__:`  — media probe result ("true"/"false")
+            //   `__buffr_cursor__:` — cursor CSS name
             if let Some(ref params) = msg.params
                 && let Some(args) = params.get("args").and_then(|v| v.as_array())
             {
                 for arg in args {
                     let value_str = arg.get("value").and_then(|v| v.as_str()).unwrap_or("");
                     if value_str.is_empty() {
+                        continue;
+                    }
+                    if let Some(rest) = value_str.strip_prefix("__buffr_media__:") {
+                        let active = rest.trim() == "true";
+                        tracing::debug!(active, "firefox-cdp: media probe sentinel");
+                        video_active.store(active, Ordering::Relaxed);
+                        continue;
+                    }
+                    if let Some(css_cursor) = value_str.strip_prefix("__buffr_cursor__:") {
+                        let raw = css_cursor_to_cef_raw(css_cursor.trim());
+                        tracing::debug!(css_cursor, raw, "firefox-cdp: cursor sentinel");
+                        // browser_id 0 — no per-tab integer ID in CDP backend
+                        if let Ok(mut guard) = cursor_change.lock() {
+                            *guard = Some((0, raw));
+                        }
                         continue;
                     }
                     match parse_console_event(value_str) {
@@ -555,6 +580,29 @@ fn dispatch_message(
             }
         }
         _ => {}
+    }
+}
+
+// ── CSS cursor → CEF raw kind ─────────────────────────────────────────────────
+
+/// Map a CSS cursor name to its CEF `cef_cursor_type_t` integer value.
+///
+/// CEF integer mapping (matching `cef_cursor_type_t` in `include/internal/cef_types.h`):
+/// 0=default, 1=text, 6=crosshair, 8=help, 9=move, 12=not-allowed,
+/// 13=wait, 28=pointer, 34=grab, 35=grabbing.
+pub fn css_cursor_to_cef_raw(name: &str) -> u32 {
+    match name {
+        "text" | "vertical-text" => 1,
+        "pointer" => 28,
+        "default" => 0,
+        "wait" | "progress" => 13,
+        "crosshair" => 6,
+        "move" | "all-scroll" => 9,
+        "not-allowed" | "no-drop" => 12,
+        "grab" => 34,
+        "grabbing" => 35,
+        "help" => 8,
+        _ => 0,
     }
 }
 

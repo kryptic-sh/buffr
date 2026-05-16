@@ -216,6 +216,15 @@ pub struct FirefoxCdpEngine {
     hint_sink: HintEventSink,
     /// Active hint session. `None` when hint mode is off.
     hint_session: Mutex<Option<HintSession>>,
+    /// System clipboard handle. `None` when hjkl-clipboard fails to init.
+    clipboard: Option<std::sync::Arc<hjkl_clipboard::Clipboard>>,
+    /// Set to `true` by `run_media_probe` when `__buffr_media__:true` is
+    /// scraped from the console; cleared on `__buffr_media__:false`.
+    video_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// One-slot mailbox for cursor changes. Written by the worker when
+    /// `__buffr_cursor__:<css-cursor>` is scraped; drained by
+    /// `take_cursor_change`. Stores `(browser_id, raw_kind)`.
+    cursor_change: std::sync::Arc<Mutex<Option<(i32, u32)>>>,
 }
 
 impl FirefoxCdpEngine {
@@ -290,6 +299,12 @@ impl FirefoxCdpEngine {
         let popup_queue = new_popup_queue();
         let worker_popup_queue = Arc::clone(&popup_queue);
 
+        let video_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cursor_change: std::sync::Arc<Mutex<Option<(i32, u32)>>> =
+            std::sync::Arc::new(Mutex::new(None));
+        let worker_video_active = std::sync::Arc::clone(&video_active);
+        let worker_cursor_change = std::sync::Arc::clone(&cursor_change);
+
         let worker = std::thread::Builder::new()
             .name("firefox-cdp-worker".to_owned())
             .spawn(move || {
@@ -305,6 +320,8 @@ impl FirefoxCdpEngine {
                     worker_favicon,
                     worker_hint_sink,
                     worker_popup_queue,
+                    worker_video_active,
+                    worker_cursor_change,
                 )
             })
             .map_err(FirefoxError::SpawnFailed)?;
@@ -333,6 +350,11 @@ impl FirefoxCdpEngine {
                 .expect("DEFAULT_HINT_ALPHABET is always valid"),
             hint_sink,
             hint_session: Mutex::new(None),
+            clipboard: hjkl_clipboard::Clipboard::new()
+                .ok()
+                .map(std::sync::Arc::new),
+            video_active,
+            cursor_change,
         })
     }
 
@@ -467,6 +489,26 @@ impl FirefoxCdpEngine {
         setup_cmd(self, "Page.enable", serde_json::json!({}));
         // Enable Runtime domain for Runtime.evaluate.
         setup_cmd(self, "Runtime.enable", serde_json::json!({}));
+
+        // Inject cursor-change listener: emits `__buffr_cursor__:<css>` via
+        // console.log on every mousemove where the cursor CSS value changes.
+        // The worker scrapes this sentinel in Runtime.consoleAPICalled.
+        setup_cmd(
+            self,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({
+                "source": "\
+                    let __buffr_last_cursor = null;\
+                    document.addEventListener('mousemove', function(e) {\
+                        const c = getComputedStyle(e.target).cursor;\
+                        if (c !== __buffr_last_cursor) {\
+                            __buffr_last_cursor = c;\
+                            console.log('__buffr_cursor__:' + c);\
+                        }\
+                    }, true);\
+                "
+            }),
+        );
 
         // Enable lifecycle events for loading state tracking.
         setup_cmd(
@@ -1524,7 +1566,20 @@ impl BrowserEngine for FirefoxCdpEngine {
     }
 
     fn any_video_active(&self) -> bool {
-        false
+        self.video_active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn run_media_probe(&self) {
+        // Evaluate JS that checks for active media and emits a
+        // `__buffr_media__:true/false` sentinel via console.log.
+        // The worker scrapes this sentinel in Runtime.consoleAPICalled and
+        // flips the `video_active` atomic.
+        let js = "(() => { \
+            const active = Array.from(document.querySelectorAll('video,audio'))\
+              .some(el => !el.paused && !el.ended && el.currentTime > 0); \
+            console.log('__buffr_media__:' + active); \
+        })();";
+        let _ = self.run_js(js);
     }
 
     fn popup_queue(&self) -> PopupQueue {
@@ -2104,13 +2159,15 @@ impl BrowserEngine for FirefoxCdpEngine {
 
     // ── Gap 3: Cursor change ──────────────────────────────────────────────────
     //
-    // TODO: CDP has no native cursor-change event for Firefox.  A future
-    // implementation could inject a `mousemove` listener that reads
-    // `document.documentElement.style.cursor` and sends it back via a
-    // sentinel `console.log`, but that approach is complex and fragile.
-    // Returning `None` here matches the trait default and is safe.
+    // JS mousemove listener (injected via Page.addScriptToEvaluateOnNewDocument
+    // in open_tab_internal) emits `__buffr_cursor__:<css-cursor>` via console.log.
+    // The worker scrapes this in Runtime.consoleAPICalled and writes into
+    // `cursor_change`. We drain the slot here.
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
-        None
+        self.cursor_change
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 
     // ── Gap 4: OSR sleep via Page.setWebLifecycleState ────────────────────────
@@ -2138,29 +2195,65 @@ impl BrowserEngine for FirefoxCdpEngine {
 
     // ── Gap 5: Clipboard ──────────────────────────────────────────────────────
     //
-    // `clipboard_set_text`: inject `navigator.clipboard.writeText` via JS.
-    // `clipboard_text`: async-only CDP path, no sync return — stub with TODO.
+    // Uses `hjkl-clipboard` (system clipboard) mirroring the CEF backend.
 
-    fn clipboard_set_text(&self, text: &str) -> bool {
-        let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
-        let js = format!("navigator.clipboard.writeText({text_json})");
-        match self.run_js(&js) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::debug!(error = %e, "firefox-cdp: clipboard_set_text JS injection failed");
-                false
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        let cb = self.clipboard.clone()?;
+        let reader = FfClipboardReader(cb);
+        Some(std::sync::Arc::new(reader))
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        let cb = self.clipboard.as_ref()?;
+        match cb.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::debug!(error = %err, "firefox-cdp: clipboard_text non-utf8");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!(error = %err, "firefox-cdp: clipboard_text read failed");
+                None
             }
         }
     }
 
-    fn clipboard_text(&self) -> Option<String> {
-        // TODO: `navigator.clipboard.readText()` is async and CDP's
-        // Runtime.evaluate cannot synchronously return a Promise result
-        // without `awaitPromise: true` + a blocking round-trip, which
-        // risks deadlocking the engine thread.  A future implementation
-        // could use Runtime.evaluate with `awaitPromise: true` and a
-        // dedicated timeout, but that is out of scope for Phase B.
-        None
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        use hjkl_clipboard::{MimeType, Selection};
+        let Some(cb) = self.clipboard.as_ref() else {
+            return false;
+        };
+        match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "firefox-cdp: clipboard_set_text write failed");
+                false
+            }
+        }
+    }
+}
+
+// ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
+
+/// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
+/// `ClipboardRead` trait. Identical in structure to `buffr-cef`'s
+/// `ClipboardReader` but lives here to avoid a cross-crate dependency.
+struct FfClipboardReader(std::sync::Arc<hjkl_clipboard::Clipboard>);
+
+impl buffr_engine::ClipboardRead for FfClipboardReader {
+    fn read_text(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        match self.0.get(Selection::Clipboard, MimeType::Text) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+            Err(err) => {
+                tracing::debug!(error = %err, "firefox-cdp: FfClipboardReader::read_text failed");
+                None
+            }
+        }
     }
 }
 
