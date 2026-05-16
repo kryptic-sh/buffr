@@ -205,10 +205,16 @@ static WPEView *buffr_display_create_view_vfunc(WPEDisplay *display) {
 }
 
 static WPEToplevel *buffr_display_create_toplevel_vfunc(WPEDisplay *display, guint max_views) {
-    return WPE_TOPLEVEL(g_object_new(BUFFR_TYPE_TOPLEVEL,
-                                      "display", display,
-                                      "max-views", max_views,
-                                      NULL));
+    BuffrDisplay *self = BUFFR_DISPLAY(display);
+    WPEToplevel *tl = WPE_TOPLEVEL(g_object_new(BUFFR_TYPE_TOPLEVEL,
+                                                 "display", display,
+                                                 "max-views", max_views,
+                                                 NULL));
+    /* WPE's default toplevel is 1024x768; mark it sized to the host
+     * viewport so WebKit paints at the dims buffr-app expects. */
+    if (self->viewport_w > 0 && self->viewport_h > 0)
+        wpe_toplevel_resize(tl, self->viewport_w, self->viewport_h);
+    return tl;
 }
 
 static gpointer buffr_display_get_egl_vfunc(WPEDisplay *display, GError **error) {

@@ -182,8 +182,20 @@ impl TabEntry {
         unsafe { webkit_web_view_load_uri(self.web_view, c.as_ptr()) };
     }
 
-    /// Resize. No-op until the platform path is wired.
-    pub(crate) fn resize(&self, _width: u32, _height: u32) {}
+    /// Resize the toplevel that owns this tab's view. WebKit propagates the
+    /// new size through to the WebProcess via our resize_vfunc → resized →
+    /// view_resized chain.
+    pub(crate) fn resize(&self, width: u32, height: u32) {
+        if self.wpe_view.is_null() {
+            return;
+        }
+        unsafe {
+            let tl = wpe_view_get_toplevel(self.wpe_view);
+            if !tl.is_null() {
+                wpe_toplevel_resize(tl, width as i32, height as i32);
+            }
+        }
+    }
 
     /// Current URL from the WebView (may lag by one GLib tick).
     pub(crate) fn current_url(&self) -> String {
