@@ -36,6 +36,7 @@ pub mod engine;
 pub mod error;
 pub mod input;
 pub(crate) mod render;
+pub(crate) mod shell;
 pub mod worker;
 
 pub use backend::BlitzBackend;

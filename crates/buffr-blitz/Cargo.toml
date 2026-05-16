@@ -47,5 +47,7 @@ anyrender_vello_cpu = "0.10"
 # Input event translation — versions must match blitz-traits 0.3.0-alpha.2.
 keyboard-types = "0.7"
 smol_str = "0.3"
+# CursorIcon type used by ShellProvider::set_cursor — must match blitz-traits' dep.
+cursor-icon = "1.2"
 # Synchronous HTTP fetcher for initial HTML load.
 ureq.workspace = true

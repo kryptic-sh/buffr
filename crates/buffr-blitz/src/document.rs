@@ -4,9 +4,11 @@
 //! plus navigation history so `go_back`/`go_forward` work without any
 //! browser-side history API.
 
+use std::sync::Arc;
+
 use blitz_dom::DocumentConfig;
 use blitz_html::HtmlDocument;
-use blitz_traits::shell::{ColorScheme, Viewport};
+use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 
 use buffr_engine::{TabId, TabSummary};
 
@@ -36,6 +38,8 @@ pub(crate) struct BlitzTab {
     /// [0.25, 5.0]. Read by the worker's paint() to combine with the
     /// device pixel ratio at render time.
     pub zoom: f64,
+    /// Shell provider kept so `load` can re-register it on each document rebuild.
+    shell: Arc<dyn ShellProvider>,
     /// Back-navigation stack (oldest → newest, current NOT included).
     back_stack: Vec<HistEntry>,
     /// Forward-navigation stack (popped on navigate, refilled by go_back).
@@ -45,10 +49,19 @@ pub(crate) struct BlitzTab {
 impl BlitzTab {
     /// Open a new tab at `url`.  Fetches HTML synchronously via `ureq`;
     /// falls back to an error page on network failure.
-    pub(crate) fn open(id: TabId, url: &str, width: u32, height: u32) -> Result<Self, BlitzError> {
+    ///
+    /// `shell` is registered as the `DocumentConfig::shell_provider` so Blitz
+    /// calls `ShellProvider::set_cursor` on pointer-move events.
+    pub(crate) fn open(
+        id: TabId,
+        url: &str,
+        width: u32,
+        height: u32,
+        shell: Arc<dyn ShellProvider>,
+    ) -> Result<Self, BlitzError> {
         tracing::info!("blitz: open tab {id} → {url}");
         let html = fetch_html(url);
-        let doc = make_doc(&html, url, width, height);
+        let doc = make_doc(&html, url, width, height, Arc::clone(&shell));
         let title = extract_title(&doc);
         Ok(BlitzTab {
             id,
@@ -57,6 +70,7 @@ impl BlitzTab {
             title,
             is_loading: false,
             zoom: 1.0,
+            shell,
             back_stack: Vec::new(),
             fwd_stack: Vec::new(),
         })
@@ -170,7 +184,7 @@ impl BlitzTab {
         self.is_loading = true;
         self.url = url.to_owned();
         let html = fetch_html(url);
-        self.doc = make_doc(&html, url, width, height);
+        self.doc = make_doc(&html, url, width, height, Arc::clone(&self.shell));
         self.title = extract_title(&self.doc);
         self.is_loading = false;
         tracing::debug!("blitz: tab {} loaded '{}'", self.id, self.title);
@@ -233,11 +247,22 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Build and lay out a fresh `HtmlDocument`.
-pub(crate) fn make_doc(html: &str, base_url: &str, width: u32, height: u32) -> HtmlDocument {
+///
+/// `shell` is registered as `DocumentConfig::shell_provider` so Blitz calls
+/// `ShellProvider::set_cursor` on pointer events, enabling cursor-change
+/// capture via the push-model callback.
+pub(crate) fn make_doc(
+    html: &str,
+    base_url: &str,
+    width: u32,
+    height: u32,
+    shell: Arc<dyn ShellProvider>,
+) -> HtmlDocument {
     let vp = Viewport::new(width, height, 1.0, ColorScheme::Light);
     let config = DocumentConfig {
         viewport: Some(vp),
         base_url: Some(base_url.to_owned()),
+        shell_provider: Some(shell),
         ..Default::default()
     };
     let mut doc = HtmlDocument::from_html(html, config);

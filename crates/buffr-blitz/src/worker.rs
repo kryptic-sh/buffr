@@ -20,11 +20,13 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use blitz_dom::Document;
+use blitz_traits::shell::ShellProvider;
 
 use crate::document::BlitzTab;
 use crate::error::BlitzError;
 use crate::input::BlitzInputEvent;
 use crate::render::{render_doc_into_frame, write_white_fill};
+use crate::shell::BuffrBlitzShell;
 
 // ── Tab snapshot ──────────────────────────────────────────────────────────────
 
@@ -177,10 +179,19 @@ struct Worker {
     view: SharedOsrViewState,
     width: u32,
     height: u32,
+    /// Shell provider shared with all tabs; receives cursor-change callbacks
+    /// from Blitz's pointer-event processing.
+    shell: Arc<dyn ShellProvider>,
 }
 
 impl Worker {
-    fn new(frame: SharedOsrFrame, view: SharedOsrViewState, width: u32, height: u32) -> Self {
+    fn new(
+        frame: SharedOsrFrame,
+        view: SharedOsrViewState,
+        width: u32,
+        height: u32,
+        shell: Arc<dyn ShellProvider>,
+    ) -> Self {
         Worker {
             tabs: Vec::new(),
             active_idx: None,
@@ -189,6 +200,7 @@ impl Worker {
             view,
             width,
             height,
+            shell,
         }
     }
 
@@ -205,7 +217,7 @@ impl Worker {
     fn open_tab(&mut self, url: &str) -> Result<TabId, BlitzError> {
         let id = self.next_tab_id();
         tracing::info!("blitz worker: open_tab {id} → {url}");
-        let tab = BlitzTab::open(id, url, self.width, self.height)?;
+        let tab = BlitzTab::open(id, url, self.width, self.height, Arc::clone(&self.shell))?;
         self.tabs.push(tab);
         self.active_idx = Some(self.tabs.len() - 1);
         self.paint();
@@ -514,6 +526,7 @@ pub(crate) fn spawn(
     height: u32,
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
+    shell: Arc<BuffrBlitzShell>,
 ) -> Result<WorkerHandle, BlitzError> {
     let (tx, rx) = mpsc::sync_channel::<Command>(64);
     let initial_url = initial_url.to_owned();
@@ -527,7 +540,14 @@ pub(crate) fn spawn(
             // engine side sees `Disconnected` and reports a misleading
             // "worker timeout" via recv_timeout's error mapping.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut worker = Worker::new(Arc::clone(&frame), Arc::clone(&view), width, height);
+                let shell_dyn: Arc<dyn ShellProvider> = shell;
+                let mut worker = Worker::new(
+                    Arc::clone(&frame),
+                    Arc::clone(&view),
+                    width,
+                    height,
+                    shell_dyn,
+                );
                 if let Err(e) = worker.open_tab(&initial_url) {
                     tracing::error!("blitz worker: failed to open initial tab: {e}");
                 }

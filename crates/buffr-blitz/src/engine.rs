@@ -64,6 +64,7 @@ use crate::input::{
     neutral_click_to_blitz, neutral_key_to_blitz, neutral_leave_to_blitz, neutral_move_to_blitz,
     neutral_scroll_to_blitz,
 };
+use crate::shell::BuffrBlitzShell;
 use crate::worker::{Command, WorkerHandle, spawn};
 
 // ── BlitzEngine ───────────────────────────────────────────────────────────────
@@ -101,6 +102,9 @@ pub struct BlitzEngine {
     closed_stack: Mutex<Vec<ClosedEntry>>,
     /// System clipboard handle. `None` when hjkl-clipboard fails to init.
     clipboard: Option<Arc<hjkl_clipboard::Clipboard>>,
+    /// Cursor slot written by [`BuffrBlitzShell::set_cursor`] and drained by
+    /// [`take_cursor_change`](BlitzEngine::take_cursor_change).
+    cursor_change: Arc<Mutex<Option<(i32, u32)>>>,
 }
 
 /// Cached snapshot of the worker's tab list.
@@ -123,12 +127,21 @@ impl BlitzEngine {
             Arc::new(v)
         };
 
+        // Cursor slot shared between BuffrBlitzShell (written on worker thread by
+        // Blitz's push-model set_cursor callback) and take_cursor_change (drained
+        // on the engine thread).
+        let cursor_change: Arc<Mutex<Option<(i32, u32)>>> = Arc::new(Mutex::new(None));
+        let shell = Arc::new(BuffrBlitzShell {
+            cursor: Arc::clone(&cursor_change),
+        });
+
         let worker = spawn(
             options.initial_url,
             width,
             height,
             Arc::clone(&frame),
             Arc::clone(&view),
+            shell,
         )?;
 
         tracing::info!(
@@ -145,6 +158,7 @@ impl BlitzEngine {
             cache: Mutex::new(TabCache::default()),
             closed_stack: Mutex::new(Vec::new()),
             clipboard: hjkl_clipboard::Clipboard::new().ok().map(Arc::new),
+            cursor_change,
         })
     }
 
@@ -756,15 +770,17 @@ impl BrowserEngine for BlitzEngine {
         tracing::warn!("blitz: run_edit_focus unsupported (read-only render, no JS engine)");
     }
 
-    // ── Cursor stub ───────────────────────────────────────────────────────────
+    // ── Cursor ────────────────────────────────────────────────────────────────
+    //
+    // Blitz drives cursor changes via the `ShellProvider::set_cursor` push
+    // callback.  `BuffrBlitzShell` (registered in `DocumentConfig::shell_provider`
+    // at tab-open time) writes `(browser_id=0, cef_kind)` into `cursor_change`
+    // whenever the hovered element's computed CSS `cursor` property changes.
+    // `take_cursor_change` drains that slot once per call, consistent with how
+    // CEF backends surface cursor updates.
 
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
-        // blitz lacks public hover cursor API; default no-op stands.
-        // blitz-traits 0.3.0-alpha.2 exposes `BlitzShell::set_cursor(CursorIcon)`
-        // but only as a *callback from* blitz into the host shell — there is no
-        // public API on `HtmlDocument` or `BaseDocument` to *read* the current
-        // hovered element's computed cursor style from the engine thread.
-        None
+        self.cursor_change.lock().ok().and_then(|mut g| g.take())
     }
 
     // ── Clipboard ─────────────────────────────────────────────────────────────
