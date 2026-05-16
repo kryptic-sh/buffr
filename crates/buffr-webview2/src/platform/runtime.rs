@@ -118,6 +118,7 @@ impl TabEntry {
     /// obtain the `ICoreWebView2`, wire all events, then trigger the initial
     /// navigation.
     #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: TabId,
         url: &str,
@@ -553,11 +554,11 @@ impl TabEntry {
         // SAFETY: add_DownloadStarting is an STA COM method on `wv4`.
         // The closure captures only Send types (Arc<Downloads>, DownloadNoticeQueue)
         // and is invoked on the STA thread by WebView2.
-        if let (Some(ref dl_store), Some(ref dl_queue)) = (downloads, notice_queue) {
-            if let Ok(wv4) = windows::core::Interface::cast::<
+        if let (Some(ref dl_store), Some(ref dl_queue)) = (downloads, notice_queue)
+            && let Ok(wv4) = windows::core::Interface::cast::<
                 webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4,
             >(&webview)
-            {
+        {
                 use webview2_com::DownloadStartingEventHandler;
                 use webview2_com::Microsoft::Web::WebView2::Win32::{
                     COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,

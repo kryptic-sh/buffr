@@ -708,12 +708,6 @@ pub(crate) mod macos {
             /// Called when WebKit decides a navigation response should be a download.
             /// We install `BuffrDownloadDelegate` so the file is saved and recorded.
             ///
-            /// Feature-gated: requires WKDownload + WKNavigationResponse + objc2-app-kit.
-            #[cfg(all(
-                feature = "WKDownload",
-                feature = "WKNavigationResponse",
-                feature = "objc2-app-kit"
-            ))]
             #[cfg(target_os = "macos")]
             #[unsafe(method(webView:navigationResponse:didBecomeDownload:))]
             #[allow(non_snake_case)]
@@ -1208,7 +1202,6 @@ pub(crate) mod macos {
 
         unsafe impl WKDownloadDelegate for BuffrDownloadDelegate {
             /// Required — decide where to save the download.
-            #[cfg(all(feature = "WKDownload", feature = "block2"))]
             #[unsafe(method(download:decideDestinationUsingResponse:suggestedFilename:completionHandler:))]
             #[allow(non_snake_case)]
             unsafe fn download_decideDestinationUsingResponse_suggestedFilename_completionHandler(
@@ -1280,7 +1273,6 @@ pub(crate) mod macos {
                 }
             }
 
-            #[cfg(feature = "WKDownload")]
             #[unsafe(method(downloadDidFinish:))]
             #[allow(non_snake_case)]
             unsafe fn downloadDidFinish(&self, _download: &WKDownload) {
@@ -1299,7 +1291,6 @@ pub(crate) mod macos {
                 }
             }
 
-            #[cfg(feature = "WKDownload")]
             #[unsafe(method(download:didFailWithError:resumeData:))]
             #[allow(non_snake_case)]
             unsafe fn download_didFailWithError_resumeData(

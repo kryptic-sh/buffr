@@ -530,10 +530,11 @@ impl StaRuntime {
             let tab = self.tabs.remove(appended_idx);
             self.tabs.insert(clamped, tab);
             // Fix active_idx: shift indices in [clamped, appended_idx) up by one.
-            if let Some(a) = self.active_idx {
-                if a >= clamped && a < appended_idx {
-                    self.active_idx = Some(a + 1);
-                }
+            if let Some(a) = self.active_idx
+                && a >= clamped
+                && a < appended_idx
+            {
+                self.active_idx = Some(a + 1);
             }
             // New tab is at clamped; make it active.
             self.active_idx = Some(clamped);
