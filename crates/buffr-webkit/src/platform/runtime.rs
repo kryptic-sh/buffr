@@ -460,17 +460,9 @@ impl TabEntry {
         unsafe { webkit_web_view_is_playing_audio(self.web_view) != 0 }
     }
 
-    /// Mark the WPEView visible (active) or hidden (background).
-    ///
-    /// Hidden views stop scheduling render-buffer commits — without this,
-    /// inactive WebViews keep rendering and our ViewCtx gate has to drop
-    /// every paint. Setting visible(true) on activation triggers WebKit to
-    /// schedule a fresh paint of the current page, which is what makes
-    /// select_tab actually show the new tab's pixels (otherwise WebKit
-    /// has no reason to re-render a page whose DOM hasn't changed since
-    /// the last paint, and the renderer stays on the loading animation
-    /// waiting for a needs_fresh frame that never arrives).
-    pub(crate) fn set_visible(&self, visible: bool) {
+    /// Hide this tab's WPEView. The view stops scheduling render-buffer
+    /// commits so inactive tabs don't clobber the shared OsrFrame.
+    pub(crate) fn hide(&self) {
         if self.wpe_view.is_null() {
             return;
         }
@@ -478,8 +470,43 @@ impl TabEntry {
         // call is thread-bound to the worker, which is where TabEntry
         // is mutated.
         unsafe {
-            wpe_view_set_visible(self.wpe_view, visible as gboolean);
+            wpe_view_set_visible(self.wpe_view, 0);
         }
+    }
+
+    /// Show this tab's WPEView and force a fresh repaint.
+    ///
+    /// `wpe_view_set_visible(true)` alone does not reliably cause WPE to
+    /// emit a new `render_buffer` when the page DOM hasn't changed —
+    /// WebKit's compositor only schedules a new paint when it detects a
+    /// reason to. Calling `wpe_view_resized` immediately after tricks the
+    /// AcceleratedBackingStore into recompositing and emitting a fresh
+    /// buffer even when dimensions are unchanged.
+    ///
+    /// If `wpe_view_resized` deduplicates exact same-dimension calls, we
+    /// first issue a `(w, h-1)` nudge then restore `(w, h)` — the two-step
+    /// guarantees a true dim change is observed. In practice the single
+    /// call suffices on WPE WebKit 2.52.
+    pub(crate) fn show(&self, width: u32, height: u32) {
+        if self.wpe_view.is_null() {
+            return;
+        }
+        // SAFETY: wpe_view is a live WPEView owned by the WebView; calls
+        // are thread-bound to the GLib worker thread.
+        unsafe {
+            wpe_view_set_visible(self.wpe_view, 1);
+            // Force the AcceleratedBackingStore to recomposite and emit a
+            // fresh render_buffer. Without this, switching to a tab whose
+            // DOM hasn't changed since it was last hidden produces no new
+            // paint, leaving the shared OsrFrame stuck on whatever the
+            // previously-active tab last wrote.
+            wpe_view_resized(self.wpe_view, width as i32, height as i32);
+        }
+        tracing::debug!(
+            width,
+            height,
+            "webkit: show+resized WPEView to force repaint"
+        );
     }
 }
 
@@ -592,7 +619,7 @@ impl WpeRuntime {
     /// `active_idx` stays pointing at the existing tab. The new tab is
     /// appended to both `self.tabs` and `engine_state.tabs` so it appears in
     /// the tab strip, but its WPEView is created with `is_active = false` and
-    /// immediately hidden via `set_visible(false)`.
+    /// immediately hidden via `hide()`.
     ///
     /// **Ordering contract (CRITICAL #1 rollback):**
     /// The `TabInfo` is pushed to `engine_state.tabs` *before* `TabEntry::new`
@@ -622,7 +649,7 @@ impl WpeRuntime {
             if let Some(prev) = self.active_tab() {
                 prev.is_active
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                prev.set_visible(false);
+                prev.hide();
             }
         }
 
@@ -677,7 +704,14 @@ impl WpeRuntime {
                         if let Some(prev) = self.tabs.get(idx) {
                             prev.is_active
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            prev.set_visible(true);
+                            // Read dims inside a fresh lock to avoid borrowing
+                            // self while self.tabs is also borrowed.
+                            let (w, h) = self
+                                .engine_state
+                                .lock()
+                                .map(|st| (st.width, st.height))
+                                .unwrap_or((800, 600));
+                            prev.show(w, h);
                         }
                     }
                 }
@@ -699,7 +733,7 @@ impl WpeRuntime {
         } else {
             // Background tab: hide its view immediately so it doesn't produce
             // pixels into the shared frame.
-            entry.set_visible(false);
+            entry.hide();
         }
 
         self.tabs.push(entry);
@@ -725,17 +759,24 @@ impl WpeRuntime {
         if let Some(prev) = self.active_tab() {
             prev.is_active
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            prev.set_visible(false);
+            prev.hide();
         }
         let new_tab = &self.tabs[new_idx];
         new_tab
             .is_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Setting visible(true) kicks WebKit to schedule a paint for
-        // the now-foreground view. Without this, the activation flag
-        // flip alone doesn't produce pixels — WebKit has no reason to
-        // re-render a page whose DOM is unchanged.
-        new_tab.set_visible(true);
+        // Calling show() sets visible=true AND immediately calls wpe_view_resized,
+        // which forces the AcceleratedBackingStore to recomposite and emit a fresh
+        // render_buffer even when the page DOM hasn't changed since this tab was
+        // last hidden. Without the forced resized call, WebKit has no reason to
+        // repaint a static page, so the shared OsrFrame stays stuck on the
+        // previous tab's last frame until something triggers a DOM mutation.
+        let (cur_w, cur_h) = self
+            .engine_state
+            .lock()
+            .map(|st| (st.width, st.height))
+            .unwrap_or((800, 600));
+        new_tab.show(cur_w, cur_h);
         self.active_idx = Some(new_idx);
         // Update active_idx and read is_loading in a single lock acquisition
         // so the main thread never observes the new active_idx while the
@@ -783,7 +824,12 @@ impl WpeRuntime {
             let next = &self.tabs[i];
             next.is_active
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            next.set_visible(true);
+            let (cur_w, cur_h) = self
+                .engine_state
+                .lock()
+                .map(|st| (st.width, st.height))
+                .unwrap_or((800, 600));
+            next.show(cur_w, cur_h);
         }
 
         if let Ok(mut st) = self.engine_state.lock() {
