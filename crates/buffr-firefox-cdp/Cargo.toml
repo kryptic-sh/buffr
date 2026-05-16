@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 buffr-engine.workspace = true
 buffr-core.workspace = true
+buffr-downloads.workspace = true
 buffr-modal.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

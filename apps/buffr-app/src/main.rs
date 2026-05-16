@@ -7153,6 +7153,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         private: self.private,
                         // CEF manages downloads via CefEngineSinks; these
                         // fields are for blink-cdp only.
+                        history: None,
                         download_dir: None,
                         downloads: None,
                         notice_queue: None,
@@ -7285,7 +7286,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
                         });
                     tracing::debug!(?profile_dir, "firefox-cdp profile dir");
-                    match buffr_firefox_cdp::FirefoxCdpEngine::new(&profile_dir, self.private) {
+                    match buffr_firefox_cdp::FirefoxCdpEngine::new(
+                        &profile_dir,
+                        self.private,
+                        Some(self.downloads.clone()),
+                        Some(self.download_notice_queue.clone()),
+                        Some(self.find_sink.clone()),
+                    ) {
                         Ok(engine) => {
                             info!(engine_id = %inst.id, "firefox-cdp engine created");
                             let proxy = self.event_proxy.clone();
@@ -7328,6 +7335,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         device_scale: effective_scale as f64,
                         initial_size: (cef_w, cef_h),
                         private: self.private,
+                        history: None,
                         download_dir: None,
                         downloads: None,
                         notice_queue: None,
@@ -7377,6 +7385,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         device_scale: effective_scale as f64,
                         initial_size: (cef_w, cef_h),
                         private: self.private,
+                        history: None,
                         download_dir: None,
                         downloads: None,
                         notice_queue: None,
@@ -7427,10 +7436,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         device_scale: effective_scale as f64,
                         initial_size: (cef_w, cef_h),
                         private: self.private,
+                        history: Some(
+                            Arc::new(self.history.clone()) as Arc<dyn std::any::Any + Send + Sync>
+                        ),
                         download_dir: None,
-                        downloads: None,
-                        notice_queue: None,
-                        find_sink: None,
+                        downloads: Some(Arc::new(self.downloads.clone())
+                            as Arc<dyn std::any::Any + Send + Sync>),
+                        notice_queue: Some(Arc::new(self.download_notice_queue.clone())
+                            as Arc<dyn std::any::Any + Send + Sync>),
+                        find_sink: Some(Arc::new(self.find_sink.clone())
+                            as Arc<dyn std::any::Any + Send + Sync>),
                         sinks: Box::new(()),
                     };
                     match buffr_webkitgtk::WebKitGtkEngine::new(&options) {
@@ -7481,10 +7496,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         device_scale: effective_scale as f64,
                         initial_size: (cef_w, cef_h),
                         private: self.private,
+                        history: Some(
+                            Arc::new(self.history.clone()) as Arc<dyn std::any::Any + Send + Sync>
+                        ),
                         download_dir: None,
-                        downloads: None,
-                        notice_queue: None,
-                        find_sink: None,
+                        downloads: Some(Arc::new(self.downloads.clone())
+                            as Arc<dyn std::any::Any + Send + Sync>),
+                        notice_queue: Some(Arc::new(self.download_notice_queue.clone())
+                            as Arc<dyn std::any::Any + Send + Sync>),
+                        find_sink: Some(Arc::new(self.find_sink.clone())
+                            as Arc<dyn std::any::Any + Send + Sync>),
                         sinks: Box::new(()),
                     };
                     match buffr_webkit_cocoa::WebKitCocoaEngine::new(&options) {
@@ -7535,10 +7556,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         device_scale: effective_scale as f64,
                         initial_size: (cef_w, cef_h),
                         private: self.private,
+                        history: Some(self.history.clone()),
                         download_dir: None,
-                        downloads: None,
-                        notice_queue: None,
-                        find_sink: None,
+                        downloads: Some(self.downloads.clone()),
+                        notice_queue: Some(self.download_notice_queue.clone()),
+                        find_sink: Some(self.find_sink.clone()),
                         sinks: Box::new(()),
                     };
                     match buffr_webview2::WebView2Engine::new(&options) {

@@ -452,5 +452,5 @@ fn open_tab_navigate_close() {
 fn make_test_engine() -> buffr_firefox_cdp::FirefoxCdpEngine {
     use buffr_firefox_cdp::FirefoxCdpEngine;
     let dir = tempfile::tempdir().expect("temp dir");
-    FirefoxCdpEngine::new(dir.path(), false).expect("FirefoxCdpEngine::new")
+    FirefoxCdpEngine::new(dir.path(), false, None, None, None).expect("FirefoxCdpEngine::new")
 }

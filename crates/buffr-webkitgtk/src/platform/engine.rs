@@ -40,10 +40,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use buffr_core::DownloadNoticeQueue;
+use buffr_core::find::{FindResultSink, new_sink as new_find_sink};
 use buffr_core::hint::{
     DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintEventSink, HintSession,
     build_inject_script, new_hint_event_sink, take_hint_event,
 };
+use buffr_downloads::Downloads;
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
     NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
@@ -53,6 +56,7 @@ use buffr_engine::{
         new_popup_queue,
     },
 };
+use buffr_history::History;
 
 use super::error::WebKitGtkError;
 use super::input::{
@@ -103,6 +107,19 @@ pub struct WebKitGtkEngine {
     /// One-slot mailbox: the script-message handler writes a parsed
     /// `HintConsoleEvent` each time the renderer emits the sentinel.
     hint_sink: HintEventSink,
+    // ── Apps-layer sinks ──────────────────────────────────────────────────────
+    /// Shared history store — records visits on `LoadEvent::Finished`.
+    #[allow(dead_code)]
+    history: Option<Arc<History>>,
+    /// Shared downloads store — records download lifecycle events.
+    #[allow(dead_code)]
+    downloads: Option<Arc<Downloads>>,
+    /// Download notification queue — surfaced in the chrome strip.
+    #[allow(dead_code)]
+    notice_queue: Option<DownloadNoticeQueue>,
+    /// Find-result sink — written from FindController signal handlers.
+    #[allow(dead_code)]
+    find_sink: FindResultSink,
 }
 
 impl WebKitGtkEngine {
@@ -138,6 +155,29 @@ impl WebKitGtkEngine {
                 )
             });
 
+        // ── Downcast apps-layer sinks from BackendOpenOptions ─────────────────
+        let history: Option<Arc<History>> = options
+            .history
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<Arc<History>>())
+            .cloned();
+        let downloads: Option<Arc<Downloads>> = options
+            .downloads
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<Arc<Downloads>>())
+            .cloned();
+        let notice_queue: Option<DownloadNoticeQueue> = options
+            .notice_queue
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<DownloadNoticeQueue>())
+            .cloned();
+        let find_sink: FindResultSink = options
+            .find_sink
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<FindResultSink>())
+            .cloned()
+            .unwrap_or_else(new_find_sink);
+
         let hint_sink = new_hint_event_sink();
 
         let worker = spawn(
@@ -148,6 +188,10 @@ impl WebKitGtkEngine {
             Arc::clone(&view),
             Arc::clone(&engine_state),
             Arc::clone(&hint_sink),
+            history.clone(),
+            downloads.clone(),
+            notice_queue.clone(),
+            find_sink.clone(),
         )?;
 
         let hint_alphabet = HintAlphabet::from_str(buffr_core::hint::DEFAULT_HINT_ALPHABET)
@@ -172,6 +216,10 @@ impl WebKitGtkEngine {
             hint_alphabet,
             hint_session: Mutex::new(None),
             hint_sink,
+            history,
+            downloads,
+            notice_queue,
+            find_sink,
         })
     }
 

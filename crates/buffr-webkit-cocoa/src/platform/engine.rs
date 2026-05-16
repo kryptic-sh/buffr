@@ -40,6 +40,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use buffr_core::find::FindResultSink;
 use buffr_core::hint::{
     DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintEventSink, HintSession,
     build_inject_script, new_hint_event_sink, take_hint_event,
@@ -113,6 +114,14 @@ pub struct WebKitCocoaEngine {
     /// One-slot mailbox: the WKScriptMessageHandler writes a parsed
     /// `HintConsoleEvent` each time the renderer emits the sentinel.
     hint_sink: HintEventSink,
+    // ── Apps-layer sinks (available on all platforms) ──────────────────────────
+    /// Shared history store. When `Some`, navigation completions record a visit.
+    history: Option<Arc<buffr_history::History>>,
+    /// Shared downloads store. Stubbed — WKDownload wiring is Phase D.
+    #[allow(dead_code)]
+    downloads: Option<Arc<buffr_downloads::Downloads>>,
+    /// Find-result sink. When `Some`, find completions push a `FindResult`.
+    find_sink: Option<FindResultSink>,
 }
 
 impl WebKitCocoaEngine {
@@ -130,6 +139,30 @@ impl WebKitCocoaEngine {
         let hint_alphabet = HintAlphabet::from_str(buffr_core::hint::DEFAULT_HINT_ALPHABET)
             .unwrap_or_else(|_| HintAlphabet::from_str("asdf").expect("fallback alphabet"));
         let hint_sink = new_hint_event_sink();
+
+        // ── Downcast apps-layer sinks from BackendOpenOptions ──────────────────
+        //
+        // `BackendOpenOptions` carries `history`, `downloads`, and `find_sink`
+        // as `Option<Arc<dyn Any + Send + Sync>>`. The apps layer stores the
+        // concrete `Arc<T>` inside the type-erased wrapper, so we downcast_ref
+        // to `Arc<T>` and clone. This mirrors the webkitgtk engine pattern.
+        let history: Option<Arc<buffr_history::History>> = options
+            .history
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<Arc<buffr_history::History>>())
+            .cloned();
+
+        let wk_downloads: Option<Arc<buffr_downloads::Downloads>> = options
+            .downloads
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<Arc<buffr_downloads::Downloads>>())
+            .cloned();
+
+        let find_sink: Option<FindResultSink> = options
+            .find_sink
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<FindResultSink>())
+            .cloned();
 
         #[cfg(target_os = "macos")]
         {
@@ -155,6 +188,14 @@ impl WebKitCocoaEngine {
                         Arc::new(AtomicBool::new(false)),
                     )
                 });
+
+            // Store history and find_sink in EngineState so the navigation
+            // delegate and find completion handler can reach them from the
+            // GCD main queue without going back through the engine.
+            if let Ok(mut st) = engine_state.lock() {
+                st.history = history.clone();
+                st.find_sink = find_sink.clone();
+            }
 
             let worker = super::worker::macos::spawn(
                 options.initial_url,
@@ -186,6 +227,9 @@ impl WebKitCocoaEngine {
                 hint_alphabet,
                 hint_session: Mutex::new(None),
                 hint_sink,
+                history,
+                downloads: wk_downloads,
+                find_sink,
             });
         }
 
@@ -200,6 +244,9 @@ impl WebKitCocoaEngine {
             hint_alphabet,
             hint_session: Mutex::new(None),
             hint_sink,
+            history,
+            downloads: wk_downloads,
+            find_sink,
         })
     }
 

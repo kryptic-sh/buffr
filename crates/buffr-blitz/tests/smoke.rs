@@ -24,6 +24,7 @@ fn open_engine(url: &str) -> Arc<dyn BrowserEngine> {
         frame_rate: 60,
         device_scale: 1.0,
         private: false,
+        history: None,
         download_dir: None,
         downloads: None,
         notice_queue: None,

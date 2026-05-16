@@ -25,8 +25,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::DownloadNoticeQueue;
+use buffr_core::find::FindResultSink;
 use buffr_core::hint::HintEventSink;
+use buffr_downloads::Downloads;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+use buffr_history::History;
 
 use super::error::WebKitGtkError;
 use super::input::{GtkImeEvent, GtkInputEvent, GtkMouseButton, GtkMouseKind};
@@ -35,7 +39,7 @@ use super::input_js::{
     mouse_move_js, wheel_js,
 };
 use super::osr::{paint_blank, request_snapshot};
-use super::runtime::{OsrHandles, TabEntry};
+use super::runtime::{OsrHandles, TabEntry, TabSinks};
 
 // ── EngineState (thread-safe snapshot) ────────────────────────────────────────
 
@@ -325,14 +329,29 @@ struct GtkRuntime {
     /// Forwarded from the engine so every new `WebView` can register the
     /// `buffrHint` script-message handler and write events into it.
     hint_sink: HintEventSink,
+    /// Apps-layer sinks forwarded to each new `TabEntry`.
+    history: Option<Arc<History>>,
+    /// Kept alive so the `NetworkSession::download-started` closure can
+    /// reference the stores. The fields are not read directly on the
+    /// GTK thread after construction — the closures capture clones.
+    #[allow(dead_code)]
+    downloads: Option<Arc<Downloads>>,
+    #[allow(dead_code)]
+    notice_queue: Option<DownloadNoticeQueue>,
+    find_sink: FindResultSink,
 }
 
 impl GtkRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
         engine_state: Arc<Mutex<EngineState>>,
         hint_sink: HintEventSink,
+        history: Option<Arc<History>>,
+        downloads: Option<Arc<Downloads>>,
+        notice_queue: Option<DownloadNoticeQueue>,
+        find_sink: FindResultSink,
     ) -> Self {
         GtkRuntime {
             tabs: Vec::new(),
@@ -342,6 +361,10 @@ impl GtkRuntime {
             engine_state,
             snapshot_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             hint_sink,
+            history,
+            downloads,
+            notice_queue,
+            find_sink,
         }
     }
 
@@ -375,6 +398,10 @@ impl GtkRuntime {
                 snapshot_in_flight: std::rc::Rc::clone(&self.snapshot_in_flight),
             },
             Arc::clone(&self.hint_sink),
+            TabSinks {
+                history: self.history.clone(),
+                find_sink: self.find_sink.clone(),
+            },
         );
         self.tabs.push(entry);
         self.active_idx = Some(self.tabs.len() - 1);
@@ -865,6 +892,7 @@ fn handle_command(cmd: Command, rt: &mut GtkRuntime, main_loop: &glib::MainLoop)
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     initial_url: &str,
     _width: u32,
@@ -873,6 +901,10 @@ pub(crate) fn spawn(
     view: SharedOsrViewState,
     engine_state: Arc<Mutex<EngineState>>,
     hint_sink: HintEventSink,
+    history: Option<Arc<History>>,
+    downloads: Option<Arc<Downloads>>,
+    notice_queue: Option<DownloadNoticeQueue>,
+    find_sink: FindResultSink,
 ) -> Result<WorkerHandle, WebKitGtkError> {
     // gtk4::init() must be called before any GTK widgets are created.
     // It is safe to call multiple times; subsequent calls are no-ops.
@@ -899,7 +931,142 @@ pub(crate) fn spawn(
                 Arc::clone(&view),
                 Arc::clone(&engine_state),
                 Arc::clone(&hint_sink),
+                history,
+                downloads.clone(),
+                notice_queue.clone(),
+                find_sink.clone(),
             );
+
+            // ── NetworkSession download-started signal ────────────────────
+            //
+            // Connect to the default NetworkSession's `download-started`
+            // signal to record download lifecycle events in the shared
+            // `Downloads` store and push notices to `notice_queue`.
+            //
+            // The signal fires for every download on any WebView that uses
+            // the default session. We assign a synthetic `cef_id` via a
+            // per-worker monotonic counter so the `Downloads` store (which
+            // uses `cef_id` as a natural primary key) stays happy.
+            if downloads.is_some() || notice_queue.is_some() {
+                if let Some(ns) = webkit6::NetworkSession::default() {
+                    let dl_store = downloads.clone();
+                    let nq = notice_queue.clone();
+                    // We need a shared counter inside the closure. Use an Arc<Mutex>.
+                    let dl_counter = Arc::new(Mutex::new(1u32));
+                    ns.connect_download_started(move |_session, dl| {
+                        let url = dl
+                            .request()
+                            .and_then(|r| r.uri())
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        let suggested = dl
+                            .destination()
+                            .map(|s| {
+                                std::path::Path::new(s.as_str())
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(s.as_ref())
+                                    .to_owned()
+                            })
+                            .unwrap_or_else(|| "download".to_owned());
+
+                        let cef_id = {
+                            let mut ctr = dl_counter.lock().unwrap_or_else(|e| e.into_inner());
+                            let id = *ctr;
+                            *ctr = ctr.wrapping_add(1);
+                            id
+                        };
+
+                        tracing::debug!(url, cef_id, "webkitgtk: download-started");
+
+                        if let Some(store) = &dl_store {
+                            match store.record_started(cef_id, &url, &suggested, None, None) {
+                                Ok(dl_id) => {
+                                    // Push Started notice.
+                                    if let Some(nq) = &nq {
+                                        buffr_core::download_notice::push(
+                                            nq,
+                                            buffr_core::DownloadNotice {
+                                                kind: buffr_core::DownloadNoticeKind::Started,
+                                                filename: suggested.clone(),
+                                                path: String::new(),
+                                                created_at: std::time::Instant::now(),
+                                            },
+                                        );
+                                    }
+
+                                    // Wire finished/failed signals.
+                                    let store_fin = Arc::clone(store);
+                                    let nq_fin = nq.clone();
+                                    let name_fin = suggested.clone();
+                                    dl.connect_finished(move |finished_dl| {
+                                        let dest = finished_dl
+                                            .destination()
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_default();
+                                        let path = std::path::PathBuf::from(&dest);
+                                        if let Err(e) = store_fin.record_completed(dl_id, &path) {
+                                            tracing::warn!(error = %e, "webkitgtk: record_completed failed");
+                                        }
+                                        tracing::debug!(dl_id = dl_id.0, dest, "webkitgtk: download finished");
+                                        if let Some(nq) = &nq_fin {
+                                            buffr_core::download_notice::push(
+                                                nq,
+                                                buffr_core::DownloadNotice {
+                                                    kind: buffr_core::DownloadNoticeKind::Completed,
+                                                    filename: name_fin.clone(),
+                                                    path: dest,
+                                                    created_at: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                    });
+
+                                    let store_fail = Arc::clone(store);
+                                    let nq_fail = nq.clone();
+                                    let name_fail = suggested;
+                                    dl.connect_failed(move |_dl, err| {
+                                        let reason = err.message().to_string();
+                                        if let Err(e) = store_fail.record_failed(dl_id, &reason) {
+                                            tracing::warn!(error = %e, "webkitgtk: record_failed failed");
+                                        }
+                                        tracing::debug!(dl_id = dl_id.0, reason, "webkitgtk: download failed");
+                                        if let Some(nq) = &nq_fail {
+                                            buffr_core::download_notice::push(
+                                                nq,
+                                                buffr_core::DownloadNotice {
+                                                    kind: buffr_core::DownloadNoticeKind::Failed,
+                                                    filename: name_fail.clone(),
+                                                    path: String::new(),
+                                                    created_at: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "webkitgtk: record_started failed");
+                                }
+                            }
+                        } else if let Some(nq) = &nq {
+                            // No Downloads store, just push the notice.
+                            buffr_core::download_notice::push(
+                                nq,
+                                buffr_core::DownloadNotice {
+                                    kind: buffr_core::DownloadNoticeKind::Started,
+                                    filename: suggested,
+                                    path: String::new(),
+                                    created_at: std::time::Instant::now(),
+                                },
+                            );
+                        }
+                    });
+                } else {
+                    tracing::debug!(
+                        "webkitgtk: no default NetworkSession — download tracking unavailable"
+                    );
+                }
+            }
 
             // Open initial tab.
             if let Err(e) = runtime.open_tab(&initial_url) {

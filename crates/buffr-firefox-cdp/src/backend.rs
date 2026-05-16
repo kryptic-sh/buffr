@@ -55,7 +55,8 @@ impl Backend for FirefoxCdpBackend {
                 std::path::PathBuf::from("/tmp/buffr/firefox-cdp").join(options.engine_id.as_str())
             });
 
-        let engine = FirefoxCdpEngine::new(&profile_dir, false).map_err(|e| e.to_string())?;
+        let engine = FirefoxCdpEngine::new(&profile_dir, false, None, None, None)
+            .map_err(|e| e.to_string())?;
         Ok(Arc::new(engine) as Arc<dyn BrowserEngine>)
     }
 

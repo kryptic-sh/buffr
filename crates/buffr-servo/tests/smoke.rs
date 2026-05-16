@@ -25,6 +25,7 @@ fn dummy_options() -> BackendOpenOptions<'static> {
         device_scale: 1.0,
         initial_size: (800, 600),
         private: false,
+        history: None,
         download_dir: None,
         downloads: None,
         notice_queue: None,

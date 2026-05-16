@@ -47,6 +47,7 @@ pub(crate) mod macos {
     use std::thread;
     use std::time::Duration;
 
+    use buffr_core::find::FindResultSink;
     use buffr_core::hint::HintEventSink;
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
@@ -94,6 +95,13 @@ pub(crate) mod macos {
         /// reduce CPU usage while the tab is backgrounded.  Set by
         /// `BrowserEngine::osr_sleep`; read by the recurring tick functions.
         pub osr_sleep: Arc<AtomicBool>,
+        /// Shared browsing-history store. When `Some`, the navigation delegate
+        /// calls [`buffr_history::History::record_visit`] on each
+        /// `didFinishNavigation` callback.
+        pub history: Option<Arc<buffr_history::History>>,
+        /// Find-result sink. When `Some`, the `find_string` completion handler
+        /// pushes a [`buffr_core::find::FindResult`] after each search.
+        pub find_sink: Option<FindResultSink>,
     }
 
     impl EngineState {
@@ -105,6 +113,8 @@ pub(crate) mod macos {
                 loading_active: Arc::new(AtomicBool::new(false)),
                 favicon_updates: Arc::new(Mutex::new(Vec::new())),
                 osr_sleep: Arc::new(AtomicBool::new(false)),
+                history: None,
+                find_sink: None,
             }
         }
 
@@ -463,79 +473,81 @@ pub(crate) mod macos {
 
         /// Start or stop an in-page find session on the active tab.
         ///
-        /// Uses `WKWebView::findString:withConfiguration:completionHandler:` when
-        /// available (macOS 14 / WebKit 617+).  `query=""` cancels the highlight.
+        /// Uses `WKWebView::findString:withConfiguration:completionHandler:` (macOS
+        /// 14 / WebKit 617+).  `query=""` cancels the active highlight.
         ///
-        /// The bindings in `objc2-web-kit 0.3.2` may not expose
-        /// `WKFindConfiguration` at all.  We call via `objc2::msg_send!` so the
-        /// code compiles regardless of the binding coverage.  At runtime the
-        /// selector is resolved dynamically; if WKWebView does not respond to it
-        /// (macOS < 14), the call is silently dropped by the ObjC runtime.
-        /// Start or stop an in-page find session on the active tab.
+        /// When `self.engine_state` carries a `find_sink`, the completion handler
+        /// pushes a [`buffr_core::find::FindResult`] derived from
+        /// `WKFindResult::matchFound`.  The count is capped at 1 because
+        /// `WKFindResult` exposes only a boolean; a future phase can use
+        /// `WKFindResult::matchesCount` if Apple makes that API public.
         ///
-        /// Uses `WKWebView::findString:withConfiguration:completionHandler:` when
-        /// available (macOS 14 / WebKit 617+).  `query=""` cancels the highlight.
-        ///
-        /// The bindings in `objc2-web-kit 0.3.2` do not expose
-        /// `WKFindConfiguration`.  We call via `objc2::msg_send!` so the
-        /// code compiles regardless of binding coverage.  At runtime the
-        /// selector is resolved dynamically; if WKWebView does not respond to it
-        /// (macOS < 14), the call is silently dropped by the ObjC runtime.
+        /// If `WKFindConfiguration` is unavailable (macOS < 14) we fall through
+        /// to a no-op and log at `debug!`.
         fn find_string(&self, query: &str, forward: bool) {
-            use std::ffi::CStr;
+            use core::ptr::NonNull;
 
-            use objc2::msg_send;
+            use block2::RcBlock;
+            use objc2::MainThreadMarker;
             use objc2_foundation::NSString;
+            use objc2_web_kit::{WKFindConfiguration, WKFindResult};
 
             if let Some(idx) = self.active_idx {
                 if let Some(tab) = self.tabs.get(idx) {
+                    // SAFETY: find_string is called only from closures dispatched
+                    // via dispatch_main_async, which run on the GCD main queue.
+                    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+
                     let ns_query = NSString::from_str(query);
-                    // Build WKFindConfiguration via msg_send! to avoid requiring
-                    // WKFindConfiguration bindings from objc2-web-kit.
-                    //
-                    // Class lookup: +[WKFindConfiguration new] allocates the object.
-                    // If the class does not exist on older macOS, AnyClass::get returns
-                    // None and we fall back to a no-op.
-                    //
-                    // WKFindConfiguration properties:
-                    //   backwards: BOOL  (default NO = forward)
-                    //   wraps:     BOOL  (default YES)
-                    //   caseSensitive: BOOL (default NO)
-                    // Selector confirmed: developer.apple.com WKFindConfiguration (WebKit 617+).
+
+                    // Build WKFindConfiguration using the typed binding
+                    // (objc2-web-kit feature "WKFindConfiguration").
+                    // `WKFindConfiguration::new(mtm)` requires `MainThreadOnly`.
+                    let cfg = unsafe { WKFindConfiguration::new(mtm) };
+
+                    // Set backwards = !forward (default is forward).
+                    unsafe { cfg.setBackwards(!forward) };
+
+                    // Clone the engine_state to read find_sink inside the block.
+                    // The block is `Send + 'static`, so captures must be too.
+                    // `Arc<Mutex<EngineState>>` satisfies that contract.
+                    let state_for_block = Arc::clone(&self.engine_state);
+
+                    // Build the completion handler block.
+                    // Signature: `void (^)(WKFindResult *)`.
+                    // The block receives a `NonNull<WKFindResult>` (objc2 convention).
+                    let completion = RcBlock::new(move |result: NonNull<WKFindResult>| {
+                        // SAFETY: `result` is a valid `WKFindResult *` provided by
+                        // WebKit on the GCD main queue; the pointer is alive for
+                        // the duration of this callback.
+                        let match_found = unsafe { result.as_ref().matchFound() };
+                        tracing::debug!(
+                            match_found,
+                            "webkit-cocoa: find completion (WKFindResult)"
+                        );
+                        if let Ok(st) = state_for_block.lock() {
+                            if let Some(sink) = &st.find_sink {
+                                if let Ok(mut guard) = sink.lock() {
+                                    *guard = Some(buffr_core::find::FindResult {
+                                        count: if match_found { 1 } else { 0 },
+                                        current: if match_found { 1 } else { 0 },
+                                        final_update: true,
+                                    });
+                                }
+                            }
+                        }
+                    });
+
+                    // findString:withConfiguration:completionHandler:
+                    // Binding: WKWebView.rs (feature WKFindConfiguration + WKFindResult).
+                    // `&*completion` coerces RcBlock<F> to &DynBlock<dyn Fn(…)>.
+                    // SAFETY: all arguments are valid ObjC objects on the main thread.
                     unsafe {
-                        // AnyClass::get takes &CStr (objc2 0.6).
-                        // c"WKFindConfiguration" is a CStr literal (Rust 1.77+).
-                        let find_cfg_class_name: &CStr = c"WKFindConfiguration";
-                        let cls: *mut objc2::runtime::AnyClass =
-                            objc2::runtime::AnyClass::get(find_cfg_class_name)
-                                .map(|c| c as *const _ as *mut _)
-                                .unwrap_or(std::ptr::null_mut());
-                        if cls.is_null() {
-                            // WKFindConfiguration unavailable (macOS < 14).
-                            // A JS-based find (window.find) is deprecated since macOS 11;
-                            // skip it to avoid console noise.
-                            tracing::debug!(
-                                "webkit-cocoa: WKFindConfiguration not available on this macOS version"
-                            );
-                            return;
-                        }
-                        let cfg: *mut objc2::runtime::AnyObject = msg_send![cls, new];
-                        if cfg.is_null() {
-                            return;
-                        }
-                        // Set backwards property (NO = forward, YES = backward).
-                        let backwards: objc2::runtime::Bool = (!forward).into();
-                        let _: () = msg_send![cfg, setBackwards: backwards];
-                        // Call findString:withConfiguration:completionHandler:
-                        // completionHandler is nil — fire-and-forget.
-                        let _: () = msg_send![
-                            &*tab.web_view,
-                            findString: &*ns_query,
-                            withConfiguration: cfg,
-                            completionHandler: std::ptr::null::<objc2::runtime::AnyObject>()
-                        ];
-                        // Release the configuration object (+new retains once).
-                        let _: () = msg_send![cfg, release];
+                        tab.web_view.findString_withConfiguration_completionHandler(
+                            &ns_query,
+                            Some(&cfg),
+                            &*completion,
+                        );
                     }
                 }
             }

@@ -23,6 +23,7 @@ fn make_opts(url: &str) -> BackendOpenOptions<'_> {
         frame_rate: 60,
         device_scale: 1.0,
         private: false,
+        history: None,
         download_dir: None,
         downloads: None,
         notice_queue: None,

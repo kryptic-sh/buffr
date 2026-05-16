@@ -17,8 +17,10 @@ use std::sync::{Arc, Mutex};
 use webkit6::prelude::*;
 use webkit6::{LoadEvent, WebView};
 
+use buffr_core::find::{FindResult, FindResultSink};
 use buffr_core::hint::{HintEventSink, parse_console_event};
 use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId};
+use buffr_history::{History, Transition};
 
 use super::osr::request_snapshot;
 use super::worker::EngineState;
@@ -52,6 +54,19 @@ pub(crate) struct OsrHandles {
     pub snapshot_in_flight: Rc<Cell<bool>>,
 }
 
+/// Apps-layer sink handles passed to `TabEntry::new`.
+///
+/// Bundled into a struct to avoid exceeding clippy's `too_many_arguments`
+/// limit (7) on `TabEntry::new` and `spawn`.
+pub(crate) struct TabSinks {
+    /// Shared history store — receives a `record_visit` call on each
+    /// `LoadEvent::Finished`.
+    pub history: Option<Arc<History>>,
+    /// Find-result sink — receives `FindResult` updates from the
+    /// WebView's `FindController` signals.
+    pub find_sink: FindResultSink,
+}
+
 /// One open browser tab. Owns a `WebView` and its signal handler IDs.
 pub(crate) struct TabEntry {
     pub id: TabId,
@@ -67,6 +82,12 @@ impl TabEntry {
     ///
     /// `hint_sink` is the one-slot mailbox into which the `buffrHint`
     /// script-message handler writes parsed [`HintConsoleEvent`]s.
+    ///
+    /// `history` (if `Some`) receives a `record_visit` call on each
+    /// `LoadEvent::Finished`. `find_sink` receives `FindResult` updates from
+    /// the WebView's `FindController` `found-text` / `failed-to-find-text`
+    /// signals.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: TabId,
         url: &str,
@@ -75,7 +96,10 @@ impl TabEntry {
         engine_state: Arc<Mutex<EngineState>>,
         osr: OsrHandles,
         hint_sink: HintEventSink,
+        sinks: TabSinks,
     ) -> Self {
+        let history = sinks.history;
+        let find_sink = sinks.find_sink;
         use webkit6::{
             UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime,
         };
@@ -135,14 +159,15 @@ impl TabEntry {
             let frame_lc = Arc::clone(&osr.frame);
             let view_lc = Arc::clone(&osr.view);
             let in_flight_lc = Rc::clone(&osr.snapshot_in_flight);
+            let history_lc = history.clone();
             web_view.connect_load_changed(move |wv, event| {
                 let url = wv.uri().map(|s| s.to_string()).unwrap_or_default();
                 let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
                 let is_loading = !matches!(event, LoadEvent::Finished);
                 if let Ok(mut guard) = st.lock() {
                     if let Some(tab) = guard.tabs.iter_mut().find(|t| t.id == id) {
-                        tab.url = url;
-                        tab.title = title;
+                        tab.url = url.clone();
+                        tab.title = title.clone();
                         tab.is_loading = is_loading;
                         tab.can_go_back = wv.can_go_back();
                         tab.can_go_forward = wv.can_go_forward();
@@ -151,7 +176,7 @@ impl TabEntry {
                     // BrowserEngine::is_loading() can read it lock-free.
                     guard.sync_loading_active();
                 }
-                // Trigger a snapshot on navigation complete.
+                // Trigger a snapshot and record history on navigation complete.
                 if matches!(event, LoadEvent::Finished) {
                     request_snapshot(
                         wv,
@@ -159,8 +184,56 @@ impl TabEntry {
                         Arc::clone(&view_lc),
                         Rc::clone(&in_flight_lc),
                     );
+                    // Record history visit — skip empty / internal URLs.
+                    if let Some(hist) = &history_lc {
+                        let title_opt = if title.is_empty() { None } else { Some(title.as_str()) };
+                        if let Err(e) = hist.record_visit(&url, title_opt, Transition::Link) {
+                            tracing::debug!(error = %e, url, "webkitgtk: history record_visit failed");
+                        } else {
+                            tracing::debug!(url, "webkitgtk: history visit recorded");
+                        }
+                    }
                 }
             });
+        }
+
+        // ── FindController: found-text / failed-to-find-text signals ────────
+        //
+        // `WebView::find_controller()` is available immediately after WebView
+        // construction. Wire the `found-text` (match count + current index)
+        // and `failed-to-find-text` (no matches) signals to push a
+        // `FindResult` into the shared `find_sink`.
+        //
+        // `found-text` carries the total match count only; there is no
+        // per-match index in the WebKit6 Rust bindings' signal signature.
+        // We set `current = 1` as a placeholder and `final_update = true`
+        // since WebKit fires the signal after each search completes.
+        if let Some(fc) = web_view.find_controller() {
+            let sink_found = find_sink.clone();
+            fc.connect_found_text(move |_fc, match_count| {
+                tracing::debug!(match_count, "webkitgtk: find found-text");
+                if let Ok(mut guard) = sink_found.lock() {
+                    *guard = Some(FindResult {
+                        count: match_count,
+                        current: 1,
+                        final_update: true,
+                    });
+                }
+            });
+
+            let sink_failed = find_sink.clone();
+            fc.connect_failed_to_find_text(move |_fc| {
+                tracing::debug!("webkitgtk: find failed-to-find-text");
+                if let Ok(mut guard) = sink_failed.lock() {
+                    *guard = Some(FindResult {
+                        count: 0,
+                        current: 0,
+                        final_update: true,
+                    });
+                }
+            });
+        } else {
+            tracing::debug!("webkitgtk runtime: no FindController at TabEntry::new");
         }
 
         // ── title::notify signal ─────────────────────────────────────────────

@@ -37,10 +37,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use buffr_core::DownloadNoticeQueue;
+use buffr_core::find::{FindResult, FindResultSink, new_sink as new_find_sink};
 use buffr_core::hint::{
     DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HintAlphabet, HintSession, build_inject_script,
     take_hint_event,
 };
+use buffr_downloads::Downloads;
 use buffr_engine::{
     BrowserEngine, EngineError, FaviconUpdate, HintAction, HintStatus, MouseButton,
     NeutralKeyEvent, OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
@@ -185,6 +188,25 @@ pub struct FirefoxCdpEngine {
     /// `FindNext` / `FindPrev` without requiring the caller to re-supply the
     /// query string. Cleared by `stop_find`.
     find_query: Mutex<Option<String>>,
+    /// Shared downloads store. Held here to keep the `Arc` alive; the engine
+    /// records started/completed downloads via this store when Firefox CDP
+    /// emits download events.
+    ///
+    /// # Firefox CDP download note
+    ///
+    /// Firefox does not expose `Browser.downloadWillBegin` or
+    /// `Browser.downloadProgress` in its CDP subset (as of Firefox 115+).
+    /// The store and notice_queue are kept here for API parity with blink-cdp
+    /// and to allow future wiring once Firefox exposes download events.
+    #[allow(dead_code)]
+    downloads: Option<Arc<Downloads>>,
+    /// Download notice queue. See `downloads` above for the Firefox-CDP caveat.
+    #[allow(dead_code)]
+    notice_queue: Option<DownloadNoticeQueue>,
+    /// One-slot mailbox written by `start_find` / `stop_find` after each JS
+    /// round-trip so the apps layer can poll it each tick and update the
+    /// statusline. Mirrors `BlinkCdpEngine::find_sink`.
+    find_sink: FindResultSink,
     /// Favicon updates populated by the worker from `Page.frameNavigated`
     /// `frame.faviconUrl` events.  Drained by `drain_favicon_updates`.
     favicon_sink: FaviconSink,
@@ -207,7 +229,26 @@ impl FirefoxCdpEngine {
     /// `profile_dir` is used as the Firefox profile directory (`--profile`).
     ///
     /// `private` — when `true`, passes `--private-window` to Firefox.
-    pub fn new(profile_dir: &Path, private: bool) -> Result<Self, FirefoxError> {
+    ///
+    /// `downloads` and `notice_queue` mirror the blink-cdp constructor signature.
+    /// Firefox CDP does not expose `Browser.downloadWillBegin` /
+    /// `Browser.downloadProgress` events (as of Firefox 115+), so these sinks
+    /// are stored but never written. The fields are kept for API parity so that
+    /// future Firefox CDP releases can be wired without a signature change.
+    ///
+    /// `find_sink` is the one-slot mailbox shared with the apps layer.  The
+    /// engine writes a [`buffr_core::find::FindResult`] into it after each
+    /// `start_find` / `stop_find` call so the statusline can display match
+    /// counts. Pass the same sink that `AppState::find_sink` was constructed
+    /// with. If `None`, a private sink is created (results computed but not
+    /// surfaced to the UI).
+    pub fn new(
+        profile_dir: &Path,
+        private: bool,
+        downloads: Option<Arc<Downloads>>,
+        notice_queue: Option<DownloadNoticeQueue>,
+        find_sink: Option<FindResultSink>,
+    ) -> Result<Self, FirefoxError> {
         let firefox = find_firefox().ok_or(FirefoxError::FirefoxNotFound)?;
 
         let port = pick_free_port()?;
@@ -279,6 +320,9 @@ impl FirefoxCdpEngine {
             title_map,
             nav_history_cache: Mutex::new(HashMap::new()),
             find_query: Mutex::new(None),
+            downloads,
+            notice_queue,
+            find_sink: find_sink.unwrap_or_else(new_find_sink),
             favicon_sink,
             hint_alphabet: HintAlphabet::from_str(DEFAULT_HINT_ALPHABET)
                 .expect("DEFAULT_HINT_ALPHABET is always valid"),
@@ -1283,16 +1327,33 @@ impl BrowserEngine for FirefoxCdpEngine {
         // query to escape backslashes + single quotes; nothing else is needed
         // for this string literal context.
 
+        tracing::debug!(%query, forward, "firefox-cdp: start_find");
+
         // Store for FindNext / FindPrev dispatch.
         if let Ok(mut g) = self.find_query.lock() {
             *g = Some(query.to_owned());
         }
 
         let escaped = query.replace('\\', r"\\").replace('\'', r"\'");
-        let js = format!(
+
+        // window.find returns a bool (found/not-found). To get a match count we
+        // run a second expression that counts substring occurrences in the page
+        // text. This is approximate (ignores hidden nodes, case sensitivity) but
+        // provides a useful count for the statusline without a heavier DOM walk.
+        let find_js = format!(
             "window.find('{escaped}', false /* caseSensitive */, {} /* backwards */, true /* wrapAround */, false /* wholeWord */, true /* searchInFrames */, false /* showDialog */)",
             !forward,
         );
+        // Count expression: number of non-overlapping occurrences of the query
+        // in the full page text. Returns 0 when the query is empty.
+        let count_js = if query.is_empty() {
+            "0".to_owned()
+        } else {
+            format!(
+                "(function(){{ var t = document.body ? document.body.innerText : ''; var q = '{escaped}'; if (!q) return 0; var n = 0, i = 0; while ((i = t.toLowerCase().indexOf(q.toLowerCase(), i)) !== -1) {{ n++; i += q.length; }} return n; }})()"
+            )
+        };
+
         let Some(session_id) = ({
             let state = self.lock_state();
             state.active.and_then(|id| {
@@ -1305,20 +1366,67 @@ impl BrowserEngine for FirefoxCdpEngine {
         }) else {
             return;
         };
+
+        // Run window.find to move the browser's selection highlight.
         let _ = self.session_cmd(
             &session_id,
             "Runtime.evaluate",
             serde_json::json!({
-                "expression": js,
+                "expression": find_js,
                 "returnByValue": true,
             }),
         );
+
+        // Evaluate the count expression and push into find_sink.
+        match self.session_cmd(
+            &session_id,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": count_js,
+                "returnByValue": true,
+            }),
+        ) {
+            Ok(val) => {
+                let count = val
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                tracing::debug!(count, %query, "firefox-cdp: find count");
+                if let Ok(mut guard) = self.find_sink.lock() {
+                    *guard = Some(FindResult {
+                        count,
+                        current: if count > 0 { 1 } else { 0 },
+                        final_update: true,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "firefox-cdp: find count eval failed");
+                // Push a zero result so the UI shows "no matches" rather than
+                // stale counts from a previous query.
+                if let Ok(mut guard) = self.find_sink.lock() {
+                    *guard = Some(FindResult {
+                        count: 0,
+                        current: 0,
+                        final_update: true,
+                    });
+                }
+            }
+        }
     }
 
     fn stop_find(&self) {
+        tracing::debug!("firefox-cdp: stop_find");
+
         // Clear the stored query so FindNext / FindPrev become no-ops.
         if let Ok(mut g) = self.find_query.lock() {
             *g = None;
+        }
+
+        // Clear the find_sink so the statusline reflects no active find.
+        if let Ok(mut guard) = self.find_sink.lock() {
+            *guard = None;
         }
 
         // window.find leaves a selection — clearing window.getSelection()

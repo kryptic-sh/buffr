@@ -122,6 +122,9 @@ impl TabEntry {
         environment: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
         cmd_tx: &mpsc::SyncSender<Command>,
         hint_sink: HintEventSink,
+        history: Option<std::sync::Arc<buffr_history::History>>,
+        downloads: Option<std::sync::Arc<buffr_downloads::Downloads>>,
+        notice_queue: Option<buffr_core::download_notice::DownloadNoticeQueue>,
     ) -> Result<Self, WebView2Error> {
         use webview2_com::{
             AddScriptToExecuteOnDocumentCreatedCompletedHandler,
@@ -218,6 +221,9 @@ impl TabEntry {
         let state_history = Arc::clone(engine_state);
         // Clone for NavigationCompleted → TriggerCapture post.
         let cmd_tx_nav_completed = cmd_tx.clone();
+        // Clone for NavigationCompleted → history.record_visit.
+        // ICoreWebView2 is COM STA — valid to hold on this thread.
+        let wv_nav_completed = webview.clone();
 
         let mut nav_starting_token: i64 = 0;
         let mut nav_completed_token: i64 = 0;
@@ -250,6 +256,11 @@ impl TabEntry {
 
         // ── NavigationCompleted ───────────────────────────────────────────────
         // SAFETY: same invariants as NavigationStarting above.
+        // The closure also captures `wv_nav_completed` (ICoreWebView2 — COM STA
+        // pointer valid on this thread) and `history` (Arc<History> — Send).
+        // Reading Source() and DocumentTitle() from inside the NavigationCompleted
+        // handler is safe: the page has finished navigating, so Source returns the
+        // committed URL and DocumentTitle returns the final page title.
         unsafe {
             webview
                 .add_NavigationCompleted(
@@ -262,6 +273,65 @@ impl TabEntry {
                             // Keep loading_active in sync for the active tab.
                             guard.sync_loading_active();
                         }
+
+                        // ── History record ────────────────────────────────────
+                        //
+                        // Read the committed URL and document title from the
+                        // webview on the STA thread, then call
+                        // `History::record_visit`. Both Source() and
+                        // DocumentTitle() return CoTask-allocated PWSTRs that we
+                        // own and must free.
+                        if let Some(ref hist) = history {
+                            let mut uri_pwstr = windows::core::PWSTR::null();
+                            let url_str = if wv_nav_completed.Source(&mut uri_pwstr).is_ok()
+                                && !uri_pwstr.is_null()
+                            {
+                                let s = uri_pwstr.to_string().unwrap_or_default();
+                                windows::Win32::System::Com::CoTaskMemFree(Some(
+                                    uri_pwstr.0.cast(),
+                                ));
+                                s
+                            } else {
+                                String::new()
+                            };
+                            if !url_str.is_empty() {
+                                let mut title_pwstr = windows::core::PWSTR::null();
+                                let title_str =
+                                    if wv_nav_completed.DocumentTitle(&mut title_pwstr).is_ok()
+                                        && !title_pwstr.is_null()
+                                    {
+                                        let s = title_pwstr.to_string().unwrap_or_default();
+                                        windows::Win32::System::Com::CoTaskMemFree(Some(
+                                            title_pwstr.0.cast(),
+                                        ));
+                                        s
+                                    } else {
+                                        String::new()
+                                    };
+                                let title_opt = if title_str.is_empty() {
+                                    None
+                                } else {
+                                    Some(title_str.as_str())
+                                };
+                                if let Err(e) = hist.record_visit(
+                                    &url_str,
+                                    title_opt,
+                                    buffr_history::Transition::Link,
+                                ) {
+                                    tracing::debug!(
+                                        url = %url_str,
+                                        error = %e,
+                                        "webview2 runtime: history.record_visit failed (non-fatal)"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        url = %url_str,
+                                        "webview2 runtime: history.record_visit ok"
+                                    );
+                                }
+                            }
+                        }
+
                         // Post a TriggerCapture so the worker fires CapturePreview
                         // as soon as the page finishes loading. Fire-and-forget:
                         // if the channel is full the capture will happen on the
@@ -446,6 +516,217 @@ impl TabEntry {
                 tracing::debug!(
                     "webview2 runtime: add_FaviconChanged skipped (older runtime?): {e}"
                 );
+            }
+        }
+
+        // ── Download wiring (ICoreWebView2_4::add_DownloadStarting) ─────────────
+        //
+        // Subscribe to the download-starting event to record downloads in the
+        // shared `buffr_downloads::Downloads` store and push a `DownloadNotice`
+        // onto the UI-layer queue.
+        //
+        // `add_DownloadStarting` lives on `ICoreWebView2_4`. We QI-cast from the
+        // base `ICoreWebView2` and skip gracefully if the cast fails (older
+        // runtime). This matches the `FaviconChanged` / `ICoreWebView2_15` pattern.
+        //
+        // The handler:
+        //   1. Reads `DownloadOperation` from the event args.
+        //   2. Reads `Uri` + `MimeType` + `TotalBytesToReceive` from the operation.
+        //   3. Calls `downloads.record_started` (idempotent on cef_id=0 — we use
+        //      the tab id as a surrogate since WebView2 doesn't expose a numeric
+        //      download id at the Starting phase).
+        //   4. Pushes a `DownloadNotice::Started` onto the notice queue.
+        //   5. Subscribes `add_StateChanged` on the operation to fire
+        //      `Completed` / `Failed` notices.
+        //
+        // SAFETY: add_DownloadStarting is an STA COM method on `wv4`.
+        // The closure captures only Send types (Arc<Downloads>, DownloadNoticeQueue)
+        // and is invoked on the STA thread by WebView2.
+        if let (Some(ref dl_store), Some(ref dl_queue)) = (downloads, notice_queue) {
+            if let Ok(wv4) = windows::core::Interface::cast::<
+                webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4,
+            >(&webview)
+            {
+                use webview2_com::DownloadStartingEventHandler;
+                use webview2_com::Microsoft::Web::WebView2::Win32::{
+                    COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                };
+
+                let dl_store_dl = dl_store.clone();
+                let dl_queue_dl = dl_queue.clone();
+                let mut dl_token: i64 = 0;
+
+                if let Err(e) = unsafe {
+                    wv4.add_DownloadStarting(
+                        &DownloadStartingEventHandler::create(Box::new(
+                            move |_sender, args| {
+                                let Some(args) = args else { return Ok(()) };
+
+                                // Obtain the download operation.
+                                let op = match args.DownloadOperation() {
+                                    Ok(o) => o,
+                                    Err(_) => return Ok(()),
+                                };
+
+                                // Read URI.
+                                let mut uri_pwstr = windows::core::PWSTR::null();
+                                let url_str = if op.Uri(&mut uri_pwstr).is_ok()
+                                    && !uri_pwstr.is_null()
+                                {
+                                    let s = uri_pwstr.to_string().unwrap_or_default();
+                                    windows::Win32::System::Com::CoTaskMemFree(Some(
+                                        uri_pwstr.0.cast(),
+                                    ));
+                                    s
+                                } else {
+                                    String::new()
+                                };
+
+                                // Read MIME type (optional).
+                                let mut mime_pwstr = windows::core::PWSTR::null();
+                                let mime_str = if op.MimeType(&mut mime_pwstr).is_ok()
+                                    && !mime_pwstr.is_null()
+                                {
+                                    let s = mime_pwstr.to_string().unwrap_or_default();
+                                    windows::Win32::System::Com::CoTaskMemFree(Some(
+                                        mime_pwstr.0.cast(),
+                                    ));
+                                    s
+                                } else {
+                                    String::new()
+                                };
+
+                                // Read total bytes (optional; -1 = unknown).
+                                let mut total: i64 = -1;
+                                let _ = op.TotalBytesToReceive(&mut total);
+                                let total_bytes =
+                                    if total > 0 { Some(total as u64) } else { None };
+
+                                // Derive a suggested filename from the URL path.
+                                let suggested_name = url_str
+                                    .rsplit('/')
+                                    .next()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("download")
+                                    .to_owned();
+
+                                tracing::debug!(
+                                    url = %url_str,
+                                    mime = %mime_str,
+                                    ?total_bytes,
+                                    "webview2 runtime: DownloadStarting"
+                                );
+
+                                // Record start — cef_id=0 (no numeric id
+                                // exposed at Starting phase); the store dedupes
+                                // by cef_id so repeated calls for the same
+                                // download are idempotent.
+                                let mime_opt =
+                                    if mime_str.is_empty() { None } else { Some(mime_str.as_str()) };
+                                let dl_id = dl_store_dl.record_started(
+                                    0,
+                                    &url_str,
+                                    &suggested_name,
+                                    mime_opt,
+                                    total_bytes,
+                                );
+                                tracing::debug!(
+                                    download_id = ?dl_id,
+                                    "webview2 runtime: download recorded"
+                                );
+
+                                // Push Started notice.
+                                buffr_core::download_notice::push(
+                                    &dl_queue_dl,
+                                    buffr_core::DownloadNotice {
+                                        kind: buffr_core::DownloadNoticeKind::Started,
+                                        filename: suggested_name.clone(),
+                                        path: String::new(),
+                                        created_at: std::time::Instant::now(),
+                                    },
+                                );
+
+                                // Subscribe StateChanged to push Completed/Failed.
+                                let op_state = op.clone();
+                                let queue_state = dl_queue_dl.clone();
+                                let name_state = suggested_name.clone();
+                                let mut state_token: i64 = 0;
+                                let _ = op.add_StateChanged(
+                                    &webview2_com::StateChangedEventHandler::create(Box::new(
+                                        move |_sender, _args| {
+                                            let mut state =
+                                                webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+                                            if op_state.State(&mut state).is_err() {
+                                                return Ok(());
+                                            }
+                                            let kind = if state
+                                                == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+                                            {
+                                                // Read the result file path.
+                                                let mut path_pwstr =
+                                                    windows::core::PWSTR::null();
+                                                let path_str = if op_state
+                                                    .ResultFilePath(&mut path_pwstr)
+                                                    .is_ok()
+                                                    && !path_pwstr.is_null()
+                                                {
+                                                    let s = path_pwstr
+                                                        .to_string()
+                                                        .unwrap_or_default();
+                                                    windows::Win32::System::Com::CoTaskMemFree(
+                                                        Some(path_pwstr.0.cast()),
+                                                    );
+                                                    s
+                                                } else {
+                                                    String::new()
+                                                };
+                                                tracing::debug!(
+                                                    path = %path_str,
+                                                    "webview2 runtime: download completed"
+                                                );
+                                                buffr_core::download_notice::push(
+                                                    &queue_state,
+                                                    buffr_core::DownloadNotice {
+                                                        kind: buffr_core::DownloadNoticeKind::Completed,
+                                                        filename: name_state.clone(),
+                                                        path: path_str,
+                                                        created_at: std::time::Instant::now(),
+                                                    },
+                                                );
+                                                return Ok(());
+                                            } else if state
+                                                == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                                            {
+                                                buffr_core::DownloadNoticeKind::Failed
+                                            } else {
+                                                return Ok(());
+                                            };
+                                            tracing::debug!(?kind, "webview2 runtime: download state changed");
+                                            buffr_core::download_notice::push(
+                                                &queue_state,
+                                                buffr_core::DownloadNotice {
+                                                    kind,
+                                                    filename: name_state.clone(),
+                                                    path: String::new(),
+                                                    created_at: std::time::Instant::now(),
+                                                },
+                                            );
+                                            Ok(())
+                                        },
+                                    )),
+                                    &mut state_token,
+                                );
+
+                                Ok(())
+                            },
+                        )),
+                        &mut dl_token,
+                    )
+                } {
+                    tracing::debug!(
+                        "webview2 runtime: add_DownloadStarting skipped (older runtime?): {e}"
+                    );
+                }
             }
         }
 

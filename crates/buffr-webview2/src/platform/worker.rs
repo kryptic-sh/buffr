@@ -55,6 +55,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue};
+use buffr_core::find::{FindResult, FindResultSink};
 use buffr_core::hint::HintEventSink;
 use buffr_engine::{FaviconUpdate, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
@@ -354,6 +356,19 @@ struct StaRuntime {
     /// round-trip.  `WebView2Engine::pump_hint_events` drains this from any
     /// thread.
     hint_sink: HintEventSink,
+    /// Shared browsing-history store. `None` when not provided (private mode,
+    /// backends that don't wire history, etc.). Visits are recorded on the STA
+    /// thread by the `NavigationCompleted` event handler.
+    history: Option<Arc<buffr_history::History>>,
+    /// Shared download store. `None` when not provided. Populated by the
+    /// `ICoreWebView2_4::add_DownloadStarting` event handler.
+    downloads: Option<Arc<buffr_downloads::Downloads>>,
+    /// Download-notice queue — carries `Started` / `Completed` / `Failed`
+    /// banners for the chrome strip. `None` when not provided.
+    notice_queue: Option<DownloadNoticeQueue>,
+    /// Find-result sink — one-slot mailbox for the UI thread's find statusline.
+    /// `None` when not provided. Updated by `ICoreWebView2Find` events.
+    find_sink: Option<FindResultSink>,
 }
 
 impl StaRuntime {
@@ -383,6 +398,9 @@ impl StaRuntime {
             &self.environment,
             &self.cmd_tx,
             Arc::clone(&self.hint_sink),
+            self.history.clone(),
+            self.downloads.clone(),
+            self.notice_queue.clone(),
         )?;
         #[cfg(not(target_os = "windows"))]
         let entry = TabEntry::new(id, url, &self.engine_state);
@@ -905,6 +923,101 @@ impl StaRuntime {
             })();
 
             if let Some(session) = wv28_result {
+                // ── Wire find-sink events ─────────────────────────────────────
+                //
+                // Subscribe to ActiveMatchIndexChanged and MatchCountChanged so
+                // the UI thread's `take_find_result` poll sees the live match
+                // position while the user navigates.
+                //
+                // Both handlers share the same `FindResultSink` (one-slot
+                // mailbox). The latest write wins — the UI thread reads the
+                // most recent state on each frame tick.
+                //
+                // Handler shape:
+                //   ICoreWebView2FindActiveMatchIndexChangedEventHandler
+                //     (Option<ICoreWebView2Find>, Option<IUnknown>)
+                //   ICoreWebView2FindMatchCountChangedEventHandler
+                //     (Option<ICoreWebView2Find>, Option<IUnknown>)
+                //
+                // Sender: ICoreWebView2Find (the same `session` we just got).
+                // SAFETY: add_ActiveMatchIndexChanged / add_MatchCountChanged are
+                // STA COM methods on a valid ICoreWebView2Find pointer owned by
+                // this STA thread.
+                if let Some(ref sink) = self.find_sink {
+                    use webview2_com::{
+                        FindActiveMatchIndexChangedEventHandler, FindMatchCountChangedEventHandler,
+                    };
+
+                    let sink_idx = Arc::clone(sink);
+                    let session_idx = session.clone();
+                    let mut token_idx: i64 = 0;
+                    let _ = unsafe {
+                        session.add_ActiveMatchIndexChanged(
+                            &FindActiveMatchIndexChangedEventHandler::create(Box::new(
+                                move |_sender, _args| {
+                                    let mut idx: i32 = 0;
+                                    let mut cnt: i32 = 0;
+                                    // ICoreWebView2Find::ActiveMatchIndex / MatchCount
+                                    // return -1 while the search is still in progress.
+                                    // Clamp to 0 for the UI (current is 1-based).
+                                    if session_idx.ActiveMatchIndex(&mut idx).is_err() {
+                                        idx = 0;
+                                    }
+                                    if session_idx.MatchCount(&mut cnt).is_err() {
+                                        cnt = 0;
+                                    }
+                                    let current = idx.max(0) as u32;
+                                    let count = cnt.max(0) as u32;
+                                    if let Ok(mut guard) = sink_idx.lock() {
+                                        *guard = Some(FindResult {
+                                            count,
+                                            current,
+                                            final_update: false,
+                                        });
+                                    }
+                                    Ok(())
+                                },
+                            )),
+                            &mut token_idx,
+                        )
+                    };
+
+                    let sink_cnt = Arc::clone(sink);
+                    let session_cnt = session.clone();
+                    let mut token_cnt: i64 = 0;
+                    let _ = unsafe {
+                        session.add_MatchCountChanged(
+                            &FindMatchCountChangedEventHandler::create(Box::new(
+                                move |_sender, _args| {
+                                    let mut idx: i32 = 0;
+                                    let mut cnt: i32 = 0;
+                                    if session_cnt.ActiveMatchIndex(&mut idx).is_err() {
+                                        idx = 0;
+                                    }
+                                    if session_cnt.MatchCount(&mut cnt).is_err() {
+                                        cnt = 0;
+                                    }
+                                    let current = idx.max(0) as u32;
+                                    let count = cnt.max(0) as u32;
+                                    if let Ok(mut guard) = sink_cnt.lock() {
+                                        *guard = Some(FindResult {
+                                            count,
+                                            current,
+                                            final_update: count > 0,
+                                        });
+                                    }
+                                    Ok(())
+                                },
+                            )),
+                            &mut token_cnt,
+                        )
+                    };
+
+                    tracing::debug!(
+                        "webview2: find-sink events wired (ActiveMatchIndexChanged + MatchCountChanged)"
+                    );
+                }
+
                 self.find_session = Some(session);
             } else {
                 // ── Fallback: document.execCommand (deprecated, but works) ────
@@ -1484,6 +1597,10 @@ pub(crate) fn spawn(
     engine_state: Arc<Mutex<EngineState>>,
     hint_sink: HintEventSink,
     data_dir: Option<std::path::PathBuf>,
+    history: Option<Arc<buffr_history::History>>,
+    downloads: Option<Arc<buffr_downloads::Downloads>>,
+    notice_queue: Option<DownloadNoticeQueue>,
+    find_sink: Option<FindResultSink>,
 ) -> Result<WorkerHandle, WebView2Error> {
     let (tx, rx) = mpsc::sync_channel::<Command>(64);
     // Clone before the closure captures `tx` so the WorkerHandle can hold a
@@ -1583,6 +1700,10 @@ pub(crate) fn spawn(
                 osr_sleeping: false,
                 find_session: None,
                 hint_sink: Arc::clone(&hint_sink),
+                history,
+                downloads,
+                notice_queue,
+                find_sink,
             };
 
             #[cfg(not(target_os = "windows"))]
@@ -1590,7 +1711,7 @@ pub(crate) fn spawn(
                 // Non-Windows path never reaches here (spawn is only called via
                 // the Windows platform path), but the compiler still type-checks
                 // both branches.
-                let _ = (frame, view, engine_state, hint_sink, data_dir);
+                let _ = (frame, view, engine_state, hint_sink, data_dir, history, downloads, notice_queue, find_sink);
                 return;
             };
 

@@ -874,6 +874,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "buffr-core",
+ "buffr-downloads",
  "buffr-engine",
  "buffr-modal",
  "image",
@@ -973,7 +974,10 @@ name = "buffr-webkit-cocoa"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
+ "buffr-core",
+ "buffr-downloads",
  "buffr-engine",
+ "buffr-history",
  "buffr-modal",
  "dispatch2",
  "objc2 0.6.4",
@@ -990,7 +994,10 @@ dependencies = [
 name = "buffr-webkitgtk"
 version = "0.1.0"
 dependencies = [
+ "buffr-core",
+ "buffr-downloads",
  "buffr-engine",
+ "buffr-history",
  "buffr-modal",
  "glib",
  "gtk4",
@@ -1004,7 +1011,10 @@ dependencies = [
 name = "buffr-webview2"
 version = "0.1.0"
 dependencies = [
+ "buffr-core",
+ "buffr-downloads",
  "buffr-engine",
+ "buffr-history",
  "buffr-modal",
  "image",
  "serde_json",

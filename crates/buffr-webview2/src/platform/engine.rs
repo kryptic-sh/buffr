@@ -41,6 +41,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use buffr_core::find::FindResultSink;
 use buffr_core::hint::{
     DEFAULT_HINT_SELECTORS, HintAlphabet, HintEventSink, HintSession, build_inject_script,
     new_hint_event_sink, take_hint_event,
@@ -147,6 +148,31 @@ impl WebView2Engine {
 
         let data_dir = options.data_dir.map(|p| p.to_path_buf());
 
+        // Downcast apps-layer sinks from type-erased Arc<dyn Any>.
+        // Each is optional — `None` means the caller didn't wire it (e.g.
+        // private mode skips history; stub backends pass None for all).
+        let history: Option<Arc<buffr_history::History>> = options
+            .history
+            .as_ref()
+            .and_then(|a| a.clone().downcast::<buffr_history::History>().ok());
+        let downloads: Option<Arc<buffr_downloads::Downloads>> = options
+            .downloads
+            .as_ref()
+            .and_then(|a| a.clone().downcast::<buffr_downloads::Downloads>().ok());
+        let notice_queue: Option<buffr_core::download_notice::DownloadNoticeQueue> = options
+            .notice_queue
+            .as_ref()
+            .and_then(|a| {
+                a.clone()
+                    .downcast::<std::sync::Mutex<std::collections::VecDeque<buffr_core::DownloadNotice>>>()
+                    .ok()
+            });
+        let find_sink: Option<FindResultSink> = options.find_sink.as_ref().and_then(|a| {
+            a.clone()
+                .downcast::<std::sync::Mutex<Option<buffr_core::find::FindResult>>>()
+                .ok()
+        });
+
         // Hint-mode infrastructure: alphabet, event sink, session slot.
         // The hint_alphabet falls back to the buffr-core default if the
         // options struct doesn't carry one yet.
@@ -164,6 +190,10 @@ impl WebView2Engine {
             Arc::clone(&engine_state),
             Arc::clone(&hint_sink),
             data_dir,
+            history,
+            downloads,
+            notice_queue,
+            find_sink,
         )?;
 
         tracing::info!(

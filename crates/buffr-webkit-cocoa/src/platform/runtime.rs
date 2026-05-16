@@ -98,6 +98,7 @@ pub(crate) mod macos {
 
     use buffr_core::hint::{HintEventSink, parse_console_event};
     use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
+    use buffr_history::Transition as HistoryTransition;
 
     use super::super::error::WebKitCocoaError;
     use super::super::worker::EngineState;
@@ -546,8 +547,8 @@ pub(crate) mod macos {
                 let tab_id = self.ivars().tab_id;
                 if let Ok(mut st) = self.ivars().state.lock() {
                     if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.url = url;
-                        tab.title = title;
+                        tab.url = url.clone();
+                        tab.title = title.clone();
                         tab.is_loading = false;
                     }
                     st.sync_loading_active();
@@ -569,6 +570,30 @@ pub(crate) mod macos {
                             height: 0,
                             pixels: Vec::new(),
                         });
+                    }
+
+                    // ── History recording ────────────────────────────────────────
+                    //
+                    // Record a visit for this navigation completion. `record_visit`
+                    // handles URL canonicalisation, skip-scheme filtering, and
+                    // dedupe internally — we just pass what we have. The title may
+                    // be empty for pages that set it asynchronously; a future
+                    // `on_title_change` equivalent can call `update_latest_title`.
+                    if let Some(history) = &st.history {
+                        let title_opt = if title.is_empty() {
+                            None
+                        } else {
+                            Some(title.as_str())
+                        };
+                        if let Err(e) =
+                            history.record_visit(&url, title_opt, HistoryTransition::Link)
+                        {
+                            tracing::debug!(
+                                error = %e,
+                                url = url.as_str(),
+                                "webkit-cocoa: history record_visit failed"
+                            );
+                        }
                     }
                 }
             }
