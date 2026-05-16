@@ -59,6 +59,10 @@ impl WebKitEngine {
         // Set initial viewport dims on the view state.
         view.width.store(width, Ordering::Relaxed);
         view.height.store(height, Ordering::Relaxed);
+        if options.frame_rate > 0 {
+            view.frame_rate_hz
+                .store(options.frame_rate as u32, Ordering::Relaxed);
+        }
 
         let worker = spawn(
             initial_url,

@@ -7531,6 +7531,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                                     let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
                                 }),
                             );
+                            buffr_engine::BrowserEngine::set_frame_rate(&engine, display_hz);
                             buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
                             let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
