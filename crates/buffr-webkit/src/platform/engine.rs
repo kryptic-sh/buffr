@@ -3,6 +3,7 @@
 //! Engine methods send [`Command`]s to the GLib worker thread via mpsc.
 //! Tab state is read from the shared `Arc<Mutex<EngineState>>`.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -11,6 +12,7 @@ use buffr_engine::{
     NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
     SharedOsrViewState, TabId, TabSummary,
     engine_id::EngineId,
+    internal_server::InternalServer,
     newtab::{default_newtab_html, default_settings_html, translate_internal_url},
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
@@ -46,26 +48,55 @@ pub struct WebKitEngine {
     /// the page reflects current keybinds / palette / splash art. None
     /// falls back to the raw template via [`default_newtab_html`].
     newtab_html_provider: Mutex<Option<NewTabHtmlProvider>>,
+    /// Optional shared loopback HTTP server. When set, `buffr://path`
+    /// resolves to `http://127.0.0.1:<port>/<token>/path` instead of a
+    /// `data:` URL; the server invokes per-route handlers wired by the
+    /// host so internal pages get a real HTTP origin (fetch, modules,
+    /// CSS imports all work) rather than the opaque data-URL origin.
+    internal_server: Mutex<Option<Arc<InternalServer>>>,
+    /// Per-tab mapping from TabId to the *display* URL the user typed
+    /// (e.g. `buffr://new`). Tracked separately from the translated URL
+    /// actually loaded into WebKit so the omnibar shows the human URL.
+    display_urls: Mutex<HashMap<TabId, String>>,
 }
 
 impl WebKitEngine {
     /// Construct a new Phase 2 engine.
     ///
     /// Initialises the WPE loader, spawns the GLib worker thread, and opens
-    /// the initial tab at `options.initial_url`.
+    /// the initial tab at `options.initial_url`. Equivalent to
+    /// [`Self::new_with_server`] with `None`; useful when the embedder
+    /// doesn't run a buffr internal-page server.
     pub fn new(options: &BackendOpenOptions<'_>) -> Result<Self, WebKitError> {
+        Self::new_with_server(options, None)
+    }
+
+    /// Construct an engine and bind it to a shared [`InternalServer`] in
+    /// one shot, so the worker's very first `open_tab` (fired from the
+    /// GLib idle handler before the embedder can call any setter) loads
+    /// `buffr://*` URLs via the server instead of falling back to a data
+    /// URL. The server keeps working for every subsequent navigate.
+    pub fn new_with_server(
+        options: &BackendOpenOptions<'_>,
+        internal_server: Option<Arc<InternalServer>>,
+    ) -> Result<Self, WebKitError> {
         let (width, height) = options.initial_size;
         // Translate `buffr://*` before the worker's idle handler loads the
-        // initial URL — the host-supplied newtab HTML provider isn't wired
-        // until after `new` returns, so we fall back to default templates
-        // here. Without this, the very first tab loads raw `buffr://new`
-        // and renders the "URL can't be shown" error page.
-        let initial_url_owned = translate_internal_url(
-            options.initial_url,
-            default_newtab_html,
-            default_settings_html,
-        )
-        .unwrap_or_else(|| options.initial_url.to_owned());
+        // initial URL. Prefer the loopback HTTP server when available so
+        // the initial tab matches the URL we'll use for subsequent navs;
+        // otherwise fall back to a self-contained data: URL.
+        let initial_url_owned = if let Some(rest) = options.initial_url.strip_prefix("buffr://")
+            && let Some(server) = internal_server.as_ref()
+        {
+            server.url_for(&format!("/{rest}"))
+        } else {
+            translate_internal_url(
+                options.initial_url,
+                default_newtab_html,
+                default_settings_html,
+            )
+            .unwrap_or_else(|| options.initial_url.to_owned())
+        };
         let initial_url = initial_url_owned.as_str();
 
         tracing::info!("webkit: WebKitEngine::new {width}x{height}");
@@ -99,7 +130,27 @@ impl WebKitEngine {
             popup_close_sink: new_popup_close_sink(),
             live_url: Mutex::new(String::new()),
             newtab_html_provider: Mutex::new(None),
+            internal_server: Mutex::new(internal_server),
+            display_urls: Mutex::new({
+                // The worker mints TabId(1) for the initial open_tab fired
+                // from spawn's idle handler. Pre-record the display URL so
+                // the omnibar shows `buffr://new` rather than the
+                // translated http://127.0.0.1:.../data: URL from the very
+                // first frame.
+                let mut m = HashMap::new();
+                m.insert(TabId(1), options.initial_url.to_owned());
+                m
+            }),
         })
+    }
+
+    /// Attach a shared [`InternalServer`] so future `buffr://*` navigations
+    /// resolve to authenticated localhost HTTP URLs instead of opaque
+    /// `data:` URLs. Idempotent; later calls replace the previous server.
+    pub fn set_internal_server(&self, server: Arc<InternalServer>) {
+        if let Ok(mut guard) = self.internal_server.lock() {
+            *guard = Some(server);
+        }
     }
 
     /// Wire the host-side `buffr://new` HTML provider so future buffr:// loads
@@ -111,9 +162,22 @@ impl WebKitEngine {
         }
     }
 
-    /// Translate a `buffr://` URL to a data: URL the engine can load.
-    /// Returns the input untouched for non-internal URLs.
+    /// Translate a `buffr://` URL into something the engine can actually
+    /// load. Prefers the shared [`InternalServer`] when one is attached
+    /// (real HTTP origin, supports fetch/modules) and falls back to a
+    /// self-contained `data:text/html;base64,…` URL otherwise. Non-buffr
+    /// URLs are returned untouched.
     fn resolve_url(&self, url: &str) -> String {
+        if let Some(rest) = url.strip_prefix("buffr://") {
+            // Route everything past `buffr://` straight to the server. The
+            // route table on the server side is what determines whether
+            // `/<rest>` resolves to a known page or 404.
+            if let Ok(guard) = self.internal_server.lock()
+                && let Some(server) = guard.as_ref()
+            {
+                return server.url_for(&format!("/{rest}"));
+            }
+        }
         let newtab = || {
             self.newtab_html_provider
                 .lock()
@@ -124,6 +188,26 @@ impl WebKitEngine {
         translate_internal_url(url, newtab, default_settings_html).unwrap_or_else(|| url.to_owned())
     }
 
+    /// Remember that `tab_id` was opened with the display URL `original`.
+    /// The omnibar reads this back via `active_tab_live_url` so users see
+    /// `buffr://new` instead of the `http://127.0.0.1:.../…` or `data:…`
+    /// that WebKit actually loaded.
+    fn record_display_url(&self, tab_id: TabId, original: &str) {
+        if let Ok(mut guard) = self.display_urls.lock() {
+            guard.insert(tab_id, original.to_owned());
+        }
+    }
+
+    fn forget_display_url(&self, tab_id: TabId) {
+        if let Ok(mut guard) = self.display_urls.lock() {
+            guard.remove(&tab_id);
+        }
+    }
+
+    fn display_url_for(&self, tab_id: TabId) -> Option<String> {
+        self.display_urls.lock().ok()?.get(&tab_id).cloned()
+    }
+
     /// Send a fire-and-forget command to the worker thread.
     fn send(&self, cmd: Command) {
         if let Err(e) = self.worker.cmd_tx.try_send(cmd) {
@@ -131,17 +215,22 @@ impl WebKitEngine {
         }
     }
 
-    /// Open a tab synchronously via a reply channel.
+    /// Open a tab synchronously via a reply channel. Records the original
+    /// (untranslated) URL against the minted [`TabId`] so omnibar reads
+    /// stay in `buffr://` space.
     fn open_tab_sync(&self, url: &str) -> Result<TabId, EngineError> {
+        let original = url.to_owned();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.send(Command::OpenTab {
             url: self.resolve_url(url),
             reply: reply_tx,
         });
-        reply_rx
+        let tab_id = reply_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| EngineError::Other("open_tab timed out".into()))?
-            .map_err(|e| EngineError::Other(e))
+            .map_err(EngineError::Other)?;
+        self.record_display_url(tab_id, &original);
+        Ok(tab_id)
     }
 }
 
@@ -170,12 +259,25 @@ impl BrowserEngine for WebKitEngine {
         self.open_tab(url)
     }
 
-    fn close_tab(&self, _id: TabId) -> Result<bool, EngineError> {
-        tracing::debug!("webkit: close_tab stub (single-tab phase)");
-        Ok(true)
+    fn close_tab(&self, id: TabId) -> Result<bool, EngineError> {
+        tracing::debug!(?id, "webkit: close_tab (single-tab phase, routes through close_active)");
+        self.forget_display_url(id);
+        self.close_active()
     }
 
     fn close_active(&self) -> Result<bool, EngineError> {
+        // Drop the active tab's display-URL stash now; if close_active
+        // succeeds the tab is gone, and if it fails the stash is no worse
+        // than slightly stale.
+        if let Some(active) = self
+            .worker
+            .engine_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_tab_info().map(|t| t.id))
+        {
+            self.forget_display_url(active);
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.send(Command::CloseActive { reply: reply_tx });
         Ok(reply_rx
@@ -211,15 +313,26 @@ impl BrowserEngine for WebKitEngine {
     fn active_tab(&self) -> Option<TabSummary> {
         let st = self.worker.engine_state.lock().ok()?;
         let info = st.active_tab_info()?;
-        Some(info.to_summary())
+        let mut summary = info.to_summary();
+        if let Some(display) = self.display_url_for(summary.id) {
+            summary.url = display;
+        }
+        Some(summary)
     }
 
     fn tabs_summary(&self) -> Vec<TabSummary> {
-        self.worker
+        let mut summaries: Vec<TabSummary> = self
+            .worker
             .engine_state
             .lock()
             .map(|st| st.tabs_summary())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for summary in &mut summaries {
+            if let Some(display) = self.display_url_for(summary.id) {
+                summary.url = display;
+            }
+        }
+        summaries
     }
 
     fn tab_count(&self) -> usize {
@@ -245,6 +358,21 @@ impl BrowserEngine for WebKitEngine {
     // ── Navigation ────────────────────────────────────────────────────────────
 
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
+        // Update the per-tab display-URL stash before dispatching so the
+        // omnibar reads the human-readable URL even if the navigation is
+        // still in flight when the next paint queries us.
+        if let Some(active) = self
+            .worker
+            .engine_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_tab_info().map(|t| t.id))
+        {
+            // For non-buffr:// URLs we still record so subsequent calls
+            // return the user-typed input rather than the loaded URL,
+            // which may differ after redirects.
+            self.record_display_url(active, url);
+        }
         self.send(Command::Navigate {
             url: self.resolve_url(url),
         });
@@ -252,12 +380,18 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn active_tab_live_url(&self) -> String {
-        self.worker
+        // Prefer the user-typed display URL (e.g. `buffr://new`) over the
+        // engine-loaded URL (e.g. the localhost+token URL or data: blob).
+        let active = self
+            .worker
             .engine_state
             .lock()
             .ok()
-            .and_then(|st| st.active_tab_info().map(|t| t.url.clone()))
-            .unwrap_or_default()
+            .and_then(|st| st.active_tab_info().map(|t| (t.id, t.url.clone())));
+        match active {
+            Some((id, loaded)) => self.display_url_for(id).unwrap_or(loaded),
+            None => String::new(),
+        }
     }
 
     fn pump_address_changes(&self) -> bool {

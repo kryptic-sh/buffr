@@ -970,6 +970,43 @@ fn main() -> Result<()> {
         backend.register_new_tab_handler(provider);
     }
 
+    // Bring up the loopback HTTP server that serves `buffr://*` internal
+    // pages. The same server is shared with every browser engine the app
+    // instantiates so they all resolve `buffr://new` to the same
+    // `http://127.0.0.1:<port>/<token>/new` URL — engines that can't
+    // register custom URI schemes (WPE WebKit, blink-cdp) get an HTTP
+    // origin out of the box, with fetch/modules/CSS imports working.
+    //
+    // Failure to bind is non-fatal: engines fall back to data: URL or
+    // their native scheme handler.
+    let internal_server = {
+        let engine_for_routes = Arc::clone(&engine);
+        let newtab_handler: buffr_engine::internal_server::Handler =
+            Arc::new(move || render_new_tab_html(&engine_for_routes));
+        let routes = buffr_engine::internal_server::Routes::new()
+            .html("/new", Arc::clone(&newtab_handler))
+            // `buffr://newtab` is an alias historical config files use.
+            .html("/newtab", Arc::clone(&newtab_handler))
+            .html(
+                "/settings",
+                Arc::new(|| buffr_engine::newtab::default_settings_html()),
+            );
+        match buffr_engine::internal_server::InternalServer::start(routes) {
+            Ok(srv) => {
+                let srv = Arc::new(srv);
+                info!(
+                    addr = %srv.addr(),
+                    "internal_server: listening on loopback"
+                );
+                Some(srv)
+            }
+            Err(err) => {
+                warn!(error = %err, "internal_server: bind failed — engines will fall back to data: URLs");
+                None
+            }
+        }
+    };
+
     // Register the `buffr-src:` scheme handler factory. Fetches the
     // underlying URL on a worker thread and renders it with bonsai
     // syntax highlighting (Round 2 of #30).
@@ -1186,6 +1223,7 @@ fn main() -> Result<()> {
         shutdown_flag,
         event_proxy,
     );
+    app_state.internal_server = internal_server;
     app_state.heartbeat = initial_heartbeat;
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -2176,6 +2214,13 @@ struct AppState {
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
+    /// Loopback HTTP server that serves `buffr://*` internal pages. Bound
+    /// to `127.0.0.1` on an ephemeral port, gated by a per-launch hex
+    /// token in the URL path. Shared across every browser engine the app
+    /// instantiates so they all resolve `buffr://new` to the same place.
+    /// `None` if startup binding failed — engines then fall back to their
+    /// own internal-page handling (e.g. data: URLs).
+    internal_server: Option<Arc<buffr_engine::internal_server::InternalServer>>,
     /// Next time CEF expects a pump, or `None` when idle.
     /// Set by `OnScheduleMessagePumpWork(delay_ms)`; cleared after
     /// pumping so we wait for CEF to schedule the next work item.
@@ -2640,6 +2685,7 @@ impl AppState {
             swipe_last_at: None,
             swipe_committed: false,
             shutdown_flag,
+            internal_server: None,
             cef_next_pump_at: None,
             tab_ids: Vec::new(),
             session_dirty: false,
@@ -7548,7 +7594,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         find_sink: None,
                         sinks: Box::new(()),
                     };
-                    match buffr_webkit::WebKitEngine::new(&options) {
+                    // Hand the app-wide loopback server to the engine at
+                    // construction so the worker's very first open_tab
+                    // (fired from spawn's idle handler) loads buffr:// URLs
+                    // via the server rather than falling back to data:.
+                    let server = self.internal_server.as_ref().map(Arc::clone);
+                    match buffr_webkit::WebKitEngine::new_with_server(&options, server) {
                         Ok(engine) => {
                             info!(engine_id = %inst.id, "webkit (WPE) engine created (phase 1 stub)");
                             let proxy = self.event_proxy.clone();
