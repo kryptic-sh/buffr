@@ -149,12 +149,30 @@ fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    // Shared library.
+    // Shared libraries. Linux ships ~6 runtime .so files alongside libcef.so
+    // (libEGL, libGLESv2, libvk_swiftshader, libvulkan, etc.) plus
+    // vk_swiftshader_icd.json. Copy all of them so dev runs don't hit
+    // "libGLESv2.so: cannot open shared object file" in the GPU subprocess.
     #[cfg(target_os = "linux")]
     {
-        let so = lib_dir.join("libcef.so");
-        if so.exists() {
-            copy_into_dir(&so, &target_dir)?;
+        if lib_dir.exists() {
+            for entry in fs::read_dir(lib_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "libcef.so"
+                        || name.starts_with("libEGL.so")
+                        || name.starts_with("libGLESv2.so")
+                        || name.starts_with("libvk_swiftshader.so")
+                        || name.starts_with("libvulkan.so")
+                        || name == "vk_swiftshader_icd.json"
+                    {
+                        copy_into_dir(&path, &target_dir)?;
+                    }
+                }
+            }
         }
     }
     #[cfg(target_os = "windows")]

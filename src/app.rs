@@ -241,8 +241,15 @@ fn append_switch_with_value(cmd: &CommandLine, name: &str, value: &str) {
 /// Returns `Err(buffr_core::CoreError::NoProjectDirs)` if the platform has no
 /// home dir (uncommon in practice — CI containers and servers occasionally hit this).
 pub fn profile_paths() -> Result<ProfilePaths, buffr_core::CoreError> {
+    // Debug builds use a separate XDG suffix so dev runs don't trample on
+    // release-build profile state (cookies, sqlite, CEF cache) and vice versa.
+    let app_name = if cfg!(debug_assertions) {
+        "buffr-debug"
+    } else {
+        "buffr"
+    };
     let cache =
-        hjkl_config::cache_dir("buffr").map_err(|_| buffr_core::CoreError::NoProjectDirs)?;
-    let data = hjkl_config::data_dir("buffr").map_err(|_| buffr_core::CoreError::NoProjectDirs)?;
+        hjkl_config::cache_dir(app_name).map_err(|_| buffr_core::CoreError::NoProjectDirs)?;
+    let data = hjkl_config::data_dir(app_name).map_err(|_| buffr_core::CoreError::NoProjectDirs)?;
     Ok(ProfilePaths { cache, data })
 }
