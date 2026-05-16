@@ -21,9 +21,11 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glib = "0.22"
+khronos-egl = { version = "6", features = ["dynamic"] }
+libloading = "0.8"
 
 [build-dependencies]
-# pkg-config finds wpe-webkit-2.0/wpe-1.0/wpebackend-fdo-1.0/wayland-server
-# cflags/libs; bindgen generates unified FFI bindings.
+# pkg-config finds wpe-webkit-2.0 + wpe-platform-2.0; bindgen generates
+# unified FFI bindings for both umbrellas.
 pkg-config = "0.3"
 bindgen = "0.71"

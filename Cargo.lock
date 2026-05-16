@@ -1006,6 +1006,8 @@ dependencies = [
  "buffr-engine",
  "buffr-history",
  "glib",
+ "khronos-egl",
+ "libloading 0.8.9",
  "pkg-config",
  "thiserror 2.0.18",
  "tracing",

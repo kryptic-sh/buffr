@@ -24,7 +24,6 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitError;
-use super::ffi::*;
 use super::runtime::{TabInfo, WpeRuntime};
 
 // ── EngineState ───────────────────────────────────────────────────────────────
@@ -149,49 +148,9 @@ pub(crate) fn spawn(
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
 ) -> Result<WorkerHandle, WebKitError> {
-    // ── Force WebKit's WPE renderer onto the SHM path ────────────────────────
-    //
-    // FDO 1.16 picks DMA-BUF by default; without an EGL display wired into
-    // FDO it silently fails to present and the SHM export callback never
-    // fires. These env vars are read by the WPEWebProcess subprocess WebKit
-    // spawns, which inherits this process's environment.
-    //
-    // SAFETY: `set_var` is unsound if any other thread is reading env at the
-    // same time, but at backend-spawn we are still single-threaded w.r.t. the
-    // WebKit/WPE world (the worker thread hasn't started yet).
-    unsafe {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        std::env::set_var("WEBKIT_FORCE_COMPLEX_TEXT", "0");
-    }
-
-    // ── Initialise wpe_loader (must happen before any WPE calls) ─────────────
-    //
-    // `wpe_loader_init` is safe to call multiple times; subsequent calls are
-    // no-ops. On Arch Linux the backend SO is `libWPEBackend-fdo-1.0.so`.
-    //
-    // SAFETY: string literal is valid and null-terminated.
-    let ok = unsafe { wpe_loader_init(b"libWPEBackend-fdo-1.0.so\0".as_ptr() as *const _) };
-    if !ok {
-        return Err(WebKitError::InitFailed(
-            "wpe_loader_init(WPEBackend-fdo-1.0) failed".into(),
-        ));
-    }
-    tracing::info!("webkit: wpe_loader_init OK");
-
-    // ── Initialise wpebackend-fdo for SHM (CPU readback, no EGL required) ────
-    //
-    // `wpe_fdo_initialize_shm` creates the internal Wayland compositor used by
-    // wpebackend-fdo to shuttle SHM buffers between the WebKit renderer process
-    // and the embedder. Must be called before any view backend is created.
-    //
-    // SAFETY: no parameters; safe to call once per process.
-    let shm_ok = unsafe { wpe_fdo_initialize_shm() };
-    if !shm_ok {
-        return Err(WebKitError::InitFailed(
-            "wpe_fdo_initialize_shm() failed".into(),
-        ));
-    }
-    tracing::info!("webkit: wpe_fdo_initialize_shm OK");
+    // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
+    // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
+    // / `wpe_fdo_initialize_*` are gone with the Phase 2 scaffold.
 
     let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(64);
@@ -299,27 +258,10 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
             rt.resize(width, height);
         }
         Command::KeyEvent { ev } => {
-            let wpe_ev = wpe_input_keyboard_event {
-                time: timestamp_ms(),
-                key_code: ev.key_code,
-                hardware_key_code: ev.hardware_key_code,
-                pressed: ev.pressed,
-                modifiers: ev.modifiers,
-            };
-            rt.dispatch_keyboard(wpe_ev);
+            rt.dispatch_keyboard(ev.key_code, ev.pressed, ev.modifiers);
         }
         Command::MouseMove { x, y, modifiers } => {
-            use super::ffi::wpe_input_pointer_event_type_wpe_input_pointer_event_type_motion as MOTION;
-            let ev = wpe_input_pointer_event {
-                type_: MOTION,
-                time: timestamp_ms(),
-                x,
-                y,
-                button: 0,
-                state: 0,
-                modifiers: translate_modifiers(modifiers),
-            };
-            rt.dispatch_pointer(ev);
+            rt.dispatch_pointer_motion(x, y, translate_modifiers(modifiers));
         }
         Command::MouseClick {
             x,
@@ -328,17 +270,7 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
             pressed,
             modifiers,
         } => {
-            use super::ffi::wpe_input_pointer_event_type_wpe_input_pointer_event_type_button as BUTTON;
-            let ev = wpe_input_pointer_event {
-                type_: BUTTON,
-                time: timestamp_ms(),
-                x,
-                y,
-                button,
-                state: if pressed { 1 } else { 0 },
-                modifiers: translate_modifiers(modifiers),
-            };
-            rt.dispatch_pointer(ev);
+            rt.dispatch_pointer_button(x, y, button, pressed, translate_modifiers(modifiers));
         }
         Command::MouseWheel {
             x,
@@ -347,54 +279,11 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
             delta_y,
             modifiers,
         } => {
-            use super::ffi::wpe_input_axis_event_type_wpe_input_axis_event_type_motion as MOTION;
-            // Dispatch two separate axis events for X and Y if non-zero.
-            if delta_y != 0 {
-                let ev = wpe_input_axis_event {
-                    type_: MOTION,
-                    time: timestamp_ms(),
-                    x,
-                    y,
-                    axis: 0,         // vertical
-                    value: -delta_y, // WPE: positive = scroll up = negative delta_y
-                    modifiers: translate_modifiers(modifiers),
-                };
-                rt.dispatch_axis(ev);
-            }
-            if delta_x != 0 {
-                let ev = wpe_input_axis_event {
-                    type_: MOTION,
-                    time: timestamp_ms(),
-                    x,
-                    y,
-                    axis: 1, // horizontal
-                    value: delta_x,
-                    modifiers: translate_modifiers(modifiers),
-                };
-                rt.dispatch_axis(ev);
-            }
+            rt.dispatch_axis(x, y, delta_x, delta_y, translate_modifiers(modifiers));
         }
-        Command::Focus { focused } => {
-            if let Some(tab) = rt.tab.as_ref() {
-                let backend = tab.wpe_backend();
-                if !backend.is_null() {
-                    unsafe {
-                        use super::ffi::{
-                            wpe_view_activity_state_wpe_view_activity_state_focused as FOCUSED,
-                            wpe_view_activity_state_wpe_view_activity_state_in_window as IN_WINDOW,
-                            wpe_view_activity_state_wpe_view_activity_state_visible as VISIBLE,
-                        };
-                        if focused {
-                            wpe_view_backend_add_activity_state(
-                                backend,
-                                VISIBLE | FOCUSED | IN_WINDOW,
-                            );
-                        } else {
-                            wpe_view_backend_remove_activity_state(backend, FOCUSED);
-                        }
-                    }
-                }
-            }
+        Command::Focus { focused: _ } => {
+            // Focus tracking moves to the BuffrView focus_in/focus_out API.
+            // Stub: no-op until the platform path is wired.
         }
         Command::OsrSleep { sleep } => {
             if let Ok(st) = rt.engine_state.lock() {
@@ -407,16 +296,6 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
     }
     false
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn timestamp_ms() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_millis()
 }
 
 /// Map CEF EVENTFLAG_* bitmask → WPE `wpe_input_modifier`.

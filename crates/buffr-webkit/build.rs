@@ -17,66 +17,67 @@ fn build_linux() {
          Install libwpewebkit-2.0-dev (Debian/Ubuntu) or wpewebkit (Arch).",
     );
 
-    // ── libwpe (wpe-1.0) ───────────────────────────────────────────────────────
-    let wpe_lib = pkg_config::probe_library("wpe-1.0")
-        .expect("wpe-1.0 not found via pkg-config. Install libwpe-1.0-dev or libwpe.");
-
-    // ── wpebackend-fdo-1.0 ────────────────────────────────────────────────────
-    let fdo_lib = pkg_config::probe_library("wpebackend-fdo-1.0").expect(
-        "wpebackend-fdo-1.0 not found. Install wpebackend-fdo or libwpebackend-fdo-1.0-dev.",
+    // ── wpe-platform-2.0 (the new WPEDisplay/WPEView API) ────────────────────
+    //
+    // Ships inside the wpewebkit package on Arch — separate .pc file. This is
+    // the OSR seam we hook into: a custom WPEDisplay subclass that hands
+    // WebKit our EGL display + a WPEView whose `render_buffer` vmethod copies
+    // pixels into our shared OsrFrame.
+    let platform_lib = pkg_config::probe_library("wpe-platform-2.0").expect(
+        "wpe-platform-2.0 not found via pkg-config. Requires WPE WebKit ≥ 2.50 \
+         with ENABLE_WPE_PLATFORM=ON.",
     );
 
-    // ── wayland-server (for wl_shm_buffer pixel readback) ────────────────────
-    let wayland_lib = pkg_config::probe_library("wayland-server")
-        .expect("wayland-server not found. Install libwayland-dev.");
-
     // Collect -I flags for bindgen's clang args (deduplicated).
-    let mut include_set: std::collections::HashSet<String> = webkit_lib
+    let include_set: std::collections::HashSet<String> = webkit_lib
         .include_paths
         .iter()
-        .chain(wpe_lib.include_paths.iter())
-        .chain(fdo_lib.include_paths.iter())
-        .chain(wayland_lib.include_paths.iter())
+        .chain(platform_lib.include_paths.iter())
         .map(|p| format!("-I{}", p.display()))
         .collect();
-    // Always expose wpe-1.0 headers so fdo can include <wpe/wpe.h>.
-    include_set.insert("-I/usr/include/wpe-1.0".to_owned());
     let clang_args: Vec<String> = include_set.into_iter().collect();
 
     // ── Generate unified FFI bindings ──────────────────────────────────────────
     //
-    // Single bindgen run covers all four libraries so cross-type references
-    // (e.g. wpe_view_backend* used by both wpe-1.0 and wpebackend-fdo) resolve
-    // without duplication.
+    // One bindgen run covers wpe-webkit-2.0 and wpe-platform-2.0 so the
+    // cross-type references (WebKitWebView's `display` property is a
+    // WPEDisplay*) resolve without duplication.
     let bindings = bindgen::Builder::default()
-        // wpe-webkit-2.0 umbrella header.
+        // wpe-webkit-2.0 umbrella.
         .header("/usr/include/wpe-webkit-2.0/wpe/webkit.h")
-        // libwpe umbrella header.
-        .header("/usr/include/wpe-1.0/wpe/wpe.h")
-        // wpebackend-fdo EGL umbrella (SHM + EGL exportable APIs).
-        .header("/usr/include/wpe-fdo-1.0/wpe/fdo-egl.h")
-        // wpebackend-fdo SHM+base exportable (non-EGL path used for CPU readback).
-        .header("/usr/include/wpe-fdo-1.0/wpe/fdo.h")
-        // wpebackend-fdo unstable SHM init (wpe_fdo_initialize_shm).
-        .header("/usr/include/wpe-fdo-1.0/wpe/unstable/fdo-shm.h")
-        // wayland-server for wl_shm_buffer pixel access.
-        .header("/usr/include/wayland-server-core.h")
+        // wpe-platform-2.0 umbrella — pulls in WPEDisplay/WPEView/WPEBuffer
+        // and the rest of the platform surface.
+        .header("/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h")
         .clang_args(&clang_args)
-        // Required guards to compile the fdo headers outside the library.
-        .clang_arg("-DWPE_FDO_COMPILATION")
-        // Required guard for the unstable SHM header.
-        .clang_arg("-D__WPE_FDO_SHM_H_INSIDE__")
-        .clang_arg("-DWL_HIDE_DEPRECATED")
         // Allowlists — keep compact.
         .allowlist_function("webkit_.*")
         .allowlist_type("WebKit.*")
         .allowlist_var("WEBKIT_.*")
         .allowlist_function("wpe_.*")
+        .allowlist_type("WPE.*")
+        .allowlist_type("_WPE.*")
         .allowlist_type("wpe_.*")
         .allowlist_var("WPE_.*")
-        .allowlist_function("wl_shm_buffer_.*")
-        .allowlist_type("wl_shm_buffer")
-        .allowlist_type("wl_resource")
+        // GObject helpers we'll need for raw type registration + property
+        // construction.
+        .allowlist_function("g_object_new")
+        .allowlist_function("g_object_ref")
+        .allowlist_function("g_object_unref")
+        .allowlist_function("g_signal_connect_data")
+        .allowlist_function("g_signal_handler_disconnect")
+        .allowlist_function("g_type_register_static_simple")
+        .allowlist_function("g_type_check_instance_cast")
+        .allowlist_function("g_type_class_peek_parent")
+        .allowlist_function("g_type_class_ref")
+        .allowlist_function("g_type_class_unref")
+        .allowlist_function("g_param_spec_object")
+        .allowlist_function("g_bytes_.*")
+        .allowlist_function("g_error_free")
+        .allowlist_type("GTypeInfo")
+        .allowlist_type("GTypeFlags")
+        .allowlist_type("GError")
+        .allowlist_type("GBytes")
+        .allowlist_var("G_TYPE_OBJECT")
         // Disable layout assertions — we use the FFI types as opaque pointers
         // only. The glib crate provides real GLib types; our bindgen output just
         // needs the function signatures.
@@ -92,9 +93,7 @@ fn build_linux() {
         .expect("failed to write wpe_bindings.rs");
 
     println!("cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe/webkit.h");
-    println!("cargo:rerun-if-changed=/usr/include/wpe-1.0/wpe/wpe.h");
-    println!("cargo:rerun-if-changed=/usr/include/wpe-fdo-1.0/wpe/fdo-egl.h");
-    println!("cargo:rerun-if-changed=/usr/include/wpe-fdo-1.0/wpe/fdo.h");
-    println!("cargo:rerun-if-changed=/usr/include/wpe-fdo-1.0/wpe/unstable/fdo-shm.h");
-    println!("cargo:rerun-if-changed=/usr/include/wayland-server-core.h");
+    println!(
+        "cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h"
+    );
 }
