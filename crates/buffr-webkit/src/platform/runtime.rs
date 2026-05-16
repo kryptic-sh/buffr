@@ -455,6 +455,28 @@ impl TabEntry {
         // SAFETY: web_view is valid for the tab's lifetime.
         unsafe { webkit_web_view_is_playing_audio(self.web_view) != 0 }
     }
+
+    /// Mark the WPEView visible (active) or hidden (background).
+    ///
+    /// Hidden views stop scheduling render-buffer commits — without this,
+    /// inactive WebViews keep rendering and our ViewCtx gate has to drop
+    /// every paint. Setting visible(true) on activation triggers WebKit to
+    /// schedule a fresh paint of the current page, which is what makes
+    /// select_tab actually show the new tab's pixels (otherwise WebKit
+    /// has no reason to re-render a page whose DOM hasn't changed since
+    /// the last paint, and the renderer stays on the loading animation
+    /// waiting for a needs_fresh frame that never arrives).
+    pub(crate) fn set_visible(&self, visible: bool) {
+        if self.wpe_view.is_null() {
+            return;
+        }
+        // SAFETY: wpe_view is a live WPEView owned by the WebView; the
+        // call is thread-bound to the worker, which is where TabEntry
+        // is mutated.
+        unsafe {
+            wpe_view_set_visible(self.wpe_view, visible as gboolean);
+        }
+    }
 }
 
 impl Drop for TabEntry {
@@ -582,6 +604,7 @@ impl WpeRuntime {
         if let Some(prev) = self.active_tab() {
             prev.is_active
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            prev.set_visible(false);
         }
 
         // TabInfo must exist before signal handlers fire — load-changed
@@ -638,10 +661,17 @@ impl WpeRuntime {
         if let Some(prev) = self.active_tab() {
             prev.is_active
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            prev.set_visible(false);
         }
-        self.tabs[new_idx]
+        let new_tab = &self.tabs[new_idx];
+        new_tab
             .is_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Setting visible(true) kicks WebKit to schedule a paint for
+        // the now-foreground view. Without this, the activation flag
+        // flip alone doesn't produce pixels — WebKit has no reason to
+        // re-render a page whose DOM is unchanged.
+        new_tab.set_visible(true);
         self.active_idx = Some(new_idx);
         if let Ok(mut st) = self.engine_state.lock() {
             st.active_idx = Some(new_idx);
@@ -690,9 +720,10 @@ impl WpeRuntime {
         };
         self.active_idx = new_idx;
         if let Some(i) = new_idx {
-            self.tabs[i]
-                .is_active
+            let next = &self.tabs[i];
+            next.is_active
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            next.set_visible(true);
         }
 
         if let Ok(mut st) = self.engine_state.lock() {
