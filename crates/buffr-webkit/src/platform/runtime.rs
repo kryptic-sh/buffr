@@ -366,30 +366,146 @@ impl WpeRuntime {
         }
     }
 
-    pub(crate) fn dispatch_keyboard(&self, _ev_key_code: u32, _ev_pressed: bool, _ev_modifiers: u32) {
-        // Stub: input dispatch reattaches once WPEView is wired.
+    /// Monotonic millisecond clock used for `wpe_event_*_new` time stamps.
+    /// WebKit reads it back via `wpe_event_get_time`; only the relative
+    /// ordering matters, so a process-start epoch is fine.
+    fn event_time_ms() -> u32 {
+        static ONCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let epoch = *ONCE.get_or_init(std::time::Instant::now);
+        epoch.elapsed().as_millis() as u32
     }
 
-    pub(crate) fn dispatch_pointer_motion(&self, _x: i32, _y: i32, _modifiers: u32) {}
+    /// Construct and dispatch a `WPEEvent` for this runtime's active tab.
+    /// `make` is invoked with the live `WPEView*` and the current time and
+    /// must return a freshly-owned event (`wpe_event_*_new` already adds
+    /// one ref; we unref after `wpe_view_event` takes its own).
+    fn dispatch_event<F>(&self, make: F)
+    where
+        F: FnOnce(*mut WPEView, u32) -> *mut WPEEvent,
+    {
+        let Some(tab) = &self.tab else {
+            return;
+        };
+        let view = tab.wpe_view;
+        if view.is_null() {
+            return;
+        }
+        let time = Self::event_time_ms();
+        // SAFETY: view is a live WPEView held by TabEntry; the factory
+        // closure receives it for the duration of this call. Both new()
+        // and wpe_view_event are thread-bound to the GLib main loop —
+        // dispatch_* always runs on the worker thread.
+        let event = make(view, time);
+        if event.is_null() {
+            return;
+        }
+        unsafe {
+            wpe_view_event(view, event);
+            wpe_event_unref(event);
+        }
+    }
+
+    pub(crate) fn dispatch_keyboard(&self, key_code: u32, pressed: bool, modifiers: u32) {
+        let event_type = if pressed {
+            WPEEventType_WPE_EVENT_KEYBOARD_KEY_DOWN
+        } else {
+            WPEEventType_WPE_EVENT_KEYBOARD_KEY_UP
+        };
+        self.dispatch_event(|view, time| unsafe {
+            wpe_event_keyboard_new(
+                event_type,
+                view,
+                WPEInputSource_WPE_INPUT_SOURCE_KEYBOARD,
+                time,
+                modifiers,
+                // `keycode` is the hardware code; `keyval` is the XKB
+                // keysym. For Phase-2 buffr passes a single value
+                // through `key_code`; route it to both so chrome key
+                // handling reads either field correctly.
+                key_code,
+                key_code,
+            )
+        });
+    }
+
+    pub(crate) fn dispatch_pointer_motion(&self, x: i32, y: i32, modifiers: u32) {
+        self.dispatch_event(|view, time| unsafe {
+            wpe_event_pointer_move_new(
+                WPEEventType_WPE_EVENT_POINTER_MOVE,
+                view,
+                WPEInputSource_WPE_INPUT_SOURCE_MOUSE,
+                time,
+                modifiers,
+                x as f64,
+                y as f64,
+                // delta_x/delta_y are the relative motion since the last
+                // POINTER_MOVE; buffr-app sends absolute positions so we
+                // don't carry per-tab deltas yet. WebKit copes fine — it
+                // primarily uses x/y for hit-testing.
+                0.0,
+                0.0,
+            )
+        });
+    }
 
     pub(crate) fn dispatch_pointer_button(
         &self,
-        _x: i32,
-        _y: i32,
-        _button: u32,
-        _pressed: bool,
-        _modifiers: u32,
+        x: i32,
+        y: i32,
+        button: u32,
+        pressed: bool,
+        modifiers: u32,
     ) {
+        let event_type = if pressed {
+            WPEEventType_WPE_EVENT_POINTER_DOWN
+        } else {
+            WPEEventType_WPE_EVENT_POINTER_UP
+        };
+        self.dispatch_event(|view, time| unsafe {
+            wpe_event_pointer_button_new(
+                event_type,
+                view,
+                WPEInputSource_WPE_INPUT_SOURCE_MOUSE,
+                time,
+                modifiers,
+                button,
+                x as f64,
+                y as f64,
+                // Always reporting `1` (single press) is OK for now;
+                // double-click detection is the chrome layer's job.
+                1,
+            )
+        });
     }
 
     pub(crate) fn dispatch_axis(
         &self,
-        _x: i32,
-        _y: i32,
-        _delta_x: i32,
-        _delta_y: i32,
-        _modifiers: u32,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: u32,
     ) {
+        // Pure horizontal+vertical zero → treat as "scroll stop" so WebKit
+        // can release momentum state.
+        let is_stop = (delta_x == 0 && delta_y == 0) as gboolean;
+        self.dispatch_event(|view, time| unsafe {
+            wpe_event_scroll_new(
+                view,
+                WPEInputSource_WPE_INPUT_SOURCE_MOUSE,
+                time,
+                modifiers,
+                delta_x as f64,
+                delta_y as f64,
+                // `precise_deltas = TRUE` for trackpad-style smooth
+                // scrolling. CEF input is already in pixel units, so this
+                // matches the scale WebKit's smooth-scroll code expects.
+                1,
+                is_stop,
+                x as f64,
+                y as f64,
+            )
+        });
     }
 
     pub(crate) fn any_audio_active(&self) -> bool {
