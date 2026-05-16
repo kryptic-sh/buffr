@@ -559,17 +559,17 @@ impl TabEntry {
                 webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4,
             >(&webview)
         {
-                use webview2_com::DownloadStartingEventHandler;
-                use webview2_com::Microsoft::Web::WebView2::Win32::{
-                    COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
-                };
+            use webview2_com::DownloadStartingEventHandler;
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+            };
 
-                let dl_store_dl = dl_store.clone();
-                let dl_queue_dl = dl_queue.clone();
-                let mut dl_token: i64 = 0;
+            let dl_store_dl = dl_store.clone();
+            let dl_queue_dl = dl_queue.clone();
+            let mut dl_token: i64 = 0;
 
-                if let Err(e) = unsafe {
-                    wv4.add_DownloadStarting(
+            if let Err(e) = unsafe {
+                wv4.add_DownloadStarting(
                         &DownloadStartingEventHandler::create(Box::new(
                             move |_sender, args| {
                                 let Some(args) = args else { return Ok(()) };
@@ -734,11 +734,10 @@ impl TabEntry {
                         )),
                         &mut dl_token,
                     )
-                } {
-                    tracing::debug!(
-                        "webview2 runtime: add_DownloadStarting skipped (older runtime?): {e}"
-                    );
-                }
+            } {
+                tracing::debug!(
+                    "webview2 runtime: add_DownloadStarting skipped (older runtime?): {e}"
+                );
             }
         }
 
