@@ -136,8 +136,11 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn close_active(&self) -> Result<bool, EngineError> {
-        tracing::debug!("webkit: close_active stub");
-        Ok(true)
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.send(Command::CloseActive { reply: reply_tx });
+        Ok(reply_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or(false))
     }
 
     fn select_tab(&self, _id: TabId) {

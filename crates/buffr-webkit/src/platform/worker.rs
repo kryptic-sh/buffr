@@ -118,6 +118,10 @@ pub(crate) enum Command {
     OsrSleep {
         sleep: bool,
     },
+    /// Close the active tab. Drops the WebView and clears engine_state.tabs.
+    CloseActive {
+        reply: mpsc::SyncSender<bool>,
+    },
     Shutdown,
 }
 
@@ -324,6 +328,10 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
             if let Ok(st) = rt.engine_state.lock() {
                 st.osr_sleeping.store(sleep, Ordering::Relaxed);
             }
+        }
+        Command::CloseActive { reply } => {
+            let closed = rt.close_active();
+            let _ = reply.try_send(closed);
         }
         Command::Shutdown => {
             ml.quit();

@@ -321,6 +321,20 @@ impl WpeRuntime {
         Ok(id)
     }
 
+    /// Close the active tab. Returns true if a tab was actually closed.
+    /// Drops the WebView (which releases its display ref) and clears the
+    /// tab list on the shared engine_state.
+    pub(crate) fn close_active(&mut self) -> bool {
+        if self.tab.take().is_none() {
+            return false;
+        }
+        if let Ok(mut st) = self.engine_state.lock() {
+            st.tabs.clear();
+            st.active_idx = None;
+        }
+        true
+    }
+
     pub(crate) fn navigate(&mut self, url: &str) {
         if let Some(tab) = &self.tab {
             tab.load_uri(url);

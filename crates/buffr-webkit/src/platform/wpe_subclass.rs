@@ -204,6 +204,18 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
         // each row tight into OsrFrame.
         let src_stride = size_us / (h as usize);
         let mut generation = 0u64;
+        // WebKit/WPE may deliver a buffer slightly smaller than the host
+        // requested (block-aligned content area). Mirror the actual frame
+        // dims into the shared OsrViewState so buffr-app's
+        // is_osr_frame_fresh gate accepts the frame.
+        let view_w = ctx.view.width.load(Ordering::Relaxed);
+        let view_h = ctx.view.height.load(Ordering::Relaxed);
+        if view_w != w {
+            ctx.view.width.store(w, Ordering::Relaxed);
+        }
+        if view_h != h {
+            ctx.view.height.store(h, Ordering::Relaxed);
+        }
         if let Ok(mut frame) = ctx.frame.lock() {
             if frame.width != w || frame.height != h {
                 frame.width = w;
