@@ -94,6 +94,8 @@ pub(crate) unsafe extern "C" fn on_export_shm_buffer(
     // SAFETY: `data` was set as `Box::into_raw(ctx)` in TabEntry::new.
     let ctx = unsafe { &*(data as *const ExportableCtx) };
 
+    tracing::trace!("webkit: on_export_shm_buffer fired");
+
     // SAFETY: buf is non-null per the FDO callback contract.
     let shm = unsafe { wpe_fdo_shm_exported_buffer_get_shm_buffer(buf) };
     if shm.is_null() {
@@ -205,6 +207,7 @@ unsafe extern "C" fn on_load_changed(
     load_event: std::os::raw::c_int,
     data: *mut std::os::raw::c_void,
 ) {
+    tracing::debug!("webkit: load-changed event={load_event}");
     // Reconstruct the Arc without consuming it.
     let es = unsafe { Arc::from_raw(data as *const Mutex<EngineState>) };
     let es_clone = Arc::clone(&es);
@@ -473,6 +476,10 @@ impl TabEntry {
                 tracing::error!("webkit: webkit_web_view_new returned null");
                 return None;
             }
+
+            // Kick the renderer process; without this the WebProcess never asks
+            // for a frame and the SHM export callback never fires.
+            wpe_view_backend_initialize(wpe_backend);
 
             (exportable, wpe_backend, wk_backend, web_view)
         };

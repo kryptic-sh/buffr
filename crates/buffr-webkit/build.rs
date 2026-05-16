@@ -57,11 +57,15 @@ fn build_linux() {
         .header("/usr/include/wpe-fdo-1.0/wpe/fdo-egl.h")
         // wpebackend-fdo SHM+base exportable (non-EGL path used for CPU readback).
         .header("/usr/include/wpe-fdo-1.0/wpe/fdo.h")
+        // wpebackend-fdo unstable SHM init (wpe_fdo_initialize_shm).
+        .header("/usr/include/wpe-fdo-1.0/wpe/unstable/fdo-shm.h")
         // wayland-server for wl_shm_buffer pixel access.
         .header("/usr/include/wayland-server-core.h")
         .clang_args(&clang_args)
         // Required guards to compile the fdo headers outside the library.
         .clang_arg("-DWPE_FDO_COMPILATION")
+        // Required guard for the unstable SHM header.
+        .clang_arg("-D__WPE_FDO_SHM_H_INSIDE__")
         .clang_arg("-DWL_HIDE_DEPRECATED")
         // Allowlists — keep compact.
         .allowlist_function("webkit_.*")
@@ -91,5 +95,6 @@ fn build_linux() {
     println!("cargo:rerun-if-changed=/usr/include/wpe-1.0/wpe/wpe.h");
     println!("cargo:rerun-if-changed=/usr/include/wpe-fdo-1.0/wpe/fdo-egl.h");
     println!("cargo:rerun-if-changed=/usr/include/wpe-fdo-1.0/wpe/fdo.h");
+    println!("cargo:rerun-if-changed=/usr/include/wpe-fdo-1.0/wpe/unstable/fdo-shm.h");
     println!("cargo:rerun-if-changed=/usr/include/wayland-server-core.h");
 }

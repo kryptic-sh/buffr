@@ -149,12 +149,27 @@ pub(crate) fn spawn(
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
 ) -> Result<WorkerHandle, WebKitError> {
+    // ── Force WebKit's WPE renderer onto the SHM path ────────────────────────
+    //
+    // FDO 1.16 picks DMA-BUF by default; without an EGL display wired into
+    // FDO it silently fails to present and the SHM export callback never
+    // fires. These env vars are read by the WPEWebProcess subprocess WebKit
+    // spawns, which inherits this process's environment.
+    //
+    // SAFETY: `set_var` is unsound if any other thread is reading env at the
+    // same time, but at backend-spawn we are still single-threaded w.r.t. the
+    // WebKit/WPE world (the worker thread hasn't started yet).
+    unsafe {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        std::env::set_var("WEBKIT_FORCE_COMPLEX_TEXT", "0");
+    }
+
     // ── Initialise wpe_loader (must happen before any WPE calls) ─────────────
     //
     // `wpe_loader_init` is safe to call multiple times; subsequent calls are
     // no-ops. On Arch Linux the backend SO is `libWPEBackend-fdo-1.0.so`.
     //
-    // SAFETY: string literal is valid UTF-8 and null-terminated.
+    // SAFETY: string literal is valid and null-terminated.
     let ok = unsafe { wpe_loader_init(b"libWPEBackend-fdo-1.0.so\0".as_ptr() as *const _) };
     if !ok {
         return Err(WebKitError::InitFailed(
@@ -162,6 +177,21 @@ pub(crate) fn spawn(
         ));
     }
     tracing::info!("webkit: wpe_loader_init OK");
+
+    // ── Initialise wpebackend-fdo for SHM (CPU readback, no EGL required) ────
+    //
+    // `wpe_fdo_initialize_shm` creates the internal Wayland compositor used by
+    // wpebackend-fdo to shuttle SHM buffers between the WebKit renderer process
+    // and the embedder. Must be called before any view backend is created.
+    //
+    // SAFETY: no parameters; safe to call once per process.
+    let shm_ok = unsafe { wpe_fdo_initialize_shm() };
+    if !shm_ok {
+        return Err(WebKitError::InitFailed(
+            "wpe_fdo_initialize_shm() failed".into(),
+        ));
+    }
+    tracing::info!("webkit: wpe_fdo_initialize_shm OK");
 
     let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(64);
@@ -177,17 +207,30 @@ pub(crate) fn spawn(
             // Build the GLib main loop bound to this thread's default context.
             let main_loop = glib::MainLoop::new(None, false);
 
-            let mut runtime =
-                WpeRuntime::new(Arc::clone(&frame), Arc::clone(&view), Arc::clone(&es));
-
-            // Open the initial tab.
-            if let Err(e) = runtime.open_tab(&initial_url) {
-                tracing::error!("webkit worker: initial open_tab failed: {e}");
-            }
-
             use std::cell::RefCell;
             use std::rc::Rc;
-            let runtime_rc = Rc::new(RefCell::new(runtime));
+
+            let runtime_rc = Rc::new(RefCell::new(WpeRuntime::new(
+                Arc::clone(&frame),
+                Arc::clone(&view),
+                Arc::clone(&es),
+            )));
+
+            // ── Initial tab: open inside the main loop via idle callback ──
+            //
+            // WebKit WPE requires the GLib main loop to be running before
+            // any WebView is created (it needs its internal Wayland display
+            // compositor + D-Bus process manager to initialise). Using
+            // idle_add_local ensures the main loop is pumping before
+            // wpe_view_backend_exportable_fdo_create is called.
+            {
+                let rt = Rc::clone(&runtime_rc);
+                glib::idle_add_local_once(move || {
+                    if let Err(e) = rt.borrow_mut().open_tab(&initial_url) {
+                        tracing::error!("webkit worker: initial open_tab failed: {e}");
+                    }
+                });
+            }
 
             // ── Audio-activity poll (500 ms) ──────────────────────────────
             {
