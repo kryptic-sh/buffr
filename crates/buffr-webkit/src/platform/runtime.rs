@@ -72,6 +72,123 @@ unsafe extern "C" {
     fn g_object_unref(object: *mut std::os::raw::c_void);
 }
 
+/// Per-tab heap context handed to WebKit's signal handlers via `user_data`.
+/// Keeps an Arc clone of the shared engine state so handlers running on the
+/// worker thread can flip the loading flag / update URL / title without
+/// touching TabEntry directly.
+struct TabSignalCtx {
+    tab_id: TabId,
+    engine_state: Arc<Mutex<EngineState>>,
+}
+
+impl TabSignalCtx {
+    fn with_tab_info<F: FnOnce(&mut TabInfo)>(&self, f: F) {
+        if let Ok(mut st) = self.engine_state.lock()
+            && let Some(info) = st.tabs.iter_mut().find(|t| t.id == self.tab_id)
+        {
+            f(info);
+            st.address_changed = true;
+        }
+    }
+}
+
+/// `load-changed (WebKitWebView*, WebKitLoadEvent)`. Toggles
+/// `TabInfo::is_loading` on STARTED / COMMITTED / FINISHED so buffr-app's
+/// `is_loading` accessor returns the right thing — the loading animation
+/// uses this to decide whether to keep itself on top of the page.
+unsafe extern "C" fn on_load_changed(
+    web_view: *mut WebKitWebView,
+    event: WebKitLoadEvent,
+    user_data: *mut std::os::raw::c_void,
+) {
+    let _ = web_view;
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is a `*mut TabSignalCtx` we stash via
+    // `Box::into_raw` when connecting the signal; lives until the matching
+    // Box::from_raw fires in TabEntry::drop.
+    let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
+    let started =
+        event == WebKitLoadEvent_WEBKIT_LOAD_STARTED || event == WebKitLoadEvent_WEBKIT_LOAD_REDIRECTED;
+    let finished = event == WebKitLoadEvent_WEBKIT_LOAD_FINISHED;
+    ctx.with_tab_info(|info| {
+        if started {
+            info.is_loading = true;
+            info.progress = 0.0;
+        } else if finished {
+            info.is_loading = false;
+            info.progress = 1.0;
+        }
+    });
+}
+
+/// `notify::uri` — fires whenever WebKit's view URL changes (redirects,
+/// SPA pushState, etc.). Mirrors it into `TabInfo.url` so the omnibar
+/// stays in sync.
+unsafe extern "C" fn on_notify_uri(
+    web_view: *mut WebKitWebView,
+    _pspec: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: see on_load_changed.
+    let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
+    // SAFETY: web_view is the signal-emitting object; valid for the call.
+    let uri_ptr = unsafe { webkit_web_view_get_uri(web_view) };
+    if uri_ptr.is_null() {
+        return;
+    }
+    // SAFETY: WebKit guarantees a null-terminated UTF-8 URI string.
+    let uri = unsafe { std::ffi::CStr::from_ptr(uri_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    ctx.with_tab_info(|info| info.url = uri);
+}
+
+/// `notify::title` — mirrors WebKit's page title into `TabInfo.title`
+/// so tab pills show the document title once it's parsed (instead of
+/// the URL placeholder we set on tab creation).
+unsafe extern "C" fn on_notify_title(
+    web_view: *mut WebKitWebView,
+    _pspec: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: see on_load_changed.
+    let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
+    // SAFETY: web_view is the signal-emitting object; valid for the call.
+    let title_ptr = unsafe { webkit_web_view_get_title(web_view) };
+    if title_ptr.is_null() {
+        return;
+    }
+    // SAFETY: WebKit guarantees a null-terminated UTF-8 title string.
+    let title = unsafe { std::ffi::CStr::from_ptr(title_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    if title.is_empty() {
+        return;
+    }
+    ctx.with_tab_info(|info| info.title = title);
+}
+
+/// Free a `*mut TabSignalCtx` previously stashed via `Box::into_raw`.
+/// GLib invokes this as `GClosureNotify` when the last signal handler
+/// using the user_data is disconnected.
+unsafe extern "C" fn drop_tab_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw in TabEntry::new.
+        drop(unsafe { Box::from_raw(user_data as *mut TabSignalCtx) });
+    }
+}
+
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
 /// One open browser tab. Owns the WebKitWebView GObject. The shared
@@ -109,6 +226,7 @@ impl TabEntry {
         display: *mut WPEDisplay,
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
+        engine_state: Arc<Mutex<EngineState>>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -149,6 +267,69 @@ impl TabEntry {
         );
         tracing::info!("webkit: ViewCtx attached to WPEView");
 
+        // Connect load-changed / notify::uri / notify::title so the engine
+        // state's TabInfo stays in sync. Without this:
+        //   - is_loading is set to true on navigate but never cleared, so
+        //     the loading animation overlay never deactivates (page hides
+        //     behind it for the entirety of the tab's lifetime).
+        //   - the omnibar shows the URL we asked WebKit to load, never
+        //     the URL it ended up on after redirects / pushState.
+        //   - tab pills keep the URL placeholder until they're reopened.
+        //
+        // The handler closure captures an engine_state Arc clone through a
+        // Boxed TabSignalCtx; GLib frees the Box via drop_tab_signal_ctx
+        // when the signal is disconnected at TabEntry::drop.
+        let ctx = Box::into_raw(Box::new(TabSignalCtx {
+            tab_id: id,
+            engine_state,
+        }));
+        let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
+            let signal_c = CString::new(signal).unwrap();
+            // SAFETY: web_view is a live WebKitWebView; signal_c lives
+            // until the end of this block; cb is a 'static C fn pointer;
+            // ctx is leaked into a Box::into_raw and freed by
+            // drop_tab_signal_ctx on disconnect.
+            unsafe {
+                g_signal_connect_data(
+                    web_view as *mut _,
+                    signal_c.as_ptr(),
+                    Some(cb),
+                    ctx as *mut _,
+                    Some(drop_tab_signal_ctx),
+                    0,
+                )
+            }
+        };
+        let load_changed_id = connect("load-changed", unsafe {
+            // SAFETY: transmute matches the fn pointer ABI shape required
+            // by g_signal_connect_data (a callable C fn). The actual
+            // arity-correct signature is enforced when WebKit invokes it.
+            std::mem::transmute::<
+                unsafe extern "C" fn(*mut WebKitWebView, WebKitLoadEvent, *mut std::os::raw::c_void),
+                unsafe extern "C" fn(),
+            >(on_load_changed)
+        });
+        let notify_uri_id = connect("notify::uri", unsafe {
+            std::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut WebKitWebView,
+                    *mut std::os::raw::c_void,
+                    *mut std::os::raw::c_void,
+                ),
+                unsafe extern "C" fn(),
+            >(on_notify_uri)
+        });
+        let notify_title_id = connect("notify::title", unsafe {
+            std::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut WebKitWebView,
+                    *mut std::os::raw::c_void,
+                    *mut std::os::raw::c_void,
+                ),
+                unsafe extern "C" fn(),
+            >(on_notify_title)
+        });
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -157,9 +338,9 @@ impl TabEntry {
             id,
             web_view,
             wpe_view,
-            load_changed_id: 0,
-            notify_title_id: 0,
-            notify_uri_id: 0,
+            load_changed_id,
+            notify_title_id,
+            notify_uri_id,
         })
     }
 
@@ -301,21 +482,25 @@ impl WpeRuntime {
 
         self.tab = None;
 
-        let entry = TabEntry::new(
-            id,
-            url,
-            self.display.raw,
-            Arc::clone(&self.frame),
-            Arc::clone(&self.view),
-        )
-        .ok_or_else(|| "TabEntry::new returned None".to_string())?;
-
+        // TabInfo must exist before signal handlers fire — load-changed
+        // can race the return from TabEntry::new because webkit_web_view_load_uri
+        // emits LOAD_STARTED synchronously.
         let info = TabInfo::new(id, url);
         if let Ok(mut st) = self.engine_state.lock() {
             st.tabs.clear();
             st.tabs.push(info);
             st.active_idx = Some(0);
         }
+
+        let entry = TabEntry::new(
+            id,
+            url,
+            self.display.raw,
+            Arc::clone(&self.frame),
+            Arc::clone(&self.view),
+            Arc::clone(&self.engine_state),
+        )
+        .ok_or_else(|| "TabEntry::new returned None".to_string())?;
 
         self.tab = Some(entry);
         Ok(id)

@@ -671,6 +671,7 @@ impl BrowserEngine for WebKitEngine {
     /// dedicated trait methods.
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
+        tracing::debug!(?action, "webkit: dispatch");
         // Per-action JS snippet. `n` is the count multiplier from the
         // keymap engine (e.g. `5j` → ScrollDown(5)). Pixel-per-line and
         // page fraction match Chromium / Firefox defaults so user
