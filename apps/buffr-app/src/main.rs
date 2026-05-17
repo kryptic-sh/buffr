@@ -7128,6 +7128,26 @@ impl AppState {
 }
 
 impl ApplicationHandler<BuffrUserEvent> for AppState {
+    /// Called by winit at the start of every event-loop iteration, before
+    /// any window/device events are dispatched. We piggyback the
+    /// supervisor liveness heartbeat here so the ping fires even under
+    /// sustained input (continuous scroll, drag, etc.) when
+    /// `about_to_wait` would otherwise be starved — winit only reaches
+    /// `about_to_wait` when the event queue drains, so a busy scroll
+    /// stream can hold off the heartbeat for >8 s and trip the
+    /// supervisor's hang watchdog. `tick()` is internally throttled to
+    /// `HEARTBEAT_INTERVAL` so calling it on every batch is cheap.
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        if let Some(h) = self.heartbeat.as_mut() {
+            if h.tick().is_none() {
+                // Broken pipe — supervisor is gone. Drop the handle so
+                // we stop trying on a dead socket; `about_to_wait` also
+                // checks this path on its own.
+                self.heartbeat = None;
+            }
+        }
+    }
+
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
         match event {
             BuffrUserEvent::Shutdown => {
