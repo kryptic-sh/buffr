@@ -7552,14 +7552,24 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         notice_queue: None,
                         find_sink: None,
                         sinks: Box::new(()),
-                        // Opt in to WPEDisplayWayland on Wayland sessions (#144).
-                        // The engine still reads XDG_SESSION_TYPE as the final gate.
-                        prefer_native: true,
+                        // Phase 3 native compositing (#144 / #152 / #153) is
+                        // shipped as v1 but unverified — polish items #147–#150
+                        // (position sync, input forwarding audit, HiDPI scale
+                        // sync, overlay z-order) are still open. Symptoms of an
+                        // unfinished native path include: chrome obscured by
+                        // the WebView subsurface (z-order), watchdog hang
+                        // detection on idle (parent surface stops getting
+                        // frame callbacks once the subsurface owns the
+                        // content). Until those gates close, the default is
+                        // OSR (Phase 2 — verified). Opt in to native via:
+                        //   BUFFR_WEBKIT_NATIVE=1
+                        prefer_native: std::env::var_os("BUFFR_WEBKIT_NATIVE")
+                            .is_some_and(|v| v == "1"),
                         // Thread raw Wayland handles directly into construction so
-                        // BuffrDisplayWayland (#152) can consume them before the
-                        // GLib worker thread's first WpeRuntime::new call.
-                        // None on non-Wayland sessions (field is Some only when
-                        // XDG_SESSION_TYPE=wayland and winit extracted handles).
+                        // BuffrDisplayWayland (#152) can consume them when
+                        // prefer_native is set. Always set on Wayland (zero
+                        // cost when prefer_native is false; the engine never
+                        // dereferences them in that case).
                         wayland_handles: self.wayland_native_handles,
                     };
                     // Hand the app-wide loopback server to the engine at
