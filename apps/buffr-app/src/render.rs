@@ -1015,7 +1015,9 @@ impl Renderer {
                 }
             }
 
+            tracing::info!(target: "buffr::ui_path", "enter: surface.get_current_texture");
             let mut cst = self.surface.get_current_texture();
+            tracing::info!(target: "buffr::ui_path", "exit:  surface.get_current_texture");
             for retry in 0..2 {
                 match &cst {
                     wgpu::CurrentSurfaceTexture::Success(f)
@@ -1036,13 +1038,21 @@ impl Renderer {
                         // the swapchain can rebuild without a live
                         // reference outstanding.
                         drop(cst);
+                        tracing::info!(target: "buffr::ui_path", "enter: surface.configure (stale-size retry)");
                         self.surface.configure(&self.device, &self.config);
+                        tracing::info!(target: "buffr::ui_path", "exit:  surface.configure");
+                        tracing::info!(target: "buffr::ui_path", "enter: surface.get_current_texture (retry)");
                         cst = self.surface.get_current_texture();
+                        tracing::info!(target: "buffr::ui_path", "exit:  surface.get_current_texture (retry)");
                     }
                     wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                         tracing::debug!(retry, "wgpu surface: outdated/lost, reconfigure + retry");
+                        tracing::info!(target: "buffr::ui_path", "enter: surface.configure (outdated/lost retry)");
                         self.surface.configure(&self.device, &self.config);
+                        tracing::info!(target: "buffr::ui_path", "exit:  surface.configure");
+                        tracing::info!(target: "buffr::ui_path", "enter: surface.get_current_texture (outdated retry)");
                         cst = self.surface.get_current_texture();
+                        tracing::info!(target: "buffr::ui_path", "exit:  surface.get_current_texture (outdated retry)");
                     }
                     wgpu::CurrentSurfaceTexture::Timeout => {
                         tracing::warn!(

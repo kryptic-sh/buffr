@@ -3615,7 +3615,9 @@ impl AppState {
 
     fn request_redraw(&self) {
         if let Some(window) = self.window.as_ref() {
+            tracing::info!(target: "buffr::ui_path", "enter: window.request_redraw");
             window.request_redraw();
+            tracing::info!(target: "buffr::ui_path", "exit:  window.request_redraw");
         }
     }
 
@@ -3766,7 +3768,9 @@ impl AppState {
         // Otherwise treat as main-window event (active tab or
         // unidentified — `-1` from a synthetic event).
         if let Some(window) = self.window.as_ref() {
+            tracing::info!(target: "buffr::ui_path", "enter: window.set_cursor");
             window.set_cursor(icon);
+            tracing::info!(target: "buffr::ui_path", "exit:  window.set_cursor");
         }
     }
 
@@ -3825,7 +3829,9 @@ impl AppState {
     }
 
     fn paint_chrome(&mut self) {
+        tracing::info!(target: "buffr::ui_path", "enter: paint_chrome");
         self.paint_chrome_with(None);
+        tracing::info!(target: "buffr::ui_path", "exit:  paint_chrome");
     }
 
     /// Two-finger horizontal-swipe back/forward gesture detector.
