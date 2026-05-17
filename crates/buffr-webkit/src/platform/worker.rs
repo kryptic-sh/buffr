@@ -22,6 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use buffr_core::hint::{HintEventSink, new_hint_event_sink};
+use buffr_downloads::Downloads;
+use buffr_engine::popup::{PopupQueue, new_popup_queue};
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitError;
@@ -202,6 +204,10 @@ pub(crate) struct WorkerHandle {
     /// every TabEntry's UCM script-message handler. `WebKitEngine` reads this
     /// via `pump_hint_events`.
     pub hint_sink: HintEventSink,
+    /// Shared popup URL queue. Written by the `create` signal handler on each
+    /// WebView when JS calls `window.open(url)` or a link has `target=_blank`.
+    /// Drained by the apps layer via `BrowserEngine::popup_queue`.
+    pub popup_queue: PopupQueue,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -236,10 +242,13 @@ impl Drop for WorkerHandle {
 
 /// Spawn the GLib worker thread and return a handle.
 ///
-/// `cookie_db_path` — when `Some`, the worker calls
-/// `webkit_cookie_manager_set_persistent_storage` once at startup so
-/// cookies survive browser restarts. `None` leaves WebKit's default
-/// in-memory cookie store active.
+/// - `cookie_db_path` — when `Some`, the worker calls
+///   `webkit_cookie_manager_set_persistent_storage` once at startup so
+///   cookies survive browser restarts. `None` leaves WebKit's default
+///   in-memory cookie store active.
+/// - `downloads` — when `Some`, the worker wires the `download-started`
+///   signal on the default `WebKitNetworkSession` and records lifecycle
+///   events (`started` / `finished` / `failed`) into the shared store.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     initial_url: &str,
@@ -250,6 +259,7 @@ pub(crate) fn spawn(
     is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
     zoom_level: Arc<Mutex<f64>>,
     cookie_db_path: Option<String>,
+    downloads: Option<std::sync::Arc<Downloads>>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -263,9 +273,15 @@ pub(crate) fn spawn(
     // signal handler) share the same Arc.
     let hint_sink: HintEventSink = new_hint_event_sink();
 
+    // Shared popup URL queue. Allocated here so both `WebKitEngine` (drainer)
+    // and the GLib worker thread (writer, via TabEntry's `create` signal)
+    // share the same Arc.
+    let popup_queue: PopupQueue = new_popup_queue();
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
+    let popup_queue_worker = Arc::clone(&popup_queue);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -313,6 +329,7 @@ pub(crate) fn spawn(
                 Arc::clone(&is_loading_atomic),
                 Arc::clone(&zoom_level),
                 hint_sink_worker,
+                popup_queue_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -373,6 +390,54 @@ pub(crate) fn spawn(
                         tracing::warn!(
                             path,
                             "webkit: cookie DB path contains NUL byte — cookies remain in-memory"
+                        );
+                    }
+                }
+            }
+
+            // ── Download tracking: NetworkSession `download-started` signal ──
+            //
+            // Wire the default NetworkSession's `download-started` signal to
+            // record lifecycle events into the shared `Downloads` store.
+            // Pattern mirrors the cookie wiring above: one connection at
+            // worker-init time on the process-wide default session.
+            //
+            // Signal callbacks are module-level `unsafe extern "C" fn`s defined
+            // below `spawn` so they can name the types they need.
+            // user_data for the session signal is a `Box<Arc<Downloads>>` leaked
+            // via `Box::into_raw` so the callback can clone the Arc safely.
+            if let Some(ref dl_store) = downloads {
+                // Connect `download-started` on the default NetworkSession.
+                // SAFETY: webkit_network_session_get_default() is always valid
+                // after WebKit is loaded; the process singleton lives for the
+                // process lifetime.
+                unsafe {
+                    use super::ffi::webkit_network_session_get_default;
+                    let session = webkit_network_session_get_default();
+                    if !session.is_null() {
+                        // Box the Arc so the callback can clone it via raw ptr.
+                        let store_raw =
+                            Box::into_raw(Box::new(Arc::clone(dl_store))) as *mut std::os::raw::c_void;
+                        let sig = std::ffi::CString::new("download-started").unwrap();
+                        super::ffi::g_signal_connect_data(
+                            session as *mut _,
+                            sig.as_ptr(),
+                            Some(std::mem::transmute::<
+                                unsafe extern "C" fn(
+                                    *mut std::os::raw::c_void,
+                                    *mut std::os::raw::c_void,
+                                    *mut std::os::raw::c_void,
+                                ),
+                                unsafe extern "C" fn(),
+                            >(on_download_started)),
+                            store_raw,
+                            Some(drop_boxed_arc_downloads),
+                            0,
+                        );
+                        tracing::info!("webkit: download-started signal connected");
+                    } else {
+                        tracing::warn!(
+                            "webkit: default network session NULL — download tracking unavailable"
                         );
                     }
                 }
@@ -442,6 +507,7 @@ pub(crate) fn spawn(
         cmd_tx,
         engine_state,
         hint_sink,
+        popup_queue,
         thread: Some(thread),
     })
 }
@@ -534,6 +600,279 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
     }
     false
+}
+
+// ── Download signal helpers ───────────────────────────────────────────────────
+//
+// Module-level `unsafe extern "C"` functions for the `download-started` chain
+// on WebKitNetworkSession. Defined here so they can name `DlCtx` + `Downloads`.
+//
+// Ownership model:
+//   - The `download-started` handler's `user_data` is a
+//     `Box<Arc<Downloads>>` produced by `Box::into_raw` in `spawn`.
+//     `drop_boxed_arc_downloads` reconstitutes + drops it on signal disconnect.
+//   - Each per-download signal (progress / finished / failed) has its own
+//     `user_data = Box<DlCtx>` (independent clone of the Arc inside).
+//     `drop_dl_ctx` handles cleanup.
+
+/// Per-download context shared across progress / finished / failed handlers.
+pub(crate) struct DlCtx {
+    pub id: buffr_downloads::DownloadId,
+    pub store: Arc<Downloads>,
+    pub suggested: String,
+}
+
+/// GClosureNotify: drop the `Box<Arc<Downloads>>` leaked in `spawn` for the
+/// `download-started` signal connection.
+pub(crate) unsafe extern "C" fn drop_boxed_arc_downloads(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut super::ffi::_GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data is a Box<Arc<Downloads>> produced by Box::into_raw.
+        unsafe { drop(Box::from_raw(user_data as *mut Arc<Downloads>)) };
+    }
+}
+
+/// GClosureNotify: drop the `Box<DlCtx>` leaked for per-download signal connections.
+pub(crate) unsafe extern "C" fn drop_dl_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut super::ffi::_GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data is a Box<DlCtx> produced by Box::into_raw.
+        unsafe { drop(Box::from_raw(user_data as *mut DlCtx)) };
+    }
+}
+
+/// `notify::estimated-progress` on `WebKitDownload`.
+/// Signal prototype: `(GObject*, GParamSpec*, gpointer)`.
+pub(crate) unsafe extern "C" fn on_download_progress(
+    download: *mut std::os::raw::c_void,
+    _pspec: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if download.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is a Box<DlCtx> valid until drop_dl_ctx fires.
+    let ctx = unsafe { &*(user_data as *const DlCtx) };
+    let progress = unsafe {
+        use super::ffi::{WebKitDownload, webkit_download_get_estimated_progress};
+        webkit_download_get_estimated_progress(download as *mut WebKitDownload)
+    };
+    // Store progress as a 0..1_000_000 received_bytes approximation.
+    let received = (progress * 1_000_000.0) as u64;
+    let _ = ctx.store.update_progress(ctx.id, received, None);
+    tracing::debug!(progress, "webkit: download progress");
+}
+
+/// `finished` on `WebKitDownload`.
+/// Signal prototype: `(WebKitDownload*, gpointer)`.
+pub(crate) unsafe extern "C" fn on_download_finished(
+    download: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if download.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is a Box<DlCtx> valid until drop_dl_ctx fires.
+    let ctx = unsafe { &*(user_data as *const DlCtx) };
+    let dest = unsafe {
+        use super::ffi::{WebKitDownload, webkit_download_get_destination};
+        let dest_ptr = webkit_download_get_destination(download as *mut WebKitDownload);
+        if dest_ptr.is_null() {
+            std::path::PathBuf::from(&ctx.suggested)
+        } else {
+            std::path::PathBuf::from(
+                std::ffi::CStr::from_ptr(dest_ptr)
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+        }
+    };
+    if let Err(e) = ctx.store.record_completed(ctx.id, &dest) {
+        tracing::warn!(error = %e, "webkit: record_completed failed");
+    }
+    tracing::debug!(id = ctx.id.0, dest = %dest.display(), "webkit: download finished");
+}
+
+/// `failed` on `WebKitDownload`.
+/// Signal prototype: `(WebKitDownload*, GError*, gpointer)`.
+pub(crate) unsafe extern "C" fn on_download_failed(
+    _download: *mut std::os::raw::c_void,
+    _error: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is a Box<DlCtx> valid until drop_dl_ctx fires.
+    let ctx = unsafe { &*(user_data as *const DlCtx) };
+    if let Err(e) = ctx.store.record_failed(ctx.id, "download failed") {
+        tracing::warn!(error = %e, "webkit: record_failed failed");
+    }
+    tracing::debug!(id = ctx.id.0, "webkit: download failed");
+}
+
+/// `download-started` on `WebKitNetworkSession`.
+/// Signal prototype: `(WebKitNetworkSession*, WebKitDownload*, gpointer)`.
+/// `user_data` is a `Box<Arc<Downloads>>` (see `drop_boxed_arc_downloads`).
+pub(crate) unsafe extern "C" fn on_download_started(
+    _session: *mut std::os::raw::c_void,
+    download: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if download.is_null() || user_data.is_null() {
+        return;
+    }
+    // Clone the Arc from the Box so we can hand it to DlCtx instances.
+    // SAFETY: user_data is a Box<Arc<Downloads>> valid until drop_boxed_arc_downloads.
+    let store: Arc<Downloads> = unsafe { Arc::clone(&*(user_data as *const Arc<Downloads>)) };
+
+    use super::ffi::{
+        WebKitDownload, webkit_download_get_estimated_progress, webkit_download_get_request,
+        webkit_download_get_response, webkit_download_set_destination, webkit_uri_request_get_uri,
+        webkit_uri_response_get_suggested_filename,
+    };
+    use std::ffi::{CStr, CString};
+
+    let dl = download as *mut WebKitDownload;
+
+    // Derive URL from request.
+    let url = unsafe {
+        let req = webkit_download_get_request(dl);
+        if req.is_null() {
+            String::new()
+        } else {
+            let uri_ptr = webkit_uri_request_get_uri(req);
+            if uri_ptr.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(uri_ptr).to_string_lossy().into_owned()
+            }
+        }
+    };
+
+    // Derive suggested filename from response (Content-Disposition) or URL.
+    let suggested: String = unsafe {
+        let resp = webkit_download_get_response(dl);
+        let from_resp = if resp.is_null() {
+            None
+        } else {
+            let sfn = webkit_uri_response_get_suggested_filename(resp);
+            if sfn.is_null() {
+                None
+            } else {
+                let s = CStr::from_ptr(sfn).to_string_lossy().into_owned();
+                if s.is_empty() { None } else { Some(s) }
+            }
+        };
+        from_resp.unwrap_or_else(|| url.split('/').next_back().unwrap_or("download").to_owned())
+    };
+
+    tracing::debug!(url, "webkit: download-started");
+
+    // Insert a row in the Downloads store. Use cef_id=0; the store is
+    // idempotent per (cef_id, url, suggested_name) but we're always adding
+    // a fresh download here so any distinct cef_id would work.
+    let dl_id = match store.record_started(0, &url, &suggested, None, None) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, "webkit: record_started failed");
+            return;
+        }
+    };
+
+    // Set destination to $HOME/Downloads/<suggested>.
+    unsafe {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+        let dir = std::path::Path::new(&home).join("Downloads");
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join(&suggested);
+        if let Some(s) = dest.to_str() {
+            if let Ok(c) = CString::new(s) {
+                webkit_download_set_destination(dl, c.as_ptr());
+            }
+        }
+    }
+
+    // Wire `notify::estimated-progress`.
+    {
+        let ctx_ptr = Box::into_raw(Box::new(DlCtx {
+            id: dl_id,
+            store: Arc::clone(&store),
+            suggested: suggested.clone(),
+        })) as *mut std::os::raw::c_void;
+        let sig = CString::new("notify::estimated-progress").unwrap();
+        unsafe {
+            super::ffi::g_signal_connect_data(
+                download,
+                sig.as_ptr(),
+                Some(std::mem::transmute::<
+                    unsafe extern "C" fn(
+                        *mut std::os::raw::c_void,
+                        *mut std::os::raw::c_void,
+                        *mut std::os::raw::c_void,
+                    ),
+                    unsafe extern "C" fn(),
+                >(on_download_progress)),
+                ctx_ptr,
+                Some(drop_dl_ctx),
+                0,
+            );
+        }
+    }
+
+    // Wire `finished`.
+    {
+        let ctx_ptr = Box::into_raw(Box::new(DlCtx {
+            id: dl_id,
+            store: Arc::clone(&store),
+            suggested: suggested.clone(),
+        })) as *mut std::os::raw::c_void;
+        let sig = CString::new("finished").unwrap();
+        unsafe {
+            super::ffi::g_signal_connect_data(
+                download,
+                sig.as_ptr(),
+                Some(std::mem::transmute::<
+                    unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void),
+                    unsafe extern "C" fn(),
+                >(on_download_finished)),
+                ctx_ptr,
+                Some(drop_dl_ctx),
+                0,
+            );
+        }
+    }
+
+    // Wire `failed`.
+    {
+        let ctx_ptr = Box::into_raw(Box::new(DlCtx {
+            id: dl_id,
+            store,
+            suggested,
+        })) as *mut std::os::raw::c_void;
+        let sig = CString::new("failed").unwrap();
+        unsafe {
+            super::ffi::g_signal_connect_data(
+                download,
+                sig.as_ptr(),
+                Some(std::mem::transmute::<
+                    unsafe extern "C" fn(
+                        *mut std::os::raw::c_void,
+                        *mut std::os::raw::c_void,
+                        *mut std::os::raw::c_void,
+                    ),
+                    unsafe extern "C" fn(),
+                >(on_download_failed)),
+                ctx_ptr,
+                Some(drop_dl_ctx),
+                0,
+            );
+        }
+    }
 }
 
 /// Map CEF EVENTFLAG_* bitmask → WPE `wpe_input_modifier`.

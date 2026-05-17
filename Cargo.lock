@@ -1010,6 +1010,7 @@ dependencies = [
  "buffr-modal",
  "cc",
  "glib",
+ "hjkl-clipboard",
  "khronos-egl",
  "libloading 0.8.9",
  "pkg-config",

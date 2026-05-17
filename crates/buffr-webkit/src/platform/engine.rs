@@ -11,6 +11,7 @@ use buffr_core::hint::{
     DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintSession,
     build_inject_script, take_hint_event,
 };
+use buffr_downloads::Downloads;
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
     NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
@@ -20,7 +21,6 @@ use buffr_engine::{
     newtab::{default_newtab_html, default_settings_html, translate_internal_url},
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
-        new_popup_queue,
     },
 };
 
@@ -178,6 +178,13 @@ impl WebKitEngine {
                 })
         };
 
+        // Downcast the downloads sink from BackendOpenOptions if provided.
+        let downloads: Option<Arc<Downloads>> = options
+            .downloads
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<Arc<Downloads>>())
+            .cloned();
+
         let worker = spawn(
             initial_url,
             width,
@@ -187,7 +194,13 @@ impl WebKitEngine {
             Arc::clone(&is_loading_atomic),
             Arc::clone(&zoom_level),
             cookie_db_path,
+            downloads,
         )?;
+
+        // Share the popup_queue that the worker already created and wired to
+        // each TabEntry's `create` signal. Using the same Arc ensures the
+        // apps layer drains the same queue the signals push into.
+        let popup_queue = Arc::clone(&worker.popup_queue);
 
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
@@ -200,7 +213,7 @@ impl WebKitEngine {
             frame,
             view,
             worker,
-            popup_queue: new_popup_queue(),
+            popup_queue,
             popup_create_sink: new_popup_create_sink(),
             popup_close_sink: new_popup_close_sink(),
             live_url: Mutex::new(String::new()),
