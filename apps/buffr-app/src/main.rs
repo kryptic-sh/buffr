@@ -10124,6 +10124,30 @@ mod tests {
     }
 
     #[test]
+    fn loading_anim_on_when_height_mismatches_beyond_tolerance() {
+        // Width matches, height differs by > OSR_DIM_TOLERANCE: still
+        // on because the page is mid-resize.
+        assert!(should_show_loading_anim(
+            Some((1272, 500)),
+            1272,
+            500 + OSR_DIM_TOLERANCE + 1,
+        ));
+    }
+
+    #[test]
+    fn loading_anim_signature_independent_of_load_state() {
+        // Regression: the splash gate used to OR in `host_is_loading`,
+        // which got pinned `true` forever when a tab-switch raced
+        // LOAD_COMMITTED — the splash never gave way to the page even
+        // though fresh frames were arriving.  The fix dropped the
+        // load-state input from the gate; the only inputs are now the
+        // dimension triple.  This test encodes the constraint at the
+        // type level: any signature regression that re-adds an
+        // is_loading bool would fail to compile.
+        let _ = should_show_loading_anim(Some((1272, 623)), 1272, 623);
+    }
+
+    #[test]
     fn cef_rect_chrome_state_changes_height() {
         // The debounce-flush invariant: chrome state at flush time must
         // be consulted, because (full_w, full_h) alone do NOT determine

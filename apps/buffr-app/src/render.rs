@@ -585,26 +585,7 @@ impl Renderer {
         // lets the underlying wl_subsurface show through; until that
         // path is closed, OSR wins the default.
         let want_native = std::env::var_os("BUFFR_WEBKIT_NATIVE").is_some_and(|v| v == "1");
-        let alpha_priority: &[wgpu::CompositeAlphaMode] = if want_native {
-            &[
-                wgpu::CompositeAlphaMode::PreMultiplied,
-                wgpu::CompositeAlphaMode::PostMultiplied,
-                wgpu::CompositeAlphaMode::Auto,
-                wgpu::CompositeAlphaMode::Opaque,
-            ]
-        } else {
-            &[
-                wgpu::CompositeAlphaMode::Opaque,
-                wgpu::CompositeAlphaMode::Auto,
-                wgpu::CompositeAlphaMode::PreMultiplied,
-                wgpu::CompositeAlphaMode::PostMultiplied,
-            ]
-        };
-        let composite_alpha = alpha_priority
-            .iter()
-            .find(|m| caps.alpha_modes.contains(m))
-            .copied()
-            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+        let composite_alpha = pick_composite_alpha(&caps.alpha_modes, want_native);
         tracing::info!(
             ?composite_alpha,
             want_native,
@@ -1317,4 +1298,136 @@ fn write_fullscreen_uniform(queue: &wgpu::Queue, buf: &wgpu::Buffer) {
         uv: [0.0, 0.0, 1.0, 1.0],
     };
     queue.write_buffer(buf, 0, bytemuck::bytes_of(&uni));
+}
+
+/// Select the wgpu surface's composite-alpha mode from the compositor's
+/// advertised capabilities and the live "native compositing wanted"
+/// flag.  Pure function so the priority logic has a unit test.
+///
+/// Default path (OSR, `want_native = false`):
+///   Opaque → Auto → PreMultiplied → PostMultiplied.
+/// WebKit's OSR pixel buffer carries a real alpha channel — Google's
+/// homepage background, for example, ships with alpha < 255 in regions
+/// of the rendered output.  With a PreMultiplied surface the
+/// compositor blends our window against the desktop, producing the
+/// visible bleed-through reported during webkit verification.  Opaque
+/// tells the compositor to discard our alpha channel; correct for OSR
+/// because we own every pixel in the window.
+///
+/// Native path (`BUFFR_WEBKIT_NATIVE=1`, `want_native = true`):
+///   PreMultiplied → PostMultiplied → Auto → Opaque.
+/// The chrome quad's browser region is fully transparent (alpha = 0)
+/// so the underlying wl_subsurface shows through.  Needs per-pixel
+/// alpha on the surface.
+///
+/// Falls back to Opaque when the compositor doesn't advertise any of
+/// the listed modes — defensive default; wgpu's surface configure
+/// would error later if Opaque is also unsupported, but in practice
+/// every Wayland / X11 / macOS / Windows compositor supports it.
+fn pick_composite_alpha(
+    advertised: &[wgpu::CompositeAlphaMode],
+    want_native: bool,
+) -> wgpu::CompositeAlphaMode {
+    let priority: &[wgpu::CompositeAlphaMode] = if want_native {
+        &[
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::Auto,
+            wgpu::CompositeAlphaMode::Opaque,
+        ]
+    } else {
+        &[
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::Auto,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+        ]
+    };
+    priority
+        .iter()
+        .find(|m| advertised.contains(m))
+        .copied()
+        .unwrap_or(wgpu::CompositeAlphaMode::Opaque)
+}
+
+#[cfg(test)]
+mod composite_alpha_tests {
+    use super::*;
+
+    #[test]
+    fn osr_path_prefers_opaque_when_available() {
+        // Regression: viewport rendered semi-transparent against the
+        // desktop on the default OSR path because PreMultiplied was
+        // picked first.  Opaque MUST win on the non-native path.
+        let advertised = vec![
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::Auto,
+        ];
+        assert_eq!(
+            pick_composite_alpha(&advertised, /* want_native */ false),
+            wgpu::CompositeAlphaMode::Opaque
+        );
+    }
+
+    #[test]
+    fn native_path_prefers_premultiplied_for_subsurface_transparency() {
+        // Phase 3 native compositing needs per-pixel alpha so the
+        // chrome quad's transparent browser region lets the
+        // wl_subsurface show through.  PreMultiplied first.
+        let advertised = vec![
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::Auto,
+        ];
+        assert_eq!(
+            pick_composite_alpha(&advertised, /* want_native */ true),
+            wgpu::CompositeAlphaMode::PreMultiplied
+        );
+    }
+
+    #[test]
+    fn osr_path_falls_through_priority_when_opaque_missing() {
+        // Compositor advertises only the alpha-blended modes.  The
+        // OSR path's priority then has to settle for Auto — the
+        // next-best "compositor decides" semantics.
+        let advertised = vec![
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Auto,
+        ];
+        assert_eq!(
+            pick_composite_alpha(&advertised, false),
+            wgpu::CompositeAlphaMode::Auto
+        );
+    }
+
+    #[test]
+    fn native_path_falls_through_to_opaque_when_blended_missing() {
+        // Pathological compositor advertising only Opaque.  Native
+        // path still resolves — the chrome quad simply won't have
+        // its transparent region honoured, but the engine won't crash
+        // and there's nothing more to do at this layer.
+        let advertised = vec![wgpu::CompositeAlphaMode::Opaque];
+        assert_eq!(
+            pick_composite_alpha(&advertised, true),
+            wgpu::CompositeAlphaMode::Opaque
+        );
+    }
+
+    #[test]
+    fn empty_advertised_falls_back_to_opaque() {
+        // Defensive default.  Empty caps shouldn't happen in practice
+        // (wgpu wouldn't have returned a SurfaceCapabilities), but
+        // the priority logic must not panic.
+        assert_eq!(
+            pick_composite_alpha(&[], false),
+            wgpu::CompositeAlphaMode::Opaque
+        );
+        assert_eq!(
+            pick_composite_alpha(&[], true),
+            wgpu::CompositeAlphaMode::Opaque
+        );
+    }
 }

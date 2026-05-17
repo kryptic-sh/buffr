@@ -225,7 +225,7 @@ const CLIPBOARD_BRIDGE_JS: &str = r#"
 /// Picks the best `<link rel="icon">` URL and posts `{ url, origin }` to
 /// the native `buffrFavicon` UCM handler. Fires once at DOMContentLoaded
 /// and again whenever `<head>` mutates (SPAs that swap icons mid-session).
-const FAVICON_BRIDGE_JS: &str = r#"
+pub(crate) const FAVICON_BRIDGE_JS: &str = r#"
 (() => {
   const pick = () => {
     const links = Array.from(document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"]'));
@@ -323,7 +323,7 @@ const CLIPBOARD_PASTE_BRIDGE_JS: &str = r#"
 ///
 /// The `readyState >= 2` (HAVE_CURRENT_DATA) guard prevents transient false
 /// positives from elements that fired `play` but haven't loaded media yet.
-const AUDIO_BRIDGE_JS: &str = r#"
+pub(crate) const AUDIO_BRIDGE_JS: &str = r#"
 (() => {
   let last = false;
   const compute = () => Array.from(document.querySelectorAll('video, audio'))
@@ -353,7 +353,7 @@ const AUDIO_BRIDGE_JS: &str = r#"
 /// whenever the computed cursor style changes. A `mouseleave` event resets to
 /// `"default"`. Custom `url()` cursors are stripped — the fallback keyword
 /// from the value list (last item) is used instead.
-const CURSOR_BRIDGE_JS: &str = r#"
+pub(crate) const CURSOR_BRIDGE_JS: &str = r#"
 (() => {
   let last = '';
   let lastT = 0;

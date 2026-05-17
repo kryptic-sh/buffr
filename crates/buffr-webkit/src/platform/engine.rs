@@ -210,48 +210,15 @@ impl WebKitEngine {
         let can_go_back = Arc::new(AtomicBool::new(false));
         let can_go_forward = Arc::new(AtomicBool::new(false));
 
-        // Build the cookie DB path.  When `options.data_dir` is provided
-        // (the normal apps/buffr-app path) it is already the per-engine
-        // namespace at `<data_root>/engines/<id>/profile/` — we just
-        // append `cookies.sqlite` to it.  Re-namespacing produced the
-        // doubled path `engines/<id>/profile/engines/<id>/cookies.sqlite`
-        // that libsoup logged as "Can't open" in #IME-era test runs.
-        //
-        // Fallback (data_dir unset): start from XDG_DATA_HOME / $HOME and
-        // namespace under `buffr/engines/<id>/` ourselves.
-        let cookie_db_path = {
-            let engine_id = options.engine_id.as_str();
-            let path: Option<std::path::PathBuf> = match options.data_dir {
-                Some(d) => Some(d.join("cookies.sqlite")),
-                None => {
-                    let xdg = std::env::var("XDG_DATA_HOME")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| {
-                            std::env::var("HOME")
-                                .ok()
-                                .filter(|s| !s.is_empty())
-                                .map(|h| std::path::PathBuf::from(h).join(".local/share"))
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        });
-                    Some(
-                        xdg.join("buffr")
-                            .join("engines")
-                            .join(engine_id)
-                            .join("cookies.sqlite"),
-                    )
-                }
-            };
-            path.and_then(|p| {
-                p.to_str().map(|s| s.to_owned()).or_else(|| {
-                    tracing::warn!(
-                        "webkit: cookie DB path is not valid UTF-8 — cookies remain in-memory"
-                    );
-                    None
-                })
-            })
-        };
+        // Build the cookie DB path.  See `compute_cookie_db_path` for
+        // the per-engine namespacing rules; extracted as a pure fn so
+        // the doubled-path regression has a unit test.
+        let xdg_fallback = compute_xdg_data_home();
+        let cookie_db_path = compute_cookie_db_path(
+            options.data_dir,
+            options.engine_id.as_str(),
+            xdg_fallback.as_deref(),
+        );
 
         // Downcast the downloads sink from BackendOpenOptions if provided.
         let downloads: Option<Arc<Downloads>> = options
@@ -794,49 +761,9 @@ impl BrowserEngine for WebKitEngine {
     // ── Input ─────────────────────────────────────────────────────────────────
 
     fn osr_key_event(&self, event: NeutralKeyEvent) {
-        use buffr_engine::KeyEventKind;
-        // The apps-layer key encoder emits up to three events per physical
-        // keystroke: RawDown (the keystroke), Char (the text-bearing
-        // event for printable keys), and Up (release).  CEF wants all
-        // three — RawDown drives accelerators, Char carries the literal
-        // text for input fields.  WPE/WebKit's wpe_view_event surface
-        // takes ONE press + ONE release per physical key and inserts the
-        // character associated with the keysym, so dispatching both
-        // RawDown and Char doubles the inserted character: typing "h"
-        // produced "Hh" in production (RawDown's windows_key_code=72
-        // gave 'H' and Char's character=104 gave 'h').
-        //
-        // Rule: drop RawDown when the apps-layer already filled in a
-        // text-bearing `character` / `unmodified_character` field —
-        // those keystrokes are printable and the matching Char event
-        // will carry the correct insert.  Pure-shortcut RawDown
-        // (Esc, Enter, F-keys, arrows, modifiers — character == 0)
-        // still passes through as a press so WebKit's key handler can
-        // act on them.
-        let pressed = match event.kind {
-            KeyEventKind::Up => false,
-            KeyEventKind::Char => true,
-            KeyEventKind::RawDown => {
-                if event.character != 0 || event.unmodified_character != 0 {
-                    return;
-                }
-                true
-            }
-        };
-        // Prefer the Char event's text-bearing `character` over the
-        // VK code for the WPE keysym.  Falls back to windows_key_code
-        // for non-text events (shortcut keys, releases).
-        let key_code = if event.character != 0 {
-            event.character as u32
-        } else {
-            event.windows_key_code as u32
-        };
-        let ev = WpeKeyEvent {
-            key_code,
-            pressed,
-            modifiers: event.modifiers,
-        };
-        self.send(Command::KeyEvent { ev });
+        if let Some(ev) = neutral_key_to_wpe(event) {
+            self.send(Command::KeyEvent { ev });
+        }
     }
 
     fn osr_mouse_move(&self, x: i32, y: i32, modifiers: u32) {
@@ -1613,6 +1540,112 @@ fn scroll_lines_to_px(count: u32) -> u32 {
     count.saturating_mul(60).max(60)
 }
 
+/// Resolve the XDG data home for the cookie-path fallback branch.
+/// `$XDG_DATA_HOME` wins; `$HOME/.local/share` is the freedesktop
+/// default; `.` (cwd) is the last-resort when neither env var is set
+/// (e.g. tiny init container, headless test).  Returned as an owned
+/// `PathBuf` rather than a `&Path` so the caller can hold it across
+/// multiple `compute_cookie_db_path` calls without re-querying env.
+fn compute_xdg_data_home() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
+        if !v.is_empty() {
+            return Some(std::path::PathBuf::from(v));
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return Some(std::path::PathBuf::from(h).join(".local/share"));
+        }
+    }
+    None
+}
+
+/// Compute the on-disk cookie SQLite path for a webkit engine instance.
+///
+/// `data_dir` is the per-engine namespace that `apps/buffr-app` builds
+/// from its config (canonically `<data_root>/engines/<id>/profile/`);
+/// it is ALREADY namespaced, so we only append `cookies.sqlite` to it.
+/// Re-namespacing inside this function is what produced the doubled
+/// path `engines/<id>/profile/engines/<id>/cookies.sqlite` that
+/// libsoup logged as "Can't open …" in production.
+///
+/// `xdg_fallback` is the resolved XDG data home (typically
+/// `$HOME/.local/share`) used when `data_dir` is unset — this branch
+/// must namespace under `buffr/engines/<id>/` itself because the
+/// fallback is shared across engines.
+///
+/// Returns `None` when the chosen path is not valid UTF-8 (libsoup's
+/// C API requires `*const c_char`), in which case the engine logs a
+/// warning and runs with in-memory cookies.
+fn compute_cookie_db_path(
+    data_dir: Option<&std::path::Path>,
+    engine_id: &str,
+    xdg_fallback: Option<&std::path::Path>,
+) -> Option<String> {
+    let path: std::path::PathBuf = match data_dir {
+        Some(d) => d.join("cookies.sqlite"),
+        None => {
+            let base = xdg_fallback
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            base.join("buffr")
+                .join("engines")
+                .join(engine_id)
+                .join("cookies.sqlite")
+        }
+    };
+    path.to_str().map(|s| s.to_owned()).or_else(|| {
+        tracing::warn!("webkit: cookie DB path is not valid UTF-8 — cookies remain in-memory");
+        None
+    })
+}
+
+/// Pure mapping from the apps-layer's `NeutralKeyEvent` to the WPE
+/// `WpeKeyEvent` (or `None` to drop the event).  Extracted out of the
+/// `osr_key_event` trait impl so it's unit-testable without spinning up
+/// a real GLib worker.
+///
+/// The apps-layer key encoder emits up to three events per physical
+/// keystroke: `RawDown` (keystroke), `Char` (text-bearing for printable
+/// keys), `Up` (release).  CEF wants all three.  WPE's
+/// `wpe_view_event` surface takes ONE press + ONE release per physical
+/// key, so we must drop one of {RawDown, Char} for printables —
+/// otherwise WebKit inserts the character twice (regression: typing
+/// "h" produced "Hh" because the windows_key_code on RawDown is the
+/// uppercase keysym 72='H' while Char carried character=104='h').
+///
+/// Returns `None` when the event should be dropped at the WPE boundary.
+fn neutral_key_to_wpe(event: NeutralKeyEvent) -> Option<WpeKeyEvent> {
+    use buffr_engine::KeyEventKind;
+    let pressed = match event.kind {
+        KeyEventKind::Up => false,
+        KeyEventKind::Char => true,
+        KeyEventKind::RawDown => {
+            // Drop the RawDown for printables — the matching Char
+            // event will carry the correct insert.  Pure shortcut
+            // RawDown (Esc, Enter, F-keys, modifiers — character==0)
+            // still passes through.
+            if event.character != 0 || event.unmodified_character != 0 {
+                return None;
+            }
+            true
+        }
+    };
+    // Prefer the Char event's text-bearing `character` over the
+    // VK code for the WPE keysym.  Falls back to windows_key_code
+    // for non-text events (shortcut keys, releases).
+    let key_code = if event.character != 0 {
+        event.character as u32
+    } else {
+        event.windows_key_code as u32
+    };
+    Some(WpeKeyEvent {
+        key_code,
+        pressed,
+        modifiers: event.modifiers,
+    })
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1720,5 +1753,200 @@ mod tests {
         // then .max(60) is a no-op. Confirms no panic on attacker-typed
         // huge prefix counts.
         assert_eq!(scroll_lines_to_px(u32::MAX), u32::MAX);
+    }
+
+    // ── neutral_key_to_wpe — double-input regression guard ────────────────────
+
+    /// Build a `NeutralKeyEvent` representing the RawDown half of a
+    /// printable keystroke.  apps-layer fills `character` /
+    /// `unmodified_character` on the RawDown too (mirrors CEF's
+    /// `windows_key_code`-driven shape), which is what made the
+    /// "Hh" double-input bug subtle.
+    fn raw_down(vk: i32, ch: u16) -> NeutralKeyEvent {
+        NeutralKeyEvent {
+            kind: buffr_engine::KeyEventKind::RawDown,
+            windows_key_code: vk,
+            native_key_code: 0,
+            character: ch,
+            unmodified_character: ch,
+            modifiers: 0,
+            is_system_key: false,
+            focus_on_editable_field: true,
+        }
+    }
+    fn char_ev(vk: i32, ch: u16) -> NeutralKeyEvent {
+        NeutralKeyEvent {
+            kind: buffr_engine::KeyEventKind::Char,
+            windows_key_code: vk,
+            native_key_code: 0,
+            character: ch,
+            unmodified_character: ch,
+            modifiers: 0,
+            is_system_key: false,
+            focus_on_editable_field: true,
+        }
+    }
+    fn key_up(vk: i32) -> NeutralKeyEvent {
+        NeutralKeyEvent {
+            kind: buffr_engine::KeyEventKind::Up,
+            windows_key_code: vk,
+            native_key_code: 0,
+            character: 0,
+            unmodified_character: 0,
+            modifiers: 0,
+            is_system_key: false,
+            focus_on_editable_field: true,
+        }
+    }
+
+    #[test]
+    fn neutral_key_to_wpe_drops_printable_rawdown() {
+        // Regression: production reproducer.  Typing 'h' delivered
+        // RawDown vk=72 ch=104 followed by Char vk=104 ch=104; before
+        // the fix, both reached WPE and the field rendered "Hh".  The
+        // RawDown of a printable must be filtered at this boundary.
+        let dropped = neutral_key_to_wpe(raw_down(72, 104));
+        assert!(
+            dropped.is_none(),
+            "RawDown for a printable character must not reach WPE"
+        );
+    }
+
+    #[test]
+    fn neutral_key_to_wpe_dispatches_char_with_text_keysym() {
+        // The Char event carries the actual lowercase code point in
+        // `character`.  WPE keysym must come from that, not from
+        // windows_key_code (which holds the uppercase VK).
+        let ev =
+            neutral_key_to_wpe(char_ev(72, 104)).expect("Char event for printable must dispatch");
+        assert_eq!(
+            ev.key_code, 104,
+            "Char dispatch must use the text-bearing character, not the VK"
+        );
+        assert!(ev.pressed, "Char must dispatch as a press");
+    }
+
+    #[test]
+    fn neutral_key_to_wpe_passes_shortcut_rawdown_through() {
+        // Esc (VK 27) has no text payload; the apps-layer leaves
+        // character == 0.  WebKit needs the press to receive Esc, so
+        // the RawDown must NOT be dropped.
+        let ev = neutral_key_to_wpe(raw_down(27, 0))
+            .expect("RawDown for a shortcut key (Esc) must reach WPE");
+        assert_eq!(ev.key_code, 27);
+        assert!(ev.pressed);
+    }
+
+    #[test]
+    fn neutral_key_to_wpe_passes_modifier_rawdown_through() {
+        // Pure modifier presses (Shift, Ctrl, Alt) come in as
+        // RawDown with character == 0.  They must reach WPE so the
+        // chord state on the engine side stays in sync with the host.
+        let ev = neutral_key_to_wpe(raw_down(16 /* VK_SHIFT */, 0))
+            .expect("RawDown for a modifier key must reach WPE");
+        assert_eq!(ev.key_code, 16);
+        assert!(ev.pressed);
+    }
+
+    #[test]
+    fn neutral_key_to_wpe_emits_release_on_up() {
+        // The Up event has no character payload; we use
+        // windows_key_code as the keysym so WebKit can match the
+        // release with whichever physical key it was for.
+        let ev = neutral_key_to_wpe(key_up(72)).expect("Up event must dispatch");
+        assert_eq!(ev.key_code, 72);
+        assert!(!ev.pressed, "Up must dispatch as a release");
+    }
+
+    // ── compute_cookie_db_path — doubled-path regression guard ────────────────
+
+    #[test]
+    fn cookie_path_uses_data_dir_as_is_without_renamespacing() {
+        // Regression: apps/buffr-app passes data_dir already namespaced
+        // as `<data_root>/engines/<id>/profile/`.  The previous impl
+        // appended another `engines/<id>/` on top, producing
+        // `…/engines/webkit/profile/engines/webkit/cookies.sqlite`
+        // which libsoup couldn't open.  data_dir must be the FINAL
+        // namespace — only `cookies.sqlite` is appended.
+        let data_dir =
+            std::path::PathBuf::from("/home/u/.local/share/buffr-debug/engines/webkit/profile");
+        let got =
+            compute_cookie_db_path(Some(&data_dir), "webkit", None).expect("path must resolve");
+        assert_eq!(
+            got,
+            "/home/u/.local/share/buffr-debug/engines/webkit/profile/cookies.sqlite"
+        );
+        assert!(
+            !got.contains("engines/webkit/profile/engines/webkit"),
+            "regression: engine namespace appears twice in the path"
+        );
+    }
+
+    #[test]
+    fn cookie_path_fallback_branch_namespaces_under_xdg() {
+        // When data_dir is None (rare, unsupported configuration) we
+        // build the path from the XDG fallback.  This branch DOES
+        // namespace itself because the XDG root is shared across
+        // engines; landing every engine's cookies in a single file
+        // would corrupt state.
+        let xdg = std::path::PathBuf::from("/home/u/.local/share");
+        let got = compute_cookie_db_path(None, "webkit", Some(&xdg))
+            .expect("path must resolve from XDG fallback");
+        assert_eq!(
+            got,
+            "/home/u/.local/share/buffr/engines/webkit/cookies.sqlite"
+        );
+    }
+
+    // ── UCM JS bridges — object-payload regression guard ─────────────────────
+
+    /// The three object-payload UCM channels (`buffrCursor`,
+    /// `buffrAudio`, `buffrFavicon`) used to call `postMessage({…})`
+    /// with a JS object literal; the C-side `jsc_value_to_string`
+    /// then returned `"[object Object]"` instead of JSON, which
+    /// serde_json rejected with "expected value at line 1 column 2"
+    /// at every mousemove.  Fix wraps every payload in
+    /// `JSON.stringify(...)` so the C side gets real JSON text.
+    ///
+    /// This test pins the contract: each bridge's source must contain
+    /// `postMessage(JSON.stringify(`.  A future edit that removes
+    /// the wrapper will fail the test before it reaches production.
+    #[test]
+    fn ucm_object_payloads_are_json_stringified() {
+        use super::super::runtime::{AUDIO_BRIDGE_JS, CURSOR_BRIDGE_JS, FAVICON_BRIDGE_JS};
+        for (name, src) in [
+            ("buffrCursor", CURSOR_BRIDGE_JS),
+            ("buffrAudio", AUDIO_BRIDGE_JS),
+            ("buffrFavicon", FAVICON_BRIDGE_JS),
+        ] {
+            assert!(
+                src.contains("postMessage(JSON.stringify("),
+                "{name} bridge JS must wrap its object payload in JSON.stringify(…); \
+                 raw objects serialise to \"[object Object]\" via jsc_value_to_string"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_path_fallback_uses_cwd_when_xdg_missing() {
+        // No data_dir AND no XDG home — last resort is the current
+        // working directory.  Confirms no panic and no surprise
+        // absolute path injection.
+        let got = compute_cookie_db_path(None, "webkit", None)
+            .expect("path must resolve from cwd fallback");
+        assert_eq!(got, "./buffr/engines/webkit/cookies.sqlite");
+    }
+
+    #[test]
+    fn neutral_key_to_wpe_preserves_modifiers() {
+        // Modifier bitmask flows verbatim through the boundary so
+        // shortcut keystrokes (Ctrl-T, Shift-Tab, …) reach WebKit
+        // with the right chord state.
+        let e = NeutralKeyEvent {
+            modifiers: 0b1010, // arbitrary mask
+            ..raw_down(13, 0)  // Enter, shortcut-style
+        };
+        let ev = neutral_key_to_wpe(e).expect("Enter RawDown must dispatch");
+        assert_eq!(ev.modifiers, 0b1010);
     }
 }
