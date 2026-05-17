@@ -3072,13 +3072,21 @@ impl TabEntry {
     /// view_resized chain.
     pub(crate) fn resize(&self, width: u32, height: u32) {
         if self.wpe_view.is_null() {
+            tracing::warn!(target: "buffr::resize_path", "TabEntry::resize skipped: wpe_view null");
             return;
         }
         unsafe {
             let tl = wpe_view_get_toplevel(self.wpe_view);
-            if !tl.is_null() {
-                wpe_toplevel_resize(tl, width as i32, height as i32);
+            if tl.is_null() {
+                tracing::warn!(target: "buffr::resize_path", "TabEntry::resize: toplevel null");
+                return;
             }
+            tracing::info!(
+                target: "buffr::resize_path",
+                width, height,
+                "TabEntry::resize: wpe_toplevel_resize"
+            );
+            wpe_toplevel_resize(tl, width as i32, height as i32);
         }
     }
 
@@ -3929,6 +3937,12 @@ impl WpeRuntime {
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        tracing::info!(
+            target: "buffr::resize_path",
+            width, height,
+            tabs = self.tabs.len(),
+            "WpeRuntime::resize: dispatching wpe_toplevel_resize to all tabs"
+        );
         if let Ok(mut st) = self.engine_state.lock() {
             st.width = width;
             st.height = height;

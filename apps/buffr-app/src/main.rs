@@ -9232,6 +9232,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             if let Some(window) = self.window.as_ref() {
                 let size = window.inner_size();
                 let (_, _, w, h) = self.cef_child_rect(size.width.max(1), size.height.max(1));
+                tracing::info!(
+                    target: "buffr::resize_path",
+                    w, h,
+                    engines = self.engines.len(),
+                    "fire: osr_resize fan-out"
+                );
                 // Fan out resize to all engines; watchdog tracks active engine.
                 for (id, host) in &self.engines {
                     host.osr_resize(w, h);
