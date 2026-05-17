@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
+use buffr_engine::popup::PopupQueue;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
 use super::egl::EglWorker;
@@ -98,6 +99,26 @@ const HINT_CONSOLE_BRIDGE_JS: &str = r#"
       try { window.webkit.messageHandlers.buffrHint.postMessage(msg); } catch(e) {}
     }
   };
+})();
+"#;
+
+/// Clipboard bridge JS injected at document start.
+///
+/// Intercepts `copy` and `cut` DOM events, captures the selected text, and
+/// forwards it to the native `buffrClipboard` script-message handler so the
+/// host can push it to the system clipboard via `hjkl-clipboard`.
+///
+/// Pattern mirrors hint mode's `HINT_CONSOLE_BRIDGE_JS`.
+const CLIPBOARD_BRIDGE_JS: &str = r#"
+(function() {
+  function sendSel() {
+    var text = window.getSelection ? window.getSelection().toString() : '';
+    if (text) {
+      try { window.webkit.messageHandlers.buffrClipboard.postMessage(text); } catch(e) {}
+    }
+  }
+  document.addEventListener('copy', function() { setTimeout(sendSel, 0); }, true);
+  document.addEventListener('cut',  function() { setTimeout(sendSel, 0); }, true);
 })();
 "#;
 
@@ -362,6 +383,132 @@ unsafe extern "C" fn drop_hint_sink_arc(
     }
 }
 
+// ── Clipboard script-message signal ──────────────────────────────────────────
+
+/// `script-message-received::buffrClipboard` handler on the UCM.
+///
+/// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries the selected text the page posted via
+/// `window.webkit.messageHandlers.buffrClipboard.postMessage(text)`.
+/// We call `jsc_value_to_string`, then push the text to the system clipboard
+/// via `hjkl_clipboard`.
+///
+/// `user_data` is a raw `*const hjkl_clipboard::Clipboard` produced by
+/// `Box::into_raw`; the matching `GClosureNotify` (`drop_clipboard_box`)
+/// drops it on disconnect.
+unsafe extern "C" fn on_clipboard_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let text_str = unsafe { std::ffi::CStr::from_ptr(raw_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { g_free(raw_ptr as *mut _) };
+
+    if text_str.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        len = text_str.len(),
+        "webkit: buffrClipboard — pushing selection to system clipboard"
+    );
+
+    // SAFETY: user_data is a `*const hjkl_clipboard::Clipboard` owned by a
+    // Box that lives until `drop_clipboard_box` fires on disconnect.
+    let cb = unsafe { &*(user_data as *const hjkl_clipboard::Clipboard) };
+    use hjkl_clipboard::{MimeType, Selection};
+    if let Err(e) = cb.set(Selection::Clipboard, MimeType::Text, text_str.as_bytes()) {
+        tracing::warn!(error = %e, "webkit: clipboard_set_text failed");
+    }
+}
+
+/// GLib `GClosureNotify` for the `Box<hjkl_clipboard::Clipboard>` pointer
+/// leaked in `TabEntry::new` for the clipboard script-message connection.
+unsafe extern "C" fn drop_clipboard_box(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut hjkl_clipboard::Clipboard) });
+    }
+}
+
+// ── Popup create signal ───────────────────────────────────────────────────────
+
+/// `create (WebKitWebView*, WebKitNavigationAction*)` signal handler.
+///
+/// Fires when JS calls `window.open(url)` or a link has `target=_blank`.
+/// We extract the requested URL, push it to `PopupQueue` for the apps layer to
+/// open as a new tab, then return NULL to suppress the native popup WebView.
+///
+/// Signal prototype (GLib): returns `WebKitWebView*` (NULL = suppress).
+/// `user_data` is `*const Mutex<VecDeque<String>>` (the PopupQueue inner Arc
+/// produced by `Arc::into_raw`).
+unsafe extern "C" fn on_create(
+    _web_view: *mut WebKitWebView,
+    nav_action: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) -> *mut WebKitWebView {
+    if user_data.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: user_data is an Arc<Mutex<VecDeque<String>>> (PopupQueue inner)
+    // produced by Arc::into_raw; we borrow without consuming.
+    let queue_ptr = user_data as *const Mutex<std::collections::VecDeque<String>>;
+    let queue = unsafe { &*queue_ptr };
+
+    if !nav_action.is_null() {
+        // Extract the request URI from the navigation action.
+        // SAFETY: nav_action is a WebKitNavigationAction* for the duration of
+        // this signal handler (WebKit guarantees it is valid inside the handler).
+        let request = unsafe {
+            webkit_navigation_action_get_request(nav_action as *mut WebKitNavigationAction)
+        };
+        if !request.is_null() {
+            let uri_ptr = unsafe { webkit_uri_request_get_uri(request) };
+            if !uri_ptr.is_null() {
+                let url = unsafe { std::ffi::CStr::from_ptr(uri_ptr) }
+                    .to_string_lossy()
+                    .into_owned();
+                if !url.is_empty() {
+                    tracing::debug!(url, "webkit: create signal — pushing to popup_queue");
+                    if let Ok(mut q) = queue.lock() {
+                        q.push_back(url);
+                    }
+                }
+            }
+        }
+    }
+    // Return NULL: suppress the native popup WebView — the apps layer opens
+    // the URL from popup_queue as a new tab.
+    std::ptr::null_mut()
+}
+
+/// GLib `GClosureNotify` for the `PopupQueue` Arc pointer leaked in
+/// `TabEntry::new` for the `create` signal connection.
+unsafe extern "C" fn drop_popup_queue_arc(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Arc::into_raw on the PopupQueue's
+        // inner Mutex. Reconstitute + drop to decrement the refcount.
+        drop(unsafe {
+            Arc::from_raw(user_data as *const Mutex<std::collections::VecDeque<String>>)
+        });
+    }
+}
+
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
 /// One open browser tab. Owns the WebKitWebView GObject. The shared
@@ -379,6 +526,11 @@ pub(crate) struct TabEntry {
     notify_uri_id: u64,
     notify_estimated_load_progress_id: u64,
     hint_script_message_received_id: u64,
+    /// Signal ID for `script-message-received::buffrClipboard` on the UCM.
+    /// 0 when the clipboard init failed.
+    clipboard_script_message_received_id: u64,
+    /// Signal ID for `create` on this WebView (popup interception).
+    create_signal_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -408,6 +560,7 @@ impl TabEntry {
         is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
         is_active: Arc<std::sync::atomic::AtomicBool>,
         hint_sink: HintEventSink,
+        popup_queue: PopupQueue,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -626,6 +779,124 @@ impl TabEntry {
             }
         };
 
+        // ── Clipboard bridge: UCM script-message handler ──────────────────────
+        //
+        // 1. Inject CLIPBOARD_BRIDGE_JS at document-start so `copy`/`cut` DOM
+        //    events forward the selection to the native `buffrClipboard` handler.
+        // 2. Register `buffrClipboard` and wire `script-message-received::buffrClipboard`
+        //    to push the text to the system clipboard via `hjkl_clipboard`.
+        //
+        // Pattern mirrors the hint IPC above — same UCM, same signal mechanism.
+        let clipboard_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                0
+            } else {
+                // Build a per-tab Clipboard handle. Clipboard::new() probes the best
+                // available Wayland/X11 backend. Failure is non-fatal — just logs.
+                match hjkl_clipboard::Clipboard::new() {
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "webkit: clipboard init failed — copy/cut will not reach system clipboard"
+                        );
+                        0
+                    }
+                    Ok(cb) => {
+                        // Register the native message handler name.
+                        let handler_name = CString::new("buffrClipboard").unwrap();
+                        let _ok = webkit_user_content_manager_register_script_message_handler(
+                            ucm,
+                            handler_name.as_ptr(),
+                            std::ptr::null(),
+                        );
+
+                        // Inject clipboard bridge at document-start on all frames.
+                        let source_c = CString::new(CLIPBOARD_BRIDGE_JS).unwrap();
+                        let script = webkit_user_script_new(
+                            source_c.as_ptr(),
+                            INJECT_ALL,
+                            INJECT_START,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                        );
+                        if !script.is_null() {
+                            webkit_user_content_manager_add_script(ucm, script);
+                            webkit_user_script_unref(script);
+                        }
+
+                        // Connect `script-message-received::buffrClipboard`.
+                        // user_data is a Box<Clipboard> leaked via Box::into_raw;
+                        // drop_clipboard_box reconstitutes + drops it on disconnect.
+                        let cb_ptr = Box::into_raw(Box::new(cb)) as *mut std::os::raw::c_void;
+                        let signal_name =
+                            CString::new("script-message-received::buffrClipboard").unwrap();
+                        g_signal_connect_data(
+                            ucm as *mut _,
+                            signal_name.as_ptr(),
+                            Some(std::mem::transmute::<
+                                unsafe extern "C" fn(
+                                    *mut std::os::raw::c_void,
+                                    *mut std::os::raw::c_void,
+                                    *mut std::os::raw::c_void,
+                                ),
+                                unsafe extern "C" fn(),
+                            >(on_clipboard_script_message)),
+                            cb_ptr,
+                            Some(drop_clipboard_box),
+                            0,
+                        )
+                    }
+                }
+            }
+        };
+
+        // ── Popup queue: `create` signal ──────────────────────────────────────
+        //
+        // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
+        // We extract the URL, push to popup_queue, and return NULL to suppress
+        // the native popup WebView. The apps layer drains popup_queue and opens
+        // the URL as a new tab.
+        //
+        // Signal prototype (GLib): `WebKitWebView* create(WebKitWebView*,
+        //   WebKitNavigationAction*, gpointer)` — returns `WebKitWebView*`.
+        // We transmute to the generic `unsafe extern "C" fn()` shape expected
+        // by g_signal_connect_data, same as all other signals above.
+        let create_signal_id: u64 = {
+            // Leak one Arc clone of the inner Mutex into user_data.
+            // GLib calls drop_popup_queue_arc on disconnect (via GClosureNotify).
+            // SAFETY: Arc::into_raw produces a valid pointer; drop_popup_queue_arc
+            // will reconstitute + drop it exactly once on signal disconnect.
+            let queue_raw = Arc::into_raw(Arc::clone(&popup_queue)) as *mut std::os::raw::c_void;
+            let signal_name = CString::new("create").unwrap();
+            unsafe {
+                g_signal_connect_data(
+                    web_view as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut WebKitWebView,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ) -> *mut WebKitWebView,
+                        unsafe extern "C" fn(),
+                    >(on_create)),
+                    queue_raw,
+                    Some(drop_popup_queue_arc),
+                    0,
+                )
+            }
+        };
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -639,6 +910,8 @@ impl TabEntry {
             notify_uri_id,
             notify_estimated_load_progress_id,
             hint_script_message_received_id,
+            clipboard_script_message_received_id,
+            create_signal_id,
             is_active,
         })
     }
@@ -772,17 +1045,27 @@ impl Drop for TabEntry {
                     self.notify_estimated_load_progress_id,
                 );
             }
-            // Disconnect the hint script-message signal from the UCM. The UCM
-            // is owned by the WebView and will be freed on g_object_unref below;
-            // disconnecting first prevents the destroy notify firing on freed mem.
-            if self.hint_script_message_received_id != 0 {
-                let ucm = super::ffi::webkit_web_view_get_user_content_manager(self.web_view);
-                if !ucm.is_null() {
+            // Disconnect UCM signals (hint, clipboard) before unref so the
+            // GClosureNotify (drop_hint_sink_arc, drop_clipboard_box) fires while
+            // the UCM is still alive, not after it's freed by g_object_unref.
+            let ucm = super::ffi::webkit_web_view_get_user_content_manager(self.web_view);
+            if !ucm.is_null() {
+                if self.hint_script_message_received_id != 0 {
                     g_signal_handler_disconnect(
                         ucm as *mut _,
                         self.hint_script_message_received_id,
                     );
                 }
+                if self.clipboard_script_message_received_id != 0 {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.clipboard_script_message_received_id,
+                    );
+                }
+            }
+            // Disconnect `create` signal on the WebView before unref.
+            if self.create_signal_id != 0 {
+                g_signal_handler_disconnect(self.web_view as *mut _, self.create_signal_id);
             }
             g_object_unref(self.web_view as *mut _);
         }
@@ -825,6 +1108,10 @@ pub(crate) struct WpeRuntime {
     /// `hint.js` fires a `console.log('__buffr_hint__:…')` message.
     /// Read (and cleared) by `WebKitEngine::pump_hint_events` on any thread.
     pub hint_sink: HintEventSink,
+    /// Shared popup URL queue. Written by the `create` signal handler on
+    /// each WebView when JS calls `window.open(url)` or a link has
+    /// `target=_blank`. Drained by the apps layer via `BrowserEngine::popup_queue`.
+    pub popup_queue: PopupQueue,
 }
 
 impl WpeRuntime {
@@ -836,6 +1123,7 @@ impl WpeRuntime {
         is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
         zoom_level: Arc<Mutex<f64>>,
         hint_sink: HintEventSink,
+        popup_queue: PopupQueue,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -876,6 +1164,7 @@ impl WpeRuntime {
             is_loading_atomic,
             zoom_level,
             hint_sink,
+            popup_queue,
         })
     }
 
@@ -954,6 +1243,7 @@ impl WpeRuntime {
             Arc::clone(&self.is_loading_atomic),
             Arc::clone(&is_active),
             Arc::clone(&self.hint_sink),
+            Arc::clone(&self.popup_queue),
         );
 
         let entry = match entry {
