@@ -201,6 +201,36 @@ unsafe extern "C" fn on_notify_uri(
     ctx.with_tab_info(|info| info.url = uri);
 }
 
+/// `notify::estimated-load-progress` — fires continuously as sub-resources
+/// finish loading (0.0 → 1.0). Mirrors the live value into `TabInfo.progress`
+/// so the tab-strip progress bar reflects real per-resource progress rather
+/// than the three-step STARTED (0.0) / COMMITTED (0.5) / FINISHED (1.0)
+/// approximation that `on_load_changed` sets.
+///
+/// `on_load_changed` still resets progress to 0.0 on STARTED and pins it
+/// to 1.0 on FINISHED; those are the authoritative bookends. This handler
+/// fills in the continuous values in between.
+///
+/// Audio probe signal (`notify::is-playing-audio`) is omitted here.
+/// `TabSummary` has no per-tab `is_playing_audio` field yet; the existing
+/// `any_audio_active()` polls `webkit_web_view_is_playing_audio` directly
+/// on a 500 ms timer, which is sufficient. Add the signal once
+/// `TabSummary` gets the field.
+unsafe extern "C" fn on_notify_estimated_load_progress(
+    web_view: *mut WebKitWebView,
+    _pspec: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: see on_load_changed.
+    let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
+    // SAFETY: web_view is the signal-emitting object; valid for the call.
+    let progress = unsafe { webkit_web_view_get_estimated_load_progress(web_view) };
+    ctx.with_tab_info(|info| info.progress = progress);
+}
+
 /// `notify::title` — mirrors WebKit's page title into `TabInfo.title`
 /// so tab pills show the document title once it's parsed (instead of
 /// the URL placeholder we set on tab creation).
@@ -258,6 +288,7 @@ pub(crate) struct TabEntry {
     load_changed_id: u64,
     notify_title_id: u64,
     notify_uri_id: u64,
+    notify_estimated_load_progress_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -403,6 +434,17 @@ impl TabEntry {
                 unsafe extern "C" fn(),
             >(on_notify_title)
         });
+        let notify_estimated_load_progress_id =
+            connect("notify::estimated-load-progress", unsafe {
+                std::mem::transmute::<
+                    unsafe extern "C" fn(
+                        *mut WebKitWebView,
+                        *mut std::os::raw::c_void,
+                        *mut std::os::raw::c_void,
+                    ),
+                    unsafe extern "C" fn(),
+                >(on_notify_estimated_load_progress)
+            });
 
         // Enable developer extras on every WebView so the inspector can be
         // toggled at any time. Must be set before the inspector is shown;
@@ -425,6 +467,7 @@ impl TabEntry {
             load_changed_id,
             notify_title_id,
             notify_uri_id,
+            notify_estimated_load_progress_id,
             is_active,
         })
     }
@@ -551,6 +594,12 @@ impl Drop for TabEntry {
             }
             if self.notify_uri_id != 0 {
                 g_signal_handler_disconnect(self.web_view as *mut _, self.notify_uri_id);
+            }
+            if self.notify_estimated_load_progress_id != 0 {
+                g_signal_handler_disconnect(
+                    self.web_view as *mut _,
+                    self.notify_estimated_load_progress_id,
+                );
             }
             g_object_unref(self.web_view as *mut _);
         }
