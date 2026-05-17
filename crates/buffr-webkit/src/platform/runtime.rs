@@ -797,6 +797,121 @@ unsafe extern "C" fn on_context_menu(
     1
 }
 
+// ── Policy signal handlers (#123) ────────────────────────────────────────────
+
+/// Internal URI schemes that WebKit should load directly.
+///
+/// Any scheme not in this list is passed to `xdg-open` and ignored by WebKit.
+/// `ws` and `wss` are included because WebKit handles WebSocket connections
+/// internally via the same network session as HTTP.
+const INTERNAL_SCHEMES: &[&str] = &[
+    "http", "https", "file", "buffr", "about", "data", "blob", "ws", "wss",
+];
+
+/// `decide-policy` on `WebKitWebView`.
+///
+/// Signal prototype:
+///   `(WebKitWebView*, WebKitPolicyDecision*, WebKitPolicyDecisionType, gpointer)` → void.
+///
+/// For NAVIGATION_ACTION and NEW_WINDOW_ACTION decisions we inspect the
+/// request URI scheme:
+/// - Internal schemes (`http`, `https`, `file`, `buffr`, `about`, `data`,
+///   `blob`, `ws`, `wss`): call `webkit_policy_decision_use`.
+/// - External schemes (`mailto:`, `magnet:`, etc.): spawn `xdg-open` and
+///   call `webkit_policy_decision_ignore`.
+///
+/// RESPONSE decisions are always passed to `webkit_policy_decision_use`
+/// (allow all MIME types; WebKit handles Content-Disposition downloads via
+/// the `decide-policy` RESPONSE path automatically).
+///
+/// user_data is NULL — no context needed.
+unsafe extern "C" fn on_decide_policy(
+    _web_view: *mut WebKitWebView,
+    decision: *mut WebKitPolicyDecision,
+    decision_type: WebKitPolicyDecisionType,
+    _user_data: *mut std::os::raw::c_void,
+) {
+    if decision.is_null() {
+        return;
+    }
+
+    // WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION = 0
+    // WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION = 1
+    // WEBKIT_POLICY_DECISION_TYPE_RESPONSE          = 2
+    let is_navigation = decision_type
+        == WebKitPolicyDecisionType_WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
+        || decision_type == WebKitPolicyDecisionType_WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION;
+
+    if is_navigation {
+        // Cast to WebKitNavigationPolicyDecision to extract the URI.
+        let nav_decision = decision as *mut WebKitNavigationPolicyDecision;
+        let nav_action =
+            unsafe { webkit_navigation_policy_decision_get_navigation_action(nav_decision) };
+
+        let uri: String = if nav_action.is_null() {
+            String::new()
+        } else {
+            let req = unsafe { webkit_navigation_action_get_request(nav_action) };
+            if req.is_null() {
+                String::new()
+            } else {
+                let uri_ptr = unsafe { webkit_uri_request_get_uri(req) };
+                if uri_ptr.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(uri_ptr) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            }
+        };
+
+        // Determine scheme (everything before the first ':').
+        let scheme = uri.split(':').next().unwrap_or("").to_ascii_lowercase();
+
+        if INTERNAL_SCHEMES.contains(&scheme.as_str()) {
+            tracing::debug!(uri, "webkit: decide-policy → use (internal scheme)");
+            unsafe { webkit_policy_decision_use(decision) };
+        } else {
+            tracing::debug!(
+                uri,
+                "webkit: decide-policy → xdg-open + ignore (external scheme)"
+            );
+            if !uri.is_empty() {
+                // Spawn xdg-open and discard result — failure is non-fatal.
+                let _ = std::process::Command::new("xdg-open").arg(&uri).spawn();
+            }
+            unsafe { webkit_policy_decision_ignore(decision) };
+        }
+    } else {
+        // RESPONSE decision — let WebKit decide (handles Content-Disposition download).
+        unsafe { webkit_policy_decision_use(decision) };
+    }
+}
+
+/// `permission-request` on `WebKitWebView`.
+///
+/// Signal prototype: `(WebKitWebView*, WebKitPermissionRequest*, gpointer)` → gboolean.
+/// Returns TRUE (handled). We auto-deny all permission requests with a
+/// `tracing::warn`; persistent per-origin grants are out of scope for phase 1.
+///
+/// user_data is NULL — no context needed.
+unsafe extern "C" fn on_permission_request(
+    _web_view: *mut WebKitWebView,
+    request: *mut WebKitPermissionRequest,
+    _user_data: *mut std::os::raw::c_void,
+) -> gboolean {
+    if !request.is_null() {
+        tracing::warn!(
+            "webkit: permission-request auto-denied \
+             (persistent grants not yet supported in buffr-webkit phase 1)"
+        );
+        unsafe { webkit_permission_request_deny(request) };
+    }
+    // Return TRUE: signal handled (prevents the default allow behaviour).
+    1
+}
+
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
 /// One open browser tab. Owns the WebKitWebView GObject. The shared
@@ -823,6 +938,10 @@ pub(crate) struct TabEntry {
     tls_error_id: u64,
     /// Signal ID for `context-menu` (#121).
     context_menu_id: u64,
+    /// Signal ID for `decide-policy` (#123).
+    decide_policy_id: u64,
+    /// Signal ID for `permission-request` (#123).
+    permission_request_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -1241,6 +1360,54 @@ impl TabEntry {
             >(on_load_failed_with_tls_errors)
         });
 
+        // ── Navigation + permission policy signals (#123) ─────────────────────
+        //
+        // decide-policy: external schemes → xdg-open + ignore; internal → use.
+        // permission-request: auto-deny with tracing::warn.
+        // Both use NULL user_data and no GClosureNotify (no heap allocation).
+        let decide_policy_id: u64 = {
+            let signal_c = CString::new("decide-policy").unwrap();
+            unsafe {
+                g_signal_connect_data(
+                    web_view as *mut _,
+                    signal_c.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut WebKitWebView,
+                            *mut WebKitPolicyDecision,
+                            WebKitPolicyDecisionType,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_decide_policy)),
+                    std::ptr::null_mut(),
+                    None,
+                    0,
+                )
+            }
+        };
+
+        let permission_request_id: u64 = {
+            let signal_c = CString::new("permission-request").unwrap();
+            unsafe {
+                g_signal_connect_data(
+                    web_view as *mut _,
+                    signal_c.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut WebKitWebView,
+                            *mut WebKitPermissionRequest,
+                            *mut std::os::raw::c_void,
+                        ) -> gboolean,
+                        unsafe extern "C" fn(),
+                    >(on_permission_request)),
+                    std::ptr::null_mut(),
+                    None,
+                    0,
+                )
+            }
+        };
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -1258,6 +1425,8 @@ impl TabEntry {
             create_signal_id,
             tls_error_id,
             context_menu_id,
+            decide_policy_id,
+            permission_request_id,
             is_active,
         })
     }
@@ -1420,6 +1589,13 @@ impl Drop for TabEntry {
             // Disconnect context-menu signal (#121).
             if self.context_menu_id != 0 {
                 g_signal_handler_disconnect(self.web_view as *mut _, self.context_menu_id);
+            }
+            // Disconnect policy signals (#123).
+            if self.decide_policy_id != 0 {
+                g_signal_handler_disconnect(self.web_view as *mut _, self.decide_policy_id);
+            }
+            if self.permission_request_id != 0 {
+                g_signal_handler_disconnect(self.web_view as *mut _, self.permission_request_id);
             }
             g_object_unref(self.web_view as *mut _);
         }
