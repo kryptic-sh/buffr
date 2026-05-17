@@ -1,28 +1,45 @@
 //! Heartbeat liveness probe for the buffr-supervisor watchdog.
 //!
-//! The UI thread calls [`Heartbeat::tick`] on every `about_to_wait`.
-//! If at least 1 s has elapsed since the last ping, a single byte
-//! (`0x01`) is written to the supervisor transport:
+//! A dedicated background thread owns the supervisor socket and writes
+//! one byte (`0x01`) every [`HEARTBEAT_INTERVAL`].  The UI thread does
+//! NOT touch the socket — it only stores a monotonic "last alive"
+//! timestamp via [`Heartbeat::mark_alive`].  The background thread
+//! consults that timestamp before each write and stops pinging if the
+//! UI thread has been silent for longer than [`UI_LIVENESS_TIMEOUT`],
+//! at which point the supervisor's deadline expires and the child is
+//! restarted.
+//!
+//! Decoupling the write from the event loop fixes two failure modes:
+//!
+//!   1. winit's `ControlFlow::WaitUntil` is not honoured reliably on
+//!      every Wayland compositor when no frame callback arrives, so
+//!      relying on `about_to_wait` / `new_events` to drive the ping
+//!      lets the supervisor declare a hang on a perfectly healthy
+//!      idle UI thread.
+//!   2. A single slow `write_all` on the UDS socket from the UI thread
+//!      previously dropped the connection handle outright (the
+//!      `tick() -> Option` contract treated any IO error as fatal),
+//!      after which no pings ever fired again for the lifetime of the
+//!      process.
+//!
+//! The background thread retries on transient errors and stops only on
+//! a UI-thread-liveness timeout or fatal broken-pipe error.  Supported
+//! transports:
 //!
 //! - **Unix (Linux + macOS)**: Unix-domain socket (`BUFFR_SUPERVISOR_SOCK`).
 //! - **Windows**: named pipe (`BUFFR_SUPERVISOR_PIPE`).
 //!
-//! The supervisor kills + restarts the child if no ping arrives for
-//! `--heartbeat-timeout` seconds (default 8).
-//!
 //! `try_connect` returns `None` when the env var is unset (unsupervised
-//! run) or the connect fails.  Either way, the caller continues normally
-//! — running without a supervisor is never fatal.
-//!
-//! ## macOS notes
-//!
-//! Filesystem UDS only — abstract sockets do not exist on Darwin.
-//! The socket path is supplied by the supervisor via `BUFFR_SUPERVISOR_SOCK`
-//! (`/tmp/buffr-<pid>.sock` on macOS when `XDG_RUNTIME_DIR` is unset),
-//! well within macOS's `sun_path` limit (~104 bytes).
+//! run) or the connect fails — running without a supervisor is never
+//! fatal.
 
-/// 1 Hz heartbeat — write one byte every second the UI thread is live.
+/// 1 Hz heartbeat — write one byte every second while the UI is alive.
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// If the UI thread has not called `mark_alive` for this long, the
+/// background thread stops pinging so the supervisor's watchdog fires.
+/// Must be shorter than the supervisor-side timeout (default 8 s).
+pub const UI_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ── Unix implementation (Linux + macOS) ──────────────────────────────────────
 
@@ -30,38 +47,39 @@ pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_se
 mod inner {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::HEARTBEAT_INTERVAL;
+    use super::{HEARTBEAT_INTERVAL, UI_LIVENESS_TIMEOUT};
 
     /// Env var the supervisor passes to the child with the UDS path.
     pub const SUPERVISOR_SOCK_ENV: &str = "BUFFR_SUPERVISOR_SOCK";
 
-    /// Active heartbeat connection to the supervisor.
+    /// Public handle held by the UI thread.  Cheap to clone (`Arc`).
+    /// Dropping the last handle stops the background thread.
     pub struct Heartbeat {
-        stream: UnixStream,
-        last_sent: Instant,
+        last_alive_us: Arc<AtomicU64>,
+        epoch: Instant,
+        /// Cleared when the background thread observes a fatal write
+        /// error so the next `mark_alive` does not log spurious staleness.
+        thread_alive: Arc<AtomicBool>,
     }
 
     impl Heartbeat {
-        /// Try to connect to the supervisor socket.
+        /// Try to connect to the supervisor socket and spawn the
+        /// heartbeat thread.
         ///
-        /// Reads `BUFFR_SUPERVISOR_SOCK`; returns `None` if the env var is
-        /// absent (unsupervised), the path is invalid, or the connect fails.
-        /// Errors are logged at `warn!` so they appear in RUST_LOG output
-        /// but never abort the child.
+        /// Reads `BUFFR_SUPERVISOR_SOCK`; returns `None` when the env var
+        /// is absent (unsupervised), the path is invalid, or connect
+        /// fails.  Errors are logged at `warn!` but never abort the child.
         pub fn try_connect() -> Option<Self> {
             let path = match std::env::var(SUPERVISOR_SOCK_ENV) {
                 Ok(p) => p,
-                Err(_) => {
-                    // No supervisor — running standalone.
-                    return None;
-                }
+                Err(_) => return None,
             };
 
-            // Connect with a short timeout via non-blocking + select.
-            // `UnixStream::connect` is synchronous; for our purposes a
-            // blocking 2 s attempt is fine — CEF init takes longer anyway.
             let stream = match connect_with_timeout(&path, Duration::from_secs(2)) {
                 Ok(s) => s,
                 Err(e) => {
@@ -75,55 +93,115 @@ mod inner {
             };
 
             tracing::info!(path = %path, "heartbeat: connected to supervisor socket");
+
+            let epoch = Instant::now();
+            // Seed the atomic to "now" so the bg thread sends at least
+            // one ping before the UI thread has a chance to mark itself.
+            let last_alive_us = Arc::new(AtomicU64::new(0));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+
+            let alive_clone = Arc::clone(&last_alive_us);
+            let thread_alive_clone = Arc::clone(&thread_alive);
+            thread::Builder::new()
+                .name("buffr-heartbeat".into())
+                .spawn(move || {
+                    run_heartbeat_loop(stream, epoch, alive_clone, thread_alive_clone);
+                })
+                .ok()?;
+
             Some(Self {
-                stream,
-                // Force a ping on the very first tick.
-                last_sent: Instant::now() - HEARTBEAT_INTERVAL,
+                last_alive_us,
+                epoch,
+                thread_alive,
             })
         }
 
-        /// Send a ping if due; return the next deadline regardless.
-        ///
-        /// Returns `Some(next_due)` while the connection is healthy.
-        /// Returns `None` on a broken-pipe or any IO error so the caller
-        /// can drop the `Heartbeat` — the supervisor will detect the silence
-        /// and restart us.
-        pub fn tick(&mut self) -> Option<std::time::Instant> {
-            let now = Instant::now();
-            if now.duration_since(self.last_sent) >= HEARTBEAT_INTERVAL {
-                match self.stream.write_all(b"\x01") {
-                    Ok(()) => {
-                        tracing::debug!("heartbeat: ping sent");
-                        self.last_sent = now;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "heartbeat: write failed; dropping connection");
-                        return None;
-                    }
-                }
-            }
-            Some(self.last_sent + HEARTBEAT_INTERVAL)
+        /// Record a UI-thread liveness pulse.  Cheap atomic store; safe
+        /// to call from any winit lifecycle hook (`new_events`,
+        /// `window_event`, `about_to_wait`).  No syscalls, no allocation.
+        pub fn mark_alive(&self) {
+            // Microseconds since the heartbeat epoch — fits in a u64 for
+            // ~584 000 years which is comfortably forever.
+            let us = self.epoch.elapsed().as_micros() as u64;
+            self.last_alive_us.store(us, Ordering::Relaxed);
+        }
+
+        /// Whether the background heartbeat thread is still alive
+        /// (i.e. no fatal IO error has occurred).  The UI thread uses
+        /// this to skip per-event work when the connection is gone.
+        pub fn is_alive(&self) -> bool {
+            self.thread_alive.load(Ordering::Relaxed)
         }
     }
 
-    /// Connect to a Unix socket with a wall-clock timeout.
-    ///
-    /// We set non-blocking, attempt connect (which returns immediately
-    /// with `EINPROGRESS`), then `select()` / `poll()` up to `timeout`.
-    /// On success the stream is set back to blocking mode.
+    /// Background thread: send a ping every `HEARTBEAT_INTERVAL` while
+    /// the UI thread is fresh.  Exits when the UI thread stops marking
+    /// itself for `UI_LIVENESS_TIMEOUT` — the supervisor watchdog then
+    /// declares a hang on its own deadline and restarts us.
+    fn run_heartbeat_loop(
+        mut stream: UnixStream,
+        epoch: Instant,
+        last_alive_us: Arc<AtomicU64>,
+        thread_alive: Arc<AtomicBool>,
+    ) {
+        loop {
+            thread::sleep(HEARTBEAT_INTERVAL);
+
+            // Liveness check.  `last_alive_us == 0` is the seeded value
+            // — treat it as "fresh enough" so the first ping fires even
+            // if the UI thread hasn't reached its first event yet.
+            let last_us = last_alive_us.load(Ordering::Relaxed);
+            let elapsed = epoch.elapsed();
+            let staleness = if last_us == 0 {
+                Duration::ZERO
+            } else {
+                elapsed.saturating_sub(Duration::from_micros(last_us))
+            };
+            if staleness > UI_LIVENESS_TIMEOUT {
+                tracing::error!(
+                    staleness_ms = staleness.as_millis(),
+                    "heartbeat: UI thread silent for >{}s; stopping pings so supervisor restarts us",
+                    UI_LIVENESS_TIMEOUT.as_secs()
+                );
+                thread_alive.store(false, Ordering::Relaxed);
+                return;
+            }
+
+            match stream.write_all(b"\x01") {
+                Ok(()) => {
+                    tracing::trace!("heartbeat: ping sent");
+                }
+                Err(e) => {
+                    let kind = e.kind();
+                    if kind == std::io::ErrorKind::WouldBlock
+                        || kind == std::io::ErrorKind::Interrupted
+                        || kind == std::io::ErrorKind::TimedOut
+                    {
+                        // Transient — supervisor reader is slow but
+                        // the socket is still open.  Skip this tick
+                        // and try again next interval.
+                        tracing::debug!(error = %e, "heartbeat: transient write error; retrying");
+                        continue;
+                    }
+                    tracing::warn!(error = %e, "heartbeat: fatal write error; thread exiting");
+                    thread_alive.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Connect to a Unix socket synchronously.  Sets a generous write
+    /// timeout so the background thread can recover from a stalled
+    /// supervisor reader instead of blocking forever.
     fn connect_with_timeout(path: &str, timeout: Duration) -> std::io::Result<UnixStream> {
         use std::os::unix::io::AsRawFd;
 
         let stream = UnixStream::connect(path)?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_read_timeout(Some(timeout))?;
-        // The fd is not marked non-blocking; a plain connect already
-        // succeeded (Unix sockets connect synchronously on Linux when
-        // the listener is ready).  Just make the writes non-blocking so
-        // a stalled socket doesn't wedge the UI thread.
         stream.set_nonblocking(false)?;
 
-        // Verify the fd is usable with a zero-byte probe.
         let fd = stream.as_raw_fd();
         if fd < 0 {
             return Err(std::io::Error::new(
@@ -141,27 +219,22 @@ mod inner {
 #[cfg(windows)]
 mod inner {
     use std::io::Write;
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::HEARTBEAT_INTERVAL;
+    use super::{HEARTBEAT_INTERVAL, UI_LIVENESS_TIMEOUT};
 
-    /// Env var the supervisor passes to the child with the named-pipe path.
     pub const SUPERVISOR_PIPE_ENV: &str = "BUFFR_SUPERVISOR_PIPE";
 
-    /// Active heartbeat connection to the supervisor via named pipe.
     pub struct Heartbeat {
-        /// The pipe file handle wrapped as a `std::fs::File` for `Write`.
-        file: std::fs::File,
-        last_sent: Instant,
+        last_alive_us: Arc<AtomicU64>,
+        epoch: Instant,
+        thread_alive: Arc<AtomicBool>,
     }
 
     impl Heartbeat {
-        /// Try to connect to the supervisor's named pipe.
-        ///
-        /// Reads `BUFFR_SUPERVISOR_PIPE`; returns `None` if the env var is
-        /// absent (unsupervised run), the path is invalid, or the connect
-        /// fails.  Errors are logged at `warn!` so they appear in RUST_LOG
-        /// output but never abort the child.
         pub fn try_connect() -> Option<Self> {
             use std::os::windows::io::FromRawHandle;
             use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
@@ -202,31 +275,81 @@ mod inner {
             // SAFETY: handle is a valid, owned Win32 file handle.
             let file = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
             tracing::info!(path = %path, "heartbeat: connected to supervisor named pipe");
+
+            let epoch = Instant::now();
+            let last_alive_us = Arc::new(AtomicU64::new(0));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+
+            let alive_clone = Arc::clone(&last_alive_us);
+            let thread_alive_clone = Arc::clone(&thread_alive);
+            thread::Builder::new()
+                .name("buffr-heartbeat".into())
+                .spawn(move || {
+                    run_heartbeat_loop(file, epoch, alive_clone, thread_alive_clone);
+                })
+                .ok()?;
+
             Some(Self {
-                file,
-                last_sent: Instant::now() - HEARTBEAT_INTERVAL,
+                last_alive_us,
+                epoch,
+                thread_alive,
             })
         }
 
-        /// Send a ping if due; return the next deadline while healthy.
-        ///
-        /// Returns `None` on broken-pipe or IO error so the caller can drop
-        /// the `Heartbeat` — the supervisor will detect silence and restart.
-        pub fn tick(&mut self) -> Option<std::time::Instant> {
-            let now = Instant::now();
-            if now.duration_since(self.last_sent) >= HEARTBEAT_INTERVAL {
-                match self.file.write_all(b"\x01") {
-                    Ok(()) => {
-                        tracing::debug!("heartbeat: ping sent");
-                        self.last_sent = now;
+        pub fn mark_alive(&self) {
+            let us = self.epoch.elapsed().as_micros() as u64;
+            self.last_alive_us.store(us, Ordering::Relaxed);
+        }
+
+        pub fn is_alive(&self) -> bool {
+            self.thread_alive.load(Ordering::Relaxed)
+        }
+    }
+
+    fn run_heartbeat_loop(
+        mut file: std::fs::File,
+        epoch: Instant,
+        last_alive_us: Arc<AtomicU64>,
+        thread_alive: Arc<AtomicBool>,
+    ) {
+        loop {
+            thread::sleep(HEARTBEAT_INTERVAL);
+
+            let last_us = last_alive_us.load(Ordering::Relaxed);
+            let elapsed = epoch.elapsed();
+            let staleness = if last_us == 0 {
+                Duration::ZERO
+            } else {
+                elapsed.saturating_sub(Duration::from_micros(last_us))
+            };
+            if staleness > UI_LIVENESS_TIMEOUT {
+                tracing::error!(
+                    staleness_ms = staleness.as_millis(),
+                    "heartbeat: UI thread silent for >{}s; stopping pings so supervisor restarts us",
+                    UI_LIVENESS_TIMEOUT.as_secs()
+                );
+                thread_alive.store(false, Ordering::Relaxed);
+                return;
+            }
+
+            match file.write_all(b"\x01") {
+                Ok(()) => {
+                    tracing::trace!("heartbeat: ping sent");
+                }
+                Err(e) => {
+                    let kind = e.kind();
+                    if kind == std::io::ErrorKind::WouldBlock
+                        || kind == std::io::ErrorKind::Interrupted
+                        || kind == std::io::ErrorKind::TimedOut
+                    {
+                        tracing::debug!(error = %e, "heartbeat: transient write error; retrying");
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "heartbeat: write failed; dropping connection");
-                        return None;
-                    }
+                    tracing::warn!(error = %e, "heartbeat: fatal write error; thread exiting");
+                    thread_alive.store(false, Ordering::Relaxed);
+                    return;
                 }
             }
-            Some(self.last_sent + HEARTBEAT_INTERVAL)
         }
     }
 }
@@ -245,8 +368,10 @@ mod inner {
             None
         }
 
-        pub fn tick(&mut self) -> Option<std::time::Instant> {
-            None
+        pub fn mark_alive(&self) {}
+
+        pub fn is_alive(&self) -> bool {
+            false
         }
     }
 }

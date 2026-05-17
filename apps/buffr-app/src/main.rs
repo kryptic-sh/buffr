@@ -7129,20 +7129,21 @@ impl AppState {
 
 impl ApplicationHandler<BuffrUserEvent> for AppState {
     /// Called by winit at the start of every event-loop iteration, before
-    /// any window/device events are dispatched. We piggyback the
-    /// supervisor liveness heartbeat here so the ping fires even under
-    /// sustained input (continuous scroll, drag, etc.) when
-    /// `about_to_wait` would otherwise be starved — winit only reaches
-    /// `about_to_wait` when the event queue drains, so a busy scroll
-    /// stream can hold off the heartbeat for >8 s and trip the
-    /// supervisor's hang watchdog. `tick()` is internally throttled to
-    /// `HEARTBEAT_INTERVAL` so calling it on every batch is cheap.
+    /// any window/device events are dispatched. Stamps the supervisor
+    /// liveness atomic on every loop wake — the actual ping write
+    /// happens on a dedicated background thread that reads the atomic
+    /// before each tick, so the UI thread never blocks on a UDS write
+    /// and the supervisor keeps getting pings even when winit's
+    /// `ControlFlow::WaitUntil` deadline is starved by Wayland frame
+    /// callback semantics on the host compositor.
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
-        if let Some(h) = self.heartbeat.as_mut() {
-            if h.tick().is_none() {
-                // Broken pipe — supervisor is gone. Drop the handle so
-                // we stop trying on a dead socket; `about_to_wait` also
-                // checks this path on its own.
+        if let Some(h) = self.heartbeat.as_ref() {
+            h.mark_alive();
+            if !h.is_alive() {
+                // Background thread observed a fatal write error.
+                // Drop the handle so we stop touching the atomic on
+                // every wake; the supervisor's deadline will fire and
+                // restart us cleanly.
                 self.heartbeat = None;
             }
         }
@@ -9332,20 +9333,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
-        // Heartbeat liveness probe: tick the supervisor ping and clamp the
-        // wakeup deadline to the next due time. Does NOT request a redraw —
-        // this is a pure liveness signal to the supervisor, not a paint loop.
-        let deadline = match self.heartbeat.as_mut().and_then(|h| h.tick()) {
-            Some(next_due) if next_due < deadline => next_due,
-            None if self.heartbeat.is_some() => {
-                // tick() returned None → broken pipe; supervisor will notice
-                // the silence and restart us. Drop the handle so we don't
-                // keep trying on a dead socket.
+        // Heartbeat liveness probe: stamp the atomic the background
+        // heartbeat thread reads.  No socket write happens here — the
+        // bg thread owns the supervisor socket and sends pings on its
+        // own 1 Hz timer, so the wakeup deadline does NOT need to be
+        // clamped to a heartbeat-driven instant any more.  Drop the
+        // handle if the bg thread observed a fatal write error.
+        if let Some(h) = self.heartbeat.as_ref() {
+            h.mark_alive();
+            if !h.is_alive() {
                 self.heartbeat = None;
-                deadline
             }
-            _ => deadline,
-        };
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
