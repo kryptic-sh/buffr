@@ -25,7 +25,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 ureq = { version = "3", features = ["json"] }
 semver = { version = "1", features = ["serde"] }
-buffr-engine = "0.1"
+buffr-engine = "0.2"
 buffr-modal = "0.1"
 buffr-history = "0.1"
 buffr-downloads = "0.1"
