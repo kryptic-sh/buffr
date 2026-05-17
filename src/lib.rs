@@ -86,6 +86,7 @@ pub use profile::ProfilePaths;
 pub use tab::{TabId, TabOptions, TabSession, TabSummary};
 pub use types::{
     AudioEvent, ContextMenuRequest, CursorChanged, LoadState, NativeRect, NavigationEvent,
+    WaylandNativeHandles,
 };
 
 /// Re-export of the raw-window-handle crate so backends + apps share the

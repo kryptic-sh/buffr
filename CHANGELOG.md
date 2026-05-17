@@ -6,13 +6,24 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-17
+
+### Added
+
+- `WaylandNativeHandles` struct in `types` module — carries the raw Wayland
+  (`wl_display`, `parent_wl_surface`, `wl_compositor`, `wl_subcompositor`) and
+  EGL (`egl_display`) pointers extracted from the host winit window on Wayland
+  sessions. Re-exported at crate root. Consumed by `buffr-webkit` (#151) to wire
+  platform handles to `WebKitEngine` so the upcoming `BuffrDisplayWayland` C
+  subclass (#152) can read them without passing raw pointers through the trait.
+
 ## [0.1.5] - 2026-05-17
 
 ### Added
 
 - `BackendOpenOptions.prefer_native: bool` — opt-in flag for backends that
-  support native compositing. Defaults to `false`; existing callers remain
-  on the OSR path. Consumed by `buffr-webkit` (#144) to switch to
+  support native compositing. Defaults to `false`; existing callers remain on
+  the OSR path. Consumed by `buffr-webkit` (#144) to switch to
   `WPEDisplayWayland` on Wayland sessions.
 
 ## [0.1.3] - 2026-05-15
@@ -51,7 +62,8 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 _Initial release._
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.6
 [0.1.5]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.5
 [0.1.4]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.4
 [0.1.3]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.3
