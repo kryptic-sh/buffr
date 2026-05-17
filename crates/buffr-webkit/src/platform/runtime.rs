@@ -531,25 +531,27 @@ unsafe extern "C" fn drop_popup_queue_arc(
 ///
 /// Signal prototype: `(WebKitWebView*, failing_uri: gchar*,
 ///   certificate: GTlsCertificate*, errors: GTlsCertificateFlags, user_data)`.
-/// Returns gboolean: TRUE = we handled it (suppress WebKit's default error page).
+/// Returns gboolean: TRUE = we handled it (suppress WebKit's default error page),
+/// FALSE = use WebKit's default (which shows an informative "your connection
+/// is not private" page that the user can navigate away from).
 ///
-/// Strategy: auto-allow (allow + reload) with a tracing::warn so the admin
-/// sees the override. Persistent cert exceptions are out of scope for this PR.
-/// user_data is a `*const TabSignalCtx` (same Arc pattern as load-changed).
+/// Safe default: log the error + return FALSE. This keeps WebKit's built-in
+/// error page in place. A previous version auto-allowed every TLS error with
+/// just a `tracing::warn`, which is a silent security regression — any
+/// self-signed-cert MITM would succeed without user awareness. See follow-up
+/// issue for proper prompt integration (`buffr-permissions` style) where the
+/// user can choose to bypass per-host. Until then, fail closed.
 unsafe extern "C" fn on_load_failed_with_tls_errors(
     web_view: *mut WebKitWebView,
     failing_uri: *const std::os::raw::c_char,
-    certificate: *mut GTlsCertificate,
+    _certificate: *mut GTlsCertificate,
     errors: GTlsCertificateFlags,
     _user_data: *mut std::os::raw::c_void,
 ) -> gboolean {
-    if web_view.is_null() || failing_uri.is_null() || certificate.is_null() {
-        return 0; // let WebKit show its own error page
+    if web_view.is_null() || failing_uri.is_null() {
+        return 0;
     }
-
     let uri_str = unsafe { CStr::from_ptr(failing_uri) }.to_string_lossy();
-
-    // Describe the error flags for the log.
     let mut flag_parts: Vec<&str> = Vec::new();
     if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_UNKNOWN_CA != 0 {
         flag_parts.push("unknown-ca");
@@ -577,36 +579,12 @@ unsafe extern "C" fn on_load_failed_with_tls_errors(
     } else {
         flag_parts.join(", ")
     };
-
-    // Extract hostname from the failing URI.
-    let host = extract_host_from_uri(&uri_str);
-
     tracing::warn!(
         uri = %uri_str,
         flags = %flags_desc,
-        "webkit: TLS certificate error — auto-allowing for this session"
+        "webkit: TLS certificate error — letting WebKit show its error page (fail closed)"
     );
-
-    // Allow the certificate for the host on the network session so the
-    // reload succeeds without another TLS error. Both the session and the
-    // certificate are valid for at least the duration of this signal handler.
-    if let Ok(host_c) = CString::new(host.as_str()) {
-        unsafe {
-            let session = webkit_web_view_get_network_session(web_view);
-            if !session.is_null() {
-                webkit_network_session_allow_tls_certificate_for_host(
-                    session,
-                    certificate,
-                    host_c.as_ptr(),
-                );
-            }
-        }
-    }
-    // Reload the page. WebKit re-fetches the certificate; now that the host
-    // exception is registered the request will succeed.
-    unsafe { webkit_web_view_reload(web_view) };
-    // Return TRUE: we handled the error — WebKit should not show its own page.
-    1
+    0 // FALSE: use WebKit's default error page
 }
 
 /// Extract the hostname from a URI string (best-effort, no external dep).
