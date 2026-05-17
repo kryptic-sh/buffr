@@ -22,6 +22,7 @@
  * alongside the bindgen-generated FFI bindings.
  */
 
+#include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -794,6 +795,175 @@ static WPEView *buffr_view_wayland_new(WPEDisplay *display,
     return WPE_VIEW(self);
 }
 
+/* ── BuffrInputMethodContext ─────────────────────────────────────────────── */
+/*
+ * Subclass of WebKitInputMethodContext that lets Rust push preedit strings
+ * and commit text from winit IME events.
+ *
+ * The subclass stores the current preedit text and cursor byte range.
+ * Rust calls:
+ *   buffr_input_method_context_set_preedit(ctx, text, cursor)
+ *   buffr_input_method_context_commit(ctx, text)
+ *   buffr_input_method_context_cancel(ctx)
+ *
+ * The get_preedit vmethod returns the stored preedit and converts the byte
+ * cursor offset to a character offset using g_utf8_pointer_to_offset, as
+ * required by WebKitInputMethodContextClass.
+ */
+
+#define BUFFR_TYPE_INPUT_METHOD_CONTEXT (buffr_input_method_context_get_type())
+G_DECLARE_FINAL_TYPE(BuffrInputMethodContext, buffr_input_method_context,
+                     BUFFR, INPUT_METHOD_CONTEXT, WebKitInputMethodContext)
+
+struct _BuffrInputMethodContext {
+    WebKitInputMethodContext parent_instance;
+
+    /* Current preedit string. NULL or "" when no composition is active. */
+    gchar *preedit_text;
+    /* Byte offset of the cursor within preedit_text. */
+    gint cursor_end;
+};
+
+G_DEFINE_FINAL_TYPE(BuffrInputMethodContext, buffr_input_method_context,
+                    WEBKIT_TYPE_INPUT_METHOD_CONTEXT)
+
+/* get_preedit vmethod: returns the stored preedit and a character-offset
+ * cursor derived from the byte-offset cursor_end stored in the instance.
+ * WebKit g_free()s *text and g_list_free_full()s *underlines on its side. */
+static void buffr_input_method_context_get_preedit_vfunc(
+    WebKitInputMethodContext *context,
+    gchar                   **text,
+    GList                   **underlines,
+    guint                    *cursor_offset)
+{
+    BuffrInputMethodContext *self = BUFFR_INPUT_METHOD_CONTEXT(context);
+
+    if (text) {
+        *text = self->preedit_text ? g_strdup(self->preedit_text) : g_strdup("");
+    }
+    if (underlines) {
+        *underlines = NULL; /* No per-character underline styling from winit. */
+    }
+    if (cursor_offset) {
+        if (self->preedit_text && self->cursor_end > 0) {
+            /* Convert byte offset to character offset.
+             * cursor_end is the exclusive end of the selection in bytes.
+             * Clamp to string length to guard against stale/bad values. */
+            gsize byte_len = strlen(self->preedit_text);
+            gint clamped = (self->cursor_end > (gint)byte_len)
+                ? (gint)byte_len : self->cursor_end;
+            /* g_utf8_pointer_to_offset returns the character count from
+             * the start of the string to the pointer position. */
+            *cursor_offset = (guint)g_utf8_pointer_to_offset(
+                self->preedit_text,
+                self->preedit_text + clamped);
+        } else {
+            *cursor_offset = 0;
+        }
+    }
+}
+
+static void buffr_input_method_context_init(BuffrInputMethodContext *self)
+{
+    self->preedit_text = NULL;
+    self->cursor_end   = 0;
+}
+
+static void buffr_input_method_context_finalize(GObject *object)
+{
+    BuffrInputMethodContext *self = BUFFR_INPUT_METHOD_CONTEXT(object);
+    g_free(self->preedit_text);
+    self->preedit_text = NULL;
+    G_OBJECT_CLASS(buffr_input_method_context_parent_class)->finalize(object);
+}
+
+static void buffr_input_method_context_class_init(
+    BuffrInputMethodContextClass *klass)
+{
+    GObjectClass *object_class = G_OBJECT_CLASS(klass);
+    object_class->finalize = buffr_input_method_context_finalize;
+
+    WebKitInputMethodContextClass *imc_class =
+        WEBKIT_INPUT_METHOD_CONTEXT_CLASS(klass);
+    imc_class->get_preedit = buffr_input_method_context_get_preedit_vfunc;
+}
+
+/* ── Public API ─────────────────────────────────────────────────────────── */
+
+BuffrInputMethodContext *buffr_input_method_context_new(void)
+{
+    return g_object_new(BUFFR_TYPE_INPUT_METHOD_CONTEXT, NULL);
+}
+
+void buffr_input_method_context_set_preedit(
+    BuffrInputMethodContext *ctx,
+    const char              *text,
+    int                      cursor)
+{
+    if (!ctx)
+        return;
+
+    gboolean was_empty = (!ctx->preedit_text || ctx->preedit_text[0] == '\0');
+    gboolean new_empty = (!text || text[0] == '\0');
+
+    g_free(ctx->preedit_text);
+    ctx->preedit_text = g_strdup(text ? text : "");
+    ctx->cursor_end   = cursor;
+
+    if (new_empty) {
+        /* Preedit cleared: always emit preedit-finished. */
+        g_signal_emit_by_name(ctx, "preedit-finished");
+    } else {
+        if (was_empty) {
+            /* First preedit character: emit preedit-started before changed. */
+            g_signal_emit_by_name(ctx, "preedit-started");
+        }
+        g_signal_emit_by_name(ctx, "preedit-changed");
+    }
+}
+
+void buffr_input_method_context_commit(
+    BuffrInputMethodContext *ctx,
+    const char              *text)
+{
+    if (!ctx)
+        return;
+
+    gboolean had_preedit = (ctx->preedit_text && ctx->preedit_text[0] != '\0');
+
+    /* Clear preedit state before emitting so get_preedit returns "" if
+     * WebKit queries it from within the committed signal handler OR the
+     * preedit-finished handler that follows. */
+    g_free(ctx->preedit_text);
+    ctx->preedit_text = g_strdup("");
+    ctx->cursor_end   = 0;
+
+    /* Emit committed with the final text. */
+    g_signal_emit_by_name(ctx, "committed", text ? text : "");
+
+    /* If there was an active preedit, close it. */
+    if (had_preedit) {
+        g_signal_emit_by_name(ctx, "preedit-finished");
+    }
+}
+
+void buffr_input_method_context_cancel(BuffrInputMethodContext *ctx)
+{
+    if (!ctx)
+        return;
+
+    gboolean had_preedit = (ctx->preedit_text && ctx->preedit_text[0] != '\0');
+
+    g_free(ctx->preedit_text);
+    ctx->preedit_text = g_strdup("");
+    ctx->cursor_end   = 0;
+
+    if (had_preedit) {
+        g_signal_emit_by_name(ctx, "preedit-finished");
+    }
+}
+
+/* ── BuffrViewWayland: buffr_view_wayland_set_rect ─────────────────────────── */
 /*
  * buffr_view_wayland_set_rect — update subsurface position and view size.
  *

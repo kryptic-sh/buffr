@@ -1531,6 +1531,25 @@ impl BrowserEngine for WebKitEngine {
             "webkit: set_native_visible (stub — Phase 3 #145 pending)"
         );
     }
+
+    // ── IME composition (#IME) ────────────────────────────────────────────────
+
+    fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
+        self.send(Command::ImeSetComposition {
+            text: text.to_owned(),
+            cursor,
+        });
+    }
+
+    fn ime_commit(&self, text: &str) {
+        self.send(Command::ImeCommit {
+            text: text.to_owned(),
+        });
+    }
+
+    fn ime_cancel(&self) {
+        self.send(Command::ImeCancel);
+    }
 }
 
 /// 60 px per "line" of vim-style scroll, matching Chromium/Firefox

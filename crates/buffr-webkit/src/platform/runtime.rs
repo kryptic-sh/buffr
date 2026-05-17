@@ -57,6 +57,8 @@ use super::worker::EngineState;
 use super::wpe_subclass::{
     BuffrDisplayHandle, BuffrDisplayWaylandHandle, ViewCtx, WlSurfacePtr, WpeDisplayKind,
     ack_pending_buffer, attach_view_ctx, buffr_display_take_last_view, buffr_display_wayland_new,
+    buffr_input_method_context_cancel, buffr_input_method_context_commit,
+    buffr_input_method_context_new, buffr_input_method_context_set_preedit,
     buffr_view_wayland_set_rect,
 };
 
@@ -2097,6 +2099,13 @@ pub(crate) struct TabEntry {
     /// `None` on the OSR path or if `wpe_view_wayland_get_wl_surface`
     /// returned NULL. Stored as a Send-safe wrapper for use in #145.
     pub wl_surface: Option<WlSurfacePtr>,
+    /// Owned `BuffrInputMethodContext` attached to this tab's WebView.
+    ///
+    /// Created by `buffr_input_method_context_new()` and wired to the WebView
+    /// via `webkit_web_view_set_input_method_context`.  NULL if construction
+    /// failed (defensive — should not happen in practice).  `Drop` releases
+    /// the GObject ref via `g_object_unref`.
+    pub ime_ctx: *mut WebKitInputMethodContext,
 }
 
 // SAFETY: TabEntry owns C pointers that are used only on the worker thread.
@@ -3043,6 +3052,25 @@ impl TabEntry {
             }
         };
 
+        // ── IME: create BuffrInputMethodContext and attach to WebView ─────────
+        //
+        // Each tab gets its own IME context so that Rust-side winit IME events
+        // (preedit-started, preedit-changed, committed) are forwarded to the
+        // focused editable in this tab's page.  The context is owned here
+        // (ref=1 from g_object_new); Drop releases it via g_object_unref.
+        let ime_ctx: *mut WebKitInputMethodContext = unsafe {
+            let ctx = buffr_input_method_context_new();
+            if !ctx.is_null() {
+                webkit_web_view_set_input_method_context(web_view, ctx);
+                tracing::debug!("webkit: IME context attached to WebView id={id:?}");
+            } else {
+                tracing::warn!(
+                    "webkit: buffr_input_method_context_new returned NULL — IME unavailable for id={id:?}"
+                );
+            }
+            ctx
+        };
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -3053,6 +3081,7 @@ impl TabEntry {
             wpe_view,
             is_native,
             wl_surface,
+            ime_ctx,
             load_changed_id,
             notify_title_id,
             notify_uri_id,
@@ -3284,6 +3313,12 @@ impl Drop for TabEntry {
             }
             if self.permission_request_id != 0 {
                 g_signal_handler_disconnect(self.web_view as *mut _, self.permission_request_id);
+            }
+            // Release the IME context ref we own. webkit_web_view_set_input_method_context
+            // held a ref on our behalf; dropping our own ref here lets GLib collect it
+            // after the WebView's ref is released below.
+            if !self.ime_ctx.is_null() {
+                g_object_unref(self.ime_ctx as *mut _);
             }
             g_object_unref(self.web_view as *mut _);
         }
@@ -4196,6 +4231,67 @@ impl WpeRuntime {
         unsafe {
             buffr_view_wayland_set_rect(view, x, y, w as i32, h as i32);
         }
+    }
+
+    /// Push a preedit update to the active tab's `BuffrInputMethodContext`.
+    ///
+    /// `cursor` is `(start_byte, end_byte)` within `text`, or `None` to
+    /// collapse the cursor to the end of the text. Only the end byte is used
+    /// (WebKit's get_preedit API exposes a single cursor_offset, not a range).
+    pub(crate) fn ime_set_composition(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.ime_ctx.is_null() {
+            return;
+        }
+        let cursor_byte = cursor
+            .map(|(_, e)| e as i32)
+            .unwrap_or_else(|| text.len() as i32);
+        let text_c = match std::ffi::CString::new(text) {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!("webkit: ime_set_composition: text contains NUL byte");
+                return;
+            }
+        };
+        let ctx = tab.ime_ctx;
+        // SAFETY: ctx is a live BuffrInputMethodContext owned by TabEntry;
+        // this call is on the GLib worker thread.
+        unsafe { buffr_input_method_context_set_preedit(ctx, text_c.as_ptr(), cursor_byte) };
+    }
+
+    /// Commit text to the focused editable in the active tab.
+    pub(crate) fn ime_commit(&mut self, text: &str) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.ime_ctx.is_null() {
+            return;
+        }
+        let text_c = match std::ffi::CString::new(text) {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!("webkit: ime_commit: text contains NUL byte");
+                return;
+            }
+        };
+        let ctx = tab.ime_ctx;
+        // SAFETY: ctx is live; call is on the GLib worker thread.
+        unsafe { buffr_input_method_context_commit(ctx, text_c.as_ptr()) };
+    }
+
+    /// Cancel the in-progress IME composition on the active tab.
+    pub(crate) fn ime_cancel(&mut self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.ime_ctx.is_null() {
+            return;
+        }
+        let ctx = tab.ime_ctx;
+        // SAFETY: ctx is live; call is on the GLib worker thread.
+        unsafe { buffr_input_method_context_cancel(ctx) };
     }
 
     /// Adjust zoom on the active tab.

@@ -98,6 +98,33 @@ unsafe extern "C" {
         h: std::os::raw::c_int,
     );
 
+    // ── BuffrInputMethodContext (#IME) ────────────────────────────────────
+    //
+    // Declared here (not in the bindgen allowlist) because they live in our
+    // own C code, not in the WebKit headers. The pointer type is opaque to
+    // Rust — we only ever carry it as *mut c_void and cast to
+    // *mut WebKitInputMethodContext for webkit_web_view_set_input_method_context.
+
+    /// Constructor: returns a new BuffrInputMethodContext (GObject, ref=1).
+    pub fn buffr_input_method_context_new() -> *mut super::ffi::WebKitInputMethodContext;
+
+    /// Store the preedit string and byte-offset cursor position. Emits
+    /// preedit-started / preedit-changed / preedit-finished as appropriate.
+    pub fn buffr_input_method_context_set_preedit(
+        ctx: *mut super::ffi::WebKitInputMethodContext,
+        text: *const std::os::raw::c_char,
+        cursor: std::os::raw::c_int,
+    );
+
+    /// Commit text to the focused editable. Emits committed + preedit-finished.
+    pub fn buffr_input_method_context_commit(
+        ctx: *mut super::ffi::WebKitInputMethodContext,
+        text: *const std::os::raw::c_char,
+    );
+
+    /// Cancel any in-progress composition. Emits preedit-finished when active.
+    pub fn buffr_input_method_context_cancel(ctx: *mut super::ffi::WebKitInputMethodContext);
+
     // Tiny GLib helpers we link against directly. The bindgeneration surface
     // already covers g_bytes_*, g_error_free, etc; we only redeclare
     // qdata-related helpers since bindgeneration's allowlist skipped them.

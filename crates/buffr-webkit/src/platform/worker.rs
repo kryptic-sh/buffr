@@ -231,6 +231,21 @@ pub(crate) enum Command {
         w: u32,
         h: u32,
     },
+    /// Push a preedit update to the active tab's `BuffrInputMethodContext`.
+    ///
+    /// `text` is the preedit string; `cursor` is an optional `(start, end)`
+    /// byte range within `text` for the IME composition selection.  `None`
+    /// collapses the selection to the end of the text.
+    ImeSetComposition {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// Commit text to the focused editable in the active tab.
+    ImeCommit {
+        text: String,
+    },
+    /// Cancel any in-progress IME composition on the active tab.
+    ImeCancel,
     Shutdown,
 }
 
@@ -767,6 +782,15 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::SetNativeRect { x, y, w, h } => {
             rt.set_native_rect(x, y, w, h);
+        }
+        Command::ImeSetComposition { text, cursor } => {
+            rt.ime_set_composition(&text, cursor);
+        }
+        Command::ImeCommit { text } => {
+            rt.ime_commit(&text);
+        }
+        Command::ImeCancel => {
+            rt.ime_cancel();
         }
         Command::Shutdown => {
             ml.quit();
