@@ -237,10 +237,7 @@ mod tests {
 
     #[test]
     fn parse_engine_command() {
-        assert_eq!(
-            parse("engine webkit"),
-            Command::Engine("webkit".into())
-        );
+        assert_eq!(parse("engine webkit"), Command::Engine("webkit".into()));
         assert_eq!(parse("engine cef"), Command::Engine("cef".into()));
     }
 
