@@ -83,8 +83,8 @@ pub struct WebKitEngine {
     /// Shared with `WpeRuntime`. Written by the GLib worker on zoom commands;
     /// read from any thread via `active_zoom_level`. Initialised to 1.0.
     zoom_level: Arc<Mutex<f64>>,
-    /// Alphabet used to mint hint labels. Mirrors the webkitgtk backend's
-    /// setup — default is `buffr_core::hint::DEFAULT_HINT_ALPHABET`.
+    /// Alphabet used to mint hint labels. Default is
+    /// `buffr_core::hint::DEFAULT_HINT_ALPHABET`.
     hint_alphabet: HintAlphabet,
     /// Active hint session for the current tab. `None` when not in hint mode.
     /// Mutated by `feed_hint_key`, `backspace_hint`, `cancel_hint`, and
@@ -298,9 +298,9 @@ impl WebKitEngine {
         // The engine's `set_edit_sink` populates the inner Option at runtime.
         let edit_sink = Arc::clone(&worker.edit_sink);
 
-        // Default hint alphabet — mirrors webkitgtk backend. Fallback to
-        // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
-        // validation (it never does, but the API returns Result).
+        // Default hint alphabet. Fallback to a hard-coded 2-char alphabet
+        // if DEFAULT_HINT_ALPHABET ever fails validation (it never does,
+        // but the API returns Result).
         let hint_alphabet = HintAlphabet::from_str(DEFAULT_HINT_ALPHABET)
             .unwrap_or_else(|_| HintAlphabet::from_str("as").expect("fallback alphabet"));
 

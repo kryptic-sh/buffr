@@ -777,10 +777,10 @@ mod tests {
             .unwrap()
     }
 
-    fn multi_engine_router_with_blink() -> EngineRouter {
+    fn multi_engine_router_with_ladybird() -> EngineRouter {
         EngineRouter::builder()
             .register(EngineId::new("cef"), stub_arc())
-            .register(EngineId::new("blink-cdp"), stub_arc())
+            .register(EngineId::new("ladybird"), stub_arc())
             .default_engine(EngineId::new("cef"))
             .build()
             .unwrap()
@@ -789,17 +789,17 @@ mod tests {
     #[test]
     fn badge_color_for_returns_none_for_cef() {
         // "cef" is the primary default — no badge even in multi-engine config.
-        let router = multi_engine_router_with_blink();
+        let router = multi_engine_router_with_ladybird();
         assert_eq!(router.badge_color_for(&EngineId::new("cef")), None);
     }
 
     #[test]
     fn badge_color_for_returns_color_for_non_cef_when_multi() {
-        let router = multi_engine_router_with_blink();
-        let color = router.badge_color_for(&EngineId::new("blink-cdp"));
+        let router = multi_engine_router_with_ladybird();
+        let color = router.badge_color_for(&EngineId::new("ladybird"));
         assert!(
             color.is_some(),
-            "blink-cdp should get a badge colour in multi-engine config"
+            "ladybird should get a badge colour in multi-engine config"
         );
     }
 
@@ -808,14 +808,14 @@ mod tests {
         // Only one engine registered → badges suppressed for all ids.
         let router = single_engine_router();
         assert_eq!(router.badge_color_for(&EngineId::new("cef")), None);
-        assert_eq!(router.badge_color_for(&EngineId::new("blink-cdp")), None);
+        assert_eq!(router.badge_color_for(&EngineId::new("ladybird")), None);
     }
 
     #[test]
     fn badge_color_for_deterministic_per_id() {
-        let router = multi_engine_router_with_blink();
-        let c1 = router.badge_color_for(&EngineId::new("blink-cdp"));
-        let c2 = router.badge_color_for(&EngineId::new("blink-cdp"));
+        let router = multi_engine_router_with_ladybird();
+        let c1 = router.badge_color_for(&EngineId::new("ladybird"));
+        let c2 = router.badge_color_for(&EngineId::new("ladybird"));
         assert_eq!(
             c1, c2,
             "badge_color_for must be deterministic for the same id"
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn badge_label_text_two_chars_uppercase() {
-        assert_eq!(super::badge_label_text("blink-cdp"), "BL");
+        assert_eq!(super::badge_label_text("ladybird"), "LA");
         assert_eq!(super::badge_label_text("webkit"), "WE");
         assert_eq!(super::badge_label_text("cef"), "CE");
     }
@@ -852,22 +852,22 @@ mod tests {
 
     #[test]
     fn badge_label_for_returns_none_for_cef_in_multi() {
-        let router = multi_engine_router_with_blink();
+        let router = multi_engine_router_with_ladybird();
         assert_eq!(router.badge_label_for(&EngineId::new("cef")), None);
     }
 
     #[test]
     fn badge_label_for_returns_some_for_non_cef_in_multi() {
-        let router = multi_engine_router_with_blink();
-        let label = router.badge_label_for(&EngineId::new("blink-cdp"));
-        assert_eq!(label, Some("BL".to_string()));
+        let router = multi_engine_router_with_ladybird();
+        let label = router.badge_label_for(&EngineId::new("ladybird"));
+        assert_eq!(label, Some("LA".to_string()));
     }
 
     #[test]
     fn badge_label_for_returns_none_in_single_engine() {
         let router = single_engine_router();
         assert_eq!(router.badge_label_for(&EngineId::new("cef")), None);
-        assert_eq!(router.badge_label_for(&EngineId::new("blink-cdp")), None);
+        assert_eq!(router.badge_label_for(&EngineId::new("ladybird")), None);
     }
 
     // ── Additional resolve scenarios ──────────────────────────────────────────
@@ -877,10 +877,10 @@ mod tests {
         let router = EngineRouter::builder()
             .register(EngineId::new("cef"), stub_arc())
             .register(EngineId::new("webkit"), stub_arc())
-            .register(EngineId::new("blink"), stub_arc())
+            .register(EngineId::new("blitz"), stub_arc())
             .default_engine(EngineId::new("cef"))
             .rule("example.com", "webkit") // first
-            .rule("example.com", "blink") // second — must NOT win
+            .rule("example.com", "blitz") // second — must NOT win
             .build()
             .unwrap();
         assert_eq!(
@@ -1111,17 +1111,17 @@ mod tests {
     #[test]
     fn badge_label_text_handles_long_id() {
         // Only first 2 alphanumeric chars taken.
-        let label = super::badge_label_text("blink-cdp-experimental");
-        assert_eq!(label, "BL");
+        let label = super::badge_label_text("ladybird-experimental");
+        assert_eq!(label, "LA");
     }
 
     #[test]
     fn badge_color_palette_index_in_range() {
         // Any DJB2 hash index must land within the palette array.
         let palette_len = EngineRouter::BADGE_PALETTE.len();
-        let router = multi_engine_router_with_blink();
-        // blink-cdp gets a color; compute expected index to verify it's in range.
-        let color = router.badge_color_for(&EngineId::new("blink-cdp")).unwrap();
+        let router = multi_engine_router_with_ladybird();
+        // ladybird gets a color; compute expected index to verify it's in range.
+        let color = router.badge_color_for(&EngineId::new("ladybird")).unwrap();
         assert!(
             EngineRouter::BADGE_PALETTE.contains(&color),
             "returned color {color:#08x} must be in BADGE_PALETTE (len={palette_len})"
@@ -1134,7 +1134,7 @@ mod tests {
         // suppresses "cef" and single-engine cases. With multi-engine + unknown id:
         // it still returns Some because the function doesn't check registration.
         // The contract is: None for "cef" or single-engine; Some otherwise.
-        let router = multi_engine_router_with_blink();
+        let router = multi_engine_router_with_ladybird();
         let color = router.badge_color_for(&EngineId::new("unknown-engine"));
         // "unknown-engine" != "cef" and multi-engine → returns Some.
         assert!(

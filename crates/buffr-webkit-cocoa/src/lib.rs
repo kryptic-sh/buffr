@@ -1,7 +1,10 @@
-//! WebKit Cocoa (macOS) backend for buffr-engine.
+//! WKWebView (macOS) backend for buffr-engine.
 //!
-//! Phase A stub: all engine methods return `EngineError::Unimplemented`.
-//! Phase B will wire real WebKit/WKWebView integration.
+//! Wraps `WKWebView` behind `BrowserEngine`: navigation, OSR via
+//! `CapturePreview`, input forwarding, hint mode, find-in-page,
+//! permissions, downloads, clipboard, favicon, and IME composition.
+//! Built on `objc2` with `Retained<NSObject>` subclasses for the
+//! navigation/UI/script-message/download delegates.
 //!
 //! The real implementation lives in `platform/` and is only compiled on macOS.
 //! On all other platforms, `stub/` provides a minimal no-op that returns an

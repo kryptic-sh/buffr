@@ -22,8 +22,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# PNG decode for CapturePreview OSR pipeline — same version + features as
-# buffr-blink-cdp so the dep is deduplicated in the workspace build graph.
+# PNG decode for CapturePreview OSR pipeline — same version + features
+# across the workspace so the dep is deduplicated in the build graph.
 # Also used to decode fetched favicon bytes into RGBA pixels.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "gif", "webp"] }
 # HTTP client for fetching favicon URLs from the STA thread's spawned worker.

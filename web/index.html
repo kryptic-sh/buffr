@@ -801,14 +801,14 @@
         <div class="badges">
           <span class="badge live">● __VERSION__</span>
           <span class="badge">MIT</span>
-          <span class="badge">Rust + CEF + blink-cdp</span>
+          <span class="badge">Rust + CEF + WPE WebKit</span>
         </div>
         <h1>
           Vim-inspired<br />
           <span class="grad">browser.</span>
         </h1>
         <p class="tagline">
-          Native, GPU-accelerated. Rust on top of CEF or headless Chromium —
+          Native, GPU-accelerated. Rust on top of CEF or WPE WebKit —
           your choice, per domain.
         </p>
         <p class="tagline" style="color: var(--fg-muted); font-size: 16px">
@@ -895,13 +895,15 @@
           </div>
           <div class="feat">
             <div class="icon">03 — ENGINE</div>
-            <h4>Two backends, one trait</h4>
+            <h4>Multiple backends, one trait</h4>
             <p>
               <code>buffr-engine</code> defines the
               <code>BrowserEngine</code> trait; <code>buffr-cef</code> wraps
-              Chromium Embedded Framework, <code>buffr-blink-cdp</code> drives
-              headless Chromium over CDP. Per-domain rules pick the engine per
-              tab — tab-strip badge shows <code>BL</code> or <code>CE</code>.
+              Chromium Embedded Framework, <code>buffr-webkit</code> drives
+              WPE WebKit natively, with WKWebView, WebView2, Blitz, and
+              Ladybird backends alongside. Per-domain rules pick the engine
+              per tab — tab-strip badge shows <code>WK</code> or
+              <code>CE</code>.
             </p>
           </div>
           <div class="feat">
@@ -928,7 +930,7 @@
             <div class="icon">06 — PARITY</div>
             <h4>Permissions · downloads · find · IME · PiP</h4>
             <p>
-              blink-cdp tabs handle geolocation/notifications/mic/camera
+              Non-CEF tabs handle geolocation/notifications/mic/camera
               prompts, downloads with progress, <code>/</code> find-in-page,
               context-menu hit-test, IME composition, and
               <code>HTMLVideoElement.requestPictureInPicture</code> — same

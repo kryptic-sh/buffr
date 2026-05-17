@@ -1,7 +1,10 @@
 //! Servo backend for buffr-engine.
 //!
-//! Phase A stub: scaffolding only.
-//! Phase B: real Servo integration via the `servo` crate (v0.1.0, crates.io).
+//! Real Servo integration via the `servo` crate. `ServoEngine` implements
+//! `Backend` + `BrowserEngine`; navigation, tab management, OSR readback,
+//! and input forwarding are wired through `worker.rs`. Built standalone
+//! (umbrella `workspace.exclude`) because Servo's stylo pin diverges from
+//! the Blitz-driven stylo elsewhere in the workspace.
 //!
 //! # Architecture
 //!

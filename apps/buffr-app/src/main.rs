@@ -167,7 +167,6 @@ use buffr_ui::{
 };
 
 mod crash_guard;
-mod engine_migrate;
 mod engine_router;
 mod heartbeat;
 mod loading_anim;
@@ -462,9 +461,8 @@ struct Cli {
     x11: bool,
     /// Override the default engine backend for this run. Synthesises a single
     /// instance with the chosen backend and routes every tab through it,
-    /// ignoring `[engines]` config. Valid values: cef, blink-cdp, firefox-cdp,
-    /// webkit (WPE, Linux only), webkit-cocoa (macOS only), webkitgtk (Linux
-    /// only), webview2 (Windows only), blitz, ladybird.
+    /// ignoring `[engines]` config. Valid values: cef, webkit (WPE, Linux only),
+    /// webkit-cocoa (macOS only), webview2 (Windows only), blitz, ladybird.
     #[arg(long, value_name = "NAME")]
     engine: Option<String>,
     /// URLs to open. Each becomes a new tab. When another buffr instance is
@@ -522,11 +520,8 @@ fn main() -> Result<()> {
     if let Some(raw) = cli.engine.as_deref() {
         const VALID: &[&str] = &[
             "cef",
-            "blink-cdp",
-            "firefox-cdp",
             "webkit",
             "webkit-cocoa",
-            "webkitgtk",
             "webview2",
             "blitz",
             "ladybird",
@@ -648,15 +643,6 @@ fn main() -> Result<()> {
     } else {
         info!("profile paths resolved");
         debug!(cache = %paths.cache.display(), data = %paths.data.display(), "profile paths");
-    }
-
-    // -------- Phase 11a: engine on-disk layout migration -----------------
-    //
-    // Runs before the event loop so the new paths are correct from first use.
-    // Private mode skips migration: the tempdir is empty by construction and
-    // there is nothing to move.
-    if !cli.private {
-        engine_migrate::migrate_engine_layout(&paths.cache, &paths.data);
     }
 
     // -------- single-instance check -----------------------------------
@@ -7351,7 +7337,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => engine_migrate::compute_cef_default(&self.cache_root, &inst.id),
+                            None => self.cache_root.join("engines").join(&inst.id),
                         });
                     let options = BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
@@ -7426,118 +7412,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                     }
                 }
-                "blink-cdp" => {
-                    let data_dir = inst
-                        .data_dir
-                        .as_deref()
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| {
-                            // Default to <data_root>/engines/<instance-id>/profile/
-                            // (Phase 11a layout). Each instance gets its own isolated
-                            // profile. In normal mode data_root is the XDG data dir;
-                            // in --private mode it is the throwaway TempDir, so
-                            // cookies/storage are deleted on process exit without any
-                            // extra teardown code.
-                            engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                        });
-                    tracing::debug!(?data_dir, "blink-cdp profile dir");
-                    // Phase 11b: ephemeral cache directory for --disk-cache-dir split.
-                    // Canonical location: <cache_root>/engines/<id>/
-                    // Ephemeral by definition — no migration needed; user gets a fresh
-                    // cache on first run with Phase 11b.
-                    let blink_cache_dir =
-                        engine_migrate::compute_blink_cdp_cache_default(&self.cache_root, &inst.id);
-                    tracing::debug!(?blink_cache_dir, "blink-cdp cache dir");
-                    // Resolve download directory for this blink-cdp instance.
-                    // Prefer the user-configured `[downloads] default_dir`; fall
-                    // back to `<data_dir>/downloads` so Chromium never touches
-                    // the desktop.
-                    let blink_download_dir = self
-                        .downloads_config
-                        .default_dir
-                        .clone()
-                        .unwrap_or_else(|| data_dir.join("downloads"));
-                    match buffr_blink_cdp::BlinkCdpEngine::new(
-                        &data_dir,
-                        Some(&blink_cache_dir),
-                        Some(&blink_download_dir),
-                        Some(self.downloads.clone()),
-                        Some(self.download_notice_queue.clone()),
-                        Some(self.find_sink.clone()),
-                    ) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "blink-cdp engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create blink-cdp engine");
-                        }
-                    }
-                }
-                "firefox-cdp" => {
-                    let profile_dir = inst
-                        .data_dir
-                        .as_deref()
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| {
-                            engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                        });
-                    tracing::debug!(?profile_dir, "firefox-cdp profile dir");
-                    match buffr_firefox_cdp::FirefoxCdpEngine::new(
-                        &profile_dir,
-                        self.private,
-                        Some(self.downloads.clone()),
-                        Some(self.download_notice_queue.clone()),
-                        Some(self.find_sink.clone()),
-                    ) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "firefox-cdp engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create firefox-cdp engine");
-                        }
-                    }
-                }
                 "blitz" => {
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => {
-                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                            }
+                            None => self
+                                .data_root
+                                .join("engines")
+                                .join(&inst.id)
+                                .join("profile"),
                         });
                     let options = buffr_engine::BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
@@ -7587,9 +7470,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => {
-                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                            }
+                            None => self
+                                .data_root
+                                .join("engines")
+                                .join(&inst.id)
+                                .join("profile"),
                         });
                     let options = buffr_engine::BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
@@ -7636,75 +7521,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
                 #[cfg(target_os = "linux")]
-                "webkitgtk" => {
-                    let data_dir_buf: Option<std::path::PathBuf> =
-                        Some(match inst.data_dir.as_deref() {
-                            Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => {
-                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                            }
-                        });
-                    let options = buffr_engine::BackendOpenOptions {
-                        engine_id: buffr_engine::EngineId::new(&inst.id),
-                        data_dir: data_dir_buf.as_deref(),
-                        cache_dir: None,
-                        initial_url: &self.homepage,
-                        frame_rate: display_hz as i32,
-                        device_scale: effective_scale as f64,
-                        initial_size: (cef_w, cef_h),
-                        private: self.private,
-                        history: Some(
-                            Arc::new(self.history.clone()) as Arc<dyn std::any::Any + Send + Sync>
-                        ),
-                        download_dir: None,
-                        downloads: Some(Arc::new(self.downloads.clone())
-                            as Arc<dyn std::any::Any + Send + Sync>),
-                        notice_queue: Some(Arc::new(self.download_notice_queue.clone())
-                            as Arc<dyn std::any::Any + Send + Sync>),
-                        find_sink: Some(Arc::new(self.find_sink.clone())
-                            as Arc<dyn std::any::Any + Send + Sync>),
-                        sinks: Box::new(()),
-                        prefer_native: false,
-                        wayland_handles: None,
-                    };
-                    match buffr_webkitgtk::WebKitGtkEngine::new(&options) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "webkitgtk engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create webkitgtk engine");
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                "webkitgtk" => {
-                    warn!(engine_id = %inst.id, "webkitgtk is only supported on Linux — skipping");
-                }
-                #[cfg(target_os = "linux")]
                 "webkit" => {
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => {
-                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                            }
+                            None => self
+                                .data_root
+                                .join("engines")
+                                .join(&inst.id)
+                                .join("profile"),
                         });
                     let options = buffr_engine::BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
@@ -7789,9 +7614,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => {
-                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                            }
+                            None => self
+                                .data_root
+                                .join("engines")
+                                .join(&inst.id)
+                                .join("profile"),
                         });
                     let options = buffr_engine::BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),
@@ -7851,9 +7678,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => {
-                                engine_migrate::compute_blink_cdp_default(&self.data_root, &inst.id)
-                            }
+                            None => self
+                                .data_root
+                                .join("engines")
+                                .join(&inst.id)
+                                .join("profile"),
                         });
                     let options = buffr_engine::BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),

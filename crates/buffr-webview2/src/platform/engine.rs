@@ -952,7 +952,7 @@ impl BrowserEngine for WebView2Engine {
     // ── Clipboard (Gap 4) ─────────────────────────────────────────────────────
     //
     // Primary path: `hjkl_clipboard::Clipboard` — synchronous, any-thread,
-    // matches the pattern used by buffr-firefox-cdp and buffr-webkitgtk.
+    // matches the pattern used by buffr-cef and buffr-webkit.
     // Fallback path: STA worker Win32 API (ClipboardRead / ClipboardWrite
     // commands) — used when hjkl-clipboard fails to initialise (e.g. no
     // display server on Windows CI).
@@ -1154,7 +1154,7 @@ impl BrowserEngine for WebView2Engine {
     fn dispatch(&self, action: &buffr_modal::PageAction) {
         use buffr_modal::PageAction as A;
 
-        /// Pixels per scroll step (matches blink-cdp / CEF constant).
+        /// Pixels per scroll step (matches CEF constant).
         const STEP_PX: i32 = 40;
         /// Win32 WHEEL_DELTA per notch. Negative = scroll down (away from user).
         const WHEEL_DELTA: i32 = 120;
@@ -1309,8 +1309,8 @@ impl WebView2Engine {
 // ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
 
 /// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
-/// `ClipboardRead` trait.  Mirrors the pattern used by `buffr-firefox-cdp` and
-/// `buffr-webkitgtk`.
+/// `ClipboardRead` trait.  Mirrors the pattern used by `buffr-cef` and
+/// `buffr-webkit`.
 struct Wv2ClipboardReader(std::sync::Arc<hjkl_clipboard::Clipboard>);
 
 impl buffr_engine::ClipboardRead for Wv2ClipboardReader {

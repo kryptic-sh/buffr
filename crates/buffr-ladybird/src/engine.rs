@@ -657,7 +657,6 @@ impl BrowserEngine for LadybirdEngine {
     // ── Clipboard (Gap 5) ────────────────────────────────────────────────────
     //
     // Pure system clipboard via hjkl-clipboard — no FFI to ladybird needed.
-    // Mirrors the firefox-cdp `FfClipboardReader` / `clipboard_handle` pattern.
 
     fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
         let cb = self.clipboard.clone()?;
@@ -860,8 +859,8 @@ impl BrowserEngine for LadybirdEngine {
 // ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
 
 /// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
-/// `ClipboardRead` trait.  Identical in structure to `buffr-cef`'s and
-/// `buffr-firefox-cdp`'s `ClipboardReader` — lives here to avoid cross-crate deps.
+/// `ClipboardRead` trait.  Identical in structure to `buffr-cef`'s
+/// `ClipboardReader` — lives here to avoid cross-crate deps.
 struct LadybirdClipboardReader(std::sync::Arc<hjkl_clipboard::Clipboard>);
 
 impl buffr_engine::ClipboardRead for LadybirdClipboardReader {

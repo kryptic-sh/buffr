@@ -113,8 +113,8 @@ pub(crate) mod macos {
     // `__buffr_hint__:` sentinel are forwarded to the native handler
     // `window.webkit.messageHandlers.buffrHint.postMessage(msg)`.
     //
-    // This mirrors the webkitgtk approach (runtime.rs HINT_CONSOLE_BRIDGE_JS)
-    // and the CEF reference impl (host.rs sentinel scraping).
+    // Mirrors the CEF reference impl (host.rs sentinel scraping) and the
+    // WPE backend's `HINT_CONSOLE_BRIDGE_JS`.
     const HINT_CONSOLE_BRIDGE_JS: &str = r#"(function() {
   var orig = console.log;
   console.log = function() {
@@ -1123,7 +1123,7 @@ pub(crate) mod macos {
 
         let width = img.width();
         let height = img.height();
-        // Pack RGBA bytes as `0xAARRGGBB` u32 (matching CEF/firefox-cdp favicon layout).
+        // Pack RGBA bytes as `0xAARRGGBB` u32 (matching CEF favicon layout).
         let pixels: Vec<u32> = img
             .chunks_exact(4)
             .map(|c| {

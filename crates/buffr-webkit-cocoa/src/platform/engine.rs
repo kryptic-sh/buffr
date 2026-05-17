@@ -158,7 +158,7 @@ impl WebKitCocoaEngine {
         // `BackendOpenOptions` carries `history`, `downloads`, and `find_sink`
         // as `Option<Arc<dyn Any + Send + Sync>>`. The apps layer stores the
         // concrete `Arc<T>` inside the type-erased wrapper, so we downcast_ref
-        // to `Arc<T>` and clone. This mirrors the webkitgtk engine pattern.
+        // to `Arc<T>` and clone.
         let history: Option<Arc<buffr_history::History>> = options
             .history
             .as_ref()
@@ -1349,8 +1349,8 @@ impl WebKitCocoaEngine {
 // ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
 
 /// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
-/// `ClipboardRead` trait. Identical in structure to `buffr-cef`'s and
-/// `buffr-firefox-cdp`'s clipboard readers.
+/// `ClipboardRead` trait. Identical in structure to `buffr-cef`'s
+/// clipboard reader.
 struct WkClipboardReader(Arc<hjkl_clipboard::Clipboard>);
 
 impl buffr_engine::ClipboardRead for WkClipboardReader {

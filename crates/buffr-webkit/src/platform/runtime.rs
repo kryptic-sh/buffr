@@ -184,7 +184,7 @@ unsafe impl Sync for WpePermissionRequestPtr {}
 // forward messages with the buffr hint sentinel to the native `buffrHint`
 // script-message handler registered via WebKitUserContentManager.
 //
-// Pattern mirrors the webkitgtk backend (crates/buffr-webkitgtk).
+// Pattern: scrape sentinel-prefixed console.log lines from the JS side.
 const HINT_CONSOLE_BRIDGE_JS: &str = r#"
 (function() {
   var orig = console.log;

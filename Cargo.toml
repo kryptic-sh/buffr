@@ -3,13 +3,10 @@ resolver = "2"
 members = [
     "crates/buffr-engine",
     "crates/buffr-cef",
-    "crates/buffr-blink-cdp",
     "crates/buffr-blitz",
-    "crates/buffr-firefox-cdp",
     "crates/buffr-ladybird",
     "crates/buffr-webkit-cocoa",
     "crates/buffr-webkit",
-    "crates/buffr-webkitgtk",
     "crates/buffr-webview2",
     "crates/buffr-core",
     "crates/buffr-modal",
@@ -106,16 +103,13 @@ semver = { version = "1", features = ["serde"] }
 # deps from submodule Cargo.tomls (which list `buffr-modal = "0.1"`
 # etc. for their standalone CI) all resolve to the same workspace
 # member, eliminating "multiple versions of buffr_<name>" errors.
-buffr-engine = "0.1"
+buffr-engine = "0.2"
 buffr-cef = "0.1"
-buffr-blink-cdp = "0.1"
 buffr-blitz = { path = "crates/buffr-blitz" }
-buffr-firefox-cdp = { path = "crates/buffr-firefox-cdp" }
 buffr-ladybird = { path = "crates/buffr-ladybird" }
 # buffr-servo is intentionally absent — see [workspace.exclude] above.
 buffr-webkit = { path = "crates/buffr-webkit" }
 buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
-buffr-webkitgtk = { path = "crates/buffr-webkitgtk" }
 buffr-webview2 = { path = "crates/buffr-webview2" }
 buffr-core = "0.7"
 buffr-modal = "0.1"
@@ -145,7 +139,6 @@ hjkl-splash = "0.2"
 [patch.crates-io]
 buffr-engine = { path = "crates/buffr-engine" }
 buffr-cef = { path = "crates/buffr-cef" }
-buffr-blink-cdp = { path = "crates/buffr-blink-cdp" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 buffr-config = { path = "crates/buffr-config" }
 buffr-core = { path = "crates/buffr-core" }

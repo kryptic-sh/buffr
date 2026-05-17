@@ -611,7 +611,7 @@ impl BrowserEngine for ServoEngine {
     fn can_go_back(&self) -> bool {
         // Phase B: worker tracks can_go_back per WebView but the TabSummary
         // struct has no dedicated field for it yet.  Always false is the safe
-        // conservative answer (matching blink-cdp's default).
+        // conservative answer (matching the trait's default).
         false
     }
 

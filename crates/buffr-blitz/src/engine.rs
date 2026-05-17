@@ -915,8 +915,8 @@ impl BrowserEngine for BlitzEngine {
 // ── hjkl-clipboard → ClipboardRead bridge ────────────────────────────────────
 
 /// Wraps `Arc<hjkl_clipboard::Clipboard>` to implement the engine-agnostic
-/// `ClipboardRead` trait. Mirrors the same wrapper in `buffr-firefox-cdp`
-/// (`FfClipboardReader`) and `buffr-cef` (`ClipboardReader`).
+/// `ClipboardRead` trait. Mirrors the same wrapper in `buffr-cef`
+/// (`ClipboardReader`).
 struct BlitzClipboardReader(Arc<hjkl_clipboard::Clipboard>);
 
 impl buffr_engine::ClipboardRead for BlitzClipboardReader {
