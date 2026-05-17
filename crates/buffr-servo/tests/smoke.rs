@@ -31,6 +31,7 @@ fn dummy_options() -> BackendOpenOptions<'static> {
         notice_queue: None,
         find_sink: None,
         sinks: Box::new(()),
+        prefer_native: false,
     }
 }
 

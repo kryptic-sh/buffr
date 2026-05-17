@@ -252,6 +252,7 @@ impl WebKitEngine {
             downloads,
             Arc::clone(&can_go_back),
             Arc::clone(&can_go_forward),
+            options.prefer_native,
         )?;
 
         // Share the popup_queue that the worker already created and wired to

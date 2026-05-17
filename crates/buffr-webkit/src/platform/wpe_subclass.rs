@@ -432,8 +432,72 @@ impl Drop for BuffrDisplayHandle {
 
 // Re-export the GLib unref via the bindings allowlist.
 unsafe extern "C" {
-    fn g_object_unref(object: *mut c_void);
+    pub(crate) fn g_object_unref(object: *mut c_void);
 }
+
+// ── WpeDisplayKind ────────────────────────────────────────────────────────────
+
+/// Which WPEDisplay variant the runtime is using.
+///
+/// - `Osr(BuffrDisplayHandle)` — our custom BuffrDisplay subclass that feeds the
+///   OSR pixel-copy path (`buffr_rust_render_buffer`). Used on X11, headless, or
+///   when `prefer_native` is false.
+/// - `Wayland(*mut WPEDisplay)` — `WPEDisplayWayland` connected to the host
+///   compositor. WebKit renders into a real `wl_surface`; the OSR render callback
+///   is never fired on this path. Used when `prefer_native=true` and
+///   `XDG_SESSION_TYPE=wayland`.
+pub(crate) enum WpeDisplayKind {
+    Osr(BuffrDisplayHandle),
+    /// Raw `*mut WPEDisplay` (actually `*mut WPEDisplayWayland`, upcast).
+    /// Owned: we hold one GObject ref and release it on drop.
+    Wayland(*mut WPEDisplay),
+}
+
+unsafe impl Send for WpeDisplayKind {}
+
+impl WpeDisplayKind {
+    /// Return the raw `*mut WPEDisplay` regardless of variant.
+    ///
+    /// Used by `TabEntry::new` to pass the display as the `display`
+    /// construct-property on `WebKitWebView`.
+    pub(crate) fn raw_display(&self) -> *mut WPEDisplay {
+        match self {
+            WpeDisplayKind::Osr(h) => h.raw,
+            WpeDisplayKind::Wayland(p) => *p,
+        }
+    }
+
+    /// Returns `true` when this is the `WPEDisplayWayland` path.
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(self, WpeDisplayKind::Wayland(_))
+    }
+}
+
+impl Drop for WpeDisplayKind {
+    fn drop(&mut self) {
+        if let WpeDisplayKind::Wayland(p) = self {
+            if !p.is_null() {
+                // SAFETY: *p is a live WPEDisplayWayland GObject we own a ref on.
+                unsafe { g_object_unref(*p as *mut c_void) };
+            }
+        }
+        // Osr variant: BuffrDisplayHandle's own Drop handles the unref.
+    }
+}
+
+// ── WlSurfacePtr ─────────────────────────────────────────────────────────────
+
+/// Send wrapper around a raw `*mut wl_surface` returned by
+/// `wpe_view_wayland_get_wl_surface`.
+///
+/// The pointer is owned by WPE's `WPEViewWayland` — its lifetime is tied to
+/// the view, not to us. We store it on `TabEntry` for #145 (subsurface attach)
+/// so it's available when the compositor handshake happens. Any dereference
+/// must occur on the GLib worker thread while the view is alive.
+#[repr(transparent)]
+pub(crate) struct WlSurfacePtr(pub(crate) *mut std::os::raw::c_void);
+
+unsafe impl Send for WlSurfacePtr {}
 
 // ── No-op constructors that publish the symbols Rust uses ────────────────────
 

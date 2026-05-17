@@ -33,6 +33,7 @@ fn open_engine(url: &str) -> Arc<dyn BrowserEngine> {
         notice_queue: None,
         find_sink: None,
         sinks: Box::new(()),
+        prefer_native: false,
     };
     backend.open_engine(opts).expect("open_engine failed")
 }

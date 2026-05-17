@@ -29,6 +29,7 @@ fn make_opts(url: &str) -> BackendOpenOptions<'_> {
         notice_queue: None,
         find_sink: None,
         sinks: Box::new(()),
+        prefer_native: false,
     }
 }
 

@@ -329,6 +329,7 @@ pub(crate) fn spawn(
     downloads: Option<std::sync::Arc<Downloads>>,
     can_go_back: Arc<AtomicBool>,
     can_go_forward: Arc<AtomicBool>,
+    prefer_native: bool,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -462,6 +463,7 @@ pub(crate) fn spawn(
                 cursor_state_worker,
                 video_active_worker,
                 edit_sink_worker,
+                prefer_native,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {

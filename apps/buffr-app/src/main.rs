@@ -7285,6 +7285,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             counters: counters_opt,
                             show_favicons: self.show_favicons,
                         }),
+                        prefer_native: false,
                     };
                     match self.backend.open_engine(options) {
                         Ok(host_dyn) => {
@@ -7453,6 +7454,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         notice_queue: None,
                         find_sink: None,
                         sinks: Box::new(()),
+                        prefer_native: false,
                     };
                     match buffr_blitz::BlitzEngine::new(&options) {
                         Ok(engine) => {
@@ -7503,6 +7505,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         notice_queue: None,
                         find_sink: None,
                         sinks: Box::new(()),
+                        prefer_native: false,
                     };
                     match buffr_ladybird::LadybirdEngine::new(&options) {
                         Ok(engine) => {
@@ -7559,6 +7562,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         find_sink: Some(Arc::new(self.find_sink.clone())
                             as Arc<dyn std::any::Any + Send + Sync>),
                         sinks: Box::new(()),
+                        prefer_native: false,
                     };
                     match buffr_webkitgtk::WebKitGtkEngine::new(&options) {
                         Ok(engine) => {
@@ -7614,6 +7618,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         notice_queue: None,
                         find_sink: None,
                         sinks: Box::new(()),
+                        // Opt in to WPEDisplayWayland on Wayland sessions (#144).
+                        // The engine still reads XDG_SESSION_TYPE as the final gate.
+                        prefer_native: true,
                     };
                     // Hand the app-wide loopback server to the engine at
                     // construction so the worker's very first open_tab
@@ -7645,7 +7652,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             // verify the gate fires on the right sessions.
                             // Phase 3 of #109 — real subsurface attach lands later.
                             info!(
-                                supports_native = buffr_engine::BrowserEngine::supports_native(&engine),
+                                supports_native =
+                                    buffr_engine::BrowserEngine::supports_native(&engine),
                                 "webkit: native-compositing capability"
                             );
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
@@ -7696,6 +7704,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         find_sink: Some(Arc::new(self.find_sink.clone())
                             as Arc<dyn std::any::Any + Send + Sync>),
                         sinks: Box::new(()),
+                        prefer_native: false,
                     };
                     match buffr_webkit_cocoa::WebKitCocoaEngine::new(&options) {
                         Ok(engine) => {
@@ -7751,6 +7760,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         notice_queue: Some(self.download_notice_queue.clone()),
                         find_sink: Some(self.find_sink.clone()),
                         sinks: Box::new(()),
+                        prefer_native: false,
                     };
                     match buffr_webview2::WebView2Engine::new(&options) {
                         Ok(engine) => {

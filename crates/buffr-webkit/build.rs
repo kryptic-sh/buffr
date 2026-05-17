@@ -28,11 +28,23 @@ fn build_linux() {
          with ENABLE_WPE_PLATFORM=ON.",
     );
 
+    // ── wpe-platform-wayland-2.0 (WPEDisplayWayland / WPEViewWayland) ────────
+    //
+    // Separate .pc on Arch. Provides the Wayland-specific WPEDisplay subclass
+    // that renders into a real wl_surface instead of the OSR pixel-copy path.
+    // Required for #144 (WPEDisplayWayland switch on Wayland sessions).
+    let wayland_lib = pkg_config::probe_library("wpe-platform-wayland-2.0").expect(
+        "wpe-platform-wayland-2.0 not found via pkg-config. \
+         Required for WPEDisplayWayland (#144). \
+         Install wpewebkit (Arch) or libwpewebkit-2.0-dev with Wayland support.",
+    );
+
     // Collect -I flags for bindgen's clang args (deduplicated).
     let include_set: std::collections::HashSet<String> = webkit_lib
         .include_paths
         .iter()
         .chain(platform_lib.include_paths.iter())
+        .chain(wayland_lib.include_paths.iter())
         .map(|p| format!("-I{}", p.display()))
         .collect();
     let clang_args: Vec<String> = include_set.into_iter().collect();
@@ -48,6 +60,10 @@ fn build_linux() {
         // wpe-platform-2.0 umbrella — pulls in WPEDisplay/WPEView/WPEBuffer
         // and the rest of the platform surface.
         .header("/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h")
+        // wpe-wayland umbrella — must come after wpe-platform.h since the
+        // Wayland subclasses inherit from the platform base types.
+        // Provides WPEDisplayWayland, WPEViewWayland, WPEToplevelWayland, etc.
+        .header("/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wayland/wpe-wayland.h")
         .clang_args(&clang_args)
         // Allowlists — keep compact.
         .allowlist_function("webkit_.*")
@@ -94,6 +110,9 @@ fn build_linux() {
 
     println!("cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe/webkit.h");
     println!("cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h");
+    println!(
+        "cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wayland/wpe-wayland.h"
+    );
 
     // ── Compile the C bridge ────────────────────────────────────────────────
     //
@@ -110,6 +129,7 @@ fn build_linux() {
         .include_paths
         .iter()
         .chain(webkit_lib.include_paths.iter())
+        .chain(wayland_lib.include_paths.iter())
     {
         build.include(path);
     }
