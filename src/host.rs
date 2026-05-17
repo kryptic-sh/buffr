@@ -2816,28 +2816,6 @@ impl BrowserHost {
         self.run_main_frame_js(&js, "buffr://context-menu");
     }
 
-    /// Rotate the `<img>` element under `(x, y)` by `delta_deg` degrees
-    /// (positive = clockwise, negative = counter-clockwise). Accumulates
-    /// into `el.dataset.buffrRotate` so successive rotations compose.
-    pub fn image_rotate(&self, x: i32, y: i32, delta_deg: i32) {
-        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-        let delta = serde_json::to_string(&delta_deg).unwrap_or_else(|_| "0".to_string());
-        let js = format!(
-            "(function(x,y,delta){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLImageElement))el=el.parentElement;\
-               if(!el)return;\
-               var cur=parseInt(el.dataset.buffrRotate||'0',10);\
-               cur=(cur+delta)%360;\
-               if(cur<0)cur+=360;\
-               el.dataset.buffrRotate=String(cur);\
-               el.style.transform='rotate('+cur+'deg)';\
-             }})({x},{y},{delta});"
-        );
-        self.run_main_frame_js(&js, "buffr://context-menu");
-    }
-
     fn current_domain(&self) -> String {
         self.with_active(|t| {
             t.browser
@@ -3271,12 +3249,6 @@ impl buffr_engine::BrowserEngine for BrowserHost {
 
     fn media_toggle_mute(&self, x: i32, y: i32) {
         self.media_toggle_mute(x, y)
-    }
-
-    // ── Image (Phase 6c, #95) ────────────────────────────────────────────────
-
-    fn image_rotate(&self, x: i32, y: i32, delta_deg: i32) {
-        self.image_rotate(x, y, delta_deg)
     }
 
     // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
@@ -3717,24 +3689,6 @@ mod tests {
         )
     }
 
-    fn build_image_rotate_js(x: i32, y: i32, delta_deg: i32) -> String {
-        let x = serde_json::to_string(&x).unwrap();
-        let y = serde_json::to_string(&y).unwrap();
-        let delta = serde_json::to_string(&delta_deg).unwrap();
-        format!(
-            "(function(x,y,delta){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLImageElement))el=el.parentElement;\
-               if(!el)return;\
-               var cur=parseInt(el.dataset.buffrRotate||'0',10);\
-               cur=(cur+delta)%360;\
-               if(cur<0)cur+=360;\
-               el.dataset.buffrRotate=String(cur);\
-               el.style.transform='rotate('+cur+'deg)';\
-             }})({x},{y},{delta});"
-        )
-    }
-
     #[test]
     fn media_play_pause_js_contains_coords_and_toggle() {
         let js = build_media_play_pause_js(100, 200);
@@ -3799,25 +3753,6 @@ mod tests {
         assert!(
             js.contains("querySelector('video')"),
             "overlay-sibling fallback missing"
-        );
-    }
-
-    #[test]
-    fn image_rotate_js_clockwise_90() {
-        let js = build_image_rotate_js(30, 40, 90);
-        assert!(js.contains("90"), "delta missing");
-        assert!(js.contains("buffrRotate"), "dataset key missing");
-        assert!(js.contains("rotate("), "transform missing");
-        assert!(js.contains("HTMLImageElement"), "image type guard missing");
-    }
-
-    #[test]
-    fn image_rotate_js_counterclockwise_handles_negative() {
-        let js = build_image_rotate_js(0, 0, -90);
-        assert!(js.contains("-90"), "negative delta missing");
-        assert!(
-            js.contains("if(cur<0)cur+=360"),
-            "negative wrap-around missing"
         );
     }
 }
