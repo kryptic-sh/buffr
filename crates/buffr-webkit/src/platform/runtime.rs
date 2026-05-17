@@ -3981,8 +3981,46 @@ impl WpeRuntime {
     }
 
     pub(crate) fn navigate(&mut self, url: &str) {
+        // Capture dims before borrowing the tab — `force_repaint` needs
+        // them and we can't hold a self-borrow across multiple paths.
+        let (width, height) = if let Ok(st) = self.engine_state.lock() {
+            (st.width, st.height)
+        } else {
+            (0, 0)
+        };
         if let Some(tab) = self.active_tab() {
             tab.load_uri(url);
+            // Same-tab navigations need the resize-wiggle + needs_fresh
+            // trick that open_tab applies to foreground tab creations.
+            // Two failure modes without this:
+            //
+            //   1. WebKit's render scheduler can decide the new
+            //      navigation produces "no significant visual change
+            //      yet" and skip emitting render buffers — e.g. when
+            //      navigating off an error page (about:blank-ish) to
+            //      a fresh URL whose first paint is also white.  The
+            //      previous page's pixels stay in the shared OsrFrame
+            //      forever, producing the symptom reported in
+            //      production: chrome metadata (title, favicon, URL)
+            //      updated correctly to the new page but the viewport
+            //      showed the old page's content.
+            //   2. The app-layer freshness gate is content-only
+            //      (generation + dims, no per-URL tag), so without
+            //      a needs_fresh flip the stale frame from the old
+            //      page never gets rejected on read.
+            //
+            // The wiggle forces WebKit's AcceleratedBackingStore to
+            // recomposite and emit a fresh buffer regardless of its
+            // own emission heuristics.  Bounds check needed: width=0
+            // means the runtime hasn't seen a resize yet (early
+            // startup); skip the wiggle in that case — the natural
+            // load-driven paint sequence covers it.
+            if width > 0 && height > 0 {
+                tab.force_repaint(width, height);
+            }
+        }
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.needs_fresh = true;
         }
         if let Ok(mut st) = self.engine_state.lock() {
             if let Some(idx) = st.active_idx {
