@@ -183,6 +183,13 @@ pub(crate) enum Command {
     },
     /// Cancel the active find session and remove highlights.
     StopFind,
+    /// Execute a named WebKit editing command on the active tab.
+    ///
+    /// Standard names: `"Undo"`, `"Redo"`, `"Cut"`, `"Copy"`, `"Paste"`,
+    /// `"PasteAsPlainText"`, `"SelectAll"`.
+    ExecEditingCommand {
+        command: &'static str,
+    },
     Shutdown,
 }
 
@@ -267,6 +274,8 @@ pub(crate) fn spawn(
     zoom_level: Arc<Mutex<f64>>,
     cookie_db_path: Option<String>,
     downloads: Option<std::sync::Arc<Downloads>>,
+    can_go_back: Arc<AtomicBool>,
+    can_go_forward: Arc<AtomicBool>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -301,6 +310,8 @@ pub(crate) fn spawn(
     let popup_queue_worker = Arc::clone(&popup_queue);
     let context_menu_sink_worker = Arc::clone(&context_menu_sink);
     let favicon_sink_worker = Arc::clone(&favicon_sink);
+    let can_go_back_worker = Arc::clone(&can_go_back);
+    let can_go_forward_worker = Arc::clone(&can_go_forward);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -351,6 +362,8 @@ pub(crate) fn spawn(
                 popup_queue_worker,
                 context_menu_sink_worker,
                 favicon_sink_worker,
+                can_go_back_worker,
+                can_go_forward_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -616,6 +629,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::StopFind => {
             rt.stop_find();
+        }
+        Command::ExecEditingCommand { command } => {
+            rt.execute_editing_command(command);
         }
         Command::Shutdown => {
             ml.quit();

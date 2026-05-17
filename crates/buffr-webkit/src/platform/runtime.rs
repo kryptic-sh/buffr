@@ -268,7 +268,24 @@ pub(crate) struct TabSignalCtx {
     /// Context-menu request sink — written by the `context-menu` signal
     /// handler; drained by the apps layer via `drain_context_menu_requests`.
     context_menu_sink: WpeContextMenuSink,
+    /// Runtime-wide nav-state atomics written by `on_load_changed` for the
+    /// ACTIVE tab on COMMITTED / FINISHED. Read lock-free from the UI thread
+    /// by `WebKitEngine::can_go_back` / `can_go_forward`.
+    can_go_back: Arc<std::sync::atomic::AtomicBool>,
+    can_go_forward: Arc<std::sync::atomic::AtomicBool>,
+    /// Raw pointer to the WebView owning this ctx. Used by `on_load_changed`
+    /// to query `webkit_web_view_can_go_back/forward` on COMMITTED/FINISHED.
+    /// Valid for the signal handler's lifetime because the handler is
+    /// disconnected (in `TabEntry::Drop`) before the WebView is unreffed.
+    web_view: *mut WebKitWebView,
 }
+
+// SAFETY: TabSignalCtx carries a raw `*mut WebKitWebView` that is only
+// dereferenced inside GLib signal callbacks, which always run on the GLib
+// worker thread. The pointer stays valid for the signal's lifetime because
+// `TabEntry::drop` disconnects every signal before calling `g_object_unref`.
+unsafe impl Send for TabSignalCtx {}
+unsafe impl Sync for TabSignalCtx {}
 
 impl TabSignalCtx {
     /// Mutate the per-tab info under `engine_state`. Uses `try_lock` so a
@@ -327,6 +344,17 @@ unsafe extern "C" fn on_load_changed(
             ctx.is_loading_atomic.store(true, Ordering::SeqCst);
         } else if revealed {
             ctx.is_loading_atomic.store(false, Ordering::SeqCst);
+        }
+        // Refresh can_go_back / can_go_forward on COMMITTED or FINISHED.
+        // These are the first moments a navigation has committed so the
+        // WebKit session history is in its final state for this load.
+        if revealed && !ctx.web_view.is_null() {
+            // SAFETY: web_view is valid for the signal handler's lifetime;
+            // TabEntry::drop disconnects the signal before unreffing.
+            let back = unsafe { webkit_web_view_can_go_back(ctx.web_view) != 0 };
+            let fwd = unsafe { webkit_web_view_can_go_forward(ctx.web_view) != 0 };
+            ctx.can_go_back.store(back, Ordering::Relaxed);
+            ctx.can_go_forward.store(fwd, Ordering::Relaxed);
         }
     }
     tracing::debug!(
@@ -611,12 +639,11 @@ unsafe extern "C" fn on_favicon_script_message(
 
     // Parse { url, origin } from the JS object serialised to JSON.
     let url = match serde_json::from_str::<serde_json::Value>(&json_str) {
-        Ok(v) => {
-            v.get("url")
-                .and_then(|u| u.as_str())
-                .unwrap_or("")
-                .to_owned()
-        }
+        Ok(v) => v
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_owned(),
         Err(e) => {
             tracing::warn!(error = %e, json = json_str, "webkit: buffrFavicon — JSON parse failed");
             return;
@@ -645,7 +672,11 @@ unsafe extern "C" fn on_favicon_script_message(
             }
         };
         if resp.status().as_u16() != 200 {
-            tracing::warn!(url, status = resp.status().as_u16(), "webkit: favicon non-200");
+            tracing::warn!(
+                url,
+                status = resp.status().as_u16(),
+                "webkit: favicon non-200"
+            );
             return;
         }
         let buf = match resp.body_mut().with_config().limit(MAX_BYTES).read_to_vec() {
@@ -760,9 +791,7 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
                 None
             }
             Ok(cb) => match cb.get(Selection::Clipboard, MimeType::Text) {
-                Ok(bytes) => {
-                    String::from_utf8(bytes).ok().filter(|s| !s.is_empty())
-                }
+                Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
                 Err(e) => {
                     tracing::debug!(
                         error = %e,
@@ -812,11 +841,7 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
                     if stream.is_null() {
                         // OOM — finish with an empty stream rather than crashing.
                         let empty: *mut GInputStream = unsafe {
-                            g_memory_input_stream_new_from_data(
-                                std::ptr::null(),
-                                0,
-                                None,
-                            )
+                            g_memory_input_stream_new_from_data(std::ptr::null(), 0, None)
                         };
                         let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
                         unsafe { webkit_uri_scheme_request_finish(req, empty, 0, ct.as_ptr()) };
@@ -826,12 +851,7 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
                     } else {
                         let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
                         unsafe {
-                            webkit_uri_scheme_request_finish(
-                                req,
-                                stream,
-                                len as i64,
-                                ct.as_ptr(),
-                            )
+                            webkit_uri_scheme_request_finish(req, stream, len as i64, ct.as_ptr())
                         };
                         unsafe { g_object_unref(stream as *mut _) };
                     }
@@ -839,9 +859,8 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
                 None => {
                     // Return empty body rather than an error so fetch() resolves
                     // cleanly (resp.ok = true, resp.text() = '').
-                    let empty: *mut GInputStream = unsafe {
-                        g_memory_input_stream_new_from_data(std::ptr::null(), 0, None)
-                    };
+                    let empty: *mut GInputStream =
+                        unsafe { g_memory_input_stream_new_from_data(std::ptr::null(), 0, None) };
                     let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
                     unsafe { webkit_uri_scheme_request_finish(req, empty, 0, ct.as_ptr()) };
                     if !empty.is_null() {
@@ -1196,7 +1215,16 @@ unsafe extern "C" fn on_context_menu(
 /// `ws` and `wss` are included because WebKit handles WebSocket connections
 /// internally via the same network session as HTTP.
 const INTERNAL_SCHEMES: &[&str] = &[
-    "http", "https", "file", "buffr", "buffr-clipboard", "about", "data", "blob", "ws", "wss",
+    "http",
+    "https",
+    "file",
+    "buffr",
+    "buffr-clipboard",
+    "about",
+    "data",
+    "blob",
+    "ws",
+    "wss",
 ];
 
 /// `decide-policy` on `WebKitWebView`.
@@ -1368,6 +1396,8 @@ impl TabEntry {
         popup_queue: PopupQueue,
         context_menu_sink: WpeContextMenuSink,
         favicon_sink: buffr_core::favicon::FaviconSink,
+        can_go_back: Arc<std::sync::atomic::AtomicBool>,
+        can_go_forward: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -1431,6 +1461,9 @@ impl TabEntry {
             is_loading_atomic,
             is_active: Arc::clone(&is_active),
             context_menu_sink: Arc::clone(&context_menu_sink),
+            can_go_back,
+            can_go_forward,
+            web_view,
         });
         let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
             let signal_c = CString::new(signal).unwrap();
@@ -2157,6 +2190,11 @@ pub(crate) struct WpeRuntime {
     /// handler (background thread) after fetch + decode; drained by
     /// `WebKitEngine::drain_favicon_updates` on any thread.
     pub favicon_sink: buffr_core::favicon::FaviconSink,
+    /// Runtime-wide nav-state atomics. Written by `on_load_changed` for the
+    /// ACTIVE tab on COMMITTED / FINISHED; read lock-free from the UI thread
+    /// by `WebKitEngine::can_go_back` / `can_go_forward`.
+    pub can_go_back: Arc<std::sync::atomic::AtomicBool>,
+    pub can_go_forward: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WpeRuntime {
@@ -2171,6 +2209,8 @@ impl WpeRuntime {
         popup_queue: PopupQueue,
         context_menu_sink: WpeContextMenuSink,
         favicon_sink: buffr_core::favicon::FaviconSink,
+        can_go_back: Arc<std::sync::atomic::AtomicBool>,
+        can_go_forward: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -2234,10 +2274,7 @@ impl WpeRuntime {
                         sec,
                         scheme_c.as_ptr(),
                     );
-                    webkit_security_manager_register_uri_scheme_as_secure(
-                        sec,
-                        scheme_c.as_ptr(),
-                    );
+                    webkit_security_manager_register_uri_scheme_as_secure(sec, scheme_c.as_ptr());
                 }
                 tracing::info!(
                     "webkit: buffr-clipboard URI scheme registered (clipboard paste inbound)"
@@ -2264,6 +2301,8 @@ impl WpeRuntime {
             popup_queue,
             favicon_sink,
             context_menu_sink,
+            can_go_back,
+            can_go_forward,
         })
     }
 
@@ -2345,6 +2384,8 @@ impl WpeRuntime {
             Arc::clone(&self.popup_queue),
             Arc::clone(&self.context_menu_sink),
             Arc::clone(&self.favicon_sink),
+            Arc::clone(&self.can_go_back),
+            Arc::clone(&self.can_go_forward),
         );
 
         let entry = match entry {
@@ -2453,6 +2494,18 @@ impl WpeRuntime {
         };
         self.is_loading_atomic
             .store(new_is_loading, std::sync::atomic::Ordering::SeqCst);
+        // Refresh can_go_back / can_go_forward atomics synchronously so the
+        // UI thread reads nav state for the newly-active tab immediately.
+        let new_tab = &self.tabs[new_idx];
+        if !new_tab.web_view.is_null() {
+            use std::sync::atomic::Ordering;
+            // SAFETY: web_view is valid for the tab's lifetime; we're on the
+            // GLib worker thread which is the only thread that can close tabs.
+            let back = unsafe { webkit_web_view_can_go_back(new_tab.web_view) != 0 };
+            let fwd = unsafe { webkit_web_view_can_go_forward(new_tab.web_view) != 0 };
+            self.can_go_back.store(back, Ordering::Relaxed);
+            self.can_go_forward.store(fwd, Ordering::Relaxed);
+        }
         if let Ok(mut frame) = self.frame.lock() {
             frame.needs_fresh = true;
         }
@@ -2892,6 +2945,30 @@ impl WpeRuntime {
             }
         }
         tracing::debug!("webkit: stop_find");
+    }
+
+    /// Execute a named editing command (`"Undo"`, `"Cut"`, `"Copy"`, etc.)
+    /// on the active tab's focused frame.
+    ///
+    /// `webkit_web_view_execute_editing_command` is fire-and-forget: it
+    /// delivers the command to the WebProcess and returns immediately.
+    pub(crate) fn execute_editing_command(&self, name: &str) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.web_view.is_null() {
+            return;
+        }
+        let Ok(cmd_c) = CString::new(name) else {
+            tracing::warn!(name, "webkit: execute_editing_command: NUL in command name");
+            return;
+        };
+        // SAFETY: web_view is valid for the tab's lifetime; cmd_c is
+        // null-terminated and lives until the end of this call.
+        unsafe {
+            webkit_web_view_execute_editing_command(tab.web_view, cmd_c.as_ptr());
+        }
+        tracing::debug!(name, "webkit: execute_editing_command");
     }
 
     /// Toggle the WebKit web inspector for the active tab.

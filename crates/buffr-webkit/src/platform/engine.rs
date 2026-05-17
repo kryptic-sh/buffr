@@ -69,6 +69,12 @@ pub struct WebKitEngine {
     /// `is_loading` below — never goes through the engine_state mutex
     /// so the host's animation gate can't get stuck.
     is_loading_atomic: Arc<AtomicBool>,
+    /// Lock-free nav-state. Written by the GLib worker's `on_load_changed`
+    /// signal handler (COMMITTED/FINISHED, active-tab only) and by
+    /// `select_tab` so switching tabs refreshes state synchronously.
+    /// Read by `can_go_back` / `can_go_forward` on the UI thread.
+    can_go_back: Arc<AtomicBool>,
+    can_go_forward: Arc<AtomicBool>,
     /// Shared with `WpeRuntime`. Written by the GLib worker on zoom commands;
     /// read from any thread via `active_zoom_level`. Initialised to 1.0.
     zoom_level: Arc<Mutex<f64>>,
@@ -149,6 +155,10 @@ impl WebKitEngine {
         let is_loading_atomic = Arc::new(AtomicBool::new(true));
         let zoom_level = Arc::new(Mutex::new(1.0_f64));
 
+        // Nav-state atomics — initialised to false (no history on a fresh tab).
+        let can_go_back = Arc::new(AtomicBool::new(false));
+        let can_go_forward = Arc::new(AtomicBool::new(false));
+
         // Build the cookie DB path from data_dir + engine_id. Use
         // `<data_dir>/engines/<engine_id>/cookies.sqlite` so each logical
         // engine instance has its own isolated cookie store. Falls back to an
@@ -203,6 +213,8 @@ impl WebKitEngine {
             Arc::clone(&zoom_level),
             cookie_db_path,
             downloads,
+            Arc::clone(&can_go_back),
+            Arc::clone(&can_go_forward),
         )?;
 
         // Share the popup_queue that the worker already created and wired to
@@ -253,6 +265,8 @@ impl WebKitEngine {
             hint_session: Mutex::new(None),
             context_menu_sink,
             favicon_sink,
+            can_go_back,
+            can_go_forward,
         })
     }
 
@@ -566,6 +580,14 @@ impl BrowserEngine for WebKitEngine {
         self.is_loading_atomic.load(Ordering::SeqCst)
     }
 
+    fn can_go_back(&self) -> bool {
+        self.can_go_back.load(Ordering::Relaxed)
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.can_go_forward.load(Ordering::Relaxed)
+    }
+
     fn navigate(&self, url: &str) -> Result<(), EngineError> {
         // Mark loading immediately so the next paint sees the loading
         // animation while the new page fetches. The load-changed signal
@@ -774,6 +796,52 @@ impl BrowserEngine for WebKitEngine {
             script: code.to_owned(),
         });
         Ok(())
+    }
+
+    /// Execute `code` in the active tab's main frame.
+    ///
+    /// Dispatches `Command::EvalJs` — same path as `run_main_frame_js` but
+    /// without a source URI param. They intentionally stay separate so source
+    /// URI threading can be added to each independently in the future.
+    fn run_js(&self, code: &str) -> Result<(), EngineError> {
+        self.send(Command::EvalJs {
+            script: code.to_owned(),
+        });
+        Ok(())
+    }
+
+    // ── Frame editing commands ────────────────────────────────────────────────
+
+    fn frame_undo(&self) {
+        self.send(Command::ExecEditingCommand { command: "Undo" });
+    }
+
+    fn frame_redo(&self) {
+        self.send(Command::ExecEditingCommand { command: "Redo" });
+    }
+
+    fn frame_cut(&self) {
+        self.send(Command::ExecEditingCommand { command: "Cut" });
+    }
+
+    fn frame_copy(&self) {
+        self.send(Command::ExecEditingCommand { command: "Copy" });
+    }
+
+    fn frame_paste(&self) {
+        self.send(Command::ExecEditingCommand { command: "Paste" });
+    }
+
+    fn frame_paste_plain(&self) {
+        self.send(Command::ExecEditingCommand {
+            command: "PasteAsPlainText",
+        });
+    }
+
+    fn frame_select_all(&self) {
+        self.send(Command::ExecEditingCommand {
+            command: "SelectAll",
+        });
     }
 
     fn active_zoom_level(&self) -> f64 {
