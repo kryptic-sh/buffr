@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use std::collections::VecDeque;
 
+use buffr_core::cursor::SharedCursorState;
 use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
 use buffr_engine::permissions::{PendingPermission, PermissionsQueue};
 use buffr_engine::popup::PopupQueue;
@@ -326,6 +327,44 @@ const AUDIO_BRIDGE_JS: &str = r#"
   } else {
     tick();
   }
+})();
+"#;
+
+/// Cursor bridge JS injected at document-start on every frame (#137).
+///
+/// Watches the hover cursor via `mousemove` (throttled to 50 ms / 20 Hz) and
+/// posts `{ cursor: "<css-keyword>" }` to the native `buffrCursor` UCM handler
+/// whenever the computed cursor style changes. A `mouseleave` event resets to
+/// `"default"`. Custom `url()` cursors are stripped — the fallback keyword
+/// from the value list (last item) is used instead.
+const CURSOR_BRIDGE_JS: &str = r#"
+(() => {
+  let last = '';
+  let lastT = 0;
+  const send = (cursor) => {
+    if (cursor === last) return;
+    last = cursor;
+    try {
+      window.webkit.messageHandlers.buffrCursor.postMessage({ cursor });
+    } catch (_) {}
+  };
+  document.addEventListener('mousemove', (e) => {
+    const now = performance.now();
+    if (now - lastT < 50) return;
+    lastT = now;
+    const el = e.target || document.elementFromPoint(e.clientX, e.clientY);
+    if (!el) return;
+    // computed cursor may be "auto" — resolve via documentElement default ("default")
+    let c = getComputedStyle(el).cursor;
+    // strip url() prefix (custom cursors); fall back to fallback keyword if present
+    if (c.startsWith('url(')) {
+      const parts = c.split(',').map(s => s.trim());
+      c = parts[parts.length - 1] || 'default';
+    }
+    send(c);
+  }, { capture: true, passive: true });
+  // Default cursor when the mouse leaves the document
+  document.addEventListener('mouseleave', () => send('default'), { capture: true });
 })();
 "#;
 
@@ -919,6 +958,131 @@ unsafe extern "C" fn on_audio_script_message(
             active,
         });
     }
+}
+
+// ── Cursor bridge: UCM script-message signal (#137) ──────────────────────────
+
+/// Per-tab heap context for the `buffrCursor` UCM signal handler.
+pub(crate) struct CursorSignalCtx {
+    /// The tab's `browser_id` (= `TabId.0 as i32`) stored via
+    /// `CursorState::store` so the apps layer can route to the right window.
+    pub browser_id: i32,
+    /// Shared cursor state written here; read by
+    /// `WebKitEngine::take_cursor_change`.
+    pub cursor_state: SharedCursorState,
+}
+
+/// Map a CSS cursor keyword to a CEF `cef_cursor_type_t` raw discriminant.
+///
+/// Values mirror `cef_cursor_type_t` from CEF 147, which is also what
+/// `apps/buffr-app/src/main.rs::cef_cursor_type_to_winit` expects.
+pub(crate) fn css_cursor_to_cef_raw(css: &str) -> u32 {
+    match css {
+        "default" | "auto" => 0,  // POINTER
+        "crosshair" => 1,
+        "pointer" => 2,           // HAND
+        "text" => 3,              // IBEAM
+        "wait" => 4,
+        "help" => 5,
+        "e-resize" => 6,
+        "n-resize" => 7,
+        "ne-resize" => 8,
+        "nw-resize" => 9,
+        "s-resize" => 10,
+        "se-resize" => 11,
+        "sw-resize" => 12,
+        "w-resize" => 13,
+        "ns-resize" => 14,
+        "ew-resize" => 15,
+        "nesw-resize" => 16,
+        "nwse-resize" => 17,
+        "col-resize" => 18,
+        "row-resize" => 19,
+        "move" => 20,
+        "vertical-text" => 21,
+        "cell" => 22,
+        "context-menu" => 23,
+        "alias" => 24,
+        "progress" => 25,
+        "no-drop" => 26,
+        "copy" => 27,
+        "none" => 28,
+        "not-allowed" => 29,
+        "zoom-in" => 30,
+        "zoom-out" => 31,
+        "grab" => 32,
+        "grabbing" => 33,
+        _ => 0, // default
+    }
+}
+
+/// GLib `GClosureNotify` for `Box<CursorSignalCtx>` leaked for the
+/// `script-message-received::buffrCursor` connection.
+unsafe extern "C" fn drop_cursor_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut CursorSignalCtx) });
+    }
+}
+
+/// `script-message-received::buffrCursor` handler on the UCM.
+///
+/// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries `{ cursor: String }` posted by `CURSOR_BRIDGE_JS`.
+/// Parses the CSS cursor keyword, maps it to a CEF discriminant, and calls
+/// `cursor_state.store(browser_id, raw)`.
+unsafe extern "C" fn on_cursor_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let json_str = unsafe { CStr::from_ptr(raw_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { g_free(raw_ptr as *mut _) };
+
+    if json_str.is_empty() {
+        return;
+    }
+
+    let cursor_css: String = match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(v) => v
+            .get("cursor")
+            .and_then(|c| c.as_str())
+            .unwrap_or("default")
+            .to_owned(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                json = json_str,
+                "webkit: buffrCursor — JSON parse failed"
+            );
+            return;
+        }
+    };
+
+    let raw = css_cursor_to_cef_raw(&cursor_css);
+    tracing::debug!(
+        cursor = cursor_css,
+        raw,
+        "webkit: buffrCursor — cursor changed"
+    );
+
+    // SAFETY: user_data is a Box<CursorSignalCtx> owned until
+    // drop_cursor_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const CursorSignalCtx) };
+    ctx.cursor_state.store(ctx.browser_id, raw);
 }
 
 // ── Clipboard paste: buffr-clipboard URI scheme ───────────────────────────────
@@ -1691,6 +1855,9 @@ pub(crate) struct TabEntry {
     audio_event_queue: WpeAudioEventQueue,
     /// This tab's browser_id (= id.0 as i32) used in the close-cleanup event.
     audio_browser_id: i32,
+    /// Signal ID for `script-message-received::buffrCursor` on the UCM (#137).
+    /// 0 when cursor bridge init failed.
+    cursor_script_message_received_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -1729,6 +1896,7 @@ impl TabEntry {
         pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
         permission_next_id: Arc<AtomicU64>,
         audio_event_queue: WpeAudioEventQueue,
+        cursor_state: SharedCursorState,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -2216,6 +2384,76 @@ impl TabEntry {
             }
         };
 
+        // ── Cursor bridge: UCM script-message handler (#137) ─────────────────
+        //
+        // 1. Register `buffrCursor` native handler on the UCM.
+        // 2. Inject CURSOR_BRIDGE_JS at document-start on all frames so
+        //    `mousemove` events report the computed CSS cursor keyword via
+        //    `buffrCursor` postMessage whenever it changes.
+        // 3. Connect `script-message-received::buffrCursor` → on_cursor_script_message
+        //    which maps the keyword to a CEF discriminant and calls cursor_state.store.
+        let cursor_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                0
+            } else {
+                // Register the native message handler name.
+                let handler_name = CString::new("buffrCursor").unwrap();
+                let _ok = webkit_user_content_manager_register_script_message_handler(
+                    ucm,
+                    handler_name.as_ptr(),
+                    std::ptr::null(),
+                );
+
+                // Inject cursor bridge at document-start on all frames.
+                let source_c = CString::new(CURSOR_BRIDGE_JS).unwrap();
+                let script = webkit_user_script_new(
+                    source_c.as_ptr(),
+                    INJECT_ALL,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, script);
+                    webkit_user_script_unref(script);
+                }
+
+                // Connect `script-message-received::buffrCursor`.
+                // user_data is a Box<CursorSignalCtx> leaked via Box::into_raw;
+                // drop_cursor_signal_ctx reconstitutes + drops it on disconnect.
+                let ctx_box = Box::new(CursorSignalCtx {
+                    browser_id: id.0 as i32,
+                    cursor_state: Arc::clone(&cursor_state),
+                });
+                let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
+                let signal_name = CString::new("script-message-received::buffrCursor").unwrap();
+                g_signal_connect_data(
+                    ucm as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_cursor_script_message)),
+                    ctx_raw,
+                    Some(drop_cursor_signal_ctx),
+                    0,
+                )
+            }
+        };
+
         // ── Popup queue: `create` signal ──────────────────────────────────────
         //
         // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
@@ -2379,6 +2617,7 @@ impl TabEntry {
             audio_script_message_received_id,
             audio_event_queue,
             audio_browser_id: id.0 as i32,
+            cursor_script_message_received_id,
             is_active,
         })
     }
@@ -2541,6 +2780,12 @@ impl Drop for TabEntry {
                         self.audio_script_message_received_id,
                     );
                 }
+                if self.cursor_script_message_received_id != 0 {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.cursor_script_message_received_id,
+                    );
+                }
             }
             // Push a final active=false event so the apps layer clears any
             // audio indicator immediately on tab close rather than waiting for
@@ -2640,6 +2885,9 @@ pub(crate) struct WpeRuntime {
     /// Shared audio-event queue. Written by per-tab `buffrAudio` UCM signal
     /// handlers; drained by `WebKitEngine::drain_audio_events`.
     pub audio_event_queue: WpeAudioEventQueue,
+    /// Shared cursor state (#137). Written by per-tab `buffrCursor` UCM signal
+    /// handlers; read by `WebKitEngine::take_cursor_change`.
+    pub cursor_state: SharedCursorState,
 }
 
 impl WpeRuntime {
@@ -2660,6 +2908,7 @@ impl WpeRuntime {
         pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
         permission_next_id: Arc<AtomicU64>,
         audio_event_queue: WpeAudioEventQueue,
+        cursor_state: SharedCursorState,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -2756,6 +3005,7 @@ impl WpeRuntime {
             pending_permissions,
             permission_next_id,
             audio_event_queue,
+            cursor_state,
         })
     }
 
@@ -2843,6 +3093,7 @@ impl WpeRuntime {
             Arc::clone(&self.pending_permissions),
             Arc::clone(&self.permission_next_id),
             Arc::clone(&self.audio_event_queue),
+            Arc::clone(&self.cursor_state),
         );
 
         let entry = match entry {

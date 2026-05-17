@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+use buffr_core::cursor::SharedCursorState;
 use buffr_core::hint::{
     DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintSession,
     build_inject_script, take_hint_event,
@@ -114,6 +115,10 @@ pub struct WebKitEngine {
     /// signal handlers on the GLib worker thread; drained here via
     /// `drain_audio_events`. Same Arc as the one in WorkerHandle.
     audio_event_queue: WpeAudioEventQueue,
+    /// Shared cursor state (#137). Written by per-tab `buffrCursor` UCM signal
+    /// handlers on the GLib worker thread; read via `take_cursor_change`.
+    /// Same Arc as the one in WorkerHandle.
+    cursor_state: SharedCursorState,
 }
 
 impl WebKitEngine {
@@ -264,6 +269,9 @@ impl WebKitEngine {
         // Share the audio-event queue created in spawn (#132).
         let audio_event_queue = Arc::clone(&worker.audio_event_queue);
 
+        // Share the cursor state created in spawn (#137).
+        let cursor_state = Arc::clone(&worker.cursor_state);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -304,6 +312,7 @@ impl WebKitEngine {
             pending_permissions,
             permission_next_id,
             audio_event_queue,
+            cursor_state,
         })
     }
 
@@ -1007,6 +1016,12 @@ impl BrowserEngine for WebKitEngine {
         } else {
             Vec::new()
         }
+    }
+
+    // ── Cursor tracking (#137) ────────────────────────────────────────────────
+
+    fn take_cursor_change(&self) -> Option<(i32, u32)> {
+        self.cursor_state.take()
     }
 
     // ── Permissions (#138) ────────────────────────────────────────────────────

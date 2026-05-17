@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::cursor::{CursorState, SharedCursorState};
 use buffr_core::favicon::{FaviconSink, new_favicon_sink};
 use buffr_core::hint::{HintEventSink, new_hint_event_sink};
 use buffr_downloads::Downloads;
@@ -258,6 +259,9 @@ pub(crate) struct WorkerHandle {
     /// Shared audio-event queue (#132). Written by per-tab `buffrAudio` UCM
     /// signal handlers; drained by `WebKitEngine::drain_audio_events`.
     pub audio_event_queue: WpeAudioEventQueue,
+    /// Shared cursor state (#137). Written by per-tab `buffrCursor` UCM signal
+    /// handlers; read by `WebKitEngine::take_cursor_change`.
+    pub cursor_state: SharedCursorState,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -355,6 +359,11 @@ pub(crate) fn spawn(
     // (writers via `AudioSignalCtx`) share the same Arc.
     let audio_event_queue: WpeAudioEventQueue = new_audio_event_queue();
 
+    // Shared cursor state (#137). Allocated here so both `WebKitEngine`
+    // (reader via `take_cursor_change`) and per-tab UCM signal handlers
+    // (writers via `CursorSignalCtx`) share the same Arc.
+    let cursor_state: SharedCursorState = Arc::new(CursorState::new());
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
@@ -367,6 +376,7 @@ pub(crate) fn spawn(
     let pending_permissions_worker = Arc::clone(&pending_permissions);
     let permission_next_id_worker = Arc::clone(&permission_next_id);
     let audio_event_queue_worker = Arc::clone(&audio_event_queue);
+    let cursor_state_worker = Arc::clone(&cursor_state);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -423,6 +433,7 @@ pub(crate) fn spawn(
                 pending_permissions_worker,
                 permission_next_id_worker,
                 audio_event_queue_worker,
+                cursor_state_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -607,6 +618,7 @@ pub(crate) fn spawn(
         pending_permissions,
         permission_next_id,
         audio_event_queue,
+        cursor_state,
         thread: Some(thread),
     })
 }
