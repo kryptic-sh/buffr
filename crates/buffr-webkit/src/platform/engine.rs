@@ -848,6 +848,87 @@ impl BrowserEngine for WebKitEngine {
         });
     }
 
+    // ── Media controls (#131) ────────────────────────────────────────────────
+    //
+    // Each helper walks up the DOM from elementFromPoint(x, y) to find the
+    // nearest HTMLMediaElement, falls back to the first <video>/<audio> on
+    // the page, then toggles the relevant property. Mirrors CEF's impl —
+    // dispatched via run_main_frame_js → Command::EvalJs.
+
+    fn media_play_pause(&self, x: i32, y: i32) {
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
+               if(!el)return;\
+               if(el.paused)el.play();else el.pause();\
+             }})({x},{y});"
+        );
+        let _ = self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    fn media_toggle_mute(&self, x: i32, y: i32) {
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
+               if(!el)return;\
+               el.muted=!el.muted;\
+             }})({x},{y});"
+        );
+        let _ = self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    fn media_toggle_loop(&self, x: i32, y: i32) {
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
+               if(!el)return;\
+               el.loop=!el.loop;\
+             }})({x},{y});"
+        );
+        let _ = self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    fn media_toggle_controls(&self, x: i32, y: i32) {
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+               if(!el)el=document.querySelector('video, audio');\
+               if(!el)return;\
+               el.controls=!el.controls;\
+             }})({x},{y});"
+        );
+        let _ = self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
+    fn media_picture_in_picture(&self, x: i32, y: i32) {
+        // try/catch because some hosts disable PiP via Permissions Policy
+        // or the element lacks the WebKit prefix-free PiP API on older
+        // WebViews; we don't want a thrown exception to break the menu.
+        let js = format!(
+            "(function(x,y){{\
+               try{{\
+                 var el=document.elementFromPoint(x,y);\
+                 while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
+                 if(!el)el=document.querySelector('video');\
+                 if(!el)return;\
+                 if(document.pictureInPictureElement===el){{\
+                   document.exitPictureInPicture();\
+                 }}else{{\
+                   el.requestPictureInPicture();\
+                 }}\
+               }}catch(e){{}}\
+             }})({x},{y});"
+        );
+        let _ = self.run_main_frame_js(&js, "buffr://context-menu");
+    }
+
     fn active_zoom_level(&self) -> f64 {
         self.zoom_level.lock().map(|g| *g).unwrap_or(1.0)
     }
