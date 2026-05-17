@@ -24,6 +24,11 @@ use std::time::Duration;
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitError;
+use super::ffi::{
+    WebKitCookiePersistentStorage_WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE,
+    webkit_cookie_manager_set_persistent_storage, webkit_network_session_get_cookie_manager,
+    webkit_network_session_get_default,
+};
 use super::runtime::{TabInfo, WpeRuntime};
 
 // ── EngineState ───────────────────────────────────────────────────────────────
@@ -215,6 +220,11 @@ impl Drop for WorkerHandle {
 }
 
 /// Spawn the GLib worker thread and return a handle.
+///
+/// `cookie_db_path` — when `Some`, the worker calls
+/// `webkit_cookie_manager_set_persistent_storage` once at startup so
+/// cookies survive browser restarts. `None` leaves WebKit's default
+/// in-memory cookie store active.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     initial_url: &str,
@@ -224,6 +234,7 @@ pub(crate) fn spawn(
     view: SharedOsrViewState,
     is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
     zoom_level: Arc<Mutex<f64>>,
+    cookie_db_path: Option<String>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -288,6 +299,62 @@ pub(crate) fn spawn(
                 }
             };
             let runtime_rc = Rc::new(RefCell::new(runtime));
+
+            // ── Persistent cookie store ───────────────────────────────────
+            //
+            // Wire sqlite cookie storage before the first WebView is created
+            // so the persistent store is active for the initial navigation.
+            // Must run on the GLib worker thread after WpeRuntime::new (which
+            // sets up the display / EGL context WebKit needs) and before
+            // open_tab fires from the idle handler below.
+            //
+            // Called at most once per engine instance; per-tab calls are NOT
+            // needed — the default WebKitNetworkSession is shared by all
+            // WebViews in the process.
+            if let Some(path) = cookie_db_path {
+                match std::ffi::CString::new(path.as_str()) {
+                    Ok(path_c) => {
+                        // SAFETY: webkit_network_session_get_default() returns
+                        // a process-singleton that is always valid after WebKit
+                        // is loaded. webkit_network_session_get_cookie_manager
+                        // returns a borrowed pointer valid for the session's
+                        // lifetime. webkit_cookie_manager_set_persistent_storage
+                        // is idempotent and safe to call before any WebView
+                        // exists.
+                        unsafe {
+                            let session = webkit_network_session_get_default();
+                            if !session.is_null() {
+                                let manager = webkit_network_session_get_cookie_manager(session);
+                                if !manager.is_null() {
+                                    webkit_cookie_manager_set_persistent_storage(
+                                        manager,
+                                        path_c.as_ptr(),
+                                        WebKitCookiePersistentStorage_WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE,
+                                    );
+                                    tracing::info!(
+                                        path,
+                                        "webkit: persistent cookie store enabled"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "webkit: cookie manager is NULL — cookies remain in-memory"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "webkit: default network session is NULL — cookies remain in-memory"
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            path,
+                            "webkit: cookie DB path contains NUL byte — cookies remain in-memory"
+                        );
+                    }
+                }
+            }
 
             // ── Initial tab: open inside the main loop via idle callback ──
             //
