@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::favicon::{FaviconSink, new_favicon_sink};
 use buffr_core::hint::{HintEventSink, new_hint_event_sink};
 use buffr_downloads::Downloads;
 use buffr_engine::popup::{PopupQueue, new_popup_queue};
@@ -211,6 +212,9 @@ pub(crate) struct WorkerHandle {
     /// Context-menu request sink. Written by the `context-menu` signal handler
     /// on each WebView; drained by the apps layer via `drain_context_menu_requests`.
     pub context_menu_sink: WpeContextMenuSink,
+    /// Favicon decode sink. Written by the per-tab `buffrFavicon` UCM handler
+    /// (background thread); drained by `WebKitEngine::drain_favicon_updates`.
+    pub favicon_sink: FaviconSink,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -286,11 +290,17 @@ pub(crate) fn spawn(
     // (writer, via TabEntry's `context-menu` signal) share the same Arc.
     let context_menu_sink: WpeContextMenuSink = new_wpe_context_menu_sink();
 
+    // Shared favicon decode sink. Allocated here so both `WebKitEngine`
+    // (drainer via `drain_favicon_updates`) and per-tab background fetch
+    // threads (writers) share the same Arc.
+    let favicon_sink: FaviconSink = new_favicon_sink();
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
     let popup_queue_worker = Arc::clone(&popup_queue);
     let context_menu_sink_worker = Arc::clone(&context_menu_sink);
+    let favicon_sink_worker = Arc::clone(&favicon_sink);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -340,6 +350,7 @@ pub(crate) fn spawn(
                 hint_sink_worker,
                 popup_queue_worker,
                 context_menu_sink_worker,
+                favicon_sink_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -519,6 +530,7 @@ pub(crate) fn spawn(
         hint_sink,
         popup_queue,
         context_menu_sink,
+        favicon_sink,
         thread: Some(thread),
     })
 }

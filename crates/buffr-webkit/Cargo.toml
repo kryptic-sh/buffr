@@ -21,6 +21,8 @@ buffr-config.workspace = true
 hjkl-clipboard.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+ureq = { version = "3" }
+image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glib = "0.22"

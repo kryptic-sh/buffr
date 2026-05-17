@@ -84,6 +84,9 @@ pub struct WebKitEngine {
     /// `TabEntry`'s `context-menu` signal handler. Drained by
     /// `drain_context_menu_requests`.
     context_menu_sink: WpeContextMenuSink,
+    /// Favicon decode sink. Shared with `WpeRuntime` and the per-tab
+    /// background fetch threads. Drained by `drain_favicon_updates`.
+    favicon_sink: buffr_core::favicon::FaviconSink,
 }
 
 impl WebKitEngine {
@@ -212,6 +215,11 @@ impl WebKitEngine {
         // drains the same queue the signals push into.
         let context_menu_sink = Arc::clone(&worker.context_menu_sink);
 
+        // Share the favicon sink that the worker wired to each TabEntry's
+        // `buffrFavicon` UCM handler. Using the same Arc ensures the engine
+        // drains the same queue the background fetch threads push into.
+        let favicon_sink = Arc::clone(&worker.favicon_sink);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -244,6 +252,7 @@ impl WebKitEngine {
             hint_alphabet,
             hint_session: Mutex::new(None),
             context_menu_sink,
+            favicon_sink,
         })
     }
 
@@ -868,6 +877,20 @@ impl BrowserEngine for WebKitEngine {
         _delta_y: i32,
         _modifiers: u32,
     ) {
+    }
+
+    // ── Favicon ───────────────────────────────────────────────────────────────
+
+    fn drain_favicon_updates(&self) -> Vec<buffr_engine::FaviconUpdate> {
+        buffr_core::favicon::drain_favicon_updates(&self.favicon_sink)
+            .into_iter()
+            .map(|u| buffr_engine::FaviconUpdate {
+                browser_id: u.browser_id,
+                width: u.width,
+                height: u.height,
+                pixels: u.pixels,
+            })
+            .collect()
     }
 
     // ── Hint mode ─────────────────────────────────────────────────────────────

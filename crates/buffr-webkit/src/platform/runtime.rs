@@ -135,6 +135,41 @@ const CLIPBOARD_BRIDGE_JS: &str = r#"
 })();
 "#;
 
+/// Favicon bridge JS injected at document-end on top-frame only.
+///
+/// Picks the best `<link rel="icon">` URL and posts `{ url, origin }` to
+/// the native `buffrFavicon` UCM handler. Fires once at DOMContentLoaded
+/// and again whenever `<head>` mutates (SPAs that swap icons mid-session).
+const FAVICON_BRIDGE_JS: &str = r#"
+(() => {
+  const pick = () => {
+    const links = Array.from(document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"]'));
+    if (links.length === 0) {
+      return new URL('/favicon.ico', location.href).href;
+    }
+    const score = (link) => {
+      const sizes = link.getAttribute('sizes') || '';
+      const max = sizes.split(/\s+/).map(s => parseInt(s.split('x')[0], 10) || 0).reduce((a, b) => Math.max(a, b), 0);
+      return max || 16;
+    };
+    links.sort((a, b) => score(b) - score(a));
+    return new URL(links[0].href, location.href).href;
+  };
+  const send = () => {
+    try {
+      const url = pick();
+      if (url) window.webkit.messageHandlers.buffrFavicon.postMessage({ url: url, origin: location.origin });
+    } catch(e) {}
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', send);
+  } else {
+    send();
+  }
+  new MutationObserver(send).observe(document.head || document.documentElement, { childList: true, subtree: true });
+})();
+"#;
+
 /// Per-tab heap context handed to WebKit's signal handlers via `user_data`.
 /// Keeps an Arc clone of the shared engine state so handlers running on the
 /// worker thread can update URL / title; loading state is tracked via a
@@ -456,6 +491,141 @@ unsafe extern "C" fn drop_clipboard_box(
     if !user_data.is_null() {
         // SAFETY: user_data was produced by Box::into_raw.
         drop(unsafe { Box::from_raw(user_data as *mut hjkl_clipboard::Clipboard) });
+    }
+}
+
+// ── Favicon script-message signal ────────────────────────────────────────────
+
+/// Per-connection user_data for the `buffrFavicon` UCM signal.
+struct FaviconSignalCtx {
+    tab_id: TabId,
+    favicon_sink: buffr_core::favicon::FaviconSink,
+}
+
+/// `script-message-received::buffrFavicon` handler on the UCM.
+///
+/// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries `{ url, origin }` posted by `FAVICON_BRIDGE_JS`.
+/// We parse the URL, spawn a background thread to fetch + decode the
+/// image, and push a `FaviconUpdate` into the shared sink.
+unsafe extern "C" fn on_favicon_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let json_str = unsafe { std::ffi::CStr::from_ptr(raw_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { g_free(raw_ptr as *mut _) };
+
+    if json_str.is_empty() {
+        return;
+    }
+
+    // Parse { url, origin } from the JS object serialised to JSON.
+    let url = match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(v) => {
+            v.get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_owned()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, json = json_str, "webkit: buffrFavicon — JSON parse failed");
+            return;
+        }
+    };
+
+    if url.is_empty() {
+        return;
+    }
+    tracing::debug!(url, "webkit: buffrFavicon — fetching icon");
+
+    // SAFETY: user_data is a Box<FaviconSignalCtx> owned until
+    // drop_favicon_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const FaviconSignalCtx) };
+    let browser_id = ctx.tab_id.0 as i32;
+    let sink = Arc::clone(&ctx.favicon_sink);
+
+    std::thread::spawn(move || {
+        // Cap response to 1 MiB — favicons are tiny.
+        const MAX_BYTES: u64 = 1024 * 1024;
+        let mut resp = match ureq::get(&url).call() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "webkit: favicon fetch failed");
+                return;
+            }
+        };
+        if resp.status().as_u16() != 200 {
+            tracing::warn!(url, status = resp.status().as_u16(), "webkit: favicon non-200");
+            return;
+        }
+        let buf = match resp.body_mut().with_config().limit(MAX_BYTES).read_to_vec() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "webkit: favicon read body failed");
+                return;
+            }
+        };
+
+        let img = match image::load_from_memory(&buf) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "webkit: favicon image decode failed");
+                return;
+            }
+        };
+
+        // Resize to 32x32.
+        let img = img.resize_exact(32, 32, image::imageops::FilterType::Nearest);
+        let rgba = img.to_rgba8();
+        let width = rgba.width();
+        let height = rgba.height();
+
+        // Convert RGBA to packed BGRA u32 (`0xAA_RR_GG_BB` in little-endian
+        // memory = `0xBB_GG_RR_AA` as a u32 value). The buffr-core doc says
+        // `0xAA_RR_GG_BB` packed, which in Rust numeric literal means:
+        //   bits [31:24] = A, [23:16] = R, [15:8] = G, [7:0] = B
+        // Same encoding as CEF's favicon callback.
+        let pixels: Vec<u32> = rgba
+            .chunks_exact(4)
+            .map(|p| {
+                let (r, g, b, a) = (p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32);
+                (a << 24) | (r << 16) | (g << 8) | b
+            })
+            .collect();
+
+        let update = buffr_core::favicon::FaviconUpdate {
+            browser_id,
+            width,
+            height,
+            pixels,
+        };
+        if let Ok(mut guard) = sink.lock() {
+            guard.push_back(update);
+        }
+        tracing::debug!(url, browser_id, "webkit: favicon pushed to sink");
+    });
+}
+
+/// GLib `GClosureNotify` for the `Box<FaviconSignalCtx>` pointer leaked in
+/// `TabEntry::new` for the favicon script-message connection.
+unsafe extern "C" fn drop_favicon_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut FaviconSignalCtx) });
     }
 }
 
@@ -910,6 +1080,9 @@ pub(crate) struct TabEntry {
     /// Signal ID for `script-message-received::buffrClipboard` on the UCM.
     /// 0 when the clipboard init failed.
     clipboard_script_message_received_id: u64,
+    /// Signal ID for `script-message-received::buffrFavicon` on the UCM.
+    /// 0 when favicon init failed.
+    favicon_script_message_received_id: u64,
     /// Signal ID for `create` on this WebView (popup interception).
     create_signal_id: u64,
     /// Signal ID for `load-failed-with-tls-errors` (#120).
@@ -951,6 +1124,7 @@ impl TabEntry {
         hint_sink: HintEventSink,
         popup_queue: PopupQueue,
         context_menu_sink: WpeContextMenuSink,
+        favicon_sink: buffr_core::favicon::FaviconSink,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -1251,6 +1425,78 @@ impl TabEntry {
             }
         };
 
+        // ── Favicon bridge: UCM script-message handler ────────────────────────
+        //
+        // 1. Inject FAVICON_BRIDGE_JS at document-end on top-frame only so
+        //    <link rel="icon"> elements are present when the script runs.
+        // 2. Register `buffrFavicon` and wire `script-message-received::buffrFavicon`
+        //    to spawn a background fetch + decode + push into the shared sink.
+        //
+        // Pattern mirrors hint / clipboard IPC above.
+        let favicon_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_TOP_FRAME as INJECT_TOP,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END as INJECT_END,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                0
+            } else {
+                // Register the native message handler name.
+                let handler_name = std::ffi::CString::new("buffrFavicon").unwrap();
+                let _ok = webkit_user_content_manager_register_script_message_handler(
+                    ucm,
+                    handler_name.as_ptr(),
+                    std::ptr::null(),
+                );
+
+                // Inject favicon bridge at document-end on top frame only.
+                let source_c = std::ffi::CString::new(FAVICON_BRIDGE_JS).unwrap();
+                let script = webkit_user_script_new(
+                    source_c.as_ptr(),
+                    INJECT_TOP,
+                    INJECT_END,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, script);
+                    webkit_user_script_unref(script);
+                }
+
+                // Connect `script-message-received::buffrFavicon`.
+                // user_data is a Box<FaviconSignalCtx> leaked via Box::into_raw;
+                // drop_favicon_signal_ctx reconstitutes + drops it on disconnect.
+                let ctx_box = Box::new(FaviconSignalCtx {
+                    tab_id: id,
+                    favicon_sink: Arc::clone(&favicon_sink),
+                });
+                let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
+                let signal_name =
+                    std::ffi::CString::new("script-message-received::buffrFavicon").unwrap();
+                g_signal_connect_data(
+                    ucm as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_favicon_script_message)),
+                    ctx_raw,
+                    Some(drop_favicon_signal_ctx),
+                    0,
+                )
+            }
+        };
+
         // ── Popup queue: `create` signal ──────────────────────────────────────
         //
         // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
@@ -1400,6 +1646,7 @@ impl TabEntry {
             notify_estimated_load_progress_id,
             hint_script_message_received_id,
             clipboard_script_message_received_id,
+            favicon_script_message_received_id,
             create_signal_id,
             tls_error_id,
             context_menu_id,
@@ -1555,6 +1802,12 @@ impl Drop for TabEntry {
                         self.clipboard_script_message_received_id,
                     );
                 }
+                if self.favicon_script_message_received_id != 0 {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.favicon_script_message_received_id,
+                    );
+                }
             }
             // Disconnect `create` signal on the WebView before unref.
             if self.create_signal_id != 0 {
@@ -1623,6 +1876,10 @@ pub(crate) struct WpeRuntime {
     /// Context-menu request sink. Written by the `context-menu` signal handler
     /// on each WebView; drained by the apps layer via `drain_context_menu_requests`.
     pub context_menu_sink: WpeContextMenuSink,
+    /// Favicon decode sink. Written by the per-tab `buffrFavicon` UCM signal
+    /// handler (background thread) after fetch + decode; drained by
+    /// `WebKitEngine::drain_favicon_updates` on any thread.
+    pub favicon_sink: buffr_core::favicon::FaviconSink,
 }
 
 impl WpeRuntime {
@@ -1636,6 +1893,7 @@ impl WpeRuntime {
         hint_sink: HintEventSink,
         popup_queue: PopupQueue,
         context_menu_sink: WpeContextMenuSink,
+        favicon_sink: buffr_core::favicon::FaviconSink,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -1677,6 +1935,7 @@ impl WpeRuntime {
             zoom_level,
             hint_sink,
             popup_queue,
+            favicon_sink,
             context_menu_sink,
         })
     }
@@ -1758,6 +2017,7 @@ impl WpeRuntime {
             Arc::clone(&self.hint_sink),
             Arc::clone(&self.popup_queue),
             Arc::clone(&self.context_menu_sink),
+            Arc::clone(&self.favicon_sink),
         );
 
         let entry = match entry {
