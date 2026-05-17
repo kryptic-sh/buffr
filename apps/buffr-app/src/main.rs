@@ -1147,11 +1147,31 @@ fn main() -> Result<()> {
         let flag = Arc::clone(&shutdown_flag);
         let proxy = event_proxy.clone();
         if let Err(err) = ctrlc::set_handler(move || {
-            flag.store(true, Ordering::SeqCst);
-            // Wake the winit loop so the shutdown_flag check in
-            // about_to_wait fires immediately, not at the next probe /
-            // media-poll deadline (could be 2 s out while occluded).
+            // First press: cooperative shutdown.  Set the flag and
+            // wake the winit loop via the event proxy so the next
+            // `new_events` / `user_event` hook (whichever fires first)
+            // calls `event_loop.exit()`.
+            let was_set = flag.swap(true, Ordering::SeqCst);
             let _ = proxy.send_event(BuffrUserEvent::Shutdown);
+
+            if !was_set {
+                // Hard-abort fallback: if the cooperative shutdown
+                // doesn't drain within 3 s (event loop wedged, paint
+                // stuck in a syscall, etc.), exit the process the hard
+                // way.  Without this, Ctrl+C on a hung UI thread does
+                // nothing and the user is forced to SIGKILL from
+                // another terminal.
+                std::thread::Builder::new()
+                    .name("buffr-shutdown-abort".into())
+                    .spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        eprintln!("buffr: cooperative shutdown timed out after 3s; aborting");
+                        // _exit skips destructors / atexit; appropriate
+                        // for an emergency bail-out.  130 = 128 + SIGINT.
+                        unsafe { libc::_exit(130) };
+                    })
+                    .ok();
+            }
         }) {
             warn!(error = %err, "ctrlc handler already installed — using existing");
         }
@@ -7136,7 +7156,21 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
     /// and the supervisor keeps getting pings even when winit's
     /// `ControlFlow::WaitUntil` deadline is starved by Wayland frame
     /// callback semantics on the host compositor.
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        // Ctrl+C path: if the signal handler has fired since the last
+        // tick, save state and exit immediately.  Checked here (the
+        // earliest hook in the event-loop iteration) so the exit fires
+        // even when the loop never reaches `about_to_wait` — winit's
+        // ControlFlow::WaitUntil is not honoured reliably on every
+        // Wayland compositor, so trusting `about_to_wait` alone leaves
+        // Ctrl+C stuck.
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            self.save_session_now();
+            self.mark_clean_shutdown();
+            event_loop.exit();
+            return;
+        }
+
         if let Some(h) = self.heartbeat.as_ref() {
             h.mark_alive();
             if !h.is_alive() {
@@ -7149,13 +7183,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: BuffrUserEvent) {
         match event {
             BuffrUserEvent::Shutdown => {
                 // ctrl+c handler set shutdown_flag and posted this event.
-                // Just need to wake the loop — about_to_wait runs after
-                // user_event returns and picks up the flag from there.
+                // Exit directly here in addition to setting the flag —
+                // relying on about_to_wait to fire after user_event has
+                // a known failure mode on Wayland where the loop never
+                // reaches it, leaving Ctrl+C stuck.
                 tracing::debug!("user_event: Shutdown");
+                self.save_session_now();
+                self.mark_clean_shutdown();
+                event_loop.exit();
+                return;
             }
             BuffrUserEvent::OsrFrame => {
                 tracing::trace!("user_event: OsrFrame -> request_redraw");
