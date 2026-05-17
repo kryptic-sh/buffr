@@ -13,8 +13,8 @@
 //! callback) when the view is finalised, which lets us free the box safely.
 
 use std::ffi::{CStr, c_void};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Send wrapper around `*mut WPEBuffer`. The pointer is only ever
@@ -197,10 +197,7 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     // practice — WebKit waits for ack before reissuing — but defensive),
     // ack it first to keep the pool balanced before stashing the new one.
     if !ctx.is_active.load(Ordering::Relaxed) {
-        let mut pending = ctx
-            .pending_buffer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut pending = ctx.pending_buffer.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(prev) = pending.take() {
             unsafe {
                 wpe_view_buffer_rendered(view, prev.0);

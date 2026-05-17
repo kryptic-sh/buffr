@@ -37,8 +37,9 @@ impl EglWorker {
         };
         let egl = Arc::new(egl);
 
-        let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }
-            .ok_or_else(|| WebKitError::InitFailed("eglGetDisplay(DEFAULT) returned NULL".into()))?;
+        let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.ok_or_else(|| {
+            WebKitError::InitFailed("eglGetDisplay(DEFAULT) returned NULL".into())
+        })?;
 
         let (major, minor) = egl
             .initialize(display)

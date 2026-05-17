@@ -93,9 +93,7 @@ fn build_linux() {
         .expect("failed to write wpe_bindings.rs");
 
     println!("cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe/webkit.h");
-    println!(
-        "cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h"
-    );
+    println!("cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wpe-platform.h");
 
     // ── Compile the C bridge ────────────────────────────────────────────────
     //
