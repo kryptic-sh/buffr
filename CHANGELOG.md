@@ -8,13 +8,23 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [0.2.0] - 2026-05-18
 
+### Added
+
+- `BrowserEngine::is_using_native_compositing(&self) -> bool` — reports whether
+  the engine is **currently** rendering through a native platform-compositor
+  surface (Wayland subsurface, etc.) versus the OSR readback path. Distinct from
+  the existing `supports_native` which reports capability. Default impl returns
+  `false`; engines that take a native path override. The apps layer should
+  branch on this for any behaviour that differs between the two pixel pipelines
+  (loading animation overlay, chrome transparency, etc.) so gates don't fire on
+  engines that COULD composite natively but currently aren't.
+
 ### Removed
 
-- `BrowserEngine::image_rotate` trait method and the
-  `media_js::image_rotate` JS helper. The right-click "Rotate image"
-  context-menu action provided no real value (CSS-transform only, not
-  persisted, modern images carry correct EXIF) and was retired across
-  all backends rather than maintained for parity.
+- `BrowserEngine::image_rotate` trait method and the `media_js::image_rotate` JS
+  helper. The right-click "Rotate image" context-menu action provided no real
+  value (CSS-transform only, not persisted, modern images carry correct EXIF)
+  and was retired across all backends rather than maintained for parity.
 
 ### Changed
 
@@ -22,10 +32,10 @@ All notable changes to `buffr-engine` are documented here. Format follows
   `PermissionsQueue`, and `EngineError::Unimplemented` reworked to drop
   references to the retired `buffr-blink-cdp`, `buffr-firefox-cdp`, and
   `buffr-webkitgtk` backends. The umbrella drops these three engines in favour
-  of CEF, WPE WebKit, WKWebView, WebView2, Blitz, and Ladybird. The minor
-  bump reflects the trait-method removal and the umbrella-wide engine
-  roster change so consumers pinning specific engine names in routing
-  config can spot the drop in one place.
+  of CEF, WPE WebKit, WKWebView, WebView2, Blitz, and Ladybird. The minor bump
+  reflects the trait-method removal and the umbrella-wide engine roster change
+  so consumers pinning specific engine names in routing config can spot the drop
+  in one place.
 
 ## [0.1.7] - 2026-05-18
 

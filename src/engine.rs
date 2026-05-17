@@ -788,6 +788,26 @@ pub trait BrowserEngine: Send + Sync {
         false
     }
 
+    /// Whether the engine is **currently** rendering through a native
+    /// platform-compositor surface (e.g. Wayland subsurface) rather than
+    /// the OSR readback path.
+    ///
+    /// Distinct from [`Self::supports_native`]: an engine can support
+    /// native compositing (the capability exists) but still run on the
+    /// OSR path (the user opted out, the session type isn't right,
+    /// initialisation failed, etc.).  The apps layer uses this when
+    /// gating logic that needs to know which pixel pipeline is live —
+    /// e.g. suppressing the loading animation overlay over a native
+    /// subsurface that already owns the browser region, while keeping
+    /// the animation visible on OSR-backed engines.
+    ///
+    /// Default: `false`.  Engines that take a native path override this
+    /// to return `true` only when their current display backend is
+    /// actually compositing through the host surface.
+    fn is_using_native_compositing(&self) -> bool {
+        false
+    }
+
     /// Bind the engine to a parent native surface + viewport rect within it.
     ///
     /// `parent` is a [`raw_window_handle::RawWindowHandle`] — Wayland's
