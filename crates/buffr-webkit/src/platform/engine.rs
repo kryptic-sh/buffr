@@ -28,7 +28,7 @@ use buffr_engine::{
 use super::runtime::WpePermissionRequestPtr;
 
 use super::error::WebKitError;
-use super::runtime::WpeContextMenuSink;
+use super::runtime::{WpeAudioEventQueue, WpeContextMenuSink};
 use super::worker::{Command, WorkerHandle, WpeKeyEvent, spawn};
 
 // ── WebKitEngine ──────────────────────────────────────────────────────────────
@@ -110,6 +110,10 @@ pub struct WebKitEngine {
     /// Monotonic counter for resolve_ids. Shared with the GLib worker.
     #[allow(dead_code)]
     permission_next_id: Arc<AtomicU64>,
+    /// Shared audio-event queue (#132). Written by per-tab `buffrAudio` UCM
+    /// signal handlers on the GLib worker thread; drained here via
+    /// `drain_audio_events`. Same Arc as the one in WorkerHandle.
+    audio_event_queue: WpeAudioEventQueue,
 }
 
 impl WebKitEngine {
@@ -257,6 +261,9 @@ impl WebKitEngine {
         let pending_permissions = Arc::clone(&worker.pending_permissions);
         let permission_next_id = Arc::clone(&worker.permission_next_id);
 
+        // Share the audio-event queue created in spawn (#132).
+        let audio_event_queue = Arc::clone(&worker.audio_event_queue);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -296,6 +303,7 @@ impl WebKitEngine {
             permissions_queue,
             pending_permissions,
             permission_next_id,
+            audio_event_queue,
         })
     }
 
@@ -991,6 +999,14 @@ impl BrowserEngine for WebKitEngine {
 
     fn any_video_active(&self) -> bool {
         false
+    }
+
+    fn drain_audio_events(&self) -> Vec<buffr_engine::AudioEvent> {
+        if let Ok(mut q) = self.audio_event_queue.lock() {
+            q.drain(..).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     // ── Permissions (#138) ────────────────────────────────────────────────────

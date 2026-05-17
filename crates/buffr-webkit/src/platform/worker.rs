@@ -37,7 +37,10 @@ use super::ffi::{
     webkit_cookie_manager_set_persistent_storage, webkit_network_session_get_cookie_manager,
     webkit_network_session_get_default,
 };
-use super::runtime::{TabInfo, WpeContextMenuSink, WpeRuntime, new_wpe_context_menu_sink};
+use super::runtime::{
+    TabInfo, WpeAudioEventQueue, WpeContextMenuSink, WpeRuntime, new_audio_event_queue,
+    new_wpe_context_menu_sink,
+};
 
 // ── EngineState ───────────────────────────────────────────────────────────────
 
@@ -252,6 +255,9 @@ pub(crate) struct WorkerHandle {
     pub pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
     /// Monotonic counter for minting resolve_ids.
     pub permission_next_id: Arc<AtomicU64>,
+    /// Shared audio-event queue (#132). Written by per-tab `buffrAudio` UCM
+    /// signal handlers; drained by `WebKitEngine::drain_audio_events`.
+    pub audio_event_queue: WpeAudioEventQueue,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -344,6 +350,11 @@ pub(crate) fn spawn(
         Arc::new(Mutex::new(HashMap::new()));
     let permission_next_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
 
+    // Shared audio-event queue (#132). Allocated here so both `WebKitEngine`
+    // (drainer via `drain_audio_events`) and per-tab UCM signal handlers
+    // (writers via `AudioSignalCtx`) share the same Arc.
+    let audio_event_queue: WpeAudioEventQueue = new_audio_event_queue();
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
@@ -355,6 +366,7 @@ pub(crate) fn spawn(
     let permissions_queue_worker = Arc::clone(&permissions_queue);
     let pending_permissions_worker = Arc::clone(&pending_permissions);
     let permission_next_id_worker = Arc::clone(&permission_next_id);
+    let audio_event_queue_worker = Arc::clone(&audio_event_queue);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -410,6 +422,7 @@ pub(crate) fn spawn(
                 permissions_queue_worker,
                 pending_permissions_worker,
                 permission_next_id_worker,
+                audio_event_queue_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -593,6 +606,7 @@ pub(crate) fn spawn(
         permissions_queue,
         pending_permissions,
         permission_next_id,
+        audio_event_queue,
         thread: Some(thread),
     })
 }

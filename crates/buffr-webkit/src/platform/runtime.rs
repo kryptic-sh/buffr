@@ -17,11 +17,26 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use std::collections::VecDeque;
+
 use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
 use buffr_engine::permissions::{PendingPermission, PermissionsQueue};
 use buffr_engine::popup::PopupQueue;
 use buffr_engine::types::MediaType;
-use buffr_engine::{ContextMenuRequest, PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId};
+use buffr_engine::{
+    AudioEvent as EngineAudioEvent, ContextMenuRequest, PromptOutcome, SharedOsrFrame,
+    SharedOsrViewState, TabId,
+};
+
+/// Shared audio-event queue for the WPE backend.
+///
+/// Written by the per-tab `buffrAudio` UCM signal handler on the GLib worker
+/// thread; drained by `WebKitEngine::drain_audio_events` on any thread.
+pub(crate) type WpeAudioEventQueue = Arc<Mutex<VecDeque<EngineAudioEvent>>>;
+
+pub(crate) fn new_audio_event_queue() -> WpeAudioEventQueue {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
 
 /// Thread-safe context-menu request queue for the WPE backend.
 ///
@@ -278,6 +293,39 @@ const CLIPBOARD_PASTE_BRIDGE_JS: &str = r#"
     // the most reliable cross-element insertion for our use case.
     document.execCommand('insertText', false, text);
   }, true);
+})();
+"#;
+
+/// Audio bridge JS injected at document-start on every frame.
+///
+/// Listens for `play`, `pause`, `ended`, `emptied`, `abort` events on
+/// `document` with capture=true so they bubble from any `<video>`/`<audio>`
+/// element, recomputes the aggregate "any playing" state, and posts
+/// `{ active: bool }` to the native `buffrAudio` UCM handler whenever the
+/// aggregate flips.
+///
+/// The `readyState >= 2` (HAVE_CURRENT_DATA) guard prevents transient false
+/// positives from elements that fired `play` but haven't loaded media yet.
+const AUDIO_BRIDGE_JS: &str = r#"
+(() => {
+  let last = false;
+  const compute = () => Array.from(document.querySelectorAll('video, audio'))
+    .some(m => !m.paused && !m.ended && m.readyState >= 2);
+  const tick = () => {
+    const cur = compute();
+    if (cur !== last) {
+      last = cur;
+      try { window.webkit.messageHandlers.buffrAudio.postMessage({ active: cur }); } catch (_) {}
+    }
+  };
+  ['play', 'pause', 'ended', 'emptied', 'abort'].forEach(ev => {
+    document.addEventListener(ev, tick, { capture: true, passive: true });
+  });
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', tick);
+  } else {
+    tick();
+  }
 })();
 "#;
 
@@ -776,6 +824,100 @@ unsafe extern "C" fn drop_favicon_signal_ctx(
     if !user_data.is_null() {
         // SAFETY: user_data was produced by Box::into_raw.
         drop(unsafe { Box::from_raw(user_data as *mut FaviconSignalCtx) });
+    }
+}
+
+// ── Audio bridge: UCM script-message signal ───────────────────────────────────
+
+/// Per-tab heap context for the `buffrAudio` UCM signal handler.
+pub(crate) struct AudioSignalCtx {
+    /// The tab's `browser_id` (= `TabId.0 as i32`) used as the
+    /// `AudioEvent::browser_id` field so the apps layer can correlate events
+    /// back to the tab.
+    pub browser_id: i32,
+    /// Shared audio-event queue written here; drained by
+    /// `WebKitEngine::drain_audio_events`.
+    pub audio_event_queue: WpeAudioEventQueue,
+    /// Per-tab last-reported state. Prevents re-pushing redundant events when
+    /// the JS sends the same aggregate value twice (e.g. two simultaneous
+    /// `pause` fires resolve to the same false state).
+    pub last_active: std::sync::atomic::AtomicBool,
+}
+
+/// GLib `GClosureNotify` for `Box<AudioSignalCtx>` leaked for the
+/// `script-message-received::buffrAudio` connection.
+unsafe extern "C" fn drop_audio_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut AudioSignalCtx) });
+    }
+}
+
+/// `script-message-received::buffrAudio` handler on the UCM.
+///
+/// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries `{ active: bool }` posted by `AUDIO_BRIDGE_JS`.
+/// On aggregate flip, pushes `EngineAudioEvent { browser_id, active }` to
+/// the shared queue.
+unsafe extern "C" fn on_audio_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let json_str = unsafe { std::ffi::CStr::from_ptr(raw_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { g_free(raw_ptr as *mut _) };
+
+    if json_str.is_empty() {
+        return;
+    }
+
+    let active: bool = match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(v) => v.get("active").and_then(|a| a.as_bool()).unwrap_or(false),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                json = json_str,
+                "webkit: buffrAudio — JSON parse failed"
+            );
+            return;
+        }
+    };
+
+    // SAFETY: user_data is a Box<AudioSignalCtx> owned until
+    // drop_audio_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const AudioSignalCtx) };
+
+    // Deduplicate: only push when the aggregate flips.
+    use std::sync::atomic::Ordering;
+    let prev = ctx.last_active.swap(active, Ordering::Relaxed);
+    if prev == active {
+        return;
+    }
+
+    tracing::debug!(
+        browser_id = ctx.browser_id,
+        active,
+        "webkit: buffrAudio — audio state changed"
+    );
+
+    if let Ok(mut q) = ctx.audio_event_queue.lock() {
+        q.push_back(EngineAudioEvent {
+            browser_id: ctx.browser_id,
+            active,
+        });
     }
 }
 
@@ -1541,6 +1683,14 @@ pub(crate) struct TabEntry {
     decide_policy_id: u64,
     /// Signal ID for `permission-request` (#123).
     permission_request_id: u64,
+    /// Signal ID for `script-message-received::buffrAudio` on the UCM (#132).
+    /// 0 when audio bridge init failed.
+    audio_script_message_received_id: u64,
+    /// Shared audio-event queue — this tab's `buffrAudio` handler pushes here.
+    /// Kept on `TabEntry` so `Drop` can push a final `active=false` event.
+    audio_event_queue: WpeAudioEventQueue,
+    /// This tab's browser_id (= id.0 as i32) used in the close-cleanup event.
+    audio_browser_id: i32,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -1578,6 +1728,7 @@ impl TabEntry {
         permissions_queue: PermissionsQueue,
         pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
         permission_next_id: Arc<AtomicU64>,
+        audio_event_queue: WpeAudioEventQueue,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -1990,6 +2141,81 @@ impl TabEntry {
             }
         }
 
+        // ── Audio bridge: UCM script-message handler (#132) ──────────────────
+        //
+        // 1. Register `buffrAudio` native handler on the UCM.
+        // 2. Inject AUDIO_BRIDGE_JS at document-start on all frames so media
+        //    events (play/pause/ended/emptied/abort) are forwarded whenever the
+        //    aggregate "any playing" state changes.
+        // 3. Connect `script-message-received::buffrAudio` → on_audio_script_message
+        //    which pushes `AudioEvent { browser_id, active }` to the shared queue.
+        //
+        // UCM registration is per-WebView (each WebView gets its own UCM from
+        // webkit_web_view_get_user_content_manager), so we register here just
+        // like buffrHint / buffrClipboard / buffrFavicon above.
+        let audio_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                0
+            } else {
+                // Register the native message handler name.
+                let handler_name = CString::new("buffrAudio").unwrap();
+                let _ok = webkit_user_content_manager_register_script_message_handler(
+                    ucm,
+                    handler_name.as_ptr(),
+                    std::ptr::null(),
+                );
+
+                // Inject audio bridge at document-start on all frames.
+                let source_c = CString::new(AUDIO_BRIDGE_JS).unwrap();
+                let script = webkit_user_script_new(
+                    source_c.as_ptr(),
+                    INJECT_ALL,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, script);
+                    webkit_user_script_unref(script);
+                }
+
+                // Connect `script-message-received::buffrAudio`.
+                // user_data is a Box<AudioSignalCtx> leaked via Box::into_raw;
+                // drop_audio_signal_ctx reconstitutes + drops it on disconnect.
+                let ctx_box = Box::new(AudioSignalCtx {
+                    browser_id: id.0 as i32,
+                    audio_event_queue: Arc::clone(&audio_event_queue),
+                    last_active: std::sync::atomic::AtomicBool::new(false),
+                });
+                let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
+                let signal_name = CString::new("script-message-received::buffrAudio").unwrap();
+                g_signal_connect_data(
+                    ucm as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_audio_script_message)),
+                    ctx_raw,
+                    Some(drop_audio_signal_ctx),
+                    0,
+                )
+            }
+        };
+
         // ── Popup queue: `create` signal ──────────────────────────────────────
         //
         // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
@@ -2150,6 +2376,9 @@ impl TabEntry {
             context_menu_id,
             decide_policy_id,
             permission_request_id,
+            audio_script_message_received_id,
+            audio_event_queue,
+            audio_browser_id: id.0 as i32,
             is_active,
         })
     }
@@ -2306,6 +2535,21 @@ impl Drop for TabEntry {
                         self.favicon_script_message_received_id,
                     );
                 }
+                if self.audio_script_message_received_id != 0 {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.audio_script_message_received_id,
+                    );
+                }
+            }
+            // Push a final active=false event so the apps layer clears any
+            // audio indicator immediately on tab close rather than waiting for
+            // the next JS-fired event (which will never come from a closed tab).
+            if let Ok(mut q) = self.audio_event_queue.lock() {
+                q.push_back(EngineAudioEvent {
+                    browser_id: self.audio_browser_id,
+                    active: false,
+                });
             }
             // Disconnect `create` signal on the WebView before unref.
             if self.create_signal_id != 0 {
@@ -2393,6 +2637,9 @@ pub(crate) struct WpeRuntime {
     pub pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
     /// Monotonic id counter for resolve_ids.
     pub permission_next_id: Arc<AtomicU64>,
+    /// Shared audio-event queue. Written by per-tab `buffrAudio` UCM signal
+    /// handlers; drained by `WebKitEngine::drain_audio_events`.
+    pub audio_event_queue: WpeAudioEventQueue,
 }
 
 impl WpeRuntime {
@@ -2412,6 +2659,7 @@ impl WpeRuntime {
         permissions_queue: PermissionsQueue,
         pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
         permission_next_id: Arc<AtomicU64>,
+        audio_event_queue: WpeAudioEventQueue,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -2507,6 +2755,7 @@ impl WpeRuntime {
             permissions_queue,
             pending_permissions,
             permission_next_id,
+            audio_event_queue,
         })
     }
 
@@ -2593,6 +2842,7 @@ impl WpeRuntime {
             Arc::clone(&self.permissions_queue),
             Arc::clone(&self.pending_permissions),
             Arc::clone(&self.permission_next_id),
+            Arc::clone(&self.audio_event_queue),
         );
 
         let entry = match entry {
