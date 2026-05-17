@@ -23,7 +23,7 @@
 //! `active_host()` reach-through.
 //!
 //! Phase 6c (#95): frame editing, media, JS execution, run_edit_*,
-//! run_media_probe, image_rotate, start_download, and show_dev_tools_at
+//! run_media_probe, start_download, and show_dev_tools_at
 //! added so `apps/buffr-app` no longer needs `active_host()` reach-
 //! through for these families. Methods that are CEF-specific or not yet
 //! implemented by a given backend have default impls that return
@@ -437,18 +437,6 @@ pub trait BrowserEngine: Send + Sync {
     /// Default: debug-log and no-op.
     fn media_toggle_mute(&self, _x: i32, _y: i32) {
         tracing::debug!("BrowserEngine::media_toggle_mute: not implemented by this backend");
-    }
-
-    // ── Image (Phase 6c, #95) ────────────────────────────────────────────────
-
-    /// Rotate the `<img>` element under `(x, y)` by `delta_deg` degrees.
-    ///
-    /// Positive `delta_deg` = clockwise, negative = counter-clockwise.
-    /// Accumulates into `el.dataset.buffrRotate` so successive rotations compose.
-    ///
-    /// Default: debug-log and no-op.
-    fn image_rotate(&self, _x: i32, _y: i32, _delta_deg: i32) {
-        tracing::debug!("BrowserEngine::image_rotate: not implemented by this backend");
     }
 
     // ── JS execution (Phase 6c, #95) ─────────────────────────────────────────
@@ -1034,7 +1022,6 @@ mod tests {
         eng.media_toggle_controls(100, 200);
         eng.media_toggle_loop(100, 200);
         eng.media_toggle_mute(100, 200);
-        eng.image_rotate(100, 200, 90);
     }
 
     #[test]

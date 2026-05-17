@@ -90,28 +90,6 @@ pub fn picture_in_picture(x: i32, y: i32) -> String {
     )
 }
 
-/// Rotate the `<img>` element under `(x, y)` by `delta_deg` degrees.
-///
-/// Positive `delta_deg` = clockwise, negative = counter-clockwise.
-/// Accumulates into `el.dataset.buffrRotate` so successive rotations compose.
-pub fn image_rotate(x: i32, y: i32, delta_deg: i32) -> String {
-    let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-    let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-    let delta = serde_json::to_string(&delta_deg).unwrap_or_else(|_| "0".to_string());
-    format!(
-        "(function(x,y,delta){{\
-           var el=document.elementFromPoint(x,y);\
-           while(el&&!(el instanceof HTMLImageElement))el=el.parentElement;\
-           if(!el)return;\
-           var cur=parseInt(el.dataset.buffrRotate||'0',10);\
-           cur=(cur+delta)%360;\
-           if(cur<0)cur+=360;\
-           el.dataset.buffrRotate=String(cur);\
-           el.style.transform='rotate('+cur+'deg)';\
-         }})({x},{y},{delta});"
-    )
-}
-
 /// Write the image URL to the clipboard via `navigator.clipboard.writeText`.
 ///
 /// The URL is JSON-encoded to prevent injection.
