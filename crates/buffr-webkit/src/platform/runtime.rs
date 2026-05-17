@@ -55,8 +55,8 @@ use super::egl::EglWorker;
 use super::ffi::*;
 use super::worker::EngineState;
 use super::wpe_subclass::{
-    BuffrDisplayHandle, ViewCtx, WlSurfacePtr, WpeDisplayKind, ack_pending_buffer, attach_view_ctx,
-    buffr_display_take_last_view,
+    BuffrDisplayHandle, BuffrDisplayWaylandHandle, ViewCtx, WlSurfacePtr, WpeDisplayKind,
+    ack_pending_buffer, attach_view_ctx, buffr_display_take_last_view, buffr_display_wayland_new,
 };
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────
@@ -3389,6 +3389,7 @@ impl WpeRuntime {
         video_active: Arc<std::sync::atomic::AtomicBool>,
         edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
         prefer_native: bool,
+        wayland_handles: Option<buffr_engine::WaylandNativeHandles>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -3403,106 +3404,153 @@ impl WpeRuntime {
             )
         };
 
-        // ── Display construction: branch OSR vs Wayland (#144) ───────────────
+        // ── Display construction: OSR / BuffrWayland / stock Wayland (#144, #152)
         //
-        // When `prefer_native` is set AND `XDG_SESSION_TYPE=wayland`, use
-        // `WPEDisplayWayland` so WebKit renders into a real wl_surface. On all
-        // other sessions (X11, headless, or when the flag is false), fall back
-        // to `BuffrDisplay` (OSR pixel-copy path).
+        // Priority when `prefer_native=true` + `XDG_SESSION_TYPE=wayland`:
+        //
+        //   1. BuffrDisplayWayland (#152) — preferred: reuses the host
+        //      wl_display, solves the cross-client wl_subsurface problem.
+        //      Requires all four Wayland handle pointers to be non-null.
+        //      Skipped (→ 2) when `BUFFR_WEBKIT_STOCK_WAYLAND=1` or when
+        //      any handle is null.
+        //
+        //   2. Stock WPEDisplayWayland (#144) — env-gated fallback:
+        //      `BUFFR_WEBKIT_STOCK_WAYLAND=1`.  Opens its own wl_display.
+        //      Rendered content is a sibling, not a child subsurface.
+        //
+        //   3. BuffrDisplay (OSR pixel-copy) — default for X11, headless,
+        //      or when `prefer_native=false`.
         let want_wayland = prefer_native
             && std::env::var("XDG_SESSION_TYPE")
                 .map(|v| v.eq_ignore_ascii_case("wayland"))
                 .unwrap_or(false);
 
-        let display: WpeDisplayKind = if want_wayland {
-            // SAFETY: wpe_display_wayland_new returns a floating GObject ref
-            // (*mut WPEDisplayWayland upcast to *mut WPEDisplay). We sink the
-            // ref by handing it to wpe_display_set_primary (which calls
-            // g_object_ref_sink internally on a fresh object).
-            let d = unsafe { wpe_display_wayland_new() };
-            if d.is_null() {
-                tracing::warn!(
-                    "webkit: wpe_display_wayland_new returned NULL; \
-                     falling back to BuffrDisplay (OSR)"
-                );
-                // Fall through to OSR path below.
-                let handle = BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, hz)
-                    .ok_or_else(|| "BuffrDisplayHandle::new returned None".to_string())?;
-                unsafe {
-                    let mut error: *mut GError = std::ptr::null_mut();
-                    let ok = wpe_display_connect(handle.raw, &mut error);
-                    if ok == 0 {
-                        return Err("wpe_display_connect failed (OSR fallback)".into());
-                    }
-                    wpe_display_set_primary(handle.raw);
-                }
-                tracing::info!("webkit: BuffrDisplay created + connected (OSR fallback)");
-                WpeDisplayKind::Osr(handle)
-            } else {
-                let mut error: *mut GError = std::ptr::null_mut();
-                // SAFETY: d is a *mut WPEDisplay upcast from WPEDisplayWayland.
-                // wpe_display_wayland_connect takes *mut WPEDisplayWayland; cast is
-                // safe because WPEDisplayWayland's first field is a WPEDisplay.
-                let ok = unsafe {
-                    wpe_display_wayland_connect(
-                        d as *mut WPEDisplayWayland,
-                        std::ptr::null(),
-                        &mut error,
-                    )
-                };
-                if ok == 0 {
-                    if !error.is_null() {
-                        unsafe { g_error_free(error) };
-                    }
-                    tracing::warn!(
-                        "webkit: wpe_display_wayland_connect failed; \
-                         falling back to BuffrDisplay (OSR)"
-                    );
-                    // Release the failed display object.
-                    unsafe { g_object_unref(d as *mut _) };
-                    // Fall back to OSR.
-                    let handle = BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, hz)
-                        .ok_or_else(|| "BuffrDisplayHandle::new returned None".to_string())?;
-                    unsafe {
-                        let mut error2: *mut GError = std::ptr::null_mut();
-                        let ok2 = wpe_display_connect(handle.raw, &mut error2);
-                        if ok2 == 0 {
-                            return Err("wpe_display_connect failed (OSR fallback)".into());
-                        }
-                        wpe_display_set_primary(handle.raw);
-                    }
-                    tracing::info!("webkit: BuffrDisplay created + connected (OSR fallback)");
-                    WpeDisplayKind::Osr(handle)
-                } else {
-                    // SAFETY: d is a connected WPEDisplayWayland; set as primary.
-                    unsafe { wpe_display_set_primary(d) };
-                    tracing::info!("webkit: WPEDisplayWayland connected + set as primary (#144)");
-                    // #151: debug marker — WaylandNativeHandles from the host window
-                    // will be stored on WebKitEngine after construction and consumed
-                    // by BuffrDisplayWayland (#152).
-                    tracing::debug!(
-                        "webkit: WPEDisplayWayland path active; \
-                         awaiting WaylandNativeHandles from host (#151)"
-                    );
-                    WpeDisplayKind::Wayland(d)
-                }
-            }
-        } else {
-            let handle = BuffrDisplayHandle::new(egl.raw_display(), width, height, 1.0, hz)
+        // Helper: construct + connect + set-primary an OSR BuffrDisplay.
+        let make_osr = |egl_display: *mut std::ffi::c_void| -> Result<WpeDisplayKind, String> {
+            let handle = BuffrDisplayHandle::new(egl_display, width, height, 1.0, hz)
                 .ok_or_else(|| "BuffrDisplayHandle::new returned None".to_string())?;
-
-            // Connect + publish as primary once. wpe_display_get_primary calls
-            // inside WebKit now resolve here for the whole runtime lifetime.
             unsafe {
                 let mut error: *mut GError = std::ptr::null_mut();
                 let ok = wpe_display_connect(handle.raw, &mut error);
                 if ok == 0 {
-                    return Err("wpe_display_connect failed".into());
+                    return Err("wpe_display_connect failed (OSR)".into());
                 }
                 wpe_display_set_primary(handle.raw);
             }
-            tracing::info!("webkit: BuffrDisplay created + connected (shared)");
-            WpeDisplayKind::Osr(handle)
+            tracing::info!("webkit: BuffrDisplay created + connected (OSR)");
+            Ok(WpeDisplayKind::Osr(handle))
+        };
+
+        let display: WpeDisplayKind = if want_wayland {
+            let use_stock = std::env::var("BUFFR_WEBKIT_STOCK_WAYLAND")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            // ── Path 1: BuffrDisplayWayland (preferred, #152) ─────────────
+            let handles_complete = wayland_handles.as_ref().map_or(false, |h| {
+                !h.wl_display.is_null()
+                    && !h.wl_compositor.is_null()
+                    && !h.wl_subcompositor.is_null()
+                    && !h.parent_wl_surface.is_null()
+            });
+
+            if handles_complete && !use_stock {
+                let h = wayland_handles.unwrap();
+                let raw = unsafe {
+                    buffr_display_wayland_new(
+                        h.wl_display,
+                        h.wl_compositor,
+                        h.wl_subcompositor,
+                        h.parent_wl_surface,
+                        width as i32,
+                        height as i32,
+                        1.0_f64,
+                        hz as i32,
+                    )
+                };
+                if !raw.is_null() {
+                    let connect_ok = unsafe {
+                        let mut error: *mut GError = std::ptr::null_mut();
+                        // connect vmethod is a no-op — just updates WPEDisplay's
+                        // internal "connected" flag so WebKit considers it ready.
+                        let ok = wpe_display_connect(raw, &mut error);
+                        if ok == 0 {
+                            tracing::warn!(
+                                "webkit: wpe_display_connect on BuffrDisplayWayland failed; \
+                                 falling back to OSR"
+                            );
+                            g_object_unref(raw as *mut _);
+                        } else {
+                            wpe_display_set_primary(raw);
+                        }
+                        ok
+                    };
+                    if connect_ok != 0 {
+                        tracing::info!(
+                            "webkit: BuffrDisplayWayland constructed + set as primary (#152)"
+                        );
+                        WpeDisplayKind::BuffrWayland(BuffrDisplayWaylandHandle { raw })
+                    } else {
+                        make_osr(egl.raw_display())?
+                    }
+                } else {
+                    tracing::warn!(
+                        "webkit: buffr_display_wayland_new returned NULL \
+                         (eglInitialize likely failed); falling back to OSR"
+                    );
+                    make_osr(egl.raw_display())?
+                }
+            } else {
+                if use_stock {
+                    tracing::info!(
+                        "webkit: BUFFR_WEBKIT_STOCK_WAYLAND=1 → using stock WPEDisplayWayland"
+                    );
+                } else {
+                    tracing::warn!(
+                        "webkit: Wayland handles incomplete or missing; \
+                         falling back to stock WPEDisplayWayland"
+                    );
+                }
+
+                // ── Path 2: stock WPEDisplayWayland (env-gated / incomplete handles)
+                // SAFETY: wpe_display_wayland_new returns a floating GObject ref.
+                let d = unsafe { wpe_display_wayland_new() };
+                if d.is_null() {
+                    tracing::warn!(
+                        "webkit: wpe_display_wayland_new returned NULL; \
+                         falling back to BuffrDisplay (OSR)"
+                    );
+                    make_osr(egl.raw_display())?
+                } else {
+                    let mut error: *mut GError = std::ptr::null_mut();
+                    let ok = unsafe {
+                        wpe_display_wayland_connect(
+                            d as *mut WPEDisplayWayland,
+                            std::ptr::null(),
+                            &mut error,
+                        )
+                    };
+                    if ok == 0 {
+                        if !error.is_null() {
+                            unsafe { g_error_free(error) };
+                        }
+                        tracing::warn!(
+                            "webkit: wpe_display_wayland_connect failed; \
+                             falling back to BuffrDisplay (OSR)"
+                        );
+                        unsafe { g_object_unref(d as *mut _) };
+                        make_osr(egl.raw_display())?
+                    } else {
+                        unsafe { wpe_display_set_primary(d) };
+                        tracing::info!(
+                            "webkit: stock WPEDisplayWayland connected + set as primary (#144)"
+                        );
+                        WpeDisplayKind::Wayland(d)
+                    }
+                }
+            }
+        } else {
+            make_osr(egl.raw_display())?
         };
 
         // ── buffr-clipboard URI scheme (#128) ─────────────────────────────────

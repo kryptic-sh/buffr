@@ -57,6 +57,32 @@ unsafe extern "C" {
     /// Returns NULL if no view has been created since the last take.
     pub fn buffr_display_take_last_view() -> *mut WPEView;
 
+    // ── BuffrDisplayWayland (#152) ────────────────────────────────────────
+
+    /// Constructor for `BuffrDisplayWayland`.
+    ///
+    /// Takes borrowed Wayland object pointers from the host winit window and
+    /// creates an EGL platform display from the host `wl_display`.
+    /// Returns NULL when `eglInitialize` fails (caller falls back to OSR).
+    pub fn buffr_display_wayland_new(
+        wl_display: *mut c_void,
+        wl_compositor: *mut c_void,
+        wl_subcompositor: *mut c_void,
+        parent_surface: *mut c_void,
+        viewport_w: std::os::raw::c_int,
+        viewport_h: std::os::raw::c_int,
+        scale: std::os::raw::c_double,
+        refresh_hz: std::os::raw::c_int,
+    ) -> *mut WPEDisplay;
+
+    /// Stash getter: pops the most-recently-created `WPEView` from the
+    /// `BuffrDisplayWayland` stash (mirrors `buffr_display_take_last_view`
+    /// but scoped to the Wayland subclass instance).
+    /// Used by #153 (BuffrViewWayland) to recover the view after WebKitWebView
+    /// construction on the BuffrWayland path.
+    #[allow(dead_code)]
+    pub fn buffr_display_wayland_take_last_view(display: *mut WPEDisplay) -> *mut WPEView;
+
     // Tiny GLib helpers we link against directly. The bindgeneration surface
     // already covers g_bytes_*, g_error_free, etc; we only redeclare
     // qdata-related helpers since bindgeneration's allowlist skipped them.
@@ -435,6 +461,29 @@ unsafe extern "C" {
     pub(crate) fn g_object_unref(object: *mut c_void);
 }
 
+// ── BuffrDisplayWaylandHandle ─────────────────────────────────────────────────
+
+/// Owned wrapper around a `BuffrDisplayWayland` GObject (the custom WPEDisplay
+/// subclass that reuses the host Wayland connection). Drops the GObject ref on
+/// drop. Marked `Send` — GObject reference counting is thread-safe; actual
+/// vmethod calls still happen on the GLib worker thread.
+pub(crate) struct BuffrDisplayWaylandHandle {
+    pub raw: *mut WPEDisplay,
+}
+
+unsafe impl Send for BuffrDisplayWaylandHandle {}
+
+impl Drop for BuffrDisplayWaylandHandle {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            // SAFETY: raw is a live GObject from g_object_new.
+            unsafe {
+                g_object_unref(self.raw as *mut c_void);
+            }
+        }
+    }
+}
+
 // ── WpeDisplayKind ────────────────────────────────────────────────────────────
 
 /// Which WPEDisplay variant the runtime is using.
@@ -442,15 +491,22 @@ unsafe extern "C" {
 /// - `Osr(BuffrDisplayHandle)` — our custom BuffrDisplay subclass that feeds the
 ///   OSR pixel-copy path (`buffr_rust_render_buffer`). Used on X11, headless, or
 ///   when `prefer_native` is false.
-/// - `Wayland(*mut WPEDisplay)` — `WPEDisplayWayland` connected to the host
-///   compositor. WebKit renders into a real `wl_surface`; the OSR render callback
-///   is never fired on this path. Used when `prefer_native=true` and
-///   `XDG_SESSION_TYPE=wayland`.
+/// - `Wayland(*mut WPEDisplay)` — stock `WPEDisplayWayland` connected to the
+///   host compositor. Available as env-gated fallback via
+///   `BUFFR_WEBKIT_STOCK_WAYLAND=1`. Used when `prefer_native=true` and
+///   `XDG_SESSION_TYPE=wayland` but Wayland handles are not yet available.
+/// - `BuffrWayland(BuffrDisplayWaylandHandle)` — our custom WPEDisplay subclass
+///   that reuses the host's `wl_display`. Preferred Phase 3 path (#152).
+///   Used when `prefer_native=true`, `XDG_SESSION_TYPE=wayland`, and all four
+///   Wayland handle pointers are non-null.
 pub(crate) enum WpeDisplayKind {
     Osr(BuffrDisplayHandle),
     /// Raw `*mut WPEDisplay` (actually `*mut WPEDisplayWayland`, upcast).
     /// Owned: we hold one GObject ref and release it on drop.
+    /// Kept as env-gated fallback (`BUFFR_WEBKIT_STOCK_WAYLAND=1`).
     Wayland(*mut WPEDisplay),
+    /// Custom BuffrDisplayWayland subclass — preferred Phase 3 path (#152).
+    BuffrWayland(BuffrDisplayWaylandHandle),
 }
 
 unsafe impl Send for WpeDisplayKind {}
@@ -464,12 +520,16 @@ impl WpeDisplayKind {
         match self {
             WpeDisplayKind::Osr(h) => h.raw,
             WpeDisplayKind::Wayland(p) => *p,
+            WpeDisplayKind::BuffrWayland(h) => h.raw,
         }
     }
 
-    /// Returns `true` when this is the `WPEDisplayWayland` path.
+    /// Returns `true` when this is a native Wayland path (stock or custom).
     pub(crate) fn is_native(&self) -> bool {
-        matches!(self, WpeDisplayKind::Wayland(_))
+        matches!(
+            self,
+            WpeDisplayKind::Wayland(_) | WpeDisplayKind::BuffrWayland(_)
+        )
     }
 }
 
@@ -482,6 +542,7 @@ impl Drop for WpeDisplayKind {
             }
         }
         // Osr variant: BuffrDisplayHandle's own Drop handles the unref.
+        // BuffrWayland variant: BuffrDisplayWaylandHandle's Drop handles it.
     }
 }
 

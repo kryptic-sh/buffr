@@ -6,6 +6,11 @@
  * boilerplate registration that bindgen can't faithfully reproduce (the
  * *Class struct layouts are needed for setting vmethod function pointers).
  *
+ * Also defines BuffrDisplayWayland (#152): a WPEDisplay subclass that reuses
+ * the host application's Wayland connection instead of opening its own. This
+ * solves the cross-client wl_subsurface problem that blocked Phase 3 with
+ * stock WPEDisplayWayland.
+ *
  * Per-frame work happens in Rust: `buffr_view_render_buffer` (this file's
  * BuffrView vmethod) forwards each delivered WPEBuffer* to the Rust callback
  * `buffr_rust_render_buffer`, which decodes pixels into the shared OsrFrame.
@@ -15,6 +20,8 @@
  */
 
 #include <wpe/wpe-platform.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 
 /* Forward declaration of the Rust-side render callback. Implemented in
  * src/platform/wpe_subclass.rs with #[no_mangle] pub extern "C". */
@@ -321,3 +328,245 @@ WPEDisplay *buffr_display_new(gpointer egl_display,
  * the display's create_toplevel/create_view vmethods). */
 GType buffr_display_get_view_type(void) { return BUFFR_TYPE_VIEW; }
 GType buffr_display_get_toplevel_type(void) { return BUFFR_TYPE_TOPLEVEL; }
+
+/* ── BuffrDisplayWayland (#152) ─────────────────────────────────────────── */
+/*
+ * WPEDisplay subclass that reuses an existing Wayland connection supplied by
+ * buffr-app instead of opening its own.  This eliminates the cross-client
+ * wl_subsurface problem that blocked Phase 3 with stock WPEDisplayWayland.
+ *
+ * The display borrows all Wayland object pointers — they are owned by winit
+ * for the lifetime of the host process.  EGL is initialised here via
+ * eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, wl_display, NULL).
+ *
+ * create_view stubs out to a BuffrView (the existing OSR view) WITHOUT
+ * attaching a ViewCtx so WebKit gets a valid WPEView object but the OSR
+ * render-buffer ingest path never fires.  #153 will replace this stub with
+ * a proper BuffrViewWayland that composites into a wl_subsurface.
+ */
+
+#define BUFFR_TYPE_DISPLAY_WAYLAND (buffr_display_wayland_get_type())
+G_DECLARE_FINAL_TYPE(BuffrDisplayWayland, buffr_display_wayland, BUFFR, DISPLAY_WAYLAND, WPEDisplay)
+
+struct _BuffrDisplayWayland {
+    WPEDisplay parent_instance;
+
+    /* Wayland objects — borrowed from buffr-app / winit. Valid for the
+     * lifetime of the host process; we never own or free these. */
+    struct wl_display      *wl_display;
+    struct wl_compositor   *wl_compositor;
+    struct wl_subcompositor *wl_subcompositor;
+    struct wl_surface      *parent_surface;
+
+    /* EGL display created here from the host wl_display.  Valid as long as
+     * eglInitialize succeeded; NULL on failure (falls back to OSR in Rust). */
+    EGLDisplay egl_display;
+
+    /* Viewport / screen configuration. */
+    int    viewport_w;
+    int    viewport_h;
+    double scale;
+    int    refresh_hz;
+
+    /* Lazily-created single screen. */
+    BuffrScreen *screen;
+
+    /* Stash for the most-recently-created WPEView so Rust can retrieve it
+     * after webkit_web_view_new (mirrors BuffrDisplay). */
+    GMutex  last_view_mutex;
+    WPEView *last_created_view;
+};
+
+G_DEFINE_FINAL_TYPE(BuffrDisplayWayland, buffr_display_wayland, WPE_TYPE_DISPLAY)
+
+/* ── Stash accessor ─────────────────────────────────────────────────────── */
+
+WPEView *buffr_display_wayland_take_last_view(BuffrDisplayWayland *self) {
+    g_mutex_lock(&self->last_view_mutex);
+    WPEView *v = self->last_created_view;
+    self->last_created_view = NULL;
+    g_mutex_unlock(&self->last_view_mutex);
+    return v;
+}
+
+/* ── vmethods ───────────────────────────────────────────────────────────── */
+
+static gboolean buffr_display_wayland_connect_vfunc(WPEDisplay *display, GError **error) {
+    /* We don't own the wl_display — it is already connected by the host.
+     * Nothing to do; always succeed. */
+    (void)display;
+    (void)error;
+    return TRUE;
+}
+
+static gpointer buffr_display_wayland_get_egl_display_vfunc(WPEDisplay *display, GError **error) {
+    (void)error;
+    BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(display);
+    return self->egl_display;
+}
+
+static WPEView *buffr_display_wayland_create_view_vfunc(WPEDisplay *display) {
+    /* Stub for #153: create a BuffrView (the existing OSR view GObject) so
+     * WebKit gets a valid WPEView and construction succeeds.  We do NOT attach
+     * a ViewCtx here — the OSR render-buffer ingest path will never fire for
+     * this path.  #153 replaces this with BuffrViewWayland proper. */
+    g_debug("buffr_display_wayland: create_view (stub — #153 pending)");
+    WPEView *v = WPE_VIEW(g_object_new(BUFFR_TYPE_VIEW, "display", display, NULL));
+
+    BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(display);
+    g_mutex_lock(&self->last_view_mutex);
+    self->last_created_view = v;
+    g_mutex_unlock(&self->last_view_mutex);
+
+    return v;
+}
+
+static WPEToplevel *buffr_display_wayland_create_toplevel_vfunc(WPEDisplay *display, guint max_views) {
+    BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(display);
+    WPEToplevel *tl = WPE_TOPLEVEL(g_object_new(BUFFR_TYPE_TOPLEVEL,
+                                                 "display", display,
+                                                 "max-views", max_views,
+                                                 NULL));
+    if (self->viewport_w > 0 && self->viewport_h > 0)
+        wpe_toplevel_resize(tl, self->viewport_w, self->viewport_h);
+    return tl;
+}
+
+static guint buffr_display_wayland_get_n_screens_vfunc(WPEDisplay *display) {
+    (void)display;
+    return 1;
+}
+
+static WPEScreen *buffr_display_wayland_get_screen_vfunc(WPEDisplay *display, guint index) {
+    if (index != 0)
+        return NULL;
+    BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(display);
+    if (!self->screen) {
+        /* Mirror the screen setup from BuffrDisplay: non-zero id to avoid the
+         * WTFCrash in WebKit's ScreenManager (id=0 is the HashMap empty
+         * sentinel), and non-zero physical size so the DPI math doesn't hit
+         * +inf / WTFCrash in ScreenManager::collectScreenProperties. */
+        self->screen = g_object_new(BUFFR_TYPE_SCREEN, "id", (guint32)1, NULL);
+        wpe_screen_set_size(WPE_SCREEN(self->screen), self->viewport_w, self->viewport_h);
+        wpe_screen_set_scale(WPE_SCREEN(self->screen), self->scale);
+        wpe_screen_set_refresh_rate(WPE_SCREEN(self->screen), self->refresh_hz * 1000);
+        int phys_w_mm = (int)(self->viewport_w * 25.4 / 96.0);
+        int phys_h_mm = (int)(self->viewport_h * 25.4 / 96.0);
+        if (phys_w_mm <= 0) phys_w_mm = 300;
+        if (phys_h_mm <= 0) phys_h_mm = 200;
+        wpe_screen_set_physical_size(WPE_SCREEN(self->screen), phys_w_mm, phys_h_mm);
+    }
+    return WPE_SCREEN(self->screen);
+}
+
+/* ── GObject lifecycle ──────────────────────────────────────────────────── */
+
+static void buffr_display_wayland_init(BuffrDisplayWayland *self) {
+    self->wl_display        = NULL;
+    self->wl_compositor     = NULL;
+    self->wl_subcompositor  = NULL;
+    self->parent_surface    = NULL;
+    self->egl_display       = EGL_NO_DISPLAY;
+    self->viewport_w        = 1280;
+    self->viewport_h        = 720;
+    self->scale             = 1.0;
+    self->refresh_hz        = 60;
+    self->screen            = NULL;
+    self->last_created_view = NULL;
+    g_mutex_init(&self->last_view_mutex);
+}
+
+static void buffr_display_wayland_dispose(GObject *object) {
+    BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(object);
+    g_clear_object(&self->screen);
+    g_mutex_clear(&self->last_view_mutex);
+    /* Note: we do NOT call eglTerminate here — the EGLDisplay belongs to the
+     * host wl_display connection that outlives us. */
+    G_OBJECT_CLASS(buffr_display_wayland_parent_class)->dispose(object);
+}
+
+static void buffr_display_wayland_class_init(BuffrDisplayWaylandClass *klass) {
+    GObjectClass *object_class = G_OBJECT_CLASS(klass);
+    object_class->dispose = buffr_display_wayland_dispose;
+
+    WPEDisplayClass *display_class = WPE_DISPLAY_CLASS(klass);
+    display_class->connect          = buffr_display_wayland_connect_vfunc;
+    display_class->create_view      = buffr_display_wayland_create_view_vfunc;
+    display_class->create_toplevel  = buffr_display_wayland_create_toplevel_vfunc;
+    display_class->get_egl_display  = buffr_display_wayland_get_egl_display_vfunc;
+    display_class->get_n_screens    = buffr_display_wayland_get_n_screens_vfunc;
+    display_class->get_screen       = buffr_display_wayland_get_screen_vfunc;
+    /* get_keymap: NULL → WebKit synthesises a keymap on demand. */
+    /* get_drm_device: NULL → WebKit picks /dev/dri/renderD128 by default. */
+}
+
+/* ── Public constructor ─────────────────────────────────────────────────── */
+
+/*
+ * buffr_display_wayland_new — construct a BuffrDisplayWayland.
+ *
+ * Takes borrowed Wayland object pointers from the host winit window and
+ * creates an EGL platform display from the host wl_display.  Returns NULL
+ * when eglInitialize fails so the Rust caller can fall back to OSR.
+ *
+ * All pointer arguments are borrowed; the caller (winit / buffr-app) owns
+ * them for the lifetime of the host process.
+ */
+WPEDisplay *buffr_display_wayland_new(
+    void *wl_display_ptr,
+    void *wl_compositor_ptr,
+    void *wl_subcompositor_ptr,
+    void *parent_surface_ptr,
+    int viewport_w,
+    int viewport_h,
+    double scale,
+    int refresh_hz)
+{
+    if (!wl_display_ptr) {
+        g_warning("buffr_display_wayland_new: wl_display is NULL — refusing to construct");
+        return NULL;
+    }
+
+    /* Initialise EGL using the host wl_display.  We use
+     * eglGetPlatformDisplay (EGL 1.5 / EGL_EXT_platform_base) so Mesa
+     * picks the Wayland platform rather than guessing from the pointer type.
+     * If the implementation only supports eglGetDisplay, fall back to that. */
+    EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (eglGetPlatformDisplayEXT) {
+        egl_dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_KHR,
+                                           wl_display_ptr, NULL);
+    }
+    if (egl_dpy == EGL_NO_DISPLAY) {
+        /* Fallback: standard eglGetDisplay with the wl_display pointer cast
+         * to EGLNativeDisplayType.  Works on most Mesa Wayland drivers. */
+        egl_dpy = eglGetDisplay((EGLNativeDisplayType)wl_display_ptr);
+    }
+    if (egl_dpy == EGL_NO_DISPLAY) {
+        g_warning("buffr_display_wayland_new: eglGetDisplay returned EGL_NO_DISPLAY");
+        return NULL;
+    }
+
+    EGLint major = 0, minor = 0;
+    if (!eglInitialize(egl_dpy, &major, &minor)) {
+        g_warning("buffr_display_wayland_new: eglInitialize failed (error 0x%x)",
+                  (unsigned)eglGetError());
+        return NULL;
+    }
+    g_debug("buffr_display_wayland: EGL %d.%d initialised on wl_display=%p",
+            major, minor, wl_display_ptr);
+
+    BuffrDisplayWayland *self = g_object_new(BUFFR_TYPE_DISPLAY_WAYLAND, NULL);
+    self->wl_display        = (struct wl_display *)wl_display_ptr;
+    self->wl_compositor     = (struct wl_compositor *)wl_compositor_ptr;
+    self->wl_subcompositor  = (struct wl_subcompositor *)wl_subcompositor_ptr;
+    self->parent_surface    = (struct wl_surface *)parent_surface_ptr;
+    self->egl_display       = egl_dpy;
+    self->viewport_w        = viewport_w > 0  ? viewport_w  : 1280;
+    self->viewport_h        = viewport_h > 0  ? viewport_h  : 720;
+    self->scale             = scale > 0.0     ? scale        : 1.0;
+    self->refresh_hz        = refresh_hz > 0  ? refresh_hz   : 60;
+
+    return WPE_DISPLAY(self);
+}

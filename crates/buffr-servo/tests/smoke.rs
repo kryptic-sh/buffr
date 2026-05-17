@@ -32,6 +32,7 @@ fn dummy_options() -> BackendOpenOptions<'static> {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     }
 }
 

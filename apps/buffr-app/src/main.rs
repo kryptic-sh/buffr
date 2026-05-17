@@ -7385,6 +7385,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             show_favicons: self.show_favicons,
                         }),
                         prefer_native: false,
+                        wayland_handles: None,
                     };
                     match self.backend.open_engine(options) {
                         Ok(host_dyn) => {
@@ -7554,6 +7555,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         find_sink: None,
                         sinks: Box::new(()),
                         prefer_native: false,
+                        wayland_handles: None,
                     };
                     match buffr_blitz::BlitzEngine::new(&options) {
                         Ok(engine) => {
@@ -7605,6 +7607,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         find_sink: None,
                         sinks: Box::new(()),
                         prefer_native: false,
+                        wayland_handles: None,
                     };
                     match buffr_ladybird::LadybirdEngine::new(&options) {
                         Ok(engine) => {
@@ -7662,6 +7665,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             as Arc<dyn std::any::Any + Send + Sync>),
                         sinks: Box::new(()),
                         prefer_native: false,
+                        wayland_handles: None,
                     };
                     match buffr_webkitgtk::WebKitGtkEngine::new(&options) {
                         Ok(engine) => {
@@ -7720,6 +7724,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         // Opt in to WPEDisplayWayland on Wayland sessions (#144).
                         // The engine still reads XDG_SESSION_TYPE as the final gate.
                         prefer_native: true,
+                        // Thread raw Wayland handles directly into construction so
+                        // BuffrDisplayWayland (#152) can consume them before the
+                        // GLib worker thread's first WpeRuntime::new call.
+                        // None on non-Wayland sessions (field is Some only when
+                        // XDG_SESSION_TYPE=wayland and winit extracted handles).
+                        wayland_handles: self.wayland_native_handles,
                     };
                     // Hand the app-wide loopback server to the engine at
                     // construction so the worker's very first open_tab
@@ -7747,15 +7757,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             // Wire the edit-mode event sink so buffrEdit UCM
                             // messages from edit.js reach drain_edit_events (#134).
                             engine.set_edit_sink(self.edit_sink.clone());
-                            // Pass native Wayland handles so #152
-                            // (BuffrDisplayWayland) can read wl_display,
-                            // wl_surface, wl_compositor, and wl_subcompositor
-                            // without going back through the winit window.
-                            // No-op on non-Wayland sessions (field is None).
-                            #[cfg(target_os = "linux")]
-                            if let Some(handles) = self.wayland_native_handles {
-                                engine.set_native_wayland_handles(handles);
-                            }
                             // Log native-compositing capability so #144+ work can
                             // verify the gate fires on the right sessions.
                             // Phase 3 of #109 — real subsurface attach lands later.
@@ -7813,6 +7814,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             as Arc<dyn std::any::Any + Send + Sync>),
                         sinks: Box::new(()),
                         prefer_native: false,
+                        wayland_handles: None,
                     };
                     match buffr_webkit_cocoa::WebKitCocoaEngine::new(&options) {
                         Ok(engine) => {
@@ -7869,6 +7871,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         find_sink: Some(self.find_sink.clone()),
                         sinks: Box::new(()),
                         prefer_native: false,
+                        wayland_handles: None,
                     };
                     match buffr_webview2::WebView2Engine::new(&options) {
                         Ok(engine) => {

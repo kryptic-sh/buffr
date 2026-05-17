@@ -64,6 +64,7 @@ fn open_engine_returns_macos_only_error() {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     let result = backend.open_engine(opts);
     assert!(result.is_err(), "expected Err on non-macOS, got Ok");
@@ -99,6 +100,7 @@ fn zoom_stub_compiles_on_non_macos() {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     let result = backend.open_engine(opts);
     // Stub must return Err — zoom methods are unreachable but must compile.
@@ -150,6 +152,7 @@ fn open_engine_constructs_on_macos() {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     let engine = backend
         .open_engine(opts)
@@ -198,6 +201,7 @@ fn ime_set_composition_no_panic() {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     let engine: Arc<dyn BrowserEngine> = WebKitCocoaBackend::new()
         .open_engine(opts)
@@ -231,6 +235,7 @@ fn ime_commit_no_panic() {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     let engine: Arc<dyn BrowserEngine> = WebKitCocoaBackend::new()
         .open_engine(opts)
@@ -264,6 +269,7 @@ fn ime_cancel_no_panic() {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     let engine: Arc<dyn BrowserEngine> = WebKitCocoaBackend::new()
         .open_engine(opts)

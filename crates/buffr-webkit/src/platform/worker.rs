@@ -330,6 +330,7 @@ pub(crate) fn spawn(
     can_go_back: Arc<AtomicBool>,
     can_go_forward: Arc<AtomicBool>,
     prefer_native: bool,
+    wayland_handles: Option<buffr_engine::WaylandNativeHandles>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -464,6 +465,7 @@ pub(crate) fn spawn(
                 video_active_worker,
                 edit_sink_worker,
                 prefer_native,
+                wayland_handles,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {

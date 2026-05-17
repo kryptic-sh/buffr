@@ -120,6 +120,13 @@ fn build_linux() {
     // GObject subclasses using upstream's G_DEFINE_FINAL_TYPE machinery. We
     // do this in C because bindgen emits the *Class structs as opaque
     // (`_address: u8`) and rolling the layouts by hand in Rust is brittle.
+    // ── EGL (for BuffrDisplayWayland — eglGetPlatformDisplay, eglInitialize) ───
+    //
+    // BuffrDisplayWayland (#152) calls eglGetPlatformDisplay / eglGetDisplay /
+    // eglInitialize in buffr_display_wayland_new. We link directly against
+    // libEGL here so the C file resolves those symbols at link time.
+    println!("cargo:rustc-link-lib=EGL");
+
     let mut build = cc::Build::new();
     build
         .file("csrc/wpe_subclasses.c")

@@ -34,6 +34,7 @@ fn open_engine(url: &str) -> Arc<dyn BrowserEngine> {
         find_sink: None,
         sinks: Box::new(()),
         prefer_native: false,
+        wayland_handles: None,
     };
     backend.open_engine(opts).expect("open_engine failed")
 }
