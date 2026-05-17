@@ -354,6 +354,7 @@ pub(crate) fn spawn(
     can_go_forward: Arc<AtomicBool>,
     prefer_native: bool,
     wayland_handles: Option<buffr_engine::WaylandNativeHandles>,
+    using_native: Arc<AtomicBool>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -496,6 +497,10 @@ pub(crate) fn spawn(
                     return;
                 }
             };
+            // Publish the actual chosen display backend (native vs OSR) so
+            // the apps layer can gate things like the loading-animation
+            // overlay on the live pipeline rather than the capability.
+            using_native.store(runtime.display_is_native(), Ordering::Relaxed);
             let runtime_rc = Rc::new(RefCell::new(runtime));
 
             // ── Persistent cookie store ───────────────────────────────────

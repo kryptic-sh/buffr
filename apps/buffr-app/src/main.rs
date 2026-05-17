@@ -4076,9 +4076,15 @@ impl AppState {
         // transparent (alpha = 0) so the subsurface shows through. The loading
         // animation would never be visible there anyway, so suppress it to
         // prevent painting opaque pixels into the transparent browser region.
-        let host_supports_native = self
+        //
+        // Critical: gate on `is_using_native_compositing` (current path),
+        // not `supports_native` (capability).  Engines that COULD composite
+        // natively but aren't (env opt-out, init fallback, wrong session
+        // type at runtime) need the OSR-side animation path; reading the
+        // capability gates the animation off forever on those engines.
+        let host_is_using_native_compositing = self
             .active_engine_dyn()
-            .map(|e| e.supports_native())
+            .map(|e| e.is_using_native_compositing())
             .unwrap_or(false);
 
         let Some(renderer) = self.renderer.as_mut() else {
@@ -4129,7 +4135,7 @@ impl AppState {
         let want_anim = (should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
             || self.surface_drifted
             || host_is_loading)
-            && !host_supports_native;
+            && !host_is_using_native_compositing;
 
         // Idle short-circuit. If nothing has changed since the last paint —
         // chrome buffer up to date, no fresh CEF paint queued, no animation

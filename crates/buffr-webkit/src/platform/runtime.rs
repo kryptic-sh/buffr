@@ -3619,6 +3619,14 @@ impl WpeRuntime {
         self.active_idx.and_then(|i| self.tabs.get(i))
     }
 
+    /// Whether the runtime's chosen display backend is a native
+    /// compositing surface (`BuffrDisplayWayland` or stock
+    /// `WPEDisplayWayland`) rather than the OSR readback path.
+    /// Published to the apps layer via `BrowserEngine::is_using_native_compositing`.
+    pub(crate) fn display_is_native(&self) -> bool {
+        self.display.is_native()
+    }
+
     /// Open a new tab navigated to `url`.
     ///
     /// When `background` is true the current active tab is NOT deactivated,

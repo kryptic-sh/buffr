@@ -136,6 +136,14 @@ pub struct WebKitEngine {
     /// `BuffrDisplayWayland` C subclass (#152) to read; nothing consumes
     /// these pointers yet.
     wayland_handles: Mutex<Option<buffr_engine::WaylandNativeHandles>>,
+    /// True when the runtime selected a native compositing display
+    /// backend (`BuffrDisplayWayland` or stock `WPEDisplayWayland`) at
+    /// construction; false when it fell back to OSR.  Read by the apps
+    /// layer via `BrowserEngine::is_using_native_compositing` to gate
+    /// behaviour that differs between the two pixel pipelines (loading
+    /// animation overlay, chrome transparency, etc.).  Set once during
+    /// `new_with_server` and never mutated thereafter.
+    using_native: Arc<AtomicBool>,
 }
 
 impl WebKitEngine {
@@ -252,6 +260,7 @@ impl WebKitEngine {
             .and_then(|any| any.downcast_ref::<Arc<Downloads>>())
             .cloned();
 
+        let using_native = Arc::new(AtomicBool::new(false));
         let worker = spawn(
             initial_url,
             width,
@@ -266,6 +275,7 @@ impl WebKitEngine {
             Arc::clone(&can_go_forward),
             options.prefer_native,
             options.wayland_handles,
+            Arc::clone(&using_native),
         )?;
 
         // Share the popup_queue that the worker already created and wired to
@@ -348,6 +358,7 @@ impl WebKitEngine {
             video_active,
             edit_sink,
             wayland_handles: Mutex::new(None),
+            using_native,
         })
     }
 
@@ -1504,6 +1515,14 @@ impl BrowserEngine for WebKitEngine {
         std::env::var("XDG_SESSION_TYPE")
             .map(|v| v.eq_ignore_ascii_case("wayland"))
             .unwrap_or(false)
+    }
+
+    fn is_using_native_compositing(&self) -> bool {
+        // Published by the GLib worker after WpeRuntime::new chose its
+        // display backend.  True only when BuffrDisplayWayland (#152) or
+        // stock WPEDisplayWayland was actually constructed; false when
+        // the runtime fell back to the OSR readback path.
+        self.using_native.load(Ordering::Relaxed)
     }
 
     fn set_native_parent(
