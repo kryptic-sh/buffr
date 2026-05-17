@@ -7281,64 +7281,74 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // On X11 / macOS / Windows the match falls through to None and no
         // Wayland-specific code runs.
         //
-        // After extracting the display pointer we do a synchronous registry
-        // roundtrip to bind wl_compositor and wl_subcompositor — they are
-        // needed by the BuffrDisplayWayland subsurface subclass (#152).  The
-        // roundtrip is safe here because winit has not yet run the main loop
-        // (we are in the `resumed` callback before the first event iteration)
-        // and we use winit's *existing* wl_display, so we don't open a second
-        // Wayland socket.
+        // Phase 3 native compositing (#144 / #152 / #153) is gated behind
+        // BUFFR_WEBKIT_NATIVE=1.  When the opt-in is OFF we skip the
+        // Wayland registry roundtrip entirely — running our own
+        // wl_registry listener on winit's shared wl_display drains events
+        // winit's calloop is waiting for and starves the event loop so
+        // paint_chrome / new_events / user_event never fire, which
+        // looks identical to a UI hang.  The libwayland-client warning
+        // "interface 'wl_registry' has no event 0" is the visible
+        // symptom: events received on our listener that the listener
+        // table doesn't know how to dispatch.
+        //
+        // Only do the roundtrip when the native path is actually
+        // requested — that's where we need wl_compositor and
+        // wl_subcompositor for the BuffrDisplayWayland subclass (#152).
         #[cfg(target_os = "linux")]
         {
-            use raw_window_handle::{
-                HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-            };
-            let dh = window.display_handle().ok().map(|h| h.as_raw());
-            let wh = window.window_handle().ok().map(|h| h.as_raw());
-            match (dh, wh) {
-                (Some(RawDisplayHandle::Wayland(d)), Some(RawWindowHandle::Wayland(w))) => {
-                    let wl_display = d.display.as_ptr() as *mut std::ffi::c_void;
-                    let parent_wl_surface = w.surface.as_ptr() as *mut std::ffi::c_void;
-                    // Bind compositor + subcompositor via registry roundtrip.
-                    // SAFETY: wl_display is winit's live display pointer, valid for
-                    // the process lifetime.  Roundtrip fires synchronously before
-                    // the GLib worker is started, so there is no concurrent Wayland
-                    // access from our side.
-                    let (wl_compositor, wl_subcompositor) =
-                        unsafe { wayland_globals::bind_compositor_globals(wl_display) };
-                    if wl_compositor.is_null() {
-                        tracing::warn!(
-                            "wayland_globals: wl_compositor not found in registry; \
-                             #152 subsurface path will be degraded"
+            let native_opt_in = std::env::var_os("BUFFR_WEBKIT_NATIVE").is_some_and(|v| v == "1");
+            if native_opt_in {
+                use raw_window_handle::{
+                    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+                };
+                let dh = window.display_handle().ok().map(|h| h.as_raw());
+                let wh = window.window_handle().ok().map(|h| h.as_raw());
+                match (dh, wh) {
+                    (Some(RawDisplayHandle::Wayland(d)), Some(RawWindowHandle::Wayland(w))) => {
+                        let wl_display = d.display.as_ptr() as *mut std::ffi::c_void;
+                        let parent_wl_surface = w.surface.as_ptr() as *mut std::ffi::c_void;
+                        // Bind compositor + subcompositor via registry roundtrip.
+                        // SAFETY: wl_display is winit's live display pointer, valid for
+                        // the process lifetime.  Roundtrip fires synchronously before
+                        // the GLib worker is started, so there is no concurrent Wayland
+                        // access from our side.
+                        let (wl_compositor, wl_subcompositor) =
+                            unsafe { wayland_globals::bind_compositor_globals(wl_display) };
+                        if wl_compositor.is_null() {
+                            tracing::warn!(
+                                "wayland_globals: wl_compositor not found in registry; \
+                                 #152 subsurface path will be degraded"
+                            );
+                        }
+                        if wl_subcompositor.is_null() {
+                            tracing::warn!(
+                                "wayland_globals: wl_subcompositor not found in registry; \
+                                 #152 subsurface path will be degraded"
+                            );
+                        }
+                        let handles = buffr_engine::WaylandNativeHandles {
+                            wl_display,
+                            parent_wl_surface,
+                            wl_compositor,
+                            wl_subcompositor,
+                            // EGL display deferred to #152 — the BuffrDisplayWayland
+                            // C subclass initialises its own EGL platform display
+                            // using the wl_display pointer above.
+                            egl_display: std::ptr::null_mut(),
+                        };
+                        tracing::debug!(
+                            wl_display = ?wl_display,
+                            parent_wl_surface = ?parent_wl_surface,
+                            wl_compositor_null = wl_compositor.is_null(),
+                            wl_subcompositor_null = wl_subcompositor.is_null(),
+                            "wayland native handles extracted (#151)"
                         );
+                        self.wayland_native_handles = Some(handles);
                     }
-                    if wl_subcompositor.is_null() {
-                        tracing::warn!(
-                            "wayland_globals: wl_subcompositor not found in registry; \
-                             #152 subsurface path will be degraded"
-                        );
+                    _ => {
+                        // Non-Wayland session (X11, headless).  No native handles.
                     }
-                    let handles = buffr_engine::WaylandNativeHandles {
-                        wl_display,
-                        parent_wl_surface,
-                        wl_compositor,
-                        wl_subcompositor,
-                        // EGL display deferred to #152 — the BuffrDisplayWayland
-                        // C subclass initialises its own EGL platform display
-                        // using the wl_display pointer above.
-                        egl_display: std::ptr::null_mut(),
-                    };
-                    tracing::debug!(
-                        wl_display = ?wl_display,
-                        parent_wl_surface = ?parent_wl_surface,
-                        wl_compositor_null = wl_compositor.is_null(),
-                        wl_subcompositor_null = wl_subcompositor.is_null(),
-                        "wayland native handles extracted (#151)"
-                    );
-                    self.wayland_native_handles = Some(handles);
-                }
-                _ => {
-                    // Non-Wayland session (X11, headless).  No native handles.
                 }
             }
         }
