@@ -1071,6 +1071,13 @@ impl WpeRuntime {
         } else {
             WPEEventType_WPE_EVENT_POINTER_UP
         };
+        // WPE asserts `!pressCount || type == WPE_EVENT_POINTER_DOWN`:
+        //   - POINTER_DOWN: press_count > 0 (1 for single click; 2 for double).
+        //   - POINTER_UP:   press_count must be 0.
+        // Passing 1 on UP raised a CRITICAL assertion in the GTK log.
+        // Single-click is fine; double-click detection is the chrome layer's
+        // job and we'd need to track a per-button timer here for true counts.
+        let press_count = if pressed { 1 } else { 0 };
         self.dispatch_event(|view, time| unsafe {
             wpe_event_pointer_button_new(
                 event_type,
@@ -1081,9 +1088,7 @@ impl WpeRuntime {
                 button,
                 x as f64,
                 y as f64,
-                // Always reporting `1` (single press) is OK for now;
-                // double-click detection is the chrome layer's job.
-                1,
+                press_count,
             )
         });
     }
