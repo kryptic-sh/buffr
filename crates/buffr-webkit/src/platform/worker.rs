@@ -152,6 +152,13 @@ pub(crate) enum Command {
     Zoom {
         delta: f64,
     },
+    /// Reorder tabs: move the tab at `from` to the position `to` in the
+    /// strip. Both indices are pre-move positions; `to` is adjusted for
+    /// the removal shift when `to > from`.
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
     Shutdown,
 }
 
@@ -412,6 +419,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::Zoom { delta } => {
             rt.set_zoom(delta);
+        }
+        Command::MoveTab { from, to } => {
+            rt.move_tab(from, to);
         }
         Command::Shutdown => {
             ml.quit();

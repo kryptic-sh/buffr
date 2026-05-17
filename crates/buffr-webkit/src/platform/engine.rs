@@ -386,7 +386,9 @@ impl BrowserEngine for WebKitEngine {
         }
     }
 
-    fn move_tab(&self, _from: usize, _to: usize) {}
+    fn move_tab(&self, from: usize, to: usize) {
+        self.send(Command::MoveTab { from, to });
+    }
 
     fn duplicate_active(&self) -> Result<TabId, EngineError> {
         let url = self.active_tab_live_url();

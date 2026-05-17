@@ -1150,4 +1150,44 @@ impl WpeRuntime {
         }
         tracing::debug!(new_level, delta, "webkit: zoom updated");
     }
+
+    /// Reorder tabs: move the entry at `from` to position `to`.
+    ///
+    /// Both indices are pre-move positions. When `to > from` the destination
+    /// is decremented by 1 to account for the removal shift before inserting.
+    /// The same mutation is applied to `engine_state.tabs` and `active_idx`
+    /// is recomputed by locating the previously-active `TabId` in the new
+    /// order.
+    pub(crate) fn move_tab(&mut self, from: usize, to: usize) {
+        let len = self.tabs.len();
+        if from >= len || to >= len {
+            tracing::debug!(from, to, len, "webkit: move_tab: index out of bounds");
+            return;
+        }
+        if from == to {
+            return;
+        }
+        // Remember which tab is active so we can re-locate it after the move.
+        let active_id = self.active_idx.and_then(|i| self.tabs.get(i)).map(|t| t.id);
+
+        // Remove-then-insert in the worker's tab vec.
+        let entry = self.tabs.remove(from);
+        let insert_at = if to > from { to - 1 } else { to };
+        self.tabs.insert(insert_at, entry);
+
+        // Fix active_idx by finding the active tab's id in the new order.
+        self.active_idx = active_id.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+
+        // Mirror the same reorder into engine_state.tabs and active_idx.
+        if let Ok(mut st) = self.engine_state.lock() {
+            if from < st.tabs.len() && to < st.tabs.len() {
+                let info = st.tabs.remove(from);
+                let insert_at_es = if to > from { to - 1 } else { to };
+                st.tabs.insert(insert_at_es, info);
+            }
+            st.active_idx = self.active_idx;
+        }
+
+        tracing::info!(from, to, insert_at, "webkit: move_tab");
+    }
 }
