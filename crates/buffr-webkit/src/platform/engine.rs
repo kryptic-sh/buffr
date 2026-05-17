@@ -1407,6 +1407,27 @@ impl BrowserEngine for WebKitEngine {
             }),
             A::EnterHintMode => self.enter_hint_mode(false),
             A::EnterHintModeBackground => self.enter_hint_mode(true),
+            A::FocusFirstInput => {
+                // edit.js's focusin handler blurs any focus that arrives
+                // without a user-gesture flag set, so flip the flag
+                // before injecting the focus script — otherwise the
+                // page would self-cancel the focus we just requested.
+                self.send(Command::EvalJs {
+                    script: "window.__buffrUserGesture = true;".into(),
+                });
+                self.send(Command::EvalJs {
+                    script: buffr_core::scripts::FOCUS_FIRST_INPUT.into(),
+                });
+            }
+            A::ExitInsertMode => {
+                // Blur whatever the page has focused.  The DOM blur
+                // propagates to edit.js, which posts an `edit:blur`
+                // console event that drain_edit_focus_events consumes
+                // on the apps layer.
+                self.send(Command::EvalJs {
+                    script: buffr_core::scripts::EXIT_INSERT.into(),
+                });
+            }
             _ => tracing::debug!(?action, "webkit: dispatch: no mapping yet"),
         }
     }
@@ -1895,6 +1916,34 @@ mod tests {
         assert_eq!(
             got,
             "/home/u/.local/share/buffr/engines/webkit/cookies.sqlite"
+        );
+    }
+
+    // ── Dispatch mapping presence — regression guard ─────────────────────────
+
+    #[test]
+    fn focus_scripts_compile_into_dispatch_catalogue() {
+        // Regression: pressing `i` (FocusFirstInput) logged
+        // "webkit: dispatch: no mapping yet" because the engine's
+        // dispatch match didn't carry an arm for FocusFirstInput nor
+        // for ExitInsertMode.  The fix calls into the shared
+        // buffr_core::scripts constants, which are include_str!()
+        // assets — a missing or empty asset would silently land an
+        // empty JS string in the worker queue.
+        //
+        // This test pins both invariants at compile + load time:
+        //   1. The constants exist (referencing them compiles).
+        //   2. Each constant has non-trivial content (covers an
+        //      include_str!() that pointed at the wrong file).
+        let focus = buffr_core::scripts::FOCUS_FIRST_INPUT;
+        let exit = buffr_core::scripts::EXIT_INSERT;
+        assert!(
+            !focus.trim().is_empty(),
+            "FOCUS_FIRST_INPUT must carry a real JS body"
+        );
+        assert!(
+            !exit.trim().is_empty(),
+            "EXIT_INSERT must carry a real JS body"
         );
     }
 
