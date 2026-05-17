@@ -6,6 +6,16 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-05-18
+
+### Added
+
+- `BackendOpenOptions.wayland_handles: Option<WaylandNativeHandles>` — threads
+  raw Wayland handles from `buffr-app` directly into engine construction so the
+  `BuffrDisplayWayland` C subclass (#152) can consume them before the GLib
+  worker thread's first `WpeRuntime::new` call. Eliminates the post-construction
+  `set_native_wayland_handles` setter race.
+
 ## [0.1.6] - 2026-05-17
 
 ### Added
@@ -62,7 +72,8 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 _Initial release._
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.7
 [0.1.6]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.6
 [0.1.5]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.5
 [0.1.4]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.4

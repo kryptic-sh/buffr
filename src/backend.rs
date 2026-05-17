@@ -100,6 +100,18 @@ pub struct BackendOpenOptions<'a> {
     /// after this but is not yet parented — subsurface attach is #145.
     #[doc(alias = "native_compositing")]
     pub prefer_native: bool,
+    /// Raw Wayland + EGL handles from the host winit window (#152).
+    ///
+    /// When `Some`, `buffr-webkit` constructs `BuffrDisplayWayland` (the custom
+    /// WPEDisplay subclass that reuses the host's `wl_display` connection) instead
+    /// of stock `WPEDisplayWayland`. `None` on non-Wayland sessions (X11, macOS,
+    /// Windows, headless) or when the host has not yet extracted handles from
+    /// the winit window.
+    ///
+    /// Populated by `buffr-app` on Wayland sessions just before
+    /// `BackendOpenOptions` is constructed so the handles are available to the
+    /// GLib worker thread from the first moment `WpeRuntime::new` runs.
+    pub wayland_handles: Option<crate::WaylandNativeHandles>,
 }
 
 /// Process-model lifecycle hooks. One impl per backend crate.
