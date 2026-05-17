@@ -747,6 +747,26 @@ impl BrowserEngine for WebKitEngine {
         self.send(Command::StopFind);
     }
 
+    /// Run JavaScript in the active tab's main frame.
+    ///
+    /// `_url` is the DevTools source attribution — useful for stack traces
+    /// but not load-bearing. We discard it; WebKit's `evaluate_javascript`
+    /// accepts a source URI param but our current `Command::EvalJs` doesn't
+    /// carry it, and the consumers (splash anim tick, edit IPC) work fine
+    /// without it. Upgrade to carry the URI if a future caller needs proper
+    /// source attribution in the inspector.
+    ///
+    /// Fire-and-forget: dispatched to the GLib worker via the same path as
+    /// vim-style scroll JS, so a failed eval is logged but not surfaced.
+    /// Returns Ok unconditionally — the only failure mode would be a NUL
+    /// byte in the script, which the worker logs but doesn't propagate.
+    fn run_main_frame_js(&self, code: &str, _url: &str) -> Result<(), EngineError> {
+        self.send(Command::EvalJs {
+            script: code.to_owned(),
+        });
+        Ok(())
+    }
+
     fn active_zoom_level(&self) -> f64 {
         self.zoom_level.lock().map(|g| *g).unwrap_or(1.0)
     }
