@@ -23,6 +23,7 @@ use std::thread;
 use std::time::Duration;
 
 use buffr_core::cursor::{CursorState, SharedCursorState};
+use buffr_core::edit::EditEventSink;
 use buffr_core::favicon::{FaviconSink, new_favicon_sink};
 use buffr_core::hint::{HintEventSink, new_hint_event_sink};
 use buffr_downloads::Downloads;
@@ -270,6 +271,10 @@ pub(crate) struct WorkerHandle {
     /// UCM signal handlers on the GLib worker thread; read by
     /// `WebKitEngine::any_video_active` on any thread.
     pub video_active: Arc<AtomicBool>,
+    /// Edit-mode event sink (#134). Shared with `WebKitEngine::edit_sink`;
+    /// per-tab `buffrEdit` UCM signal handlers push decoded `EditConsoleEvent`s
+    /// into the inner `Option<EditEventSink>` when populated.
+    pub edit_sink: Arc<Mutex<Option<EditEventSink>>>,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -377,6 +382,12 @@ pub(crate) fn spawn(
     // handlers (writers via `MediaProbeSignalCtx`) share the same Arc.
     let video_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
+    // Edit-mode event sink (#134). Allocated here as an empty Option; the
+    // apps layer calls `WebKitEngine::set_edit_sink` post-construction which
+    // populates the inner Option. Per-tab `buffrEdit` UCM handlers hold a
+    // clone of this Arc and push decoded events when the inner sink is Some.
+    let edit_sink: Arc<Mutex<Option<EditEventSink>>> = Arc::new(Mutex::new(None));
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
@@ -391,6 +402,7 @@ pub(crate) fn spawn(
     let audio_event_queue_worker = Arc::clone(&audio_event_queue);
     let cursor_state_worker = Arc::clone(&cursor_state);
     let video_active_worker = Arc::clone(&video_active);
+    let edit_sink_worker = Arc::clone(&edit_sink);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -449,6 +461,7 @@ pub(crate) fn spawn(
                 audio_event_queue_worker,
                 cursor_state_worker,
                 video_active_worker,
+                edit_sink_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -635,6 +648,7 @@ pub(crate) fn spawn(
         audio_event_queue,
         cursor_state,
         video_active,
+        edit_sink,
         thread: Some(thread),
     })
 }

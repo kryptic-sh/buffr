@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use buffr_core::cursor::SharedCursorState;
+use buffr_core::edit::EditEventSink;
 use buffr_core::hint::{
     DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintSession,
     build_inject_script, take_hint_event,
@@ -124,6 +125,11 @@ pub struct WebKitEngine {
     /// read lock-free from any thread by `any_video_active`.
     /// Same Arc as the one in WorkerHandle.
     video_active: Arc<AtomicBool>,
+    /// Edit-mode event sink (#134). Written by per-tab `buffrEdit` UCM signal
+    /// handlers on the GLib worker thread; drained by the apps layer via
+    /// `buffr_core::edit::drain_edit_events`. Populated by `set_edit_sink`
+    /// after construction; `None` until the apps layer calls that setter.
+    edit_sink: Arc<Mutex<Option<EditEventSink>>>,
 }
 
 impl WebKitEngine {
@@ -280,6 +286,10 @@ impl WebKitEngine {
         // Share the video-active flag created in spawn (#135).
         let video_active = Arc::clone(&worker.video_active);
 
+        // Share the edit-mode event sink created in spawn (#134).
+        // The engine's `set_edit_sink` populates the inner Option at runtime.
+        let edit_sink = Arc::clone(&worker.edit_sink);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -322,6 +332,7 @@ impl WebKitEngine {
             audio_event_queue,
             cursor_state,
             video_active,
+            edit_sink,
         })
     }
 
@@ -340,6 +351,18 @@ impl WebKitEngine {
     pub fn set_newtab_html_provider(&self, provider: NewTabHtmlProvider) {
         if let Ok(mut guard) = self.newtab_html_provider.lock() {
             *guard = Some(provider);
+        }
+    }
+
+    /// Wire the edit-mode event sink so `buffrEdit` UCM messages emitted by
+    /// the injected `edit.js` are pushed into the apps layer's queue.
+    ///
+    /// Safe to call after construction (the worker's first `open_tab` fires
+    /// from a GLib idle handler — i.e. after the current tick — so this setter
+    /// always wins the race). Safe to call multiple times — replaces previous.
+    pub fn set_edit_sink(&self, sink: EditEventSink) {
+        if let Ok(mut g) = self.edit_sink.lock() {
+            *g = Some(sink);
         }
     }
 
@@ -1033,6 +1056,49 @@ impl BrowserEngine for WebKitEngine {
              }})({x},{y});"
         );
         let _ = self.run_main_frame_js(&js, "buffr://inspect-at");
+    }
+
+    // ── Edit overlay DOM IPC (#134) ───────────────────────────────────────────
+    //
+    // Each method runs a one-liner in the active tab's main frame that invokes
+    // the globals installed by `edit.js` (injected at document-end via the
+    // buffrEdit UCM bridge). Mirrors CEF's `run_edit_attach/focus/detach/cycle`
+    // impls — only the JS execution path differs (EvalJs command vs CEF's
+    // synchronous frame.execute_java_script).
+
+    fn run_edit_attach(&self, field_id: &str) {
+        let escaped = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        let _ = self.run_main_frame_js(
+            &format!("if (window.__buffrEditAttach) window.__buffrEditAttach({escaped})"),
+            "buffr://edit",
+        );
+    }
+
+    fn run_edit_focus(&self, field_id: &str) {
+        let escaped = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        let _ = self.run_main_frame_js(
+            &format!(
+                "window.__buffrUserGesture = true; \
+                 if (window.__buffrEditFocus) window.__buffrEditFocus({escaped})"
+            ),
+            "buffr://edit",
+        );
+    }
+
+    fn run_edit_cycle(&self, forward: bool) {
+        let arg = if forward { "true" } else { "false" };
+        let _ = self.run_main_frame_js(
+            &format!("if (window.__buffrCycleInput) window.__buffrCycleInput({arg})"),
+            "buffr://edit",
+        );
+    }
+
+    fn run_edit_detach(&self, field_id: &str) {
+        let escaped = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
+        let _ = self.run_main_frame_js(
+            &format!("if (window.__buffrEditDetach) window.__buffrEditDetach({escaped})"),
+            "buffr://edit",
+        );
     }
 
     // ── Audio / video ─────────────────────────────────────────────────────────

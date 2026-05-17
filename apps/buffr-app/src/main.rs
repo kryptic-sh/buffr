@@ -7638,6 +7638,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             engine.set_newtab_html_provider(Arc::new(move || {
                                 render_new_tab_html(&engine_for_newtab)
                             }));
+                            // Wire the edit-mode event sink so buffrEdit UCM
+                            // messages from edit.js reach drain_edit_events (#134).
+                            engine.set_edit_sink(self.edit_sink.clone());
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
                             let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
                             router_builder =

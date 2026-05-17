@@ -393,6 +393,30 @@ const MEDIA_PROBE_CONSOLE_SHIM_JS: &str = r#"
 })();
 "#;
 
+/// Console.log shim for edit mode (#134).
+///
+/// Intercepts `console.log` calls whose first argument starts with the
+/// `__buffr_edit__:` sentinel emitted by `edit.js` and forwards the JSON
+/// payload (without the sentinel prefix) to the native `buffrEdit` UCM
+/// handler. All other calls pass through to the original `console.log`.
+///
+/// Installed at document-start so the shim is in place before `edit.js`
+/// (injected at document-end) fires its first event.
+const EDIT_CONSOLE_SHIM_JS: &str = r#"
+(() => {
+  const orig = console.log.bind(console);
+  console.log = function(...args) {
+    try {
+      if (typeof args[0] === 'string' && args[0].startsWith('__buffr_edit__:')) {
+        const json = args[0].substring('__buffr_edit__:'.length);
+        window.webkit.messageHandlers.buffrEdit.postMessage(json);
+      }
+    } catch (_) {}
+    return orig.apply(console, args);
+  };
+})();
+"#;
+
 /// Per-tab heap context handed to WebKit's signal handlers via `user_data`.
 /// Keeps an Arc clone of the shared engine state so handlers running on the
 /// worker thread can update URL / title; loading state is tracked via a
@@ -1184,6 +1208,86 @@ unsafe extern "C" fn on_media_probe_script_message(
     tracing::debug!(video, "webkit: buffrMediaProbe — video state updated");
 }
 
+// ── Edit bridge: UCM script-message signal (#134) ────────────────────────────
+
+/// Per-tab heap context for the `buffrEdit` UCM signal handler.
+pub(crate) struct EditSignalCtx {
+    /// Shared with `WebKitEngine::edit_sink`. When the inner `Option` is
+    /// `Some`, decoded `EditConsoleEvent`s are pushed to the `VecDeque`.
+    pub edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
+}
+
+/// GLib `GClosureNotify` for `Box<EditSignalCtx>` leaked for the
+/// `script-message-received::buffrEdit` connection.
+unsafe extern "C" fn drop_edit_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut EditSignalCtx) });
+    }
+}
+
+/// `script-message-received::buffrEdit` handler on the UCM.
+///
+/// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries the JSON string forwarded by `EDIT_CONSOLE_SHIM_JS`
+/// from the `__buffr_edit__:` console.log sentinel emitted by `edit.js`.
+///
+/// Reconstructs the full sentinel-prefixed line, calls
+/// `buffr_core::edit::parse_console_event`, and pushes `Ok` events to the
+/// shared sink. Errors and missing-sentinel messages are logged and dropped.
+unsafe extern "C" fn on_edit_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let json_str = unsafe { CStr::from_ptr(raw_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { g_free(raw_ptr as *mut _) };
+
+    if json_str.is_empty() {
+        return;
+    }
+
+    // Reconstruct the full sentinel-prefixed line so parse_console_event's
+    // sentinel scan succeeds — the shim strips the prefix before postMessage.
+    let line = format!("{}{}", buffr_core::edit::EDIT_CONSOLE_SENTINEL, json_str);
+    tracing::debug!(line, "webkit: buffrEdit script-message received");
+
+    // SAFETY: user_data is a Box<EditSignalCtx> owned until
+    // drop_edit_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const EditSignalCtx) };
+
+    match buffr_core::edit::parse_console_event(&line) {
+        Some(Ok(event)) => {
+            if let Ok(mut guard) = ctx.edit_sink.lock() {
+                if let Some(sink) = guard.as_ref() {
+                    if let Ok(mut q) = sink.lock() {
+                        q.push_back(event);
+                    }
+                }
+            }
+        }
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, raw = json_str, "webkit: malformed edit event");
+        }
+        None => {
+            tracing::debug!("webkit: buffrEdit message missing sentinel (ignored)");
+        }
+    }
+}
+
 // ── Clipboard paste: buffr-clipboard URI scheme ───────────────────────────────
 
 /// URI scheme callback for `buffr-clipboard:read`.
@@ -1960,6 +2064,9 @@ pub(crate) struct TabEntry {
     /// Signal ID for `script-message-received::buffrMediaProbe` on the UCM (#135).
     /// 0 when media probe init failed.
     media_probe_script_message_received_id: u64,
+    /// Signal ID for `script-message-received::buffrEdit` on the UCM (#134).
+    /// 0 when edit bridge init failed.
+    edit_script_message_received_id: u64,
     /// Runtime-wide video-active flag. Same Arc as `WpeRuntime::video_active`
     /// and `WebKitEngine::video_active`. Kept here so `Drop` is self-contained.
     video_active: Arc<std::sync::atomic::AtomicBool>,
@@ -2003,6 +2110,7 @@ impl TabEntry {
         audio_event_queue: WpeAudioEventQueue,
         cursor_state: SharedCursorState,
         video_active: Arc<std::sync::atomic::AtomicBool>,
+        edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -2650,6 +2758,97 @@ impl TabEntry {
             }
         };
 
+        // ── Edit bridge: UCM script-message handler (#134) ───────────────────
+        //
+        // 1. Register `buffrEdit` native handler on the UCM.
+        // 2. Inject EDIT_CONSOLE_SHIM_JS at document-start on all frames so
+        //    `console.log('__buffr_edit__:…')` calls from `edit.js` are
+        //    forwarded to the native handler via postMessage.
+        // 3. Inject the substituted `edit.js` at document-end on all frames
+        //    so the focus/blur/mutate listeners are installed once per load.
+        // 4. Connect `script-message-received::buffrEdit` →
+        //    on_edit_script_message, which parses the JSON and pushes decoded
+        //    EditConsoleEvents to the shared sink.
+        let edit_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END as INJECT_END,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                0
+            } else {
+                // Register the native message handler name.
+                let handler_name = CString::new("buffrEdit").unwrap();
+                let _ok = webkit_user_content_manager_register_script_message_handler(
+                    ucm,
+                    handler_name.as_ptr(),
+                    std::ptr::null(),
+                );
+
+                // Inject console.log shim at document-start on all frames so
+                // the shim is in place before edit.js fires at document-end.
+                let shim_src = CString::new(EDIT_CONSOLE_SHIM_JS).unwrap();
+                let shim_script = webkit_user_script_new(
+                    shim_src.as_ptr(),
+                    INJECT_ALL,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !shim_script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, shim_script);
+                    webkit_user_script_unref(shim_script);
+                    tracing::debug!("webkit: EDIT_CONSOLE_SHIM_JS injected for tab {id:?}");
+                }
+
+                // Inject the substituted edit.js at document-end on all frames.
+                let edit_js = buffr_core::edit::build_inject_script();
+                let edit_src = CString::new(edit_js.as_str()).unwrap();
+                let edit_script = webkit_user_script_new(
+                    edit_src.as_ptr(),
+                    INJECT_ALL,
+                    INJECT_END,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !edit_script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, edit_script);
+                    webkit_user_script_unref(edit_script);
+                    tracing::debug!("webkit: edit.js injected for tab {id:?}");
+                }
+
+                // Connect `script-message-received::buffrEdit`.
+                // user_data is a Box<EditSignalCtx> leaked via Box::into_raw;
+                // drop_edit_signal_ctx reconstitutes + drops it on disconnect.
+                let ctx_box = Box::new(EditSignalCtx {
+                    edit_sink: Arc::clone(&edit_sink),
+                });
+                let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
+                let signal_name = CString::new("script-message-received::buffrEdit").unwrap();
+                g_signal_connect_data(
+                    ucm as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_edit_script_message)),
+                    ctx_raw,
+                    Some(drop_edit_signal_ctx),
+                    0,
+                )
+            }
+        };
+
         // ── Popup queue: `create` signal ──────────────────────────────────────
         //
         // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
@@ -2815,6 +3014,7 @@ impl TabEntry {
             audio_browser_id: id.0 as i32,
             cursor_script_message_received_id,
             media_probe_script_message_received_id,
+            edit_script_message_received_id,
             video_active,
             is_active,
         })
@@ -2990,6 +3190,12 @@ impl Drop for TabEntry {
                         self.media_probe_script_message_received_id,
                     );
                 }
+                if self.edit_script_message_received_id != 0 {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.edit_script_message_received_id,
+                    );
+                }
             }
             // Clear video_active on tab close so the aggregate flag doesn't
             // stay stuck true after the tab that owned it is gone.
@@ -3100,6 +3306,10 @@ pub(crate) struct WpeRuntime {
     /// `buffrMediaProbe` UCM signal handlers; read by
     /// `WebKitEngine::any_video_active`.
     pub video_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Edit-mode event sink (#134). Shared with `WebKitEngine::edit_sink` and
+    /// per-tab `buffrEdit` UCM handlers. Inner `Option` is populated by
+    /// `WebKitEngine::set_edit_sink` post-construction.
+    pub edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
 }
 
 impl WpeRuntime {
@@ -3122,6 +3332,7 @@ impl WpeRuntime {
         audio_event_queue: WpeAudioEventQueue,
         cursor_state: SharedCursorState,
         video_active: Arc<std::sync::atomic::AtomicBool>,
+        edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -3220,6 +3431,7 @@ impl WpeRuntime {
             audio_event_queue,
             cursor_state,
             video_active,
+            edit_sink,
         })
     }
 
@@ -3309,6 +3521,7 @@ impl WpeRuntime {
             Arc::clone(&self.audio_event_queue),
             Arc::clone(&self.cursor_state),
             Arc::clone(&self.video_active),
+            Arc::clone(&self.edit_sink),
         );
 
         let entry = match entry {
