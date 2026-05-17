@@ -1644,14 +1644,14 @@ data_dir = "/tmp/cef-cache"
             data_dir: None,
         });
         cfg.engines.instances.push(crate::EngineInstance {
-            id: "blink".into(),
-            backend: "blink-cdp".into(),
-            data_dir: Some("/tmp/blink-data".into()),
+            id: "wpe".into(),
+            backend: "webkit".into(),
+            data_dir: Some("/tmp/wpe-data".into()),
         });
         cfg.engines.default = "cef".into();
         cfg.engines.rules.push(crate::EngineRule {
             pattern: "*.figma.com".into(),
-            engine: "blink".into(),
+            engine: "wpe".into(),
         });
 
         let toml_str = to_toml_string(&cfg).unwrap();
@@ -1660,15 +1660,15 @@ data_dir = "/tmp/cef-cache"
         assert_eq!(parsed.engines.default, cfg.engines.default);
         assert_eq!(parsed.engines.instances.len(), 2);
         assert_eq!(parsed.engines.instances[0].id, "cef");
-        assert_eq!(parsed.engines.instances[1].id, "blink");
-        assert_eq!(parsed.engines.instances[1].backend, "blink-cdp");
+        assert_eq!(parsed.engines.instances[1].id, "wpe");
+        assert_eq!(parsed.engines.instances[1].backend, "webkit");
         assert_eq!(
             parsed.engines.instances[1].data_dir.as_deref(),
-            Some("/tmp/blink-data")
+            Some("/tmp/wpe-data")
         );
         assert_eq!(parsed.engines.rules.len(), 1);
         assert_eq!(parsed.engines.rules[0].pattern, "*.figma.com");
-        assert_eq!(parsed.engines.rules[0].engine, "blink");
+        assert_eq!(parsed.engines.rules[0].engine, "wpe");
         assert_eq!(parsed.engines, cfg.engines);
     }
 
