@@ -81,8 +81,6 @@ pub enum ContextMenuItem {
     SaveImageAs,
     CopyImage,
     CopyImageAddress,
-    RotateClockwise,
-    RotateCounterclockwise,
 
     // ── Video / Audio ─────────────────────────────────────────────────────
     MediaPlayPause {
@@ -162,8 +160,6 @@ impl ContextMenuItem {
             I::SaveImageAs => "Save Image As…",
             I::CopyImage => "Copy Image",
             I::CopyImageAddress => "Copy Image Address",
-            I::RotateClockwise => "Rotate Clockwise",
-            I::RotateCounterclockwise => "Rotate Counterclockwise",
             I::MediaPlayPause { playing: true } => "Pause",
             I::MediaPlayPause { playing: false } => "Play",
             I::MediaMute { muted: true } => "Unmute",
@@ -322,9 +318,6 @@ pub fn build_model(
             I::CopyImage,
             I::CopyImageAddress,
         ];
-        items.push(I::Separator);
-        items.push(I::RotateClockwise);
-        items.push(I::RotateCounterclockwise);
         items.push(I::Separator);
         items.push(I::InspectElement);
         return items;
@@ -555,8 +548,6 @@ mod tests {
         assert!(items.contains(&I::SaveImageAs));
         assert!(items.contains(&I::CopyImage));
         assert!(items.contains(&I::CopyImageAddress));
-        assert!(items.contains(&I::RotateClockwise));
-        assert!(items.contains(&I::RotateCounterclockwise));
         assert!(items.contains(&I::InspectElement));
     }
 
