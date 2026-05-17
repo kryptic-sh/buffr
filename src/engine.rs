@@ -26,7 +26,7 @@
 //! run_media_probe, image_rotate, start_download, and show_dev_tools_at
 //! added so `apps/buffr-app` no longer needs `active_host()` reach-
 //! through for these families. Methods that are CEF-specific or not yet
-//! implemented by CDP have default impls that return
+//! implemented by a given backend have default impls that return
 //! `EngineError::Unimplemented` (Result-returning) or emit a debug log
 //! and no-op (void). This avoids forcing every backend to write stubs.
 //!
@@ -244,9 +244,8 @@ pub trait BrowserEngine: Send + Sync {
     // can reach popup operations through `Arc<dyn BrowserEngine>` without a
     // CEF-specific reach-through map.
     //
-    // Backends that do not support popups (e.g. `buffr-blink-cdp`) return
-    // empty sinks / Vec or no-op, and log a debug note where appropriate.
-    // CDP popup support: future work, see #95.
+    // Backends that do not support popups return empty sinks / Vec or
+    // no-op, and log a debug note where appropriate.
 
     /// Clone the popup URL queue (new-tab reroutes from `on_before_popup`).
     fn popup_queue(&self) -> PopupQueue;
@@ -311,8 +310,7 @@ pub trait BrowserEngine: Send + Sync {
 
     // ── Hint mode (Phase 6b, #95) ─────────────────────────────────────────────
     //
-    // Backends that do not support hint mode (e.g. `buffr-blink-cdp`) return
-    // no-op / idle stubs. CDP hint mode: future work, see #95.
+    // Backends that do not support hint mode return no-op / idle stubs.
 
     /// Whether the active tab has a live hint session.
     fn is_hint_mode(&self) -> bool;
@@ -348,8 +346,7 @@ pub trait BrowserEngine: Send + Sync {
     // surface per-command errors.
     //
     // Default impls emit a `tracing::debug!` and no-op so backends that don't
-    // support frame-level editing (e.g. blink-cdp in the initial phases) don't
-    // need to write 7 explicit stubs.
+    // support frame-level editing don't need to write 7 explicit stubs.
 
     /// Send Undo to the active tab's focused frame.
     ///
@@ -488,7 +485,7 @@ pub trait BrowserEngine: Send + Sync {
     // are called via `run_main_frame_js` under the hood.
     //
     // Default impls no-op + debug log. CEF implements these via its inherent
-    // counterparts; CDP will implement them in a future phase.
+    // counterparts; other backends may override as they mature.
 
     /// Add the edit-active CSS class to `field_id` via `__buffrEditAttach`.
     ///
@@ -534,7 +531,7 @@ pub trait BrowserEngine: Send + Sync {
     /// Trigger a file-as-download for `url` via the engine's download manager.
     ///
     /// Default: debug-log and no-op (CEF implements via
-    /// `CefBrowserHost::StartDownload`; CDP download support is future work).
+    /// `CefBrowserHost::StartDownload`).
     fn start_download(&self, _url: &str) {
         tracing::debug!("BrowserEngine::start_download: not implemented by this backend");
     }
@@ -545,12 +542,11 @@ pub trait BrowserEngine: Send + Sync {
     ///
     /// Backends that support inspect-element use the coordinates to highlight
     /// the element in the Elements panel. Backends that don't support
-    /// inspect-element (e.g. blink-cdp, which always opens the full inspector)
-    /// ignore `x`/`y` and delegate to their existing `open_devtools` impl.
+    /// inspect-element ignore `x`/`y` and delegate to their existing
+    /// `open_devtools` impl.
     ///
     /// Default: debug-log and no-op. The CEF backend overrides with
-    /// `show_dev_tools_at(Some(x), Some(y))`. The blink-cdp backend opens
-    /// the full inspector (ignoring coordinates).
+    /// `show_dev_tools_at(Some(x), Some(y))`.
     fn show_dev_tools_at(&self, _x: i32, _y: i32) {
         tracing::debug!("BrowserEngine::show_dev_tools_at: not implemented by this backend");
     }
@@ -558,7 +554,7 @@ pub trait BrowserEngine: Send + Sync {
     // ── Clipboard (Phase 6d, #95) ─────────────────────────────────────────────
     //
     // Neutral clipboard surface. CEF wraps `hjkl_clipboard::Clipboard`;
-    // CDP and other backends return no-op defaults until implemented.
+    // other backends return no-op defaults until implemented.
     //
     // `clipboard_handle` hands out a `ClipboardReader` (`Arc<dyn ClipboardRead>`)
     // so the apps layer can do blocking reads on a worker thread without pulling
@@ -567,8 +563,8 @@ pub trait BrowserEngine: Send + Sync {
 
     /// Clone the clipboard reader handle for off-thread reads.
     ///
-    /// Returns `None` when the backend has no system clipboard (e.g. CDP
-    /// in Phase 6d, or when clipboard initialisation failed at startup).
+    /// Returns `None` when the backend has no system clipboard, or when
+    /// clipboard initialisation failed at startup.
     ///
     /// Default: `None`.
     fn clipboard_handle(&self) -> Option<ClipboardReader> {
@@ -615,7 +611,7 @@ pub trait BrowserEngine: Send + Sync {
 
     /// Drain all pending [`AudioEvent`]s that the backend has queued since
     /// the last call. Returns an empty `Vec` when no audio events are pending
-    /// or the backend has no audio tracking (e.g. blink-cdp).
+    /// or the backend has no audio tracking.
     ///
     /// Default: `Vec::new()`.
     fn drain_audio_events(&self) -> Vec<AudioEvent> {
@@ -649,7 +645,7 @@ pub trait BrowserEngine: Send + Sync {
     /// since the last call, `None` otherwise. Last writer wins — CEF
     /// coalesces multiple changes per frame into one slot.
     ///
-    /// Default: `None` (CDP and other backends without cursor tracking).
+    /// Default: `None` (backends without cursor tracking).
     fn take_cursor_change(&self) -> Option<(i32, u32)> {
         None
     }
@@ -692,13 +688,11 @@ pub trait BrowserEngine: Send + Sync {
 
     // ── Permissions (Phase 8a, #88) ───────────────────────────────────────────
     //
-    // Both the CEF backend and blink-cdp push neutral `PendingPermission`
-    // entries onto the shared queue.  When the user answers, apps calls
-    // `resolve_permission` so the backend can fire the appropriate callback
-    // (CEF C++ callback or CDP Runtime.evaluate promise resolution).
+    // Backends push neutral `PendingPermission` entries onto the shared
+    // queue.  When the user answers, apps calls `resolve_permission` so
+    // the backend can fire the appropriate callback (CEF C++ callback,
+    // platform webview API, etc.).
     //
-    // CEF: wraps existing callback registry; blink-cdp: sends
-    // `__buffrPermissionResolve(id, outcome)` via Runtime.evaluate.
     // Default no-op: backends that don't implement permissions return an
     // empty queue and ignore resolve calls.
 
@@ -707,15 +701,14 @@ pub trait BrowserEngine: Send + Sync {
     /// The apps layer drains one entry per tick and shows the prompt strip.
     ///
     /// Default: returns a fresh empty queue (backends that don't surface
-    /// permission requests return no-op here). CEF and blink-cdp override
-    /// with their respective shared queues.
+    /// permission requests return no-op here). Backends override with their
+    /// respective shared queues.
     fn permissions_queue(&self) -> PermissionsQueue {
         crate::permissions::new_queue()
     }
 
     /// Resolve the pending permission identified by `resolve_id` with
-    /// `outcome`.  The backend fires the appropriate C++ callback (CEF) or
-    /// resolves the JS promise (blink-cdp).
+    /// `outcome`.  The backend fires the appropriate native callback.
     ///
     /// `resolve_id` is taken from [`PendingPermission::resolve_id`].
     /// `None` means the entry has no async backend state to clean up
@@ -730,7 +723,7 @@ pub trait BrowserEngine: Send + Sync {
     /// the last call. The apps layer caches the bitmaps by browser id for
     /// the tab strip.
     ///
-    /// Default: `Vec::new()` (CDP and other backends without favicon tracking).
+    /// Default: `Vec::new()` (backends without favicon tracking).
     fn drain_favicon_updates(&self) -> Vec<FaviconUpdate> {
         Vec::new()
     }
@@ -752,9 +745,9 @@ pub trait BrowserEngine: Send + Sync {
     /// context-menu `HistoryBack { enabled }`).
     ///
     /// Default: `false` — backends that track history accurately override this.
-    /// CEF overrides via `CefBrowser::CanGoBack`; blink-cdp uses its nav_count
-    /// heuristic. Defaulting to `true` was wrong: a newly-opened tab has no
-    /// history, so the back-button would incorrectly appear enabled.
+    /// CEF overrides via `CefBrowser::CanGoBack`. Defaulting to `true` was
+    /// wrong: a newly-opened tab has no history, so the back-button would
+    /// incorrectly appear enabled.
     fn can_go_back(&self) -> bool {
         false
     }
@@ -817,12 +810,7 @@ pub trait BrowserEngine: Send + Sync {
     /// Calling again with a new parent or rect repositions / re-parents.
     ///
     /// Default: no-op.
-    fn set_native_parent(
-        &self,
-        _parent: raw_window_handle::RawWindowHandle,
-        _rect: NativeRect,
-    ) {
-    }
+    fn set_native_parent(&self, _parent: raw_window_handle::RawWindowHandle, _rect: NativeRect) {}
 
     /// Show or hide the engine's native surface attachment without tearing
     /// it down. Used by the apps layer for tab switching: only the active

@@ -1,23 +1,19 @@
 //! Neutral permission-prompt types shared between all engine backends.
 //!
 //! Phase 8a (#88): moved here from `buffr_cef::permissions` so that
-//! `buffr-blink-cdp` can populate the same queue without taking a
+//! non-CEF backends can populate the same queue without taking a
 //! dependency on CEF-specific types.
 //!
 //! # Queue model
 //!
-//! A single [`PermissionsQueue`] lives on the apps layer. Both the CEF
-//! backend and the blink-cdp backend push [`PendingPermission`] entries
-//! onto it.  When the user answers the prompt, the apps layer calls
-//! [`BrowserEngine::resolve_permission`] with the `resolve_id` taken
-//! from [`PendingPermission::resolve_id`].
+//! A single [`PermissionsQueue`] lives on the apps layer. Backends push
+//! [`PendingPermission`] entries onto it.  When the user answers the prompt,
+//! the apps layer calls [`BrowserEngine::resolve_permission`] with the
+//! `resolve_id` taken from [`PendingPermission::resolve_id`].
 //!
 //! - **CEF backend**: on push, stores the original C++ callback in a
 //!   per-engine `HashMap<String, CefCallback>`. On resolve, looks up
 //!   the callback by `resolve_id` and fires it.
-//! - **blink-cdp backend**: on push, the `resolve_id` is the JS promise
-//!   token. On resolve, calls `Runtime.evaluate` to resolve the promise
-//!   via `window.__buffrPermissionResolve(id, "granted"|"denied")`.
 //!
 //! # Thread safety
 //!

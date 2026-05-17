@@ -1,7 +1,7 @@
 //! `Backend` trait — process-model lifecycle abstraction.
 //!
 //! One implementation per concrete browser engine crate (buffr-cef,
-//! buffr-blink-cdp). The apps layer programs against this trait so
+//! buffr-webkit, …). The apps layer programs against this trait so
 //! `apps/buffr-app` imports zero concrete engine symbols beyond a single
 //! `Arc<dyn Backend>` construction site per backend type.
 
@@ -33,9 +33,9 @@ pub type NewTabHtmlProvider = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
 ///
 /// - `data_dir` — persistent profile directory. Always honoured by every
 ///   backend that stores on-disk state.
-/// - `cache_dir` — ephemeral cache directory. Only blink-cdp currently
-///   supports this via `--disk-cache-dir`. CEF silently ignores it (CEF
-///   uses a single `cache_path` for both persistent and ephemeral data).
+/// - `cache_dir` — ephemeral cache directory. CEF silently ignores it
+///   (CEF uses a single `cache_path` for both persistent and ephemeral
+///   data); other backends may honour the split when supported.
 pub struct BackendOpenOptions<'a> {
     /// Logical identifier for this engine instance (from config).
     pub engine_id: EngineId,
@@ -43,7 +43,7 @@ pub struct BackendOpenOptions<'a> {
     /// cookies, localStorage, history, etc.).
     pub data_dir: Option<&'a Path>,
     /// Optional ephemeral cache directory for engines that support a
-    /// persistent/ephemeral split (e.g. blink-cdp via `--disk-cache-dir`).
+    /// persistent/ephemeral split.
     ///
     /// When `Some`, the engine writes ephemeral data (HTTP cache, GPU
     /// shader cache, code cache, etc.) here instead of inside `data_dir`.
@@ -62,30 +62,28 @@ pub struct BackendOpenOptions<'a> {
     pub private: bool,
     /// Directory where downloads should be saved.
     ///
-    /// Used by the blink-cdp backend to configure
-    /// `Browser.setDownloadBehavior`. CEF backends manage their own
-    /// download directory via the sinks' `DownloadsConfig`.
+    /// CEF backends manage their own download directory via the sinks'
+    /// `DownloadsConfig`; other backends consume this field directly.
     pub download_dir: Option<&'a Path>,
-    /// Shared history store. webkitgtk and webview2 record visits here on
-    /// navigation-completed events. CEF and blink-cdp ignore this field
-    /// (they wire history through their own callbacks).
+    /// Shared history store. webview2 and webkit-cocoa record visits here on
+    /// navigation-completed events. CEF ignores this field (it wires history
+    /// through its own callbacks).
     pub history: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    /// Shared downloads store. blink-cdp writes to this directly when
+    /// Shared downloads store. Non-CEF backends write to this directly when
     /// downloads start / progress / complete. CEF ignores this field
     /// (continues using its existing `CefEngineSinks` wiring).
     pub downloads: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    /// Shared download-notice queue. blink-cdp pushes notices here on
+    /// Shared download-notice queue. Non-CEF backends push notices here on
     /// `Started` / `Completed` / `Canceled`. CEF ignores this field.
     pub notice_queue: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    /// Find-result sink (P1-1). blink-cdp downcasts to `FindResultSink` and
-    /// passes it to `BlinkCdpEngine::new`. CEF ignores this field (find results
-    /// are wired via `CefEngineSinks` inside `sinks`). webview2 downcasts to
-    /// `FindResultSink` and writes match counts from `ICoreWebView2Find` events.
+    /// Find-result sink (P1-1). webview2 downcasts to `FindResultSink` and
+    /// writes match counts from `ICoreWebView2Find` events. CEF ignores this
+    /// field (find results are wired via `CefEngineSinks` inside `sinks`).
     pub find_sink: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Backend-specific sink handles, type-erased.
     ///
     /// CEF: expects `Box<CefEngineSinks>` (defined in buffr-cef).
-    /// Blink-CDP: ignored (pass `Box::new(())`).
+    /// Other backends typically pass `Box::new(())`.
     pub sinks: Box<dyn std::any::Any + Send>,
     /// Hint to the backend that the host prefers native compositing over the
     /// OSR pixel-copy path when available on the current session.

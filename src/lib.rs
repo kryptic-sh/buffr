@@ -12,8 +12,8 @@
 //!                                │
 //!              ┌─────────────────┴──────────────────┐
 //!              ▼                                     ▼
-//!         buffr-cef                          buffr-blink-cdp
-//!    (CEF concrete backend)           (headless Chromium CDP backend)
+//!         buffr-cef                             buffr-webkit
+//!    (CEF concrete backend)               (WPE WebKit native backend)
 //! ```
 //!
 //! The apps layer and `buffr-core` import `buffr-engine` exclusively; they
@@ -41,7 +41,7 @@
 //! - Context menu: build model, handle selection, image/media buckets
 //! - IME: composition start/update/end, candidate window hints
 //! - Custom schemes: `buffr-src:` handler registration
-//! - Picture-in-Picture (blink-cdp): `Page.setDocumentContent` + PiP API
+//! - Picture-in-Picture
 
 pub mod backend;
 pub mod clipboard;

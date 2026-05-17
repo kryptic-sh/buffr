@@ -6,6 +6,19 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-18
+
+### Changed
+
+- Doc comments on `BrowserEngine`, `BackendOpenOptions`, `EngineId`,
+  `PermissionsQueue`, and `EngineError::Unimplemented` reworked to drop
+  references to the retired `buffr-blink-cdp`, `buffr-firefox-cdp`, and
+  `buffr-webkitgtk` backends. The umbrella drops these three engines in favour
+  of CEF, WPE WebKit, WKWebView, WebView2, Blitz, and Ladybird. No public types
+  or method signatures changed in this release; the minor bump reflects the
+  umbrella-wide engine roster change so consumers pinning specific engine names
+  in routing config can spot the drop in one place.
+
 ## [0.1.7] - 2026-05-18
 
 ### Added
@@ -72,7 +85,8 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 _Initial release._
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.2.0
 [0.1.7]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.7
 [0.1.6]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.6
 [0.1.5]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.5

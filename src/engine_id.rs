@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a registered engine backend. Examples: `"cef"`,
-/// `"webkit"`, `"blink-cdp"`. Lower-case, snake-case, ASCII-only by
+/// `"webkit"`, `"blitz"`. Lower-case, snake-case, ASCII-only by
 /// convention (not enforced — the router compares ids by equality, so
 /// whatever string was registered is what must be referenced in config).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
