@@ -55,8 +55,8 @@ use super::egl::EglWorker;
 use super::ffi::*;
 use super::worker::EngineState;
 use super::wpe_subclass::{
-    BuffrDisplayHandle, BuffrDisplayWaylandHandle, ViewCtx, WlSurfacePtr, WpeDisplayKind,
-    ack_pending_buffer, attach_view_ctx, buffr_display_take_last_view, buffr_display_wayland_new,
+    BuffrDisplayHandle, BuffrDisplayWaylandHandle, ViewCtx, WpeDisplayKind, ack_pending_buffer,
+    attach_view_ctx, buffr_display_take_last_view, buffr_display_wayland_new,
     buffr_input_method_context_cancel, buffr_input_method_context_commit,
     buffr_input_method_context_new, buffr_input_method_context_set_preedit,
     buffr_view_wayland_set_rect,
@@ -2063,17 +2063,6 @@ pub(crate) struct TabEntry {
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
     pub is_active: Arc<std::sync::atomic::AtomicBool>,
-    /// True when this tab was created against a `WPEDisplayWayland` (native
-    /// path); false on the OSR/BuffrDisplay path. Used by #145 to decide
-    /// whether to attempt a subsurface attach.
-    #[allow(dead_code)] // Phase 3 polish (#147–#150) consumes this.
-    pub is_native: bool,
-    /// The `wl_surface*` that WPEViewWayland owns for this tab, captured
-    /// immediately after `WebKitWebView` construction on the native path.
-    /// `None` on the OSR path or if `wpe_view_wayland_get_wl_surface`
-    /// returned NULL. Stored as a Send-safe wrapper for use in #145.
-    #[allow(dead_code)] // Phase 3 polish (#147–#150) consumes this.
-    pub wl_surface: Option<WlSurfacePtr>,
     /// Owned `BuffrInputMethodContext` attached to this tab's WebView.
     ///
     /// Created by `buffr_input_method_context_new()` and wired to the WebView
@@ -2153,22 +2142,16 @@ impl TabEntry {
         // Wayland path: WPEDisplayWayland creates a `WPEViewWayland` internally.
         // We skip the OSR-only `buffr_display_take_last_view` / `attach_view_ctx`
         // machinery (ViewCtx is not needed — render_buffer is never called on
-        // our side). Instead we query `wpe_view_wayland_get_wl_surface` to stash
-        // the wl_surface pointer for #145.
-        let (wpe_view, wl_surface) = if is_native {
+        // our side).
+        let wpe_view = if is_native {
             // Wayland path: WPEDisplayWayland owns the view lifecycle.
             // `webkit_web_view_get_view` is not in our bindings; instead, the
             // display already called into WPE's view creation machinery when we
             // passed it as the `display` construct-property. We cannot get the
-            // WPEViewWayland pointer synchronously here without a signal, so we
-            // store NULL for now — #145 will wire the `view-created` signal on
-            // the display to capture it. The wl_surface is also NULL until the
-            // view is realised.
-            //
-            // NOTE: wpe_view is intentionally NULL on the native path. Any code
-            // that calls wpe_view_* must guard on `!self.is_native || !self.wpe_view.is_null()`.
+            // WPEViewWayland pointer synchronously here without a signal.
+            // wpe_view is intentionally NULL on the native path.
             tracing::info!("webkit: native Wayland path — skipping OSR ViewCtx attach");
-            (std::ptr::null_mut::<super::ffi::WPEView>(), None)
+            std::ptr::null_mut::<super::ffi::WPEView>()
         } else {
             // OSR path: pop the stash left by BuffrDisplay's create_view vmethod.
             let wpe_view = unsafe { buffr_display_take_last_view() };
@@ -2188,7 +2171,7 @@ impl TabEntry {
                 },
             );
             tracing::info!("webkit: ViewCtx attached to WPEView");
-            (wpe_view, None)
+            wpe_view
         };
 
         // Connect load-changed / notify::uri / notify::title so the engine
@@ -3053,8 +3036,6 @@ impl TabEntry {
             id,
             web_view,
             wpe_view,
-            is_native,
-            wl_surface,
             ime_ctx,
             load_changed_id,
             notify_title_id,
@@ -3098,21 +3079,6 @@ impl TabEntry {
             if !tl.is_null() {
                 wpe_toplevel_resize(tl, width as i32, height as i32);
             }
-        }
-    }
-
-    /// Current URL from the WebView (may lag by one GLib tick).
-    #[allow(dead_code)] // Surfaced for future URL-bar wiring; safe getter.
-    pub(crate) fn current_url(&self) -> String {
-        // SAFETY: web_view is valid for the tab's lifetime.
-        let ptr = unsafe { webkit_web_view_get_uri(self.web_view) };
-        if ptr.is_null() {
-            String::new()
-        } else {
-            // SAFETY: ptr is a valid null-terminated UTF-8 string.
-            unsafe { std::ffi::CStr::from_ptr(ptr) }
-                .to_string_lossy()
-                .into_owned()
         }
     }
 
@@ -3643,14 +3609,6 @@ impl WpeRuntime {
     /// The currently active tab, if any.
     fn active_tab(&self) -> Option<&TabEntry> {
         self.active_idx.and_then(|i| self.tabs.get(i))
-    }
-
-    /// Returns `true` when the runtime is using `WPEDisplayWayland` (native
-    /// Wayland compositing path). Consumers (#145) use this to decide whether
-    /// to attempt a subsurface attach.
-    #[allow(dead_code)] // Phase 3 polish (#147–#150) consumes this.
-    pub(crate) fn is_native(&self) -> bool {
-        self.display.is_native()
     }
 
     /// Open a new tab navigated to `url`.

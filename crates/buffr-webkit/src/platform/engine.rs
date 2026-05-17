@@ -786,7 +786,6 @@ impl BrowserEngine for WebKitEngine {
             // For proper xkb keysyms this would need a VK→XKB lookup table,
             // but for Phase 2 this gives basic Latin character input.
             key_code: event.windows_key_code as u32,
-            hardware_key_code: event.native_key_code as u32,
             pressed,
             modifiers: event.modifiers,
         };
@@ -840,8 +839,8 @@ impl BrowserEngine for WebKitEngine {
         });
     }
 
-    fn osr_focus(&self, focused: bool) {
-        self.send(Command::Focus { focused });
+    fn osr_focus(&self, _focused: bool) {
+        self.send(Command::Focus);
     }
 
     // ── OSR state ─────────────────────────────────────────────────────────────

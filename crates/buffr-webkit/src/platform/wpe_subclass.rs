@@ -45,15 +45,6 @@ unsafe extern "C" {
         refresh_hz: std::os::raw::c_int,
     ) -> *mut WPEDisplay;
 
-    /// GType of `BuffrView` (the WPEView subclass our display creates).
-    /// Probed by `force_link_bridge` to keep the C symbol from being GC'd.
-    #[allow(dead_code)]
-    pub fn buffr_display_get_view_type() -> GType;
-
-    /// GType of `BuffrToplevel`. Probed by `force_link_bridge`.
-    #[allow(dead_code)]
-    pub fn buffr_display_get_toplevel_type() -> GType;
-
     /// Atomic getter for the most recently created `WPEView` (returned
     /// from our `create_view` vmethod). Used by Rust to grab a borrowed
     /// pointer after `webkit_web_view_new` runs through the platform path.
@@ -77,14 +68,6 @@ unsafe extern "C" {
         scale: std::os::raw::c_double,
         refresh_hz: std::os::raw::c_int,
     ) -> *mut WPEDisplay;
-
-    /// Stash getter: pops the most-recently-created `WPEView` from the
-    /// `BuffrDisplayWayland` stash (mirrors `buffr_display_take_last_view`
-    /// but scoped to the Wayland subclass instance).
-    /// Used by #153 (BuffrViewWayland) to recover the view after WebKitWebView
-    /// construction on the BuffrWayland path.
-    #[allow(dead_code)]
-    pub fn buffr_display_wayland_take_last_view(display: *mut WPEDisplay) -> *mut WPEView;
 
     // ── BuffrViewWayland (#153) ───────────────────────────────────────────
 
@@ -590,51 +573,6 @@ impl Drop for WpeDisplayKind {
         // BuffrWayland variant: BuffrDisplayWaylandHandle's Drop handles it.
     }
 }
-
-// ── WlSurfacePtr ─────────────────────────────────────────────────────────────
-
-/// Send wrapper around a raw `*mut wl_surface` returned by
-/// `wpe_view_wayland_get_wl_surface`.
-///
-/// The pointer is owned by WPE's `WPEViewWayland` — its lifetime is tied to
-/// the view, not to us. We store it on `TabEntry` for #145 (subsurface attach)
-/// so it's available when the compositor handshake happens. Any dereference
-/// must occur on the GLib worker thread while the view is alive.
-#[repr(transparent)]
-pub(crate) struct WlSurfacePtr(pub(crate) *mut std::os::raw::c_void);
-
-unsafe impl Send for WlSurfacePtr {}
-
-// ── No-op constructors that publish the symbols Rust uses ────────────────────
-
-/// Force-link the C bridge functions so the linker keeps them in even if
-/// Rust never calls them in this crate (e.g. when only the render callback
-/// is exercised). Called once from worker init.
-#[allow(dead_code)] // Linker-side anchor; called explicitly when needed.
-pub(crate) fn force_link_bridge() {
-    // SAFETY: just probes the getters; we discard the return.
-    unsafe {
-        let _ = buffr_display_get_view_type();
-        let _ = buffr_display_get_toplevel_type();
-    }
-}
-
-/// Convenience: build a `ViewCtx` from the shared frame + view state.
-#[allow(dead_code)]
-pub(crate) fn make_view_ctx(frame: SharedOsrFrame, view: SharedOsrViewState) -> ViewCtx {
-    ViewCtx {
-        frame,
-        view,
-        last_ingest_us: AtomicU64::new(0),
-        is_active: Arc::new(AtomicBool::new(true)),
-        pending_buffer: Mutex::new(None),
-    }
-}
-
-/// Used by the test compilation path to verify Arc construction; not part
-/// of the public surface yet.
-#[allow(dead_code)]
-fn _phantom_arc_use<T>(_: Arc<T>) {}
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
 

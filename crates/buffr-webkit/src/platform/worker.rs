@@ -133,11 +133,7 @@ pub(crate) enum Command {
         delta_y: i32,
         modifiers: u32,
     },
-    Focus {
-        #[allow(dead_code)]
-        // Currently dispatched but unused; future tab-strip work consumes this.
-        focused: bool,
-    },
+    Focus,
     OsrSleep {
         sleep: bool,
     },
@@ -255,10 +251,6 @@ pub(crate) enum Command {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WpeKeyEvent {
     pub key_code: u32,
-    /// X11 keycode equivalent. Carried for future input-fidelity work
-    /// (shortcut routing in non-Latin layouts); not consumed yet.
-    #[allow(dead_code)]
-    pub hardware_key_code: u32,
     pub pressed: bool,
     pub modifiers: u32,
 }
@@ -731,7 +723,7 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         } => {
             rt.dispatch_axis(x, y, delta_x, delta_y, translate_modifiers(modifiers));
         }
-        Command::Focus { focused: _ } => {
+        Command::Focus => {
             // Focus tracking moves to the BuffrView focus_in/focus_out API.
             // Stub: no-op until the platform path is wired.
         }
