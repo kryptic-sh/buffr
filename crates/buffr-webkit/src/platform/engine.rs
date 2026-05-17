@@ -202,19 +202,20 @@ impl WebKitEngine {
         let can_go_back = Arc::new(AtomicBool::new(false));
         let can_go_forward = Arc::new(AtomicBool::new(false));
 
-        // Build the cookie DB path from data_dir + engine_id. Use
-        // `<data_dir>/engines/<engine_id>/cookies.sqlite` so each logical
-        // engine instance has its own isolated cookie store. Falls back to an
-        // XDG_DATA_HOME-based path when data_dir is not configured, and to
-        // None (in-memory cookies) when neither is available or the path isn't
-        // valid UTF-8.
+        // Build the cookie DB path.  When `options.data_dir` is provided
+        // (the normal apps/buffr-app path) it is already the per-engine
+        // namespace at `<data_root>/engines/<id>/profile/` — we just
+        // append `cookies.sqlite` to it.  Re-namespacing produced the
+        // doubled path `engines/<id>/profile/engines/<id>/cookies.sqlite`
+        // that libsoup logged as "Can't open" in #IME-era test runs.
+        //
+        // Fallback (data_dir unset): start from XDG_DATA_HOME / $HOME and
+        // namespace under `buffr/engines/<id>/` ourselves.
         let cookie_db_path = {
             let engine_id = options.engine_id.as_str();
-            // Prefer the config-driven data_dir; fall back to XDG_DATA_HOME
-            // ($HOME/.local/share when unset) so users without explicit config
-            // still get persistent cookies.
-            let base: Option<std::path::PathBuf> =
-                options.data_dir.map(|p| p.to_path_buf()).or_else(|| {
+            let path: Option<std::path::PathBuf> = match options.data_dir {
+                Some(d) => Some(d.join("cookies.sqlite")),
+                None => {
                     let xdg = std::env::var("XDG_DATA_HOME")
                         .ok()
                         .filter(|s| !s.is_empty())
@@ -226,17 +227,22 @@ impl WebKitEngine {
                                 .map(|h| std::path::PathBuf::from(h).join(".local/share"))
                                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                         });
-                    Some(xdg.join("buffr"))
-                });
-            base.map(|b| b.join("engines").join(engine_id).join("cookies.sqlite"))
-                .and_then(|p| {
-                    p.to_str().map(|s| s.to_owned()).or_else(|| {
-                        tracing::warn!(
-                            "webkit: cookie DB path is not valid UTF-8 — cookies remain in-memory"
-                        );
-                        None
-                    })
+                    Some(
+                        xdg.join("buffr")
+                            .join("engines")
+                            .join(engine_id)
+                            .join("cookies.sqlite"),
+                    )
+                }
+            };
+            path.and_then(|p| {
+                p.to_str().map(|s| s.to_owned()).or_else(|| {
+                    tracing::warn!(
+                        "webkit: cookie DB path is not valid UTF-8 — cookies remain in-memory"
+                    );
+                    None
                 })
+            })
         };
 
         // Downcast the downloads sink from BackendOpenOptions if provided.
