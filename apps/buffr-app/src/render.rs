@@ -570,6 +570,22 @@ impl Renderer {
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or_else(|| caps.formats[0]);
 
+        // Prefer PreMultiplied alpha so the wgpu surface itself can carry
+        // per-pixel transparency (required for native-compositing backends
+        // where the chrome quad's browser region is fully transparent and
+        // must let the underlying Wayland subsurface show through).
+        let composite_alpha =
+            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+                wgpu::CompositeAlphaMode::PostMultiplied
+            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Auto) {
+                wgpu::CompositeAlphaMode::Auto
+            } else {
+                wgpu::CompositeAlphaMode::Opaque
+            };
+        tracing::info!(?composite_alpha, "wgpu composite_alpha selected");
+
         // Preference order: Mailbox → Immediate → Fifo.
         //
         // Fifo blocks `surface.get_current_texture()` on vsync, and
@@ -603,7 +619,7 @@ impl Renderer {
             width,
             height,
             present_mode,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            alpha_mode: composite_alpha,
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
         };

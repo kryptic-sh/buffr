@@ -4046,6 +4046,16 @@ impl AppState {
             .map(|e| e.is_loading())
             .unwrap_or(false);
 
+        // Native-compositing engines (WebKit on Wayland) render directly into a
+        // Wayland subsurface; the chrome quad's browser region stays fully
+        // transparent (alpha = 0) so the subsurface shows through. The loading
+        // animation would never be visible there anyway, so suppress it to
+        // prevent painting opaque pixels into the transparent browser region.
+        let host_supports_native = self
+            .active_engine_dyn()
+            .map(|e| e.supports_native())
+            .unwrap_or(false);
+
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -4086,9 +4096,15 @@ impl AppState {
         // flag is set at the end of the previous paint when we detected the
         // condition; the animation overlays the wrong-sized OSR until the
         // reconcile redraw lands.
-        let want_anim = should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
+        //
+        // Don't paint the loading animation into the browser region when the
+        // active engine composites natively (WebKit/Wayland subsurface). The
+        // browser region is kept fully transparent so the subsurface shows
+        // through; an opaque animation there would occlude it.
+        let want_anim = (should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
             || self.surface_drifted
-            || host_is_loading;
+            || host_is_loading)
+            && !host_supports_native;
 
         // Idle short-circuit. If nothing has changed since the last paint —
         // chrome buffer up to date, no fresh CEF paint queued, no animation
