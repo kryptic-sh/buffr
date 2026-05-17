@@ -466,6 +466,22 @@ fn render_worker(
         cmd.surface_texture.present();
         let present_us = (render_start.elapsed().as_micros() as u64).saturating_sub(submit_done_us);
 
+        // Run wgpu's lazy-drop GC.  Without an explicit poll the
+        // resources we dropped on the Rust side (old swapchain images
+        // after surface.configure during a resize, old chrome
+        // textures after reallocate_chrome, old OSR textures on dim
+        // change) stay alive inside wgpu's internal queue until the
+        // device is polled — sustained rapid resize / churn never
+        // gets a chance to GC and the 32-bit GPU address space hits
+        // OOM at `surface.get_current_texture` within ~5 seconds.
+        //
+        // PollType::Poll is non-blocking: it processes whatever
+        // command buffers have completed since the last poll and
+        // runs the matching destructors, without waiting for any
+        // in-flight GPU work.  Called once per submitted frame so
+        // every wgpu drop is reclaimed within at most one frame.
+        let _ = state.device.poll(wgpu::PollType::Poll);
+
         tracing::trace!(submit_done_us, present_us, "render_worker: frame done");
         if submit_done_us > 16_000 || present_us > 16_000 {
             tracing::debug!(submit_done_us, present_us, "render_worker: slow frame");
