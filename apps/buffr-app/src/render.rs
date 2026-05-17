@@ -570,26 +570,46 @@ impl Renderer {
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or_else(|| caps.formats[0]);
 
-        // Prefer PreMultiplied alpha so the wgpu surface itself can carry
-        // per-pixel transparency (required for native-compositing backends
-        // where the chrome quad's browser region is fully transparent and
-        // must let the underlying Wayland subsurface show through).
-        let composite_alpha = if caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else if caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PostMultiplied
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Auto) {
-            wgpu::CompositeAlphaMode::Auto
+        // Prefer Opaque composite alpha.  WebKit's OSR pixels carry their
+        // own alpha channel — Google's homepage background, for example,
+        // ships with alpha < 255 in regions.  With a PreMultiplied
+        // surface the compositor blends our window's per-pixel alpha
+        // against the desktop background, producing visible semi-
+        // transparency in the viewport.
+        //
+        // Opaque tells the compositor to discard our alpha channel and
+        // treat the surface as fully opaque, which is the correct
+        // semantic for OSR (we own all the pixels in the window).  The
+        // native-compositing path (Phase 3 v1, BUFFR_WEBKIT_NATIVE=1)
+        // needs PreMultiplied so the chrome quad's transparent region
+        // lets the underlying wl_subsurface show through; until that
+        // path is closed, OSR wins the default.
+        let want_native = std::env::var_os("BUFFR_WEBKIT_NATIVE").is_some_and(|v| v == "1");
+        let alpha_priority: &[wgpu::CompositeAlphaMode] = if want_native {
+            &[
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+                wgpu::CompositeAlphaMode::Auto,
+                wgpu::CompositeAlphaMode::Opaque,
+            ]
         } else {
-            wgpu::CompositeAlphaMode::Opaque
+            &[
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Auto,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+            ]
         };
-        tracing::info!(?composite_alpha, "wgpu composite_alpha selected");
+        let composite_alpha = alpha_priority
+            .iter()
+            .find(|m| caps.alpha_modes.contains(m))
+            .copied()
+            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+        tracing::info!(
+            ?composite_alpha,
+            want_native,
+            "wgpu composite_alpha selected"
+        );
 
         // Preference order: Mailbox → Immediate → Fifo.
         //
