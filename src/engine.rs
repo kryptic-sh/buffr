@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use crate::{
     AudioEvent, ClipboardReader, ContextMenuRequest, EngineError, FaviconUpdate, HintAction,
-    HintStatus, MouseButton, NeutralKeyEvent, PermissionsQueue, PromptOutcome, SharedOsrFrame,
-    SharedOsrViewState, TabId, TabSummary,
+    HintStatus, MouseButton, NativeRect, NeutralKeyEvent, PermissionsQueue, PromptOutcome,
+    SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
     popup::{PopupCloseSink, PopupCreateSink, PopupQueue},
 };
 
@@ -782,6 +782,55 @@ pub trait BrowserEngine: Send + Sync {
     fn dispatch(&self, _action: &buffr_modal::PageAction) {
         tracing::debug!("BrowserEngine::dispatch: not implemented by this backend");
     }
+
+    // ── Native compositing (Phase 3, #109) ───────────────────────────────────
+    //
+    // Three-method API surface for backends that can render directly into a
+    // host-provided native surface (Wayland wl_surface today; X11 / Cocoa
+    // later). Default is "OSR-only": all three are no-ops, so existing
+    // backends compile + behave unchanged.
+
+    /// `true` when the backend supports native compositing into a host-
+    /// provided surface. When true, the apps layer should:
+    ///   1. Call [`Self::set_native_parent`] with a `RawWindowHandle` to the
+    ///      host's surface (e.g. winit's `wl_surface`) and the browser rect
+    ///      within it.
+    ///   2. Skip the OSR drain in its render loop — engine pixels arrive
+    ///      directly via the platform-native compositor.
+    ///   3. Render its chrome with alpha (transparent over the browser
+    ///      region) so the engine's native surface shows through.
+    ///   4. Call [`Self::set_native_visible`] on tab activation / window
+    ///      occlusion.
+    ///
+    /// Default: `false` (CEF and other backends without native compositing).
+    fn supports_native(&self) -> bool {
+        false
+    }
+
+    /// Bind the engine to a parent native surface + viewport rect within it.
+    ///
+    /// `parent` is a [`raw_window_handle::RawWindowHandle`] — Wayland's
+    /// `WaylandWindowHandle::surface` carries the host `wl_surface`. The
+    /// engine creates a child surface (Wayland subsurface, X11 child window,
+    /// etc.) positioned at `rect` and renders into it.
+    ///
+    /// Calling again with a new parent or rect repositions / re-parents.
+    ///
+    /// Default: no-op.
+    fn set_native_parent(
+        &self,
+        _parent: raw_window_handle::RawWindowHandle,
+        _rect: NativeRect,
+    ) {
+    }
+
+    /// Show or hide the engine's native surface attachment without tearing
+    /// it down. Used by the apps layer for tab switching: only the active
+    /// tab's native surface should be visible; others stay attached but
+    /// hidden so reactivation is instant.
+    ///
+    /// Default: no-op.
+    fn set_native_visible(&self, _visible: bool) {}
 }
 
 #[cfg(test)]
