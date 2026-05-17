@@ -16,7 +16,8 @@
 //! (unlike GTK4), so the worker creates its own `glib::MainLoop::new(None, false)`
 //! and immediately owns it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -24,8 +25,11 @@ use std::time::Duration;
 use buffr_core::favicon::{FaviconSink, new_favicon_sink};
 use buffr_core::hint::{HintEventSink, new_hint_event_sink};
 use buffr_downloads::Downloads;
+use buffr_engine::permissions::{PermissionsQueue, new_queue as new_permissions_queue};
 use buffr_engine::popup::{PopupQueue, new_popup_queue};
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+use buffr_engine::{PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
+
+use super::runtime::WpePermissionRequestPtr;
 
 use super::error::WebKitError;
 use super::ffi::{
@@ -199,6 +203,14 @@ pub(crate) enum Command {
     StartDownload {
         url: String,
     },
+    /// Resolve a pending permission request.
+    ///
+    /// `resolve_id` matches a key in `WpeRuntime::pending_permissions`.
+    /// `outcome` is mapped to `webkit_permission_request_allow/deny`.
+    ResolvePermission {
+        resolve_id: String,
+        outcome: PromptOutcome,
+    },
     Shutdown,
 }
 
@@ -231,6 +243,15 @@ pub(crate) struct WorkerHandle {
     /// Favicon decode sink. Written by the per-tab `buffrFavicon` UCM handler
     /// (background thread); drained by `WebKitEngine::drain_favicon_updates`.
     pub favicon_sink: FaviconSink,
+    /// Permissions queue. Written by the `permission-request` signal handler on
+    /// each WebView; drained by the apps layer via `BrowserEngine::permissions_queue`.
+    pub permissions_queue: PermissionsQueue,
+    /// Map resolve_id → g_object_ref'd WebKitPermissionRequest ptr.
+    /// Written on the worker thread from the signal handler; consumed by
+    /// `Command::ResolvePermission` on the worker thread.
+    pub pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
+    /// Monotonic counter for minting resolve_ids.
+    pub permission_next_id: Arc<AtomicU64>,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -313,6 +334,16 @@ pub(crate) fn spawn(
     // threads (writers) share the same Arc.
     let favicon_sink: FaviconSink = new_favicon_sink();
 
+    // Shared permissions queue + pending map + id counter. Allocated here so
+    // both `WebKitEngine` (drainer via `permissions_queue`) and the GLib
+    // worker thread (writer, via TabEntry's `permission-request` signal) share
+    // the same Arcs. The map and counter are also used inside the worker's
+    // `Command::ResolvePermission` handler.
+    let permissions_queue: PermissionsQueue = new_permissions_queue();
+    let pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let permission_next_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
@@ -321,6 +352,9 @@ pub(crate) fn spawn(
     let favicon_sink_worker = Arc::clone(&favicon_sink);
     let can_go_back_worker = Arc::clone(&can_go_back);
     let can_go_forward_worker = Arc::clone(&can_go_forward);
+    let permissions_queue_worker = Arc::clone(&permissions_queue);
+    let pending_permissions_worker = Arc::clone(&pending_permissions);
+    let permission_next_id_worker = Arc::clone(&permission_next_id);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -373,6 +407,9 @@ pub(crate) fn spawn(
                 favicon_sink_worker,
                 can_go_back_worker,
                 can_go_forward_worker,
+                permissions_queue_worker,
+                pending_permissions_worker,
+                permission_next_id_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -553,6 +590,9 @@ pub(crate) fn spawn(
         popup_queue,
         context_menu_sink,
         favicon_sink,
+        permissions_queue,
+        pending_permissions,
+        permission_next_id,
         thread: Some(thread),
     })
 }
@@ -644,6 +684,12 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::StartDownload { url } => {
             rt.start_download(&url);
+        }
+        Command::ResolvePermission {
+            resolve_id,
+            outcome,
+        } => {
+            rt.resolve_permission(&resolve_id, outcome);
         }
         Command::Shutdown => {
             ml.quit();

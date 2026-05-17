@@ -4,7 +4,7 @@
 //! Tab state is read from the shared `Arc<Mutex<EngineState>>`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use buffr_core::hint::{
@@ -15,14 +15,17 @@ use buffr_downloads::Downloads;
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, ClipboardRead, ContextMenuRequest, EngineError, HintAction,
     HintStatus, MouseButton, NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState,
-    SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
     engine_id::EngineId,
     internal_server::InternalServer,
     newtab::{default_newtab_html, default_settings_html, translate_internal_url},
+    permissions::PermissionsQueue,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
     },
 };
+
+use super::runtime::WpePermissionRequestPtr;
 
 use super::error::WebKitError;
 use super::runtime::WpeContextMenuSink;
@@ -96,6 +99,17 @@ pub struct WebKitEngine {
     /// System clipboard reader. `None` when clipboard initialisation failed at
     /// startup (e.g. headless / SSH without OSC-52 fallback).
     clipboard_reader: Option<std::sync::Arc<super::clipboard::WebKitClipboardReader>>,
+    /// Shared permissions queue — cloned from the worker's queue so the apps
+    /// layer drains the same VecDeque the signal handler pushes into.
+    permissions_queue: PermissionsQueue,
+    /// Map resolve_id → g_object_ref'd WebKitPermissionRequest ptr. Shared
+    /// with the GLib worker thread. Kept here for the `resolve_permission`
+    /// command dispatch path.
+    #[allow(dead_code)]
+    pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
+    /// Monotonic counter for resolve_ids. Shared with the GLib worker.
+    #[allow(dead_code)]
+    permission_next_id: Arc<AtomicU64>,
 }
 
 impl WebKitEngine {
@@ -235,6 +249,14 @@ impl WebKitEngine {
         // drains the same queue the background fetch threads push into.
         let favicon_sink = Arc::clone(&worker.favicon_sink);
 
+        // Share the permissions queue + pending map + id counter created in spawn.
+        // The apps layer calls permissions_queue() to get the Arc; the worker
+        // thread's signal handler and Command::ResolvePermission handler both use
+        // the pending_permissions and permission_next_id Arcs through WpeRuntime.
+        let permissions_queue = Arc::clone(&worker.permissions_queue);
+        let pending_permissions = Arc::clone(&worker.pending_permissions);
+        let permission_next_id = Arc::clone(&worker.permission_next_id);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -271,6 +293,9 @@ impl WebKitEngine {
             can_go_back,
             can_go_forward,
             clipboard_reader: super::clipboard::WebKitClipboardReader::new(),
+            permissions_queue,
+            pending_permissions,
+            permission_next_id,
         })
     }
 
@@ -966,6 +991,23 @@ impl BrowserEngine for WebKitEngine {
 
     fn any_video_active(&self) -> bool {
         false
+    }
+
+    // ── Permissions (#138) ────────────────────────────────────────────────────
+
+    fn permissions_queue(&self) -> PermissionsQueue {
+        self.permissions_queue.clone()
+    }
+
+    fn resolve_permission(&self, resolve_id: Option<&str>, outcome: PromptOutcome) {
+        let Some(id) = resolve_id else {
+            tracing::debug!("webkit: resolve_permission called with no resolve_id (no-op)");
+            return;
+        };
+        self.send(Command::ResolvePermission {
+            resolve_id: id.to_owned(),
+            outcome,
+        });
     }
 
     // ── Popup sinks ───────────────────────────────────────────────────────────

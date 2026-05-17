@@ -11,14 +11,17 @@
 //! Until those subclasses land, `TabEntry::new` returns `None` and tabs
 //! fail to open.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
+use buffr_engine::permissions::{PendingPermission, PermissionsQueue};
 use buffr_engine::popup::PopupQueue;
 use buffr_engine::types::MediaType;
-use buffr_engine::{ContextMenuRequest, SharedOsrFrame, SharedOsrViewState, TabId};
+use buffr_engine::{ContextMenuRequest, PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId};
 
 /// Thread-safe context-menu request queue for the WPE backend.
 ///
@@ -117,6 +120,35 @@ unsafe extern "C" {
         destroy: Option<unsafe extern "C" fn(*mut std::os::raw::c_void)>,
     ) -> *mut super::ffi::GInputStream;
 }
+
+// SAFETY: g_type_check_instance_is_a is a GLib type system function not in
+// the bindgen allowlist (the GTypeInstance introspection helpers were excluded).
+// Returns TRUE when `instance` is-a `iface_type` (including inherited types).
+// Equivalent to G_TYPE_CHECK_INSTANCE_TYPE / G_IS_OBJECT macros.
+unsafe extern "C" {
+    fn g_type_check_instance_is_a(
+        instance: *mut std::os::raw::c_void,
+        iface_type: super::ffi::GType,
+    ) -> super::ffi::gboolean;
+}
+
+// ── WpePermissionRequestPtr ───────────────────────────────────────────────────
+
+/// Opaque wrapper around a `*mut WebKitPermissionRequest` that is safe to
+/// send across threads.
+///
+/// Safety contract (mirrors `WpeBufferPtr` in wpe_subclass.rs):
+/// - The pointer is produced by `g_object_ref` in the signal handler; the ref
+///   is released exactly once in `resolve_permission` (or the engine drop path)
+///   via `g_object_unref`.
+/// - Raw pointer access is only ever performed on the GLib worker thread.
+/// - The `Arc<Mutex<HashMap<…, WpePermissionRequestPtr>>>` (`pending_permissions`)
+///   is the sole owner between signal fire and resolve; `Arc<AtomicU64>` is used
+///   only to mint IDs with no pointer access.
+#[repr(transparent)]
+pub(crate) struct WpePermissionRequestPtr(pub(crate) *mut super::ffi::WebKitPermissionRequest);
+unsafe impl Send for WpePermissionRequestPtr {}
+unsafe impl Sync for WpePermissionRequestPtr {}
 
 // Console-bridge JS injected at document start. Overrides console.log to
 // forward messages with the buffr hint sentinel to the native `buffrHint`
@@ -278,6 +310,14 @@ pub(crate) struct TabSignalCtx {
     /// Valid for the signal handler's lifetime because the handler is
     /// disconnected (in `TabEntry::Drop`) before the WebView is unreffed.
     web_view: *mut WebKitWebView,
+    /// Shared permissions queue — permission-request signal handler pushes
+    /// `PendingPermission` entries here for the apps layer to drain.
+    permissions_queue: PermissionsQueue,
+    /// Map of resolve_id → g_object_ref'd WebKitPermissionRequest ptr.
+    /// Written by the signal handler; consumed by Command::ResolvePermission.
+    pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
+    /// Monotonic counter for minting resolve_ids. Starts at 1.
+    permission_next_id: Arc<AtomicU64>,
 }
 
 // SAFETY: TabSignalCtx carries a raw `*mut WebKitWebView` that is only
@@ -1043,6 +1083,25 @@ fn extract_host_from_uri(uri: &str) -> String {
     host_port.to_owned()
 }
 
+/// Extract `scheme://host[:port]` from a URI for use as a permission origin.
+/// Keeps the scheme (unlike `extract_host_from_uri`) so the apps layer can
+/// distinguish `https://` from `http://` origins in the prompt strip.
+fn extract_origin_from_uri(uri: &str) -> String {
+    // Find the scheme boundary.
+    let Some(scheme_end) = uri.find("://") else {
+        // No scheme — return raw string so the caller still has something.
+        return uri.to_owned();
+    };
+    let scheme = &uri[..scheme_end];
+    let after_scheme = &uri[scheme_end + 3..];
+    // Take up to the first path separator.
+    let host_port = after_scheme
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(after_scheme);
+    format!("{scheme}://{host_port}")
+}
+
 // ── Context-menu signal (#121) ────────────────────────────────────────────────
 
 /// Heap context for the `context-menu` signal. Carries the context-menu sink
@@ -1311,23 +1370,141 @@ unsafe extern "C" fn on_decide_policy(
 /// `permission-request` on `WebKitWebView`.
 ///
 /// Signal prototype: `(WebKitWebView*, WebKitPermissionRequest*, gpointer)` → gboolean.
-/// Returns TRUE (handled). We auto-deny all permission requests with a
-/// `tracing::warn`; persistent per-origin grants are out of scope for phase 1.
+/// Returns TRUE (handled). We g_object_ref the request to keep it alive past
+/// signal return, classify the capability via GType introspection, push a
+/// `PendingPermission` to the shared queue for the apps layer, and resolve
+/// it later when `Command::ResolvePermission` arrives.
 ///
-/// user_data is NULL — no context needed.
+/// `user_data` is a `*const TabSignalCtx` (same lifecycle as the other signals).
 unsafe extern "C" fn on_permission_request(
-    _web_view: *mut WebKitWebView,
+    web_view: *mut WebKitWebView,
     request: *mut WebKitPermissionRequest,
-    _user_data: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
 ) -> gboolean {
-    if !request.is_null() {
-        tracing::warn!(
-            "webkit: permission-request auto-denied \
-             (persistent grants not yet supported in buffr-webkit phase 1)"
-        );
-        unsafe { webkit_permission_request_deny(request) };
+    use super::ffi::{
+        webkit_geolocation_permission_request_get_type,
+        webkit_notification_permission_request_get_type,
+        webkit_user_media_permission_is_for_audio_device,
+        webkit_user_media_permission_is_for_video_device,
+        webkit_user_media_permission_request_get_type,
+        webkit_website_data_access_permission_request_get_type,
+    };
+    use buffr_permissions::Capability;
+
+    if request.is_null() || user_data.is_null() {
+        // No request or no context — auto-deny to be safe.
+        if !request.is_null() {
+            unsafe { webkit_permission_request_deny(request) };
+        }
+        return 1;
     }
-    // Return TRUE: signal handled (prevents the default allow behaviour).
+
+    // SAFETY: user_data is an Arc<TabSignalCtx> produced by Arc::into_raw.
+    let ctx = unsafe { &*(user_data as *const TabSignalCtx) };
+
+    // Keep request alive past signal return. We'll g_object_unref in resolve.
+    unsafe { g_object_ref(request as *mut _) };
+
+    // ── Classify capability by GType ─────────────────────────────────────────
+    let mut capabilities: Vec<Capability> = Vec::new();
+    let request_void = request as *mut std::os::raw::c_void;
+
+    // User media (camera / microphone)?
+    let user_media_type = unsafe { webkit_user_media_permission_request_get_type() };
+    if unsafe { g_type_check_instance_is_a(request_void, user_media_type) } != 0 {
+        let um = request as *mut super::ffi::WebKitUserMediaPermissionRequest;
+        if unsafe { webkit_user_media_permission_is_for_audio_device(um) } != 0 {
+            capabilities.push(Capability::Microphone);
+        }
+        if unsafe { webkit_user_media_permission_is_for_video_device(um) } != 0 {
+            capabilities.push(Capability::Camera);
+        }
+        // If neither flag is set, treat as microphone (shouldn't happen but be safe).
+        if capabilities.is_empty() {
+            capabilities.push(Capability::Microphone);
+        }
+    }
+    // Geolocation?
+    else if unsafe {
+        g_type_check_instance_is_a(
+            request_void,
+            webkit_geolocation_permission_request_get_type(),
+        )
+    } != 0
+    {
+        capabilities.push(Capability::Geolocation);
+    }
+    // Notifications?
+    else if unsafe {
+        g_type_check_instance_is_a(
+            request_void,
+            webkit_notification_permission_request_get_type(),
+        )
+    } != 0
+    {
+        capabilities.push(Capability::Notifications);
+    }
+    // Website data access (storage, cookies cross-site)?
+    else if unsafe {
+        g_type_check_instance_is_a(
+            request_void,
+            webkit_website_data_access_permission_request_get_type(),
+        )
+    } != 0
+    {
+        // WebsiteDataAccess is a cross-site storage / cookie-access prompt.
+        // Map to Other(0) — no single `Capability` variant covers it yet.
+        capabilities.push(Capability::Other(0));
+    }
+    // Unknown subclass.
+    else {
+        capabilities.push(Capability::Other(0));
+    }
+
+    // ── Extract origin from the WebView URI ───────────────────────────────────
+    let origin = if !web_view.is_null() {
+        let uri_ptr = unsafe { webkit_web_view_get_uri(web_view) };
+        if uri_ptr.is_null() {
+            String::new()
+        } else {
+            extract_origin_from_uri(
+                unsafe { CStr::from_ptr(uri_ptr) }
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+        }
+    } else {
+        String::new()
+    };
+
+    // ── Mint resolve_id ───────────────────────────────────────────────────────
+    let resolve_id = ctx
+        .permission_next_id
+        .fetch_add(1, AtomicOrdering::Relaxed)
+        .to_string();
+
+    tracing::debug!(
+        origin,
+        resolve_id,
+        ?capabilities,
+        "webkit: permission-request — queued for apps layer"
+    );
+
+    // ── Store ptr in pending map ──────────────────────────────────────────────
+    if let Ok(mut map) = ctx.pending_permissions.lock() {
+        map.insert(resolve_id.clone(), WpePermissionRequestPtr(request));
+    }
+
+    // ── Push PendingPermission to shared queue ────────────────────────────────
+    if let Ok(mut q) = ctx.permissions_queue.lock() {
+        q.push_back(PendingPermission {
+            origin,
+            capabilities,
+            resolve_id: Some(resolve_id),
+        });
+    }
+
+    // Return TRUE: signal is handled; WebKit won't auto-allow.
     1
 }
 
@@ -1398,6 +1575,9 @@ impl TabEntry {
         favicon_sink: buffr_core::favicon::FaviconSink,
         can_go_back: Arc<std::sync::atomic::AtomicBool>,
         can_go_forward: Arc<std::sync::atomic::AtomicBool>,
+        permissions_queue: PermissionsQueue,
+        pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
+        permission_next_id: Arc<AtomicU64>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -1464,6 +1644,9 @@ impl TabEntry {
             can_go_back,
             can_go_forward,
             web_view,
+            permissions_queue,
+            pending_permissions,
+            permission_next_id,
         });
         let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
             let signal_c = CString::new(signal).unwrap();
@@ -1922,6 +2105,11 @@ impl TabEntry {
         };
 
         let permission_request_id: u64 = {
+            // Pass a per-connection Arc<TabSignalCtx> clone as user_data so
+            // the signal handler can access the queue + pending map.
+            // drop_tab_signal_ctx handles the Arc decrement on disconnect.
+            let arc_clone = Arc::clone(&ctx);
+            let user_data = Arc::into_raw(arc_clone) as *mut std::os::raw::c_void;
             let signal_c = CString::new("permission-request").unwrap();
             unsafe {
                 g_signal_connect_data(
@@ -1935,8 +2123,8 @@ impl TabEntry {
                         ) -> gboolean,
                         unsafe extern "C" fn(),
                     >(on_permission_request)),
-                    std::ptr::null_mut(),
-                    None,
+                    user_data,
+                    Some(drop_tab_signal_ctx),
                     0,
                 )
             }
@@ -2195,6 +2383,16 @@ pub(crate) struct WpeRuntime {
     /// by `WebKitEngine::can_go_back` / `can_go_forward`.
     pub can_go_back: Arc<std::sync::atomic::AtomicBool>,
     pub can_go_forward: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared permissions queue — pushed from `on_permission_request` on the
+    /// GLib worker thread; drained by `WebKitEngine::permissions_queue` on any
+    /// thread.
+    pub permissions_queue: PermissionsQueue,
+    /// Map resolve_id → g_object_ref'd WebKitPermissionRequest ptr. Written
+    /// by the GLib worker's signal handler; consumed by the worker's
+    /// `Command::ResolvePermission` handler.
+    pub pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
+    /// Monotonic id counter for resolve_ids.
+    pub permission_next_id: Arc<AtomicU64>,
 }
 
 impl WpeRuntime {
@@ -2211,6 +2409,9 @@ impl WpeRuntime {
         favicon_sink: buffr_core::favicon::FaviconSink,
         can_go_back: Arc<std::sync::atomic::AtomicBool>,
         can_go_forward: Arc<std::sync::atomic::AtomicBool>,
+        permissions_queue: PermissionsQueue,
+        pending_permissions: Arc<Mutex<HashMap<String, WpePermissionRequestPtr>>>,
+        permission_next_id: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -2303,6 +2504,9 @@ impl WpeRuntime {
             context_menu_sink,
             can_go_back,
             can_go_forward,
+            permissions_queue,
+            pending_permissions,
+            permission_next_id,
         })
     }
 
@@ -2386,6 +2590,9 @@ impl WpeRuntime {
             Arc::clone(&self.favicon_sink),
             Arc::clone(&self.can_go_back),
             Arc::clone(&self.can_go_forward),
+            Arc::clone(&self.permissions_queue),
+            Arc::clone(&self.pending_permissions),
+            Arc::clone(&self.permission_next_id),
         );
 
         let entry = match entry {
@@ -3022,5 +3229,88 @@ impl WpeRuntime {
         }
         tracing::info!("webkit: open_devtools: inspector toggled");
         Ok(())
+    }
+
+    /// Resolve a pending permission request identified by `resolve_id`.
+    ///
+    /// Called from the GLib worker's command handler when
+    /// `Command::ResolvePermission` arrives. Looks up the stored
+    /// `WebKitPermissionRequest*`, fires allow or deny, and drops our
+    /// g_object_ref via g_object_unref.
+    ///
+    /// `remember` flag: persistence is out of scope for this PR — both
+    /// `Allow { remember: true }` and `Allow { remember: false }` call
+    /// `webkit_permission_request_allow` (allow once). Both `Deny` variants
+    /// and `Defer` call deny. A follow-up issue should add per-origin storage.
+    pub(crate) fn resolve_permission(&self, resolve_id: &str, outcome: PromptOutcome) {
+        use super::ffi::{webkit_permission_request_allow, webkit_permission_request_deny};
+
+        let ptr = match self.pending_permissions.lock() {
+            Ok(mut map) => map.remove(resolve_id),
+            Err(_) => {
+                tracing::warn!(
+                    resolve_id,
+                    "webkit: resolve_permission — pending_permissions mutex poisoned"
+                );
+                return;
+            }
+        };
+
+        let Some(WpePermissionRequestPtr(raw)) = ptr else {
+            tracing::debug!(
+                resolve_id,
+                "webkit: resolve_permission — resolve_id not found (already resolved?)"
+            );
+            return;
+        };
+
+        if raw.is_null() {
+            return;
+        }
+
+        // SAFETY: raw was g_object_ref'd in on_permission_request and kept
+        // alive in pending_permissions. We are on the GLib worker thread.
+        // After allow/deny WebKit has completed its internal handling; we then
+        // release our ref via g_object_unref.
+        unsafe {
+            match outcome {
+                PromptOutcome::Allow { .. } => {
+                    tracing::debug!(resolve_id, "webkit: permission allowed");
+                    webkit_permission_request_allow(raw);
+                }
+                PromptOutcome::Deny { .. } | PromptOutcome::Defer => {
+                    tracing::debug!(resolve_id, ?outcome, "webkit: permission denied/deferred");
+                    webkit_permission_request_deny(raw);
+                }
+            }
+            g_object_unref(raw as *mut _);
+        }
+    }
+}
+
+impl Drop for WpeRuntime {
+    fn drop(&mut self) {
+        // Drain any unresolved permission requests — deny them all and release
+        // the g_object_ref we took in on_permission_request. Without this,
+        // WebKit's network/media process holds the request pending forever.
+        use super::ffi::webkit_permission_request_deny;
+        let pending: Vec<(String, WpePermissionRequestPtr)> = self
+            .pending_permissions
+            .lock()
+            .map(|mut map| map.drain().collect())
+            .unwrap_or_default();
+        for (id, WpePermissionRequestPtr(raw)) in pending {
+            if !raw.is_null() {
+                tracing::debug!(
+                    id,
+                    "webkit: WpeRuntime drop — deny + unref pending permission"
+                );
+                // SAFETY: raw is still valid; we hold the only remaining ref.
+                unsafe {
+                    webkit_permission_request_deny(raw);
+                    g_object_unref(raw as *mut _);
+                }
+            }
+        }
     }
 }
