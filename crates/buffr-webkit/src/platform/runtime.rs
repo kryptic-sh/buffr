@@ -3477,6 +3477,13 @@ impl WpeRuntime {
                     // SAFETY: d is a connected WPEDisplayWayland; set as primary.
                     unsafe { wpe_display_set_primary(d) };
                     tracing::info!("webkit: WPEDisplayWayland connected + set as primary (#144)");
+                    // #151: debug marker — WaylandNativeHandles from the host window
+                    // will be stored on WebKitEngine after construction and consumed
+                    // by BuffrDisplayWayland (#152).
+                    tracing::debug!(
+                        "webkit: WPEDisplayWayland path active; \
+                         awaiting WaylandNativeHandles from host (#151)"
+                    );
                     WpeDisplayKind::Wayland(d)
                 }
             }

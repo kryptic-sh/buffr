@@ -174,6 +174,8 @@ mod loading_anim;
 mod render;
 mod session;
 mod single_instance;
+#[cfg(target_os = "linux")]
+mod wayland_globals;
 use buffr_engine::MouseButton as NeutralMouseButton;
 use clap::Parser;
 use tempfile::TempDir;
@@ -2396,6 +2398,15 @@ struct AppState {
     /// or connect failed). Ticked every `about_to_wait`; on write error the
     /// field is set back to `None` (supervisor detects the silence and kills).
     heartbeat: Option<heartbeat::Heartbeat>,
+    /// Raw Wayland + EGL handles extracted from the winit window (#151).
+    ///
+    /// Populated in `resumed` on Wayland sessions immediately after window
+    /// creation.  `None` on non-Wayland sessions (X11, macOS, Windows,
+    /// headless).  Passed to each WebKit engine via
+    /// `WebKitEngine::set_native_wayland_handles` so the upcoming
+    /// `BuffrDisplayWayland` C subclass (#152) can read them.
+    #[cfg(target_os = "linux")]
+    wayland_native_handles: Option<buffr_engine::WaylandNativeHandles>,
 }
 
 /// OSR paint policy for the window.
@@ -2730,6 +2741,8 @@ impl AppState {
             window_focused: false,
             context_menu: None,
             heartbeat: None,
+            #[cfg(target_os = "linux")]
+            wayland_native_handles: None,
         }
     }
 
@@ -7221,6 +7234,76 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         };
         let window = Arc::new(window);
 
+        // ── Wayland native handle extraction (#151) ───────────────────────────
+        //
+        // Extract wl_display + wl_surface from the winit window's raw handles.
+        // On Wayland sessions these are NonNull pointers to the live connection
+        // owned by winit's backend; they remain valid for the process lifetime.
+        // On X11 / macOS / Windows the match falls through to None and no
+        // Wayland-specific code runs.
+        //
+        // After extracting the display pointer we do a synchronous registry
+        // roundtrip to bind wl_compositor and wl_subcompositor — they are
+        // needed by the BuffrDisplayWayland subsurface subclass (#152).  The
+        // roundtrip is safe here because winit has not yet run the main loop
+        // (we are in the `resumed` callback before the first event iteration)
+        // and we use winit's *existing* wl_display, so we don't open a second
+        // Wayland socket.
+        #[cfg(target_os = "linux")]
+        {
+            use raw_window_handle::{
+                HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+            };
+            let dh = window.display_handle().ok().map(|h| h.as_raw());
+            let wh = window.window_handle().ok().map(|h| h.as_raw());
+            match (dh, wh) {
+                (Some(RawDisplayHandle::Wayland(d)), Some(RawWindowHandle::Wayland(w))) => {
+                    let wl_display = d.display.as_ptr() as *mut std::ffi::c_void;
+                    let parent_wl_surface = w.surface.as_ptr() as *mut std::ffi::c_void;
+                    // Bind compositor + subcompositor via registry roundtrip.
+                    // SAFETY: wl_display is winit's live display pointer, valid for
+                    // the process lifetime.  Roundtrip fires synchronously before
+                    // the GLib worker is started, so there is no concurrent Wayland
+                    // access from our side.
+                    let (wl_compositor, wl_subcompositor) =
+                        unsafe { wayland_globals::bind_compositor_globals(wl_display) };
+                    if wl_compositor.is_null() {
+                        tracing::warn!(
+                            "wayland_globals: wl_compositor not found in registry; \
+                             #152 subsurface path will be degraded"
+                        );
+                    }
+                    if wl_subcompositor.is_null() {
+                        tracing::warn!(
+                            "wayland_globals: wl_subcompositor not found in registry; \
+                             #152 subsurface path will be degraded"
+                        );
+                    }
+                    let handles = buffr_engine::WaylandNativeHandles {
+                        wl_display,
+                        parent_wl_surface,
+                        wl_compositor,
+                        wl_subcompositor,
+                        // EGL display deferred to #152 — the BuffrDisplayWayland
+                        // C subclass initialises its own EGL platform display
+                        // using the wl_display pointer above.
+                        egl_display: std::ptr::null_mut(),
+                    };
+                    tracing::debug!(
+                        wl_display = ?wl_display,
+                        parent_wl_surface = ?parent_wl_surface,
+                        wl_compositor_null = wl_compositor.is_null(),
+                        wl_subcompositor_null = wl_subcompositor.is_null(),
+                        "wayland native handles extracted (#151)"
+                    );
+                    self.wayland_native_handles = Some(handles);
+                }
+                _ => {
+                    // Non-Wayland session (X11, headless).  No native handles.
+                }
+            }
+        }
+
         // Pass the same page viewport used by later resize events so
         // CEF paints the first frame in the area below the tab strip and
         // above the statusline.
@@ -7664,6 +7747,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             // Wire the edit-mode event sink so buffrEdit UCM
                             // messages from edit.js reach drain_edit_events (#134).
                             engine.set_edit_sink(self.edit_sink.clone());
+                            // Pass native Wayland handles so #152
+                            // (BuffrDisplayWayland) can read wl_display,
+                            // wl_surface, wl_compositor, and wl_subcompositor
+                            // without going back through the winit window.
+                            // No-op on non-Wayland sessions (field is None).
+                            #[cfg(target_os = "linux")]
+                            if let Some(handles) = self.wayland_native_handles {
+                                engine.set_native_wayland_handles(handles);
+                            }
                             // Log native-compositing capability so #144+ work can
                             // verify the gate fires on the right sessions.
                             // Phase 3 of #109 — real subsurface attach lands later.

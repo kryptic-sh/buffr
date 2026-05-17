@@ -130,6 +130,12 @@ pub struct WebKitEngine {
     /// `buffr_core::edit::drain_edit_events`. Populated by `set_edit_sink`
     /// after construction; `None` until the apps layer calls that setter.
     edit_sink: Arc<Mutex<Option<EditEventSink>>>,
+    /// Native Wayland + EGL handles extracted from the host winit window
+    /// (#151).  `None` on non-Wayland sessions or before the apps layer
+    /// calls `set_native_wayland_handles`.  Stored here for the upcoming
+    /// `BuffrDisplayWayland` C subclass (#152) to read; nothing consumes
+    /// these pointers yet.
+    wayland_handles: Mutex<Option<buffr_engine::WaylandNativeHandles>>,
 }
 
 impl WebKitEngine {
@@ -334,6 +340,7 @@ impl WebKitEngine {
             cursor_state,
             video_active,
             edit_sink,
+            wayland_handles: Mutex::new(None),
         })
     }
 
@@ -365,6 +372,20 @@ impl WebKitEngine {
         if let Ok(mut g) = self.edit_sink.lock() {
             *g = Some(sink);
         }
+    }
+
+    /// Store raw Wayland + EGL handles from the host window (#151).
+    ///
+    /// Called by `buffr-app` after construction on Wayland sessions.  The
+    /// handles are held here until the `BuffrDisplayWayland` C subclass (#152)
+    /// reads them to open a shared `wl_display` connection.  No-op on
+    /// non-Wayland sessions (apps layer gates the call on the display handle
+    /// variant check).  Safe to call multiple times — replaces previous value.
+    pub fn set_native_wayland_handles(&self, handles: buffr_engine::WaylandNativeHandles) {
+        if let Ok(mut g) = self.wayland_handles.lock() {
+            *g = Some(handles);
+        }
+        tracing::info!("webkit: native wayland handles received");
     }
 
     /// Translate a `buffr://` URL into something the engine can actually

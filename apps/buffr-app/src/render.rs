@@ -574,16 +574,21 @@ impl Renderer {
         // per-pixel transparency (required for native-compositing backends
         // where the chrome quad's browser region is fully transparent and
         // must let the underlying Wayland subsurface show through).
-        let composite_alpha =
-            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-                wgpu::CompositeAlphaMode::PreMultiplied
-            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-                wgpu::CompositeAlphaMode::PostMultiplied
-            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Auto) {
-                wgpu::CompositeAlphaMode::Auto
-            } else {
-                wgpu::CompositeAlphaMode::Opaque
-            };
+        let composite_alpha = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Auto) {
+            wgpu::CompositeAlphaMode::Auto
+        } else {
+            wgpu::CompositeAlphaMode::Opaque
+        };
         tracing::info!(?composite_alpha, "wgpu composite_alpha selected");
 
         // Preference order: Mailbox → Immediate → Fifo.
