@@ -114,6 +114,63 @@ fn build_linux() {
         "cargo:rerun-if-changed=/usr/include/wpe-webkit-2.0/wpe-platform/wpe/wayland/wpe-wayland.h"
     );
 
+    // ── Generate zwp_linux_dmabuf_v1 C bindings via wayland-scanner ────────────
+    //
+    // BuffrViewWayland's render_buffer vmethod wraps DMA-BUF fds into a
+    // wl_buffer using zwp_linux_dmabuf_v1. We generate both the client-header
+    // and the private-code C source from the stable protocol XML, then compile
+    // the generated code as a separate archive.
+    //
+    // This must happen BEFORE compiling wpe_subclasses.c so the generated
+    // header is available (included by BuffrViewWayland code in that file).
+    let xml_candidates = [
+        "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
+        "/usr/share/wayland-protocols/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml",
+    ];
+    let dmabuf_xml = xml_candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .expect(
+            "linux-dmabuf protocol XML not found. \
+             Install wayland-protocols (Arch: pacman -S wayland-protocols).",
+        );
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let dmabuf_hdr = std::path::PathBuf::from(&out_dir).join("linux-dmabuf-client.h");
+    let dmabuf_src = std::path::PathBuf::from(&out_dir).join("linux-dmabuf-client.c");
+
+    let scanner = std::process::Command::new("wayland-scanner")
+        .args(["client-header", dmabuf_xml, dmabuf_hdr.to_str().unwrap()])
+        .status()
+        .expect("wayland-scanner not found — install wayland (Arch: pacman -S wayland)");
+    assert!(scanner.success(), "wayland-scanner client-header failed");
+
+    let scanner2 = std::process::Command::new("wayland-scanner")
+        .args(["private-code", dmabuf_xml, dmabuf_src.to_str().unwrap()])
+        .status()
+        .expect("wayland-scanner failed to run for private-code generation");
+    assert!(scanner2.success(), "wayland-scanner private-code failed");
+
+    println!("cargo:rerun-if-changed={dmabuf_xml}");
+
+    // Compile linux-dmabuf generated C source.
+    let mut dmabuf_build = cc::Build::new();
+    dmabuf_build
+        .file(&dmabuf_src)
+        .flag("-Wno-unused-parameter")
+        .flag("-Wno-cast-function-type")
+        .include("/usr/include");
+    for path in platform_lib
+        .include_paths
+        .iter()
+        .chain(webkit_lib.include_paths.iter())
+        .chain(wayland_lib.include_paths.iter())
+    {
+        dmabuf_build.include(path);
+    }
+    dmabuf_build.compile("buffr_wpe_dmabuf_protocol");
+
     // ── Compile the C bridge ────────────────────────────────────────────────
     //
     // wpe_subclasses.c defines BuffrDisplay/View/Toplevel/Screen as final
@@ -127,11 +184,16 @@ fn build_linux() {
     // libEGL here so the C file resolves those symbols at link time.
     println!("cargo:rustc-link-lib=EGL");
 
+    // Link wayland-client for wl_surface_*, wl_subsurface_*, wl_buffer_* calls.
+    println!("cargo:rustc-link-lib=wayland-client");
+
     let mut build = cc::Build::new();
     build
         .file("csrc/wpe_subclasses.c")
         .flag("-Wno-unused-parameter")
-        .flag("-Wno-cast-function-type");
+        .flag("-Wno-cast-function-type")
+        // wpe_subclasses.c includes the generated linux-dmabuf-client.h from OUT_DIR.
+        .include(&out_dir);
     for path in platform_lib
         .include_paths
         .iter()

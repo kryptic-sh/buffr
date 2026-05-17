@@ -1506,17 +1506,21 @@ impl BrowserEngine for WebKitEngine {
         _parent: buffr_engine::raw_window_handle::RawWindowHandle,
         rect: buffr_engine::NativeRect,
     ) {
-        // Stub. Real impl in #145 sends a Command::SetNativeParent to the
-        // worker which creates the wl_subsurface and attaches WebKit's
-        // wl_surface as child. Log the call so we can verify the apps
-        // layer is wiring it.
+        // Send the rect to the GLib worker thread so wl_subsurface_set_position
+        // and wpe_view_resized run in the right Wayland/GLib context (#153).
         tracing::debug!(
             x = rect.x,
             y = rect.y,
             w = rect.w,
             h = rect.h,
-            "webkit: set_native_parent (stub — Phase 3 #145 pending)"
+            "webkit: set_native_parent → Command::SetNativeRect"
         );
+        self.send(Command::SetNativeRect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        });
     }
 
     fn set_native_visible(&self, visible: bool) {

@@ -57,6 +57,7 @@ use super::worker::EngineState;
 use super::wpe_subclass::{
     BuffrDisplayHandle, BuffrDisplayWaylandHandle, ViewCtx, WlSurfacePtr, WpeDisplayKind,
     ack_pending_buffer, attach_view_ctx, buffr_display_take_last_view, buffr_display_wayland_new,
+    buffr_view_wayland_set_rect,
 };
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────
@@ -4163,6 +4164,38 @@ impl WpeRuntime {
     /// the runtime-wide `video_active` atomic.
     pub(crate) fn run_media_probe(&self) {
         self.eval_js(buffr_core::scripts::MEDIA_PROBE_POLL_JS);
+    }
+
+    /// Update the active tab's `BuffrViewWayland` subsurface position + render
+    /// size (#153). No-op when the active tab has no `wpe_view` (e.g. stock
+    /// Wayland path or OSR path where `wpe_view` is NULL on native).
+    ///
+    /// Called from the `Command::SetNativeRect` handler on the GLib worker
+    /// thread, ensuring Wayland protocol calls happen in the right context.
+    pub(crate) fn set_native_rect(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        let Some(tab) = self.active_tab() else {
+            tracing::debug!("webkit: set_native_rect — no active tab");
+            return;
+        };
+        let view = tab.wpe_view;
+        if view.is_null() {
+            tracing::debug!("webkit: set_native_rect — wpe_view is NULL (native path uses stash)");
+            // On the BuffrWayland path, wpe_view is populated from the stash
+            // after create_view fires. If still NULL, the tab is too new.
+            return;
+        }
+        tracing::debug!(
+            x,
+            y,
+            w,
+            h,
+            "webkit: set_native_rect → buffr_view_wayland_set_rect"
+        );
+        // SAFETY: view is a live WPEView held by the active TabEntry; this
+        // call is on the GLib worker thread matching the Wayland connection.
+        unsafe {
+            buffr_view_wayland_set_rect(view, x, y, w as i32, h as i32);
+        }
     }
 
     /// Adjust zoom on the active tab.

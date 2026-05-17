@@ -83,6 +83,21 @@ unsafe extern "C" {
     #[allow(dead_code)]
     pub fn buffr_display_wayland_take_last_view(display: *mut WPEDisplay) -> *mut WPEView;
 
+    // ── BuffrViewWayland (#153) ───────────────────────────────────────────
+
+    /// Update the subsurface position and WebKit view render size.
+    ///
+    /// Must be called on the GLib worker thread (same thread that commits
+    /// Wayland protocol messages). No-op when `view` is NULL or is not a
+    /// `BuffrViewWayland` instance.
+    pub fn buffr_view_wayland_set_rect(
+        view: *mut WPEView,
+        x: std::os::raw::c_int,
+        y: std::os::raw::c_int,
+        w: std::os::raw::c_int,
+        h: std::os::raw::c_int,
+    );
+
     // Tiny GLib helpers we link against directly. The bindgeneration surface
     // already covers g_bytes_*, g_error_free, etc; we only redeclare
     // qdata-related helpers since bindgeneration's allowlist skipped them.
