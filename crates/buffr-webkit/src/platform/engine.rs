@@ -827,7 +827,9 @@ impl BrowserEngine for WebKitEngine {
         Arc::clone(&self.view)
     }
 
-    fn force_repaint_active(&self) {}
+    fn force_repaint_active(&self) {
+        self.send(Command::ForceRepaintActive);
+    }
 
     fn osr_sleep(&self, sleep: bool) {
         self.send(Command::OsrSleep { sleep });

@@ -244,6 +244,16 @@ pub(crate) enum Command {
     },
     /// Cancel any in-progress IME composition on the active tab.
     ImeCancel,
+    /// Force the active tab's view to drop any cached paint and emit a
+    /// fresh frame at its current dims.  Used by the apps-layer
+    /// resize-paint watchdog when wpe_toplevel_resize completed but no
+    /// new buffer arrived afterwards — WPE 2.52 occasionally drops the
+    /// repaint when the size only differs by a few pixels and the
+    /// internal AcceleratedBackingStore deems the old frame "close
+    /// enough", which leaves the splash overlay pinned on top of stale
+    /// pixels.  Implemented via the same h-1 → h wiggle that
+    /// `TabEntry::show` uses on tab activation; cheap and idempotent.
+    ForceRepaintActive,
     Shutdown,
 }
 
@@ -793,6 +803,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::ImeCancel => {
             rt.ime_cancel();
+        }
+        Command::ForceRepaintActive => {
+            rt.force_repaint_active();
         }
         Command::Shutdown => {
             ml.quit();

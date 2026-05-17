@@ -3090,6 +3090,31 @@ impl TabEntry {
         }
     }
 
+    /// Kick this tab's view to drop any cached paint and emit a fresh
+    /// frame at `(width, height)`.  Same h-1 → h wiggle TabEntry::show
+    /// uses on activation — WPE 2.52 no-ops a same-dim resize, so the
+    /// 1-pixel intermediate forces the AcceleratedBackingStore to
+    /// reflow + re-render and yields a fresh `render_buffer` callback
+    /// on the way back to the original dim.
+    pub(crate) fn force_repaint(&self, width: u32, height: u32) {
+        if self.wpe_view.is_null() {
+            return;
+        }
+        let wiggle_h = (height.saturating_sub(1)).max(1);
+        // SAFETY: wpe_view is a live WPEView owned by the WebView;
+        // calls are thread-bound to the GLib worker thread.
+        unsafe {
+            wpe_view_resized(self.wpe_view, width as i32, wiggle_h as i32);
+            wpe_view_resized(self.wpe_view, width as i32, height as i32);
+        }
+        tracing::debug!(
+            target: "buffr::resize_path",
+            width,
+            height,
+            "TabEntry::force_repaint: resize-wiggle kick"
+        );
+    }
+
     /// Whether the tab is currently playing audio.
     pub(crate) fn is_playing_audio(&self) -> bool {
         // SAFETY: web_view is valid for the tab's lifetime.
@@ -4251,6 +4276,23 @@ impl WpeRuntime {
         let ctx = tab.ime_ctx;
         // SAFETY: ctx is live; call is on the GLib worker thread.
         unsafe { buffr_input_method_context_cancel(ctx) };
+    }
+
+    /// Force the active tab's view to repaint at its current dims.
+    /// Same h-1 → h wiggle TabEntry::show uses to kick a fresh frame
+    /// after tab activation; applied here so the apps-layer
+    /// resize-paint watchdog can retire its retry loop quickly when
+    /// WPE coalesced the original resize.
+    pub(crate) fn force_repaint_active(&self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let (width, height) = if let Ok(st) = self.engine_state.lock() {
+            (st.width, st.height)
+        } else {
+            return;
+        };
+        tab.force_repaint(width, height);
     }
 
     /// Adjust zoom on the active tab.
