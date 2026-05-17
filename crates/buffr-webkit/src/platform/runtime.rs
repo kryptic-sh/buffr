@@ -243,7 +243,7 @@ const FAVICON_BRIDGE_JS: &str = r#"
   const send = () => {
     try {
       const url = pick();
-      if (url) window.webkit.messageHandlers.buffrFavicon.postMessage({ url: url, origin: location.origin });
+      if (url) window.webkit.messageHandlers.buffrFavicon.postMessage(JSON.stringify({ url: url, origin: location.origin }));
     } catch(e) {}
   };
   if (document.readyState === 'loading') {
@@ -332,7 +332,7 @@ const AUDIO_BRIDGE_JS: &str = r#"
     const cur = compute();
     if (cur !== last) {
       last = cur;
-      try { window.webkit.messageHandlers.buffrAudio.postMessage({ active: cur }); } catch (_) {}
+      try { window.webkit.messageHandlers.buffrAudio.postMessage(JSON.stringify({ active: cur })); } catch (_) {}
     }
   };
   ['play', 'pause', 'ended', 'emptied', 'abort'].forEach(ev => {
@@ -361,7 +361,7 @@ const CURSOR_BRIDGE_JS: &str = r#"
     if (cursor === last) return;
     last = cursor;
     try {
-      window.webkit.messageHandlers.buffrCursor.postMessage({ cursor });
+      window.webkit.messageHandlers.buffrCursor.postMessage(JSON.stringify({ cursor }));
     } catch (_) {}
   };
   document.addEventListener('mousemove', (e) => {
@@ -449,9 +449,6 @@ pub(crate) struct TabSignalCtx {
     /// TabInfo.is_loading still updates so the tabstrip's per-tab
     /// progress badge stays accurate for hidden tabs.
     is_active: Arc<std::sync::atomic::AtomicBool>,
-    /// Context-menu request sink — written by the `context-menu` signal
-    /// handler; drained by the apps layer via `drain_context_menu_requests`.
-    context_menu_sink: WpeContextMenuSink,
     /// Runtime-wide nav-state atomics written by `on_load_changed` for the
     /// ACTIVE tab on COMMITTED / FINISHED. Read lock-free from the UI thread
     /// by `WebKitEngine::can_go_back` / `can_go_forward`.
@@ -1287,7 +1284,7 @@ unsafe extern "C" fn on_edit_script_message(
 
     match buffr_core::edit::parse_console_event(&line) {
         Some(Ok(event)) => {
-            if let Ok(mut guard) = ctx.edit_sink.lock() {
+            if let Ok(guard) = ctx.edit_sink.lock() {
                 if let Some(sink) = guard.as_ref() {
                     if let Ok(mut q) = sink.lock() {
                         q.push_back(event);
@@ -1582,30 +1579,6 @@ unsafe extern "C" fn on_load_failed_with_tls_errors(
         "webkit: TLS certificate error — letting WebKit show its error page (fail closed)"
     );
     0 // FALSE: use WebKit's default error page
-}
-
-/// Extract the hostname from a URI string (best-effort, no external dep).
-fn extract_host_from_uri(uri: &str) -> String {
-    // Strip scheme (e.g. "https://")
-    let after_scheme = if let Some(pos) = uri.find("://") {
-        &uri[pos + 3..]
-    } else {
-        uri
-    };
-    // Strip path and query — take up to the first '/', '?', or '#'.
-    let host_port = after_scheme
-        .split(|c| c == '/' || c == '?' || c == '#')
-        .next()
-        .unwrap_or(after_scheme);
-    // Strip port number.
-    if let Some(colon) = host_port.rfind(':') {
-        // Avoid stripping IPv6 colons — only strip if everything after ':' is digits.
-        let after_colon = &host_port[colon + 1..];
-        if after_colon.chars().all(|c| c.is_ascii_digit()) {
-            return host_port[..colon].to_owned();
-        }
-    }
-    host_port.to_owned()
 }
 
 /// Extract `scheme://host[:port]` from a URI for use as a permission origin.
@@ -2093,11 +2066,13 @@ pub(crate) struct TabEntry {
     /// True when this tab was created against a `WPEDisplayWayland` (native
     /// path); false on the OSR/BuffrDisplay path. Used by #145 to decide
     /// whether to attempt a subsurface attach.
+    #[allow(dead_code)] // Phase 3 polish (#147–#150) consumes this.
     pub is_native: bool,
     /// The `wl_surface*` that WPEViewWayland owns for this tab, captured
     /// immediately after `WebKitWebView` construction on the native path.
     /// `None` on the OSR path or if `wpe_view_wayland_get_wl_surface`
     /// returned NULL. Stored as a Send-safe wrapper for use in #145.
+    #[allow(dead_code)] // Phase 3 polish (#147–#150) consumes this.
     pub wl_surface: Option<WlSurfacePtr>,
     /// Owned `BuffrInputMethodContext` attached to this tab's WebView.
     ///
@@ -2236,7 +2211,6 @@ impl TabEntry {
             engine_state,
             is_loading_atomic,
             is_active: Arc::clone(&is_active),
-            context_menu_sink: Arc::clone(&context_menu_sink),
             can_go_back,
             can_go_forward,
             web_view,
@@ -3128,6 +3102,7 @@ impl TabEntry {
     }
 
     /// Current URL from the WebView (may lag by one GLib tick).
+    #[allow(dead_code)] // Surfaced for future URL-bar wiring; safe getter.
     pub(crate) fn current_url(&self) -> String {
         // SAFETY: web_view is valid for the tab's lifetime.
         let ptr = unsafe { webkit_web_view_get_uri(self.web_view) };
@@ -3343,6 +3318,9 @@ pub(crate) struct WpeRuntime {
     pub engine_state: Arc<Mutex<EngineState>>,
     pub frame: SharedOsrFrame,
     pub view: SharedOsrViewState,
+    /// EGL worker. Held for the runtime's lifetime so the EGLDisplay /
+    /// EGLContext survive across tabs; not directly read after construction.
+    #[allow(dead_code)]
     pub egl: EglWorker,
     /// Shared display. Lives for the runtime's lifetime; each WebView
     /// bumps its ref via the `display` construct property.
@@ -3670,6 +3648,7 @@ impl WpeRuntime {
     /// Returns `true` when the runtime is using `WPEDisplayWayland` (native
     /// Wayland compositing path). Consumers (#145) use this to decide whether
     /// to attempt a subsurface attach.
+    #[allow(dead_code)] // Phase 3 polish (#147–#150) consumes this.
     pub(crate) fn is_native(&self) -> bool {
         self.display.is_native()
     }

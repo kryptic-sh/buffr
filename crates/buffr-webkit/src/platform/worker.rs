@@ -134,6 +134,8 @@ pub(crate) enum Command {
         modifiers: u32,
     },
     Focus {
+        #[allow(dead_code)]
+        // Currently dispatched but unused; future tab-strip work consumes this.
         focused: bool,
     },
     OsrSleep {
@@ -253,6 +255,9 @@ pub(crate) enum Command {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WpeKeyEvent {
     pub key_code: u32,
+    /// X11 keycode equivalent. Carried for future input-fidelity work
+    /// (shortcut routing in non-Latin layouts); not consumed yet.
+    #[allow(dead_code)]
     pub hardware_key_code: u32,
     pub pressed: bool,
     pub modifiers: u32,
@@ -929,8 +934,8 @@ pub(crate) unsafe extern "C" fn on_download_started(
     let store: Arc<Downloads> = unsafe { Arc::clone(&*(user_data as *const Arc<Downloads>)) };
 
     use super::ffi::{
-        WebKitDownload, webkit_download_get_estimated_progress, webkit_download_get_request,
-        webkit_download_get_response, webkit_download_set_destination, webkit_uri_request_get_uri,
+        WebKitDownload, webkit_download_get_request, webkit_download_get_response,
+        webkit_download_set_destination, webkit_uri_request_get_uri,
         webkit_uri_response_get_suggested_filename,
     };
     use std::ffi::{CStr, CString};

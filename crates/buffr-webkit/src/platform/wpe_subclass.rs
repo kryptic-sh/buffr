@@ -46,9 +46,12 @@ unsafe extern "C" {
     ) -> *mut WPEDisplay;
 
     /// GType of `BuffrView` (the WPEView subclass our display creates).
+    /// Probed by `force_link_bridge` to keep the C symbol from being GC'd.
+    #[allow(dead_code)]
     pub fn buffr_display_get_view_type() -> GType;
 
-    /// GType of `BuffrToplevel`.
+    /// GType of `BuffrToplevel`. Probed by `force_link_bridge`.
+    #[allow(dead_code)]
     pub fn buffr_display_get_toplevel_type() -> GType;
 
     /// Atomic getter for the most recently created `WPEView` (returned
@@ -607,6 +610,7 @@ unsafe impl Send for WlSurfacePtr {}
 /// Force-link the C bridge functions so the linker keeps them in even if
 /// Rust never calls them in this crate (e.g. when only the render callback
 /// is exercised). Called once from worker init.
+#[allow(dead_code)] // Linker-side anchor; called explicitly when needed.
 pub(crate) fn force_link_bridge() {
     // SAFETY: just probes the getters; we discard the return.
     unsafe {
