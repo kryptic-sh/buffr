@@ -43,11 +43,7 @@ pub const NEW_TAB_SPLASH_ART_MARKER: &str = "<!--SPLASH-ART-->";
 /// from FFI; Chromium-via-CDP rejects unknown schemes before `Fetch` can
 /// intercept). The base64-encoded data URL keeps the resource self-contained
 /// so the engine never sees `buffr://`.
-pub fn translate_internal_url<F, G>(
-    url: &str,
-    newtab_html: F,
-    settings_html: G,
-) -> Option<String>
+pub fn translate_internal_url<F, G>(url: &str, newtab_html: F, settings_html: G) -> Option<String>
 where
     F: FnOnce() -> Vec<u8>,
     G: FnOnce() -> Vec<u8>,
@@ -119,8 +115,7 @@ mod tests {
 
     #[test]
     fn translates_buffr_settings_to_settings_html() {
-        let url =
-            translate_internal_url("buffr://settings", newtab, settings).expect("translated");
+        let url = translate_internal_url("buffr://settings", newtab, settings).expect("translated");
         assert_eq!(decode(&url), settings());
     }
 
@@ -164,7 +159,10 @@ mod tests {
         // show the "URL can't be shown" error.
         let bytes = default_settings_html();
         let s = std::str::from_utf8(&bytes).expect("settings html is utf-8");
-        assert!(s.starts_with("<!DOCTYPE html>"), "want DOCTYPE, got: {s:.80}");
+        assert!(
+            s.starts_with("<!DOCTYPE html>"),
+            "want DOCTYPE, got: {s:.80}"
+        );
         assert!(s.contains("<title>"), "settings html should set a title");
     }
 

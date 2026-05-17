@@ -428,7 +428,10 @@ mod tests {
             .expect("parse code");
 
         // Find header/body separator.
-        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len() - 4);
+        let sep = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap_or(buf.len() - 4);
         let body = buf[sep + 4..].to_vec();
         (code, body)
     }
@@ -480,8 +483,7 @@ mod tests {
     #[test]
     fn serves_route_with_correct_token() {
         let counter = Arc::new(AtomicU32::new(0));
-        let routes =
-            Routes::new().html("/new", count_handler(Arc::clone(&counter), "<h1>hi</h1>"));
+        let routes = Routes::new().html("/new", count_handler(Arc::clone(&counter), "<h1>hi</h1>"));
         let server = InternalServer::start(routes).expect("start");
         let path = format!("/{}/new", server.token());
         let (code, body) = raw_get(server.addr(), &path);
@@ -495,8 +497,7 @@ mod tests {
         // Fresh body on every GET — internal pages need this for live
         // keybinds / palette updates.
         let counter = Arc::new(AtomicU32::new(0));
-        let routes =
-            Routes::new().html("/new", count_handler(Arc::clone(&counter), "<h1>hi</h1>"));
+        let routes = Routes::new().html("/new", count_handler(Arc::clone(&counter), "<h1>hi</h1>"));
         let server = InternalServer::start(routes).expect("start");
         let path = format!("/{}/new", server.token());
         for _ in 0..3 {
@@ -523,8 +524,9 @@ mod tests {
 
         let mut stream =
             TcpStream::connect_timeout(&server.addr(), Duration::from_secs(2)).unwrap();
-        let req =
-            format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         stream.write_all(req.as_bytes()).unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).unwrap();
@@ -603,8 +605,7 @@ mod tests {
     #[test]
     fn query_string_stripped_for_routing() {
         let counter = Arc::new(AtomicU32::new(0));
-        let routes =
-            Routes::new().html("/new", count_handler(Arc::clone(&counter), "<h1>q</h1>"));
+        let routes = Routes::new().html("/new", count_handler(Arc::clone(&counter), "<h1>q</h1>"));
         let server = InternalServer::start(routes).expect("start");
         let path = format!("/{}/new?foo=bar&baz=qux", server.token());
         let (code, body) = raw_get(server.addr(), &path);
