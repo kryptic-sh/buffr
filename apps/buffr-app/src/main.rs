@@ -4132,10 +4132,28 @@ impl AppState {
         // active engine composites natively (WebKit/Wayland subsurface). The
         // browser region is kept fully transparent so the subsurface shows
         // through; an opaque animation there would occlude it.
+        // Show the splash overlay only when there are no usable pixels to
+        // present — either no OSR frame yet, or the most recent frame's
+        // dims don't match the current browser rect (mid-resize / first
+        // paint), or the renderer flagged a stale-size buffer drift on
+        // the previous paint.
+        //
+        // `host_is_loading` is deliberately NOT part of this gate.  The
+        // atomic that drives it is cleared by the engine's
+        // load-state-changed signal handler on the active tab only, so
+        // it gets pinned true forever whenever a tab switch races a
+        // LOAD_COMMITTED, a navigation errors before commit, or a
+        // page-state callback drops a signal — symptom seen in
+        // production: animation never gives way to the page despite
+        // fresh frames arriving.  Loading progress belongs in the
+        // statusline / progress spinner, not the full-screen splash;
+        // user-visible "I can see the page now" maps to "we have
+        // pixels at the right dims", which is exactly what
+        // `should_show_loading_anim` measures.
         let want_anim = (should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
-            || self.surface_drifted
-            || host_is_loading)
+            || self.surface_drifted)
             && !host_is_using_native_compositing;
+        let _ = host_is_loading;
 
         // Idle short-circuit. If nothing has changed since the last paint —
         // chrome buffer up to date, no fresh CEF paint queued, no animation
