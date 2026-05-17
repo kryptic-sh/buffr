@@ -190,6 +190,15 @@ pub(crate) enum Command {
     ExecEditingCommand {
         command: &'static str,
     },
+    /// Trigger a download of `url` on the active WebView.
+    ///
+    /// Calls `webkit_web_view_download_uri` on the active tab's WebView;
+    /// the returned `*mut WebKitDownload` is discarded — the process-wide
+    /// `download-started` signal handler (wired in `spawn`) picks it up and
+    /// routes lifecycle events through the buffr-downloads pipeline.
+    StartDownload {
+        url: String,
+    },
     Shutdown,
 }
 
@@ -632,6 +641,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::ExecEditingCommand { command } => {
             rt.execute_editing_command(command);
+        }
+        Command::StartDownload { url } => {
+            rt.start_download(&url);
         }
         Command::Shutdown => {
             ml.quit();

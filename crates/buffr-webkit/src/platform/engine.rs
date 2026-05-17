@@ -13,9 +13,9 @@ use buffr_core::hint::{
 };
 use buffr_downloads::Downloads;
 use buffr_engine::{
-    BackendOpenOptions, BrowserEngine, ContextMenuRequest, EngineError, HintAction, HintStatus,
-    MouseButton, NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
-    SharedOsrViewState, TabId, TabSummary,
+    BackendOpenOptions, BrowserEngine, ClipboardRead, ContextMenuRequest, EngineError, HintAction,
+    HintStatus, MouseButton, NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState,
+    SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
     engine_id::EngineId,
     internal_server::InternalServer,
     newtab::{default_newtab_html, default_settings_html, translate_internal_url},
@@ -93,6 +93,9 @@ pub struct WebKitEngine {
     /// Favicon decode sink. Shared with `WpeRuntime` and the per-tab
     /// background fetch threads. Drained by `drain_favicon_updates`.
     favicon_sink: buffr_core::favicon::FaviconSink,
+    /// System clipboard reader. `None` when clipboard initialisation failed at
+    /// startup (e.g. headless / SSH without OSC-52 fallback).
+    clipboard_reader: Option<std::sync::Arc<super::clipboard::WebKitClipboardReader>>,
 }
 
 impl WebKitEngine {
@@ -267,6 +270,7 @@ impl WebKitEngine {
             favicon_sink,
             can_go_back,
             can_go_forward,
+            clipboard_reader: super::clipboard::WebKitClipboardReader::new(),
         })
     }
 
@@ -1146,6 +1150,47 @@ impl BrowserEngine for WebKitEngine {
             A::EnterHintModeBackground => self.enter_hint_mode(true),
             _ => tracing::debug!(?action, "webkit: dispatch: no mapping yet"),
         }
+    }
+
+    // ── Clipboard ─────────────────────────────────────────────────────────────
+
+    fn clipboard_handle(&self) -> Option<buffr_engine::ClipboardReader> {
+        self.clipboard_reader
+            .clone()
+            .map(|arc| arc as buffr_engine::ClipboardReader)
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        self.clipboard_reader.as_ref().and_then(|r| r.read_text())
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> bool {
+        use hjkl_clipboard::{MimeType, Selection};
+        let Some(reader) = self.clipboard_reader.as_ref() else {
+            return false;
+        };
+        match reader
+            .inner
+            .set(Selection::Clipboard, MimeType::Text, text.as_bytes())
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "webkit: clipboard_set_text failed");
+                false
+            }
+        }
+    }
+
+    // ── Downloads / image copy ────────────────────────────────────────────────
+
+    fn start_download(&self, url: &str) {
+        self.send(Command::StartDownload {
+            url: url.to_owned(),
+        });
+    }
+
+    fn copy_image_url_to_clipboard(&self, url: &str) {
+        buffr_core::image_copy::copy_image_to_clipboard(url.to_owned());
     }
 }
 

@@ -2971,6 +2971,38 @@ impl WpeRuntime {
         tracing::debug!(name, "webkit: execute_editing_command");
     }
 
+    /// Trigger a download of `url` on the active WebView.
+    ///
+    /// Calls `webkit_web_view_download_uri`; the returned `*mut WebKitDownload`
+    /// is discarded — the process-wide `download-started` signal on
+    /// `WebKitNetworkSession` (wired in `worker::spawn`) picks it up and routes
+    /// lifecycle events through the buffr-downloads pipeline.
+    pub(crate) fn start_download(&self, url: &str) {
+        let Some(tab) = self.active_tab() else {
+            tracing::warn!(url, "webkit: start_download: no active tab");
+            return;
+        };
+        if tab.web_view.is_null() {
+            tracing::warn!(url, "webkit: start_download: active tab has no WebView");
+            return;
+        }
+        let Ok(url_c) = CString::new(url) else {
+            tracing::warn!(
+                url,
+                "webkit: start_download: URL contains NUL byte — dropping"
+            );
+            return;
+        };
+        // SAFETY: web_view is valid for the tab's lifetime; url_c is
+        // null-terminated and lives until the end of this call.
+        // The returned *mut WebKitDownload is a floating ref that WebKit
+        // immediately sinks into its internal download list — we discard it.
+        unsafe {
+            webkit_web_view_download_uri(tab.web_view, url_c.as_ptr());
+        }
+        tracing::debug!(url, "webkit: start_download dispatched");
+    }
+
     /// Toggle the WebKit web inspector for the active tab.
     ///
     /// Returns `Err` when there is no active tab. On success the inspector

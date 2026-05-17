@@ -1,5 +1,6 @@
 //! Real WPE WebKit implementation — compiled on Linux only.
 
+pub(crate) mod clipboard;
 pub(crate) mod egl;
 pub(crate) mod ffi;
 pub(crate) mod wpe_subclass;
