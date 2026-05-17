@@ -119,6 +119,11 @@ pub struct WebKitEngine {
     /// handlers on the GLib worker thread; read via `take_cursor_change`.
     /// Same Arc as the one in WorkerHandle.
     cursor_state: SharedCursorState,
+    /// Runtime-wide video-active flag (#135). Written by per-tab
+    /// `buffrMediaProbe` UCM signal handlers on the GLib worker thread;
+    /// read lock-free from any thread by `any_video_active`.
+    /// Same Arc as the one in WorkerHandle.
+    video_active: Arc<AtomicBool>,
 }
 
 impl WebKitEngine {
@@ -272,6 +277,9 @@ impl WebKitEngine {
         // Share the cursor state created in spawn (#137).
         let cursor_state = Arc::clone(&worker.cursor_state);
 
+        // Share the video-active flag created in spawn (#135).
+        let video_active = Arc::clone(&worker.video_active);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -313,6 +321,7 @@ impl WebKitEngine {
             permission_next_id,
             audio_event_queue,
             cursor_state,
+            video_active,
         })
     }
 
@@ -1007,7 +1016,11 @@ impl BrowserEngine for WebKitEngine {
     }
 
     fn any_video_active(&self) -> bool {
-        false
+        self.video_active.load(Ordering::Relaxed)
+    }
+
+    fn run_media_probe(&self) {
+        self.send(Command::RunMediaProbe);
     }
 
     fn drain_audio_events(&self) -> Vec<buffr_engine::AudioEvent> {

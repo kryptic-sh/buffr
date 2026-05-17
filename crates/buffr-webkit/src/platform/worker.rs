@@ -215,6 +215,10 @@ pub(crate) enum Command {
         resolve_id: String,
         outcome: PromptOutcome,
     },
+    /// Fire `MEDIA_PROBE_POLL_JS` on the active tab (#135). The result is
+    /// delivered asynchronously via the `buffrMediaProbe` UCM handler, which
+    /// stores the `video` flag in the runtime-wide `video_active` atomic.
+    RunMediaProbe,
     Shutdown,
 }
 
@@ -262,6 +266,10 @@ pub(crate) struct WorkerHandle {
     /// Shared cursor state (#137). Written by per-tab `buffrCursor` UCM signal
     /// handlers; read by `WebKitEngine::take_cursor_change`.
     pub cursor_state: SharedCursorState,
+    /// Runtime-wide video-active flag (#135). Written by per-tab `buffrMediaProbe`
+    /// UCM signal handlers on the GLib worker thread; read by
+    /// `WebKitEngine::any_video_active` on any thread.
+    pub video_active: Arc<AtomicBool>,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -364,6 +372,11 @@ pub(crate) fn spawn(
     // (writers via `CursorSignalCtx`) share the same Arc.
     let cursor_state: SharedCursorState = Arc::new(CursorState::new());
 
+    // Runtime-wide video-active flag (#135). Allocated here so both
+    // `WebKitEngine` (reader via `any_video_active`) and per-tab UCM signal
+    // handlers (writers via `MediaProbeSignalCtx`) share the same Arc.
+    let video_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
@@ -377,6 +390,7 @@ pub(crate) fn spawn(
     let permission_next_id_worker = Arc::clone(&permission_next_id);
     let audio_event_queue_worker = Arc::clone(&audio_event_queue);
     let cursor_state_worker = Arc::clone(&cursor_state);
+    let video_active_worker = Arc::clone(&video_active);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -434,6 +448,7 @@ pub(crate) fn spawn(
                 permission_next_id_worker,
                 audio_event_queue_worker,
                 cursor_state_worker,
+                video_active_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -619,6 +634,7 @@ pub(crate) fn spawn(
         permission_next_id,
         audio_event_queue,
         cursor_state,
+        video_active,
         thread: Some(thread),
     })
 }
@@ -716,6 +732,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
             outcome,
         } => {
             rt.resolve_permission(&resolve_id, outcome);
+        }
+        Command::RunMediaProbe => {
+            rt.run_media_probe();
         }
         Command::Shutdown => {
             ml.quit();

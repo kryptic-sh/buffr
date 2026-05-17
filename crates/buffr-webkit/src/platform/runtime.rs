@@ -368,6 +368,31 @@ const CURSOR_BRIDGE_JS: &str = r#"
 })();
 "#;
 
+/// Console.log shim for the media probe (#135).
+///
+/// Intercepts `console.log` calls whose first argument starts with the
+/// `__buffr_media__:` sentinel emitted by `MEDIA_PROBE_POLL_JS` and forwards
+/// the JSON payload via the `buffrMediaProbe` UCM handler. All other calls
+/// pass through to the original `console.log` unchanged.
+///
+/// Installed at document-start on the top frame only (the poll script also
+/// runs in the top frame). A try/catch wrapper prevents any breakage if the
+/// UCM handler isn't registered yet.
+const MEDIA_PROBE_CONSOLE_SHIM_JS: &str = r#"
+(() => {
+  const orig = console.log.bind(console);
+  console.log = function(...args) {
+    try {
+      if (typeof args[0] === 'string' && args[0].startsWith('__buffr_media__:')) {
+        const json = args[0].substring('__buffr_media__:'.length);
+        window.webkit.messageHandlers.buffrMediaProbe.postMessage(json);
+      }
+    } catch (_) {}
+    return orig.apply(console, args);
+  };
+})();
+"#;
+
 /// Per-tab heap context handed to WebKit's signal handlers via `user_data`.
 /// Keeps an Arc clone of the shared engine state so handlers running on the
 /// worker thread can update URL / title; loading state is tracked via a
@@ -978,10 +1003,10 @@ pub(crate) struct CursorSignalCtx {
 /// `apps/buffr-app/src/main.rs::cef_cursor_type_to_winit` expects.
 pub(crate) fn css_cursor_to_cef_raw(css: &str) -> u32 {
     match css {
-        "default" | "auto" => 0,  // POINTER
+        "default" | "auto" => 0, // POINTER
         "crosshair" => 1,
-        "pointer" => 2,           // HAND
-        "text" => 3,              // IBEAM
+        "pointer" => 2, // HAND
+        "text" => 3,    // IBEAM
         "wait" => 4,
         "help" => 5,
         "e-resize" => 6,
@@ -1083,6 +1108,80 @@ unsafe extern "C" fn on_cursor_script_message(
     // drop_cursor_signal_ctx fires on disconnect.
     let ctx = unsafe { &*(user_data as *const CursorSignalCtx) };
     ctx.cursor_state.store(ctx.browser_id, raw);
+}
+
+// ── Media probe: UCM script-message signal (#135) ────────────────────────────
+
+/// Per-tab heap context for the `buffrMediaProbe` UCM signal handler.
+pub(crate) struct MediaProbeSignalCtx {
+    /// Runtime-wide flag. Set to the `video` field from the last poll JSON.
+    /// Last-writer-wins across tabs — correct for the "any tab has video"
+    /// aggregate that `any_video_active` exposes.
+    pub video_active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// GLib `GClosureNotify` for `Box<MediaProbeSignalCtx>` leaked for the
+/// `script-message-received::buffrMediaProbe` connection.
+unsafe extern "C" fn drop_media_probe_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut MediaProbeSignalCtx) });
+    }
+}
+
+/// `script-message-received::buffrMediaProbe` handler on the UCM.
+///
+/// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries the JSON string forwarded by `MEDIA_PROBE_CONSOLE_SHIM_JS`
+/// from the `__buffr_media__:` console.log sentinel emitted by `MEDIA_PROBE_POLL_JS`.
+/// Expected shape: `{ "media": bool, "video": bool }`.
+///
+/// Stores the `video` field into the runtime-wide `video_active` atomic.
+/// The `media` field is intentionally ignored here — audio state is already
+/// tracked via the dedicated `buffrAudio` bridge (#132).
+unsafe extern "C" fn on_media_probe_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let json_str = unsafe { CStr::from_ptr(raw_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { g_free(raw_ptr as *mut _) };
+
+    if json_str.is_empty() {
+        return;
+    }
+
+    let video: bool = match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(v) => v.get("video").and_then(|b| b.as_bool()).unwrap_or(false),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                json = json_str,
+                "webkit: buffrMediaProbe — JSON parse failed"
+            );
+            return;
+        }
+    };
+
+    // SAFETY: user_data is a Box<MediaProbeSignalCtx> owned until
+    // drop_media_probe_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const MediaProbeSignalCtx) };
+    use std::sync::atomic::Ordering;
+    ctx.video_active.store(video, Ordering::Relaxed);
+    tracing::debug!(video, "webkit: buffrMediaProbe — video state updated");
 }
 
 // ── Clipboard paste: buffr-clipboard URI scheme ───────────────────────────────
@@ -1858,6 +1957,12 @@ pub(crate) struct TabEntry {
     /// Signal ID for `script-message-received::buffrCursor` on the UCM (#137).
     /// 0 when cursor bridge init failed.
     cursor_script_message_received_id: u64,
+    /// Signal ID for `script-message-received::buffrMediaProbe` on the UCM (#135).
+    /// 0 when media probe init failed.
+    media_probe_script_message_received_id: u64,
+    /// Runtime-wide video-active flag. Same Arc as `WpeRuntime::video_active`
+    /// and `WebKitEngine::video_active`. Kept here so `Drop` is self-contained.
+    video_active: Arc<std::sync::atomic::AtomicBool>,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -1897,6 +2002,7 @@ impl TabEntry {
         permission_next_id: Arc<AtomicU64>,
         audio_event_queue: WpeAudioEventQueue,
         cursor_state: SharedCursorState,
+        video_active: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -2454,6 +2560,96 @@ impl TabEntry {
             }
         };
 
+        // ── Media probe: UCM script-message handler (#135) ───────────────────
+        //
+        // 1. Register `buffrMediaProbe` native handler on the UCM.
+        // 2. Inject MEDIA_PROBE_INIT_JS at document-start on top-frame only so
+        //    constructor patching is installed once per main document.
+        // 3. Inject MEDIA_PROBE_CONSOLE_SHIM_JS at document-start on top-frame
+        //    to intercept the `__buffr_media__:` console.log sentinel and
+        //    forward the JSON payload via the `buffrMediaProbe` UCM handler.
+        // 4. Connect `script-message-received::buffrMediaProbe` →
+        //    on_media_probe_script_message, which stores `video_active`.
+        //
+        // run_media_probe (eval MEDIA_PROBE_POLL_JS) is called by the apps
+        // layer on its own polling cadence (~2 s); we just handle the response.
+        let media_probe_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_TOP_FRAME as INJECT_TOP,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                0
+            } else {
+                // Register the native message handler name.
+                let handler_name = CString::new("buffrMediaProbe").unwrap();
+                let _ok = webkit_user_content_manager_register_script_message_handler(
+                    ucm,
+                    handler_name.as_ptr(),
+                    std::ptr::null(),
+                );
+
+                // Inject media probe init script at document-start on top frame.
+                let init_src = CString::new(buffr_core::scripts::MEDIA_PROBE_INIT_JS).unwrap();
+                let init_script = webkit_user_script_new(
+                    init_src.as_ptr(),
+                    INJECT_TOP,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !init_script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, init_script);
+                    webkit_user_script_unref(init_script);
+                    tracing::debug!("webkit: MEDIA_PROBE_INIT_JS injected for tab {id:?}");
+                }
+
+                // Inject console.log shim at document-start on top frame.
+                let shim_src = CString::new(MEDIA_PROBE_CONSOLE_SHIM_JS).unwrap();
+                let shim_script = webkit_user_script_new(
+                    shim_src.as_ptr(),
+                    INJECT_TOP,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !shim_script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, shim_script);
+                    webkit_user_script_unref(shim_script);
+                    tracing::debug!("webkit: MEDIA_PROBE_CONSOLE_SHIM_JS injected for tab {id:?}");
+                }
+
+                // Connect `script-message-received::buffrMediaProbe`.
+                // user_data is a Box<MediaProbeSignalCtx> leaked via Box::into_raw;
+                // drop_media_probe_signal_ctx reconstitutes + drops it on disconnect.
+                let ctx_box = Box::new(MediaProbeSignalCtx {
+                    video_active: Arc::clone(&video_active),
+                });
+                let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
+                let signal_name = CString::new("script-message-received::buffrMediaProbe").unwrap();
+                g_signal_connect_data(
+                    ucm as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_media_probe_script_message)),
+                    ctx_raw,
+                    Some(drop_media_probe_signal_ctx),
+                    0,
+                )
+            }
+        };
+
         // ── Popup queue: `create` signal ──────────────────────────────────────
         //
         // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
@@ -2618,6 +2814,8 @@ impl TabEntry {
             audio_event_queue,
             audio_browser_id: id.0 as i32,
             cursor_script_message_received_id,
+            media_probe_script_message_received_id,
+            video_active,
             is_active,
         })
     }
@@ -2786,7 +2984,17 @@ impl Drop for TabEntry {
                         self.cursor_script_message_received_id,
                     );
                 }
+                if self.media_probe_script_message_received_id != 0 {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.media_probe_script_message_received_id,
+                    );
+                }
             }
+            // Clear video_active on tab close so the aggregate flag doesn't
+            // stay stuck true after the tab that owned it is gone.
+            self.video_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             // Push a final active=false event so the apps layer clears any
             // audio indicator immediately on tab close rather than waiting for
             // the next JS-fired event (which will never come from a closed tab).
@@ -2888,6 +3096,10 @@ pub(crate) struct WpeRuntime {
     /// Shared cursor state (#137). Written by per-tab `buffrCursor` UCM signal
     /// handlers; read by `WebKitEngine::take_cursor_change`.
     pub cursor_state: SharedCursorState,
+    /// Runtime-wide video-active flag (#135). Written by per-tab
+    /// `buffrMediaProbe` UCM signal handlers; read by
+    /// `WebKitEngine::any_video_active`.
+    pub video_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WpeRuntime {
@@ -2909,6 +3121,7 @@ impl WpeRuntime {
         permission_next_id: Arc<AtomicU64>,
         audio_event_queue: WpeAudioEventQueue,
         cursor_state: SharedCursorState,
+        video_active: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -3006,6 +3219,7 @@ impl WpeRuntime {
             permission_next_id,
             audio_event_queue,
             cursor_state,
+            video_active,
         })
     }
 
@@ -3094,6 +3308,7 @@ impl WpeRuntime {
             Arc::clone(&self.permission_next_id),
             Arc::clone(&self.audio_event_queue),
             Arc::clone(&self.cursor_state),
+            Arc::clone(&self.video_active),
         );
 
         let entry = match entry {
@@ -3524,6 +3739,18 @@ impl WpeRuntime {
 
     pub(crate) fn any_audio_active(&self) -> bool {
         self.tabs.iter().any(|t| t.is_playing_audio())
+    }
+
+    /// Fire the media probe poll script on the active tab (#135).
+    ///
+    /// Evaluates `MEDIA_PROBE_POLL_JS` which recomputes `__buffr_media_active` /
+    /// `__buffr_video_active` from five signal sources and, on any state
+    /// transition, emits `console.log('__buffr_media__:' + JSON)`. The shim
+    /// installed by `MEDIA_PROBE_CONSOLE_SHIM_JS` intercepts that prefix and
+    /// forwards the JSON to the `buffrMediaProbe` UCM handler, which updates
+    /// the runtime-wide `video_active` atomic.
+    pub(crate) fn run_media_probe(&self) {
+        self.eval_js(buffr_core::scripts::MEDIA_PROBE_POLL_JS);
     }
 
     /// Adjust zoom on the active tab.
