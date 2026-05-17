@@ -381,34 +381,12 @@ fn render_worker(
         // The UI thread drives resize (surface.configure) and mirrors the
         // new dims into every RenderCommand. The worker updates its GPU
         // state lazily here rather than via a separate channel message.
-        //
-        // Only reallocate the chrome texture when the new dims fall
-        // outside CHROME_REALLOC_TOLERANCE pixels of the current
-        // texture.  Hyprland fires ~5ms-apart Resized events during a
-        // window-edge drag, and unconditional reallocation here piled
-        // up dozens of in-flight 4×W×H byte textures inside wgpu's
-        // queue — eventually tripping a `wgpu error: Out of Memory`
-        // panic at `surface.get_current_texture`.  The GPU's linear
-        // sampler stretches the previous chrome texture across a few
-        // pixels of mismatch without visible artifact, so we eat the
-        // sampling cost for transient drag frames and only reallocate
-        // when the drag actually crosses a real size boundary or the
-        // window expands past the existing texture.
-        const CHROME_REALLOC_TOLERANCE: u32 = 32;
-        let lw_drift = state.chrome_lw.abs_diff(cmd.chrome_lw);
-        let lh_drift = state.chrome_lh.abs_diff(cmd.chrome_lh);
-        let outgrew = cmd.chrome_lw > state.chrome_lw || cmd.chrome_lh > state.chrome_lh;
-        let must_realloc =
-            outgrew || lw_drift > CHROME_REALLOC_TOLERANCE || lh_drift > CHROME_REALLOC_TOLERANCE;
-        if must_realloc && (cmd.chrome_lw != state.chrome_lw || cmd.chrome_lh != state.chrome_lh) {
+        if cmd.chrome_lw != state.chrome_lw || cmd.chrome_lh != state.chrome_lh {
             tracing::debug!(
                 old_lw = state.chrome_lw,
                 old_lh = state.chrome_lh,
                 new_lw = cmd.chrome_lw,
                 new_lh = cmd.chrome_lh,
-                outgrew,
-                lw_drift,
-                lh_drift,
                 "render_worker: chrome dims changed, reallocating"
             );
             state.reallocate_chrome(cmd.chrome_lw, cmd.chrome_lh);
