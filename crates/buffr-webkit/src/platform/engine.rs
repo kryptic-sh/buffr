@@ -13,8 +13,8 @@ use buffr_core::hint::{
 };
 use buffr_downloads::Downloads;
 use buffr_engine::{
-    BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
-    NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
+    BackendOpenOptions, BrowserEngine, ContextMenuRequest, EngineError, HintAction, HintStatus,
+    MouseButton, NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
     SharedOsrViewState, TabId, TabSummary,
     engine_id::EngineId,
     internal_server::InternalServer,
@@ -25,6 +25,7 @@ use buffr_engine::{
 };
 
 use super::error::WebKitError;
+use super::runtime::WpeContextMenuSink;
 use super::worker::{Command, WorkerHandle, WpeKeyEvent, spawn};
 
 // ── WebKitEngine ──────────────────────────────────────────────────────────────
@@ -79,6 +80,10 @@ pub struct WebKitEngine {
     /// populated with the hint list from `pump_hint_events` when the renderer
     /// fires the `ready` event via the UCM script-message bridge.
     hint_session: Mutex<Option<HintSession>>,
+    /// Context-menu request sink. Shared with `WpeRuntime` and every
+    /// `TabEntry`'s `context-menu` signal handler. Drained by
+    /// `drain_context_menu_requests`.
+    context_menu_sink: WpeContextMenuSink,
 }
 
 impl WebKitEngine {
@@ -202,6 +207,11 @@ impl WebKitEngine {
         // apps layer drains the same queue the signals push into.
         let popup_queue = Arc::clone(&worker.popup_queue);
 
+        // Share the context-menu sink that the worker wired to each TabEntry's
+        // `context-menu` signal. Using the same Arc ensures the apps layer
+        // drains the same queue the signals push into.
+        let context_menu_sink = Arc::clone(&worker.context_menu_sink);
+
         // Default hint alphabet — mirrors webkitgtk backend. Fallback to
         // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
         // validation (it never does, but the API returns Result).
@@ -233,6 +243,7 @@ impl WebKitEngine {
             zoom_level,
             hint_alphabet,
             hint_session: Mutex::new(None),
+            context_menu_sink,
         })
     }
 
@@ -803,6 +814,15 @@ impl BrowserEngine for WebKitEngine {
     fn popup_history_back(&self, _browser_id: i32) {}
     fn popup_history_forward(&self, _browser_id: i32) {}
     fn popup_osr_focus(&self, _browser_id: i32, _focused: bool) {}
+
+    // ── Context menu ──────────────────────────────────────────────────────────
+
+    fn drain_context_menu_requests(&self) -> Vec<ContextMenuRequest> {
+        match self.context_menu_sink.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
     fn popup_osr_key_event(&self, _browser_id: i32, _event: NeutralKeyEvent) {}
 
     fn popup_osr_mouse_click(

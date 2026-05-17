@@ -17,7 +17,20 @@ use std::sync::Mutex;
 
 use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
 use buffr_engine::popup::PopupQueue;
-use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
+use buffr_engine::types::MediaType;
+use buffr_engine::{ContextMenuRequest, SharedOsrFrame, SharedOsrViewState, TabId};
+
+/// Thread-safe context-menu request queue for the WPE backend.
+///
+/// Uses `buffr_engine::ContextMenuRequest` (the neutral type holding raw flags
+/// like `link_url`, `media_type`, etc.) so the apps layer can call
+/// `build_context_menu_items_from_neutral` with live `can_go_back` / `is_loading`
+/// values at display time rather than building the item list inside the signal handler.
+pub(crate) type WpeContextMenuSink = Arc<Mutex<std::collections::VecDeque<ContextMenuRequest>>>;
+
+pub(crate) fn new_wpe_context_menu_sink() -> WpeContextMenuSink {
+    Arc::new(Mutex::new(std::collections::VecDeque::new()))
+}
 
 use super::egl::EglWorker;
 use super::ffi::*;
@@ -138,6 +151,9 @@ pub(crate) struct TabSignalCtx {
     /// TabInfo.is_loading still updates so the tabstrip's per-tab
     /// progress badge stays accurate for hidden tabs.
     is_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Context-menu request sink — written by the `context-menu` signal
+    /// handler; drained by the apps layer via `drain_context_menu_requests`.
+    context_menu_sink: WpeContextMenuSink,
 }
 
 impl TabSignalCtx {
@@ -617,6 +633,170 @@ fn extract_host_from_uri(uri: &str) -> String {
     host_port.to_owned()
 }
 
+// ── Context-menu signal (#121) ────────────────────────────────────────────────
+
+/// Heap context for the `context-menu` signal. Carries the context-menu sink
+/// so the handler can push `ContextMenuRequest` entries without holding the
+/// full `TabSignalCtx` (which owns engine_state and other unneeded fields).
+pub(crate) struct ContextSignalCtx {
+    pub context_menu_sink: WpeContextMenuSink,
+}
+
+/// GLib GClosureNotify for `Box<ContextSignalCtx>` leaked for the context-menu
+/// signal connection.
+unsafe extern "C" fn drop_context_signal_ctx(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: produced by Box::into_raw; reconstitute and drop.
+        drop(unsafe { Box::from_raw(user_data as *mut ContextSignalCtx) });
+    }
+}
+
+/// `context-menu` on `WebKitWebView`.
+///
+/// Signal prototype: `(WebKitWebView*, WebKitContextMenu*,
+///   WebKitHitTestResult*, user_data)` → gboolean.
+/// Returns TRUE to suppress WebKit's native context menu. We push a neutral
+/// `ContextMenuRequest` into the context-menu sink so the apps layer can
+/// render buffr's `ContextMenuOverlay`.
+unsafe extern "C" fn on_context_menu(
+    web_view: *mut WebKitWebView,
+    context_menu: *mut WebKitContextMenu,
+    hit_test: *mut WebKitHitTestResult,
+    user_data: *mut std::os::raw::c_void,
+) -> gboolean {
+    if web_view.is_null() || user_data.is_null() {
+        return 0;
+    }
+    // SAFETY: user_data is a Box<ContextSignalCtx> produced by Box::into_raw.
+    let ctx = unsafe { &*(user_data as *const ContextSignalCtx) };
+
+    // Extract position from the context menu object.
+    let (x, y) = if !context_menu.is_null() {
+        let mut mx: gint = 0;
+        let mut my: gint = 0;
+        let ok = unsafe { webkit_context_menu_get_position(context_menu, &mut mx, &mut my) };
+        if ok != 0 { (mx, my) } else { (0, 0) }
+    } else {
+        (0, 0)
+    };
+
+    // Extract hit-test result flags.
+    let (is_link, is_image, is_media, is_editable, _is_selection) = if !hit_test.is_null() {
+        unsafe {
+            (
+                webkit_hit_test_result_context_is_link(hit_test) != 0,
+                webkit_hit_test_result_context_is_image(hit_test) != 0,
+                webkit_hit_test_result_context_is_media(hit_test) != 0,
+                webkit_hit_test_result_context_is_editable(hit_test) != 0,
+                webkit_hit_test_result_context_is_selection(hit_test) != 0,
+            )
+        }
+    } else {
+        (false, false, false, false, false)
+    };
+
+    // Extract link / image / media URIs.
+    let link_url: Option<String> = if is_link && !hit_test.is_null() {
+        let ptr = unsafe { webkit_hit_test_result_get_link_uri(hit_test) };
+        if ptr.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    } else {
+        None
+    };
+    let image_url: Option<String> = if is_image && !hit_test.is_null() {
+        let ptr = unsafe { webkit_hit_test_result_get_image_uri(hit_test) };
+        if ptr.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    } else {
+        None
+    };
+    let media_url: Option<String> = if is_media && !hit_test.is_null() {
+        let ptr = unsafe { webkit_hit_test_result_get_media_uri(hit_test) };
+        if ptr.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    } else {
+        None
+    };
+
+    // Page URL from the WebView.
+    let page_url: String = {
+        let ptr = unsafe { webkit_web_view_get_uri(web_view) };
+        if ptr.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+
+    // Determine the neutral MediaType for the ContextMenuRequest.
+    let media_type_neutral = if is_image {
+        MediaType::Image
+    } else if is_media {
+        MediaType::Video
+    } else {
+        MediaType::None
+    };
+
+    let req = ContextMenuRequest {
+        browser_id: 0,
+        x,
+        y,
+        page_url,
+        frame_url: String::new(),
+        link_url,
+        image_url,
+        media_url,
+        selection_text: None,
+        is_editable,
+        has_image_contents: is_image,
+        media_type: media_type_neutral,
+    };
+
+    tracing::debug!(
+        x,
+        y,
+        is_link,
+        is_image,
+        is_media,
+        is_editable,
+        "webkit: context-menu — pushing ContextMenuRequest"
+    );
+
+    if let Ok(mut queue) = ctx.context_menu_sink.lock() {
+        // Cap at 8 entries — same as buffr_core::context_menu::CONTEXT_MENU_REQUEST_QUEUE_CAP.
+        if queue.len() >= 8 {
+            queue.pop_front();
+        }
+        queue.push_back(req);
+    }
+
+    // Return TRUE: suppress WebKit's native context menu.
+    1
+}
+
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
 /// One open browser tab. Owns the WebKitWebView GObject. The shared
@@ -641,6 +821,8 @@ pub(crate) struct TabEntry {
     create_signal_id: u64,
     /// Signal ID for `load-failed-with-tls-errors` (#120).
     tls_error_id: u64,
+    /// Signal ID for `context-menu` (#121).
+    context_menu_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -671,6 +853,7 @@ impl TabEntry {
         is_active: Arc<std::sync::atomic::AtomicBool>,
         hint_sink: HintEventSink,
         popup_queue: PopupQueue,
+        context_menu_sink: WpeContextMenuSink,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -733,6 +916,7 @@ impl TabEntry {
             engine_state,
             is_loading_atomic,
             is_active: Arc::clone(&is_active),
+            context_menu_sink: Arc::clone(&context_menu_sink),
         });
         let connect = |signal: &str, cb: unsafe extern "C" fn()| -> u64 {
             let signal_c = CString::new(signal).unwrap();
@@ -1007,6 +1191,38 @@ impl TabEntry {
             }
         };
 
+        // ── Context-menu signal (#121) ────────────────────────────────────────
+        //
+        // Fires on right-click. We suppress the native menu and push a neutral
+        // ContextMenuRequest into the shared sink for the apps layer to render
+        // as ContextMenuOverlay.
+        // user_data is a Box<ContextSignalCtx> (contains the sink Arc).
+        let context_menu_id: u64 = {
+            let ctx_box = Box::new(ContextSignalCtx {
+                context_menu_sink: Arc::clone(&context_menu_sink),
+            });
+            let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
+            let signal_c = CString::new("context-menu").unwrap();
+            unsafe {
+                g_signal_connect_data(
+                    web_view as *mut _,
+                    signal_c.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut WebKitWebView,
+                            *mut WebKitContextMenu,
+                            *mut WebKitHitTestResult,
+                            *mut std::os::raw::c_void,
+                        ) -> gboolean,
+                        unsafe extern "C" fn(),
+                    >(on_context_menu)),
+                    ctx_raw,
+                    Some(drop_context_signal_ctx),
+                    0,
+                )
+            }
+        };
+
         // ── TLS certificate error signal (#120) ───────────────────────────────
         //
         // Fires when a navigation hits a TLS error. We auto-allow + reload
@@ -1041,6 +1257,7 @@ impl TabEntry {
             clipboard_script_message_received_id,
             create_signal_id,
             tls_error_id,
+            context_menu_id,
             is_active,
         })
     }
@@ -1200,6 +1417,10 @@ impl Drop for TabEntry {
             if self.tls_error_id != 0 {
                 g_signal_handler_disconnect(self.web_view as *mut _, self.tls_error_id);
             }
+            // Disconnect context-menu signal (#121).
+            if self.context_menu_id != 0 {
+                g_signal_handler_disconnect(self.web_view as *mut _, self.context_menu_id);
+            }
             g_object_unref(self.web_view as *mut _);
         }
     }
@@ -1245,6 +1466,9 @@ pub(crate) struct WpeRuntime {
     /// each WebView when JS calls `window.open(url)` or a link has
     /// `target=_blank`. Drained by the apps layer via `BrowserEngine::popup_queue`.
     pub popup_queue: PopupQueue,
+    /// Context-menu request sink. Written by the `context-menu` signal handler
+    /// on each WebView; drained by the apps layer via `drain_context_menu_requests`.
+    pub context_menu_sink: WpeContextMenuSink,
 }
 
 impl WpeRuntime {
@@ -1257,6 +1481,7 @@ impl WpeRuntime {
         zoom_level: Arc<Mutex<f64>>,
         hint_sink: HintEventSink,
         popup_queue: PopupQueue,
+        context_menu_sink: WpeContextMenuSink,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -1298,6 +1523,7 @@ impl WpeRuntime {
             zoom_level,
             hint_sink,
             popup_queue,
+            context_menu_sink,
         })
     }
 
@@ -1377,6 +1603,7 @@ impl WpeRuntime {
             Arc::clone(&is_active),
             Arc::clone(&self.hint_sink),
             Arc::clone(&self.popup_queue),
+            Arc::clone(&self.context_menu_sink),
         );
 
         let entry = match entry {

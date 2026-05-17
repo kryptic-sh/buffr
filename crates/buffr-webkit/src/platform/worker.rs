@@ -32,7 +32,7 @@ use super::ffi::{
     webkit_cookie_manager_set_persistent_storage, webkit_network_session_get_cookie_manager,
     webkit_network_session_get_default,
 };
-use super::runtime::{TabInfo, WpeRuntime};
+use super::runtime::{TabInfo, WpeContextMenuSink, WpeRuntime, new_wpe_context_menu_sink};
 
 // ── EngineState ───────────────────────────────────────────────────────────────
 
@@ -208,6 +208,9 @@ pub(crate) struct WorkerHandle {
     /// WebView when JS calls `window.open(url)` or a link has `target=_blank`.
     /// Drained by the apps layer via `BrowserEngine::popup_queue`.
     pub popup_queue: PopupQueue,
+    /// Context-menu request sink. Written by the `context-menu` signal handler
+    /// on each WebView; drained by the apps layer via `drain_context_menu_requests`.
+    pub context_menu_sink: WpeContextMenuSink,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -278,10 +281,16 @@ pub(crate) fn spawn(
     // share the same Arc.
     let popup_queue: PopupQueue = new_popup_queue();
 
+    // Shared context-menu request sink. Allocated here so both `WebKitEngine`
+    // (drainer via `drain_context_menu_requests`) and the GLib worker thread
+    // (writer, via TabEntry's `context-menu` signal) share the same Arc.
+    let context_menu_sink: WpeContextMenuSink = new_wpe_context_menu_sink();
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
     let hint_sink_worker = Arc::clone(&hint_sink);
     let popup_queue_worker = Arc::clone(&popup_queue);
+    let context_menu_sink_worker = Arc::clone(&context_menu_sink);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -330,6 +339,7 @@ pub(crate) fn spawn(
                 Arc::clone(&zoom_level),
                 hint_sink_worker,
                 popup_queue_worker,
+                context_menu_sink_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -508,6 +518,7 @@ pub(crate) fn spawn(
         engine_state,
         hint_sink,
         popup_queue,
+        context_menu_sink,
         thread: Some(thread),
     })
 }
