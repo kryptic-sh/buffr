@@ -85,7 +85,14 @@ impl TabInfo {
 unsafe extern "C" {
     fn g_signal_handler_disconnect(instance: *mut std::os::raw::c_void, handler_id: u64);
     fn g_object_unref(object: *mut std::os::raw::c_void);
+    fn g_object_ref(object: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
     fn g_free(ptr: *mut std::os::raw::c_void);
+    /// Schedule a one-shot idle callback on the GLib default main context.
+    /// GSourceFunc: returns 0 (G_SOURCE_REMOVE) to run once.
+    fn g_idle_add(
+        function: unsafe extern "C" fn(*mut std::os::raw::c_void) -> i32,
+        data: *mut std::os::raw::c_void,
+    ) -> u32;
 }
 
 // SAFETY: jsc_value_to_string is exported by the JavaScriptCore library that
@@ -95,6 +102,20 @@ unsafe extern "C" {
 // signal handler.
 unsafe extern "C" {
     fn jsc_value_to_string(value: *mut std::os::raw::c_void) -> *mut std::os::raw::c_char;
+}
+
+// SAFETY: g_memory_input_stream_new_from_data is a GLib/GIO symbol not in the
+// bindgen allowlist (GIO stream types were excluded from the allowlist).
+// Takes (data, len, destroy_func) and returns a GInputStream*.
+// When destroy_func is non-NULL, GLib calls it with the data pointer when the
+// stream is fully consumed — for heap-allocated bytes we pass g_free so GLib
+// takes ownership.
+unsafe extern "C" {
+    fn g_memory_input_stream_new_from_data(
+        data: *const std::os::raw::c_void,
+        len: isize,
+        destroy: Option<unsafe extern "C" fn(*mut std::os::raw::c_void)>,
+    ) -> *mut super::ffi::GInputStream;
 }
 
 // Console-bridge JS injected at document start. Overrides console.log to
@@ -167,6 +188,64 @@ const FAVICON_BRIDGE_JS: &str = r#"
     send();
   }
   new MutationObserver(send).observe(document.head || document.documentElement, { childList: true, subtree: true });
+})();
+"#;
+
+/// Clipboard paste bridge JS injected at document-start on every frame.
+///
+/// Overrides `navigator.clipboard.readText` to call `fetch('buffr-clipboard:read')`
+/// and intercepts DOM `paste` events on editable elements to insert host
+/// clipboard text when no clipboardData text is already present.
+///
+/// The `buffr-clipboard` custom URI scheme is registered in `WpeRuntime::new`
+/// via `webkit_web_context_register_uri_scheme`; the callback reads the host
+/// clipboard via `hjkl_clipboard` and returns the bytes as `text/plain`.
+const CLIPBOARD_PASTE_BRIDGE_JS: &str = r#"
+(() => {
+  // Async readText helper backed by the buffr-clipboard URI scheme.
+  const readClipboard = async () => {
+    try {
+      const resp = await fetch('buffr-clipboard:read');
+      if (!resp.ok) return '';
+      return await resp.text();
+    } catch (_) { return ''; }
+  };
+
+  // Override navigator.clipboard.readText so modern Clipboard API works.
+  if (navigator.clipboard) {
+    try {
+      Object.defineProperty(navigator.clipboard, 'readText', {
+        value: readClipboard,
+        writable: true,
+        configurable: true,
+      });
+    } catch (_) {
+      // Some pages freeze navigator.clipboard — best effort.
+    }
+  }
+
+  // Intercept paste events on editable elements so Ctrl+V works in
+  // <input>, <textarea>, and contenteditable surfaces.
+  document.addEventListener('paste', async (ev) => {
+    const target = ev.target;
+    if (!target) return;
+    // Only handle when we have an editable target.
+    const isEditable = target.matches && (
+      target.matches('input:not([type=button]):not([type=submit]):not([type=reset])') ||
+      target.matches('textarea') ||
+      (target.isContentEditable === true)
+    );
+    if (!isEditable) return;
+    // Skip if clipboardData already has text — means another source filled it.
+    const existing = ev.clipboardData && ev.clipboardData.getData('text/plain');
+    if (existing) return;
+    ev.preventDefault();
+    const text = await readClipboard();
+    if (!text) return;
+    // Insert at caret. execCommand('insertText') is deprecated but still
+    // the most reliable cross-element insertion for our use case.
+    document.execCommand('insertText', false, text);
+  }, true);
 })();
 "#;
 
@@ -629,6 +708,170 @@ unsafe extern "C" fn drop_favicon_signal_ctx(
     }
 }
 
+// ── Clipboard paste: buffr-clipboard URI scheme ───────────────────────────────
+
+/// URI scheme callback for `buffr-clipboard:read`.
+///
+/// Registered once per process in `WpeRuntime::new` via
+/// `webkit_web_context_register_uri_scheme`. WebKit calls this on the
+/// GLib main thread whenever the page fetches `buffr-clipboard:read`.
+///
+/// We spawn a worker thread so the GLib main thread is never blocked by
+/// the hjkl-clipboard Wayland roundtrip (which can take a few ms).
+/// The worker calls `webkit_uri_scheme_request_finish` (or `_finish_error`)
+/// on the same thread via `g_idle_add` to ensure the call lands on the
+/// GLib main loop as required.
+///
+/// `user_data` is NULL — hjkl_clipboard::Clipboard::new() is called fresh
+/// per request because Clipboard is not Send (Wayland back-end uses a
+/// per-thread Wayland connection proxy via a static lazy thread).
+unsafe extern "C" fn on_clipboard_paste_scheme_request(
+    request: *mut super::ffi::WebKitURISchemeRequest,
+    _user_data: *mut std::os::raw::c_void,
+) {
+    use super::ffi::{GInputStream, WebKitURISchemeRequest, webkit_uri_scheme_request_finish};
+
+    if request.is_null() {
+        return;
+    }
+
+    // WebKit guarantees the request object is live for the duration of this
+    // callback. We need to keep it alive until the finish call on the idle
+    // thread — g_object_ref bumps the ref count.
+    unsafe { g_object_ref(request as *mut _) };
+
+    // Capture a raw pointer to pass to the worker thread. The g_object_ref
+    // above ensures the request outlives the thread.
+    let req_raw = request as usize; // usize is Send
+
+    std::thread::spawn(move || {
+        use hjkl_clipboard::{MimeType, Selection};
+
+        // Read host clipboard text. Clipboard::new() probes the best backend
+        // (Wayland bg thread → X11 → OSC52). The Wayland backend is safe to
+        // call from any OS thread — it has its own dedicated Wayland socket
+        // and does not share state with the main GLib/Wayland compositor thread.
+        let text: Option<String> = match hjkl_clipboard::Clipboard::new() {
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "webkit: buffr-clipboard — clipboard init failed, returning empty"
+                );
+                None
+            }
+            Ok(cb) => match cb.get(Selection::Clipboard, MimeType::Text) {
+                Ok(bytes) => {
+                    String::from_utf8(bytes).ok().filter(|s| !s.is_empty())
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "webkit: buffr-clipboard — clipboard get failed, returning empty"
+                    );
+                    None
+                }
+            },
+        };
+
+        // Marshal back to the GLib main loop via g_idle_add.
+        // SAFETY: g_idle_callback is a valid GSourceFunc; closure_ptr is a
+        // Box<…> we release inside the callback.
+        type Closure = Box<dyn FnOnce() + Send>;
+        let closure: Closure = Box::new(move || {
+            // SAFETY: req_raw was produced by `request as usize`; the
+            // g_object_ref above keeps it alive until this closure runs.
+            let req = req_raw as *mut WebKitURISchemeRequest;
+
+            match text {
+                Some(t) => {
+                    // Allocate a C string from the heap. We pass ownership to
+                    // g_memory_input_stream_new_from_data via g_free destroy.
+                    let bytes = t.into_bytes();
+                    let len = bytes.len() as isize;
+                    // Box::into_raw — ownership transferred to GLib via g_free.
+                    let data_ptr = {
+                        let mut b = bytes.into_boxed_slice();
+                        let p = b.as_mut_ptr() as *mut std::os::raw::c_void;
+                        std::mem::forget(b);
+                        p
+                    };
+                    let stream: *mut GInputStream = unsafe {
+                        g_memory_input_stream_new_from_data(
+                            data_ptr as *const _,
+                            len,
+                            // GLib calls g_free(data_ptr) when the stream is
+                            // fully consumed — GLib's allocator matches Rust's
+                            // global allocator on Linux (both use the system
+                            // malloc), so this is safe.
+                            Some(std::mem::transmute::<
+                                unsafe extern "C" fn(*mut std::os::raw::c_void),
+                                unsafe extern "C" fn(*mut std::os::raw::c_void),
+                            >(g_free)),
+                        )
+                    };
+                    if stream.is_null() {
+                        // OOM — finish with an empty stream rather than crashing.
+                        let empty: *mut GInputStream = unsafe {
+                            g_memory_input_stream_new_from_data(
+                                std::ptr::null(),
+                                0,
+                                None,
+                            )
+                        };
+                        let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
+                        unsafe { webkit_uri_scheme_request_finish(req, empty, 0, ct.as_ptr()) };
+                        if !empty.is_null() {
+                            unsafe { g_object_unref(empty as *mut _) };
+                        }
+                    } else {
+                        let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
+                        unsafe {
+                            webkit_uri_scheme_request_finish(
+                                req,
+                                stream,
+                                len as i64,
+                                ct.as_ptr(),
+                            )
+                        };
+                        unsafe { g_object_unref(stream as *mut _) };
+                    }
+                }
+                None => {
+                    // Return empty body rather than an error so fetch() resolves
+                    // cleanly (resp.ok = true, resp.text() = '').
+                    let empty: *mut GInputStream = unsafe {
+                        g_memory_input_stream_new_from_data(std::ptr::null(), 0, None)
+                    };
+                    let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
+                    unsafe { webkit_uri_scheme_request_finish(req, empty, 0, ct.as_ptr()) };
+                    if !empty.is_null() {
+                        unsafe { g_object_unref(empty as *mut _) };
+                    }
+                }
+            }
+
+            // Release our extra ref — WebKit now owns the request again.
+            unsafe { g_object_unref(req as *mut _) };
+        });
+
+        // Package the closure into a raw pointer for g_idle_add.
+        let closure_ptr = Box::into_raw(Box::new(closure)) as *mut std::os::raw::c_void;
+
+        unsafe extern "C" fn g_idle_callback(data: *mut std::os::raw::c_void) -> i32 {
+            if !data.is_null() {
+                // SAFETY: data was produced by Box::into_raw(Box<Box<dyn FnOnce()…>>).
+                let closure = unsafe { Box::from_raw(data as *mut Closure) };
+                closure();
+            }
+            0 // G_SOURCE_REMOVE — run once
+        }
+
+        // SAFETY: g_idle_add schedules g_idle_callback on the GLib default
+        // main context. closure_ptr is a valid heap pointer.
+        unsafe { g_idle_add(g_idle_callback, closure_ptr) };
+    });
+}
+
 // ── Popup create signal ───────────────────────────────────────────────────────
 
 /// `create (WebKitWebView*, WebKitNavigationAction*)` signal handler.
@@ -953,7 +1196,7 @@ unsafe extern "C" fn on_context_menu(
 /// `ws` and `wss` are included because WebKit handles WebSocket connections
 /// internally via the same network session as HTTP.
 const INTERNAL_SCHEMES: &[&str] = &[
-    "http", "https", "file", "buffr", "about", "data", "blob", "ws", "wss",
+    "http", "https", "file", "buffr", "buffr-clipboard", "about", "data", "blob", "ws", "wss",
 ];
 
 /// `decide-policy` on `WebKitWebView`.
@@ -1497,6 +1740,40 @@ impl TabEntry {
             }
         };
 
+        // ── Clipboard paste bridge: inject user-script (#128) ────────────────
+        //
+        // Inject CLIPBOARD_PASTE_BRIDGE_JS at document-start on all frames.
+        // This overrides `navigator.clipboard.readText` and intercepts DOM
+        // `paste` events, both delegating to `fetch('buffr-clipboard:read')`
+        // which is served by the URI scheme registered in `WpeRuntime::new`.
+        //
+        // No UCM signal handler needed — the response goes through the URI
+        // scheme callback (`on_clipboard_paste_scheme_request`), not postMessage.
+        unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script, webkit_user_script_new,
+                webkit_user_script_unref, webkit_web_view_get_user_content_manager,
+            };
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if !ucm.is_null() {
+                let source_c = CString::new(CLIPBOARD_PASTE_BRIDGE_JS).unwrap();
+                let script = webkit_user_script_new(
+                    source_c.as_ptr(),
+                    INJECT_ALL,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, script);
+                    webkit_user_script_unref(script);
+                    tracing::debug!("webkit: CLIPBOARD_PASTE_BRIDGE_JS injected for tab {id:?}");
+                }
+            }
+        }
+
         // ── Popup queue: `create` signal ──────────────────────────────────────
         //
         // Fired when JS calls `window.open(url)` or a link has `target=_blank`.
@@ -1922,6 +2199,56 @@ impl WpeRuntime {
             wpe_display_set_primary(display.raw);
         }
         tracing::info!("webkit: BuffrDisplay created + connected (shared)");
+
+        // ── buffr-clipboard URI scheme (#128) ─────────────────────────────────
+        //
+        // Register `buffr-clipboard:read` once on the default WebContext so
+        // any WebView can call `fetch('buffr-clipboard:read')` to read the
+        // host clipboard. The callback (`on_clipboard_paste_scheme_request`)
+        // spawns a worker thread to avoid blocking the GLib main loop on the
+        // hjkl-clipboard Wayland roundtrip, then delivers the result via
+        // g_idle_add.
+        //
+        // Security: mark the scheme as CORS-enabled + secure so fetch() from
+        // any origin works without preflight and without mixed-content blocking.
+        unsafe {
+            use super::ffi::{
+                webkit_security_manager_register_uri_scheme_as_cors_enabled,
+                webkit_security_manager_register_uri_scheme_as_secure,
+                webkit_web_context_get_default, webkit_web_context_get_security_manager,
+                webkit_web_context_register_uri_scheme,
+            };
+            let ctx = webkit_web_context_get_default();
+            if !ctx.is_null() {
+                let scheme_c = std::ffi::CString::new("buffr-clipboard").unwrap();
+                webkit_web_context_register_uri_scheme(
+                    ctx,
+                    scheme_c.as_ptr(),
+                    Some(on_clipboard_paste_scheme_request),
+                    std::ptr::null_mut(),
+                    None,
+                );
+                let sec = webkit_web_context_get_security_manager(ctx);
+                if !sec.is_null() {
+                    webkit_security_manager_register_uri_scheme_as_cors_enabled(
+                        sec,
+                        scheme_c.as_ptr(),
+                    );
+                    webkit_security_manager_register_uri_scheme_as_secure(
+                        sec,
+                        scheme_c.as_ptr(),
+                    );
+                }
+                tracing::info!(
+                    "webkit: buffr-clipboard URI scheme registered (clipboard paste inbound)"
+                );
+            } else {
+                tracing::warn!(
+                    "webkit: webkit_web_context_get_default() returned NULL \
+                     — buffr-clipboard paste scheme not registered"
+                );
+            }
+        }
 
         Ok(Self {
             tabs: Vec::new(),
