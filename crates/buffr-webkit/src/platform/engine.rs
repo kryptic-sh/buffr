@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+use buffr_core::hint::{
+    DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HintAlphabet, HintConsoleEvent, HintSession,
+    build_inject_script, take_hint_event,
+};
 use buffr_engine::{
     BackendOpenOptions, BrowserEngine, EngineError, HintAction, HintStatus, MouseButton,
     NeutralKeyEvent, NewTabHtmlProvider, OsrFrame, OsrViewState, SharedOsrFrame,
@@ -67,6 +71,14 @@ pub struct WebKitEngine {
     /// Shared with `WpeRuntime`. Written by the GLib worker on zoom commands;
     /// read from any thread via `active_zoom_level`. Initialised to 1.0.
     zoom_level: Arc<Mutex<f64>>,
+    /// Alphabet used to mint hint labels. Mirrors the webkitgtk backend's
+    /// setup — default is `buffr_core::hint::DEFAULT_HINT_ALPHABET`.
+    hint_alphabet: HintAlphabet,
+    /// Active hint session for the current tab. `None` when not in hint mode.
+    /// Mutated by `feed_hint_key`, `backspace_hint`, `cancel_hint`, and
+    /// populated with the hint list from `pump_hint_events` when the renderer
+    /// fires the `ready` event via the UCM script-message bridge.
+    hint_session: Mutex<Option<HintSession>>,
 }
 
 impl WebKitEngine {
@@ -177,6 +189,12 @@ impl WebKitEngine {
             cookie_db_path,
         )?;
 
+        // Default hint alphabet — mirrors webkitgtk backend. Fallback to
+        // a hard-coded 2-char alphabet if DEFAULT_HINT_ALPHABET ever fails
+        // validation (it never does, but the API returns Result).
+        let hint_alphabet = HintAlphabet::from_str(DEFAULT_HINT_ALPHABET)
+            .unwrap_or_else(|_| HintAlphabet::from_str("as").expect("fallback alphabet"));
+
         Ok(Self {
             engine_id: options.engine_id.clone(),
             frame,
@@ -200,6 +218,8 @@ impl WebKitEngine {
             }),
             is_loading_atomic,
             zoom_level,
+            hint_alphabet,
+            hint_session: Mutex::new(None),
         })
     }
 
@@ -273,6 +293,27 @@ impl WebKitEngine {
     fn apply_display_overrides(&self, summary: TabSummary) -> TabSummary {
         let display = self.display_url_for(summary.id);
         apply_display_overrides_pure(summary, display.as_deref())
+    }
+
+    /// Inject hint.js into the active tab and initialise a `HintSession`.
+    ///
+    /// Mirrors `WebKitGtkEngine::enter_hint_mode` 1:1.
+    fn enter_hint_mode(&self, background: bool) {
+        const LABEL_BUDGET: usize = 256;
+        let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
+        let alphabet_str = self.hint_alphabet.as_string();
+        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
+
+        let alphabet = self.hint_alphabet.clone();
+        if let Ok(mut g) = self.hint_session.lock() {
+            *g = Some(HintSession::new(alphabet, Vec::new(), background));
+        }
+        self.send(Command::EvalJs { script });
+        tracing::info!(
+            background,
+            label_budget = LABEL_BUDGET,
+            "webkit: hint mode injected"
+        );
     }
 
     /// Send a fire-and-forget command to the worker thread.
@@ -671,8 +712,16 @@ impl BrowserEngine for WebKitEngine {
 
     // ── Find / zoom ───────────────────────────────────────────────────────────
 
-    fn start_find(&self, _query: &str, _forward: bool) {}
-    fn stop_find(&self) {}
+    fn start_find(&self, query: &str, forward: bool) {
+        self.send(Command::StartFind {
+            query: query.to_owned(),
+            forward,
+        });
+    }
+
+    fn stop_find(&self) {
+        self.send(Command::StopFind);
+    }
 
     fn active_zoom_level(&self) -> f64 {
         self.zoom_level.lock().map(|g| *g).unwrap_or(1.0)
@@ -768,29 +817,130 @@ impl BrowserEngine for WebKitEngine {
     ) {
     }
 
-    // ── Hint mode — stub ──────────────────────────────────────────────────────
+    // ── Hint mode ─────────────────────────────────────────────────────────────
 
     fn is_hint_mode(&self) -> bool {
-        false
+        self.hint_session
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
     }
 
     fn hint_status(&self) -> Option<HintStatus> {
-        None
+        let g = self.hint_session.lock().ok()?;
+        let s = g.as_ref()?;
+        Some(HintStatus {
+            typed: s.typed.clone(),
+            match_count: s.match_count(),
+            background: s.background,
+        })
     }
 
     fn pump_hint_events(&self) -> bool {
-        false
+        let Some(event) = take_hint_event(&self.worker.hint_sink) else {
+            return false;
+        };
+        match event {
+            HintConsoleEvent::Ready { hints, alphabet: _ } => {
+                let alphabet = self.hint_alphabet.clone();
+                if let Ok(mut g) = self.hint_session.lock()
+                    && let Some(existing) = g.as_mut()
+                {
+                    let background = existing.background;
+                    *existing = HintSession::new(alphabet, hints, background);
+                }
+                true
+            }
+            HintConsoleEvent::Error { message } => {
+                tracing::warn!(message, "webkit: hint mode renderer error");
+                self.cancel_hint();
+                true
+            }
+        }
     }
 
-    fn feed_hint_key(&self, _c: char) -> Option<HintAction> {
-        None
+    fn feed_hint_key(&self, ch: char) -> Option<HintAction> {
+        let mut commit_id: Option<u32> = None;
+        let mut filter_typed: Option<String> = None;
+        let mut clear = false;
+        let mut cancel = false;
+
+        let action = {
+            let mut g = self.hint_session.lock().ok()?;
+            let session = g.as_mut()?;
+            let action = session.feed(ch);
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Click(id) | HintAction::OpenInBackground(id) => {
+                    commit_id = Some(*id);
+                    clear = true;
+                }
+                HintAction::Cancel => cancel = true,
+            }
+            action
+        };
+
+        if let Some(typed) = filter_typed {
+            let js = format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                serde_json::to_string(&typed).unwrap_or_else(|_| "\"\"".into())
+            );
+            self.send(Command::EvalJs { script: js });
+        }
+        if let Some(id) = commit_id {
+            let js = format!("if (window.__buffrHintCommit) window.__buffrHintCommit({id})");
+            self.send(Command::EvalJs { script: js });
+        }
+        if clear {
+            if let Ok(mut g) = self.hint_session.lock() {
+                *g = None;
+            }
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
     fn backspace_hint(&self) -> Option<HintAction> {
-        None
+        let mut filter_typed: Option<String> = None;
+        let mut cancel = false;
+
+        let action = {
+            let mut g = self.hint_session.lock().ok()?;
+            let session = g.as_mut()?;
+            let action = session.backspace();
+            let typed = session.typed.clone();
+            match &action {
+                HintAction::Filter => filter_typed = Some(typed),
+                HintAction::Cancel => cancel = true,
+                _ => {}
+            }
+            action
+        };
+
+        if let Some(typed) = filter_typed {
+            let js = format!(
+                "if (window.__buffrHintFilter) window.__buffrHintFilter({})",
+                serde_json::to_string(&typed).unwrap_or_else(|_| "\"\"".into())
+            );
+            self.send(Command::EvalJs { script: js });
+        }
+        if cancel {
+            self.cancel_hint();
+        }
+        Some(action)
     }
 
-    fn cancel_hint(&self) {}
+    fn cancel_hint(&self) {
+        self.send(Command::EvalJs {
+            script: "if (window.__buffrHintCancel) window.__buffrHintCancel()".into(),
+        });
+        if let Ok(mut g) = self.hint_session.lock() {
+            *g = None;
+        }
+    }
 
     /// Vim-style PageAction dispatcher. CEF implements this as a big
     /// match that pokes the browser host directly. For WPE we route the
@@ -848,6 +998,8 @@ impl BrowserEngine for WebKitEngine {
             A::StopLoading => self.send(Command::EvalJs {
                 script: "window.stop();".into(),
             }),
+            A::EnterHintMode => self.enter_hint_mode(false),
+            A::EnterHintModeBackground => self.enter_hint_mode(true),
             _ => tracing::debug!(?action, "webkit: dispatch: no mapping yet"),
         }
     }

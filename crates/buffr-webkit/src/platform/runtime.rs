@@ -11,10 +11,11 @@
 //! Until those subclasses land, `TabEntry::new` returns `None` and tabs
 //! fail to open.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId};
 
 use super::egl::EglWorker;
@@ -70,7 +71,35 @@ impl TabInfo {
 unsafe extern "C" {
     fn g_signal_handler_disconnect(instance: *mut std::os::raw::c_void, handler_id: u64);
     fn g_object_unref(object: *mut std::os::raw::c_void);
+    fn g_free(ptr: *mut std::os::raw::c_void);
 }
+
+// SAFETY: jsc_value_to_string is exported by the JavaScriptCore library that
+// wpe-webkit-2.0 depends on. It allocates a UTF-8 string that the caller
+// must free with g_free. Symbol not in the bindgen allowlist because the
+// JSCValue type was excluded; declared here manually for the script-message
+// signal handler.
+unsafe extern "C" {
+    fn jsc_value_to_string(value: *mut std::os::raw::c_void) -> *mut std::os::raw::c_char;
+}
+
+// Console-bridge JS injected at document start. Overrides console.log to
+// forward messages with the buffr hint sentinel to the native `buffrHint`
+// script-message handler registered via WebKitUserContentManager.
+//
+// Pattern mirrors the webkitgtk backend (crates/buffr-webkitgtk).
+const HINT_CONSOLE_BRIDGE_JS: &str = r#"
+(function() {
+  var orig = console.log;
+  console.log = function() {
+    orig.apply(console, arguments);
+    var msg = arguments[0];
+    if (typeof msg === 'string' && msg.indexOf('__buffr_hint__:') === 0) {
+      try { window.webkit.messageHandlers.buffrHint.postMessage(msg); } catch(e) {}
+    }
+  };
+})();
+"#;
 
 /// Per-tab heap context handed to WebKit's signal handlers via `user_data`.
 /// Keeps an Arc clone of the shared engine state so handlers running on the
@@ -273,6 +302,66 @@ unsafe extern "C" fn drop_tab_signal_ctx(
     }
 }
 
+// ── Hint script-message signal ────────────────────────────────────────────────
+
+/// `script-message-received::buffrHint` handler on the WebKitUserContentManager.
+///
+/// Prototype (GLib signal): `(WebKitUserContentManager*, JSCValue*, user_data*)`.
+/// `js_value` carries the string the page posted via
+/// `window.webkit.messageHandlers.buffrHint.postMessage(msg)`.
+/// We call `jsc_value_to_string` (malloc'd, must g_free), parse the sentinel
+/// prefix with `buffr_core::hint::parse_console_event`, and write the result
+/// into the shared `HintEventSink`.
+unsafe extern "C" fn on_hint_script_message(
+    _ucm: *mut std::os::raw::c_void,
+    js_value: *mut std::os::raw::c_void,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if js_value.is_null() || user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is an Arc<Mutex<Option<HintConsoleEvent>>> leaked via
+    // Arc::into_raw; we borrow it here without consuming (no from_raw).
+    let sink = unsafe { &*(user_data as *const Mutex<Option<HintConsoleEvent>>) };
+
+    // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
+    let raw_ptr = unsafe { jsc_value_to_string(js_value) };
+    if raw_ptr.is_null() {
+        return;
+    }
+    let raw_str = unsafe { CStr::from_ptr(raw_ptr) }.to_string_lossy();
+    let raw: &str = &raw_str;
+    tracing::debug!(raw, "webkit: buffrHint script-message received");
+
+    match parse_console_event(raw) {
+        Some(Ok(event)) => {
+            if let Ok(mut guard) = sink.lock() {
+                *guard = Some(event);
+            }
+        }
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, raw, "webkit: malformed hint event");
+        }
+        None => {
+            tracing::debug!("webkit: buffrHint message missing sentinel (ignored)");
+        }
+    }
+    // SAFETY: g_free the malloc'd string from jsc_value_to_string.
+    unsafe { g_free(raw_ptr as *mut _) };
+}
+
+/// GLib `GClosureNotify` for the `Arc<HintEventSink>` pointer leaked in
+/// `TabEntry::new` for the `script-message-received::buffrHint` connection.
+unsafe extern "C" fn drop_hint_sink_arc(
+    user_data: *mut std::os::raw::c_void,
+    _closure: *mut _GClosure,
+) {
+    if !user_data.is_null() {
+        // SAFETY: user_data was produced by Arc::into_raw.
+        drop(unsafe { Arc::from_raw(user_data as *const Mutex<Option<HintConsoleEvent>>) });
+    }
+}
+
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
 /// One open browser tab. Owns the WebKitWebView GObject. The shared
@@ -289,6 +378,7 @@ pub(crate) struct TabEntry {
     notify_title_id: u64,
     notify_uri_id: u64,
     notify_estimated_load_progress_id: u64,
+    hint_script_message_received_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -317,6 +407,7 @@ impl TabEntry {
         engine_state: Arc<Mutex<EngineState>>,
         is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
         is_active: Arc<std::sync::atomic::AtomicBool>,
+        hint_sink: HintEventSink,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
@@ -456,6 +547,85 @@ impl TabEntry {
             }
         }
 
+        // ── Hint mode: UCM script-message handler ─────────────────────────────
+        //
+        // 1. Grab the WebView's default UserContentManager.
+        // 2. Register the `buffrHint` native handler name. JS running in the page
+        //    can then call `window.webkit.messageHandlers.buffrHint.postMessage(msg)`.
+        // 3. Inject HINT_CONSOLE_BRIDGE_JS at document-start so that any
+        //    `console.log('__buffr_hint__:…')` from hint.js is forwarded to the
+        //    native handler without needing to modify hint.js.
+        // 4. Wire the `script-message-received::buffrHint` GLib signal so the
+        //    Rust side parses the event and writes it into `hint_sink`.
+        //
+        // IPC mechanism: webkit_user_content_manager_register_script_message_handler
+        // + `script-message-received::buffrHint` signal — confirmed present in
+        // WPE 2.52 bindings (see build/buffr-webkit-*/out/wpe_bindings.rs).
+        let hint_script_message_received_id: u64 = unsafe {
+            use super::ffi::{
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
+                webkit_user_content_manager_add_script,
+                webkit_user_content_manager_register_script_message_handler,
+                webkit_user_script_new, webkit_user_script_unref,
+                webkit_web_view_get_user_content_manager,
+            };
+
+            let ucm = webkit_web_view_get_user_content_manager(web_view);
+            if ucm.is_null() {
+                tracing::warn!(
+                    "webkit: TabEntry::new — UserContentManager is NULL, hint IPC unavailable"
+                );
+                0
+            } else {
+                // Register the native message handler name.
+                let handler_name = CString::new("buffrHint").unwrap();
+                let _ok = webkit_user_content_manager_register_script_message_handler(
+                    ucm,
+                    handler_name.as_ptr(),
+                    std::ptr::null(),
+                );
+
+                // Inject console bridge at document-start on all frames.
+                let source_c = CString::new(HINT_CONSOLE_BRIDGE_JS).unwrap();
+                let script = webkit_user_script_new(
+                    source_c.as_ptr(),
+                    INJECT_ALL,
+                    INJECT_START,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if !script.is_null() {
+                    webkit_user_content_manager_add_script(ucm, script);
+                    webkit_user_script_unref(script);
+                }
+
+                // Connect `script-message-received::buffrHint` on the UCM.
+                // The signal detail ("buffrHint") ensures we only receive
+                // messages from that named handler, not all script messages.
+                // Signal prototype:
+                //   void script_message_received(WebKitUserContentManager*,
+                //                                JSCValue* js_value, gpointer)
+                let sink_arc = Arc::into_raw(Arc::clone(&hint_sink)) as *mut std::os::raw::c_void;
+                let signal_name = CString::new("script-message-received::buffrHint").unwrap();
+                g_signal_connect_data(
+                    ucm as *mut _,
+                    signal_name.as_ptr(),
+                    Some(std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                            *mut std::os::raw::c_void,
+                        ),
+                        unsafe extern "C" fn(),
+                    >(on_hint_script_message)),
+                    sink_arc,
+                    Some(drop_hint_sink_arc),
+                    0,
+                )
+            }
+        };
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -468,6 +638,7 @@ impl TabEntry {
             notify_title_id,
             notify_uri_id,
             notify_estimated_load_progress_id,
+            hint_script_message_received_id,
             is_active,
         })
     }
@@ -601,6 +772,18 @@ impl Drop for TabEntry {
                     self.notify_estimated_load_progress_id,
                 );
             }
+            // Disconnect the hint script-message signal from the UCM. The UCM
+            // is owned by the WebView and will be freed on g_object_unref below;
+            // disconnecting first prevents the destroy notify firing on freed mem.
+            if self.hint_script_message_received_id != 0 {
+                let ucm = super::ffi::webkit_web_view_get_user_content_manager(self.web_view);
+                if !ucm.is_null() {
+                    g_signal_handler_disconnect(
+                        ucm as *mut _,
+                        self.hint_script_message_received_id,
+                    );
+                }
+            }
             g_object_unref(self.web_view as *mut _);
         }
     }
@@ -637,6 +820,11 @@ pub(crate) struct WpeRuntime {
     /// Shared zoom level. Written by the worker on every zoom command;
     /// read from any thread via `WebKitEngine::active_zoom_level`.
     pub zoom_level: Arc<Mutex<f64>>,
+    /// One-slot hint event mailbox. Written by the `buffrHint`
+    /// script-message handler on the GLib worker thread when the injected
+    /// `hint.js` fires a `console.log('__buffr_hint__:…')` message.
+    /// Read (and cleared) by `WebKitEngine::pump_hint_events` on any thread.
+    pub hint_sink: HintEventSink,
 }
 
 impl WpeRuntime {
@@ -647,6 +835,7 @@ impl WpeRuntime {
         egl: EglWorker,
         is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
         zoom_level: Arc<Mutex<f64>>,
+        hint_sink: HintEventSink,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -686,6 +875,7 @@ impl WpeRuntime {
             display,
             is_loading_atomic,
             zoom_level,
+            hint_sink,
         })
     }
 
@@ -763,6 +953,7 @@ impl WpeRuntime {
             Arc::clone(&self.engine_state),
             Arc::clone(&self.is_loading_atomic),
             Arc::clone(&is_active),
+            Arc::clone(&self.hint_sink),
         );
 
         let entry = match entry {
@@ -1248,6 +1439,68 @@ impl WpeRuntime {
         }
 
         tracing::info!(from, to, insert_at, "webkit: move_tab");
+    }
+
+    // ── Find-in-page (webkit_find_controller_*) ───────────────────────────────
+
+    /// Begin an in-page find session on the active tab's WebView.
+    ///
+    /// Uses CASE_INSENSITIVE | WRAP_AROUND always; adds BACKWARDS when
+    /// `forward == false`. `max_match_count` is set to `u32::MAX` so
+    /// WebKit highlights every occurrence.
+    pub(crate) fn start_find(&self, query: &str, forward: bool) {
+        let Some(tab) = self.active_tab() else {
+            tracing::debug!("webkit: start_find — no active tab");
+            return;
+        };
+        if tab.web_view.is_null() {
+            return;
+        }
+        let Ok(query_c) = CString::new(query) else {
+            tracing::warn!("webkit: start_find: query contains NUL byte");
+            return;
+        };
+        // WebKitFindOptions bitmask (from wpe_bindings.rs):
+        //   NONE=0, CASE_INSENSITIVE=1, AT_WORD_STARTS=2,
+        //   TREAT_MEDIAL_CAPITAL_AS_WORD_START=4, BACKWARDS=8, WRAP_AROUND=16
+        const CASE_INSENSITIVE: u32 = 1;
+        const BACKWARDS: u32 = 8;
+        const WRAP_AROUND: u32 = 16;
+        let opts = if forward {
+            CASE_INSENSITIVE | WRAP_AROUND
+        } else {
+            CASE_INSENSITIVE | BACKWARDS | WRAP_AROUND
+        };
+        // SAFETY: web_view is valid for the tab's lifetime; all calls are on
+        // the GLib worker thread.  webkit_web_view_get_find_controller returns
+        // a borrowed ref that stays valid as long as the WebView is alive.
+        unsafe {
+            let fc = webkit_web_view_get_find_controller(tab.web_view);
+            if fc.is_null() {
+                tracing::warn!("webkit: start_find — null FindController");
+                return;
+            }
+            webkit_find_controller_search(fc, query_c.as_ptr(), opts, u32::MAX);
+        }
+        tracing::debug!(query, forward, "webkit: start_find");
+    }
+
+    /// Cancel the active find session and remove all match highlights.
+    pub(crate) fn stop_find(&self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.web_view.is_null() {
+            return;
+        }
+        // SAFETY: see start_find.
+        unsafe {
+            let fc = webkit_web_view_get_find_controller(tab.web_view);
+            if !fc.is_null() {
+                webkit_find_controller_search_finish(fc);
+            }
+        }
+        tracing::debug!("webkit: stop_find");
     }
 
     /// Toggle the WebKit web inspector for the active tab.

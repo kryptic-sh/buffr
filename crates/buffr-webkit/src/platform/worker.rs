@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::hint::{HintEventSink, new_hint_event_sink};
 use buffr_engine::{SharedOsrFrame, SharedOsrViewState, TabId, TabSummary};
 
 use super::error::WebKitError;
@@ -169,6 +170,16 @@ pub(crate) enum Command {
     OpenDevtools {
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    /// Begin an in-page find session on the active tab.
+    ///
+    /// `query` is the search string; `forward = false` searches backwards.
+    /// Options: CASE_INSENSITIVE | WRAP_AROUND (+ BACKWARDS when !forward).
+    StartFind {
+        query: String,
+        forward: bool,
+    },
+    /// Cancel the active find session and remove highlights.
+    StopFind,
     Shutdown,
 }
 
@@ -187,6 +198,10 @@ pub(crate) struct WpeKeyEvent {
 pub(crate) struct WorkerHandle {
     pub cmd_tx: mpsc::SyncSender<Command>,
     pub engine_state: Arc<Mutex<EngineState>>,
+    /// One-slot hint event mailbox shared with the worker's WpeRuntime and
+    /// every TabEntry's UCM script-message handler. `WebKitEngine` reads this
+    /// via `pump_hint_events`.
+    pub hint_sink: HintEventSink,
     /// `Option` so [`Drop`] can take + join the handle. Stays `Some`
     /// until either `shutdown_and_join` is called explicitly or the
     /// engine is dropped.
@@ -243,8 +258,14 @@ pub(crate) fn spawn(
     let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(64);
 
+    // Shared hint event mailbox. Allocated here so both `WebKitEngine`
+    // (reader) and the GLib worker thread (writer, via TabEntry's UCM
+    // signal handler) share the same Arc.
+    let hint_sink: HintEventSink = new_hint_event_sink();
+
     let initial_url = initial_url.to_owned();
     let es = Arc::clone(&engine_state);
+    let hint_sink_worker = Arc::clone(&hint_sink);
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -291,6 +312,7 @@ pub(crate) fn spawn(
                 egl,
                 Arc::clone(&is_loading_atomic),
                 Arc::clone(&zoom_level),
+                hint_sink_worker,
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -419,6 +441,7 @@ pub(crate) fn spawn(
     Ok(WorkerHandle {
         cmd_tx,
         engine_state,
+        hint_sink,
         thread: Some(thread),
     })
 }
@@ -498,6 +521,12 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         Command::OpenDevtools { reply } => {
             let res = rt.open_devtools();
             let _ = reply.try_send(res);
+        }
+        Command::StartFind { query, forward } => {
+            rt.start_find(&query, forward);
+        }
+        Command::StopFind => {
+            rt.stop_find();
         }
         Command::Shutdown => {
             ml.quit();

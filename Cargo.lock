@@ -1013,6 +1013,7 @@ dependencies = [
  "khronos-egl",
  "libloading 0.8.9",
  "pkg-config",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]
