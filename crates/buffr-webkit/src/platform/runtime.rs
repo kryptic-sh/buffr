@@ -3134,9 +3134,34 @@ impl TabEntry {
     /// paint scheduling, no CPU cost). This method exists for symmetry +
     /// future hook surface; the flag flip is done by the caller.
     pub(crate) fn hide(&self) {
-        // No FFI work needed — pause is implicit via the is_active gate +
-        // parked-buffer mechanism. The caller has already flipped
-        // `self.is_active` to false before calling hide().
+        // Tell WebKit the view is no longer visible.  WPE's
+        // `wpe_view_set_visible(view, FALSE)` does three load-bearing
+        // things for memory pressure:
+        //
+        //   1. Pauses the page's render scheduler — WebKit stops
+        //      driving the AcceleratedBackingStore on this view.
+        //   2. Fires the Page Visibility API change so JS-driven
+        //      animations (requestAnimationFrame, IntersectionObserver)
+        //      stop, easing CPU + GPU work for inactive tabs.
+        //   3. Makes WebKit eligible to drop the backing-store tile
+        //      cache for this view.  On AMDGPU we see this as freed
+        //      DMA-BUF pool slots; on multi-tab sessions it's the
+        //      difference between hitting the 32-bit address-space
+        //      ceiling at ~3 tabs vs comfortably running ~20.
+        //
+        // The is_active flag + parked-buffer ack-gating remain in
+        // place as a defence-in-depth: if WebKit emits a final
+        // buffer between this call and the actual scheduler pause,
+        // buffr_rust_render_buffer parks it without copying into
+        // the shared OsrFrame, and the next show() acks + wiggles
+        // to recover.
+        if self.wpe_view.is_null() {
+            return;
+        }
+        // SAFETY: wpe_view is a live WPEView; this call is on the
+        // GLib worker thread (Command dispatch).
+        unsafe { wpe_view_set_visible(self.wpe_view, 0) };
+        tracing::debug!(id = ?self.id, "webkit: hide — wpe_view_set_visible(0)");
     }
 
     /// Activate this tab at the WebKit level.
