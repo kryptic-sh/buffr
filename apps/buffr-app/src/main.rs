@@ -10135,16 +10135,27 @@ mod tests {
     }
 
     #[test]
-    fn loading_anim_signature_independent_of_load_state() {
+    fn loading_anim_off_even_when_load_would_be_in_flight() {
         // Regression: the splash gate used to OR in `host_is_loading`,
         // which got pinned `true` forever when a tab-switch raced
-        // LOAD_COMMITTED — the splash never gave way to the page even
+        // LOAD_COMMITTED — splash never gave way to the page even
         // though fresh frames were arriving.  The fix dropped the
-        // load-state input from the gate; the only inputs are now the
-        // dimension triple.  This test encodes the constraint at the
-        // type level: any signature regression that re-adds an
-        // is_loading bool would fail to compile.
-        let _ = should_show_loading_anim(Some((1272, 623)), 1272, 623);
+        // load-state input from the gate.  Two safeguards:
+        //
+        //   1. Signature regression — any future change that re-adds
+        //      an `is_loading: bool` param would force a fix on this
+        //      call site.  The constraint lives in the function
+        //      signature itself (the call below).
+        //   2. Behaviour assertion — with dims matching the live
+        //      browser rect, the gate MUST return false.  Were the
+        //      old logic still in play, a stuck-true loading atomic
+        //      would have flipped this to true; the assert pins that
+        //      degradation can't sneak back in.
+        assert!(
+            !should_show_loading_anim(Some((1272, 623)), 1272, 623),
+            "regression: splash overlay would re-engage even when the engine \
+             reports fresh pixels at the right dims, repeating the stuck-splash bug"
+        );
     }
 
     #[test]
