@@ -6,6 +6,15 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-17
+
+### Added
+
+- `BackendOpenOptions.prefer_native: bool` — opt-in flag for backends that
+  support native compositing. Defaults to `false`; existing callers remain
+  on the OSR path. Consumed by `buffr-webkit` (#144) to switch to
+  `WPEDisplayWayland` on Wayland sessions.
+
 ## [0.1.3] - 2026-05-15
 
 ### Changed
@@ -42,7 +51,9 @@ All notable changes to `buffr-engine` are documented here. Format follows
 
 _Initial release._
 
-[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr-engine/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.5
+[0.1.4]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.4
 [0.1.3]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kryptic-sh/buffr-engine/releases/tag/v0.1.1

@@ -87,6 +87,19 @@ pub struct BackendOpenOptions<'a> {
     /// CEF: expects `Box<CefEngineSinks>` (defined in buffr-cef).
     /// Blink-CDP: ignored (pass `Box::new(())`).
     pub sinks: Box<dyn std::any::Any + Send>,
+    /// Hint to the backend that the host prefers native compositing over the
+    /// OSR pixel-copy path when available on the current session.
+    ///
+    /// The backend is still free to veto (e.g. if the session type is X11 or
+    /// headless). Defaults to `false` so existing callers that don't set this
+    /// field stay on the OSR path.
+    ///
+    /// Currently consumed by `buffr-webkit` (#144): when `true` and
+    /// `XDG_SESSION_TYPE=wayland`, the WPE runtime uses `WPEDisplayWayland`
+    /// instead of `BuffrDisplay` (OSR subclass). The WebKit `wl_surface` exists
+    /// after this but is not yet parented — subsurface attach is #145.
+    #[doc(alias = "native_compositing")]
+    pub prefer_native: bool,
 }
 
 /// Process-model lifecycle hooks. One impl per backend crate.
