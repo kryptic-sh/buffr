@@ -62,15 +62,13 @@ Right-clicking a hyperlink (`<a href="...">` or any element with a URL).
 
 Right-clicking an `<img>` or other image-type media element.
 
-| Variant                  | Label                   | Notes                                                      |
-| ------------------------ | ----------------------- | ---------------------------------------------------------- |
-| `OpenImageInNewTab`      | Open Image in New Tab   | Navigates to the image URL directly.                       |
-| `SaveImageAs`            | Save Image As…          | Triggers a CEF download.                                   |
-| `CopyImage`              | Copy Image              | Fetches off-thread, transcodes to PNG, writes clipboard.   |
-| `CopyImageAddress`       | Copy Image Address      | Writes the image URL as text to the clipboard.             |
-| `RotateClockwise`        | Rotate Clockwise        | Rotates +90° via `el.style.transform`. Composes on repeat. |
-| `RotateCounterclockwise` | Rotate Counterclockwise | Rotates −90° via `el.style.transform`. Composes on repeat. |
-| `InspectElement`         | Inspect Element         | Opens DevTools at the right-click hit-point.               |
+| Variant             | Label                 | Notes                                                    |
+| ------------------- | --------------------- | -------------------------------------------------------- |
+| `OpenImageInNewTab` | Open Image in New Tab | Navigates to the image URL directly.                     |
+| `SaveImageAs`       | Save Image As…        | Triggers a CEF download.                                 |
+| `CopyImage`         | Copy Image            | Fetches off-thread, transcodes to PNG, writes clipboard. |
+| `CopyImageAddress`  | Copy Image Address    | Writes the image URL as text to the clipboard.           |
+| `InspectElement`    | Inspect Element       | Opens DevTools at the right-click hit-point.             |
 
 `CopyImage` falls back to writing the image URL as text when the clipboard
 backend doesn't support image MIME (e.g. OSC52 over SSH).

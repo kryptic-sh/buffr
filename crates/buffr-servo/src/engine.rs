@@ -556,10 +556,6 @@ impl BrowserEngine for ServoEngine {
         let _ = self.run_js(&buffr_engine::media_js::picture_in_picture(x, y));
     }
 
-    fn image_rotate(&self, x: i32, y: i32, delta_deg: i32) {
-        let _ = self.run_js(&buffr_engine::media_js::image_rotate(x, y, delta_deg));
-    }
-
     fn copy_image_url_to_clipboard(&self, url: &str) {
         let _ = self.run_js(&buffr_engine::media_js::copy_image_url(url));
     }

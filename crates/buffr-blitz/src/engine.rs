@@ -737,10 +737,6 @@ impl BrowserEngine for BlitzEngine {
         tracing::warn!("blitz: media_toggle_mute unsupported (read-only render, no JS engine)");
     }
 
-    fn image_rotate(&self, _x: i32, _y: i32, _delta_deg: i32) {
-        tracing::warn!("blitz: image_rotate unsupported (read-only render, no JS engine)");
-    }
-
     // ── Clipboard stubs ───────────────────────────────────────────────────────
 
     fn copy_image_url_to_clipboard(&self, _url: &str) {

@@ -5069,20 +5069,6 @@ impl AppState {
                 }
             }
 
-            // ── Image rotate ─────────────────────────────────────────────────
-            I::RotateClockwise => {
-                tracing::info!(target: "buffr::context_menu", action = "rotate_clockwise", "dispatch");
-                if let Some(engine) = self.active_engine_dyn() {
-                    engine.image_rotate(request.x, request.y, 90);
-                }
-            }
-            I::RotateCounterclockwise => {
-                tracing::info!(target: "buffr::context_menu", action = "rotate_counterclockwise", "dispatch");
-                if let Some(engine) = self.active_engine_dyn() {
-                    engine.image_rotate(request.x, request.y, -90);
-                }
-            }
-
             // ── Tab strip ────────────────────────────────────────────────────
             I::TabReload => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_reload", "dispatch");
