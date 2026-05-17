@@ -795,14 +795,44 @@ impl BrowserEngine for WebKitEngine {
 
     fn osr_key_event(&self, event: NeutralKeyEvent) {
         use buffr_engine::KeyEventKind;
-        // Map NeutralKeyEvent → WPE keyboard event.
-        // WPE doesn't distinguish RawDown vs Char — send pressed=true for both.
-        let pressed = event.kind != KeyEventKind::Up;
+        // The apps-layer key encoder emits up to three events per physical
+        // keystroke: RawDown (the keystroke), Char (the text-bearing
+        // event for printable keys), and Up (release).  CEF wants all
+        // three — RawDown drives accelerators, Char carries the literal
+        // text for input fields.  WPE/WebKit's wpe_view_event surface
+        // takes ONE press + ONE release per physical key and inserts the
+        // character associated with the keysym, so dispatching both
+        // RawDown and Char doubles the inserted character: typing "h"
+        // produced "Hh" in production (RawDown's windows_key_code=72
+        // gave 'H' and Char's character=104 gave 'h').
+        //
+        // Rule: drop RawDown when the apps-layer already filled in a
+        // text-bearing `character` / `unmodified_character` field —
+        // those keystrokes are printable and the matching Char event
+        // will carry the correct insert.  Pure-shortcut RawDown
+        // (Esc, Enter, F-keys, arrows, modifiers — character == 0)
+        // still passes through as a press so WebKit's key handler can
+        // act on them.
+        let pressed = match event.kind {
+            KeyEventKind::Up => false,
+            KeyEventKind::Char => true,
+            KeyEventKind::RawDown => {
+                if event.character != 0 || event.unmodified_character != 0 {
+                    return;
+                }
+                true
+            }
+        };
+        // Prefer the Char event's text-bearing `character` over the
+        // VK code for the WPE keysym.  Falls back to windows_key_code
+        // for non-text events (shortcut keys, releases).
+        let key_code = if event.character != 0 {
+            event.character as u32
+        } else {
+            event.windows_key_code as u32
+        };
         let ev = WpeKeyEvent {
-            // Use windows_key_code as key_code (WPE keysym).
-            // For proper xkb keysyms this would need a VK→XKB lookup table,
-            // but for Phase 2 this gives basic Latin character input.
-            key_code: event.windows_key_code as u32,
+            key_code,
             pressed,
             modifiers: event.modifiers,
         };
