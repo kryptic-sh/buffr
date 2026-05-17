@@ -78,7 +78,7 @@ pub struct TabView {
     /// (single-engine config or the primary `cef` engine).
     pub engine_badge: Option<u32>,
     /// 2-character uppercase label rendered inside the badge column (e.g.
-    /// `"BL"` for `blink-cdp`, `"WK"` for `webkit`). Paired with
+    /// `"WK"` for `webkit`, `"LA"` for `ladybird`). Paired with
     /// `engine_badge`; ignored when `engine_badge` is `None`.
     pub engine_label: Option<String>,
     /// Whether the cursor is hovering over this tab. When `true` and a badge
@@ -260,7 +260,7 @@ impl TabStrip {
             } else {
                 // Engine badge: a coloured rectangle at the left edge of the
                 // pill. Width is wide enough to render a 2-character uppercase
-                // glyph (e.g. "BL" for blink-cdp) with BADGE_SIDE_PAD px of
+                // glyph (e.g. "WK" for webkit) with BADGE_SIDE_PAD px of
                 // horizontal padding on each side. Only painted when the router
                 // has more than one engine registered and this tab's engine is
                 // not the primary "cef" engine.
