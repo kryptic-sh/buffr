@@ -144,6 +144,14 @@ pub(crate) enum Command {
     EvalJs {
         script: String,
     },
+    /// Adjust zoom level on the active tab.
+    ///
+    /// `delta = +0.1` for zoom_in, `-0.1` for zoom_out, `0.0` for reset.
+    /// The new level is clamped to `0.25..=5.0` and written back to the
+    /// shared `zoom_level` Arc.
+    Zoom {
+        delta: f64,
+    },
     Shutdown,
 }
 
@@ -203,6 +211,7 @@ pub(crate) fn spawn(
     frame: SharedOsrFrame,
     view: SharedOsrViewState,
     is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
+    zoom_level: Arc<Mutex<f64>>,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
@@ -258,6 +267,7 @@ pub(crate) fn spawn(
                 Arc::clone(&es),
                 egl,
                 Arc::clone(&is_loading_atomic),
+                Arc::clone(&zoom_level),
             ) {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -399,6 +409,9 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::EvalJs { script } => {
             rt.eval_js(&script);
+        }
+        Command::Zoom { delta } => {
+            rt.set_zoom(delta);
         }
         Command::Shutdown => {
             ml.quit();

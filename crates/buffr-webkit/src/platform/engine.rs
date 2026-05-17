@@ -64,6 +64,9 @@ pub struct WebKitEngine {
     /// `is_loading` below — never goes through the engine_state mutex
     /// so the host's animation gate can't get stuck.
     is_loading_atomic: Arc<AtomicBool>,
+    /// Shared with `WpeRuntime`. Written by the GLib worker on zoom commands;
+    /// read from any thread via `active_zoom_level`. Initialised to 1.0.
+    zoom_level: Arc<Mutex<f64>>,
 }
 
 impl WebKitEngine {
@@ -124,6 +127,7 @@ impl WebKitEngine {
         // would briefly observe is_loading=false at startup before the
         // signal flips it to true, which can race a paint.
         let is_loading_atomic = Arc::new(AtomicBool::new(true));
+        let zoom_level = Arc::new(Mutex::new(1.0_f64));
 
         let worker = spawn(
             initial_url,
@@ -132,6 +136,7 @@ impl WebKitEngine {
             Arc::clone(&frame),
             Arc::clone(&view),
             Arc::clone(&is_loading_atomic),
+            Arc::clone(&zoom_level),
         )?;
 
         Ok(Self {
@@ -156,6 +161,7 @@ impl WebKitEngine {
                 m
             }),
             is_loading_atomic,
+            zoom_level,
         })
     }
 
@@ -629,7 +635,19 @@ impl BrowserEngine for WebKitEngine {
     fn stop_find(&self) {}
 
     fn active_zoom_level(&self) -> f64 {
-        1.0
+        self.zoom_level.lock().map(|g| *g).unwrap_or(1.0)
+    }
+
+    fn zoom_in(&self) {
+        self.send(Command::Zoom { delta: 0.1 });
+    }
+
+    fn zoom_out(&self) {
+        self.send(Command::Zoom { delta: -0.1 });
+    }
+
+    fn zoom_reset(&self) {
+        self.send(Command::Zoom { delta: 0.0 });
     }
 
     // ── Audio / video ─────────────────────────────────────────────────────────

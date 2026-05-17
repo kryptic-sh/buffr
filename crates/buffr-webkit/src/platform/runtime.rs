@@ -21,8 +21,7 @@ use super::egl::EglWorker;
 use super::ffi::*;
 use super::worker::EngineState;
 use super::wpe_subclass::{
-    BuffrDisplayHandle, ViewCtx, ack_pending_buffer, attach_view_ctx,
-    buffr_display_take_last_view,
+    BuffrDisplayHandle, ViewCtx, ack_pending_buffer, attach_view_ctx, buffr_display_take_last_view,
 };
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────
@@ -576,6 +575,9 @@ pub(crate) struct WpeRuntime {
     /// engine_state mutex so worker-thread signal handlers never race
     /// (or worse, drop the update) against main-thread reads.
     pub is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared zoom level. Written by the worker on every zoom command;
+    /// read from any thread via `WebKitEngine::active_zoom_level`.
+    pub zoom_level: Arc<Mutex<f64>>,
 }
 
 impl WpeRuntime {
@@ -585,6 +587,7 @@ impl WpeRuntime {
         engine_state: Arc<Mutex<EngineState>>,
         egl: EglWorker,
         is_loading_atomic: Arc<std::sync::atomic::AtomicBool>,
+        zoom_level: Arc<Mutex<f64>>,
     ) -> Result<Self, String> {
         let (width, height, hz) = {
             let st = engine_state
@@ -623,6 +626,7 @@ impl WpeRuntime {
             egl,
             display,
             is_loading_atomic,
+            zoom_level,
         })
     }
 
@@ -1118,5 +1122,32 @@ impl WpeRuntime {
 
     pub(crate) fn any_audio_active(&self) -> bool {
         self.tabs.iter().any(|t| t.is_playing_audio())
+    }
+
+    /// Adjust zoom on the active tab.
+    ///
+    /// `delta == 0.0` → reset to 1.0; otherwise the current level has
+    /// `delta` added and is clamped to `[0.25, 5.0]`. The result is written
+    /// back to the shared `zoom_level` so the main thread's
+    /// `active_zoom_level()` returns the updated value immediately.
+    pub(crate) fn set_zoom(&mut self, delta: f64) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let new_level = if delta == 0.0 {
+            1.0_f64
+        } else {
+            let current = self.zoom_level.lock().map(|g| *g).unwrap_or(1.0);
+            (current + delta).clamp(0.25, 5.0)
+        };
+        // SAFETY: web_view is valid for the tab's lifetime; all calls are on
+        // the GLib worker thread.
+        unsafe {
+            webkit_web_view_set_zoom_level(tab.web_view, new_level);
+        }
+        if let Ok(mut guard) = self.zoom_level.lock() {
+            *guard = new_level;
+        }
+        tracing::debug!(new_level, delta, "webkit: zoom updated");
     }
 }
