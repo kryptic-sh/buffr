@@ -509,6 +509,114 @@ unsafe extern "C" fn drop_popup_queue_arc(
     }
 }
 
+// ── TLS error signal (#120) ───────────────────────────────────────────────────
+
+/// `load-failed-with-tls-errors` on `WebKitWebView`.
+///
+/// Signal prototype: `(WebKitWebView*, failing_uri: gchar*,
+///   certificate: GTlsCertificate*, errors: GTlsCertificateFlags, user_data)`.
+/// Returns gboolean: TRUE = we handled it (suppress WebKit's default error page).
+///
+/// Strategy: auto-allow (allow + reload) with a tracing::warn so the admin
+/// sees the override. Persistent cert exceptions are out of scope for this PR.
+/// user_data is a `*const TabSignalCtx` (same Arc pattern as load-changed).
+unsafe extern "C" fn on_load_failed_with_tls_errors(
+    web_view: *mut WebKitWebView,
+    failing_uri: *const std::os::raw::c_char,
+    certificate: *mut GTlsCertificate,
+    errors: GTlsCertificateFlags,
+    _user_data: *mut std::os::raw::c_void,
+) -> gboolean {
+    if web_view.is_null() || failing_uri.is_null() || certificate.is_null() {
+        return 0; // let WebKit show its own error page
+    }
+
+    let uri_str = unsafe { CStr::from_ptr(failing_uri) }.to_string_lossy();
+
+    // Describe the error flags for the log.
+    let mut flag_parts: Vec<&str> = Vec::new();
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_UNKNOWN_CA != 0 {
+        flag_parts.push("unknown-ca");
+    }
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_BAD_IDENTITY != 0 {
+        flag_parts.push("bad-identity");
+    }
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_NOT_ACTIVATED != 0 {
+        flag_parts.push("not-activated");
+    }
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_EXPIRED != 0 {
+        flag_parts.push("expired");
+    }
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_REVOKED != 0 {
+        flag_parts.push("revoked");
+    }
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_INSECURE != 0 {
+        flag_parts.push("insecure");
+    }
+    if errors & GTlsCertificateFlags_G_TLS_CERTIFICATE_GENERIC_ERROR != 0 {
+        flag_parts.push("generic-error");
+    }
+    let flags_desc = if flag_parts.is_empty() {
+        "none".to_owned()
+    } else {
+        flag_parts.join(", ")
+    };
+
+    // Extract hostname from the failing URI.
+    let host = extract_host_from_uri(&uri_str);
+
+    tracing::warn!(
+        uri = %uri_str,
+        flags = %flags_desc,
+        "webkit: TLS certificate error — auto-allowing for this session"
+    );
+
+    // Allow the certificate for the host on the network session so the
+    // reload succeeds without another TLS error. Both the session and the
+    // certificate are valid for at least the duration of this signal handler.
+    if let Ok(host_c) = CString::new(host.as_str()) {
+        unsafe {
+            let session = webkit_web_view_get_network_session(web_view);
+            if !session.is_null() {
+                webkit_network_session_allow_tls_certificate_for_host(
+                    session,
+                    certificate,
+                    host_c.as_ptr(),
+                );
+            }
+        }
+    }
+    // Reload the page. WebKit re-fetches the certificate; now that the host
+    // exception is registered the request will succeed.
+    unsafe { webkit_web_view_reload(web_view) };
+    // Return TRUE: we handled the error — WebKit should not show its own page.
+    1
+}
+
+/// Extract the hostname from a URI string (best-effort, no external dep).
+fn extract_host_from_uri(uri: &str) -> String {
+    // Strip scheme (e.g. "https://")
+    let after_scheme = if let Some(pos) = uri.find("://") {
+        &uri[pos + 3..]
+    } else {
+        uri
+    };
+    // Strip path and query — take up to the first '/', '?', or '#'.
+    let host_port = after_scheme
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(after_scheme);
+    // Strip port number.
+    if let Some(colon) = host_port.rfind(':') {
+        // Avoid stripping IPv6 colons — only strip if everything after ':' is digits.
+        let after_colon = &host_port[colon + 1..];
+        if after_colon.chars().all(|c| c.is_ascii_digit()) {
+            return host_port[..colon].to_owned();
+        }
+    }
+    host_port.to_owned()
+}
+
 // ── TabEntry ──────────────────────────────────────────────────────────────────
 
 /// One open browser tab. Owns the WebKitWebView GObject. The shared
@@ -531,6 +639,8 @@ pub(crate) struct TabEntry {
     clipboard_script_message_received_id: u64,
     /// Signal ID for `create` on this WebView (popup interception).
     create_signal_id: u64,
+    /// Signal ID for `load-failed-with-tls-errors` (#120).
+    tls_error_id: u64,
     /// Shared per-tab flag wired into both `ViewCtx` (pixel write gate)
     /// and `TabSignalCtx` (is_loading_atomic write gate). Owned by
     /// `WpeRuntime` so it can flip the active tab via `select_tab`.
@@ -897,6 +1007,24 @@ impl TabEntry {
             }
         };
 
+        // ── TLS certificate error signal (#120) ───────────────────────────────
+        //
+        // Fires when a navigation hits a TLS error. We auto-allow + reload
+        // in-session. user_data is a per-connection Arc<TabSignalCtx> clone
+        // via the shared `connect` closure.
+        let tls_error_id = connect("load-failed-with-tls-errors", unsafe {
+            std::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut WebKitWebView,
+                    *const std::os::raw::c_char,
+                    *mut GTlsCertificate,
+                    GTlsCertificateFlags,
+                    *mut std::os::raw::c_void,
+                ) -> gboolean,
+                unsafe extern "C" fn(),
+            >(on_load_failed_with_tls_errors)
+        });
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -912,6 +1040,7 @@ impl TabEntry {
             hint_script_message_received_id,
             clipboard_script_message_received_id,
             create_signal_id,
+            tls_error_id,
             is_active,
         })
     }
@@ -1066,6 +1195,10 @@ impl Drop for TabEntry {
             // Disconnect `create` signal on the WebView before unref.
             if self.create_signal_id != 0 {
                 g_signal_handler_disconnect(self.web_view as *mut _, self.create_signal_id);
+            }
+            // Disconnect TLS error signal (#120).
+            if self.tls_error_id != 0 {
+                g_signal_handler_disconnect(self.web_view as *mut _, self.tls_error_id);
             }
             g_object_unref(self.web_view as *mut _);
         }
