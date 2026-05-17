@@ -1455,6 +1455,55 @@ impl BrowserEngine for WebKitEngine {
     fn copy_image_url_to_clipboard(&self, url: &str) {
         buffr_core::image_copy::copy_image_to_clipboard(url.to_owned());
     }
+
+    // ── Native compositing (#143) ────────────────────────────────────────────
+    //
+    // Phase 3 of the WPE WebKit umbrella (#109). WPE 2.52 ships
+    // WPEDisplayWayland which renders WebKit directly into a wl_surface —
+    // avoiding the OSR readback path entirely. supports_native gates the
+    // apps-layer's decision to skip OSR drains; set_native_parent /
+    // set_native_visible are the actual wiring (deferred to #145 / #147).
+    //
+    // Current state: supports_native checks XDG_SESSION_TYPE and returns
+    // true only on a Wayland session. set_native_parent / set_native_visible
+    // are stubs that log; real impls land in #145.
+
+    fn supports_native(&self) -> bool {
+        // For now, gate purely on session type. Once #144 lands the
+        // engine will additionally check whether WPEDisplayWayland was
+        // actually constructed (vs the OSR BuffrDisplay fallback), but
+        // the env-var heuristic is enough for the apps-layer to branch.
+        std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+    }
+
+    fn set_native_parent(
+        &self,
+        _parent: buffr_engine::raw_window_handle::RawWindowHandle,
+        rect: buffr_engine::NativeRect,
+    ) {
+        // Stub. Real impl in #145 sends a Command::SetNativeParent to the
+        // worker which creates the wl_subsurface and attaches WebKit's
+        // wl_surface as child. Log the call so we can verify the apps
+        // layer is wiring it.
+        tracing::debug!(
+            x = rect.x,
+            y = rect.y,
+            w = rect.w,
+            h = rect.h,
+            "webkit: set_native_parent (stub — Phase 3 #145 pending)"
+        );
+    }
+
+    fn set_native_visible(&self, visible: bool) {
+        // Stub. Real impl in #145 toggles wl_subsurface attach via a
+        // null-buffer commit or place_above/below dance.
+        tracing::debug!(
+            visible,
+            "webkit: set_native_visible (stub — Phase 3 #145 pending)"
+        );
+    }
 }
 
 /// 60 px per "line" of vim-style scroll, matching Chromium/Firefox

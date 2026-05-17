@@ -7641,6 +7641,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             // Wire the edit-mode event sink so buffrEdit UCM
                             // messages from edit.js reach drain_edit_events (#134).
                             engine.set_edit_sink(self.edit_sink.clone());
+                            // Log native-compositing capability so #144+ work can
+                            // verify the gate fires on the right sessions.
+                            // Phase 3 of #109 — real subsurface attach lands later.
+                            info!(
+                                supports_native = buffr_engine::BrowserEngine::supports_native(&engine),
+                                "webkit: native-compositing capability"
+                            );
                             let engine_id = buffr_engine::EngineId::new(&inst.id);
                             let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
                             router_builder =
