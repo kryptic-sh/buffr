@@ -1005,6 +1005,36 @@ impl BrowserEngine for WebKitEngine {
             .map_err(EngineError::Other)
     }
 
+    /// "Inspect Element" — open devtools and scroll the element at (x, y)
+    /// into view so the user sees the target node right away.
+    ///
+    /// WPE WebKit 2.52 only exposes `webkit_web_view_toggle_inspector` (no
+    /// positional inspect API), so we (a) reuse `Command::OpenDevtools` to
+    /// toggle the inspector on, and (b) inject a JS snippet that finds the
+    /// element under the coordinates and scrolls it + flashes a brief outline
+    /// so the user can locate it in the page. The inspector itself doesn't
+    /// auto-select the node — that's the remaining capability gap vs CEF's
+    /// `ShowDevToolsAt`, but acceptable for v1.
+    fn show_dev_tools_at(&self, x: i32, y: i32) {
+        // Fire-and-forget: open devtools (toggle), then highlight the target.
+        // Drop the reply channel — we don't need to know if the toggle
+        // succeeded, just trigger it. Future: a separate, non-reply variant.
+        let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
+        self.send(Command::OpenDevtools { reply: reply_tx });
+        let js = format!(
+            "(function(x,y){{\
+               var el=document.elementFromPoint(x,y);\
+               if(!el)return;\
+               try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}});}}\
+               catch(_){{el.scrollIntoView();}}\
+               var prev=el.style.outline;\
+               el.style.outline='2px solid #ff00aa';\
+               setTimeout(function(){{el.style.outline=prev;}},1500);\
+             }})({x},{y});"
+        );
+        let _ = self.run_main_frame_js(&js, "buffr://inspect-at");
+    }
+
     // ── Audio / video ─────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
