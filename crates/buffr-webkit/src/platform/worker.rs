@@ -159,6 +159,11 @@ pub(crate) enum Command {
         from: usize,
         to: usize,
     },
+    /// Toggle the WebKit web inspector for the active tab and report
+    /// success/failure via the reply channel.
+    OpenDevtools {
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -422,6 +427,10 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::MoveTab { from, to } => {
             rt.move_tab(from, to);
+        }
+        Command::OpenDevtools { reply } => {
+            let res = rt.open_devtools();
+            let _ = reply.try_send(res);
         }
         Command::Shutdown => {
             ml.quit();

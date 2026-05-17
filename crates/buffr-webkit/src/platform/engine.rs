@@ -652,6 +652,15 @@ impl BrowserEngine for WebKitEngine {
         self.send(Command::Zoom { delta: 0.0 });
     }
 
+    fn open_devtools(&self, _tab: TabId) -> Result<(), EngineError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.send(Command::OpenDevtools { reply: reply_tx });
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .map_err(|_| EngineError::Other("open_devtools timed out".into()))?
+            .map_err(EngineError::Other)
+    }
+
     // ── Audio / video ─────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {

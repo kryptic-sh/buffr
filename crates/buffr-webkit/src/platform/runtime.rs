@@ -404,6 +404,16 @@ impl TabEntry {
             >(on_notify_title)
         });
 
+        // Enable developer extras on every WebView so the inspector can be
+        // toggled at any time. Must be set before the inspector is shown;
+        // calling it here (before load_uri) ensures that precondition is met.
+        unsafe {
+            let settings = webkit_web_view_get_settings(web_view);
+            if !settings.is_null() {
+                webkit_settings_set_enable_developer_extras(settings, 1);
+            }
+        }
+
         let url_c = CString::new(url).unwrap_or_default();
         unsafe { webkit_web_view_load_uri(web_view, url_c.as_ptr()) };
         tracing::info!("webkit: created WebView id={id:?} url={url}");
@@ -1189,5 +1199,26 @@ impl WpeRuntime {
         }
 
         tracing::info!(from, to, insert_at, "webkit: move_tab");
+    }
+
+    /// Toggle the WebKit web inspector for the active tab.
+    ///
+    /// Returns `Err` when there is no active tab. On success the inspector
+    /// window opens (or closes if already open — WebKit toggles).
+    pub(crate) fn open_devtools(&self) -> Result<(), String> {
+        let Some(tab) = self.active_tab() else {
+            return Err("no active tab".to_string());
+        };
+        if tab.web_view.is_null() {
+            return Err("active tab has no WebView".to_string());
+        }
+        // SAFETY: web_view is valid for the tab's lifetime; all calls are on
+        // the GLib worker thread. webkit_settings_set_enable_developer_extras
+        // was already called in TabEntry::new, so the inspector is ready.
+        unsafe {
+            webkit_web_view_toggle_inspector(tab.web_view);
+        }
+        tracing::info!("webkit: open_devtools: inspector toggled");
+        Ok(())
     }
 }
