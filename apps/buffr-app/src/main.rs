@@ -2011,16 +2011,18 @@ struct AppState {
     private: bool,
     /// Root of the cache directory for this session. In normal mode this is
     /// `<XDG_CACHE_HOME>/buffr` (or equivalent); in `--private` mode it is
-    /// `$TMPDIR/buffr-private-<pid>/cache`. Per-engine CEF directories land
-    /// under `<cache_root>/engines/<id>/` (Phase 11a).
+    /// `$TMPDIR/buffr-private-<pid>/cache`. Reserved for future split between
+    /// persistent and ephemeral state — currently CEF stores both under
+    /// `data_root` because its RequestContext doesn't expose a split.
+    #[allow(dead_code)]
     cache_root: PathBuf,
     /// Root of the user-data directory for this session. In normal mode
     /// this is `<XDG_DATA_HOME>/buffr` (or equivalent); in `--private`
     /// mode it is `$TMPDIR/buffr-private-<pid>/data` (deleted on Drop
-    /// by the TempDir held in main). All per-engine default profile
-    /// directories are derived from this root so `--private` mode truly
-    /// isolates every engine's storage to the throwaway tempdir.
-    #[allow(dead_code)]
+    /// by the TempDir held in main). Per-engine profile dirs land under
+    /// `<data_root>/engines/<id>/` so `--private` mode truly isolates
+    /// every engine's storage to the throwaway tempdir, and persistent
+    /// state survives system cache wipes.
     data_root: PathBuf,
     modifiers: ModifiersState,
     startup: Instant,
@@ -7411,13 +7413,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     } else {
                         None
                     };
-                    // Default: ~/.cache/buffr/engines/<id>/ (Phase 11a layout).
-                    // Per-engine RequestContext keeps CEF state namespaced under
-                    // the cache root rather than flat at ~/.cache/buffr/.
+                    // Default: ~/.local/share/buffr/engines/<id>/ (XDG_DATA_HOME).
+                    // CEF stores persistent profile state (cookies, localStorage,
+                    // IndexedDB, history) and ephemeral cache together under this
+                    // path — XDG spec says ~/.cache is "lost without warning"
+                    // (systemd-tmpfiles, tmpfs, cleanup tools), so persistent
+                    // profile state belongs in data_root.
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => self.cache_root.join("engines").join(&inst.id),
+                            None => self.data_root.join("engines").join(&inst.id),
                         });
                     let options = BackendOpenOptions {
                         engine_id: buffr_engine::EngineId::new(&inst.id),

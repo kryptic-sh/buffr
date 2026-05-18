@@ -1973,6 +1973,14 @@ impl BrowserHost {
             frame.load_url(Some(&cef_url));
             t.url = to_display_url(trimmed).into_owned();
             tracing::debug!(target: "buffr_core::host", url = %trimmed, "navigate");
+            // Track or clear the display-url override so the omnibar / session
+            // reports the right URL: buffr://* stays as the friendly form;
+            // anything else clears any prior buffr:// override.
+            if trimmed.starts_with("buffr://") || trimmed.starts_with("buffr-src:") {
+                self.record_display_url(t.id, trimmed);
+            } else {
+                self.forget_display_url(t.id);
+            }
             Ok(())
         })
         .ok_or(CoreError::CreateBrowserFailed)?
