@@ -36,7 +36,7 @@ buffr-zoom = "0.1"
 buffr-permissions = "0.1"
 buffr-view-source = "0.1"
 hjkl-clipboard = "0.5"
-winit = "0.30"
+winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
