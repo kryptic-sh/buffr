@@ -8,6 +8,117 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-18
+
+### Removed
+
+- X11 support on Linux. buffr now requires a Wayland session
+  (`XDG_SESSION_TYPE=wayland`) and refuses to start otherwise. winit's
+  X11 backend is no longer compiled in. The X11 idle-inhibit backend
+  (`buffr-core::inhibit::linux::x11`, 242 LoC) is gone.
+- Browser-engine backends: `buffr-servo`, `buffr-ladybird`, `buffr-blitz`,
+  `buffr-webkit-cocoa`, `buffr-webview2`. CEF is now the only
+  user-facing engine on every platform. `buffr-webkit` (WPE WebKit) is
+  retained on disk as an experimental Linux-only backend but is
+  workspace-excluded — build standalone with
+  `cargo build --manifest-path crates/buffr-webkit/Cargo.toml`.
+- `--engine` CLI flag now accepts only `cef`.
+- `apps/buffr-stub` (the `buffr` crates.io name-holder). All 13 published
+  versions on crates.io have been yanked. Binary distribution moves
+  entirely to GitHub release artifacts.
+- CEF custom `buffr://` scheme registration. The scheme handler factory,
+  `register_buffr_scheme`, `register_buffr_handler_factory`, and
+  `BuffrSchemeHandlerFactory` are deleted.
+- WebKit `data:text/html;base64,…` URL fallback for `buffr://*`.
+- `buffr-engine::newtab::translate_internal_url` and
+  `default_newtab_html` (data: URL helpers).
+- `BrowserEngine::image_rotate` trait method (no use case).
+- xvfb-based smoke test in CI (incompatible with Wayland-only Linux).
+
+### Added
+
+- `BrowserEngine::is_using_native_compositing` trait method to surface
+  the runtime native-vs-OSR state.
+- IME composition support in `buffr-webkit` via
+  `WebKitInputMethodContext`.
+- `BackendOpenOptions::internal_server` so backends receive the
+  loopback HTTP server at construction. Avoids a race where the
+  initial-tab navigation fires before the server can be wired post-hoc.
+
+### Changed
+
+- Repository structure: 12 ex-submodule crates (`buffr-bookmarks`,
+  `buffr-cef`, `buffr-config`, `buffr-core`, `buffr-downloads`,
+  `buffr-engine`, `buffr-history`, `buffr-modal`, `buffr-permissions`,
+  `buffr-ui`, `buffr-view-source`, `buffr-zoom`) absorbed into the
+  monorepo via `git subtree add` (history preserved). `.gitmodules`
+  deleted. `[patch.crates-io]` dropped. Per-crate scaffolding
+  (CHANGELOG, README, LICENSE, dependabot, ci.yml, deny.toml,
+  rust-toolchain.toml, rustfmt.toml, .gitignore, .editorconfig) stripped
+  — workspace-level files cover all members. `.editorconfig` hoisted to
+  workspace root.
+- CEF backend routes `buffr://*` through `InternalServer` (HTTP
+  loopback) instead of a custom URI scheme. Mirrors the webkit pattern.
+  CEF `on_register_custom_schemes` no longer touches `buffr://`;
+  `buffr-src://` (view-source) keeps its custom handler.
+- WebKit's `resolve_url` requires an `InternalServer` to translate
+  `buffr://*`. Bind failure is now fatal at startup (was a silent
+  data-URL fallback).
+- CEF `tabs_summary` reports the display URL (`buffr://new`) instead of
+  the engine-loaded `http://127.0.0.1:<port>/<token>/new`, so
+  `session.json` saves a stable URL across restarts (the ephemeral
+  loopback port no longer outlives the process).
+- All workspace members marked `publish.workspace = true` →
+  `publish = false`. No member is published to crates.io independently.
+- All Wayland render path moved to an async worker thread (canonical
+  Wayland backpressure fix): UI thread does CPU + memcpy + try_send,
+  worker owns all wgpu mutating calls.
+- Supervisor heartbeat decoupled from UI event loop (bg thread + atomic
+  liveness counter). Survives sustained input and Wayland event-loop
+  stalls.
+- Loading animation now gates on the live pixel pipeline state, not
+  the engine's `host_is_loading` flag (which could pin true forever).
+- `--engine cef` skips engine selection state (single binary stays
+  CEF-only).
+- WebKit `prefer_native` (Wayland subsurface compositing) is now
+  opt-in via `BUFFR_WEBKIT_NATIVE=1`; default is the OSR pixel-copy
+  path. Native path remains experimental (chrome overlay layout +
+  watchdog hang issues unresolved).
+- Demoted `buffr::ui_path` per-frame traces from `info!` to `debug!`.
+- crates.io: yanked all 14 buffr-* component crates (58 versions
+  total). Names remain reserved.
+- GitHub: 12 submodule repos deleted under `kryptic-sh/buffr-*`.
+
+### Fixed
+
+- Wayland-only Linux: `wayland_globals` registry roundtrip gated
+  behind native-compositing opt-in (avoided clobbering main-loop event
+  routing on Wayland sessions).
+- CEF OSR composite alpha: prefer Opaque over PreMultiplied to fix
+  semi-transparent viewport on the OSR path.
+- WebKit cookie DB path doubling (`engines/<id>/profile/engines/<id>/`
+  → `engines/<id>/profile/`).
+- WebKit `JSON.stringify` wrapping on `postMessage` UCM bridge
+  (`[object Object]` payloads silently dropped before).
+- WebKit RawDown handling: printable keys no longer emit duplicate
+  events (typing produced `"Hh"`, `"Ee"`).
+- WebKit `FocusFirstInput` + `ExitInsertMode` dispatch arms.
+- WebKit resize-paint watchdog: `force_repaint_active()` reaches the
+  worker so paint can recover after stuck-frame timeouts.
+- Same-tab navigation no longer leaves a stale OSR frame: applies
+  resize-wiggle + `needs_fresh` like cross-tab open does.
+- wgpu OOM at surface acquire under rapid resize: poll the device
+  every frame so lazy resource drops actually run (32-bit AMDGPU
+  address-space pressure).
+- Ctrl+C now works reliably on Wayland-stuck event loops via a
+  three-layer fix (NewEvents check, UserEvent exit, 3s libc::_exit
+  abort).
+- Splash gate no longer reads `host_is_loading` (could pin true
+  forever).
+- Heartbeat keeps alive under sustained input.
+
+[0.13.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.0
+
 ## [0.12.0] - 2026-05-15
 
 ### Security
