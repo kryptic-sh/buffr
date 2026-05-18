@@ -1,0 +1,28 @@
+[package]
+name = "buffr-permissions"
+description = "SQLite-backed per-origin permissions store for buffr."
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-permissions"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
+
+[features]
+# The SQLite-backed Permissions store. On by default for existing
+# consumers (buffr-app). Off for callers that only need the Capability
+# / Decision types (e.g. buffr-engine pulled into a Servo build that
+# can't tolerate the rusqlite transitive deps).
+default = ["store"]
+store = ["dep:rusqlite"]
+
+[dependencies]
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1"
