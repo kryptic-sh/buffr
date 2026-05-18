@@ -1,0 +1,44 @@
+[package]
+name = "buffr-modal"
+description = "Vim-style modal keybinding engine for buffr."
+version = "0.1.5"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-modal"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
+
+[features]
+default = []
+# Bring in the winit `KeyEvent` → `KeyChord` adapter so embedding apps
+# can wire raw key events into the engine without re-implementing the
+# mapping. Optional because the engine itself is winit-agnostic.
+winit = ["dep:winit"]
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+bitflags = "2"
+
+# Edit-mode delegates to hjkl-engine against a mirrored Rope synced to
+# the DOM via CEF. Bumped to 0.5/0.6 — the public API used here
+# (Editor, Host, Buffer, Viewport) is fully additive across 0.1→0.5/0.6.
+hjkl-engine = "0.5"
+hjkl-buffer = "0.6"
+
+# crossterm KeyEvent is the engine's input type today; the host
+# bridges from CEF browser keys into it. When trait extraction lands a
+# host-native Input enum, this dep moves out.
+crossterm = "0.29.0"
+
+# Optional: only enabled by the `winit` feature. Used by the
+# `winit_adapter` module that converts `winit::event::KeyEvent` into
+# our internal `KeyChord`. The engine itself stays winit-agnostic.
+winit = { version = "0.30", optional = true, default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
+
+[dev-dependencies]
+toml = "1.1"
