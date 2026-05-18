@@ -907,7 +907,13 @@ fn main() -> Result<()> {
         .map(|e| e.eq_ignore_ascii_case("cef"))
         .unwrap_or(true);
     if cli_uses_cef {
-        let cache_path = paths.cache.to_string_lossy().into_owned();
+        // CEF's `root_cache_path` must be a common ancestor of every
+        // RequestContext cache_path (per-engine ones live under
+        // `data_root/engines/<id>/`). When they don't share a root, CEF
+        // silently falls back to the global Default context and the
+        // per-engine cookie store is unused. Use `data_root` here so
+        // both global + per-engine state share a persistent root.
+        let cache_path = paths.data.to_string_lossy().into_owned();
         backend
             .initialize(&cache_path)
             .map_err(|e| anyhow::anyhow!(e))?;

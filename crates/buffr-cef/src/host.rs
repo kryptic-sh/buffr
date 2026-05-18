@@ -500,7 +500,14 @@ impl BrowserHost {
                 "creating per-engine CEF RequestContext"
             );
             match request_context_create_context(Some(&ctx_settings), None) {
-                Some(ctx) => Some(ctx),
+                Some(ctx) => {
+                    use cef::ImplRequestContext;
+                    tracing::info!(
+                        is_global = ctx.is_global(),
+                        "per-engine RequestContext created"
+                    );
+                    Some(ctx)
+                }
                 None => {
                     tracing::warn!(
                         cache_path = %cache_path_str,
