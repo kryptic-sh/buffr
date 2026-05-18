@@ -60,14 +60,7 @@ proptest = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-buffr-webkit.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-buffr-webkit-cocoa.workspace = true
-
 [target.'cfg(target_os = "windows")'.dependencies]
-buffr-webview2.workspace = true
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

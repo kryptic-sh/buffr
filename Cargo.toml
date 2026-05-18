@@ -3,9 +3,6 @@ resolver = "2"
 members = [
     "crates/buffr-engine",
     "crates/buffr-cef",
-    "crates/buffr-webkit-cocoa",
-    "crates/buffr-webkit",
-    "crates/buffr-webview2",
     "crates/buffr-core",
     "crates/buffr-modal",
     "crates/buffr-ui",
@@ -25,7 +22,14 @@ members = [
 # crates.io-published stub that owns the `buffr` name on crates.io.
 # Publish it independently:
 #   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
-exclude = ["apps/buffr-stub", "fuzz"]
+exclude = [
+    "apps/buffr-stub",
+    "fuzz",
+    # Experimental WPE WebKit backend — Linux-only, not built by CI.
+    # Build standalone on systems with WPE WebKit 2.0 (Arch / Debian sid):
+    #   cargo build --manifest-path crates/buffr-webkit/Cargo.toml
+    "crates/buffr-webkit",
+]
 # `cargo build` (no -p) builds all three app binaries — supervisor,
 # browser, and helper — so a sibling-resolved `target/debug/buffr-app`
 # exists when you `cargo run -b buffr`. Multiple bins make `cargo run`
@@ -96,9 +100,6 @@ semver = { version = "1", features = ["serde"] }
 # All deps resolve directly via path — no registry pins or [patch.crates-io] needed.
 buffr-engine = { path = "crates/buffr-engine" }
 buffr-cef = { path = "crates/buffr-cef" }
-buffr-webkit = { path = "crates/buffr-webkit" }
-buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
-buffr-webview2 = { path = "crates/buffr-webview2" }
 buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
 buffr-ui = { path = "crates/buffr-ui" }

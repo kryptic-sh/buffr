@@ -44,7 +44,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev
+            libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -94,7 +94,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev \
+            libglib2.0-dev \
             xvfb
 
       - name: install rust toolchain
@@ -188,7 +188,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev
+            libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -234,59 +234,6 @@ jobs:
           command: check
           arguments: --all-features
 
-  # Verifies that each engine backend builds + tests cleanly on its target
-  # platform. Catches the macOS / Windows / GPU paths that the main Linux
-  # `linux` job can't exercise (webkit-cocoa platform module, webview2 COM
-  # stack).
-  backends:
-    name: backend ${{ matrix.crate }} (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux-gated backend — WPE WebKit (Wayland-only)
-          - { os: ubuntu-latest, crate: buffr-webkit,      args: "-p buffr-webkit",      apt: "libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev" }
-
-          # macOS-gated backend — exercises the platform/ module (untestable on Linux)
-          - { os: macos-latest,  crate: buffr-webkit-cocoa, args: "-p buffr-webkit-cocoa", apt: "" }
-
-          # Windows-gated backend — exercises the platform/ module on MSVC
-          - { os: windows-latest, crate: buffr-webview2,   args: "-p buffr-webview2",     apt: "" }
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: install apt deps
-        if: runner.os == 'Linux' && matrix.apt != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          cache: false
-      - run: rustup update --no-self-update stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: backends-${{ matrix.crate }}-${{ matrix.os }}
-
-      - name: cargo build
-        run: cargo build ${{ matrix.args }}
-
-      - name: cargo test
-        # --test-threads=1 keeps the webkitgtk renderer from racing
-        # on fontconfig + WebKit init when CI runners have only 2 vCPUs.
-        # The flake otherwise hits a 30s worker-recv timeout intermittently.
-        run: cargo test ${{ matrix.args }} -- --test-threads=1
-
-      - name: cargo clippy
-        run: cargo clippy ${{ matrix.args }} --tests -- -D warnings
-
   bundle-macos-cross:
     # Cross-bundle the macOS .app on a Linux runner. Catches
     # `xtask bundle-macos` regressions per-commit without paying for a real
@@ -326,7 +273,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev \
+            libglib2.0-dev \
             libxml2-utils
 
       - name: install rust toolchain

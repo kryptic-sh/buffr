@@ -456,8 +456,7 @@ struct Cli {
     audit_keymap: bool,
     /// Override the default engine backend for this run. Synthesises a single
     /// instance with the chosen backend and routes every tab through it,
-    /// ignoring `[engines]` config. Valid values: cef, webkit (WPE, Linux only),
-    /// webkit-cocoa (macOS only), webview2 (Windows only).
+    /// ignoring `[engines]` config. Valid values: cef.
     #[arg(long, value_name = "NAME")]
     engine: Option<String>,
     /// URLs to open. Each becomes a new tab. When another buffr instance is
@@ -513,7 +512,7 @@ fn main() -> Result<()> {
 
     // -------- --engine validation (before CEF init) ------------------
     if let Some(raw) = cli.engine.as_deref() {
-        const VALID: &[&str] = &["cef", "webkit", "webkit-cocoa", "webview2"];
+        const VALID: &[&str] = &["cef"];
         let chosen = raw.to_lowercase();
         if !VALID.contains(&chosen.as_str()) {
             anyhow::bail!(
@@ -967,7 +966,7 @@ fn main() -> Result<()> {
             .html("/newtab", Arc::clone(&newtab_handler))
             .html(
                 "/settings",
-                Arc::new(|| buffr_engine::newtab::default_settings_html()),
+                Arc::new(buffr_engine::newtab::default_settings_html),
             );
         match buffr_engine::internal_server::InternalServer::start(routes) {
             Ok(srv) => {
@@ -2017,6 +2016,7 @@ struct AppState {
     /// by the TempDir held in main). All per-engine default profile
     /// directories are derived from this root so `--private` mode truly
     /// isolates every engine's storage to the throwaway tempdir.
+    #[allow(dead_code)]
     data_root: PathBuf,
     modifiers: ModifiersState,
     startup: Instant,
@@ -7215,7 +7215,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.save_session_now();
                 self.mark_clean_shutdown();
                 event_loop.exit();
-                return;
             }
             BuffrUserEvent::OsrFrame => {
                 tracing::trace!("user_event: OsrFrame -> request_redraw");
@@ -7320,8 +7319,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let wh = window.window_handle().ok().map(|h| h.as_raw());
                 match (dh, wh) {
                     (Some(RawDisplayHandle::Wayland(d)), Some(RawWindowHandle::Wayland(w))) => {
-                        let wl_display = d.display.as_ptr() as *mut std::ffi::c_void;
-                        let parent_wl_surface = w.surface.as_ptr() as *mut std::ffi::c_void;
+                        let wl_display = d.display.as_ptr();
+                        let parent_wl_surface = w.surface.as_ptr();
                         // Bind compositor + subcompositor via registry roundtrip.
                         // SAFETY: wl_display is winit's live display pointer, valid for
                         // the process lifetime.  Roundtrip fires synchronously before
@@ -7488,228 +7487,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             warn!(engine_id = %inst.id, error = %err, "failed to create browser host");
                         }
                     }
-                }
-                #[cfg(target_os = "linux")]
-                "webkit" => {
-                    let data_dir_buf: Option<std::path::PathBuf> =
-                        Some(match inst.data_dir.as_deref() {
-                            Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => self
-                                .data_root
-                                .join("engines")
-                                .join(&inst.id)
-                                .join("profile"),
-                        });
-                    let options = buffr_engine::BackendOpenOptions {
-                        engine_id: buffr_engine::EngineId::new(&inst.id),
-                        data_dir: data_dir_buf.as_deref(),
-                        cache_dir: None,
-                        initial_url: &self.homepage,
-                        frame_rate: display_hz as i32,
-                        device_scale: effective_scale as f64,
-                        initial_size: (cef_w, cef_h),
-                        private: self.private,
-                        history: None,
-                        download_dir: None,
-                        downloads: None,
-                        notice_queue: None,
-                        find_sink: None,
-                        sinks: Box::new(()),
-                        // Phase 3 native compositing (#144 / #152 / #153) is
-                        // shipped as v1 but unverified — polish items #147–#150
-                        // (position sync, input forwarding audit, HiDPI scale
-                        // sync, overlay z-order) are still open. Symptoms of an
-                        // unfinished native path include: chrome obscured by
-                        // the WebView subsurface (z-order), watchdog hang
-                        // detection on idle (parent surface stops getting
-                        // frame callbacks once the subsurface owns the
-                        // content). Until those gates close, the default is
-                        // OSR (Phase 2 — verified). Opt in to native via:
-                        //   BUFFR_WEBKIT_NATIVE=1
-                        prefer_native: std::env::var_os("BUFFR_WEBKIT_NATIVE")
-                            .is_some_and(|v| v == "1"),
-                        // Thread raw Wayland handles directly into construction so
-                        // BuffrDisplayWayland (#152) can consume them when
-                        // prefer_native is set. Always set on Wayland (zero
-                        // cost when prefer_native is false; the engine never
-                        // dereferences them in that case).
-                        wayland_handles: self.wayland_native_handles,
-                    };
-                    // Hand the app-wide loopback server to the engine at
-                    // construction so the worker's very first open_tab
-                    // (fired from spawn's idle handler) loads buffr:// URLs
-                    // via the server rather than falling back to data:.
-                    let server = self.internal_server.as_ref().map(Arc::clone);
-                    match buffr_webkit::WebKitEngine::new_with_server(&options, server) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "webkit (WPE) engine created (phase 1 stub)");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_frame_rate(&engine, display_hz);
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            // Wire the buffr://new HTML provider so the page reflects
-                            // current keybinds / palette without a binary rebuild.
-                            let engine_for_newtab = Arc::clone(&self.engine);
-                            engine.set_newtab_html_provider(Arc::new(move || {
-                                render_new_tab_html(&engine_for_newtab)
-                            }));
-                            // Wire the edit-mode event sink so buffrEdit UCM
-                            // messages from edit.js reach drain_edit_events (#134).
-                            engine.set_edit_sink(self.edit_sink.clone());
-                            // Log native-compositing capability so #144+ work can
-                            // verify the gate fires on the right sessions.
-                            // Phase 3 of #109 — real subsurface attach lands later.
-                            info!(
-                                supports_native =
-                                    buffr_engine::BrowserEngine::supports_native(&engine),
-                                "webkit: native-compositing capability"
-                            );
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create webkit (WPE) engine");
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                "webkit" => {
-                    warn!(engine_id = %inst.id, "webkit (WPE) is only supported on Linux — skipping");
-                }
-                #[cfg(target_os = "macos")]
-                "webkit-cocoa" => {
-                    let data_dir_buf: Option<std::path::PathBuf> =
-                        Some(match inst.data_dir.as_deref() {
-                            Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => self
-                                .data_root
-                                .join("engines")
-                                .join(&inst.id)
-                                .join("profile"),
-                        });
-                    let options = buffr_engine::BackendOpenOptions {
-                        engine_id: buffr_engine::EngineId::new(&inst.id),
-                        data_dir: data_dir_buf.as_deref(),
-                        cache_dir: None,
-                        initial_url: &self.homepage,
-                        frame_rate: display_hz as i32,
-                        device_scale: effective_scale as f64,
-                        initial_size: (cef_w, cef_h),
-                        private: self.private,
-                        history: Some(
-                            Arc::new(self.history.clone()) as Arc<dyn std::any::Any + Send + Sync>
-                        ),
-                        download_dir: None,
-                        downloads: Some(Arc::new(self.downloads.clone())
-                            as Arc<dyn std::any::Any + Send + Sync>),
-                        notice_queue: Some(Arc::new(self.download_notice_queue.clone())
-                            as Arc<dyn std::any::Any + Send + Sync>),
-                        find_sink: Some(Arc::new(self.find_sink.clone())
-                            as Arc<dyn std::any::Any + Send + Sync>),
-                        sinks: Box::new(()),
-                        prefer_native: false,
-                        wayland_handles: None,
-                    };
-                    match buffr_webkit_cocoa::WebKitCocoaEngine::new(&options) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "webkit-cocoa engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create webkit-cocoa engine");
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                "webkit-cocoa" => {
-                    warn!(engine_id = %inst.id, "webkit-cocoa is only supported on macOS — skipping");
-                }
-                #[cfg(target_os = "windows")]
-                "webview2" => {
-                    let data_dir_buf: Option<std::path::PathBuf> =
-                        Some(match inst.data_dir.as_deref() {
-                            Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => self
-                                .data_root
-                                .join("engines")
-                                .join(&inst.id)
-                                .join("profile"),
-                        });
-                    let options = buffr_engine::BackendOpenOptions {
-                        engine_id: buffr_engine::EngineId::new(&inst.id),
-                        data_dir: data_dir_buf.as_deref(),
-                        cache_dir: None,
-                        initial_url: &self.homepage,
-                        frame_rate: display_hz as i32,
-                        device_scale: effective_scale as f64,
-                        initial_size: (cef_w, cef_h),
-                        private: self.private,
-                        history: Some(self.history.clone()),
-                        download_dir: None,
-                        downloads: Some(self.downloads.clone()),
-                        notice_queue: Some(self.download_notice_queue.clone()),
-                        find_sink: Some(self.find_sink.clone()),
-                        sinks: Box::new(()),
-                        prefer_native: false,
-                        wayland_handles: None,
-                    };
-                    match buffr_webview2::WebView2Engine::new(&options) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "webview2 engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create webview2 engine");
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                "webview2" => {
-                    warn!(engine_id = %inst.id, "webview2 is only supported on Windows — skipping");
                 }
                 other => {
                     warn!(backend = %other, engine_id = %inst.id, "unknown engine backend — skipping");

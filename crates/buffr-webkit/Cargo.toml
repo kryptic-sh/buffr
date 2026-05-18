@@ -1,27 +1,27 @@
 [package]
 name = "buffr-webkit"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-authors.workspace = true
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr"
+homepage = "https://kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
 description = "WPE WebKit (Linux native) backend for buffr-engine — phase 1 scaffold"
 publish = false
 
 [dependencies]
-buffr-core.workspace = true
-buffr-engine.workspace = true
-buffr-permissions.workspace = true
-serde_json.workspace = true
-buffr-modal.workspace = true
-buffr-history.workspace = true
-buffr-downloads.workspace = true
-buffr-config.workspace = true
-hjkl-clipboard.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
+buffr-core = { path = "../buffr-core" }
+buffr-engine = { path = "../buffr-engine" }
+buffr-permissions = { path = "../buffr-permissions", default-features = false }
+serde_json = "1"
+buffr-modal = { path = "../buffr-modal" }
+buffr-history = { path = "../buffr-history" }
+buffr-downloads = { path = "../buffr-downloads" }
+buffr-config = { path = "../buffr-config" }
+hjkl-clipboard = "0.5"
+tracing = "0.1"
+thiserror = "2"
 ureq = { version = "3" }
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
 
