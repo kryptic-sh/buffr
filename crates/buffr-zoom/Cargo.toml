@@ -1,0 +1,18 @@
+[package]
+name = "buffr-zoom"
+description = "SQLite-backed per-site zoom-level store for buffr."
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-zoom"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
+
+[dependencies]
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+url = "2"
