@@ -18,12 +18,7 @@ members = [
     "apps/buffr-helper",
     "xtask",
 ]
-# `apps/buffr-stub` is intentionally *not* a workspace member. It's the
-# crates.io-published stub that owns the `buffr` name on crates.io.
-# Publish it independently:
-#   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
 exclude = [
-    "apps/buffr-stub",
     "fuzz",
     # Experimental WPE WebKit backend — Linux-only, not built by CI.
     # Build standalone on systems with WPE WebKit 2.0 (Arch / Debian sid):
@@ -44,9 +39,8 @@ license = "MIT"
 repository = "https://github.com/kryptic-sh/buffr"
 homepage = "https://kryptic.sh"
 authors = ["mxaddict <mxaddict@kryptic.sh>"]
-# Monorepo private — no member is published to crates.io independently.
-# apps/buffr-stub (excluded from workspace) holds the `buffr` name and
-# is the only crate published from this repo.
+# Monorepo private — no member is published to crates.io. The `buffr`
+# name on crates.io is yanked; binary distribution is via release artifacts.
 publish = false
 
 [workspace.dependencies]
