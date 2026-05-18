@@ -1483,18 +1483,13 @@ impl BrowserEngine for WebKitEngine {
     // apps-layer's decision to skip OSR drains; set_native_parent /
     // set_native_visible are the actual wiring (deferred to #145 / #147).
     //
-    // Current state: supports_native checks XDG_SESSION_TYPE and returns
-    // true only on a Wayland session. set_native_parent / set_native_visible
-    // are stubs that log; real impls land in #145.
+    // buffr is Wayland-only on Linux, so the session-type check is redundant.
+    // supports_native always returns true; the actual compositing path is
+    // determined by is_using_native_compositing (which reflects whether
+    // WPEDisplayWayland was actually constructed vs the OSR fallback).
 
     fn supports_native(&self) -> bool {
-        // For now, gate purely on session type. Once #144 lands the
-        // engine will additionally check whether WPEDisplayWayland was
-        // actually constructed (vs the OSR BuffrDisplay fallback), but
-        // the env-var heuristic is enough for the apps-layer to branch.
-        std::env::var("XDG_SESSION_TYPE")
-            .map(|v| v.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false)
+        true
     }
 
     fn is_using_native_compositing(&self) -> bool {

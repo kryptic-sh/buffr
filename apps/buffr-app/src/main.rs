@@ -454,15 +454,10 @@ struct Cli {
     /// audit. No CEF init.
     #[arg(long)]
     audit_keymap: bool,
-    /// Force the X11 backend on Linux. No effect on macOS / Windows.
-    /// Useful for testing the X11 path on a Wayland session.
-    #[cfg(target_os = "linux")]
-    #[arg(long)]
-    x11: bool,
     /// Override the default engine backend for this run. Synthesises a single
     /// instance with the chosen backend and routes every tab through it,
     /// ignoring `[engines]` config. Valid values: cef, webkit (WPE, Linux only),
-    /// webkit-cocoa (macOS only), webview2 (Windows only), blitz, ladybird.
+    /// webkit-cocoa (macOS only), webview2 (Windows only).
     #[arg(long, value_name = "NAME")]
     engine: Option<String>,
     /// URLs to open. Each becomes a new tab. When another buffr instance is
@@ -518,25 +513,30 @@ fn main() -> Result<()> {
 
     // -------- --engine validation (before CEF init) ------------------
     if let Some(raw) = cli.engine.as_deref() {
-        const VALID: &[&str] = &[
-            "cef",
-            "webkit",
-            "webkit-cocoa",
-            "webview2",
-            "blitz",
-            "ladybird",
-        ];
+        const VALID: &[&str] = &["cef", "webkit", "webkit-cocoa", "webview2"];
         let chosen = raw.to_lowercase();
-        if chosen == "servo" {
-            anyhow::bail!(
-                "--engine servo: servo is outside the workspace and cannot be used from buffr-app"
-            );
-        }
         if !VALID.contains(&chosen.as_str()) {
             anyhow::bail!(
                 "--engine {}: unknown backend. Valid values: {}",
                 chosen,
                 VALID.join(", ")
+            );
+        }
+    }
+
+    // -------- Linux Wayland-only gate --------------------------------
+    //
+    // buffr requires a Wayland session on Linux. Refuse early — before CEF
+    // init, before any window creation — so the user gets a clear message
+    // instead of a cryptic winit/CEF panic.
+    #[cfg(target_os = "linux")]
+    {
+        let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+        if !session.eq_ignore_ascii_case("wayland") {
+            anyhow::bail!(
+                "buffr requires a Wayland session on Linux (got XDG_SESSION_TYPE={:?}). \
+                 Switch your DE to Wayland — GNOME, KDE, Sway, Hyprland all support it.",
+                session
             );
         }
     }
@@ -930,19 +930,9 @@ fn main() -> Result<()> {
     //
     // All platforms run OSR: CEF paints into a shared bitmap, the
     // wgpu present layer composites it under buffr's chrome strips.
-    // On Linux, `--x11` forces the X11 backend even on a Wayland session
-    // (useful for regression testing the X11 path).
-    let event_loop = {
-        let mut builder = EventLoop::<BuffrUserEvent>::with_user_event();
-        #[cfg(target_os = "linux")]
-        {
-            use winit::platform::x11::EventLoopBuilderExtX11;
-            if cli.x11 {
-                builder.with_x11();
-            }
-        }
-        builder.build().context("creating winit event loop")?
-    };
+    let event_loop = EventLoop::<BuffrUserEvent>::with_user_event()
+        .build()
+        .context("creating winit event loop")?;
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -7496,114 +7486,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }
                         Err(err) => {
                             warn!(engine_id = %inst.id, error = %err, "failed to create browser host");
-                        }
-                    }
-                }
-                "blitz" => {
-                    let data_dir_buf: Option<std::path::PathBuf> =
-                        Some(match inst.data_dir.as_deref() {
-                            Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => self
-                                .data_root
-                                .join("engines")
-                                .join(&inst.id)
-                                .join("profile"),
-                        });
-                    let options = buffr_engine::BackendOpenOptions {
-                        engine_id: buffr_engine::EngineId::new(&inst.id),
-                        data_dir: data_dir_buf.as_deref(),
-                        cache_dir: None,
-                        initial_url: &self.homepage,
-                        frame_rate: display_hz as i32,
-                        device_scale: effective_scale as f64,
-                        initial_size: (cef_w, cef_h),
-                        private: self.private,
-                        history: None,
-                        download_dir: None,
-                        downloads: None,
-                        notice_queue: None,
-                        find_sink: None,
-                        sinks: Box::new(()),
-                        prefer_native: false,
-                        wayland_handles: None,
-                    };
-                    match buffr_blitz::BlitzEngine::new(&options) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "blitz engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create blitz engine");
-                        }
-                    }
-                }
-                "ladybird" => {
-                    let data_dir_buf: Option<std::path::PathBuf> =
-                        Some(match inst.data_dir.as_deref() {
-                            Some(explicit) => std::path::PathBuf::from(explicit),
-                            None => self
-                                .data_root
-                                .join("engines")
-                                .join(&inst.id)
-                                .join("profile"),
-                        });
-                    let options = buffr_engine::BackendOpenOptions {
-                        engine_id: buffr_engine::EngineId::new(&inst.id),
-                        data_dir: data_dir_buf.as_deref(),
-                        cache_dir: None,
-                        initial_url: &self.homepage,
-                        frame_rate: display_hz as i32,
-                        device_scale: effective_scale as f64,
-                        initial_size: (cef_w, cef_h),
-                        private: self.private,
-                        history: None,
-                        download_dir: None,
-                        downloads: None,
-                        notice_queue: None,
-                        find_sink: None,
-                        sinks: Box::new(()),
-                        prefer_native: false,
-                        wayland_handles: None,
-                    };
-                    match buffr_ladybird::LadybirdEngine::new(&options) {
-                        Ok(engine) => {
-                            info!(engine_id = %inst.id, "ladybird engine created");
-                            let proxy = self.event_proxy.clone();
-                            buffr_engine::BrowserEngine::set_osr_wake(
-                                &engine,
-                                Arc::new(move || {
-                                    let _ = proxy.send_event(BuffrUserEvent::OsrFrame);
-                                }),
-                            );
-                            buffr_engine::BrowserEngine::set_device_scale(&engine, effective_scale);
-                            let engine_id = buffr_engine::EngineId::new(&inst.id);
-                            let dyn_engine: Arc<dyn buffr_engine::BrowserEngine> = Arc::new(engine);
-                            router_builder =
-                                router_builder.register(engine_id.clone(), Arc::clone(&dyn_engine));
-                            self.engines.insert(engine_id.clone(), dyn_engine);
-                            if first_instance {
-                                self.active_engine = engine_id;
-                            }
-                            first_instance = false;
-                        }
-                        Err(err) => {
-                            warn!(engine_id = %inst.id, error = %err, "failed to create ladybird engine");
                         }
                     }
                 }

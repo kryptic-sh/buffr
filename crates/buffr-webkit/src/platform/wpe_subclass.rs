@@ -517,16 +517,16 @@ impl Drop for BuffrDisplayWaylandHandle {
 /// Which WPEDisplay variant the runtime is using.
 ///
 /// - `Osr(BuffrDisplayHandle)` — our custom BuffrDisplay subclass that feeds the
-///   OSR pixel-copy path (`buffr_rust_render_buffer`). Used on X11, headless, or
+///   OSR pixel-copy path (`buffr_rust_render_buffer`). Used in headless / CI, or
 ///   when `prefer_native` is false.
 /// - `Wayland(*mut WPEDisplay)` — stock `WPEDisplayWayland` connected to the
 ///   host compositor. Available as env-gated fallback via
-///   `BUFFR_WEBKIT_STOCK_WAYLAND=1`. Used when `prefer_native=true` and
-///   `XDG_SESSION_TYPE=wayland` but Wayland handles are not yet available.
+///   `BUFFR_WEBKIT_STOCK_WAYLAND=1`. Used when `prefer_native=true` but Wayland
+///   handles are not yet available.
 /// - `BuffrWayland(BuffrDisplayWaylandHandle)` — our custom WPEDisplay subclass
 ///   that reuses the host's `wl_display`. Preferred Phase 3 path (#152).
-///   Used when `prefer_native=true`, `XDG_SESSION_TYPE=wayland`, and all four
-///   Wayland handle pointers are non-null.
+///   Used when `prefer_native=true` and all four Wayland handle pointers are
+///   non-null.
 pub(crate) enum WpeDisplayKind {
     Osr(BuffrDisplayHandle),
     /// Raw `*mut WPEDisplay` (actually `*mut WPEDisplayWayland`, upcast).

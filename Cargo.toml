@@ -3,8 +3,6 @@ resolver = "2"
 members = [
     "crates/buffr-engine",
     "crates/buffr-cef",
-    "crates/buffr-blitz",
-    "crates/buffr-ladybird",
     "crates/buffr-webkit-cocoa",
     "crates/buffr-webkit",
     "crates/buffr-webview2",
@@ -27,15 +25,7 @@ members = [
 # crates.io-published stub that owns the `buffr` name on crates.io.
 # Publish it independently:
 #   cargo publish --manifest-path apps/buffr-stub/Cargo.toml --locked
-#
-# `crates/buffr-servo` is also intentionally outside the workspace.
-# Servo 0.1.0 pins stylo 0.15; blitz 0.3-alpha.2 pins stylo 0.16.
-# Both crates are `links = "servo_style_crate"`, so they cannot share
-# one Cargo.lock. Keeping buffr-servo standalone lets it resolve its
-# own stylo + libsqlite3-sys + transitive Servo deps without forcing
-# downgrades on the rest of the workspace.  Build with:
-#   cargo build --manifest-path crates/buffr-servo/Cargo.toml
-exclude = ["apps/buffr-stub", "crates/buffr-servo", "fuzz"]
+exclude = ["apps/buffr-stub", "fuzz"]
 # `cargo build` (no -p) builds all three app binaries — supervisor,
 # browser, and helper — so a sibling-resolved `target/debug/buffr-app`
 # exists when you `cargo run -b buffr`. Multiple bins make `cargo run`
@@ -61,7 +51,7 @@ serde = { version = "1", features = ["derive"] }
 bitflags = "2"
 toml = "1.1"
 directories = "6"
-winit = "0.30"
+winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
 raw-window-handle = "0.6"
 ureq = { version = "3", features = ["json"] }
 serde_json = "1"
@@ -105,9 +95,6 @@ semver = { version = "1", features = ["serde"] }
 # member, eliminating "multiple versions of buffr_<name>" errors.
 buffr-engine = "0.2"
 buffr-cef = "0.1"
-buffr-blitz = { path = "crates/buffr-blitz" }
-buffr-ladybird = { path = "crates/buffr-ladybird" }
-# buffr-servo is intentionally absent — see [workspace.exclude] above.
 buffr-webkit = { path = "crates/buffr-webkit" }
 buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
 buffr-webview2 = { path = "crates/buffr-webview2" }

@@ -3419,7 +3419,7 @@ impl WpeRuntime {
 
         // ── Display construction: OSR / BuffrWayland / stock Wayland (#144, #152)
         //
-        // Priority when `prefer_native=true` + `XDG_SESSION_TYPE=wayland`:
+        // Priority when `prefer_native=true`:
         //
         //   1. BuffrDisplayWayland (#152) — preferred: reuses the host
         //      wl_display, solves the cross-client wl_subsurface problem.
@@ -3431,12 +3431,12 @@ impl WpeRuntime {
         //      `BUFFR_WEBKIT_STOCK_WAYLAND=1`.  Opens its own wl_display.
         //      Rendered content is a sibling, not a child subsurface.
         //
-        //   3. BuffrDisplay (OSR pixel-copy) — default for X11, headless,
-        //      or when `prefer_native=false`.
-        let want_wayland = prefer_native
-            && std::env::var("XDG_SESSION_TYPE")
-                .map(|v| v.eq_ignore_ascii_case("wayland"))
-                .unwrap_or(false);
+        //   3. BuffrDisplay (OSR pixel-copy) — headless / CI fallback, or
+        //      when `prefer_native=false`.
+        //
+        // The session-type env-var check was removed: buffr enforces Wayland
+        // at startup on Linux, so the session is guaranteed Wayland here.
+        let want_wayland = prefer_native;
 
         // Helper: construct + connect + set-primary an OSR BuffrDisplay.
         let make_osr = |egl_display: *mut std::ffi::c_void| -> Result<WpeDisplayKind, String> {

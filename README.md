@@ -31,6 +31,10 @@ Each release publishes binary artifacts for:
 | macOS   | arm64 (Apple Silicon) | `.dmg`                    |
 | Windows | x64, arm64            | `.msi` (per-user)         |
 
+> **Linux requires a Wayland session.** X11 is not supported. GNOME 45+, KDE 6,
+> Sway, Hyprland, and other modern compositors all run Wayland by default. buffr
+> will exit with a clear error if `XDG_SESSION_TYPE` is not `wayland`.
+
 ### Why no Intel Mac (`x86_64-apple-darwin`)?
 
 We dropped Intel Mac builds in `0.1.14`. Apple stopped selling Intel Macs in

@@ -43,7 +43,6 @@ jobs:
             libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
             libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev
 
@@ -94,7 +93,6 @@ jobs:
             libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
             libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev \
             xvfb
@@ -189,7 +187,6 @@ jobs:
             libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
             libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev
 
@@ -240,7 +237,7 @@ jobs:
   # Verifies that each engine backend builds + tests cleanly on its target
   # platform. Catches the macOS / Windows / GPU paths that the main Linux
   # `linux` job can't exercise (webkit-cocoa platform module, webview2 COM
-  # stack, servo standalone with Mesa software rasterizer).
+  # stack).
   backends:
     name: backend ${{ matrix.crate }} (${{ matrix.os }})
     strategy:
@@ -249,9 +246,6 @@ jobs:
         include:
           # Cross-plat backends — build & test on Linux (host CI baseline)
           - { os: ubuntu-latest, crate: buffr-firefox-cdp, args: "-p buffr-firefox-cdp", apt: "" }
-          # Blitz pulls stylo + fontconfig via blitz-paint — needs system font headers
-          - { os: ubuntu-latest, crate: buffr-blitz,       args: "-p buffr-blitz",       apt: "libfontconfig1-dev libfreetype-dev libexpat1-dev pkg-config" }
-          - { os: ubuntu-latest, crate: buffr-ladybird,    args: "-p buffr-ladybird",    apt: "" }
 
           # Linux-gated backend
           - { os: ubuntu-latest, crate: buffr-webkitgtk,   args: "-p buffr-webkitgtk",   apt: "libwebkitgtk-6.0-dev libgtk-4-dev libglib2.0-dev" }
@@ -261,13 +255,6 @@ jobs:
 
           # Windows-gated backend — exercises the platform/ module on MSVC
           - { os: windows-latest, crate: buffr-webview2,   args: "-p buffr-webview2",     apt: "" }
-
-          # Servo: standalone crate (outside workspace). Build only — runtime
-          # tests are #[ignore] because servo's compositor needs EGL/GPU which
-          # GitHub's ubuntu-latest doesn't provide reliably. The build pass
-          # validates the 690-crate dep graph + our integration code compiles.
-          # Servo pulls a wide system-dep surface (Mesa, fontconfig, alsa, etc).
-          - { os: ubuntu-latest, crate: buffr-servo,       args: "--manifest-path crates/buffr-servo/Cargo.toml", apt: "libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev libfreetype-dev libexpat1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libasound2-dev libpulse-dev pkg-config" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -295,11 +282,7 @@ jobs:
         run: cargo build ${{ matrix.args }}
 
       - name: cargo test
-        # Skip tests on the servo standalone matrix entry — they need a GPU.
-        # All other backends have either offline tests or stub-path tests
-        # that work fine without a display server.
-        if: matrix.crate != 'buffr-servo'
-        # --test-threads=1 keeps the blitz/webkitgtk renderers from racing
+        # --test-threads=1 keeps the webkitgtk renderer from racing
         # on fontconfig + WebKit init when CI runners have only 2 vCPUs.
         # The flake otherwise hits a 30s worker-recv timeout intermittently.
         run: cargo test ${{ matrix.args }} -- --test-threads=1
@@ -345,7 +328,6 @@ jobs:
             libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
             libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev \
             libxml2-utils
@@ -434,7 +416,6 @@ jobs:
             libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
             libgl1 libegl1 libgles2 \
             dpkg dpkg-dev fakeroot file \
             rpm
