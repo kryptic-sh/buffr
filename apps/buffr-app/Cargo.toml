@@ -9,7 +9,6 @@ homepage.workspace = true
 authors.workspace = true
 description = "Vim-inspired browser. Native, GPU-accelerated. Rust + CEF."
 # Browser binary. `buffr` (supervisor) spawns this as its child process.
-# The on-crates.io `buffr` package is the stub at apps/buffr-stub.
 publish = false
 
 [[bin]]

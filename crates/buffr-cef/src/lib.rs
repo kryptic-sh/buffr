@@ -33,7 +33,7 @@
 //! - Downloads: `start_download`, drain events
 //! - Audio: `any_audio_active`, `drain_audio_events`, `run_media_probe`
 //! - Dev tools: `show_dev_tools_at`
-//! - Custom schemes: `register_buffr_src_scheme`, `register_buffr_handler_factory`
+//! - Custom schemes: `register_buffr_src_scheme` (`buffr://` served via InternalServer HTTP)
 //!
 //! Deferred / unimplemented in this crate: none — CEF provides the full
 //! surface.  Per-engine `CefRequestContext` isolation is a Phase 5+ follow-up
@@ -80,9 +80,7 @@ pub use buffr_engine::ProfilePaths;
 pub use buffr_engine::{BrowserEngine, TabId, TabSummary};
 pub use new_tab::{
     NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
-    NewTabHtmlProvider, SETTINGS_URL, SettingsHtmlProvider, register_buffr_handler_factory,
-    register_buffr_handler_factory_static, register_buffr_handler_factory_with_settings,
-    register_buffr_scheme, settings_html,
+    NewTabHtmlProvider, SETTINGS_URL, SettingsHtmlProvider, settings_html,
 };
 pub use osr::{OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState};
 // Popup types and helpers promoted to buffr-engine in Phase 6a (#95).

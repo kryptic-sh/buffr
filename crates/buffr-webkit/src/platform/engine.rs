@@ -20,7 +20,6 @@ use buffr_engine::{
     PromptOutcome, SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
     engine_id::EngineId,
     internal_server::InternalServer,
-    newtab::{default_newtab_html, default_settings_html, translate_internal_url},
     permissions::PermissionsQueue,
     popup::{
         PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
@@ -55,14 +54,15 @@ pub struct WebKitEngine {
     /// Current live URL (updated via `pump_address_changes`).
     live_url: Mutex<String>,
     /// `buffr://new` HTML provider. Wired by buffr-app at registration so
-    /// the page reflects current keybinds / palette / splash art. None
-    /// falls back to the raw template via [`default_newtab_html`].
+    /// the page reflects current keybinds / palette / splash art. Used by
+    /// the InternalServer `/new` route handler when set.
     newtab_html_provider: Mutex<Option<NewTabHtmlProvider>>,
     /// Optional shared loopback HTTP server. When set, `buffr://path`
-    /// resolves to `http://127.0.0.1:<port>/<token>/path` instead of a
-    /// `data:` URL; the server invokes per-route handlers wired by the
-    /// host so internal pages get a real HTTP origin (fetch, modules,
-    /// CSS imports all work) rather than the opaque data-URL origin.
+    /// resolves to `http://127.0.0.1:<port>/<token>/path`; the server
+    /// invokes per-route handlers wired by the host so internal pages get
+    /// a real HTTP origin (fetch, modules, CSS imports all work). When
+    /// unset, `buffr://` URLs fail visibly rather than falling back to a
+    /// data: URL.
     internal_server: Mutex<Option<Arc<InternalServer>>>,
     /// Per-tab mapping from TabId to the *display* URL the user typed
     /// (e.g. `buffr://new`). Tracked separately from the translated URL
@@ -176,12 +176,11 @@ impl WebKitEngine {
         {
             server.url_for(&format!("/{rest}"))
         } else {
-            translate_internal_url(
-                options.initial_url,
-                default_newtab_html,
-                default_settings_html,
-            )
-            .unwrap_or_else(|| options.initial_url.to_owned())
+            // Server not attached — pass the URL through. If it is a
+            // `buffr://` URL the engine will fail visibly (no server, no
+            // custom scheme handler) rather than masking the error with a
+            // data: URL. Non-buffr URLs are navigated as-is.
+            options.initial_url.to_owned()
         };
         let initial_url = initial_url_owned.as_str();
 
@@ -375,8 +374,9 @@ impl WebKitEngine {
 
     /// Translate a `buffr://` URL into something the engine can actually
     /// load. Prefers the shared [`InternalServer`] when one is attached
-    /// (real HTTP origin, supports fetch/modules) and falls back to a
-    /// self-contained `data:text/html;base64,…` URL otherwise. Non-buffr
+    /// (real HTTP origin, supports fetch/modules/CSS imports). When no server
+    /// is attached, the URL is returned unchanged — the engine will fail
+    /// visibly instead of masking the error with a data: URL. Non-buffr
     /// URLs are returned untouched.
     fn resolve_url(&self, url: &str) -> String {
         if let Some(rest) = url.strip_prefix("buffr://") {
@@ -388,15 +388,10 @@ impl WebKitEngine {
             {
                 return server.url_for(&format!("/{rest}"));
             }
+            // Server not attached — let the engine fail visibly rather than
+            // masking the bind failure with a data: URL.
         }
-        let newtab = || {
-            self.newtab_html_provider
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().map(|p| p()))
-                .unwrap_or_else(default_newtab_html)
-        };
-        translate_internal_url(url, newtab, default_settings_html).unwrap_or_else(|| url.to_owned())
+        url.to_owned()
     }
 
     /// Remember that `tab_id` was opened with the display URL `original`.

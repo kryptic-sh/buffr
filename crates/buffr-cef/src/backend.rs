@@ -24,8 +24,8 @@ use buffr_engine::{Backend, BackendOpenOptions, BrowserEngine, NewTabHtmlProvide
 use crate::{
     BrowserHost, BuffrApp, PermissionsQueue, cef_initialize, cef_shutdown, delete_all_cookies,
     do_message_loop_work, execute_process_for_subprocess, load_cef_library,
-    register_buffr_handler_factory, register_buffr_src_handler_factory, set_device_scale_factor,
-    set_force_renderer_accessibility, take_scheduled_message_pump_delay_ms,
+    register_buffr_src_handler_factory, set_device_scale_factor, set_force_renderer_accessibility,
+    take_scheduled_message_pump_delay_ms,
 };
 
 /// Concrete sink handles passed to `CefBackend::open_engine` via the
@@ -124,8 +124,11 @@ impl Backend for CefBackend {
         set_force_renderer_accessibility(force);
     }
 
-    fn register_new_tab_handler(&self, provider: NewTabHtmlProvider) {
-        register_buffr_handler_factory(provider);
+    fn register_new_tab_handler(&self, _provider: NewTabHtmlProvider) {
+        // No-op: `buffr://` navigation is now handled by InternalServer HTTP
+        // loopback (rewritten in `BrowserHost::cef_navigation_url`). The
+        // custom CEF scheme handler has been removed. The provider closure is
+        // still wired to the InternalServer `/new` route in apps/buffr-app.
     }
 
     fn register_view_source_handler(&self) {
@@ -167,6 +170,7 @@ impl Backend for CefBackend {
             sinks.counters,
             sinks.show_favicons,
             options.data_dir,
+            options.internal_server.clone(),
         )
         .map_err(|e| e.to_string())?;
 

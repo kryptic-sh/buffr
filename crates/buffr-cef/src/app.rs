@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 // — the upstream cefsimple example uses `use cef::*;` for this reason.
 use cef::*;
 
-use crate::new_tab::register_buffr_scheme;
 use crate::view_source_scheme::register_buffr_src_scheme;
 
 // For profile_paths()
@@ -99,7 +98,11 @@ wrap_app! {
     impl App {
         fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
             if let Some(r) = registrar {
-                register_buffr_scheme(r);
+                // `buffr://` is no longer a custom CEF scheme — navigation to
+                // `buffr://new` etc. is rewritten to the InternalServer HTTP
+                // loopback by `BrowserHost::cef_navigation_url` before CEF sees
+                // the URL. Only `buffr-src:` (view-source) still needs a custom
+                // scheme registration.
                 register_buffr_src_scheme(r);
             }
         }

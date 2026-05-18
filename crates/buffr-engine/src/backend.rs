@@ -98,6 +98,12 @@ pub struct BackendOpenOptions<'a> {
     /// this but is not yet parented — subsurface attach is #145.
     #[doc(alias = "native_compositing")]
     pub prefer_native: bool,
+    /// Shared [`crate::internal_server::InternalServer`] for resolving `buffr://` URLs to
+    /// the loopback HTTP origin. Passed at construction so the engine's initial
+    /// tab opens with the server already attached — avoids a race where the
+    /// initial `buffr://new` navigation fires before the server can be wired
+    /// post-construction.
+    pub internal_server: Option<Arc<crate::internal_server::InternalServer>>,
     /// Raw Wayland + EGL handles from the host winit window (#152).
     ///
     /// When `Some`, `buffr-webkit` constructs `BuffrDisplayWayland` (the custom

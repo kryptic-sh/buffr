@@ -771,6 +771,17 @@ pub trait BrowserEngine: Send + Sync {
     // Default is "OSR-only": all three are no-ops, so existing backends
     // compile + behave unchanged.
 
+    // ── Internal server (InternalServer HTTP loopback) ───────────────────────
+
+    /// Attach a shared [`crate::internal_server::InternalServer`] so future
+    /// `buffr://*` navigations resolve to authenticated localhost HTTP URLs.
+    ///
+    /// Idempotent; later calls replace the previous server.
+    ///
+    /// Default: no-op. Backends override when they support the loopback path.
+    fn set_internal_server(&self, _server: std::sync::Arc<crate::internal_server::InternalServer>) {
+    }
+
     /// `true` when the backend supports native compositing into a host-
     /// provided surface. When true, the apps layer should:
     ///   1. Call [`Self::set_native_parent`] with a `RawWindowHandle` to the

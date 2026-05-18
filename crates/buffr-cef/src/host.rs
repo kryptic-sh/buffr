@@ -21,6 +21,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use buffr_engine::internal_server::InternalServer;
+
 use buffr_config::DownloadsConfig;
 use buffr_downloads::Downloads;
 use buffr_history::History;
@@ -89,10 +91,10 @@ use buffr_engine::{TabId, TabSummary};
 /// when dispatching "view page source" from the context menu.
 pub const BUFFR_SRC_PREFIX: &str = "buffr-src:";
 
-/// Translate a user-facing URL into the form CEF should actually
-/// navigate to. `buffr-src:` URLs reach CEF unmodified — the custom
-/// scheme handler registered in `view_source_scheme.rs` intercepts
-/// them. Identity for all URLs.
+/// Identity translation kept for the unit-test in this file. Production
+/// code uses `BrowserHost::cef_navigation_url` which rewrite `buffr://`
+/// URLs to the InternalServer HTTP loopback when a server is attached.
+#[cfg(test)]
 fn to_cef_navigation_url(url: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(url)
 }
@@ -337,6 +339,17 @@ pub struct BrowserHost {
     /// Written on the CEF IO thread when a permission request arrives;
     /// read + drained by `BrowserEngine::resolve_permission` on the UI thread.
     cef_callback_registry: crate::permissions::CefCallbackRegistry,
+    /// Shared loopback HTTP server for `buffr://*` internal pages. When
+    /// `Some`, `buffr://new` and friends are rewritten to
+    /// `http://127.0.0.1:<port>/<token>/<path>` before CEF sees them —
+    /// eliminating `ERR_UNKNOWN_URL_SCHEME` without a custom scheme handler.
+    /// Set via [`Self::set_internal_server`] after construction.
+    internal_server: Mutex<Option<Arc<InternalServer>>>,
+    /// Display URL overrides keyed by [`TabId`]. When a tab was opened with
+    /// a `buffr://` URL the actual navigation goes to the InternalServer HTTP
+    /// URL; we remember the original `buffr://` form here so the omnibar
+    /// shows `buffr://new` instead of `http://127.0.0.1:…/…`.
+    display_urls: Mutex<HashMap<TabId, String>>,
 }
 
 /// Stashed live tab for `reopen_closed_tab`. The CEF browser is kept
@@ -429,6 +442,7 @@ impl BrowserHost {
             None,
             true,
             None,
+            None,
         )
     }
 
@@ -455,6 +469,7 @@ impl BrowserHost {
         counters: Option<Arc<UsageCounters>>,
         show_favicons: bool,
         data_dir: Option<&Path>,
+        internal_server: Option<Arc<InternalServer>>,
     ) -> Result<Self, CoreError> {
         // All platforms run OSR. CEF paints into a shared bitmap; the
         // wgpu present layer composites it under buffr's chrome strips.
@@ -553,9 +568,54 @@ impl BrowserHost {
             request_context: Mutex::new(request_context),
             neutral_permissions_queue: buffr_engine::permissions::new_queue(),
             cef_callback_registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            internal_server: Mutex::new(internal_server),
+            display_urls: Mutex::new(HashMap::new()),
         };
         host.open_tab(url)?;
         Ok(host)
+    }
+
+    /// Attach a shared [`InternalServer`] so future `buffr://*` navigations
+    /// resolve to authenticated localhost HTTP URLs. Idempotent; later calls
+    /// replace the previous server.
+    pub fn set_internal_server(&self, server: Arc<InternalServer>) {
+        if let Ok(mut guard) = self.internal_server.lock() {
+            *guard = Some(server);
+        }
+    }
+
+    /// Translate a user-facing URL into the form CEF should actually navigate
+    /// to. `buffr-src:` URLs pass through unchanged (handled by the custom
+    /// scheme handler). `buffr://` URLs are rewritten to the InternalServer
+    /// HTTP loopback when one is attached; otherwise passed through so CEF
+    /// fails visibly rather than masking the error.
+    fn cef_navigation_url<'a>(&self, url: &'a str) -> std::borrow::Cow<'a, str> {
+        if let Some(rest) = url.strip_prefix("buffr://")
+            && let Ok(guard) = self.internal_server.lock()
+            && let Some(server) = guard.as_ref()
+        {
+            return std::borrow::Cow::Owned(server.url_for(&format!("/{rest}")));
+        }
+        std::borrow::Cow::Borrowed(url)
+    }
+
+    /// Record that `tab_id` was navigated with the user-facing URL `original`.
+    /// Lets the omnibar show `buffr://new` instead of the http://127.0.0.1:…
+    /// URL that CEF actually loaded.
+    fn record_display_url(&self, tab_id: TabId, original: &str) {
+        if let Ok(mut guard) = self.display_urls.lock() {
+            guard.insert(tab_id, original.to_owned());
+        }
+    }
+
+    fn forget_display_url(&self, tab_id: TabId) {
+        if let Ok(mut guard) = self.display_urls.lock() {
+            guard.remove(&tab_id);
+        }
+    }
+
+    fn display_url_for(&self, tab_id: TabId) -> Option<String> {
+        self.display_urls.lock().ok()?.get(&tab_id).cloned()
     }
 
     /// Borrow the shared permissions store. The UI thread uses this to
@@ -578,8 +638,10 @@ impl BrowserHost {
         self.popup_queue.clone()
     }
 
-    /// Returns the cached main-frame URL of the active tab. Updated by
-    /// `pump_address_changes` whenever CEF fires `on_address_change`.
+    /// Returns the user-facing URL of the active tab. For `buffr://` tabs the
+    /// original `buffr://new` form is returned (from `display_urls`) rather
+    /// than the `http://127.0.0.1:…` URL that CEF actually navigated to.
+    /// Updated by `pump_address_changes` whenever CEF fires `on_address_change`.
     /// Empty string if no active tab.
     pub fn active_tab_live_url(&self) -> String {
         let Ok(tabs) = self.tabs.lock() else {
@@ -589,7 +651,9 @@ impl BrowserHost {
         if let Some(idx) = active_idx
             && let Some(t) = tabs.get(idx)
         {
-            t.url.clone()
+            // Prefer the display-URL override (set for `buffr://` navigations)
+            // so the omnibar shows `buffr://new` rather than http://127.0.0.1:…
+            self.display_url_for(t.id).unwrap_or_else(|| t.url.clone())
         } else {
             String::new()
         }
@@ -1277,9 +1341,12 @@ impl BrowserHost {
             "create_browser: window_info"
         );
 
-        // Translate `buffr-src:` → `view-source:` for CEF; chrome-side
-        // we keep the `buffr-src:` form (see Tab.url assignment below).
-        let cef_navigation_url = to_cef_navigation_url(url);
+        // Translate `buffr://` → InternalServer HTTP URL for CEF; the
+        // user-facing form is preserved in `display_urls` (via
+        // `record_display_url`) so the omnibar shows `buffr://new`.
+        // `buffr-src:` passes through unchanged — handled by the custom
+        // scheme handler.
+        let cef_navigation_url = self.cef_navigation_url(url);
         let cef_url = CefString::from(cef_navigation_url.as_ref());
         let mut settings = BrowserSettings::default();
         // CEF's OSR default is 30 fps — that's the lag floor for mouse
@@ -1384,6 +1451,11 @@ impl BrowserHost {
         }
         info!(target: "buffr_core::host", %id, background, "tab opened");
         tracing::debug!(target: "buffr_core::host", %url, "tab opened — url");
+        // Remember the user-facing URL for `buffr://` tabs so the omnibar
+        // shows `buffr://new` rather than the http://127.0.0.1:… form.
+        if url.starts_with("buffr://") || url.starts_with("buffr-src:") {
+            self.record_display_url(id, url);
+        }
         // Phase 6 telemetry: count every tab open (foreground +
         // background) — they are equally "user opened a tab" events.
         if let Some(c) = self.counters.as_ref() {
@@ -1604,7 +1676,7 @@ impl BrowserHost {
             id: t.id,
             browser_id: t.browser.identifier(),
             title: t.display_title(),
-            url: t.url.clone(),
+            url: self.display_url_for(t.id).unwrap_or_else(|| t.url.clone()),
             progress: t.progress,
             is_loading: t.is_loading,
             pinned: t.pinned,
@@ -1666,6 +1738,9 @@ impl BrowserHost {
             }
             tabs.remove(idx)
         };
+
+        // Clean up display-URL override for the removed tab.
+        self.forget_display_url(removed.id);
 
         // Decide whether this tab is worth stashing on the closed-tabs
         // undo stack: blank pages aren't (re-opening them is the same
@@ -1888,12 +1963,12 @@ impl BrowserHost {
         if trimmed.is_empty() {
             return Err(CoreError::InvalidUrl(String::new()));
         }
+        let cef_navigation_url = self.cef_navigation_url(trimmed);
         self.with_active(|t| {
             let Some(frame) = t.browser.main_frame() else {
                 warn!("navigate: main frame unavailable");
                 return Err(CoreError::CreateBrowserFailed);
             };
-            let cef_navigation_url = to_cef_navigation_url(trimmed);
             let cef_url = CefString::from(cef_navigation_url.as_ref());
             frame.load_url(Some(&cef_url));
             t.url = to_display_url(trimmed).into_owned();
@@ -2879,6 +2954,12 @@ impl buffr_engine::BrowserEngine for BrowserHost {
 
     fn close_all_browsers(&self) {
         self.close_all_browsers()
+    }
+
+    // ── Internal server ──────────────────────────────────────────────────────
+
+    fn set_internal_server(&self, server: Arc<InternalServer>) {
+        self.set_internal_server(server);
     }
 
     // ── Tabs ─────────────────────────────────────────────────────────────────

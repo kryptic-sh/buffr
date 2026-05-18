@@ -956,7 +956,7 @@ fn main() -> Result<()> {
     //
     // Failure to bind is non-fatal: engines fall back to data: URL or
     // their native scheme handler.
-    let internal_server = {
+    let internal_server: Arc<buffr_engine::internal_server::InternalServer> = {
         let engine_for_routes = Arc::clone(&engine);
         let newtab_handler: buffr_engine::internal_server::Handler =
             Arc::new(move || render_new_tab_html(&engine_for_routes));
@@ -968,20 +968,14 @@ fn main() -> Result<()> {
                 "/settings",
                 Arc::new(buffr_engine::newtab::default_settings_html),
             );
-        match buffr_engine::internal_server::InternalServer::start(routes) {
-            Ok(srv) => {
-                let srv = Arc::new(srv);
-                info!(
-                    addr = %srv.addr(),
-                    "internal_server: listening on loopback"
-                );
-                Some(srv)
-            }
-            Err(err) => {
-                warn!(error = %err, "internal_server: bind failed — engines will fall back to data: URLs");
-                None
-            }
-        }
+        let srv = buffr_engine::internal_server::InternalServer::start(routes)
+            .context("internal_server: bind failed — buffr:// URLs will not load")?;
+        let srv = Arc::new(srv);
+        info!(
+            addr = %srv.addr(),
+            "internal_server: listening on loopback"
+        );
+        srv
     };
 
     // Register the `buffr-src:` scheme handler factory. Fetches the
@@ -1220,7 +1214,7 @@ fn main() -> Result<()> {
         shutdown_flag,
         event_proxy,
     );
-    app_state.internal_server = internal_server;
+    app_state.internal_server = Some(internal_server);
     app_state.heartbeat = initial_heartbeat;
     if let Err(err) = event_loop.run_app(&mut app_state) {
         warn!(error = %err, "winit event loop exited with error");
@@ -3605,9 +3599,9 @@ impl AppState {
 
     fn request_redraw(&self) {
         if let Some(window) = self.window.as_ref() {
-            tracing::info!(target: "buffr::ui_path", "enter: window.request_redraw");
+            tracing::debug!(target: "buffr::ui_path", "enter: window.request_redraw");
             window.request_redraw();
-            tracing::info!(target: "buffr::ui_path", "exit:  window.request_redraw");
+            tracing::debug!(target: "buffr::ui_path", "exit:  window.request_redraw");
         }
     }
 
@@ -3758,9 +3752,9 @@ impl AppState {
         // Otherwise treat as main-window event (active tab or
         // unidentified — `-1` from a synthetic event).
         if let Some(window) = self.window.as_ref() {
-            tracing::info!(target: "buffr::ui_path", "enter: window.set_cursor");
+            tracing::debug!(target: "buffr::ui_path", "enter: window.set_cursor");
             window.set_cursor(icon);
-            tracing::info!(target: "buffr::ui_path", "exit:  window.set_cursor");
+            tracing::debug!(target: "buffr::ui_path", "exit:  window.set_cursor");
         }
     }
 
@@ -3819,9 +3813,9 @@ impl AppState {
     }
 
     fn paint_chrome(&mut self) {
-        tracing::info!(target: "buffr::ui_path", "enter: paint_chrome");
+        tracing::debug!(target: "buffr::ui_path", "enter: paint_chrome");
         self.paint_chrome_with(None);
-        tracing::info!(target: "buffr::ui_path", "exit:  paint_chrome");
+        tracing::debug!(target: "buffr::ui_path", "exit:  paint_chrome");
     }
 
     /// Two-finger horizontal-swipe back/forward gesture detector.
@@ -7448,6 +7442,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         }),
                         prefer_native: false,
                         wayland_handles: None,
+                        internal_server: self.internal_server.as_ref().map(Arc::clone),
                     };
                     match self.backend.open_engine(options) {
                         Ok(host_dyn) => {
