@@ -1,0 +1,1837 @@
+//! CEF callback handlers that bridge browser events into buffr's
+//! data layer.
+//!
+//! Phase 5 wires up three:
+//!
+//! - [`make_load_handler`] — `LoadHandler::on_load_end` records every
+//!   main-frame navigation into [`buffr_history::History`].
+//! - [`make_display_handler`] — `DisplayHandler::on_title_change`
+//!   updates the most recent visit's title via
+//!   [`buffr_history::History::update_latest_title`]. CEF emits
+//!   `on_title_change` slightly after `on_load_end`, so the visit row
+//!   already exists.
+//! - [`make_download_handler`] — `DownloadHandler::on_before_download`
+//!   resolves a target path under
+//!   [`buffr_config::DownloadsConfig::default_dir`] and routes
+//!   progress / lifecycle ticks into [`buffr_downloads::Downloads`].
+//!
+//! All three are exposed through [`make_client`], which spins a tiny
+//! `BuffrClient` whose only job is to hand the load + display +
+//! download handlers to CEF when it asks. `BrowserHost::new` passes
+//! the resulting `Client` to `browser_host_create_browser_sync` so CEF
+//! actually invokes our callbacks (without a custom `Client`, CEF
+//! defaults to a no-op client and our handlers never fire).
+#![allow(clippy::too_many_arguments)]
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+use buffr_config::DownloadsConfig;
+use buffr_downloads::{DownloadStatus, Downloads};
+use buffr_history::{History, Transition};
+use buffr_permissions::{Decision, Permissions};
+use buffr_zoom::ZoomStore;
+
+use crate::audio::{AudioEventQueue, AudioStateSink, BuffrAudioHandler};
+use crate::permissions::{
+    PendingPermission, PermissionsQueue, capabilities_for_media_mask,
+    capabilities_for_request_mask, precheck,
+};
+use buffr_core::context_menu::{
+    CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuRequest, ContextMenuSink, ContextMenuTarget,
+    build_model,
+};
+use buffr_core::download_notice::{DownloadNotice, DownloadNoticeKind, DownloadNoticeQueue, push};
+use buffr_core::edit::{EditEventSink, build_inject_script as build_edit_inject_script};
+use buffr_core::find::{FindResult, FindResultSink};
+use buffr_core::hint::{HintEventSink, parse_console_event};
+use buffr_core::scripts::MEDIA_PROBE_INIT_JS;
+use buffr_core::telemetry::{KEY_DOWNLOADS_COMPLETED, KEY_PAGES_LOADED, UsageCounters};
+// `wrap_client!` / `wrap_load_handler!` / `wrap_display_handler!` /
+// `wrap_download_handler!` expand to references to bare `Client`,
+// `WrapClient`, `ImplClient`, `LoadHandler`, `DownloadHandler`, etc.,
+// so the upstream cef-rs examples (and our `app.rs`) glob-import the
+// whole crate. We do the same here.
+use cef::*;
+
+use buffr_core::cursor::SharedCursorState;
+use buffr_core::favicon::{FaviconEnabled, FaviconSink, FaviconUpdate, favicon_is_enabled};
+
+// CEF's `on_cursor_change` second arg is the OS-native cursor handle.
+// cef-rs ports it as a different Rust type per platform, and not always
+// the `cef::sys::cef_cursor_handle_t` typedef:
+//   linux   → c_ulong              (matches typedef)
+//   windows → *mut HICON__         (matches typedef)
+//   macos   → *mut u8              (NOT the typedef, which is *mut c_void)
+// We don't use the value, but the override has to match the trait
+// signature exactly. Alias here keeps the impl readable.
+#[cfg(target_os = "linux")]
+type CefCursorArg = ::std::os::raw::c_ulong;
+#[cfg(target_os = "windows")]
+type CefCursorArg = cef::sys::cef_cursor_handle_t;
+#[cfg(target_os = "macos")]
+type CefCursorArg = *mut u8;
+use crate::osr::{OsrFrame, OsrViewState, PopupFrameMap};
+use crate::{PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
+use buffr_core::open_finder::{OsSpawn, open_path};
+
+/// Build a CEF `Client` that returns our load + display + download
+/// handlers when CEF asks for them. This is the entry point
+/// `BrowserHost::new` uses; consumers don't construct `BuffrClient`
+/// directly.
+///
+/// `render_handler` is `Some` only in OSR mode; windowed mode passes `None`
+/// and the default no-op path is preserved.
+#[allow(clippy::too_many_arguments)]
+pub fn make_client(
+    history: Arc<History>,
+    downloads: Arc<Downloads>,
+    downloads_config: Arc<DownloadsConfig>,
+    zoom: Arc<ZoomStore>,
+    permissions: Arc<Permissions>,
+    permissions_queue: PermissionsQueue,
+    neutral_permissions_queue: buffr_engine::PermissionsQueue,
+    cef_callback_registry: crate::permissions::CefCallbackRegistry,
+    find_sink: FindResultSink,
+    hint_sink: HintEventSink,
+    edit_sink: EditEventSink,
+    counters: Option<Arc<UsageCounters>>,
+    notice_queue: DownloadNoticeQueue,
+    render_handler: Option<RenderHandler>,
+    popup_queue: PopupQueue,
+    address_sink: crate::host::AddressSink,
+    popup_title_sink: crate::host::AddressSink,
+    popup_frames: PopupFrameMap,
+    pending_popup_alloc: PendingPopupAlloc,
+    popup_create_sink: PopupCreateSink,
+    popup_close_sink: PopupCloseSink,
+    popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+    cursor_state: SharedCursorState,
+    favicon_sink: FaviconSink,
+    favicon_enabled: FaviconEnabled,
+    loading_busy: Arc<AtomicBool>,
+    audio_sink: AudioStateSink,
+    audio_queue: AudioEventQueue,
+    video_active: Arc<AtomicBool>,
+    context_menu_sink: ContextMenuSink,
+) -> Client {
+    BuffrClient::new(
+        history,
+        downloads,
+        downloads_config,
+        zoom,
+        permissions,
+        permissions_queue,
+        neutral_permissions_queue,
+        cef_callback_registry,
+        find_sink,
+        hint_sink,
+        edit_sink,
+        counters,
+        notice_queue,
+        render_handler,
+        popup_queue,
+        address_sink,
+        popup_title_sink,
+        popup_frames,
+        pending_popup_alloc,
+        popup_create_sink,
+        popup_close_sink,
+        popup_browsers,
+        cursor_state,
+        favicon_sink,
+        favicon_enabled,
+        loading_busy,
+        audio_sink,
+        audio_queue,
+        video_active,
+        context_menu_sink,
+    )
+}
+
+/// Standalone factory for the load handler — exposed so future
+/// `BrowserHost` flavors (OSR, multi-tab) can build their own client
+/// while still funnelling visits into the same history store.
+pub fn make_load_handler(
+    history: Arc<History>,
+    zoom: Arc<ZoomStore>,
+    counters: Option<Arc<UsageCounters>>,
+    edit_sink: EditEventSink,
+    loading_busy: Arc<AtomicBool>,
+) -> LoadHandler {
+    BuffrLoadHandler::new(
+        history,
+        zoom,
+        counters,
+        Arc::new(Mutex::new(HashMap::new())),
+        edit_sink,
+        loading_busy,
+    )
+}
+
+/// Standalone factory for the display handler — same rationale as
+/// [`make_load_handler`].
+pub fn make_display_handler(
+    history: Arc<History>,
+    hint_sink: HintEventSink,
+    edit_sink: EditEventSink,
+    address_sink: crate::host::AddressSink,
+    popup_title_sink: crate::host::AddressSink,
+    cursor_state: SharedCursorState,
+    favicon_sink: FaviconSink,
+    favicon_enabled: FaviconEnabled,
+    video_active: Arc<AtomicBool>,
+) -> DisplayHandler {
+    BuffrDisplayHandler::new(
+        history,
+        hint_sink,
+        edit_sink,
+        address_sink,
+        popup_title_sink,
+        cursor_state,
+        favicon_sink,
+        favicon_enabled,
+        video_active,
+    )
+}
+
+/// Standalone factory for the download handler.
+pub fn make_download_handler(
+    downloads: Arc<Downloads>,
+    downloads_config: Arc<DownloadsConfig>,
+    counters: Option<Arc<UsageCounters>>,
+    notice_queue: DownloadNoticeQueue,
+) -> DownloadHandler {
+    BuffrDownloadHandler::new(downloads, downloads_config, counters, notice_queue)
+}
+
+/// Standalone factory for the find handler. Takes the same
+/// [`FindResultSink`] [`BrowserHost`] uses so callbacks land in one
+/// place.
+pub fn make_find_handler(sink: FindResultSink) -> FindHandler {
+    BuffrFindHandler::new(sink)
+}
+
+/// Standalone factory for the permission handler. Pre-checks the
+/// store synchronously; otherwise enqueues the request for the UI
+/// thread.
+///
+/// Phase 8a (#88): `neutral_queue` and `callback_registry` are the new
+/// dual-push targets; `queue` is kept for backward-compat shutdown drain.
+pub fn make_permission_handler(
+    permissions: Arc<Permissions>,
+    queue: PermissionsQueue,
+    neutral_queue: buffr_engine::PermissionsQueue,
+    callback_registry: crate::permissions::CefCallbackRegistry,
+) -> PermissionHandler {
+    BuffrPermissionHandler::new(permissions, queue, neutral_queue, callback_registry)
+}
+
+wrap_life_span_handler! {
+    pub struct BuffrLifeSpanHandler {
+        popup_queue: PopupQueue,
+        pending_popup_alloc: PendingPopupAlloc,
+        popup_frames: PopupFrameMap,
+        popup_create_sink: PopupCreateSink,
+        popup_close_sink: PopupCloseSink,
+        popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+    }
+
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            // Re-route only "open in new tab" intents (target=_blank,
+            // Ctrl+click). NEW_POPUP / NEW_WINDOW carry features the
+            // page expects (window.opener handle for OAuth flows,
+            // postMessage parent ref) — let CEF handle them via OSR
+            // in a new buffr window.
+            let raw = target_disposition.get_raw();
+            let is_tab = raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw()
+                || raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw();
+            if is_tab {
+                if let Some(url) = target_url {
+                    let url_str = url.to_string();
+                    if !url_str.is_empty()
+                        && let Ok(mut guard) = self.popup_queue.lock()
+                    {
+                        guard.push_back(url_str);
+                    }
+                }
+                // Cancel — main loop will open the URL as a tab.
+                return 1;
+            }
+
+            // For NEW_POPUP / NEW_WINDOW: allocate OSR frame/view, configure
+            // windowless rendering, and let CEF create the popup browser.
+            let url_str = target_url
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            tracing::debug!(
+                %url_str,
+                disposition = raw,
+                "on_before_popup: intercepting popup window for OSR"
+            );
+
+            // Allocate frame + view at a sensible default size. CEF will
+            // immediately call view_rect and resize from there.
+            let frame = Arc::new(Mutex::new(OsrFrame::new(800, 600)));
+            let view = Arc::new(OsrViewState::new());
+            view.width.store(800, std::sync::atomic::Ordering::Relaxed);
+            view.height.store(600, std::sync::atomic::Ordering::Relaxed);
+
+            // Stash for on_after_created to pick up.
+            if let Ok(mut slot) = self.pending_popup_alloc.lock() {
+                *slot = Some((frame, view, url_str));
+            }
+
+            // Configure the popup browser for OSR.
+            if let Some(wi) = window_info {
+                wi.windowless_rendering_enabled = 1;
+                // Alloy runtime — same as main browser.
+                wi.runtime_style =
+                    cef::sys::cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY.into();
+            }
+            if let Some(s) = settings {
+                s.windowless_frame_rate = 60;
+            }
+
+            // Return 0: allow CEF to create the popup browser.
+            // on_after_created will fire next with the assigned id.
+            0
+        }
+
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else { return };
+            if browser.is_popup() == 0 {
+                // Not a popup — main/tab browser; nothing extra to do.
+                return;
+            }
+            let browser_id = cef::ImplBrowser::identifier(browser);
+
+            // Consume the pending alloc.
+            let alloc = match self.pending_popup_alloc.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => None,
+            };
+            let (frame, view, url) = match alloc {
+                Some(a) => a,
+                None => {
+                    tracing::warn!(
+                        browser_id,
+                        "on_after_created: no pending alloc for popup — skipping"
+                    );
+                    return;
+                }
+            };
+
+            // Register in shared frame map so OsrPaintHandler routes paint.
+            if let Ok(mut map) = self.popup_frames.lock() {
+                map.insert(browser_id, (frame.clone(), view.clone()));
+            }
+            // Keep live browser handle for resize / close.
+            if let Ok(mut browsers) = self.popup_browsers.lock() {
+                browsers.insert(browser_id, browser.clone());
+            }
+            // Emit create event for apps layer.
+            if let Ok(mut sink) = self.popup_create_sink.lock() {
+                sink.push_back(PopupCreated {
+                    browser_id,
+                    url,
+                    frame,
+                    view,
+                });
+            }
+            tracing::debug!(browser_id, "on_after_created: popup browser registered");
+        }
+
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else { return };
+            if browser.is_popup() == 0 {
+                return;
+            }
+            let browser_id = cef::ImplBrowser::identifier(browser);
+            if let Ok(mut map) = self.popup_frames.lock() {
+                map.remove(&browser_id);
+            }
+            if let Ok(mut browsers) = self.popup_browsers.lock() {
+                browsers.remove(&browser_id);
+            }
+            if let Ok(mut sink) = self.popup_close_sink.lock() {
+                sink.push_back(browser_id);
+            }
+            tracing::debug!(browser_id, "on_before_close: popup browser deregistered");
+        }
+    }
+}
+
+wrap_request_handler! {
+    pub struct BuffrRequestHandler {
+        popup_queue: PopupQueue,
+    }
+
+    impl RequestHandler {
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // Ctrl+click / middle-click come through here (Chromium does
+            // not route them through on_before_popup). Re-route the
+            // new-tab dispositions to our tab queue and cancel.
+            let raw = target_disposition.get_raw();
+            let is_tab = raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw()
+                || raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw();
+            if !is_tab {
+                return 0;
+            }
+            if let Some(url) = target_url {
+                let url_str = url.to_string();
+                if !url_str.is_empty()
+                    && let Ok(mut guard) = self.popup_queue.lock()
+                {
+                    guard.push_back(url_str);
+                }
+            }
+            1
+        }
+    }
+}
+
+wrap_client! {
+    pub struct BuffrClient {
+        history: Arc<History>,
+        downloads: Arc<Downloads>,
+        downloads_config: Arc<DownloadsConfig>,
+        zoom: Arc<ZoomStore>,
+        permissions: Arc<Permissions>,
+        permissions_queue: PermissionsQueue,
+        neutral_permissions_queue: buffr_engine::PermissionsQueue,
+        cef_callback_registry: crate::permissions::CefCallbackRegistry,
+        find_sink: FindResultSink,
+        hint_sink: HintEventSink,
+        edit_sink: EditEventSink,
+        counters: Option<Arc<UsageCounters>>,
+        notice_queue: DownloadNoticeQueue,
+        render_handler: Option<RenderHandler>,
+        popup_queue: PopupQueue,
+        address_sink: crate::host::AddressSink,
+        popup_title_sink: crate::host::AddressSink,
+        popup_frames: PopupFrameMap,
+        pending_popup_alloc: PendingPopupAlloc,
+        popup_create_sink: PopupCreateSink,
+        popup_close_sink: PopupCloseSink,
+        popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+        cursor_state: SharedCursorState,
+        favicon_sink: FaviconSink,
+        favicon_enabled: FaviconEnabled,
+        // loading_busy: shared with BuffrLoadHandler (set on
+        // on_load_start) and OsrPaintHandler (cleared on on_paint).
+        loading_busy: Arc<AtomicBool>,
+        audio_sink: AudioStateSink,
+        audio_queue: AudioEventQueue,
+        // video_active: shared with BrowserHost. The DisplayHandler scrapes
+        // `__buffr_media__:` console-log sentinels emitted by
+        // `media_probe_poll.js` and stores the latest video flag here.
+        video_active: Arc<AtomicBool>,
+        context_menu_sink: ContextMenuSink,
+    }
+
+    impl Client {
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            Some(BuffrAudioHandler::make(
+                self.audio_sink.clone(),
+                self.audio_queue.clone(),
+            ))
+        }
+
+        fn render_handler(&self) -> Option<RenderHandler> {
+            self.render_handler.clone()
+        }
+
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(BuffrLoadHandler::new(
+                self.history.clone(),
+                self.zoom.clone(),
+                self.counters.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+                self.edit_sink.clone(),
+                self.loading_busy.clone(),
+            ))
+        }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(BuffrDisplayHandler::new(
+                self.history.clone(),
+                self.hint_sink.clone(),
+                self.edit_sink.clone(),
+                self.address_sink.clone(),
+                self.popup_title_sink.clone(),
+                self.cursor_state.clone(),
+                self.favicon_sink.clone(),
+                self.favicon_enabled.clone(),
+                self.video_active.clone(),
+            ))
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(BuffrDownloadHandler::new(
+                self.downloads.clone(),
+                self.downloads_config.clone(),
+                self.counters.clone(),
+                self.notice_queue.clone(),
+            ))
+        }
+
+        fn find_handler(&self) -> Option<FindHandler> {
+            Some(BuffrFindHandler::new(self.find_sink.clone()))
+        }
+
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(BuffrPermissionHandler::new(
+                self.permissions.clone(),
+                self.permissions_queue.clone(),
+                self.neutral_permissions_queue.clone(),
+                self.cef_callback_registry.clone(),
+            ))
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(BuffrLifeSpanHandler::new(
+                self.popup_queue.clone(),
+                self.pending_popup_alloc.clone(),
+                self.popup_frames.clone(),
+                self.popup_create_sink.clone(),
+                self.popup_close_sink.clone(),
+                self.popup_browsers.clone(),
+            ))
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(BuffrRequestHandler::new(self.popup_queue.clone()))
+        }
+
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(BuffrContextMenuHandler::new(self.context_menu_sink.clone()))
+        }
+    }
+}
+
+wrap_find_handler! {
+    pub struct BuffrFindHandler {
+        sink: FindResultSink,
+    }
+
+    impl FindHandler {
+        fn on_find_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            _identifier: ::std::os::raw::c_int,
+            count: ::std::os::raw::c_int,
+            _selection_rect: Option<&Rect>,
+            active_match_ordinal: ::std::os::raw::c_int,
+            final_update: ::std::os::raw::c_int,
+        ) {
+            // CEF emits a stream of partial results during a search;
+            // we always overwrite the previous tick's count so the
+            // statusline reflects the latest known state. `count` is
+            // the total match count for the page; `active_match_ordinal`
+            // is 1-based (CEF returns 0 before the first match is
+            // located).
+            let count = count.max(0) as u32;
+            let current = active_match_ordinal.max(0) as u32;
+            let result = FindResult {
+                count,
+                current,
+                final_update: final_update != 0,
+            };
+            if let Ok(mut guard) = self.sink.lock() {
+                *guard = Some(result);
+            }
+        }
+    }
+}
+
+wrap_load_handler! {
+    pub struct BuffrLoadHandler {
+        history: Arc<History>,
+        zoom: Arc<ZoomStore>,
+        counters: Option<Arc<UsageCounters>>,
+        pending_transitions: Arc<Mutex<HashMap<i32, Transition>>>,
+        // Shared with BuffrDisplayHandler: write the injected edit.js
+        // script on load; display handler reads events from the queue.
+        edit_sink: EditEventSink,
+        // loading_busy: set on main-frame on_load_start, cleared on
+        // the next OsrPaintHandler::on_paint. The embedder reads
+        // this via `BrowserHost::is_loading` to play the buffr ASCII
+        // anim across the navigation gap.
+        loading_busy: Arc<AtomicBool>,
+    }
+
+    impl LoadHandler {
+        fn on_loading_state_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            is_loading: ::std::os::raw::c_int,
+            _can_go_back: ::std::os::raw::c_int,
+            _can_go_forward: ::std::os::raw::c_int,
+        ) {
+            // Authoritative loading-state signal from CEF.  on_paint clears
+            // `loading_busy` on first contentful paint, but if CEF stops
+            // emitting paints (idle page after load, throttled background
+            // tab) the flag stays stuck, host_is_loading() returns true,
+            // and the embedder spins the loading anim ticker forever.
+            // Clearing here on the explicit transition guarantees the flag
+            // matches the browser's actual state.
+            if is_loading == 0 {
+                self.loading_busy.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn on_load_start(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            transition_type: TransitionType,
+        ) {
+            // Only track main-frame navigations; subframes never reach
+            // `record_visit` in `on_load_end` anyway.
+            let Some(frame) = frame else { return };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let Some(browser) = browser else { return };
+            let id = cef::ImplBrowser::identifier(browser);
+            let transition = decode_transition(transition_type);
+            if let Ok(mut map) = self.pending_transitions.lock() {
+                map.insert(id, transition);
+            }
+            // Mark the navigation in flight; OsrPaintHandler::on_paint
+            // clears this on the first commit of the new document.
+            self.loading_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: ::std::os::raw::c_int,
+        ) {
+            // Subframes (iframes, embedded ads, etc.) must not pollute
+            // history. CEF fires `on_load_end` per frame; gate on
+            // `is_main` so we only record the top-level document.
+            let Some(frame) = frame else { return };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let url = CefStringUtf16::from(&frame.url()).to_string();
+            // Phase 6 telemetry: count one main-frame load. Gated on
+            // the same `is_main` check as the history recorder so
+            // counts and history rows stay in sync.
+            if let Some(c) = self.counters.as_ref() {
+                c.increment(KEY_PAGES_LOADED);
+            }
+            // Retrieve the transition stashed by `on_load_start`. If
+            // none is present (e.g. the load started before this
+            // handler was wired), fall back to `Link`.
+            let transition = browser
+                .as_ref()
+                .and_then(|b| {
+                    let id = cef::ImplBrowser::identifier(*b);
+                    self.pending_transitions.lock().ok()?.remove(&id)
+                })
+                .unwrap_or(Transition::Link);
+            if let Err(err) =
+                self.history.record_visit(&url, None, transition)
+            {
+                tracing::warn!(error = %err, %url, "history: record_visit failed");
+            }
+
+            // Restore persisted zoom level for this domain. Skip when
+            // the level is 0.0 (CEF default — no point round-tripping
+            // through `set_zoom_level`). On_load_end (rather than
+            // on_load_start) is the safe insertion point: the frame's
+            // committed URL is final, and CEF's renderer is ready to
+            // accept zoom changes.
+            let domain = buffr_zoom::domain_for_url(&url);
+            let zoom_level = match self.zoom.get(&domain) {
+                Ok(level) if level != 0.0 => Some(level),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(error = %err, %domain, "zoom: get failed");
+                    None
+                }
+            };
+            if let Some(browser) = browser
+                && let Some(host) = cef::ImplBrowser::host(browser)
+                && let Some(level) = zoom_level
+            {
+                host.set_zoom_level(level);
+                tracing::trace!(%domain, level, "zoom: applied persisted");
+            }
+            // Intentionally no `set_focus(1)` here. Granting CEF widget
+            // focus on every load made the renderer paint the caret
+            // for any page-autofocused input, which produced a steady
+            // 60 Hz on_paint stream from the blink animation alone.
+            // Widget focus is now driven by the user's first real
+            // focus action (DOM .focus() from a click or `i` keypress
+            // promotes widget focus implicitly via Chromium).
+
+            // Edit-mode Stage 1: inject edit.js once per main-frame load.
+            // The script is idempotent (`window.__buffrEditWired` guard)
+            // so SPA soft-navigations that re-trigger on_load_end are safe.
+            // We gate on `frame.is_main()` (already checked above) so
+            // iframes and subframes never get the listener installed.
+            let script = build_edit_inject_script();
+            let cef_script = CefString::from(script.as_str());
+            let cef_url = CefString::from("buffr://edit-inject");
+            frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
+            tracing::debug!(target: "buffr_core::handlers", %url, "edit: injected edit.js into main frame");
+            // `self.edit_sink` is held for Stage 2 sink ownership; the
+            // display handler writes into it when console events arrive.
+            let _ = &self.edit_sink;
+
+            // Media-probe Phase 1.5: inject the patched-constructor init
+            // script once per main-frame load. The script is idempotent
+            // (`window.__buffr_media_probe_installed` guard) so SPA
+            // soft-navigations that re-trigger on_load_end are safe.
+            // This installs the three new signal patches (silent video,
+            // WebRTC, Screen Wake Lock) so the poll script can read them.
+            let media_init_cef = CefString::from(MEDIA_PROBE_INIT_JS);
+            let media_init_url = CefString::from("buffr://media-probe-init");
+            frame.execute_java_script(Some(&media_init_cef), Some(&media_init_url), 1);
+            tracing::debug!(target: "buffr_core::handlers", %url, "media-probe: injected init script into main frame");
+        }
+    }
+}
+
+/// Map a CEF [`TransitionType`] to our [`Transition`] enum.
+///
+/// Source bits live in the low byte (mask `0xFF`). Flag bits above that
+/// are ignored — a reload navigated via forward/back is still a reload.
+fn decode_transition(tt: TransitionType) -> Transition {
+    // Cast via i32 (the C enum's underlying repr) then widen to u32 so
+    // negative-looking flag constants don't sign-extend strangely.
+    let raw = (*tt.as_ref() as i32) as u32;
+    decode_transition_raw(raw)
+}
+
+/// Inner decoder operating on the raw `u32` representation of a
+/// `cef_transition_type_t`. Separated so tests can pass arbitrary
+/// bitwise combinations without constructing invalid enum values.
+fn decode_transition_raw(raw: u32) -> Transition {
+    use cef::sys::cef_transition_type_t as T;
+    // Strip qualifier flags; keep only the source nibble.
+    let source = raw & 0xFF;
+    // Compare against known discriminants. Flag constants (TT_BLOCKED_FLAG
+    // etc.) live well above 0xFF, so masking is safe.
+    if source == T::TT_RELOAD as u32 {
+        Transition::Reload
+    } else if source == T::TT_FORM_SUBMIT as u32 {
+        Transition::FormSubmit
+    } else if source == T::TT_GENERATED as u32
+        || source == T::TT_KEYWORD as u32
+        || source == T::TT_KEYWORD_GENERATED as u32
+    {
+        Transition::Generated
+    } else if source == T::TT_LINK as u32 {
+        Transition::Link
+    } else {
+        // TT_EXPLICIT, TT_AUTO_BOOKMARK, TT_AUTO_TOPLEVEL,
+        // TT_AUTO_SUBFRAME, TT_MANUAL_SUBFRAME, TT_NUM_VALUES, …
+        Transition::Other
+    }
+}
+
+wrap_display_handler! {
+    pub struct BuffrDisplayHandler {
+        history: Arc<History>,
+        hint_sink: HintEventSink,
+        // Receives parsed EditConsoleEvents scraped from
+        // `__buffr_edit__:`-prefixed console lines. Stage 2 drains
+        // this from the UI render loop to drive EditSession lifecycle.
+        edit_sink: EditEventSink,
+        // address_sink: shared with BrowserHost; drained each tick via pump_address_changes.
+        address_sink: crate::host::AddressSink,
+        // popup_title_sink: title changes for popup browsers (browser.is_popup() != 0).
+        // Drained by BrowserHost::popup_drain_title_changes each tick.
+        popup_title_sink: crate::host::AddressSink,
+        // cursor_state: latest CEF cursor request. Drained by the apps layer
+        // each tick and forwarded to winit's `Window::set_cursor`.
+        cursor_state: SharedCursorState,
+        // favicon_sink: decoded favicon bitmaps pushed from the
+        // `BuffrDownloadImageCallback` we hand CEF in `on_favicon_urlchange`.
+        // The apps layer drains and caches by browser id for the tab strip.
+        favicon_sink: FaviconSink,
+        // favicon_enabled: master switch from `[general] show_favicons`. When
+        // false, `on_favicon_urlchange` skips the download_image round-trip
+        // entirely.
+        favicon_enabled: FaviconEnabled,
+        // video_active: shared with `BrowserHost`. on_console_message scrapes
+        // `__buffr_media__:` sentinel lines emitted by `media_probe_poll.js`
+        // and writes the latest video flag here for the apps-layer
+        // idle-inhibit policy to consult.
+        video_active: Arc<AtomicBool>,
+    }
+
+    impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // Only track main-frame navigations; sub-frame address
+            // changes (iframes, ads) must not overwrite the tab URL.
+            let Some(frame) = frame else { return };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let Some(browser) = browser else { return };
+            let Some(url) = url else { return };
+            let browser_id = cef::ImplBrowser::identifier(browser);
+            let url_str = url.to_string();
+            if url_str.is_empty() {
+                return;
+            }
+            if let Ok(mut guard) = self.address_sink.lock() {
+                guard.push_back((browser_id, url_str));
+            }
+        }
+
+        fn on_title_change(
+            &self,
+            browser: Option<&mut Browser>,
+            title: Option<&CefString>,
+        ) {
+            let Some(browser) = browser else { return };
+            let Some(title) = title else { return };
+            let title_str = title.to_string();
+            // Route popup titles to the popup_title_sink; update history for tabs.
+            if cef::ImplBrowser::is_popup(browser) != 0 {
+                let browser_id = cef::ImplBrowser::identifier(browser);
+                if let Ok(mut sink) = self.popup_title_sink.lock() {
+                    sink.push_back((browser_id, title_str));
+                }
+                return;
+            }
+            // `browser.main_frame()` returns the live main frame; we
+            // need its URL so the title attaches to the right row.
+            let frame = match cef::ImplBrowser::main_frame(browser) {
+                Some(f) => f,
+                None => return,
+            };
+            let url = CefStringUtf16::from(&frame.url()).to_string();
+            if let Err(err) = self.history.update_latest_title(&url, &title_str) {
+                tracing::warn!(error = %err, %url, "history: update_latest_title failed");
+            }
+        }
+
+        fn on_favicon_urlchange(
+            &self,
+            browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            // Pick the first non-empty URL CEF reports. Chromium hands us
+            // a list ordered by Blink preference, so the head is the best
+            // candidate (typically the page's `<link rel="icon">` or a
+            // root `/favicon.ico` when none is declared). Empty list means
+            // the page cleared its icon — leave the cached bitmap in place;
+            // it will be overwritten on the next page that sets one.
+            if !favicon_is_enabled(&self.favicon_enabled) {
+                return;
+            }
+            let Some(browser) = browser else { return };
+            let Some(icon_urls) = icon_urls else { return };
+            // The wrapper's `IntoIterator`/`Clone` work on the underlying
+            // `_cef_string_list_t` pointer, which is opaque (zero-sized) so
+            // a Rust-level `.clone()` would yield an empty list. Walk the
+            // raw cef-sys handle instead.
+            let raw: *mut cef::sys::_cef_string_list_t = icon_urls.into();
+            if raw.is_null() {
+                return;
+            }
+            let mut first: Option<String> = None;
+            unsafe {
+                let count = cef::sys::cef_string_list_size(raw);
+                for i in 0..count {
+                    let mut value: cef::sys::cef_string_t = std::mem::zeroed();
+                    if cef::sys::cef_string_list_value(raw, i, &mut value) == 0 {
+                        continue;
+                    }
+                    let s = CefStringUtf16::from(std::ptr::from_ref(&value)).to_string();
+                    if !s.is_empty() {
+                        first = Some(s);
+                        break;
+                    }
+                }
+            }
+            let Some(first) = first else { return };
+            let browser_id = cef::ImplBrowser::identifier(browser);
+            let host = match cef::ImplBrowser::host(browser) {
+                Some(h) => h,
+                None => return,
+            };
+            let cef_url = CefString::from(first.as_str());
+            let mut callback = BuffrDownloadImageCallback::new(
+                browser_id,
+                self.favicon_sink.clone(),
+            );
+            // is_favicon = 1 lets CEF apply favicon-specific decoding (ICO);
+            // max_image_size = 64 caps the largest representation it will
+            // download — bigger than the strip needs but lets us pick a
+            // crisp source for HiDPI scaling. bypass_cache = 0 reuses the
+            // disk cache when the URL is unchanged.
+            host.download_image(Some(&cef_url), 1, 64, 0, Some(&mut callback));
+            tracing::debug!(
+                browser_id,
+                url = %first,
+                "favicon: download_image dispatched"
+            );
+        }
+
+        fn on_cursor_change(
+            &self,
+            browser: Option<&mut Browser>,
+            // Platform-specific cursor handle — see CefCursorArg alias.
+            _cursor: CefCursorArg,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> ::std::os::raw::c_int {
+            // Forward the semantic cursor type + originating browser id to
+            // the apps layer; ignore the raw OS handle (`cursor`) and any
+            // custom-cursor bitmap. winit's `CursorIcon` covers everything
+            // Chromium hands us. Browser id lets the apps layer route to
+            // the right winit window (main tab vs popup).
+            //
+            // `type_.get_raw()` is `u32` on Linux but `i32` on Windows
+            // (Chromium enum repr matches the platform's default `int`).
+            // Cast to u32 so the embedder gets a stable type to mux on.
+            // On Linux this is a no-op cast — silence clippy.
+            let browser_id = browser.map(|b| b.identifier()).unwrap_or(-1);
+            #[allow(clippy::unnecessary_cast)]
+            let kind_raw = type_.get_raw() as u32;
+            self.cursor_state.store(browser_id, kind_raw);
+            0
+        }
+
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // IPC fallback: injected JS writes sentinel-prefixed lines
+            // via `console.log`. We scrape them here and route to the
+            // appropriate sink. Returning 0 lets CEF continue logging;
+            // returning 1 would suppress the message from devtools.
+            let Some(message) = message else { return 0; };
+            let text = message.to_string();
+
+            // Diagnostic: log every console message so we can see whether
+            // edit.js focus events reach on_console_message at all.
+            tracing::debug!(target: "buffr_core::console", %text, "on_console_message");
+
+            // ---- hint mode IPC ------------------------------------------
+            // hint.js emits `__buffr_hint__:{...}` lines.
+            if let Some(parsed) = parse_console_event(&text) {
+                match parsed {
+                    Ok(event) => {
+                        if let Ok(mut guard) = self.hint_sink.lock() {
+                            *guard = Some(event);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %text, "hint: malformed console event");
+                    }
+                }
+            }
+
+            // ---- edit mode IPC ------------------------------------------
+            // edit.js emits `__buffr_edit__:{...}` lines on focus/blur/mutate.
+            if let Some(parsed) = buffr_core::edit::parse_console_event(&text) {
+                match parsed {
+                    Ok(event) => {
+                        if let Ok(mut guard) = self.edit_sink.lock() {
+                            guard.push_back(event);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %text, "edit: malformed console event");
+                    }
+                }
+            }
+
+            // ---- media probe IPC ----------------------------------------
+            // media_probe_poll.js emits `__buffr_media__:{...}` lines on
+            // every transition. Flip the shared video_active atomic so the
+            // apps-layer idle-inhibit policy picks it up next tick.
+            if let Some(parsed) = buffr_core::media_probe::parse(&text) {
+                match parsed {
+                    Ok(event) => {
+                        self.video_active
+                            .store(event.video, std::sync::atomic::Ordering::Relaxed);
+                        tracing::debug!(
+                            target: "buffr_core::media_probe",
+                            media = event.media,
+                            video = event.video,
+                            "media probe transition"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, line = %text, "media_probe: malformed sentinel");
+                    }
+                }
+            }
+
+            0
+        }
+    }
+}
+
+wrap_download_image_callback! {
+    pub struct BuffrDownloadImageCallback {
+        browser_id: i32,
+        favicon_sink: FaviconSink,
+    }
+
+    impl DownloadImageCallback {
+        fn on_download_image_finished(
+            &self,
+            _image_url: Option<&CefString>,
+            http_status_code: ::std::os::raw::c_int,
+            image: Option<&mut Image>,
+        ) {
+            // Anything other than 2xx (or the synthetic 0 CEF returns
+            // for "loaded from cache") is a fetch error. CEF still hands
+            // us a (possibly empty) Image; gate on `is_empty` to be safe.
+            if http_status_code != 0 && !(200..300).contains(&http_status_code) {
+                tracing::debug!(
+                    http_status_code,
+                    "favicon: download_image failed — discarding"
+                );
+                return;
+            }
+            let Some(image) = image else { return };
+            if image.is_empty() != 0 {
+                return;
+            }
+            // Pull the BGRA representation at 1× scale. CEF re-encodes from
+            // its internal SkBitmap so the buffer is already premultiplied
+            // alpha — exactly what our compositor expects.
+            let mut pw: ::std::os::raw::c_int = 0;
+            let mut ph: ::std::os::raw::c_int = 0;
+            let bin = image.as_bitmap(
+                1.0,
+                ColorType::BGRA_8888,
+                AlphaType::PREMULTIPLIED,
+                Some(&mut pw),
+                Some(&mut ph),
+            );
+            let Some(bin) = bin else {
+                tracing::debug!("favicon: as_bitmap returned None");
+                return;
+            };
+            let width = pw.max(0) as u32;
+            let height = ph.max(0) as u32;
+            if width == 0 || height == 0 {
+                return;
+            }
+            let expected_bytes = (width as usize) * (height as usize) * 4;
+            let total = bin.size();
+            if total < expected_bytes {
+                tracing::warn!(
+                    total,
+                    expected_bytes,
+                    "favicon: BinaryValue smaller than expected — discarding"
+                );
+                return;
+            }
+            // SAFETY: BinaryValue::raw_data points to `bin.size()` valid
+            // bytes for as long as `bin` is alive in this scope. We copy
+            // out before `bin` Drops.
+            let raw = bin.raw_data();
+            if raw.is_null() {
+                return;
+            }
+            let pixel_count = (width as usize) * (height as usize);
+            let mut pixels: Vec<u32> = Vec::with_capacity(pixel_count);
+            unsafe {
+                let bytes = std::slice::from_raw_parts(raw as *const u8, expected_bytes);
+                for chunk in bytes.chunks_exact(4) {
+                    let b = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let r = chunk[2] as u32;
+                    let a = chunk[3] as u32;
+                    // Pack as 0xAARRGGBB — matches the chrome compositor's
+                    // expected u32 layout (alpha in the high byte).
+                    pixels.push((a << 24) | (r << 16) | (g << 8) | b);
+                }
+            }
+            let update = FaviconUpdate {
+                browser_id: self.browser_id,
+                width,
+                height,
+                pixels,
+            };
+            if let Ok(mut sink) = self.favicon_sink.lock() {
+                sink.push_back(update);
+            }
+        }
+    }
+}
+
+wrap_download_handler! {
+    pub struct BuffrDownloadHandler {
+        downloads: Arc<Downloads>,
+        config: Arc<DownloadsConfig>,
+        counters: Option<Arc<UsageCounters>>,
+        notice_queue: DownloadNoticeQueue,
+    }
+
+    impl DownloadHandler {
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            tracing::info!("downloads: on_before_download fired");
+            // Resolve a target path under the configured default_dir
+            // and continue the download. Without `cont`, CEF cancels
+            // the download silently.
+            let Some(callback) = callback else {
+                tracing::warn!("downloads: on_before_download: callback is None");
+                return 0;
+            };
+            let Some(item) = download_item else {
+                tracing::warn!("downloads: on_before_download: download_item is None — falling back to CEF default path");
+                // No item → can't record. Tell CEF to use its
+                // built-in default path so the user still gets the
+                // file.
+                callback.cont(None, 1);
+                return 0;
+            };
+
+            let suggested = suggested_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    CefStringUtf16::from(&item.suggested_file_name()).to_string()
+                });
+            let url = CefStringUtf16::from(&item.url()).to_string();
+            let mime_str = CefStringUtf16::from(&item.mime_type()).to_string();
+            let mime = if mime_str.is_empty() { None } else { Some(mime_str) };
+            let total = item.total_bytes();
+            let total_opt = if total > 0 { Some(total as u64) } else { None };
+            let cef_id = item.id();
+
+            let target_dir = buffr_config::resolve_default_dir(&self.config);
+            // Best-effort directory creation. If this fails the user
+            // will see CEF's fallback path; that's acceptable.
+            let _ = std::fs::create_dir_all(&target_dir);
+            let safe_name = sanitise_filename(&suggested);
+            let target_path: PathBuf = target_dir.join(safe_name);
+
+            if let Err(err) = self.downloads.record_started(
+                cef_id,
+                &url,
+                &suggested,
+                mime.as_deref(),
+                total_opt,
+            ) {
+                tracing::warn!(error = %err, %url, "downloads: record_started failed");
+            }
+
+            let target_str = target_path.to_string_lossy();
+            let target_cef = CefString::from(target_str.as_ref());
+            let show_dialog = if self.config.ask_each_time { 1 } else { 0 };
+
+            // Push a Started notice only for the silent (default_dir)
+            // path. When ask_each_time=true the OS native Save-As dialog
+            // already provides feedback to the user.
+            if !self.config.ask_each_time && self.config.show_notifications {
+                push(
+                    &self.notice_queue,
+                    DownloadNotice {
+                        kind: DownloadNoticeKind::Started,
+                        filename: suggested.clone(),
+                        path: target_path.to_string_lossy().into_owned(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+
+            tracing::info!(
+                url = %url,
+                target = %target_path.display(),
+                show_dialog,
+                "downloads: continuing download to target"
+            );
+            callback.cont(Some(&target_cef), show_dialog);
+            0
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            _callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else {
+                tracing::trace!("downloads: on_download_updated: download_item is None");
+                return;
+            };
+            let cef_id = item.id();
+            let row = match self.downloads.get_by_cef_id(cef_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    // No row for this cef_id (handler races?) — log
+                    // and bail. We can't fabricate a started_at.
+                    tracing::trace!(cef_id, "downloads: tick for unknown cef_id");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, cef_id, "downloads: get_by_cef_id failed");
+                    return;
+                }
+            };
+
+            // Already terminal — CEF can emit one trailing tick after
+            // `is_complete`. Skip writing.
+            if row.status != DownloadStatus::InFlight {
+                return;
+            }
+
+            let received = item.received_bytes();
+            let total = item.total_bytes();
+            let received_u = if received > 0 { received as u64 } else { 0 };
+            let total_u = if total > 0 { Some(total as u64) } else { None };
+
+            if item.is_complete() != 0 {
+                let path_str = CefStringUtf16::from(&item.full_path()).to_string();
+                let path = PathBuf::from(&path_str);
+                tracing::info!(
+                    path = %path.display(),
+                    received = received,
+                    "downloads: completed"
+                );
+                if let Err(err) = self.downloads.record_completed(row.id, &path) {
+                    tracing::warn!(error = %err, "downloads: record_completed failed");
+                    return;
+                }
+                // Phase 6 telemetry: count one completed download.
+                // Failed/canceled downloads do not increment.
+                if let Some(c) = self.counters.as_ref() {
+                    c.increment(KEY_DOWNLOADS_COMPLETED);
+                }
+                // Completed notice — only for the silent path.
+                if !self.config.ask_each_time && self.config.show_notifications {
+                    push(
+                        &self.notice_queue,
+                        DownloadNotice {
+                            kind: DownloadNoticeKind::Completed,
+                            filename: row.suggested_name.clone(),
+                            path: path_str.clone(),
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                if self.config.open_on_finish && !path_str.is_empty() {
+                    open_path(&OsSpawn, &path);
+                }
+                return;
+            }
+
+            if item.is_canceled() != 0 {
+                if let Err(err) = self.downloads.record_canceled(row.id) {
+                    tracing::warn!(error = %err, "downloads: record_canceled failed");
+                }
+                // Canceled = user-initiated; skip notification noise.
+                return;
+            }
+
+            if item.is_interrupted() != 0 {
+                let reason = format!("interrupted (code {:?})", item.interrupt_reason());
+                if let Err(err) = self.downloads.record_failed(row.id, &reason) {
+                    tracing::warn!(error = %err, "downloads: record_failed failed");
+                }
+                // Failed notice.
+                if !self.config.ask_each_time && self.config.show_notifications {
+                    push(
+                        &self.notice_queue,
+                        DownloadNotice {
+                            kind: DownloadNoticeKind::Failed,
+                            filename: row.suggested_name.clone(),
+                            path: String::new(),
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                return;
+            }
+
+            if let Err(err) = self.downloads.update_progress(row.id, received_u, total_u) {
+                tracing::warn!(error = %err, "downloads: update_progress failed");
+            }
+        }
+    }
+}
+
+wrap_permission_handler! {
+    pub struct BuffrPermissionHandler {
+        permissions: Arc<Permissions>,
+        queue: PermissionsQueue,
+        neutral_queue: buffr_engine::PermissionsQueue,
+        callback_registry: crate::permissions::CefCallbackRegistry,
+    }
+
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> ::std::os::raw::c_int {
+            // CEF emits this for `getUserMedia` (camera/mic). Returning
+            // 0 hands the request back to CEF (which will deny by
+            // default in headless builds); returning 1 commits us to
+            // invoking the callback exactly once.
+            let Some(callback) = callback else {
+                tracing::warn!("permissions: media-access callback was None");
+                return 0;
+            };
+            let origin = requesting_origin
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let caps = capabilities_for_media_mask(requested_permissions);
+            if caps.is_empty() {
+                // Nothing buffr knows how to ask about — let CEF apply
+                // its default policy.
+                tracing::trace!(
+                    %origin,
+                    requested_permissions,
+                    "permissions: media request with no recognised bits — declining"
+                );
+                callback.cancel();
+                return 1;
+            }
+
+            // Pre-check the store. Sticky decisions short-circuit the
+            // prompt: every cap must agree (all-allow or any-deny).
+            match precheck(&self.permissions, &origin, &caps) {
+                Ok(Some(Decision::Allow)) => {
+                    callback.cont(requested_permissions);
+                    return 1;
+                }
+                Ok(Some(Decision::Deny)) => {
+                    callback.cancel();
+                    return 1;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, %origin, "permissions: precheck failed — falling through to prompt");
+                }
+            }
+
+            // Enqueue into callback registry + neutral queue (Phase 8a, #88).
+            // The old CEF-internal queue is no longer populated for new
+            // requests; `drain_registry_with_defer` handles shutdown cleanup.
+            let pending = PendingPermission::MediaAccess {
+                origin,
+                capabilities: caps,
+                callback: callback.clone(),
+                requested_mask: requested_permissions,
+            };
+            let resolve_id = crate::permissions::next_resolve_id();
+            crate::permissions::enqueue_to_both(
+                pending,
+                &self.callback_registry,
+                &self.neutral_queue,
+                resolve_id,
+            );
+            1
+        }
+
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                tracing::warn!("permissions: prompt callback was None");
+                return 0;
+            };
+            let origin = requesting_origin
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let caps = capabilities_for_request_mask(requested_permissions);
+            if caps.is_empty() {
+                tracing::trace!(
+                    %origin,
+                    requested_permissions,
+                    "permissions: prompt request with no recognised bits — dismissing"
+                );
+                callback.cont(PermissionRequestResult::DISMISS);
+                return 1;
+            }
+
+            match precheck(&self.permissions, &origin, &caps) {
+                Ok(Some(Decision::Allow)) => {
+                    callback.cont(PermissionRequestResult::ACCEPT);
+                    return 1;
+                }
+                Ok(Some(Decision::Deny)) => {
+                    callback.cont(PermissionRequestResult::DENY);
+                    return 1;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, %origin, "permissions: precheck failed — falling through to prompt");
+                }
+            }
+
+            // Enqueue into callback registry + neutral queue (Phase 8a, #88).
+            let pending = PendingPermission::Prompt {
+                origin,
+                capabilities: caps,
+                callback: callback.clone(),
+                prompt_id,
+            };
+            let resolve_id = crate::permissions::next_resolve_id();
+            crate::permissions::enqueue_to_both(
+                pending,
+                &self.callback_registry,
+                &self.neutral_queue,
+                resolve_id,
+            );
+            1
+        }
+
+        fn on_dismiss_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            _result: PermissionRequestResult,
+        ) {
+            // Fired when CEF cancels the prompt itself (e.g. tab navigated away).
+            // Remove the matching entry from both the callback registry and the
+            // neutral queue so the UI thread doesn't surface a stale prompt.
+            tracing::trace!(prompt_id, "permissions: dismissed by CEF — cleaning up queue");
+
+            // Find and remove the entry from the callback registry by prompt_id.
+            let resolve_id = match self.callback_registry.lock() {
+                Ok(mut reg) => {
+                    // Find the resolve_id whose PendingPermission has this prompt_id.
+                    let found_id = reg
+                        .iter()
+                        .find_map(|(id, p)| match p {
+                            crate::permissions::PendingPermission::Prompt {
+                                prompt_id: pid, ..
+                            } if *pid == prompt_id => Some(id.clone()),
+                            _ => None,
+                        });
+                    if let Some(ref id) = found_id {
+                        reg.remove(id);
+                    }
+                    found_id
+                }
+                Err(_) => {
+                    tracing::warn!(prompt_id, "permissions: callback registry poisoned in dismiss");
+                    return;
+                }
+            };
+
+            // Remove the matching entry from the neutral queue by resolve_id.
+            if let Some(rid) = resolve_id {
+                match self.neutral_queue.lock() {
+                    Ok(mut q) => {
+                        q.retain(|p| p.resolve_id.as_deref() != Some(&rid));
+                    }
+                    Err(_) => {
+                        tracing::warn!(prompt_id, "permissions: neutral queue poisoned in dismiss");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Convert a `CefStringUserfreeUtf16` to `String`, returning empty for
+/// null pointers (i.e. CEF reported "no value").
+///
+/// `CefStringUtf16::from(&userfree)` unconditionally `eprintln!`s
+/// "Invalid UTF-16 string" on null — noisy when context-menu params
+/// (link_url, selection, etc.) are legitimately empty for most clicks.
+/// Gating on the `Into<Option<&_cef_string_utf16_t>>` impl skips that
+/// path entirely.
+fn userfree_to_string(s: &CefStringUserfreeUtf16) -> String {
+    let opt: Option<&cef::sys::_cef_string_utf16_t> = s.into();
+    if opt.is_none() {
+        return String::new();
+    }
+    CefStringUtf16::from(s).to_string()
+}
+
+wrap_context_menu_handler! {
+    pub struct BuffrContextMenuHandler {
+        sink: ContextMenuSink,
+    }
+
+    impl ContextMenuHandler {
+        fn on_before_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut MenuModel>,
+        ) {
+            // Intentionally leave the default model intact. CEF skips
+            // run_context_menu entirely if the model is empty at the
+            // end of this callback (it figures there's nothing to
+            // render and short-circuits), which would prevent us from
+            // ever seeing the params. Suppression of the native menu
+            // is handled in run_context_menu via callback.cancel().
+        }
+
+        fn run_context_menu(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut MenuModel>,
+            callback: Option<&mut RunContextMenuCallback>,
+        ) -> ::std::os::raw::c_int {
+            // Log every ContextMenuParams field at debug level.
+            // Return 1 (handled) + cancel so CEF never renders its own
+            // menu; slice 3 will render our own overlay.
+            let Some(params) = params else {
+                if let Some(cb) = callback {
+                    cb.cancel();
+                }
+                return 1;
+            };
+            let type_flags = params.type_flags();
+            let link_url = userfree_to_string(&params.link_url());
+            let source_url = userfree_to_string(&params.source_url());
+            let selection = userfree_to_string(&params.selection_text());
+            let media_type = params.media_type();
+            let media_flags = params.media_state_flags();
+            let editable = params.is_editable() != 0;
+            let x = params.xcoord();
+            let y = params.ycoord();
+            tracing::debug!(
+                target: "buffr_core::context_menu",
+                ?type_flags,
+                %link_url,
+                %source_url,
+                %selection,
+                ?media_type,
+                ?media_flags,
+                editable,
+                x,
+                y,
+                "context_menu params"
+            );
+
+            // Extract raw flag integers for the pure builder.
+            // ContextMenuTypeFlags and ContextMenuMediaStateFlags have private
+            // tuple fields; use AsRef to reach the inner sys types whose fields
+            // are pub.  ContextMenuMediaType exposes get_raw() directly.
+            // Cast to u32: cef-rs sys types use c_int (i32 on Windows MSVC,
+            // u32 on Linux/macOS gcc/clang). Bit-pattern reinterpret is safe
+            // for flag fields.
+            #[allow(clippy::unnecessary_cast)]
+            let type_flags_raw = type_flags.as_ref().0 as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let media_type_raw = media_type.get_raw() as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let media_flags_raw = media_flags.as_ref().0 as u32;
+
+            let has_link_url = !link_url.is_empty();
+            let has_selection = !selection.is_empty();
+
+            let (can_go_back, can_go_forward, is_loading_now, browser_id) =
+                if let Some(ref b) = browser {
+                    (
+                        b.can_go_back() != 0,
+                        b.can_go_forward() != 0,
+                        b.is_loading() != 0,
+                        b.identifier(),
+                    )
+                } else {
+                    (false, false, false, 0)
+                };
+
+            let items = build_model(
+                type_flags_raw,
+                media_type_raw,
+                media_flags_raw,
+                editable,
+                has_link_url,
+                has_selection,
+                can_go_back,
+                can_go_forward,
+                is_loading_now,
+            );
+
+            let request = ContextMenuRequest {
+                x,
+                y,
+                browser_id,
+                items,
+                target: ContextMenuTarget::Page,
+                link_url,
+                source_url,
+                selection_text: selection,
+            };
+
+            tracing::debug!(
+                target: "buffr_core::context_menu",
+                browser_id,
+                items_count = request.items.len(),
+                "context_menu request built"
+            );
+
+            if let Ok(mut q) = self.sink.lock() {
+                if q.len() >= CONTEXT_MENU_REQUEST_QUEUE_CAP {
+                    q.pop_front();
+                }
+                q.push_back(request);
+            }
+
+            if let Some(cb) = callback {
+                cb.cancel();
+            }
+            1
+        }
+
+        fn on_context_menu_command(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            command_id: ::std::os::raw::c_int,
+            event_flags: EventFlags,
+        ) -> ::std::os::raw::c_int {
+            // No commands to dispatch in slice 1; log for traceability.
+            let selection = params
+                .map(|p| userfree_to_string(&p.selection_text()))
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "buffr_core::context_menu",
+                command_id,
+                ?event_flags,
+                %selection,
+                "context_menu command (unhandled)"
+            );
+            0
+        }
+    }
+}
+
+/// Windows reserved device names (case-insensitive, stem-only).
+///
+/// Applied on all platforms: users may copy downloads to Windows shares, and
+/// creating a file named `CON` or `NUL` on a Samba mount causes silent
+/// data-loss or hangs on the Windows side.
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Strip path-traversal bits and OS-meaningful separators from a CEF
+/// suggested filename. We don't attempt full sanitisation — CEF
+/// already filters most malicious cases — but a `Path::file_name`
+/// pass guards against `../` prefixes leaking through.
+///
+/// Additionally, if the filename stem matches a Windows reserved device name
+/// (case-insensitively), we prepend an underscore so the file is safe to
+/// copy to Windows file systems or Samba shares.
+fn sanitise_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    let stripped = std::path::Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stripped.is_empty() {
+        // Last-resort fallback — a download with no filename and no
+        // way to derive one. CEF sometimes emits this for blob: URLs.
+        return "download".to_string();
+    }
+    // Extract the stem (filename without extension) for reserved-name check.
+    let stem = std::path::Path::new(&stripped)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_uppercase())
+        .unwrap_or_default();
+    if WINDOWS_RESERVED_STEMS.contains(&stem.as_str()) {
+        // Prepend underscore to avoid Windows reserved device names.
+        format!("_{stripped}")
+    } else {
+        stripped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cef::sys::cef_transition_type_t as T;
+
+    // Test `decode_transition_raw` directly: pass arbitrary bitwise
+    // combinations without constructing invalid `cef_transition_type_t`
+    // enum discriminants.
+    fn raw(source: T) -> u32 {
+        source as u32
+    }
+
+    fn raw_flagged(source: T, flag: T) -> u32 {
+        source as u32 | flag as u32
+    }
+
+    #[test]
+    fn decode_transition_link() {
+        assert_eq!(decode_transition_raw(raw(T::TT_LINK)), Transition::Link);
+    }
+
+    #[test]
+    fn decode_transition_reload() {
+        assert_eq!(decode_transition_raw(raw(T::TT_RELOAD)), Transition::Reload);
+    }
+
+    #[test]
+    fn decode_transition_form_submit() {
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_FORM_SUBMIT)),
+            Transition::FormSubmit
+        );
+    }
+
+    #[test]
+    fn decode_transition_generated_variants() {
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_GENERATED)),
+            Transition::Generated
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_KEYWORD)),
+            Transition::Generated
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_KEYWORD_GENERATED)),
+            Transition::Generated
+        );
+    }
+
+    #[test]
+    fn decode_transition_other_variants() {
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_EXPLICIT)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_AUTO_TOPLEVEL)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_AUTO_BOOKMARK)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_AUTO_SUBFRAME)),
+            Transition::Other
+        );
+        assert_eq!(
+            decode_transition_raw(raw(T::TT_MANUAL_SUBFRAME)),
+            Transition::Other
+        );
+    }
+
+    #[test]
+    fn decode_transition_flag_bits_stripped() {
+        // TT_LINK | TT_FORWARD_BACK_FLAG — flag bits must not change the source.
+        assert_eq!(
+            decode_transition_raw(raw_flagged(T::TT_LINK, T::TT_FORWARD_BACK_FLAG)),
+            Transition::Link
+        );
+        // TT_RELOAD | TT_DIRECT_LOAD_FLAG — still a reload.
+        assert_eq!(
+            decode_transition_raw(raw_flagged(T::TT_RELOAD, T::TT_DIRECT_LOAD_FLAG)),
+            Transition::Reload
+        );
+    }
+
+    #[test]
+    fn sanitise_filename_strips_path() {
+        assert_eq!(sanitise_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitise_filename("/tmp/foo.zip"), "foo.zip");
+        assert_eq!(sanitise_filename("clean.txt"), "clean.txt");
+    }
+
+    #[test]
+    fn sanitise_filename_empty_falls_back() {
+        assert_eq!(sanitise_filename(""), "download");
+        assert_eq!(sanitise_filename("   "), "download");
+        // Pure path-traversal with no real basename also resolves to
+        // the fallback after `Path::file_name` strips dot-segments.
+        assert_eq!(sanitise_filename("/"), "download");
+    }
+
+    #[test]
+    fn sanitise_filename_rejects_windows_reserved_stems() {
+        // Bare reserved names get underscore prefix.
+        assert_eq!(sanitise_filename("CON"), "_CON");
+        assert_eq!(sanitise_filename("NUL"), "_NUL");
+        assert_eq!(sanitise_filename("PRN"), "_PRN");
+        assert_eq!(sanitise_filename("AUX"), "_AUX");
+        assert_eq!(sanitise_filename("COM1"), "_COM1");
+        assert_eq!(sanitise_filename("LPT9"), "_LPT9");
+    }
+
+    #[test]
+    fn sanitise_filename_rejects_windows_reserved_with_extension() {
+        // `CON.txt` is still reserved (Windows uses only the stem for device detection).
+        assert_eq!(sanitise_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitise_filename("NUL.pdf"), "_NUL.pdf");
+    }
+
+    #[test]
+    fn sanitise_filename_reserved_names_case_insensitive() {
+        // Windows is case-insensitive for reserved names.
+        assert_eq!(sanitise_filename("con"), "_con");
+        assert_eq!(sanitise_filename("nul"), "_nul");
+        assert_eq!(sanitise_filename("Com3.log"), "_Com3.log");
+    }
+
+    #[test]
+    fn sanitise_filename_non_reserved_unchanged() {
+        // Names that look like reserved but aren't should pass through.
+        assert_eq!(sanitise_filename("console.log"), "console.log");
+        assert_eq!(sanitise_filename("null_values.csv"), "null_values.csv");
+        assert_eq!(sanitise_filename("COM10.txt"), "COM10.txt"); // COM10 is not reserved
+    }
+}
