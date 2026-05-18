@@ -27,8 +27,8 @@ bitflags = "2"
 # Edit-mode delegates to hjkl-engine against a mirrored Rope synced to
 # the DOM via CEF. Bumped to 0.5/0.6 — the public API used here
 # (Editor, Host, Buffer, Viewport) is fully additive across 0.1→0.5/0.6.
-hjkl-engine = "0.5"
-hjkl-buffer = "0.6"
+hjkl-engine.workspace = true
+hjkl-buffer.workspace = true
 
 # crossterm KeyEvent is the engine's input type today; the host
 # bridges from CEF browser keys into it. When trait extraction lands a

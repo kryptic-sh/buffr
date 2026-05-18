@@ -18,22 +18,22 @@ osr = []
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-hjkl-config = "0.2"
+hjkl-config.workspace = true
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 ureq = { version = "3", features = ["json"] }
 semver = { version = "1", features = ["serde"] }
-buffr-engine = "0.2"
-buffr-modal = "0.1"
-buffr-history = "0.1"
-buffr-downloads = "0.1"
-buffr-config = "0.4"
-buffr-zoom = "0.1"
-buffr-permissions = "0.1"
-buffr-view-source = "0.1"
-hjkl-clipboard = "0.5"
+buffr-engine.workspace = true
+buffr-modal.workspace = true
+buffr-history.workspace = true
+buffr-downloads.workspace = true
+buffr-config.workspace = true
+buffr-zoom.workspace = true
+buffr-permissions.workspace = true
+buffr-view-source.workspace = true
+hjkl-clipboard.workspace = true
 winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
 # Image decode / re-encode for context-menu "Copy Image"
 image = { version = "0.25", default-features = false, features = [

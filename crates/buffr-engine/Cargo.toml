@@ -20,10 +20,9 @@ thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-buffr-modal = "0.1"
+buffr-modal.workspace = true
 # Only pulls the `Capability` / `Decision` type surface. The SQLite store
 # is gated behind buffr-permissions' `store` feature, which we don't
 # enable — keeps rusqlite out of buffr-engine's transitive closure so
-# standalone backend crates can resolve a different rusqlite major than
-# the umbrella workspace.
-buffr-permissions = { version = "0.1.3", default-features = false }
+# other crates can opt into a different rusqlite feature set.
+buffr-permissions.workspace = true

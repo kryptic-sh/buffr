@@ -88,54 +88,33 @@ bytemuck = { version = "1", features = ["derive"] }
 # against GitHub releases. SemVer parsing handles rc/beta suffixes.
 semver = { version = "1", features = ["serde"] }
 
-# Buffr-* crates as plain registry pins. Path overrides live in the
-# `[patch.crates-io]` table below so workspace deps and transitive
-# deps from submodule Cargo.tomls (which list `buffr-modal = "0.1"`
-# etc. for their standalone CI) all resolve to the same workspace
-# member, eliminating "multiple versions of buffr_<name>" errors.
-buffr-engine = "0.2"
-buffr-cef = "0.1"
+# Buffr-* crates are now plain monorepo members under crates/<name>/.
+# All deps resolve directly via path — no registry pins or [patch.crates-io] needed.
+buffr-engine = { path = "crates/buffr-engine" }
+buffr-cef = { path = "crates/buffr-cef" }
 buffr-webkit = { path = "crates/buffr-webkit" }
 buffr-webkit-cocoa = { path = "crates/buffr-webkit-cocoa" }
 buffr-webview2 = { path = "crates/buffr-webview2" }
-buffr-core = "0.7"
-buffr-modal = "0.1"
-buffr-ui = "0.2"
-buffr-config = "0.4"
-buffr-history = "0.1"
-buffr-bookmarks = "0.1"
-buffr-downloads = "0.1"
-buffr-zoom = "0.1"
-buffr-permissions = "0.1"
-buffr-view-source = "0.1"
+buffr-core = { path = "crates/buffr-core" }
+buffr-modal = { path = "crates/buffr-modal" }
+buffr-ui = { path = "crates/buffr-ui" }
+buffr-config = { path = "crates/buffr-config" }
+buffr-history = { path = "crates/buffr-history" }
+buffr-bookmarks = { path = "crates/buffr-bookmarks" }
+buffr-downloads = { path = "crates/buffr-downloads" }
+buffr-zoom = { path = "crates/buffr-zoom" }
+buffr-permissions = { path = "crates/buffr-permissions", default-features = false }
+buffr-view-source = { path = "crates/buffr-view-source" }
 
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
-# at their latest majors — patch bumps roll in automatically via workspace
-# member resolution; major-bump breakage is gated by the leading-zero version.
+# at their latest majors — patch bumps roll in automatically; major-bump
+# breakage is gated by the leading-zero version.
 hjkl-engine = "0.5"
 hjkl-buffer = "0.6"
 hjkl-clipboard = "0.5"
 hjkl-splash = "0.2"
-
-# Force every transitive crates.io reference to a buffr-* crate to
-# resolve to the workspace member at crates/<name>/ (a submodule). The
-# submodule Cargo.tomls list deps as plain registry pins
-# (e.g. `buffr-modal = "0.1"`) for standalone CI; without these patches
-# cargo would mix the registry copy with the workspace member, producing
-# `multiple different versions of crate buffr_<name>` build errors.
-[patch.crates-io]
-buffr-engine = { path = "crates/buffr-engine" }
-buffr-cef = { path = "crates/buffr-cef" }
-buffr-bookmarks = { path = "crates/buffr-bookmarks" }
-buffr-config = { path = "crates/buffr-config" }
-buffr-core = { path = "crates/buffr-core" }
-buffr-downloads = { path = "crates/buffr-downloads" }
-buffr-history = { path = "crates/buffr-history" }
-buffr-modal = { path = "crates/buffr-modal" }
-buffr-permissions = { path = "crates/buffr-permissions" }
-buffr-ui = { path = "crates/buffr-ui" }
-buffr-view-source = { path = "crates/buffr-view-source" }
-buffr-zoom = { path = "crates/buffr-zoom" }
+hjkl-config = "0.2"
+hjkl-bonsai = "0.6"
 
 [profile.release]
 lto = "thin"
