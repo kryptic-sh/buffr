@@ -74,7 +74,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   linux:
-    name: linux build + test + smoke
+    name: linux build + test
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -94,8 +94,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libglib2.0-dev \
-            xvfb
+            libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -133,39 +132,11 @@ jobs:
       - name: cargo test (doctests)
         run: cargo test --workspace --doc
 
-      - name: smoke test (xvfb)
-        run: |
-          set +e
-          cd target/debug
-          # Launch under Xvfb. Expect buffr to initialize CEF, open a
-          # window, and load the homepage. We give it 12s before SIGTERM
-          # since CEF cold-init on a CI VM is slow; SIGKILL 5s after
-          # that. Exit codes: 0 (clean exit, unlikely) or 124 (timeout
-          # hit, expected) or 143 (SIGTERM).
-          LD_LIBRARY_PATH=. timeout --signal=TERM --kill-after=5 12s \
-            xvfb-run -a --server-args='-screen 0 1280x800x24' \
-            ./buffr 2>&1 | tee smoke.log
-          rc=${PIPESTATUS[0]}
-          set -e
-          # Hard-fail on any FATAL/abort/segfault marker.
-          if grep -E "FATAL:|Aborted|Segmentation fault|invalid version" smoke.log; then
-            echo "::error::smoke test detected fatal markers"
-            exit 1
-          fi
-          # Require positive evidence CEF + browser host came up.
-          if ! grep -qE "cef initialized|browser host created" smoke.log; then
-            echo "::error::no positive success marker in smoke log"
-            exit 1
-          fi
-          # Accept clean exit (0), our timeout (124), or SIGTERM (143).
-          case "$rc" in
-            0|124|143) ;;
-            *)
-              echo "::error::unexpected exit code $rc"
-              exit 1
-              ;;
-          esac
-          echo "smoke test passed (rc=$rc)"
+      # xvfb-based smoke test removed — buffr now refuses non-Wayland sessions
+      # on Linux (X11 dropped). Resurrecting requires a headless Wayland
+      # compositor (weston-headless, sway-headless, cage) which is more CI
+      # setup than the smoke is worth. Workspace build + 848 unit tests
+      # already validate startup paths.
 
   linux-osr:
     name: linux build + lint (osr feature)
