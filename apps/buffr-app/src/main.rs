@@ -1151,7 +1151,10 @@ fn main() -> Result<()> {
                         eprintln!("buffr: cooperative shutdown timed out after 3s; aborting");
                         // _exit skips destructors / atexit; appropriate
                         // for an emergency bail-out.  130 = 128 + SIGINT.
+                        #[cfg(unix)]
                         unsafe { libc::_exit(130) };
+                        #[cfg(not(unix))]
+                        std::process::exit(130);
                     })
                     .ok();
             }
@@ -1317,7 +1320,10 @@ fn main() -> Result<()> {
     let _ = std::io::stderr().flush();
     // SAFETY: _exit is async-signal-safe and takes no Rust state. Skipping
     // atexit handlers is intentional — see comment above.
+    #[cfg(unix)]
     unsafe { libc::_exit(0) };
+    #[cfg(not(unix))]
+    std::process::exit(0);
 }
 
 fn run_check_config(path: Option<&std::path::Path>) -> Result<()> {
