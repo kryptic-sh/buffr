@@ -1,0 +1,18 @@
+[package]
+name = "buffr-downloads"
+description = "SQLite-backed downloads store for buffr."
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-downloads"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
+
+[dependencies]
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
