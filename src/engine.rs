@@ -44,7 +44,7 @@ use crate::{
 /// Engine-agnostic browser abstraction.
 ///
 /// `buffr-cef` implements this via `impl BrowserEngine for BrowserHost`.
-/// Future backends (e.g. `buffr-servo`) provide their own impl.
+/// Other backends (e.g. `buffr-webkit`, `buffr-webview2`) provide their own impl.
 ///
 /// All methods are `&self` — the concrete type uses interior mutability
 /// (`Arc<Mutex<…>>`) for any mutable state, matching the existing
@@ -767,9 +767,9 @@ pub trait BrowserEngine: Send + Sync {
     // ── Native compositing (Phase 3, #109) ───────────────────────────────────
     //
     // Three-method API surface for backends that can render directly into a
-    // host-provided native surface (Wayland wl_surface today; X11 / Cocoa
-    // later). Default is "OSR-only": all three are no-ops, so existing
-    // backends compile + behave unchanged.
+    // host-provided native surface (Wayland wl_surface today; Cocoa later).
+    // Default is "OSR-only": all three are no-ops, so existing backends
+    // compile + behave unchanged.
 
     /// `true` when the backend supports native compositing into a host-
     /// provided surface. When true, the apps layer should:
@@ -812,8 +812,8 @@ pub trait BrowserEngine: Send + Sync {
     ///
     /// `parent` is a [`raw_window_handle::RawWindowHandle`] — Wayland's
     /// `WaylandWindowHandle::surface` carries the host `wl_surface`. The
-    /// engine creates a child surface (Wayland subsurface, X11 child window,
-    /// etc.) positioned at `rect` and renders into it.
+    /// engine creates a child subsurface positioned at `rect` and renders
+    /// into it.
     ///
     /// Calling again with a new parent or rect repositions / re-parents.
     ///

@@ -47,7 +47,7 @@ unsafe impl Sync for WaylandNativeHandles {}
 /// Used by [`BrowserEngine::set_native_parent`] to tell the engine where its
 /// rendered content should appear within the host's window. Phase 3 of the
 /// WPE WebKit umbrella (#109) uses this to place a Wayland subsurface; future
-/// X11 / Cocoa native backends will read the same shape.
+/// Cocoa native backends will read the same shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeRect {
     pub x: i32,

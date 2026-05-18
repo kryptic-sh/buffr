@@ -88,21 +88,21 @@ pub struct BackendOpenOptions<'a> {
     /// Hint to the backend that the host prefers native compositing over the
     /// OSR pixel-copy path when available on the current session.
     ///
-    /// The backend is still free to veto (e.g. if the session type is X11 or
-    /// headless). Defaults to `false` so existing callers that don't set this
-    /// field stay on the OSR path.
+    /// The backend is still free to veto (e.g. in headless / CI contexts).
+    /// Defaults to `false` so existing callers that don't set this field stay
+    /// on the OSR path.
     ///
-    /// Currently consumed by `buffr-webkit` (#144): when `true` and
-    /// `XDG_SESSION_TYPE=wayland`, the WPE runtime uses `WPEDisplayWayland`
-    /// instead of `BuffrDisplay` (OSR subclass). The WebKit `wl_surface` exists
-    /// after this but is not yet parented — subsurface attach is #145.
+    /// Currently consumed by `buffr-webkit` (#144): when `true` on a Wayland
+    /// session, the WPE runtime uses `WPEDisplayWayland` instead of
+    /// `BuffrDisplay` (OSR subclass). The WebKit `wl_surface` exists after
+    /// this but is not yet parented — subsurface attach is #145.
     #[doc(alias = "native_compositing")]
     pub prefer_native: bool,
     /// Raw Wayland + EGL handles from the host winit window (#152).
     ///
     /// When `Some`, `buffr-webkit` constructs `BuffrDisplayWayland` (the custom
     /// WPEDisplay subclass that reuses the host's `wl_display` connection) instead
-    /// of stock `WPEDisplayWayland`. `None` on non-Wayland sessions (X11, macOS,
+    /// of stock `WPEDisplayWayland`. `None` on non-Wayland sessions (macOS,
     /// Windows, headless) or when the host has not yet extracted handles from
     /// the winit window.
     ///
