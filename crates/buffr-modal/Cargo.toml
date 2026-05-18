@@ -2,13 +2,12 @@
 name = "buffr-modal"
 description = "Vim-style modal keybinding engine for buffr."
 version = "0.1.5"
-edition = "2024"
-rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/kryptic-sh/buffr-modal"
-homepage = "https://buffr.kryptic.sh"
-authors = ["mxaddict <mxaddict@kryptic.sh>"]
-readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [features]
 default = []

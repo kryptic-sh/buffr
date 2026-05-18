@@ -2,13 +2,12 @@
 name = "buffr-core"
 description = "Engine-agnostic browser shell for buffr."
 version = "0.7.0"
-edition = "2024"
-rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/kryptic-sh/buffr-core"
-homepage = "https://buffr.kryptic.sh"
-authors = ["mxaddict <mxaddict@kryptic.sh>"]
-readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [features]
 # Off-screen rendering path (Linux default; always compiled in).

@@ -2,12 +2,12 @@
 name = "buffr-engine"
 description = "Engine-agnostic browser trait + neutral types for buffr."
 version = "0.2.0"
-edition = "2024"
-rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/kryptic-sh/buffr-engine"
-homepage = "https://buffr.kryptic.sh"
-authors = ["mxaddict <mxaddict@kryptic.sh>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [dependencies]
 base64 = "0.22"
