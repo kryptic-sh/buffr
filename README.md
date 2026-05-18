@@ -3,6 +3,7 @@
 Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
 
 [![CI](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/kryptic-sh/buffr)](https://github.com/kryptic-sh/buffr/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Website](https://img.shields.io/badge/website-buffr.kryptic.sh-7ee787)](https://buffr.kryptic.sh)
 
@@ -132,6 +133,10 @@ CEF path overrides.
   is a no-op. This is a CEF off-screen-rendering (OSR) limitation, not specific
   to buffr's implementation. Tracked in
   [#19](https://github.com/kryptic-sh/buffr/issues/19).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) (if exists) or open an issue / PR.
 
 ## License
 
