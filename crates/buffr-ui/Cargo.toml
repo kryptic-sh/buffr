@@ -1,0 +1,19 @@
+[package]
+name = "buffr-ui"
+description = "Browser chrome, command palette, and hint overlay for buffr."
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-ui"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+buffr-modal = "0.1"
+softbuffer = "0.4"
+fontdb = { version = "0.23", default-features = false, features = ["fs", "memmap"] }
+fontdue = "0.9"

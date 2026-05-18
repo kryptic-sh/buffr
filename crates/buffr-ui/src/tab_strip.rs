@@ -1,0 +1,818 @@
+//! Tab strip — horizontal row of tab pills above the input bar /
+//! statusline.
+//!
+//! Layout (top to bottom in the buffr window):
+//!
+//! ```text
+//! +---------------------------------------------+
+//! | input bar (when overlay open)               |
+//! +---------------------------------------------+
+//! | tab strip — TAB_STRIP_HEIGHT px             |
+//! +---------------------------------------------+
+//! | CEF child window (page area)                |
+//! +---------------------------------------------+
+//! | statusline — STATUSLINE_HEIGHT px           |
+//! +---------------------------------------------+
+//! ```
+//!
+//! Each tab is a fixed-width pill. The active tab uses the mode-accent
+//! colour at full intensity; inactive tabs are dimmed. Pinned tabs
+//! show a leading `*` glyph and sort first (sorting is the host's job;
+//! this widget only renders what it's given).
+//!
+//! The widget owns no state and pulls no winit / softbuffer types into
+//! its public API; like [`crate::Statusline`], embedders pass a raw
+//! `&mut [u32]` slice each frame.
+//!
+//! Loading indicator: a 2-px progress bar at the bottom edge of each
+//! tab. `progress >= 1.0` is treated as idle and the bar is hidden.
+
+use std::sync::Arc;
+
+use crate::Palette;
+use crate::fill_rect;
+use crate::font;
+
+/// Tab strip strip height in pixels. 34 px gives a 14-px glyph row
+/// with comfortable padding above + below plus a 2-px progress bar
+/// reserved at the bottom. Bumping this requires the host window to
+/// re-layout the CEF child rect.
+pub const TAB_STRIP_HEIGHT: u32 = 34;
+
+/// Minimum width of a single tab pill in pixels. With 8 px gutter the
+/// layout falls back to overflow truncation when the strip is too
+/// narrow.
+pub const MIN_TAB_WIDTH: u32 = 80;
+
+/// Maximum width of a single tab pill in pixels. Beyond this the
+/// titles get long enough to be hard to glance at.
+pub const MAX_TAB_WIDTH: u32 = 220;
+
+/// Compact width for pinned tabs. Pinned tabs render as a square
+/// icon-only pill — no title text, just the favicon (or a fallback
+/// initial) — so the user can fit many anchors in a small strip.
+pub const PINNED_TAB_WIDTH: u32 = 32;
+
+/// Decoded favicon bitmap, BGRA `u32` packed (`0xAARRGGBB`). Wrapped in
+/// `Arc` so cloning a `TabView` is O(1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabFavicon {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<Vec<u32>>,
+}
+
+/// Target favicon side length in the strip, in pixels.
+pub const FAVICON_RENDER_SIZE: u32 = 16;
+
+/// Per-tab render input. `progress >= 1.0` hides the loading bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabView {
+    pub title: String,
+    pub progress: f32,
+    pub pinned: bool,
+    pub private: bool,
+    pub favicon: Option<TabFavicon>,
+    /// Engine badge colour (`0x00RRGGBB`). `Some(colour)` paints a coloured
+    /// glyph column at the left edge of the tab pill. `None` means no badge
+    /// (single-engine config or the primary `cef` engine).
+    pub engine_badge: Option<u32>,
+    /// 2-character uppercase label rendered inside the badge column (e.g.
+    /// `"WK"` for `webkit`, `"LA"` for `ladybird`). Paired with
+    /// `engine_badge`; ignored when `engine_badge` is `None`.
+    pub engine_label: Option<String>,
+    /// Whether the cursor is hovering over this tab. When `true` and a badge
+    /// is present, a 1-px outline is drawn around the badge rectangle.
+    pub hovered: bool,
+}
+
+impl Default for TabView {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            progress: 1.0,
+            pinned: false,
+            private: false,
+            favicon: None,
+            engine_badge: None,
+            engine_label: None,
+            hovered: false,
+        }
+    }
+}
+
+/// Whole-strip render input. Re-create per frame — the widget owns no
+/// state. `palette` is set once on startup from `config.theme` and
+/// drives every colour the widget paints.
+#[derive(Debug, Clone, Default)]
+pub struct TabStrip {
+    pub tabs: Vec<TabView>,
+    pub active: Option<usize>,
+    pub palette: Palette,
+}
+
+impl TabStrip {
+    /// Paint the tab strip into rows `[start_y, start_y + TAB_STRIP_HEIGHT)`
+    /// of the window buffer. `width` and `height` are the full window's
+    /// pixel dimensions; the caller passes `start_y` so the tab strip
+    /// can sit anywhere vertically.
+    ///
+    /// The widget is a no-op when the strip would not fit (e.g. window
+    /// shorter than `start_y + TAB_STRIP_HEIGHT`). When `tabs` is empty
+    /// the strip is filled with `TAB_STRIP_BG` only — useful while a
+    /// tab is being created on startup.
+    pub fn paint(&self, buffer: &mut [u32], width: usize, height: usize, start_y: u32) {
+        let strip_h = TAB_STRIP_HEIGHT as usize;
+        let start_y = start_y as usize;
+        if width == 0 || start_y + strip_h > height {
+            return;
+        }
+        if buffer.len() < width * height {
+            return;
+        }
+
+        let p = &self.palette;
+
+        // Background fill.
+        fill_rect(
+            buffer,
+            width,
+            height,
+            0,
+            start_y as i32,
+            width,
+            strip_h,
+            p.bg,
+        );
+
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        // Compute each tab's pixel rect. Pinned tabs are fixed-width
+        // (PINNED_TAB_WIDTH) icon-only pills; unpinned tabs share the
+        // remaining width equally, clamped to [MIN, MAX], with the
+        // rightmost overflow truncating.
+        let pinned_count = self.tabs.iter().filter(|t| t.pinned).count() as u32;
+        let unpinned_count = self.tabs.len() as u32 - pinned_count;
+        let pinned_total_w = pinned_count * PINNED_TAB_WIDTH;
+        let gutter_total = ((self.tabs.len() as u32) + 1) * GUTTER;
+        let avail_for_unpinned = (width as u32)
+            .saturating_sub(pinned_total_w)
+            .saturating_sub(gutter_total);
+        let raw_w = avail_for_unpinned.checked_div(unpinned_count).unwrap_or(0);
+        let tab_w = raw_w.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
+
+        let text_y = start_y as i32 + ((strip_h as i32 - font::glyph_h() as i32) / 2);
+        let progress_y = start_y as i32 + strip_h as i32 - 2;
+
+        let mut x = GUTTER as i32;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            // Cap so we don't draw past the right edge.
+            let max_right = width as i32 - 1;
+            if x >= max_right {
+                break;
+            }
+            let target_w = if tab.pinned {
+                PINNED_TAB_WIDTH as i32
+            } else {
+                tab_w as i32
+            };
+            let pill_w = target_w.min(max_right - x);
+            let min_pill = if tab.pinned {
+                PINNED_TAB_WIDTH as i32 / 2
+            } else {
+                MIN_TAB_WIDTH as i32 / 2
+            };
+            if pill_w < min_pill {
+                break;
+            }
+            let is_active = self.active == Some(i);
+            let bg = if is_active { p.bg_lifted } else { p.bg };
+            let fg = if is_active { p.fg } else { p.fg_dim };
+
+            fill_rect(
+                buffer,
+                width,
+                height,
+                x,
+                start_y as i32,
+                pill_w as usize,
+                strip_h - 2,
+                bg,
+            );
+
+            // Active accent stripe along the bottom edge — a single
+            // bright row so the active tab pops even when colours are
+            // close.
+            if is_active {
+                fill_rect(
+                    buffer,
+                    width,
+                    height,
+                    x,
+                    start_y as i32 + strip_h as i32 - 4,
+                    pill_w as usize,
+                    2,
+                    p.accent,
+                );
+            }
+            // Private-tab marker — a thin pink top edge so private
+            // tabs read as distinct without the heavy purple fill the
+            // old palette used.
+            if tab.private {
+                fill_rect(
+                    buffer,
+                    width,
+                    height,
+                    x,
+                    start_y as i32,
+                    pill_w as usize,
+                    2,
+                    p.private,
+                );
+            }
+
+            if tab.pinned {
+                let icon_size = FAVICON_RENDER_SIZE as i32;
+                let icon_x = x + (pill_w - icon_size) / 2;
+                let icon_y = start_y as i32 + ((strip_h as i32 - icon_size) / 2);
+                if let Some(fav) = tab.favicon.as_ref() {
+                    blit_favicon(
+                        buffer,
+                        width,
+                        height,
+                        icon_x,
+                        icon_y,
+                        FAVICON_RENDER_SIZE,
+                        FAVICON_RENDER_SIZE,
+                        fav,
+                        bg,
+                    );
+                } else {
+                    // Stand-in until the favicon arrives: a single
+                    // capitalised glyph centered in the pill.
+                    let glyph: String = pinned_glyph(&tab.title);
+                    let glyph_px = font::text_width(&glyph) as i32;
+                    let glyph_x = x + (pill_w - glyph_px) / 2;
+                    font::draw_text(buffer, width, height, glyph_x, text_y, &glyph, fg);
+                }
+            } else {
+                // Engine badge: a coloured rectangle at the left edge of the
+                // pill. Width is wide enough to render a 2-character uppercase
+                // glyph (e.g. "WK" for webkit) with BADGE_SIDE_PAD px of
+                // horizontal padding on each side. Only painted when the router
+                // has more than one engine registered and this tab's engine is
+                // not the primary "cef" engine.
+                let two_char_px = font::text_width("WW") as i32; // widest 2-char label
+                let badge_content_w = two_char_px + 2 * BADGE_SIDE_PAD;
+                let badge_w: i32 = if tab.engine_badge.is_some() {
+                    badge_content_w
+                } else {
+                    0
+                };
+                if let Some(color) = tab.engine_badge {
+                    let opaque = color | 0xFF00_0000;
+                    // Coloured background for the badge column.
+                    fill_rect(
+                        buffer,
+                        width,
+                        height,
+                        x,
+                        start_y as i32,
+                        badge_w as usize,
+                        strip_h - 2,
+                        opaque,
+                    );
+                    // 2-char white label centred in the badge rectangle.
+                    let label = tab.engine_label.as_deref().unwrap_or("??");
+                    let label_px = font::text_width(label) as i32;
+                    let label_x = x + (badge_w - label_px) / 2;
+                    font::draw_text(
+                        buffer,
+                        width,
+                        height,
+                        label_x,
+                        text_y,
+                        label,
+                        BADGE_TEXT_COLOR,
+                    );
+                    // Hover outline: 1-px border around the badge rect in the
+                    // same colour as the badge fill. Painted when `hovered` so
+                    // the user can tell the badge is interactive.
+                    if tab.hovered {
+                        let bx = x;
+                        let by = start_y as i32;
+                        let bw = badge_w as usize;
+                        let bh = strip_h - 2;
+                        // Top edge
+                        fill_rect(buffer, width, height, bx, by, bw, 1, opaque);
+                        // Bottom edge
+                        fill_rect(
+                            buffer,
+                            width,
+                            height,
+                            bx,
+                            by + bh as i32 - 1,
+                            bw,
+                            1,
+                            BADGE_OUTLINE_COLOR,
+                        );
+                        // Left edge
+                        fill_rect(buffer, width, height, bx, by, 1, bh, BADGE_OUTLINE_COLOR);
+                        // Right edge
+                        fill_rect(
+                            buffer,
+                            width,
+                            height,
+                            bx + bw as i32 - 1,
+                            by,
+                            1,
+                            bh,
+                            BADGE_OUTLINE_COLOR,
+                        );
+                    }
+                }
+                // Favicon (when present) at the left edge (after badge), then title.
+                let icon_size = FAVICON_RENDER_SIZE as i32;
+                let icon_y = start_y as i32 + ((strip_h as i32 - icon_size) / 2);
+                let mut text_x = x + badge_w + 6;
+                if let Some(fav) = tab.favicon.as_ref() {
+                    blit_favicon(
+                        buffer,
+                        width,
+                        height,
+                        x + badge_w + 6,
+                        icon_y,
+                        FAVICON_RENDER_SIZE,
+                        FAVICON_RENDER_SIZE,
+                        fav,
+                        bg,
+                    );
+                    text_x = x + badge_w + 6 + icon_size + 4;
+                }
+                let max_text_px = (pill_w as usize)
+                    .saturating_sub((text_x - x) as usize)
+                    .saturating_sub(6);
+                let label = truncate_to_width(&tab.title, max_text_px);
+                font::draw_text(buffer, width, height, text_x, text_y, label, fg);
+            }
+
+            // Progress bar across the bottom edge of the pill — hidden
+            // when idle (progress >= 1.0).
+            let frac = tab.progress.clamp(0.0, 1.0);
+            if frac > 0.0 && frac < 1.0 {
+                let bar_w = ((pill_w as f32) * frac) as i32;
+                fill_rect(
+                    buffer,
+                    width,
+                    height,
+                    x,
+                    progress_y,
+                    bar_w.max(1) as usize,
+                    2,
+                    p.progress,
+                );
+            }
+
+            x += pill_w + GUTTER as i32;
+        }
+    }
+}
+
+/// First printable letter of a tab's title, uppercased — a default
+/// "favicon" stand-in for pinned tabs. Falls back to `*` when the
+/// title has no usable codepoint. When the title looks like a URL
+/// (`scheme://…`) the scheme and a leading `www.` are skipped so the
+/// glyph reflects the meaningful host segment.
+fn pinned_glyph(title: &str) -> String {
+    let body = title
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(title);
+    let body = body.strip_prefix("www.").unwrap_or(body);
+    for c in body.chars() {
+        if c.is_alphanumeric() {
+            return c.to_uppercase().to_string();
+        }
+    }
+    "*".to_string()
+}
+
+/// Truncate `s` to fit in `max_px` pixels, appending `..` when it
+/// didn't fit. Mirrors the logic in `Statusline::paint`'s URL cell.
+fn truncate_to_width(s: &str, max_px: usize) -> &str {
+    if font::text_width(s) <= max_px {
+        return s;
+    }
+    if max_px < font::text_width("..") {
+        return "";
+    }
+    let mut end = s.len();
+    while end > 0 {
+        if !s.is_char_boundary(end) {
+            end -= 1;
+            continue;
+        }
+        let prefix = &s[..end];
+        if font::text_width(prefix) + font::text_width("..") <= max_px {
+            return prefix;
+        }
+        end -= 1;
+    }
+    ""
+}
+
+const GUTTER: u32 = 4;
+
+/// Horizontal padding in pixels on each side of the 2-character engine-badge
+/// glyph. The total badge column width is therefore:
+///   `font::text_width("WW") + 2 * BADGE_SIDE_PAD`
+/// Using `"WW"` (two W's) as the widest 2-char upper-case bitmap string.
+const BADGE_SIDE_PAD: i32 = 2;
+
+/// White-ish foreground used for the 2-character label inside the engine badge.
+const BADGE_TEXT_COLOR: u32 = 0xFF_FF_FF_FF;
+
+/// Outline colour painted around the badge when the tab is hovered. Pure white
+/// so it contrasts against any badge fill colour.
+const BADGE_OUTLINE_COLOR: u32 = 0xFF_FF_FF_FF;
+
+/// Draw `fav` into the rect `(dst_x, dst_y, dst_w, dst_h)` using
+/// bilinear scaling and a `bg`-coloured backdrop for transparent pixels.
+/// Source pixels are BGRA-packed `0xAARRGGBB` with PREMULTIPLIED alpha
+/// (we ask CEF for `COLOR_TYPE_BGRA_8888` premul), so linear blends of
+/// the four taps are mathematically correct without an un-premul pass.
+/// We composite over `bg` so the antialiased edges read correctly on
+/// whichever pill colour the caller passes in.
+#[allow(clippy::too_many_arguments)]
+fn blit_favicon(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    dst_x: i32,
+    dst_y: i32,
+    dst_w: u32,
+    dst_h: u32,
+    fav: &TabFavicon,
+    bg: u32,
+) {
+    if fav.width == 0 || fav.height == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    let src_w = fav.width as usize;
+    let src_h = fav.height as usize;
+    let dst_w_us = dst_w as usize;
+    let dst_h_us = dst_h as usize;
+    let src_pixels: &[u32] = fav.pixels.as_slice();
+    if src_pixels.len() < src_w * src_h {
+        return;
+    }
+    // Pre-extract the bg channels; reused for every alpha composite.
+    let bg_r = ((bg >> 16) & 0xFF) as i32;
+    let bg_g = ((bg >> 8) & 0xFF) as i32;
+    let bg_b = (bg & 0xFF) as i32;
+
+    // Pixel-centre sampling: dst pixel (dx, dy) maps to source coord
+    // ((dx + 0.5) * src/dst - 0.5). Working in fixed-point Q16 so the
+    // hot loop stays integer-only. fx_step / fy_step are the source
+    // increment per dst pixel; fx0 / fy0 are the source coords of the
+    // first dst pixel's centre. Negative values clamp to 0 below.
+    let fx_step: i64 = ((src_w as i64) << 16) / (dst_w_us as i64);
+    let fy_step: i64 = ((src_h as i64) << 16) / (dst_h_us as i64);
+    let fx0: i64 = (fx_step >> 1) - (1 << 15);
+    let fy0: i64 = (fy_step >> 1) - (1 << 15);
+
+    let max_sx = src_w as i64 - 1;
+    let max_sy = src_h as i64 - 1;
+
+    for dy in 0..dst_h_us {
+        let py = dst_y + dy as i32;
+        if py < 0 {
+            continue;
+        }
+        let py = py as usize;
+        if py >= height {
+            break;
+        }
+        // Source y in Q16, clamped to [0, max_sy << 16].
+        let fy = (fy0 + fy_step * dy as i64).clamp(0, max_sy << 16);
+        let sy0 = (fy >> 16) as usize;
+        let sy1 = (sy0 + 1).min(src_h - 1);
+        let wy: i32 = ((fy & 0xFFFF) >> 8) as i32; // 0..=255
+
+        let row0 = sy0 * src_w;
+        let row1 = sy1 * src_w;
+
+        for dx in 0..dst_w_us {
+            let px = dst_x + dx as i32;
+            if px < 0 {
+                continue;
+            }
+            let px = px as usize;
+            if px >= width {
+                break;
+            }
+            let fx = (fx0 + fx_step * dx as i64).clamp(0, max_sx << 16);
+            let sx0 = (fx >> 16) as usize;
+            let sx1 = (sx0 + 1).min(src_w - 1);
+            let wx: i32 = ((fx & 0xFFFF) >> 8) as i32; // 0..=255
+
+            // Four taps in source-space corners.
+            let p00 = src_pixels[row0 + sx0];
+            let p10 = src_pixels[row0 + sx1];
+            let p01 = src_pixels[row1 + sx0];
+            let p11 = src_pixels[row1 + sx1];
+
+            // Bilinear over each premultiplied channel. Linear blend of
+            // premultiplied values is correct without un-premul.
+            #[inline(always)]
+            fn lerp(a: i32, b: i32, w: i32) -> i32 {
+                // w in 0..=255; return rounded a + (b - a) * w / 255.
+                a + (((b - a) * w) + 127) / 255
+            }
+            #[inline(always)]
+            fn ch(p: u32, shift: u32) -> i32 {
+                ((p >> shift) & 0xFF) as i32
+            }
+
+            let a = lerp(
+                lerp(ch(p00, 24), ch(p10, 24), wx),
+                lerp(ch(p01, 24), ch(p11, 24), wx),
+                wy,
+            );
+            let r = lerp(
+                lerp(ch(p00, 16), ch(p10, 16), wx),
+                lerp(ch(p01, 16), ch(p11, 16), wx),
+                wy,
+            );
+            let g = lerp(
+                lerp(ch(p00, 8), ch(p10, 8), wx),
+                lerp(ch(p01, 8), ch(p11, 8), wx),
+                wy,
+            );
+            let b = lerp(
+                lerp(ch(p00, 0), ch(p10, 0), wx),
+                lerp(ch(p01, 0), ch(p11, 0), wx),
+                wy,
+            );
+
+            // Composite premultiplied src over bg: out = src + bg * (1 - a).
+            let inv = 255 - a;
+            let out_r = (r + ((bg_r * inv) + 127) / 255).clamp(0, 255) as u32;
+            let out_g = (g + ((bg_g * inv) + 127) / 255).clamp(0, 255) as u32;
+            let out_b = (b + ((bg_b * inv) + 127) / 255).clamp(0, 255) as u32;
+            let out = 0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
+            if let Some(dst) = buffer.get_mut(py * width + px) {
+                *dst = out;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_buf(w: usize, h: usize) -> Vec<u32> {
+        vec![0u32; w * h]
+    }
+
+    #[test]
+    fn paint_fills_strip_bg_when_no_tabs() {
+        let w = 200;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let s = TabStrip::default();
+        s.paint(&mut buf, w, h, 0);
+        // Every pixel in the strip is the bg colour.
+        for &px in &buf {
+            assert_eq!(px, Palette::default().bg);
+        }
+    }
+
+    #[test]
+    fn paint_active_tab_has_accent_stripe_pixel() {
+        let w = 800;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let s = TabStrip {
+            tabs: vec![
+                TabView {
+                    title: "one".into(),
+                    ..Default::default()
+                },
+                TabView {
+                    title: "two".into(),
+                    ..Default::default()
+                },
+            ],
+            active: Some(1),
+            ..TabStrip::default()
+        };
+        s.paint(&mut buf, w, h, 0);
+        // The accent stripe is 2 px tall starting at strip_h - 4.
+        let stripe_y = h - 4;
+        // Find at least one accent pixel on that row.
+        let row = &buf[stripe_y * w..(stripe_y + 1) * w];
+        assert!(
+            row.contains(&Palette::default().accent),
+            "no accent stripe pixel found on active tab row",
+        );
+    }
+
+    #[test]
+    fn paint_skips_when_strip_overflows_buffer() {
+        let w = 100;
+        let h = 10;
+        let mut buf = make_buf(w, h);
+        let s = TabStrip {
+            tabs: vec![TabView::default()],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        s.paint(&mut buf, w, h, 0);
+        assert!(buf.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn paint_with_start_y_offset_only_touches_strip_rows() {
+        let w = 200;
+        let strip_h = TAB_STRIP_HEIGHT as usize;
+        let h = strip_h + 10;
+        let mut buf = make_buf(w, h);
+        let s = TabStrip {
+            tabs: vec![TabView::default()],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        s.paint(&mut buf, w, h, 10);
+        // Rows 0..10 untouched.
+        for y in 0..10 {
+            for x in 0..w {
+                assert_eq!(buf[y * w + x], 0, "row {y} touched");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_tab_renders_distinctly_from_unpinned() {
+        let w = 600;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf_pin = make_buf(w, h);
+        let mut buf_no_pin = make_buf(w, h);
+        let pin = TabStrip {
+            tabs: vec![TabView {
+                title: "x".into(),
+                pinned: true,
+                ..Default::default()
+            }],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        let no_pin = TabStrip {
+            tabs: vec![TabView {
+                title: "x".into(),
+                pinned: false,
+                ..Default::default()
+            }],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        pin.paint(&mut buf_pin, w, h, 0);
+        no_pin.paint(&mut buf_no_pin, w, h, 0);
+        assert_ne!(buf_pin, buf_no_pin, "pin glyph not visible");
+    }
+
+    #[test]
+    fn private_tab_uses_distinct_bg_when_inactive() {
+        let w = 600;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf_priv = make_buf(w, h);
+        let mut buf_norm = make_buf(w, h);
+        let priv_strip = TabStrip {
+            tabs: vec![
+                TabView {
+                    title: "a".into(),
+                    ..Default::default()
+                },
+                TabView {
+                    title: "b".into(),
+                    private: true,
+                    ..Default::default()
+                },
+            ],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        let norm_strip = TabStrip {
+            tabs: vec![
+                TabView {
+                    title: "a".into(),
+                    ..Default::default()
+                },
+                TabView {
+                    title: "b".into(),
+                    private: false,
+                    ..Default::default()
+                },
+            ],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        priv_strip.paint(&mut buf_priv, w, h, 0);
+        norm_strip.paint(&mut buf_norm, w, h, 0);
+        assert_ne!(buf_priv, buf_norm, "private bg should differ");
+    }
+
+    #[test]
+    fn progress_bar_drawn_only_while_loading() {
+        let w = 600;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf_loading = make_buf(w, h);
+        let mut buf_idle = make_buf(w, h);
+        let loading = TabStrip {
+            tabs: vec![TabView {
+                title: "x".into(),
+                progress: 0.5,
+                ..Default::default()
+            }],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        let idle = TabStrip {
+            tabs: vec![TabView {
+                title: "x".into(),
+                progress: 1.0,
+                ..Default::default()
+            }],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        loading.paint(&mut buf_loading, w, h, 0);
+        idle.paint(&mut buf_idle, w, h, 0);
+        let progress_y = h - 2;
+        let loading_row = &buf_loading[progress_y * w..(progress_y + 1) * w];
+        let idle_row = &buf_idle[progress_y * w..(progress_y + 1) * w];
+        let progress_color = Palette::default().progress;
+        assert!(loading_row.contains(&progress_color));
+        assert!(!idle_row.contains(&progress_color));
+    }
+
+    #[test]
+    fn truncate_returns_empty_when_too_narrow() {
+        assert_eq!(truncate_to_width("hello world", 1), "");
+    }
+
+    #[test]
+    fn truncate_returns_full_when_fits() {
+        assert_eq!(truncate_to_width("hi", 1000), "hi");
+    }
+
+    #[test]
+    fn many_tabs_truncate_at_strip_edge() {
+        // Strip is too narrow to fit more than a few pills; the widget
+        // must stop drawing rather than overflow.
+        let w = 200;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let s = TabStrip {
+            tabs: (0..10)
+                .map(|i| TabView {
+                    title: format!("tab {i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        s.paint(&mut buf, w, h, 0);
+        // No panic, no buffer overrun. The far-right column should be
+        // either bg (if no pill reached it) or a pill colour, but never
+        // an out-of-bounds value.
+        let far_right = &buf[(h / 2) * w + (w - 1)];
+        let p = Palette::default();
+        let allowed = [p.bg, p.bg_lifted];
+        assert!(allowed.contains(far_right));
+    }
+
+    #[test]
+    fn pinned_glyph_skips_scheme() {
+        assert_eq!(pinned_glyph("https://example.com"), "E");
+        assert_eq!(pinned_glyph("http://kryptic.sh"), "K");
+        assert_eq!(pinned_glyph("buffr://new"), "N");
+    }
+
+    #[test]
+    fn pinned_glyph_skips_www() {
+        assert_eq!(pinned_glyph("https://www.google.com"), "G");
+        assert_eq!(pinned_glyph("www.example.com"), "E");
+    }
+
+    #[test]
+    fn pinned_glyph_uses_title_when_no_scheme() {
+        assert_eq!(pinned_glyph("GitHub"), "G");
+        assert_eq!(pinned_glyph("  hello"), "H");
+        assert_eq!(pinned_glyph(""), "*");
+    }
+}
