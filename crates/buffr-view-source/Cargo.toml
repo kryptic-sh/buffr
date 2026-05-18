@@ -1,0 +1,16 @@
+[package]
+name = "buffr-view-source"
+description = "View-source renderer for buffr — syntax-highlights page source via hjkl-bonsai."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr-view-source"
+homepage = "https://buffr.kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+hjkl-bonsai = "0.6"
