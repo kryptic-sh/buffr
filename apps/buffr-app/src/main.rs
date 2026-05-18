@@ -1152,7 +1152,9 @@ fn main() -> Result<()> {
                         // _exit skips destructors / atexit; appropriate
                         // for an emergency bail-out.  130 = 128 + SIGINT.
                         #[cfg(unix)]
-                        unsafe { libc::_exit(130) };
+                        unsafe {
+                            libc::_exit(130)
+                        };
                         #[cfg(not(unix))]
                         std::process::exit(130);
                     })
@@ -1321,7 +1323,9 @@ fn main() -> Result<()> {
     // SAFETY: _exit is async-signal-safe and takes no Rust state. Skipping
     // atexit handlers is intentional — see comment above.
     #[cfg(unix)]
-    unsafe { libc::_exit(0) };
+    unsafe {
+        libc::_exit(0)
+    };
     #[cfg(not(unix))]
     std::process::exit(0);
 }
