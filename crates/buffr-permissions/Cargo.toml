@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 [features]
 # The SQLite-backed Permissions store. On by default for existing

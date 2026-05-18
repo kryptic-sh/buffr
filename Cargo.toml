@@ -40,6 +40,10 @@ license = "MIT"
 repository = "https://github.com/kryptic-sh/buffr"
 homepage = "https://kryptic.sh"
 authors = ["mxaddict <mxaddict@kryptic.sh>"]
+# Monorepo private — no member is published to crates.io independently.
+# apps/buffr-stub (excluded from workspace) holds the `buffr` name and
+# is the only crate published from this repo.
+publish = false
 
 [workspace.dependencies]
 cef = "147"

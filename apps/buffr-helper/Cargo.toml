@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+publish.workspace = true
 description = "CEF subprocess helper binary (renderer/GPU/utility)."
 
 [[bin]]
