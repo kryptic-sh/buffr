@@ -44,7 +44,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev
+            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -94,7 +94,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev \
+            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev \
             xvfb
 
       - name: install rust toolchain
@@ -188,7 +188,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev
+            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -244,11 +244,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Cross-plat backends — build & test on Linux (host CI baseline)
-          - { os: ubuntu-latest, crate: buffr-firefox-cdp, args: "-p buffr-firefox-cdp", apt: "" }
-
-          # Linux-gated backend
-          - { os: ubuntu-latest, crate: buffr-webkitgtk,   args: "-p buffr-webkitgtk",   apt: "libwebkitgtk-6.0-dev libgtk-4-dev libglib2.0-dev" }
+          # Linux-gated backend — WPE WebKit (Wayland-only)
+          - { os: ubuntu-latest, crate: buffr-webkit,      args: "-p buffr-webkit",      apt: "libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev" }
 
           # macOS-gated backend — exercises the platform/ module (untestable on Linux)
           - { os: macos-latest,  crate: buffr-webkit-cocoa, args: "-p buffr-webkit-cocoa", apt: "" }
@@ -329,7 +326,7 @@ jobs:
             libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
-            libwebkitgtk-6.0-dev libgtk-4-dev libgraphene-1.0-dev libglib2.0-dev \
+            libwpewebkit-2.0-dev libgraphene-1.0-dev libglib2.0-dev \
             libxml2-utils
 
       - name: install rust toolchain
