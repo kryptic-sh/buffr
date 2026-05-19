@@ -185,10 +185,19 @@ mod unix {
     const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
     /// How long to wait for the child to connect to the heartbeat socket.
     /// Sized to absorb cold-disk first-run setup (CEF lib load, SQLite db
-    /// init, etc.). 5 s was too tight on slower disks.
-    const CONNECT_GRACE: Duration = Duration::from_secs(20);
+    /// init, etc.). 5 s was too tight on slower disks. Integration tests
+    /// override via `BUFFR_CONNECT_GRACE_MS` to keep their runtime bounded.
+    const DEFAULT_CONNECT_GRACE: Duration = Duration::from_secs(20);
     /// Additional grace after the child connects before enforcing heartbeat.
     const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
+
+    fn connect_grace() -> Duration {
+        std::env::var("BUFFR_CONNECT_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_CONNECT_GRACE)
+    }
 
     /// Env var name written into the child's environment with the UDS path.
     pub const SUPERVISOR_SOCK_ENV: &str = "BUFFR_SUPERVISOR_SOCK";
@@ -276,7 +285,7 @@ mod unix {
             }
 
             let watch_result = if let Some(ref rx) = hb_rx {
-                match wait_for_connect(rx, &mut child, CONNECT_GRACE) {
+                match wait_for_connect(rx, &mut child, connect_grace()) {
                     ConnectResult::Connected => {
                         tracing::info!(pid = %child_pid, "child connected to heartbeat socket");
                         // Post-connect grace: give CEF time to initialise.
@@ -732,8 +741,17 @@ mod windows {
     /// How long to wait for the child to connect to the named pipe. Sized
     /// for cold-disk first runs (scoop / MSI install on a fresh Windows
     /// machine) where CEF library load + SQLite db opens can dominate
-    /// startup. 5 s was too tight under those conditions.
-    const CONNECT_GRACE: Duration = Duration::from_secs(20);
+    /// startup. 5 s was too tight under those conditions. Integration
+    /// tests override via `BUFFR_CONNECT_GRACE_MS` to keep runtime bounded.
+    const DEFAULT_CONNECT_GRACE: Duration = Duration::from_secs(20);
+
+    fn connect_grace() -> Duration {
+        std::env::var("BUFFR_CONNECT_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_CONNECT_GRACE)
+    }
     /// Additional grace after the child connects before enforcing heartbeat.
     const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
 
@@ -882,7 +900,7 @@ mod windows {
             }
 
             let watch_result = if let Some(ref rx) = hb_rx {
-                match wait_for_connect(rx, proc_info.hProcess, CONNECT_GRACE) {
+                match wait_for_connect(rx, proc_info.hProcess, connect_grace()) {
                     ConnectResult::Connected => {
                         tracing::info!(pid = child_pid, "child connected to heartbeat pipe");
                         let post_connect_deadline =

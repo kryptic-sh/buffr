@@ -1,5 +1,7 @@
 //! Integration test: fake child never connects to the heartbeat socket.
-//! Supervisor must time out after 5 s and restart (3× → halt non-zero).
+//! Supervisor must time out (CONNECT_GRACE) and restart (3× → halt non-zero).
+//! Forces `BUFFR_CONNECT_GRACE_MS=1000` so the test stays bounded irrespective
+//! of the production default (currently 20 s, sized for cold-disk first runs).
 #![cfg(unix)]
 
 use std::fs;
@@ -37,9 +39,10 @@ fn no_connect_triggers_crash_restart_then_halt() {
     let script = no_connect_script(dir.path());
     let bin = supervisor_bin();
 
-    // Each cycle: 5 s connect-grace + 250 ms cooldown. 3 cycles ≈ 16 s.
+    // Each cycle: 1 s connect-grace (overridden) + 250 ms cooldown. 3 cycles ≈ 4 s.
     let output = Command::new(&bin)
         .env("BUFFR_CHILD_BIN", &script)
+        .env("BUFFR_CONNECT_GRACE_MS", "1000")
         .env("RUST_LOG", "info")
         // Short timeout so the test stays manageable.
         .arg("--heartbeat-timeout")
