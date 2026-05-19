@@ -32,8 +32,7 @@ use std::path::Path;
 
 use cef::{
     BrowserSettings, CefString, CefStringUtf16, ImplBrowser, ImplBrowserHost, ImplFrame,
-    RequestContextSettings, WindowInfo, browser_host_create_browser_sync,
-    request_context_create_context,
+    WindowInfo, browser_host_create_browser_sync,
 };
 use tracing::{info, warn};
 

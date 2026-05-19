@@ -8,6 +8,35 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-05-19
+
+### Fixed
+
+- CEF cookie persistence on Linux. Login state + cookies + cache now
+  survive browser restart. Two stacked fixes:
+  - `--password-store=basic` propagated to every CEF subprocess via the
+    new `on_before_child_process_launch` hook on `BrowserProcessHandler`
+    (CEF does not auto-propagate user switches; each subprocess argv is
+    rebuilt at spawn). Required when a Secret Service backend
+    (pass-secret-service, KeePassXC, etc.) is detected over D-Bus but
+    its unlock/auth dance fails — Chromium policy is to drop cookies
+    rather than persist unencrypted.
+  - Per-engine `CefRequestContext` creation dropped in `BrowserHost::new`.
+    CEF Alloy runtime collapses any child `cache_path` to `Default/`
+    anyway, and creating the per-engine context was silently blocking
+    cookie persistence on top of that. Per-engine isolation tracked
+    separately in #158 — needs Chrome runtime swap to be real.
+- `session.json` URL fix and engine profile-dir relocation now have a
+  fully working storage path under them.
+
+### Changed
+
+- `BackendOpenOptions.data_dir` is currently unused by the CEF backend
+  (was wired into the deleted per-engine `CefRequestContext`). Will be
+  re-wired when per-engine isolation lands.
+
+[0.13.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.1
+
 ## [0.13.0] - 2026-05-18
 
 ### Removed
