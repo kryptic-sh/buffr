@@ -8,6 +8,20 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.11] - 2026-05-19
+
+### Fixed
+
+- Windows packaging job failed in v0.13.10 because the GitHub Actions PowerShell
+  wrapper propagates `$LASTEXITCODE` from the last external command — even when
+  the script checks it manually and chooses to continue. `buffr-helper.exe`
+  exits -1 by design (no `--type=` → cef returns -1), and that bled out as the
+  step's overall exit code. Reset `$LASTEXITCODE = 0` after the manual check.
+  macOS and Linux smoke (bash) are unaffected because the trailing `echo` resets
+  `$?` to 0.
+
+[0.13.11]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.11
+
 ## [0.13.10] - 2026-05-19
 
 ### Added

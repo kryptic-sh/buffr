@@ -707,6 +707,9 @@ jobs:
             Write-Error "buffr-helper exited $LASTEXITCODE, expected -1 (no-type path)"
             exit 1
           }
+          # Clear $LASTEXITCODE so the GH Actions pwsh wrapper doesn't
+          # propagate helper's -1 as the step's overall exit code.
+          $global:LASTEXITCODE = 0
           Write-Host "windows smoke OK"
 
       - name: compute sha256 checksums
