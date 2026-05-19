@@ -564,9 +564,7 @@ impl Renderer {
             force_fallback_adapter: false,
         }))
         .or_else(|_| {
-            tracing::warn!(
-                "wgpu: HighPerformance adapter unavailable; trying LowPower"
-            );
+            tracing::warn!("wgpu: HighPerformance adapter unavailable; trying LowPower");
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
