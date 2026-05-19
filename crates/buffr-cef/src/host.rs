@@ -485,41 +485,14 @@ impl BrowserHost {
             .store(osr_h, std::sync::atomic::Ordering::Relaxed);
         let osr_frame = Arc::new(Mutex::new(OsrFrame::new(osr_w, osr_h)));
 
-        // Build a per-engine RequestContext when the caller supplied a
-        // data_dir. CEF will isolate cookies, cache, local-storage, and
-        // IndexedDB under that path — distinct instances will not share
-        // any persistent state even within the same process.
-        let request_context: Option<cef::RequestContext> = if let Some(dir) = data_dir {
-            let cache_path_str = dir.to_string_lossy();
-            let ctx_settings = RequestContextSettings {
-                cache_path: CefString::from(cache_path_str.as_ref()),
-                ..RequestContextSettings::default()
-            };
-            tracing::info!(
-                cache_path = %cache_path_str,
-                "creating per-engine CEF RequestContext"
-            );
-            match request_context_create_context(Some(&ctx_settings), None) {
-                Some(ctx) => {
-                    use cef::ImplRequestContext;
-                    tracing::info!(
-                        is_global = ctx.is_global(),
-                        "per-engine RequestContext created"
-                    );
-                    Some(ctx)
-                }
-                None => {
-                    tracing::warn!(
-                        cache_path = %cache_path_str,
-                        "request_context_create_context returned None; \
-                         falling back to global context"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Per-engine `CefRequestContext` is disabled — CEF Alloy runtime
+        // collapses any child `cache_path` to the global `Default/` profile
+        // anyway (see kryptic-sh/buffr#158). Creating the context also
+        // somehow blocks cookie persistence even after the global context
+        // works fine standalone. Drop until Alloy is replaced with Chrome
+        // runtime OR per-engine isolation is genuinely needed.
+        let _ = data_dir; // intentionally unused
+        let request_context: Option<cef::RequestContext> = None;
 
         let popup_queue = new_popup_queue();
         let address_sink: AddressSink = Arc::new(Mutex::new(VecDeque::new()));
