@@ -8,6 +8,27 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-05-19
+
+### Fixed
+
+- Supervisor watchdog killed the browser before it could ever connect on
+  cold-disk first runs (scoop / MSI install on a fresh Windows machine). Two
+  stacking issues:
+  - buffr-app called `heartbeat::Heartbeat::try_connect` ~600 lines into `main`,
+    after `cef::load_library`, `Cli::parse`, tracing init, and SQLite db opens.
+    Hoisted to immediately after the CEF subprocess short-circuit so the
+    named-pipe / UDS connect happens before any heavy work.
+  - Supervisor `CONNECT_GRACE` was 5 s on both Unix and Windows. Raised to 20 s
+    — fits the worst observed cold-cache first run.
+- Supervisor watchdog error message pointed users at a non-existent
+  `~/.local/share/buffr/crashes/` (or `%APPDATA%\buffr\crashes\`) path — the
+  supervisor never wrote anything there. Replaced with a concrete command for
+  capturing buffr-app's stderr directly. A proper supervisor-side child-stderr
+  redirect remains a TODO.
+
+[0.13.7]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.7
+
 ## [0.13.6] - 2026-05-19
 
 ### Fixed
