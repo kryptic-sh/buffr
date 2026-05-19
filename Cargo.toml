@@ -32,7 +32,7 @@ exclude = [
 default-members = ["apps/buffr", "apps/buffr-app", "apps/buffr-helper"]
 
 [workspace.package]
-version = "0.13.1"
+version = "0.13.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

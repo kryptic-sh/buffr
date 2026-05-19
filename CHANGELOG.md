@@ -8,6 +8,24 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-05-19
+
+### Fixed
+
+- Linux packaging now ships every CEF runtime `.so` next to `libcef.so`:
+  `libEGL.so`, `libGLESv2.so` (ANGLE), `libvk_swiftshader.so`,
+  `libvulkan.so.1` (SwiftShader Vulkan fallback), plus
+  `vk_swiftshader_icd.json`. Previously only `libcef.so` was packaged
+  — on hardware without a system GLES library at the expected path, CEF
+  emitted `Failed to load GLES library: /opt/buffr/libGLESv2.so` and the
+  GPU process crashed before wgpu init. App then exited cleanly with no
+  usable renderer. Affected: any machine where the CEF binary
+  distribution's bundled ANGLE/SwiftShader libs weren't present in the
+  install root. Fix lands in `xtask::collect_runtime_payload` +
+  `stage_payload` so `.deb`, `.rpm`, `.tar.gz`, AUR all carry them.
+
+[0.13.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.2
+
 ## [0.13.1] - 2026-05-19
 
 ### Fixed

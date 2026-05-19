@@ -946,10 +946,22 @@ struct RuntimePayload {
     helper: PathBuf,
     /// Absolute path to `libcef.so` (Linux dist).
     libcef: PathBuf,
+    /// Every other .so the CEF binary distribution ships next to libcef.so:
+    /// libEGL.so + libGLESv2.so (ANGLE — needed for GPU rendering),
+    /// libvk_swiftshader.so + libvulkan.so.1 (SwiftShader Vulkan fallback).
+    /// Missing any of these → "Failed to load GLES library" at startup +
+    /// GPU process crash + wgpu no-adapter → app exits cleanly. Required
+    /// at runtime — `target/<profile>/` should have all of them after
+    /// `cargo build` thanks to buffr-core's build.rs staging.
+    runtime_libs: Vec<PathBuf>,
     /// Absolute paths to `*.pak` files.
     paks: Vec<PathBuf>,
     /// Absolute paths to `*.dat` / `*.bin` blobs (icudtl, snapshot).
     blobs: Vec<PathBuf>,
+    /// JSON metadata CEF ships in Release/ (vk_swiftshader_icd.json).
+    /// Sits next to libvk_swiftshader.so; required for SwiftShader's
+    /// Vulkan ICD discovery.
+    jsons: Vec<PathBuf>,
     /// Absolute path to the `locales/` directory.
     locales: PathBuf,
 }
@@ -987,6 +999,8 @@ fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
 
     let mut paks = Vec::new();
     let mut blobs = Vec::new();
+    let mut jsons = Vec::new();
+    let mut runtime_libs = Vec::new();
     for entry in
         fs::read_dir(target_dir).with_context(|| format!("reading {}", target_dir.display()))?
     {
@@ -1001,16 +1015,37 @@ fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
             paks.push(path);
         } else if name.ends_with(".dat") || name.ends_with(".bin") {
             blobs.push(path);
+        } else if name.ends_with(".json") {
+            jsons.push(path);
+        } else if name == "libEGL.so"
+            || name == "libGLESv2.so"
+            || name == "libvk_swiftshader.so"
+            || name == "libvulkan.so.1"
+        {
+            runtime_libs.push(path);
         }
     }
     paks.sort();
     blobs.sort();
+    jsons.sort();
+    runtime_libs.sort();
+
+    if runtime_libs.is_empty() {
+        bail!(
+            "expected runtime .so files (libEGL/libGLESv2/libvk_swiftshader/libvulkan.so.1) \
+             in {} — buffr-core build.rs should have staged them from CEF binary distribution. \
+             Did you `cargo xtask fetch-cef`?",
+            target_dir.display()
+        );
+    }
 
     Ok(RuntimePayload {
         buffr,
         buffr_app,
         helper,
         libcef,
+        runtime_libs,
+        jsons,
         paks,
         blobs,
         locales,
@@ -1028,11 +1063,17 @@ fn stage_payload(dest: &Path, payload: &RuntimePayload) -> Result<()> {
     copy_file_executable(&payload.buffr_app, &dest.join("buffr-app"))?;
     copy_file_executable(&payload.helper, &dest.join("buffr-helper"))?;
     copy_into_dir(&payload.libcef, dest)?;
+    for lib in &payload.runtime_libs {
+        copy_into_dir(lib, dest)?;
+    }
     for pak in &payload.paks {
         copy_into_dir(pak, dest)?;
     }
     for blob in &payload.blobs {
         copy_into_dir(blob, dest)?;
+    }
+    for json in &payload.jsons {
+        copy_into_dir(json, dest)?;
     }
     let locales_dest = dest.join("locales");
     let _ = fs::remove_dir_all(&locales_dest);
@@ -2113,6 +2154,13 @@ mod tests {
         fs::write(target.join("buffr-app"), b"#!/bin/sh\n").unwrap();
         fs::write(target.join("buffr-helper"), b"#!/bin/sh\n").unwrap();
         fs::write(target.join("libcef.so"), b"\x7fELF").unwrap();
+        // CEF runtime .so files staged next to libcef.so in real builds.
+        // Required for GPU init (ANGLE EGL/GLES + SwiftShader Vulkan).
+        fs::write(target.join("libEGL.so"), b"\x7fELF").unwrap();
+        fs::write(target.join("libGLESv2.so"), b"\x7fELF").unwrap();
+        fs::write(target.join("libvk_swiftshader.so"), b"\x7fELF").unwrap();
+        fs::write(target.join("libvulkan.so.1"), b"\x7fELF").unwrap();
+        fs::write(target.join("vk_swiftshader_icd.json"), b"{}").unwrap();
         fs::write(target.join("chrome_100_percent.pak"), b"pak").unwrap();
         fs::write(target.join("resources.pak"), b"pak").unwrap();
         fs::write(target.join("icudtl.dat"), b"dat").unwrap();
@@ -2122,6 +2170,8 @@ mod tests {
         let payload = collect_runtime_payload(&target).unwrap();
         assert_eq!(payload.paks.len(), 2);
         assert_eq!(payload.blobs.len(), 2);
+        assert_eq!(payload.runtime_libs.len(), 4);
+        assert_eq!(payload.jsons.len(), 1);
 
         let dest = tmp.path().join("opt-buffr");
         stage_payload(&dest, &payload).unwrap();
@@ -2129,6 +2179,11 @@ mod tests {
         assert!(dest.join("buffr-app").exists());
         assert!(dest.join("buffr-helper").exists());
         assert!(dest.join("libcef.so").exists());
+        assert!(dest.join("libEGL.so").exists());
+        assert!(dest.join("libGLESv2.so").exists());
+        assert!(dest.join("libvk_swiftshader.so").exists());
+        assert!(dest.join("libvulkan.so.1").exists());
+        assert!(dest.join("vk_swiftshader_icd.json").exists());
         assert!(dest.join("chrome_100_percent.pak").exists());
         assert!(dest.join("resources.pak").exists());
         assert!(dest.join("icudtl.dat").exists());
