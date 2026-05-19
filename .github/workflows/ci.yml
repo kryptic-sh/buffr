@@ -13,7 +13,9 @@ env:
   RUSTFLAGS: -D warnings
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group:
+    ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref
+    }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
@@ -210,7 +212,7 @@ jobs:
     # `xtask bundle-macos` regressions per-commit without paying for a real
     # macOS runner. The resulting bundle is filesystem-correct only —
     # the binaries inside are Linux ELFs and won't run on Darwin. Real
-    # macOS smoke testing is deferred to Phase 6.
+    # macOS smoke runs in `macos-package` against the signed DMG.
     #
     # Runs on every push/tag/workflow_dispatch in parallel with `linux`.
     # PR-triggered runs are excluded by the if: gate below. The job
@@ -398,6 +400,25 @@ jobs:
           tar tzf "${tarballs[0]}" | grep -q '/libcef.so$'
           echo "tarball OK: ${tarballs[0]}"
 
+      - name: smoke test extracted tarball
+        # Catch link/load regressions on real binaries. --version/--help
+        # exit inside clap before CEF init, so no display is needed.
+        # buffr-app DT_NEEDEDs libcef.so → LD_LIBRARY_PATH points at the
+        # extracted dir.
+        run: |
+          set -e
+          shopt -s nullglob
+          tarballs=(target/dist/linux/buffr-*-${{ matrix.rpm_arch }}.tar.gz)
+          smoke_dir=$(mktemp -d)
+          tar xzf "${tarballs[0]}" -C "$smoke_dir"
+          bin_dir=$(dirname "$(find "$smoke_dir" -maxdepth 3 -type f -name buffr | head -1)")
+          echo "smoke dir: $bin_dir"
+          "$bin_dir/buffr" --version
+          "$bin_dir/buffr" --help > /dev/null
+          LD_LIBRARY_PATH="$bin_dir" "$bin_dir/buffr-app" --version
+          LD_LIBRARY_PATH="$bin_dir" "$bin_dir/buffr-app" --help > /dev/null
+          echo "linux smoke OK"
+
       - name: validate PKGBUILD
         run: |
           set -e
@@ -486,6 +507,26 @@ jobs:
             exit 1
           fi
           echo "DMG OK: ${dmgs[0]}"
+
+      - name: smoke test mounted DMG
+        # Mount the just-built DMG and invoke both bundled binaries with
+        # --version / --help. Clap derive exits before CEF init, so no
+        # display server / signed entitlements are required. Catches dyld
+        # load failures (framework rpath rot, missing Helper, etc.).
+        run: |
+          set -e
+          shopt -s nullglob
+          dmgs=(target/dist/macos/buffr-*.dmg)
+          mount=/Volumes/BuffrSmoke
+          hdiutil attach "${dmgs[0]}" -mountpoint "$mount" -nobrowse -readonly
+          trap 'hdiutil detach "$mount" -force >/dev/null 2>&1 || true' EXIT
+          app=$(ls -d "$mount"/Buffr.app | head -1)
+          test -n "$app" || { echo "::error::Buffr.app not in DMG"; exit 1; }
+          "$app/Contents/MacOS/buffr" --version
+          "$app/Contents/MacOS/buffr" --help > /dev/null
+          "$app/Contents/MacOS/buffr-app" --version
+          "$app/Contents/MacOS/buffr-app" --help > /dev/null
+          echo "macos smoke OK"
 
       - name: compute sha256 checksum
         shell: bash
@@ -609,6 +650,28 @@ jobs:
           Compress-Archive -Path $bin, $cef -DestinationPath $zipPath -CompressionLevel Optimal
           Write-Host "zip OK: $zipPath"
 
+      - name: smoke test extracted zip
+        # Expand the zip the scoop manifest serves and run both supervisors
+        # with --version / --help. Clap derive exits before CEF init, so
+        # no display is needed. Catches PE link / DLL-search-path / missing
+        # buffr-app.exe regressions on the actual user-installed payload.
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem target\dist\windows\buffr-*.zip | Select-Object -First 1
+          if ($null -eq $zip) { Write-Error "no zip to smoke-test"; exit 1 }
+          $smokeDir = Join-Path $env:RUNNER_TEMP "buffr-smoke"
+          if (Test-Path $smokeDir) { Remove-Item -Recurse -Force $smokeDir }
+          Expand-Archive -Path $zip.FullName -DestinationPath $smokeDir
+          & "$smokeDir\buffr.exe" --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "buffr --version failed ($LASTEXITCODE)"; exit 1 }
+          & "$smokeDir\buffr.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error "buffr --help failed ($LASTEXITCODE)"; exit 1 }
+          & "$smokeDir\buffr-app.exe" --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "buffr-app --version failed ($LASTEXITCODE)"; exit 1 }
+          & "$smokeDir\buffr-app.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error "buffr-app --help failed ($LASTEXITCODE)"; exit 1 }
+          Write-Host "windows smoke OK"
+
       - name: compute sha256 checksums
         shell: pwsh
         run: |
@@ -696,7 +759,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: flatpak/.flatpak-builder
-          key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('flatpak/sh.kryptic.buffr.yml') }}
+          key:
+            flatpak-builder-${{ matrix.arch }}-${{
+            hashFiles('flatpak/sh.kryptic.buffr.yml') }}
           restore-keys: |
             flatpak-builder-${{ matrix.arch }}-
 
@@ -862,8 +927,8 @@ jobs:
       - flatpak
       - snap
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      github.event_name == 'workflow_dispatch' || (github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -1024,7 +1089,10 @@ jobs:
         # `ssh-keyscan` output. `accept-new` writes the AUR host key to
         # known_hosts on first connect; subsequent connects strict-verify.
         env:
-          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+          GIT_SSH_COMMAND:
+            'ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o
+            StrictHostKeyChecking=accept-new -o
+            UserKnownHostsFile=~/.ssh/known_hosts'
         run: |
           set -euo pipefail
           git config --global user.name  "buffr-ci"
@@ -1098,7 +1166,10 @@ jobs:
 
       - name: Push cask to homebrew-tap
         env:
-          GIT_SSH_COMMAND: "ssh -i ~/.ssh/brew -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+          GIT_SSH_COMMAND:
+            'ssh -i ~/.ssh/brew -o IdentitiesOnly=yes -o
+            StrictHostKeyChecking=accept-new -o
+            UserKnownHostsFile=~/.ssh/known_hosts'
         run: |
           set -euo pipefail
           git config --global user.name  "buffr-ci"
@@ -1174,7 +1245,10 @@ jobs:
 
       - name: Push manifest to scoop-bucket
         env:
-          GIT_SSH_COMMAND: "ssh -i ~/.ssh/scoop -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+          GIT_SSH_COMMAND:
+            'ssh -i ~/.ssh/scoop -o IdentitiesOnly=yes -o
+            StrictHostKeyChecking=accept-new -o
+            UserKnownHostsFile=~/.ssh/known_hosts'
         run: |
           set -euo pipefail
           git config --global user.name  "buffr-ci"

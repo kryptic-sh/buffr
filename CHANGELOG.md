@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-05-19
+
+### Added
+
+- Per-platform smoke tests in CI: every release job now extracts the produced
+  artifact (Linux tarball, macOS DMG, Windows zip) and invokes both `buffr` and
+  `buffr-app` with `--version` and `--help` before uploading. Clap exits before
+  CEF init so no display server is required; catches PE/ELF/Mach-O link
+  failures, missing `buffr-app.exe` suffix on Windows, libcef rpath rot on
+  Linux, and dyld framework misses on macOS.
+
+[0.13.9]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.9
+
 ## [0.13.8] - 2026-05-19
 
 ### Fixed
