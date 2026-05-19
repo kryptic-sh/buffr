@@ -583,7 +583,13 @@ impl Renderer {
                 force_fallback_adapter: true,
             }))
         })
-        .context("no suitable wgpu adapter (tried HighPerformance, LowPower, software)")?;
+        .context(
+            "no suitable wgpu adapter found after trying HighPerformance, LowPower, \
+             and software fallback. Install a software Vulkan driver (llvmpipe / \
+             lavapipe): `mesa-vulkan-drivers` on Debian/Ubuntu, `vulkan-swrast` on \
+             Arch, `mesa-vulkan-radeon` / `mesa-vulkan-intel` for hardware. Verify \
+             with `vulkaninfo --summary`.",
+        )?;
         tracing::info!(
             adapter_info = ?adapter.get_info(),
             "wgpu: adapter selected"
