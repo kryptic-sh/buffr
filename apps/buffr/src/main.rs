@@ -63,6 +63,18 @@ struct Cli {
     child_args: Vec<OsString>,
 }
 
+/// `buffr-app` filename with the platform's executable suffix
+/// (`buffr-app.exe` on Windows, `buffr-app` elsewhere). `is_file()`
+/// is exact-name on Windows — joining the unsuffixed string misses
+/// the actual `.exe` and falls through to a misleading PATH error.
+fn child_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "buffr-app.exe"
+    } else {
+        "buffr-app"
+    }
+}
+
 fn resolve_child_bin() -> anyhow::Result<PathBuf> {
     // 1. Env override — for testing / dev.
     if let Ok(val) = std::env::var("BUFFR_CHILD_BIN") {
@@ -74,11 +86,13 @@ fn resolve_child_bin() -> anyhow::Result<PathBuf> {
         return Ok(p);
     }
 
+    let name = child_bin_name();
+
     // 2. Sibling in the same dir as our own exe.
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
     {
-        let candidate = parent.join("buffr-app");
+        let candidate = parent.join(name);
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -89,9 +103,10 @@ fn resolve_child_bin() -> anyhow::Result<PathBuf> {
 }
 
 fn which_buffr() -> anyhow::Result<PathBuf> {
+    let name = child_bin_name();
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("buffr-app");
+        let candidate = dir.join(name);
         if candidate.is_file() {
             return Ok(candidate);
         }
