@@ -505,6 +505,13 @@ fn main() -> Result<()> {
         std::process::exit(exit_code.max(0));
     }
 
+    // Connect to the supervisor's heartbeat socket / named pipe AS EARLY AS
+    // POSSIBLE. The supervisor opens a connect-grace window the moment it
+    // CreateProcess's us, and CEF init / CLI parse / path resolution below
+    // can blow that budget on a cold-disk Windows first-run (scoop / MSI
+    // install on a fresh machine). Drained later by AppState::new.
+    let initial_heartbeat = heartbeat::Heartbeat::try_connect();
+
     // Wrap in Arc<dyn Backend> now that subprocess is handled.
     let backend: Arc<dyn Backend> = Arc::new(cef_backend);
 
@@ -1176,11 +1183,6 @@ fn main() -> Result<()> {
     if let Some(handle) = singleton_handle.take() {
         single_instance::spawn_accept_thread(handle, event_proxy.clone());
     }
-
-    // Connect to the supervisor's heartbeat socket before window creation so
-    // the supervisor's 5 s grace timer starts as early as possible. Returns
-    // None when BUFFR_SUPERVISOR_SOCK is unset (unsupervised run).
-    let initial_heartbeat = heartbeat::Heartbeat::try_connect();
 
     let mut app_state = AppState::new(
         backend,

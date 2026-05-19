@@ -184,7 +184,9 @@ mod unix {
     /// How long to wait for graceful termination before SIGKILL.
     const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
     /// How long to wait for the child to connect to the heartbeat socket.
-    const CONNECT_GRACE: Duration = Duration::from_secs(5);
+    /// Sized to absorb cold-disk first-run setup (CEF lib load, SQLite db
+    /// init, etc.). 5 s was too tight on slower disks.
+    const CONNECT_GRACE: Duration = Duration::from_secs(20);
     /// Additional grace after the child connects before enforcing heartbeat.
     const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
 
@@ -386,8 +388,9 @@ mod unix {
             if crash_times.len() >= CRASH_LIMIT {
                 tracing::error!(
                     "watchdog: {CRASH_LIMIT} crashes/hangs in {WINDOW_SECS}s, \
-                     refusing to restart. \
-                     Check crash logs at ~/.local/share/buffr/crashes/"
+                     refusing to restart. Run buffr-app directly to capture \
+                     its stderr (the supervisor does not redirect it yet): \
+                     `RUST_LOG=debug buffr-app 2>buffr-app.log`"
                 );
                 std::process::exit(1);
             }
@@ -726,8 +729,11 @@ mod windows {
     const CRASH_LIMIT: usize = 3;
     /// Restart cooldown between attempts.
     const RESTART_COOLDOWN: Duration = Duration::from_millis(250);
-    /// How long to wait for the child to connect to the named pipe.
-    const CONNECT_GRACE: Duration = Duration::from_secs(5);
+    /// How long to wait for the child to connect to the named pipe. Sized
+    /// for cold-disk first runs (scoop / MSI install on a fresh Windows
+    /// machine) where CEF library load + SQLite db opens can dominate
+    /// startup. 5 s was too tight under those conditions.
+    const CONNECT_GRACE: Duration = Duration::from_secs(20);
     /// Additional grace after the child connects before enforcing heartbeat.
     const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
 
@@ -963,8 +969,10 @@ mod windows {
             if crash_times.len() >= CRASH_LIMIT {
                 tracing::error!(
                     "watchdog: {CRASH_LIMIT} crashes/hangs in {WINDOW_SECS}s, \
-                     refusing to restart. \
-                     Check crash logs at %APPDATA%\\buffr\\crashes\\"
+                     refusing to restart. Run buffr-app directly from a \
+                     PowerShell prompt to capture its stderr (the supervisor \
+                     does not redirect it yet): \
+                     `$env:RUST_LOG=\"debug\"; buffr-app 2>buffr-app.log`"
                 );
                 std::process::exit(1);
             }
