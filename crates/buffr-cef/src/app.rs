@@ -150,6 +150,16 @@ wrap_app! {
                  AutofillAddressProfileSavePromptNicknameSupport",
             );
             append_switch(command_line, "disable-save-password-bubble");
+            // Force the basic (plaintext) password/cookie store. Linux
+            // Chromium auto-detects org.freedesktop.Secret over D-Bus;
+            // when an SS implementation is present but auth/unlock fails
+            // (common with pass-secret-service, KeePassXC, etc.), Chromium
+            // silently drops cookies rather than persist unencrypted.
+            // Verified: stock chromium reproduces the same 0-cookie bug;
+            // adding this switch restores cookie persistence.
+            // Mirrored in `on_before_child_process_launch` because CEF
+            // does not propagate user-added switches to subprocesses.
+            append_switch_with_value(command_line, "password-store", "basic");
             // GPU compositing: turn on the page compositor on the GPU even in
             // OSR mode. Without these, chrome://gpu reports "Software only"
             // for canvas, WebGL, and video decode. CEF's OSR mode does NOT
@@ -217,6 +227,21 @@ wrap_browser_process_handler! {
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
             tracing::trace!(delay_ms, "cef: schedule message pump work");
             NEXT_MESSAGE_PUMP_DELAY_MS.store(delay_ms.max(0), Ordering::SeqCst);
+        }
+
+        fn on_before_child_process_launch(
+            &self,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            let Some(command_line) = command_line else { return };
+            // Propagate --password-store=basic to every child process
+            // (renderer, GPU, utility, zygote). On Linux, Chromium's OSCrypt
+            // probes for Secret Service in whichever subprocess actually
+            // performs the cookie write. CEF doesn't auto-propagate this
+            // switch from the browser process command line, so without this
+            // hook subprocesses fall back to OSCrypt's keyring auto-detect
+            // and silently drop cookies when Secret Service unlock fails.
+            append_switch_with_value(command_line, "password-store", "basic");
         }
     }
 }
