@@ -590,10 +590,29 @@ jobs:
           Write-Host "MSI OK: $($msis[0].FullName)"
         shell: powershell
 
+      - name: package zip from staged payload
+        # Reuse the payload-bin + payload-cef trees staged by
+        # package-windows-msi. Zip filename mirrors the MSI so the scoop
+        # manifest + sha256 sidecar pair line up: buffr-X.Y.Z-{x64|arm64}.zip.
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem target\dist\windows\buffr-*.msi | Select-Object -First 1
+          if ($null -eq $msi) {
+            Write-Error "no MSI found to derive zip name from"
+            exit 1
+          }
+          $zipName = $msi.Name -replace '\.msi$', '.zip'
+          $zipPath = Join-Path target\dist\windows $zipName
+          if (Test-Path $zipPath) { Remove-Item $zipPath }
+          $bin = "target\dist\windows\payload-bin\*"
+          $cef = "target\dist\windows\payload-cef\*"
+          Compress-Archive -Path $bin, $cef -DestinationPath $zipPath -CompressionLevel Optimal
+          Write-Host "zip OK: $zipPath"
+
       - name: compute sha256 checksums
         shell: pwsh
         run: |
-          Get-ChildItem target\dist\windows\buffr-*.msi | ForEach-Object {
+          Get-ChildItem target\dist\windows\buffr-*.msi, target\dist\windows\buffr-*.zip | ForEach-Object {
             $f = $_.FullName
             $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
             $name = $_.Name
@@ -601,13 +620,15 @@ jobs:
             Write-Host "sha256: $hash  $name"
           }
 
-      - name: upload msi
+      - name: upload msi + zip
         uses: actions/upload-artifact@v7
         with:
           name: buffr-windows-msi-${{ matrix.platform }}
           path: |
             target/dist/windows/buffr-*.msi
             target/dist/windows/buffr-*.msi.sha256
+            target/dist/windows/buffr-*.zip
+            target/dist/windows/buffr-*.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -897,6 +918,8 @@ jobs:
             dist/buffr-*.dmg.sha256
             dist/buffr-*.msi
             dist/buffr-*.msi.sha256
+            dist/buffr-*.zip
+            dist/buffr-*.zip.sha256
             dist/buffr-*.flatpak
             dist/buffr-*.flatpak.sha256
             dist/buffr-*.snap
@@ -1087,6 +1110,82 @@ jobs:
           git add Casks/buffr.rb
           if git diff --cached --quiet; then
             echo "no changes vs current tap head; nothing to push"
+            exit 0
+          fi
+          git commit -m "buffr ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main
+
+  scoop-bucket:
+    # Scoop manifest auto-publish to kryptic-sh/scoop-bucket. Fetches the
+    # Windows x64 + arm64 zip sha256 sidecars off the release, renders
+    # pkg/scoop/buffr.json.in, and pushes to the bucket repo over SSH.
+    # Runs after `publish-github-release` so the zips + sidecars are
+    # guaranteed to be uploaded before we fetch.
+    #
+    # Required org/repo secret (SELECTED-scope — must be granted to this repo):
+    #   SCOOP_SSH_KEY  — ed25519 private key whose public half is a deploy key
+    #                    with write access on kryptic-sh/scoop-bucket.
+    name: Publish buffr manifest to scoop-bucket
+    needs: [publish-github-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch zip sha256 sidecars
+        id: sha
+        run: |
+          set -euo pipefail
+          V="${{ steps.tag.outputs.version }}"
+          BASE="https://github.com/kryptic-sh/buffr/releases/download/v${V}"
+          curl -fsSL "$BASE/buffr-${V}-x64.zip.sha256"   -o sha.x64
+          curl -fsSL "$BASE/buffr-${V}-arm64.zip.sha256" -o sha.arm64
+          echo "x64=$(awk '{print $1}' sha.x64)"     >> "$GITHUB_OUTPUT"
+          echo "arm64=$(awk '{print $1}' sha.arm64)" >> "$GITHUB_OUTPUT"
+
+      - name: Render manifest
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          sed \
+            -e "s|{VERSION}|${{ steps.tag.outputs.version }}|g" \
+            -e "s|{SHA256_X64}|${{ steps.sha.outputs.x64 }}|g" \
+            -e "s|{SHA256_ARM64}|${{ steps.sha.outputs.arm64 }}|g" \
+            pkg/scoop/buffr.json.in > out/buffr.json
+          echo "--- rendered manifest ---"
+          cat out/buffr.json
+
+      - name: Configure SSH for scoop-bucket
+        env:
+          SCOOP_SSH_KEY: ${{ secrets.SCOOP_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -dm700 ~/.ssh
+          printf '%s\n' "$SCOOP_SSH_KEY" > ~/.ssh/scoop
+          chmod 600 ~/.ssh/scoop
+
+      - name: Push manifest to scoop-bucket
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/scoop -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+        run: |
+          set -euo pipefail
+          git config --global user.name  "buffr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone git@github.com:kryptic-sh/scoop-bucket.git bucket
+          mkdir -p bucket/bucket
+          cp out/buffr.json bucket/bucket/buffr.json
+          cd bucket
+          git add bucket/buffr.json
+          if git diff --cached --quiet; then
+            echo "no changes vs current bucket head; nothing to push"
             exit 0
           fi
           git commit -m "buffr ${{ steps.tag.outputs.version }}"
