@@ -553,12 +553,41 @@ impl Renderer {
             .create_surface(window.clone())
             .context("create wgpu surface")?;
 
+        // Adapter selection ladder: prefer HighPerformance (discrete GPU /
+        // hardware Vulkan), fall back to LowPower (integrated), finally
+        // force a fallback adapter (llvmpipe / SwiftShader / software path)
+        // so machines with broken Vulkan + broken DRI2 + no usable GL still
+        // boot. Better to render slowly via CPU than refuse to start.
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
-        .context("no suitable wgpu adapter")?;
+        .or_else(|_| {
+            tracing::warn!(
+                "wgpu: HighPerformance adapter unavailable; trying LowPower"
+            );
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            }))
+        })
+        .or_else(|_| {
+            tracing::warn!(
+                "wgpu: no hardware adapter; falling back to software (llvmpipe / SwiftShader)"
+            );
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: true,
+            }))
+        })
+        .context("no suitable wgpu adapter (tried HighPerformance, LowPower, software)")?;
+        tracing::info!(
+            adapter_info = ?adapter.get_info(),
+            "wgpu: adapter selected"
+        );
 
         let (device_raw, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {

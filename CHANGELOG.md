@@ -8,6 +8,20 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-05-19
+
+### Fixed
+
+- wgpu adapter selection now falls back through a ladder
+  (HighPerformance → LowPower → software/llvmpipe) instead of bailing
+  with `no suitable wgpu adapter` on the first miss. Machines with
+  broken Vulkan + broken DRI2 + no usable GL (older hardware, drivers
+  in transition) now boot via the software path rather than refusing
+  to start. Logs the selected `AdapterInfo` so triage shows backend +
+  driver at a glance.
+
+[0.13.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.3
+
 ## [0.13.2] - 2026-05-19
 
 ### Fixed
