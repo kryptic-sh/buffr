@@ -8,6 +8,25 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-05-19
+
+### Fixed
+
+- Windows supervisor (`buffr.exe`) couldn't locate `buffr-app.exe` either as a
+  sibling or on `PATH` because the resolver joined the bare string `"buffr-app"`
+  and `is_file()` is exact-name on Windows. Now joins `buffr-app.exe` when
+  `cfg!(windows)`. Scoop / MSI installs launch correctly.
+
+### Changed
+
+- Scoop manifest now exposes only `buffr.exe` as a `bin` / shortcut.
+  `buffr-app.exe` and `buffr-helper.exe` were also shimmed at v0.13.5, which let
+  users double-click `buffr-app.exe` directly and land on a white screen (the
+  supervisor is the only supported entry point — it owns the crash-restart +
+  heartbeat watchdog).
+
+[0.13.6]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.6
+
 ## [0.13.5] - 2026-05-19
 
 ### Added
