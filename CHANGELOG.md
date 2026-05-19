@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-05-19
+
 ### Added
 
 - Scoop manifest pipeline. Windows packaging now produces a `.zip` payload
@@ -17,6 +19,8 @@ and this project adheres to
   and pushes the manifest to `kryptic-sh/scoop-bucket` so
   `scoop install kryptic/buffr` resolves. Requires `SCOOP_SSH_KEY` secret
   granted to the repo.
+
+[0.13.5]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.5
 
 ## [0.13.4] - 2026-05-19
 
