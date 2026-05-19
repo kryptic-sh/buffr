@@ -417,6 +417,18 @@ jobs:
           "$bin_dir/buffr" --help > /dev/null
           LD_LIBRARY_PATH="$bin_dir" "$bin_dir/buffr-app" --version
           LD_LIBRARY_PATH="$bin_dir" "$bin_dir/buffr-app" --help > /dev/null
+          # buffr-helper has no clap. Bare invocation calls load_cef_library
+          # then execute_subprocess; with no `--type=` arg cef returns -1
+          # which Rust's process::exit converts to 255 on unix. Anything
+          # else (1 = framework load failed, 139 = segfault) is a regression.
+          set +e
+          LD_LIBRARY_PATH="$bin_dir" "$bin_dir/buffr-helper"
+          helper_rc=$?
+          set -e
+          if [ "$helper_rc" -ne 255 ]; then
+            echo "::error::buffr-helper exited $helper_rc, expected 255 (no-type path)"
+            exit 1
+          fi
           echo "linux smoke OK"
 
       - name: validate PKGBUILD
@@ -526,6 +538,22 @@ jobs:
           "$app/Contents/MacOS/buffr" --help > /dev/null
           "$app/Contents/MacOS/buffr-app" --version
           "$app/Contents/MacOS/buffr-app" --help > /dev/null
+          # buffr-helper has no clap. Bare invocation runs the CEF subprocess
+          # path; without `--type=` cef returns -1 → Rust exit 255. Anything
+          # else means framework rpath rot, missing Mach-O, signing strip, etc.
+          # Catch-all helper bundle is `Buffr Helper.app` (no suffix) and the
+          # Mach-O inside is "Buffr Helper" (with space) per Apple's distinct-
+          # executable rule.
+          helper_exec="$app/Contents/Frameworks/Buffr Helper.app/Contents/MacOS/Buffr Helper"
+          test -x "$helper_exec" || { echo "::error::Buffr Helper Mach-O missing: $helper_exec"; exit 1; }
+          set +e
+          "$helper_exec"
+          helper_rc=$?
+          set -e
+          if [ "$helper_rc" -ne 255 ]; then
+            echo "::error::Buffr Helper exited $helper_rc, expected 255 (no-type path)"
+            exit 1
+          fi
           echo "macos smoke OK"
 
       - name: compute sha256 checksum
@@ -670,6 +698,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "buffr-app --version failed ($LASTEXITCODE)"; exit 1 }
           & "$smokeDir\buffr-app.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { Write-Error "buffr-app --help failed ($LASTEXITCODE)"; exit 1 }
+          # buffr-helper has no clap. Bare invocation runs the CEF subprocess
+          # path; without `--type=` cef returns -1 → Rust exit -1 (0xFFFFFFFF).
+          # PowerShell surfaces it as -1. Catches libcef.dll search-path /
+          # PE link regressions on the actual user-installed payload.
+          & "$smokeDir\buffr-helper.exe"
+          if ($LASTEXITCODE -ne -1) {
+            Write-Error "buffr-helper exited $LASTEXITCODE, expected -1 (no-type path)"
+            exit 1
+          }
           Write-Host "windows smoke OK"
 
       - name: compute sha256 checksums

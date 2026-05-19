@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.10] - 2026-05-19
+
+### Added
+
+- CI smoke now also exercises `buffr-helper` on all three platforms (Linux
+  tarball, macOS DMG, Windows zip). Helper has no clap CLI; bare invocation
+  loads `libcef` then calls `execute_subprocess`, which returns `-1` for the
+  no-`--type=` path (Rust exit 255 on unix, -1 on Windows). Catches framework
+  rpath rot on macOS (`Buffr Helper.app/Contents/MacOS/Buffr Helper`), libcef
+  RPATH on Linux, and DLL search-path regressions on Windows.
+
+[0.13.10]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.10
+
 ## [0.13.9] - 2026-05-19
 
 ### Added
