@@ -8,7 +8,7 @@ and this project adheres to
 
 ## [Unreleased]
 
-## [0.13.7] - 2026-05-19
+## [0.13.8] - 2026-05-19
 
 ### Fixed
 
@@ -20,14 +20,17 @@ and this project adheres to
     Hoisted to immediately after the CEF subprocess short-circuit so the
     named-pipe / UDS connect happens before any heavy work.
   - Supervisor `CONNECT_GRACE` was 5 s on both Unix and Windows. Raised to 20 s
-    — fits the worst observed cold-cache first run.
+    — fits the worst observed cold-cache first run. The 20 s default is
+    overridable via `BUFFR_CONNECT_GRACE_MS` so integration tests stay bounded
+    (the `heartbeat_no_connect` integration test would otherwise wedge nextest's
+    60 s per-test timeout).
 - Supervisor watchdog error message pointed users at a non-existent
   `~/.local/share/buffr/crashes/` (or `%APPDATA%\buffr\crashes\`) path — the
   supervisor never wrote anything there. Replaced with a concrete command for
   capturing buffr-app's stderr directly. A proper supervisor-side child-stderr
   redirect remains a TODO.
 
-[0.13.7]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.7
+[0.13.8]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.8
 
 ## [0.13.6] - 2026-05-19
 
