@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-05-19
+
+### Changed
+
+- `no suitable wgpu adapter` error now names the actual fix: install a
+  software Vulkan driver. Lists the package names for Arch
+  (`vulkan-swrast`, `vulkan-intel`, etc.), Debian/Ubuntu
+  (`mesa-vulkan-drivers`), and the `vulkaninfo --summary` verification
+  command. Saves a round-trip to the issue tracker for users on
+  un-configured Vulkan stacks.
+
+[0.13.4]: https://github.com/kryptic-sh/buffr/releases/tag/v0.13.4
+
 ## [0.13.3] - 2026-05-19
 
 ### Fixed
