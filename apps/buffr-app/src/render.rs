@@ -543,39 +543,36 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Construct the renderer against any combination of window +
-    /// display handles. winit callers pass the same `&Window` twice
-    /// (it impls both traits); wayr callers pass `&Toplevel` for the
-    /// window and `&EventLoop<_>` for the display.
+    /// Construct the renderer from a window source that implements
+    /// both [`HasWindowHandle`] and [`HasDisplayHandle`] and is
+    /// `Send + Sync + 'static`. wayr v0.1.4+ satisfies that for
+    /// `Arc<wayr::Toplevel>` — pass `Arc::clone(&window)`. winit's
+    /// `Arc<winit::Window>` works the same way.
     ///
     /// `initial_physical_size` is the framebuffer size in physical
-    /// pixels — winit gets it from `window.inner_size()`, wayr from
-    /// `toplevel.physical_size()`. Pulled out of the renderer so the
-    /// migration off winit doesn't churn this constructor again.
-    pub fn new<W: HasWindowHandle, D: HasDisplayHandle>(
-        window: &W,
-        display: &D,
-        initial_physical_size: (u32, u32),
-    ) -> Result<Self> {
+    /// pixels — wayr's `toplevel.physical_size()` returns it; winit's
+    /// `window.inner_size()` returns the equivalent. Passing it
+    /// explicitly avoids re-deriving from the window source so this
+    /// constructor doesn't change shape when a port lands.
+    ///
+    /// The Arc is passed to wgpu's safe surface-creation path so wgpu
+    /// holds its own ref — that keeps the underlying window object
+    /// alive across wgpu's Surface drop, fixing a teardown SIGSEGV
+    /// where the wl_* objects would otherwise be destroyed out from
+    /// under wgpu's Vulkan cleanup. Don't switch back to
+    /// `create_surface_unsafe` with raw handles unless wayr regresses.
+    pub fn new<W>(window: Arc<W>, initial_physical_size: (u32, u32)) -> Result<Self>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
-        let wh = window.window_handle().context("window_handle")?;
-        let dh = display.display_handle().context("display_handle")?;
-        // SAFETY: the raw handles borrow `window` + `display`; the
-        // resulting `wgpu::Surface<'static>` outlives them in
-        // principle, but the caller owns both — Renderer is held in
-        // App alongside the window, dropped first.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(dh.as_raw()),
-                    raw_window_handle: wh.as_raw(),
-                })
-                .context("create wgpu surface")?
-        };
+        let surface = instance
+            .create_surface(window)
+            .context("create wgpu surface")?;
 
         // Adapter selection ladder: prefer HighPerformance (discrete GPU /
         // hardware Vulkan), fall back to LowPower (integrated), finally

@@ -127,8 +127,9 @@ strip = "symbols"
 
 
 # TEMP: patch wayr to the sibling kryptic-sh/wayr checkout while
-# v0.1.3 is in flight on crates.io (fixes spurious resize storms
-# on focus changes). Remove once v0.1.3 is live and the dep range
-# below picks it up.
+# v0.1.4 is in flight on crates.io (Toplevel Send+Sync +
+# HasDisplayHandle so Arc<Toplevel> satisfies wgpu's safe
+# create_surface bound — fixes shutdown SIGSEGV). Remove once
+# 0.1.4 is live and the dep range below picks it up.
 [patch.crates-io]
 wayr = { path = "../wayr" }

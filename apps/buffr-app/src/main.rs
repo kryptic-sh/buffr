@@ -1266,41 +1266,23 @@ fn main() -> Result<()> {
     drop(app_state.engine_router.take());
     app_state.engines.clear();
 
-    // Renderer + popup renderers are intentionally LEAKED via
-    // mem::forget on the shutdown path. The process is about to call
-    // libc::_exit(0) at the bottom of this function — the kernel
-    // reclaims GPU file descriptors + memory unconditionally.
+    // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
+    // same EGL / GL / Vulkan driver state on Linux; tearing down
+    // wgpu after CEF has dismantled the GPU process segfaults.
     //
-    // Why leak instead of drop? Phase B of the winit → wayr port
-    // switched wgpu Surface construction from
-    // `instance.create_surface(Arc<Window>)` (safe, wgpu held an
-    // Arc keeping the window source alive across its own drop) to
-    // `instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle{..})`
-    // because wayr's Toplevel is !Send + !Sync (Rc internals). The
-    // unsafe path leaves wgpu without any owning reference to the
-    // window source — its drop path now SIGSEGVs ~6s into Vulkan
-    // teardown when the wl_display / wl_surface objects underneath
-    // outlive into a state wgpu doesn't expect (observed: exit 139
-    // immediately after "shutdown: dropping renderer" log).
-    //
-    // We can't trivially go back to the safe path without making
-    // wayr Toplevel Send + Sync (much larger wayr-side change).
-    // Skipping the drop is the right call: there's no leak in
-    // practice — the process is exiting. CEF runs in a separate
-    // GPU process, so wgpu not destructing doesn't fight CEF's
-    // teardown either (the original "wgpu BEFORE CEF" comment was
-    // about destructive driver-state ordering on Linux — if wgpu
-    // never destructs, there's nothing to order).
-    info!("shutdown: leaking renderer + popup renderers (kernel reclaims on _exit)");
-    if let Some(r) = app_state.renderer.take() {
-        std::mem::forget(r);
-    }
-    // Drain popups out of the HashMap and forget each, so the
-    // HashMap::clear() in app_state's drop later doesn't trip the
-    // same wgpu teardown path.
-    for (_, popup) in app_state.popups.drain() {
-        std::mem::forget(popup);
-    }
+    // Works cleanly with wayr ≥ 0.1.4 because Toplevel is now
+    // Send + Sync + 'static and impls HasDisplayHandle, so
+    // Renderer::new takes Arc<Toplevel> via wgpu's safe
+    // `instance.create_surface(arc)` path. wgpu holds its own ref;
+    // the Toplevel survives wgpu's Surface drop and the
+    // wl_surface.destroy() in Toplevel::drop runs after Vulkan
+    // teardown completes. Prior to 0.1.4 we had to leak this path
+    // because wgpu's Vulkan Surface drop SIGSEGVed when the
+    // wl_* objects were destroyed mid-teardown.
+    info!("shutdown: dropping renderer");
+    drop(app_state.renderer.take());
+    info!("shutdown: dropping popup renderers");
+    app_state.popups.clear();
 
     // -------- clear-on-exit --------
     //
@@ -7554,10 +7536,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         }
 
         // Initialise wgpu renderer. On failure, log and exit — there is
-        // no CPU-only fallback in this code path.
+        // no CPU-only fallback in this code path. Pass an Arc clone so
+        // wgpu holds its own ref and the Toplevel survives wgpu's
+        // Surface drop (fixes the shutdown SIGSEGV that the leak
+        // workaround in run_browser used to paper over).
         let win_size = window.physical_size();
-        match crate::render::Renderer::new(&*window, event_loop, (win_size.width, win_size.height))
-        {
+        match crate::render::Renderer::new(Arc::clone(&window), (win_size.width, win_size.height)) {
             Ok(r) => self.renderer = Some(r),
             Err(err) => {
                 warn!(error = %err, "wgpu renderer init failed");
@@ -8752,10 +8736,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
             };
             let popup_size = popup_win.physical_size();
-            // EventLoop implements HasDisplayHandle; Toplevel implements HasWindowHandle.
             let popup_renderer = match crate::render::Renderer::new(
-                &*popup_win,
-                event_loop,
+                Arc::clone(&popup_win),
                 (popup_size.width, popup_size.height),
             ) {
                 Ok(r) => r,
