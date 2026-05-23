@@ -125,3 +125,10 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+
+# TEMP: patch wayr to the sibling kryptic-sh/wayr checkout while
+# v0.1.3 is in flight on crates.io (fixes spurious resize storms
+# on focus changes). Remove once v0.1.3 is live and the dep range
+# below picks it up.
+[patch.crates-io]
+wayr = { path = "../wayr" }
