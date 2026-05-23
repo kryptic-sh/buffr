@@ -16,6 +16,10 @@ default = []
 # can wire raw key events into the engine without re-implementing the
 # mapping. Optional because the engine itself is winit-agnostic.
 winit = ["dep:winit"]
+# Bring in the wayr `KeyEvent` → `KeyChord` adapter. Parallel to the
+# `winit` feature; pulls in `wayr` instead. `buffr-app` enables this
+# after the migration from winit lands.
+wayr = ["dep:wayr"]
 
 [dependencies]
 anyhow = "1"
@@ -39,6 +43,10 @@ crossterm = "0.29.0"
 # `winit_adapter` module that converts `winit::event::KeyEvent` into
 # our internal `KeyChord`. The engine itself stays winit-agnostic.
 winit = { version = "0.30", optional = true, default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
+
+# Optional: only enabled by the `wayr` feature. Used by the
+# `wayr_adapter` module — parallel to `winit_adapter`.
+wayr = { version = "0.1", optional = true }
 
 [dev-dependencies]
 toml = "1.1"

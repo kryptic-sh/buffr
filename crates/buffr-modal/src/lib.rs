@@ -32,6 +32,11 @@ pub mod keymap;
 #[cfg(feature = "winit")]
 pub mod winit_adapter;
 
+/// wayr `KeyEvent` → [`KeyChord`] adapter. Gated behind the `wayr`
+/// Cargo feature; parallel to [`winit_adapter`].
+#[cfg(feature = "wayr")]
+pub mod wayr_adapter;
+
 pub use actions::{Mode, PageAction, PageMode};
 pub use edit_mode::EditSession;
 pub use engine::{DEFAULT_TIMEOUT, EditModeStep, Engine, Step};
@@ -46,3 +51,9 @@ pub use hjkl_engine::{Modifiers as EngineModifiers, PlannedInput, SpecialKey, Vi
 
 #[cfg(feature = "winit")]
 pub use winit_adapter::{key_event_to_chord, key_event_to_chord_with_repeat};
+
+#[cfg(feature = "wayr")]
+pub use wayr_adapter::{
+    key_event_to_chord as wayr_key_event_to_chord,
+    key_event_to_chord_with_repeat as wayr_key_event_to_chord_with_repeat,
+};
