@@ -8268,6 +8268,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 host.osr_mouse_wheel(bx, by, dx, dy, mods);
             }
             WindowEvent::Key(event) => {
+                // wayr's KeyEvent carries the modifier state inline
+                // (winit's separate ModifiersChanged event doesn't
+                // exist here). Sync `self.modifiers` from the event
+                // FIRST so every downstream consumer that still reads
+                // the cached field (CEF VK forwarding, edit-mode
+                // chord routing, pointer paths between key events)
+                // sees the live state. Without this, holding Ctrl
+                // and pressing X arrived as `mods=(false, …)` and
+                // CEF saw an unmodified VK_X.
+                self.modifiers = event.modifiers;
                 // Pinned-close confirmation takes precedence over
                 // everything else: `y` or `<Enter>` confirms, `n` /
                 // `<Esc>` dismisses. Other keys are swallowed so the
