@@ -3342,6 +3342,18 @@ impl AppState {
         if let Some(path) = self.crash_guard_path.as_ref() {
             crash_guard::record_clean_exit(path);
         }
+        // Also signal intent to the supervisor via the path it set in
+        // BUFFR_SUPERVISOR_CLEAN_FLAG. Touching the file tells the
+        // supervisor to treat the subsequent process exit as
+        // intentional even if CEF / wgpu teardown segfaults on the
+        // way out — without this, exit 139 would trigger a respawn
+        // immediately after the user closed the window.
+        if let Ok(path) = std::env::var("BUFFR_SUPERVISOR_CLEAN_FLAG")
+            && !path.is_empty()
+            && let Err(err) = std::fs::write(&path, b"")
+        {
+            tracing::warn!(error = %err, path, "shutdown: failed to write supervisor clean flag");
+        }
     }
 
     /// Persist the live tab list synchronously. Called on graceful

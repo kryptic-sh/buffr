@@ -202,6 +202,14 @@ mod unix {
     /// Env var name written into the child's environment with the UDS path.
     pub const SUPERVISOR_SOCK_ENV: &str = "BUFFR_SUPERVISOR_SOCK";
 
+    /// Env var name written into the child's environment with a path the
+    /// child should touch when it wants the supervisor to treat the
+    /// subsequent process exit as a clean shutdown (don't restart),
+    /// regardless of the actual exit status. Used so a slow CEF /
+    /// wgpu teardown that happens to segfault on the way out doesn't
+    /// trigger a respawn after the user explicitly closed the window.
+    pub const SUPERVISOR_CLEAN_FLAG_ENV: &str = "BUFFR_SUPERVISOR_CLEAN_FLAG";
+
     /// Events the heartbeat listener thread sends back to the main loop.
     pub enum HeartbeatEvent {
         /// Child successfully connected.
@@ -249,9 +257,30 @@ mod unix {
                 }
             };
 
+            // ── clean-shutdown flag path ──────────────────────────────────
+            // Sibling of the heartbeat socket; supervisor owns it. Child
+            // touches the file when it's about to do an intentional
+            // exit; supervisor checks it after the child exits and
+            // suppresses restart when present, regardless of the
+            // actual exit status. Each spawn gets a fresh path so a
+            // stale flag from a prior child can't suppress a real
+            // crash restart.
+            let clean_flag_path = sock_path.as_ref().map(|p| {
+                let mut q = p.clone();
+                q.set_extension("clean");
+                // Remove any stale flag from a prior spawn.
+                let _ = std::fs::remove_file(&q);
+                q
+            });
+
             // ── spawn child ───────────────────────────────────────────────
             let spawn_time = Instant::now();
-            let mut cmd = build_command(&child_bin, &child_args, sock_path.as_deref());
+            let mut cmd = build_command(
+                &child_bin,
+                &child_args,
+                sock_path.as_deref(),
+                clean_flag_path.as_deref(),
+            );
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
@@ -346,13 +375,29 @@ mod unix {
             }
 
             // ── decide whether to restart ─────────────────────────────────
-            let is_clean = status.as_ref().and_then(|s| s.code()) == Some(0) && !hang_detected;
+            // "Clean" means EITHER exit code 0 with no hang, OR the
+            // child touched the clean-shutdown flag before exiting
+            // (covers segfaults during CEF / wgpu teardown after the
+            // user explicitly closed the window — see the
+            // `SUPERVISOR_CLEAN_FLAG_ENV` doc).
+            let exit_zero = status.as_ref().and_then(|s| s.code()) == Some(0) && !hang_detected;
+            let flag_present = clean_flag_path
+                .as_ref()
+                .is_some_and(|p| p.exists());
+            // Remove the flag eagerly — whether or not we restart, the
+            // next spawn re-creates its own.
+            if let Some(ref p) = clean_flag_path {
+                let _ = std::fs::remove_file(p);
+            }
+            let is_clean = exit_zero || flag_present;
 
             if is_clean {
                 tracing::info!(
                     pid = %child_pid,
                     elapsed_ms = elapsed.as_millis(),
-                    "child exited cleanly (exit 0); supervisor done"
+                    exit_zero,
+                    flag_present,
+                    "child exited cleanly; supervisor done"
                 );
                 return Ok(());
             }
@@ -621,6 +666,7 @@ mod unix {
         bin: &PathBuf,
         args: &[OsString],
         sock_path: Option<&std::path::Path>,
+        clean_flag_path: Option<&std::path::Path>,
     ) -> std::process::Command {
         use std::os::unix::process::CommandExt;
 
@@ -630,6 +676,13 @@ mod unix {
         // Pass the socket path to the child via env var (if heartbeat active).
         if let Some(path) = sock_path {
             cmd.env(SUPERVISOR_SOCK_ENV, path);
+        }
+
+        // Pass the clean-shutdown flag path so the child can signal
+        // intentional close. Supervisor reads it on exit; presence
+        // overrides exit-status crash detection.
+        if let Some(path) = clean_flag_path {
+            cmd.env(SUPERVISOR_CLEAN_FLAG_ENV, path);
         }
 
         // setsid: child becomes session leader + new process group.
