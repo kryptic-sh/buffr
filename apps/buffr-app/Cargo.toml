@@ -43,7 +43,7 @@ cef.workspace = true
 # (fixes shutdown SIGSEGV). 0.1.3 dedupes spurious Resized on focus
 # changes. 0.1.2 filters ASCII control chars from KeyEvent::text.
 # 0.1.1 fixed request_redraw being a no-op. All are required.
-wayr = { version = "0.1.4", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
+wayr = { version = "0.1.5", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
 raw-window-handle.workspace = true
 clap.workspace = true
 tempfile.workspace = true

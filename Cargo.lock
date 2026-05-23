@@ -5287,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "wayr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitflags 2.11.1",
  "calloop 0.14.4",
