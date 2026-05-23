@@ -5794,15 +5794,29 @@ impl AppState {
             super_: modifiers.logo,
         };
         // Try text first (handles regular printable characters).
+        // Caveat: xkbcommon also emits text for control keys
+        // (Return → "\r", BackSpace → "\u{8}", Escape → "\u{1b}", …).
+        // Routing those through `PlannedInput::Char` would feed
+        // literal `\r` / `\u{8}` to the hjkl engine instead of the
+        // `SpecialKey` chord it expects (`Esc` exits insert mode!),
+        // so when `text` is a single ASCII control character, fall
+        // through to the named-key path below.
         if let Some(text) = event.text.as_deref() {
             let mut chars = text.chars();
             let first = chars.next()?;
             if chars.next().is_some() {
                 return None; // multi-char text (e.g. IME) — skip
             }
-            return Some(PlannedInput::Char(first, mods));
+            let is_ascii_control = (first as u32) < 0x20 || (first as u32) == 0x7f;
+            if !is_ascii_control {
+                return Some(PlannedInput::Char(first, mods));
+            }
+            // ASCII control chars fall through to the named-key path
+            // so the engine sees `SpecialKey::Esc` / `Backspace` /
+            // `Enter` / `Tab` / `Delete` instead of literal control
+            // characters.
         }
-        // No text — check for named keys via xkb keysym name.
+        // No printable text — check for named keys via xkb keysym name.
         use wayr::KeyCode;
         match &event.key_code {
             KeyCode::Named(name) => {
