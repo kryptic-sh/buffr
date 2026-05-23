@@ -1266,14 +1266,41 @@ fn main() -> Result<()> {
     drop(app_state.engine_router.take());
     app_state.engines.clear();
 
-    // Drop the wgpu renderer BEFORE cef::shutdown(). Both touch the
-    // same EGL / GL / Vulkan driver state on Linux; tearing down
-    // wgpu after CEF has dismantled the GPU process segfaults.
-    info!("shutdown: dropping renderer");
-    drop(app_state.renderer.take());
-    // Drop all popup renderers for the same reason.
-    info!("shutdown: dropping popup renderers");
-    app_state.popups.clear();
+    // Renderer + popup renderers are intentionally LEAKED via
+    // mem::forget on the shutdown path. The process is about to call
+    // libc::_exit(0) at the bottom of this function — the kernel
+    // reclaims GPU file descriptors + memory unconditionally.
+    //
+    // Why leak instead of drop? Phase B of the winit → wayr port
+    // switched wgpu Surface construction from
+    // `instance.create_surface(Arc<Window>)` (safe, wgpu held an
+    // Arc keeping the window source alive across its own drop) to
+    // `instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle{..})`
+    // because wayr's Toplevel is !Send + !Sync (Rc internals). The
+    // unsafe path leaves wgpu without any owning reference to the
+    // window source — its drop path now SIGSEGVs ~6s into Vulkan
+    // teardown when the wl_display / wl_surface objects underneath
+    // outlive into a state wgpu doesn't expect (observed: exit 139
+    // immediately after "shutdown: dropping renderer" log).
+    //
+    // We can't trivially go back to the safe path without making
+    // wayr Toplevel Send + Sync (much larger wayr-side change).
+    // Skipping the drop is the right call: there's no leak in
+    // practice — the process is exiting. CEF runs in a separate
+    // GPU process, so wgpu not destructing doesn't fight CEF's
+    // teardown either (the original "wgpu BEFORE CEF" comment was
+    // about destructive driver-state ordering on Linux — if wgpu
+    // never destructs, there's nothing to order).
+    info!("shutdown: leaking renderer + popup renderers (kernel reclaims on _exit)");
+    if let Some(r) = app_state.renderer.take() {
+        std::mem::forget(r);
+    }
+    // Drain popups out of the HashMap and forget each, so the
+    // HashMap::clear() in app_state's drop later doesn't trip the
+    // same wgpu teardown path.
+    for (_, popup) in app_state.popups.drain() {
+        std::mem::forget(popup);
+    }
 
     // -------- clear-on-exit --------
     //
