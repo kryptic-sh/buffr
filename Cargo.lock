@@ -548,7 +548,6 @@ dependencies = [
  "wayland-protocols",
  "wayland-sys",
  "windows-sys 0.61.2",
- "winit",
  "zbus",
 ]
 
@@ -603,7 +602,6 @@ dependencies = [
  "wayland-protocols",
  "wayland-sys",
  "windows-sys 0.61.2",
- "winit",
  "zbus",
 ]
 

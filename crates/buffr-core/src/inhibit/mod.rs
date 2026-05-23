@@ -2,9 +2,11 @@
 //! by the apps layer when a video is playing in the focused window.
 //!
 //! Each platform impl is gated behind `cfg(target_os = ...)`. Construction
-//! goes through [`new_inhibitor`] which the apps layer calls with the active
-//! winit window. [`IdleInhibitor::acquire`] and [`IdleInhibitor::release`]
-//! are idempotent — repeated `acquire()` calls are safe.
+//! goes through [`new_inhibitor`] which the apps layer calls with the raw
+//! `wl_display` + `wl_surface` pointers from the host windowing layer
+//! (wayr on Linux; the pointers are ignored on macOS and Windows).
+//! [`IdleInhibitor::acquire`] and [`IdleInhibitor::release`] are
+//! idempotent — repeated `acquire()` calls are safe.
 //!
 //! ## Platform status
 //!
@@ -15,9 +17,7 @@
 //! | Windows         | `SetThreadExecutionState`      | implemented |
 //! | Other           | no-op fallback                 | returns Ok     |
 
-use std::sync::Arc;
-
-use winit::window::Window;
+use std::ffi::c_void;
 
 /// Errors that idle-inhibit operations can produce.
 #[derive(Debug)]
@@ -58,23 +58,44 @@ pub trait IdleInhibitor: Send + Sync {
     fn is_active(&self) -> bool;
 }
 
-/// Construct the platform-default inhibitor for `window`.
+/// Construct the platform-default inhibitor.
+///
+/// `display_ptr` / `surface_ptr` are raw `wl_display*` / `wl_surface*`
+/// pointers — typically extracted via `wayr::EventLoop::wl_display_ptr`
+/// and `wayr::Toplevel::wl_surface_ptr`. macOS and Windows backends
+/// ignore them. The caller MUST keep the underlying objects alive for
+/// the inhibitor's lifetime.
 ///
 /// On unsupported platforms returns a no-op inhibitor (an `Ok` variant)
 /// rather than an error — callers do not need to special-case platform
-/// support. On supported platforms the current stubs also return the
-/// no-op inhibitor until the platform agents fill in the real impl.
-pub fn new_inhibitor(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
+/// support.
+///
+/// # Safety
+///
+/// On Linux/Wayland: `display_ptr` + `surface_ptr` must point to live
+/// objects belonging to the same Wayland connection, and must remain
+/// valid for the lifetime of the returned `IdleInhibitor`.
+pub unsafe fn new_inhibitor(
+    display_ptr: *mut c_void,
+    surface_ptr: *mut c_void,
+) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    return linux::new(window);
+    {
+        // SAFETY: forwarded to the linux backend; same precondition.
+        unsafe { linux::new(display_ptr, surface_ptr) }
+    }
     #[cfg(target_os = "macos")]
-    return macos::new(window);
+    {
+        macos::new(display_ptr, surface_ptr)
+    }
     #[cfg(target_os = "windows")]
-    return windows::new(window);
+    {
+        windows::new(display_ptr, surface_ptr)
+    }
     // Suppress "unused variable" on platforms not covered above.
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = window;
+        let _ = (display_ptr, surface_ptr);
         Ok(Box::new(NoopInhibitor))
     }
 }
@@ -129,10 +150,20 @@ pub mod linux {
         std::env::var("WAYLAND_DISPLAY").is_ok()
     }
 
-    pub fn new(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
+    /// # Safety
+    ///
+    /// `display_ptr` + `surface_ptr` must point to live `wl_display` /
+    /// `wl_surface` objects belonging to the same Wayland connection,
+    /// and must remain valid for the returned inhibitor's lifetime.
+    pub unsafe fn new(
+        display_ptr: *mut c_void,
+        surface_ptr: *mut c_void,
+    ) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
         if is_wayland() {
-            return wayland::new(window);
+            // SAFETY: forwarded to wayland backend with same precondition.
+            return unsafe { wayland::new(display_ptr, surface_ptr) };
         }
+        let _ = (display_ptr, surface_ptr);
         Ok(Box::new(NoopInhibitor))
     }
 }

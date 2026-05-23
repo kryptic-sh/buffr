@@ -169,10 +169,12 @@ impl Drop for MacosInhibitor {
 
 /// Construct a [`MacosInhibitor`].
 ///
-/// The `window` parameter is accepted for API symmetry with other backends but
-/// is not used — `IOPMAssertion` is process-wide, not per-window.
+/// The pointer arguments are accepted for API symmetry with the Linux
+/// backend but are ignored — `IOPMAssertion` is process-wide, not
+/// per-window.
 pub(super) fn new(
-    _window: std::sync::Arc<winit::window::Window>,
+    _display_ptr: *mut std::ffi::c_void,
+    _surface_ptr: *mut std::ffi::c_void,
 ) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
     Ok(Box::new(MacosInhibitor::new()))
 }

@@ -110,11 +110,12 @@ impl Drop for WindowsInhibitor {
 
 /// Construct a [`WindowsInhibitor`].
 ///
-/// The `window` parameter is accepted for API symmetry with other backends
-/// but is not used — `SetThreadExecutionState` is per-thread/system, not
-/// per-window.
+/// The pointer arguments are accepted for API symmetry with the Linux
+/// backend but are ignored — `SetThreadExecutionState` is per-thread,
+/// not per-window.
 pub(super) fn new(
-    _window: std::sync::Arc<winit::window::Window>,
+    _display_ptr: *mut std::ffi::c_void,
+    _surface_ptr: *mut std::ffi::c_void,
 ) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
     let (tx, rx) = mpsc::sync_channel::<InhibitCmd>(4);
     let active = Arc::new(AtomicBool::new(false));

@@ -34,7 +34,6 @@ buffr-zoom.workspace = true
 buffr-permissions.workspace = true
 buffr-view-source.workspace = true
 hjkl-clipboard.workspace = true
-winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
 # Image decode / re-encode for context-menu "Copy Image"
 image = { version = "0.25", default-features = false, features = [
     "png",

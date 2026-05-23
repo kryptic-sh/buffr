@@ -2,14 +2,15 @@
 //!
 //! ## Connection strategy
 //!
-//! winit already holds the Wayland connection for rendering. We plug into
-//! it by calling `Backend::from_foreign_display` with the `wl_display`
-//! pointer from `HasDisplayHandle` — this creates a "guest" backend that
-//! shares the same socket without owning it (won't disconnect on drop).
+//! The host application (buffr-app via wayr) already holds the Wayland
+//! connection for rendering. We plug into it by calling
+//! `Backend::from_foreign_display` with the raw `wl_display` pointer the
+//! caller hands in — this creates a "guest" backend that shares the same
+//! socket without owning it (won't disconnect on drop).
 //!
-//! The `wl_surface` from `HasWindowHandle` is wrapped with
-//! `ObjectId::from_ptr` to get an ID suitable for passing to
-//! `create_inhibitor`, without taking ownership of or destroying the surface.
+//! The host's `wl_surface` pointer is wrapped with `ObjectId::from_ptr`
+//! to get an ID suitable for passing to `create_inhibitor`, without
+//! taking ownership of or destroying the surface.
 //!
 //! ## Thread model
 //!
@@ -28,7 +29,6 @@ use std::{
     time::Duration,
 };
 
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
@@ -37,7 +37,6 @@ use wayland_client::{
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
-use winit::window::Window;
 
 use super::{IdleInhibitor, InhibitError};
 
@@ -158,46 +157,39 @@ impl Drop for WaylandInhibitor {
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
-/// Construct a [`WaylandInhibitor`] for `window`.
+/// Construct a [`WaylandInhibitor`] from raw `wl_display` + `wl_surface`
+/// pointers handed in by the host. The caller is responsible for keeping
+/// both objects alive for the inhibitor's lifetime — typically the host's
+/// `wayr::Toplevel` owns the `wl_surface` and `wayr::EventLoop` owns the
+/// `wl_display`, and the inhibitor drops before either.
 ///
 /// Returns [`InhibitError::Unsupported`] if the compositor does not
 /// advertise `zwp_idle_inhibit_manager_v1`.
-pub(super) fn new(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
-    // ── Extract raw Wayland handles ────────────────────────────────────────
+///
+/// # Safety
+///
+/// `display_ptr` must point to a live `wl_display`; `surface_ptr` must
+/// point to a live `wl_surface` on that display. Both must remain valid
+/// for the lifetime of the returned `IdleInhibitor`.
+pub(super) unsafe fn new(
+    display_ptr: *mut std::ffi::c_void,
+    surface_ptr: *mut std::ffi::c_void,
+) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
+    if display_ptr.is_null() {
+        return Err(InhibitError::PlatformError(
+            "wl_display pointer is null".into(),
+        ));
+    }
+    if surface_ptr.is_null() {
+        return Err(InhibitError::PlatformError(
+            "wl_surface pointer is null".into(),
+        ));
+    }
 
-    let display_ptr: *mut std::ffi::c_void = {
-        let handle = window
-            .display_handle()
-            .map_err(|e| InhibitError::PlatformError(e.to_string()))?;
-        match handle.as_raw() {
-            RawDisplayHandle::Wayland(wdh) => wdh.display.as_ptr(),
-            other => {
-                return Err(InhibitError::PlatformError(format!(
-                    "unexpected display handle type: {other:?}"
-                )));
-            }
-        }
-    };
+    // ── Build a guest Connection that shares the host's wl_display ────────
 
-    let surface_ptr: *mut std::ffi::c_void = {
-        let handle = window
-            .window_handle()
-            .map_err(|e| InhibitError::PlatformError(e.to_string()))?;
-        match handle.as_raw() {
-            RawWindowHandle::Wayland(wwh) => wwh.surface.as_ptr(),
-            other => {
-                return Err(InhibitError::PlatformError(format!(
-                    "unexpected window handle type: {other:?}"
-                )));
-            }
-        }
-    };
-
-    // ── Build a guest Connection that shares winit's wl_display ───────────
-
-    // Safety: `display_ptr` comes from winit's live Wayland connection and
-    // remains valid for the lifetime of `window` (which we hold in an Arc).
-    // The guest Backend does NOT disconnect the display on drop.
+    // Safety: caller guarantees the pointer is live; the guest Backend
+    // does NOT disconnect the display on drop.
     let backend = unsafe {
         wayland_backend::client::Backend::from_foreign_display(
             display_ptr as *mut wayland_sys::client::wl_display,
@@ -216,10 +208,10 @@ pub(super) fn new(window: Arc<Window>) -> Result<Box<dyn IdleInhibitor>, Inhibit
         .bind(&qh, 1..=1, ())
         .map_err(|_| InhibitError::Unsupported)?;
 
-    // ── Wrap winit's wl_surface as a WlSurface proxy ──────────────────────
+    // ── Wrap the host's wl_surface as a WlSurface proxy ───────────────────
 
     // Safety: `surface_ptr` is a valid `wl_proxy*` for a `wl_surface` object
-    // that remains alive for as long as the window Arc is live.
+    // that remains alive for as long as the caller keeps the host window.
     // `ObjectId::from_ptr` records the pointer without taking ownership; the
     // resulting proxy does NOT send `destroy` on drop (no Drop impl exists in
     // the generated code).

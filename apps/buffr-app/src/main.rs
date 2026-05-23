@@ -940,8 +940,7 @@ fn main() -> Result<()> {
     //
     // All platforms run OSR: CEF paints into a shared bitmap, the
     // wgpu present layer composites it under buffr's chrome strips.
-    let event_loop = EventLoop::<BuffrUserEvent>::new()
-        .context("creating wayr event loop")?;
+    let event_loop = EventLoop::<BuffrUserEvent>::new().context("creating wayr event loop")?;
     // wayr always polls — no ControlFlow needed.
 
     let engine = Arc::new(Mutex::new(Engine::new(keymap)));
@@ -5784,10 +5783,7 @@ impl AppState {
     ///
     /// Mirrors `buffr_modal::wayr_adapter::key_event_to_chord` but targets
     /// `hjkl_engine::PlannedInput` rather than our internal `KeyChord`.
-    fn wayr_key_to_planned(
-        event: &wayr::KeyEvent,
-        modifiers: &Modifiers,
-    ) -> Option<PlannedInput> {
+    fn wayr_key_to_planned(event: &wayr::KeyEvent, modifiers: &Modifiers) -> Option<PlannedInput> {
         if event.state != wayr::KeyState::Pressed {
             return None;
         }
@@ -6382,7 +6378,11 @@ impl AppState {
                     engine.popup_osr_mouse_move(browser_id, bx, by, mods);
                 }
             }
-            WindowEvent::PointerButton { state, button, modifiers } => {
+            WindowEvent::PointerButton {
+                state,
+                button,
+                modifiers,
+            } => {
                 use wayr::PointerButtonState::Pressed;
                 let Some(popup) = self.popups.get_mut(&window_id) else {
                     return;
@@ -6450,7 +6450,10 @@ impl AppState {
             WindowEvent::Scroll(scroll_ev) => {
                 // Two-finger horizontal-swipe back/forward — same path
                 // as the main window, routed to the popup's own history.
-                let is_pixel = matches!(scroll_ev.source, wayr::AxisSource::Finger | wayr::AxisSource::Continuous);
+                let is_pixel = matches!(
+                    scroll_ev.source,
+                    wayr::AxisSource::Finger | wayr::AxisSource::Continuous
+                );
                 if is_pixel {
                     if let Some(action) = self.detect_swipe(scroll_ev.delta as f32, 0.0) {
                         if let Some(engine) = self.active_engine_dyn()
@@ -6767,18 +6770,18 @@ fn scan_code_to_vk(sc: wayr::ScanCode) -> i32 {
         53 => 0xBF, // / VK_OEM_2
         57 => 0x20, // Space VK_SPACE
         // F-keys (evdev 59-68 = F1-F10, 87-88 = F11-F12).
-        59 => 0x70,  // F1
-        60 => 0x71,  // F2
-        61 => 0x72,  // F3
-        62 => 0x73,  // F4
-        63 => 0x74,  // F5
-        64 => 0x75,  // F6
-        65 => 0x76,  // F7
-        66 => 0x77,  // F8
-        67 => 0x78,  // F9
-        68 => 0x79,  // F10
-        87 => 0x7A,  // F11
-        88 => 0x7B,  // F12
+        59 => 0x70, // F1
+        60 => 0x71, // F2
+        61 => 0x72, // F3
+        62 => 0x73, // F4
+        63 => 0x74, // F5
+        64 => 0x75, // F6
+        65 => 0x76, // F7
+        66 => 0x77, // F8
+        67 => 0x78, // F9
+        68 => 0x79, // F10
+        87 => 0x7A, // F11
+        88 => 0x7B, // F12
         // Navigation cluster.
         102 => 0x24, // Home
         103 => 0x26, // ArrowUp
@@ -7303,7 +7306,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         {
             let native_opt_in = std::env::var_os("BUFFR_WEBKIT_NATIVE").is_some_and(|v| v == "1");
             if native_opt_in {
-                use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+                use raw_window_handle::{
+                    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+                };
                 let dh = event_loop.display_handle().ok().map(|h| h.as_raw());
                 let wh = window.window_handle().ok().map(|h| h.as_raw());
                 match (dh, wh) {
@@ -7506,11 +7511,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Initialise wgpu renderer. On failure, log and exit — there is
         // no CPU-only fallback in this code path.
         let win_size = window.physical_size();
-        match crate::render::Renderer::new(
-            &*window,
-            event_loop,
-            (win_size.width, win_size.height),
-        ) {
+        match crate::render::Renderer::new(&*window, event_loop, (win_size.width, win_size.height))
+        {
             Ok(r) => self.renderer = Some(r),
             Err(err) => {
                 warn!(error = %err, "wgpu renderer init failed");
@@ -7532,11 +7534,31 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         self.open_pending_tabs();
         self.refresh_tab_strip();
 
-        // TODO(wayr-inhibit): new_inhibitor still takes Arc<winit::Window>;
-        // skip construction until buffr-core is ported to wayr.
-        // The idle-inhibit feature degrades gracefully when idle_inhibitor is None.
-        let _ = &new_inhibitor; // suppress unused-import lint
-        tracing::debug!("idle_inhibit: skipped (buffr-core not yet ported from winit)");
+        // Construct the platform idle-inhibitor now that the window
+        // exists. buffr-core takes raw wl_display + wl_surface pointers
+        // (extracted via wayr's FFI accessors); macOS / Windows backends
+        // ignore them. On unsupported sessions new_inhibitor returns a
+        // no-op Ok variant, so errors below are real platform errors.
+        let display_ptr = event_loop
+            .wl_display_ptr()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let surface_ptr = window
+            .wl_surface_ptr()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        // SAFETY: both pointers come from wayr's live wayland-client
+        // connection; `window` (the Toplevel) is stored in self.window
+        // for the lifetime of AppState, and event_loop's Connection
+        // outlives self. The inhibitor's Drop releases before either
+        // does because self.idle_inhibitor lives above self.window
+        // in the struct.
+        match unsafe { new_inhibitor(display_ptr, surface_ptr) } {
+            Ok(inh) => self.idle_inhibitor = Some(inh),
+            Err(err) => {
+                tracing::warn!(error = %err, "idle_inhibit: construction failed");
+            }
+        }
 
         self.window = Some(window);
     }
@@ -7651,7 +7673,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             // WindowEvent::Moved — no Wayland equivalent; position is compositor-managed.
             // TODO(wayr): window position not exposed; saved value stays 0.
-            WindowEvent::ScaleFactorChanged { new_scale_factor, .. } => {
+            WindowEvent::ScaleFactorChanged {
+                new_scale_factor, ..
+            } => {
                 let scale_factor = new_scale_factor;
                 debug!(scale_factor, "wayr: ScaleFactorChanged");
                 {
@@ -7812,9 +7836,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
             }
-            WindowEvent::PointerButton { state, button, modifiers } => {
-                use wayr::PointerButtonState::Pressed;
+            WindowEvent::PointerButton {
+                state,
+                button,
+                modifiers,
+            } => {
                 use wayr::PointerButton as MouseButton;
+                use wayr::PointerButtonState::Pressed;
                 // Update cached modifier state from pointer event payload.
                 self.modifiers = modifiers;
                 tracing::trace!(?state, ?button, cursor = ?self.osr_cursor, "input: mouse_button");
@@ -8146,7 +8174,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // high-res (pixel) input. If a swipe commits or we're still
                 // mid-gesture after a commit, swallow the event so it
                 // doesn't also scroll the page.
-                let is_pixel = matches!(scroll_ev.source, wayr::AxisSource::Finger | wayr::AxisSource::Continuous);
+                let is_pixel = matches!(
+                    scroll_ev.source,
+                    wayr::AxisSource::Finger | wayr::AxisSource::Continuous
+                );
                 if is_pixel {
                     if let Some(action) = self.detect_swipe(scroll_ev.delta as f32, 0.0) {
                         self.dispatch_action(&action);
@@ -8352,7 +8383,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                                 // composition (e.g. Esc pressed in the IME window).
                                 engine.ime_cancel();
                             } else {
-                                engine.ime_set_composition(&text, cursor.map(|c| (c as usize, c as usize)));
+                                engine.ime_set_composition(
+                                    &text,
+                                    cursor.map(|c| (c as usize, c as usize)),
+                                );
                             }
                         }
                         ImeEvent::Commit(text) => {
@@ -8934,11 +8968,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                 }
                 if !self.engines.is_empty() {
-                    tracing::debug!(
-                        w,
-                        h,
-                        "wayr: pending Resized debounce elapsed -> osr_resize"
-                    );
+                    tracing::debug!(w, h, "wayr: pending Resized debounce elapsed -> osr_resize");
                 }
             }
             self.pending_cef_resize.clear();
