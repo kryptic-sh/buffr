@@ -62,6 +62,16 @@ fn chord_from_event(event: &KeyEvent) -> Option<KeyChord> {
 
     // Prefer the layout-composed text — matches the winit adapter's
     // "logical_key" behaviour where Shift+j arrives as "J".
+    //
+    // Caveat: xkbcommon also emits text for control keys
+    // (`Return` → `"\r"`, `BackSpace` → `"\u{8}"`, `Tab` → `"\t"`,
+    // `Escape` → `"\u{1b}"`, `Delete` → `"\u{7f}"`). If we routed
+    // those through the Char path we'd produce `Char('\r')` etc.,
+    // which doesn't match the keymap parser's `<CR>` / `<BS>` /
+    // `<Tab>` bindings. So when `text` is a single ASCII control
+    // character, fall through to the named-key path below — the
+    // chord will land on `Named(CR)` / `Named(BS)` / etc. which is
+    // what the parser produces.
     if let Some(text) = event.text.as_deref()
         && !text.is_empty()
     {
@@ -71,30 +81,38 @@ fn chord_from_event(event: &KeyEvent) -> Option<KeyChord> {
             // Multi-codepoint composition — IME path's job.
             return None;
         }
-        let mut effective = mods;
-        let mut ch = first;
-        // Drop SHIFT when the layout has already baked it into a
-        // non-alphabetic glyph (`+` from Shift+=, `!` from Shift+1).
-        // Alphabetic stays untouched so `Shift+a` → `(SHIFT, 'A')`
-        // matches the parser's canonical form.
-        if effective.contains(Modifiers::SHIFT) && first.is_ascii() && !first.is_ascii_alphabetic()
-        {
-            effective.remove(Modifiers::SHIFT);
+        let is_ascii_control = (first as u32) < 0x20 || (first as u32) == 0x7f;
+        if !is_ascii_control {
+            let mut effective = mods;
+            let mut ch = first;
+            // Drop SHIFT when the layout has already baked it into a
+            // non-alphabetic glyph (`+` from Shift+=, `!` from Shift+1).
+            // Alphabetic stays untouched so `Shift+a` → `(SHIFT, 'A')`
+            // matches the parser's canonical form.
+            if effective.contains(Modifiers::SHIFT)
+                && first.is_ascii()
+                && !first.is_ascii_alphabetic()
+            {
+                effective.remove(Modifiers::SHIFT);
+            }
+            // Ctrl+letter is case-insensitive in the parser
+            // (`<C-h>` and `<C-H>` both produce `(CTRL, 'h')`), so
+            // normalize alphabetic chars to lowercase under CTRL.
+            if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
+                ch = ch.to_ascii_lowercase();
+            }
+            return Some(KeyChord {
+                modifiers: effective,
+                key: Key::Char(ch),
+            });
         }
-        // Ctrl+letter is case-insensitive in the parser
-        // (`<C-h>` and `<C-H>` both produce `(CTRL, 'h')`), so
-        // normalize alphabetic chars to lowercase under CTRL.
-        if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-            ch = ch.to_ascii_lowercase();
-        }
-        return Some(KeyChord {
-            modifiers: effective,
-            key: Key::Char(ch),
-        });
+        // Control-character text falls through to the named-key path.
     }
 
-    // Fall through to the named-key path when `text` is absent (Escape,
-    // arrows, function keys, etc.).
+    // Named-key path. Used when `text` is absent (arrows, function
+    // keys) AND when text is an ASCII control char that the parser
+    // expects as a `Named` chord (Return, BackSpace, Tab, Escape,
+    // Delete, ...).
     if let WKey::Named(name) = &event.key_code {
         // Space comes through as text " " in practice — this branch
         // catches the rare "space without text" edge case.
@@ -188,19 +206,28 @@ fn translate_test_only(
         if chars.next().is_some() {
             return None;
         }
-        let mut effective = mods;
-        let mut ch = first;
-        if effective.contains(Modifiers::SHIFT) && first.is_ascii() && !first.is_ascii_alphabetic()
-        {
-            effective.remove(Modifiers::SHIFT);
+        let is_ascii_control = (first as u32) < 0x20 || (first as u32) == 0x7f;
+        if !is_ascii_control {
+            let mut effective = mods;
+            let mut ch = first;
+            if effective.contains(Modifiers::SHIFT)
+                && first.is_ascii()
+                && !first.is_ascii_alphabetic()
+            {
+                effective.remove(Modifiers::SHIFT);
+            }
+            if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
+                ch = ch.to_ascii_lowercase();
+            }
+            return Some(KeyChord {
+                modifiers: effective,
+                key: Key::Char(ch),
+            });
         }
-        if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-            ch = ch.to_ascii_lowercase();
-        }
-        return Some(KeyChord {
-            modifiers: effective,
-            key: Key::Char(ch),
-        });
+        // ASCII control chars (Return = "\r", BackSpace = "\u{8}",
+        // Tab = "\t", Escape = "\u{1b}", Delete = "\u{7f}", …) fall
+        // through to the named-key path so the parser's `<CR>` /
+        // `<BS>` / `<Tab>` bindings match.
     }
     if let Some(name) = named {
         if name == "space" {
@@ -304,6 +331,39 @@ mod tests {
     fn escape_named_key_no_text() {
         let chord = mk(None, Some("Escape"), WMods::default()).expect("some");
         assert_eq!(chord.key, Key::Named(NamedKey::Esc));
+    }
+
+    #[test]
+    fn enter_with_carriage_return_text_lands_on_named_cr() {
+        // xkbcommon emits `text = "\r"` for Return. Must fall through
+        // to the named path so the parser's `<CR>` binding matches.
+        let chord = mk(Some("\r"), Some("Return"), WMods::default()).expect("some");
+        assert_eq!(chord.key, Key::Named(NamedKey::CR));
+    }
+
+    #[test]
+    fn backspace_with_control_text_lands_on_named_bs() {
+        // xkbcommon emits `text = "\u{8}"` for BackSpace.
+        let chord = mk(Some("\u{8}"), Some("BackSpace"), WMods::default()).expect("some");
+        assert_eq!(chord.key, Key::Named(NamedKey::BS));
+    }
+
+    #[test]
+    fn tab_with_control_text_lands_on_named_tab() {
+        let chord = mk(Some("\t"), Some("Tab"), WMods::default()).expect("some");
+        assert_eq!(chord.key, Key::Named(NamedKey::Tab));
+    }
+
+    #[test]
+    fn escape_with_control_text_lands_on_named_esc() {
+        let chord = mk(Some("\u{1b}"), Some("Escape"), WMods::default()).expect("some");
+        assert_eq!(chord.key, Key::Named(NamedKey::Esc));
+    }
+
+    #[test]
+    fn delete_with_control_text_lands_on_named_delete() {
+        let chord = mk(Some("\u{7f}"), Some("Delete"), WMods::default()).expect("some");
+        assert_eq!(chord.key, Key::Named(NamedKey::Delete));
     }
 
     #[test]
