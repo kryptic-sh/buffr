@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
-use winit::window::Window;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 /// Per-quad uniform: NDC rect (`[x0, y0, x1, y1]`) and UV rect
 /// (`[u0, v0, u1, v1]`). Passed via a uniform buffer so we don't need
@@ -543,15 +543,39 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>) -> Result<Self> {
+    /// Construct the renderer against any combination of window +
+    /// display handles. winit callers pass the same `&Window` twice
+    /// (it impls both traits); wayr callers pass `&Toplevel` for the
+    /// window and `&EventLoop<_>` for the display.
+    ///
+    /// `initial_physical_size` is the framebuffer size in physical
+    /// pixels — winit gets it from `window.inner_size()`, wayr from
+    /// `toplevel.physical_size()`. Pulled out of the renderer so the
+    /// migration off winit doesn't churn this constructor again.
+    pub fn new<W: HasWindowHandle, D: HasDisplayHandle>(
+        window: &W,
+        display: &D,
+        initial_physical_size: (u32, u32),
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
-        let surface = instance
-            .create_surface(window.clone())
-            .context("create wgpu surface")?;
+        let wh = window.window_handle().context("window_handle")?;
+        let dh = display.display_handle().context("display_handle")?;
+        // SAFETY: the raw handles borrow `window` + `display`; the
+        // resulting `wgpu::Surface<'static>` outlives them in
+        // principle, but the caller owns both — Renderer is held in
+        // App alongside the window, dropped first.
+        let surface = unsafe {
+            instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(dh.as_raw()),
+                    raw_window_handle: wh.as_raw(),
+                })
+                .context("create wgpu surface")?
+        };
 
         // Adapter selection ladder: prefer HighPerformance (discrete GPU /
         // hardware Vulkan), fall back to LowPower (integrated), finally
@@ -607,9 +631,9 @@ impl Renderer {
         // (texture/buffer operations) can both hold a reference without clone.
         let device = Arc::new(device_raw);
 
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+        let (w, h) = initial_physical_size;
+        let width = w.max(1);
+        let height = h.max(1);
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps

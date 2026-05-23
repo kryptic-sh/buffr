@@ -7532,7 +7532,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Initialise wgpu renderer. On failure, log and exit — there is
         // no CPU-only fallback in this code path.
-        match crate::render::Renderer::new(window.clone()) {
+        let win_size = window.inner_size();
+        match crate::render::Renderer::new(
+            &*window,
+            &*window,
+            (win_size.width, win_size.height),
+        ) {
             Ok(r) => self.renderer = Some(r),
             Err(err) => {
                 warn!(error = %err, "wgpu renderer init failed");
@@ -8669,7 +8674,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     continue;
                 }
             };
-            let popup_renderer = match crate::render::Renderer::new(popup_win.clone()) {
+            let popup_size = popup_win.inner_size();
+            let popup_renderer = match crate::render::Renderer::new(
+                &*popup_win,
+                &*popup_win,
+                (popup_size.width, popup_size.height),
+            ) {
                 Ok(r) => r,
                 Err(err) => {
                     warn!(error = %err, browser_id = created.browser_id, "popup: renderer init failed");
