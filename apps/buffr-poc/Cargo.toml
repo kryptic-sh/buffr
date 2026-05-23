@@ -1,0 +1,29 @@
+[package]
+name = "buffr-poc"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/buffr"
+homepage = "https://kryptic.sh"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+description = "Minimal proof-of-concept: wayr + WPE WebKit subsurface embedding. Verifies the buffr switchover unblocks the Wayland-native browser embedding problem."
+publish = false
+
+[[bin]]
+name = "buffr-poc"
+path = "src/main.rs"
+
+[dependencies]
+# wayr — local path dep. The eventual buffr-app cutover will pin this.
+wayr = { path = "../../../wayr", features = ["subsurface"] }
+
+# WPE WebKit backend — same crate buffr-app uses. Both are excluded
+# from buffr's workspace because they need wpewebkit-2.0 system deps
+# CI doesn't install; we path-dep them here for the POC.
+buffr-webkit = { path = "../../crates/buffr-webkit" }
+buffr-engine = { path = "../../crates/buffr-engine" }
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

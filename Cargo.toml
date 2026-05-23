@@ -24,6 +24,12 @@ exclude = [
     # Build standalone on systems with WPE WebKit 2.0 (Arch / Debian sid):
     #   cargo build --manifest-path crates/buffr-webkit/Cargo.toml
     "crates/buffr-webkit",
+    # POC binary using wayr (kryptic-sh/wayr) + buffr-webkit to verify
+    # Wayland-native subsurface embedding. Excluded for the same
+    # reason as buffr-webkit — needs wpewebkit-2.0 system deps that
+    # buffr CI doesn't install. Build standalone:
+    #   cargo build --manifest-path apps/buffr-poc/Cargo.toml
+    "apps/buffr-poc",
 ]
 # `cargo build` (no -p) builds all three app binaries — supervisor,
 # browser, and helper — so a sibling-resolved `target/debug/buffr-app`
