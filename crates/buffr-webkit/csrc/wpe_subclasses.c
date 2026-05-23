@@ -377,6 +377,13 @@ struct _BuffrDisplayWayland {
      * eglInitialize succeeded; NULL on failure (falls back to OSR in Rust). */
     EGLDisplay egl_display;
 
+    /* Lazily-created DRM device handed out by get_drm_device. Without
+     * this, WebKit picks the SHM software path even when the
+     * compositor advertises zwp_linux_dmabuf_v1 — surfacing the
+     * "non-DMA-BUF buffer type" render error in BuffrViewWayland.
+     * Mirrors the OSR-flavoured BuffrDisplay's behaviour. */
+    WPEDRMDevice *drm_device;
+
     /* Viewport / screen configuration. */
     int    viewport_w;
     int    viewport_h;
@@ -484,6 +491,7 @@ static void buffr_display_wayland_init(BuffrDisplayWayland *self) {
     self->parent_surface    = NULL;
     self->dmabuf            = NULL;
     self->egl_display       = EGL_NO_DISPLAY;
+    self->drm_device        = NULL;
     self->viewport_w        = 1280;
     self->viewport_h        = 720;
     self->scale             = 1.0;
@@ -493,9 +501,23 @@ static void buffr_display_wayland_init(BuffrDisplayWayland *self) {
     g_mutex_init(&self->last_view_mutex);
 }
 
+static WPEDRMDevice *buffr_display_wayland_get_drm_device_vfunc(WPEDisplay *display) {
+    BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(display);
+    if (!self->drm_device) {
+        /* Same defaults as the OSR-flavoured BuffrDisplay. WebKit
+         * uses the DRM device descriptor to drive its
+         * AcceleratedBackingStore down the DMA-BUF path; without a
+         * device, BackingStore falls back to SHM and our render
+         * vfunc rejects the frames. */
+        self->drm_device = wpe_drm_device_new("/dev/dri/card0", "/dev/dri/renderD128");
+    }
+    return self->drm_device;
+}
+
 static void buffr_display_wayland_dispose(GObject *object) {
     BuffrDisplayWayland *self = BUFFR_DISPLAY_WAYLAND(object);
     g_clear_object(&self->screen);
+    g_clear_pointer(&self->drm_device, wpe_drm_device_unref);
     g_mutex_clear(&self->last_view_mutex);
     /* Note: we do NOT call eglTerminate here — the EGLDisplay belongs to the
      * host wl_display connection that outlives us. */
@@ -513,8 +535,8 @@ static void buffr_display_wayland_class_init(BuffrDisplayWaylandClass *klass) {
     display_class->get_egl_display  = buffr_display_wayland_get_egl_display_vfunc;
     display_class->get_n_screens    = buffr_display_wayland_get_n_screens_vfunc;
     display_class->get_screen       = buffr_display_wayland_get_screen_vfunc;
+    display_class->get_drm_device   = buffr_display_wayland_get_drm_device_vfunc;
     /* get_keymap: NULL → WebKit synthesises a keymap on demand. */
-    /* get_drm_device: NULL → WebKit picks /dev/dri/renderD128 by default. */
 }
 
 /* ── Public constructor ─────────────────────────────────────────────────── */

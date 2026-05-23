@@ -371,7 +371,7 @@ dependencies = [
  "buffr-zoom",
  "chrono",
  "core-foundation 0.10.1",
- "hjkl-clipboard",
+ "hjkl-clipboard 0.25.1",
  "hjkl-config",
  "image",
  "raw-window-handle",
@@ -387,7 +387,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winit",
  "zbus",
 ]
@@ -476,7 +476,7 @@ dependencies = [
  "buffr-permissions",
  "cc",
  "glib",
- "hjkl-clipboard",
+ "hjkl-clipboard 0.5.5",
  "image",
  "khronos-egl",
  "libloading 0.8.9",
@@ -1495,12 +1495,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "hjkl-config"
-version = "0.2.1"
+name = "hjkl-clipboard"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14194a3cc6446ba99ad692aa4b2c7f7571a02c8e5ea710eb3d01e11ccf9d8ba3"
+checksum = "1ddaeaada4b6c93569dd5590be0433ffd80ea5f8fc5eacf991ffb0dd2d47fa2e"
 dependencies = [
- "hjkl-xdg",
+ "async-trait",
+ "bitflags 2.11.1",
+ "libc",
+ "miniz_oxide 0.9.1",
+]
+
+[[package]]
+name = "hjkl-config"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cc51758ab316e5873bdc3530a7147286d3972dad8fcdda0bf990f263e5e9c6"
+dependencies = [
+ "dirs",
  "serde",
  "thiserror 2.0.18",
  "toml",
