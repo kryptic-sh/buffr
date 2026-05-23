@@ -124,3 +124,10 @@ hjkl-bonsai = "0.6"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# TEMP: patch wayr to the sibling kryptic-sh/wayr checkout while
+# v0.1.1 is in flight on crates.io (fixes request_redraw being a
+# no-op). Remove once v0.1.1 is live and the buffr-app dep picks
+# it up via the caret-minor range.
+[patch.crates-io]
+wayr = { path = "../wayr" }

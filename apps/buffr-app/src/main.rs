@@ -9115,13 +9115,21 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.heartbeat = None;
             }
         }
-        // wayr always drives the loop from run_app; park main thread until
-        // the computed deadline to match the former ControlFlow::WaitUntil
-        // behaviour. Any wakeup (input, proxy event) preempts the sleep.
-        let now = Instant::now();
-        if deadline > now {
-            std::thread::sleep(deadline - now);
-        }
+        // wayr's `run_app` always calls `blocking_pump(50ms)` after
+        // `about_to_wait` returns — it sleeps inside `poll(2)`, which
+        // wakes immediately on socket activity or user events (unlike
+        // `std::thread::sleep` which is unconditional). So we DON'T
+        // sleep here; the 50 ms cap inside wayr already paces idle
+        // iterations at 20 Hz. `deadline` is computed above only so
+        // the wheel-momentum / loading-anim / CEF-pump deadlines are
+        // honoured by `request_redraw` calls that happen above this
+        // point — the deadline value itself is informational.
+        //
+        // TODO(wayr-waituntil): if the deadline lands before wayr's
+        // 50 ms cap, we currently over-wait by up to (50 ms - delta).
+        // Add a `wayr::EventLoop::wait_until(deadline)` API so this
+        // hook can request a tighter cap for animation paths.
+        let _ = deadline;
     }
 }
 
