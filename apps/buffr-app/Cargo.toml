@@ -38,8 +38,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 cef.workspace = true
 # Wayland-only windowing toolkit. Replaces winit; see CHANGELOG.
-# 0.1.1 fixes request_redraw being a no-op — the minimum buffr needs.
-wayr = { version = "0.1.1", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
+# 0.1.2 filters ASCII control characters from `KeyEvent::text` at the
+# source, so consumers get clean "text => printable; key_code =>
+# special" dispatch without per-site filtering. 0.1.1 fixed
+# request_redraw being a no-op. Both are required.
+wayr = { version = "0.1.2", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
 raw-window-handle.workspace = true
 clap.workspace = true
 tempfile.workspace = true
