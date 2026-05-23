@@ -27,3 +27,11 @@ buffr-engine = { path = "../../crates/buffr-engine" }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# wgpu — chrome surface so the parent toplevel actually maps. Pin to
+# the same version buffr-app uses so the workspace can share build
+# artefacts (and so future migration into buffr-app is a no-op on
+# the wgpu side). Pulled in only at the POC for now.
+wgpu = "29"
+pollster = "0.4"
+raw-window-handle = "0.6"
