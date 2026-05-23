@@ -6708,16 +6708,17 @@ fn wayr_mods_to_cef(m: &Modifiers) -> u32 {
 
 /// Map a wayr `ScanCode` to a Windows virtual-key code for CEF.
 ///
-/// wayr ScanCode = evdev code + 8 (X11 convention).
+/// wayr `ScanCode` carries the raw Linux evdev scancode (matches
+/// `linux/input-event-codes.h` — `KEY_ESC = 1`, `KEY_BACKSPACE = 14`,
+/// `KEY_TAB = 15`, `KEY_ENTER = 28`, …); no offset adjustment needed.
 /// Coverage: A-Z, 0-9, F1-F12, common navigation and editing keys,
 /// plus OEM punctuation so virtual-keyboard tools (wtype, xdotool etc.)
 /// that route through `zwp_virtual_keyboard_v1` still deliver VK codes.
 /// Unknowns map to 0 (CEF ignores `windows_key_code == 0` for non-printable
 /// keys; printable keys use `character` instead).
 fn scan_code_to_vk(sc: wayr::ScanCode) -> i32 {
-    // evdev code = ScanCode.0 - 8 (X11 convention used by wayr).
-    let evdev = sc.0.saturating_sub(8);
-    match evdev {
+    // wayr surfaces the raw evdev scancode directly — no offset.
+    match sc.0 {
         // Row 1 — number row (evdev 2-13).
         2 => 0x31,  // 1
         3 => 0x32,  // 2
@@ -7718,6 +7719,25 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     "WindowEvent::Focused"
                 );
                 self.window_focused = true;
+                // Force wake on focus regain. The present-latency
+                // occlusion heuristic is reactive (2s probe interval)
+                // and was the only wake signal after the winit → wayr
+                // port — meaning a user who tabbed back into buffr saw
+                // stale OSR pixels for up to two seconds while the
+                // probe re-evaluated. Focus is an immediate
+                // visibility signal; clear the occluded flag and
+                // recompute paint policy so CEF gets `osr_sleep(false)`
+                // and resumes painting on the next frame.
+                if self.occluded {
+                    tracing::debug!("focus: clearing heuristic occlusion");
+                    self.occluded = false;
+                    self.present_us_history.clear();
+                    self.next_probe_at = None;
+                    self.recompute_paint_policy();
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::Unfocused => {
                 let mode = self.engine.lock().ok().map(|e| e.mode());
@@ -7727,6 +7747,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     "WindowEvent::Unfocused"
                 );
                 self.window_focused = false;
+                // Don't touch paint policy here — losing keyboard
+                // focus doesn't mean the window is hidden. The user
+                // may have clicked another window while buffr is still
+                // visible alongside it. The present-latency heuristic
+                // still detects true occlusion (workspace switch,
+                // minimize, fullscreen cover) via slow-frame samples;
+                // we just don't pre-empt that by going to sleep on
+                // every Alt-Tab.
             }
             // WindowEvent::Occluded — no wayr equivalent in v0.1; sleep policy
             // continues to rely on present-latency heuristic (SLOW_PRESENT_THRESHOLD_US).
