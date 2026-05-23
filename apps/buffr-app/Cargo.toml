@@ -25,10 +25,11 @@ buffr-bookmarks.workspace = true
 buffr-downloads.workspace = true
 buffr-zoom.workspace = true
 buffr-permissions = { workspace = true, features = ["store"] }
-# Enable the `winit` feature so we can pull in
-# `buffr_modal::key_event_to_chord` to translate winit key events into
-# our internal chord type without re-implementing the mapping.
-buffr-modal = { workspace = true, features = ["winit"] }
+# Enable the `wayr` feature so we can pull in
+# `buffr_modal::wayr_key_event_to_chord` to translate wayr key events
+# into our internal chord type. (Was `winit` before Phase C of the
+# migration to kryptic-sh/wayr.)
+buffr-modal = { workspace = true, features = ["wayr"] }
 buffr-ui.workspace = true
 buffr-config.workspace = true
 hjkl-splash.workspace = true
@@ -36,7 +37,8 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 cef.workspace = true
-winit.workspace = true
+# Wayland-only windowing toolkit. Replaces winit; see CHANGELOG.
+wayr = { version = "0.1", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
 raw-window-handle.workspace = true
 clap.workspace = true
 tempfile.workspace = true

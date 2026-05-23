@@ -493,9 +493,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wayr",
  "wgpu",
  "windows-sys 0.61.2",
- "winit",
 ]
 
 [[package]]
