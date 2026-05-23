@@ -38,9 +38,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 cef.workspace = true
 # Wayland-only windowing toolkit. Replaces winit; see CHANGELOG.
-# Patched to the local ../../../wayr checkout via workspace
-# [patch.crates-io] until v0.1.1 lands on crates.io.
-wayr = { version = "0.1", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
+# 0.1.1 fixes request_redraw being a no-op — the minimum buffr needs.
+wayr = { version = "0.1.1", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale"] }
 raw-window-handle.workspace = true
 clap.workspace = true
 tempfile.workspace = true
