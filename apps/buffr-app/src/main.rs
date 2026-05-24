@@ -175,6 +175,7 @@ mod loading_anim;
 mod render;
 mod session;
 mod single_instance;
+mod windowing;
 use buffr_engine::MouseButton as NeutralMouseButton;
 use clap::Parser;
 use tempfile::TempDir;

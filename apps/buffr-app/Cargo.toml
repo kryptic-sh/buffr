@@ -25,24 +25,16 @@ buffr-bookmarks.workspace = true
 buffr-downloads.workspace = true
 buffr-zoom.workspace = true
 buffr-permissions = { workspace = true, features = ["store"] }
-# Enable the `wayr` feature so we can pull in
-# `buffr_modal::wayr_key_event_to_chord` to translate wayr key events
-# into our internal chord type. (Was `winit` before Phase C of the
-# migration to kryptic-sh/wayr.)
-buffr-modal = { workspace = true, features = ["wayr"] }
+# buffr-modal feature is selected per target below: `wayr` on Linux,
+# `winit` on macOS/Windows. Without features here so the platform-
+# specific target.cfg blocks add them.
+buffr-modal.workspace = true
 buffr-ui.workspace = true
 buffr-config.workspace = true
 hjkl-splash.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# Wayland-only windowing toolkit. Replaces winit; see CHANGELOG.
-# 0.1.4 makes Toplevel Send + Sync + 'static and adds HasDisplayHandle
-# so wgpu can hold Arc<Toplevel> via its safe surface-creation path
-# (fixes shutdown SIGSEGV). 0.1.3 dedupes spurious Resized on focus
-# changes. 0.1.2 filters ASCII control chars from KeyEvent::text.
-# 0.1.1 fixed request_redraw being a no-op. All are required.
-wayr = { version = "0.2.0", features = ["subsurface", "text-input", "cursor-shape", "fractional-scale", "xdg-activation"] }
 raw-window-handle.workspace = true
 clap.workspace = true
 tempfile.workspace = true
@@ -64,6 +56,37 @@ proptest = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux: wayr is the Wayland-native windowing toolkit. WPE WebKit
+# subsurface embedding (planned engine path) requires direct Wayland
+# dispatch ownership, which winit can't provide without rewriting its
+# Wayland backend. On macOS/Windows where WPE isn't shippable anyway,
+# the buffr-app build switches to winit (see below).
+[target.'cfg(target_os = "linux")'.dependencies]
+wayr = { version = "0.2.0", features = [
+    "subsurface",
+    "text-input",
+    "cursor-shape",
+    "fractional-scale",
+    "xdg-activation",
+] }
+buffr-modal = { workspace = true, features = ["wayr"] }
+
+# macOS / Windows: winit provides cross-platform windowing. CEF in OSR
+# mode renders into a wgpu surface; the browser content doesn't need
+# any platform-specific window embedding. buffr-modal's winit_adapter
+# (parallel to wayr_adapter) translates winit KeyEvents into the
+# engine's KeyChord type.
+#
+# winit with default-features=false + only `rwh_06`: drops the
+# `wayland` / `x11` features that would force a pkg-config wayland
+# probe on macOS/Windows runners. AppKit / Win32 backends are
+# cfg-gated by target_os inside winit, not by Cargo features, so they
+# stay active regardless. `rwh_06` adds the raw-window-handle 0.6
+# trait impls wgpu needs.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+buffr-modal = { workspace = true, features = ["winit"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
