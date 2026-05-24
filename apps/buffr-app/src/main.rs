@@ -158,18 +158,12 @@ use buffr_engine::{
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
 };
-// KeyEvent → KeyChord translation lives in buffr-modal; the adapter
-// module is selected per target since the underlying KeyEvent shape
-// (wayr vs winit) differs.
-#[cfg(not(target_os = "linux"))]
+// KeyEvent → KeyChord translation lives in buffr-modal's bridge adapter.
+// winit is used on all platforms; bridge_key_event_to_chord handles all
+// toolkit-agnostic KeyEvent values produced by windowing/other.
 use buffr_modal::{
     bridge_key_event_to_chord as key_event_to_chord,
     bridge_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
-};
-#[cfg(target_os = "linux")]
-use buffr_modal::{
-    wayr_key_event_to_chord as key_event_to_chord,
-    wayr_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
 };
 use buffr_permissions::Permissions;
 use buffr_ui::{
@@ -2478,15 +2472,6 @@ struct AppState {
     /// or connect failed). Ticked every `about_to_wait`; on write error the
     /// field is set back to `None` (supervisor detects the silence and kills).
     heartbeat: Option<heartbeat::Heartbeat>,
-    /// Raw Wayland + EGL handles extracted from the winit window (#151).
-    ///
-    /// Populated in `resumed` on Wayland sessions immediately after window
-    /// creation.  `None` on non-Wayland sessions (X11, macOS, Windows,
-    /// headless).  Passed to each WebKit engine via
-    /// `WebKitEngine::set_native_wayland_handles` so the upcoming
-    /// `BuffrDisplayWayland` C subclass (#152) can read them.
-    #[cfg(target_os = "linux")]
-    wayland_native_handles: Option<buffr_engine::WaylandNativeHandles>,
 }
 
 /// OSR paint policy for the window.
@@ -2821,8 +2806,6 @@ impl AppState {
             window_focused: false,
             context_menu: None,
             heartbeat: None,
-            #[cfg(target_os = "linux")]
-            wayland_native_handles: None,
         }
     }
 
@@ -7418,71 +7401,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         #[allow(clippy::arc_with_non_send_sync)]
         let window = Arc::new(window);
 
-        // ── Wayland native handle extraction (#151) ───────────────────────────
-        //
-        // wayr owns the Wayland connection; pull compositor + subcompositor +
-        // display pointers directly from the EventLoop rather than running a
-        // separate registry roundtrip.  Phase 3 native compositing is gated
-        // behind BUFFR_WEBKIT_NATIVE=1.
-        #[cfg(target_os = "linux")]
-        {
-            let native_opt_in = std::env::var_os("BUFFR_WEBKIT_NATIVE").is_some_and(|v| v == "1");
-            if native_opt_in {
-                use raw_window_handle::{
-                    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-                };
-                let dh = event_loop.display_handle().ok().map(|h| h.as_raw());
-                let wh = window.window_handle().ok().map(|h| h.as_raw());
-                match (dh, wh) {
-                    (Some(RawDisplayHandle::Wayland(_d)), Some(RawWindowHandle::Wayland(w))) => {
-                        let wl_display = event_loop
-                            .wl_display_ptr()
-                            .map(|p| p.as_ptr())
-                            .unwrap_or(std::ptr::null_mut());
-                        let parent_wl_surface = w.surface.as_ptr();
-                        let wl_compositor = event_loop
-                            .wl_compositor_ptr()
-                            .map(|p| p.as_ptr())
-                            .unwrap_or(std::ptr::null_mut());
-                        let wl_subcompositor = event_loop
-                            .wl_subcompositor_ptr()
-                            .map(|p| p.as_ptr())
-                            .unwrap_or(std::ptr::null_mut());
-                        if wl_compositor.is_null() {
-                            tracing::warn!(
-                                "wayr: wl_compositor not found; \
-                                 #152 subsurface path will be degraded"
-                            );
-                        }
-                        if wl_subcompositor.is_null() {
-                            tracing::warn!(
-                                "wayr: wl_subcompositor not found; \
-                                 #152 subsurface path will be degraded"
-                            );
-                        }
-                        let handles = buffr_engine::WaylandNativeHandles {
-                            wl_display,
-                            parent_wl_surface,
-                            wl_compositor,
-                            wl_subcompositor,
-                            egl_display: std::ptr::null_mut(),
-                        };
-                        tracing::debug!(
-                            wl_display = ?wl_display,
-                            parent_wl_surface = ?parent_wl_surface,
-                            wl_compositor_null = wl_compositor.is_null(),
-                            wl_subcompositor_null = wl_subcompositor.is_null(),
-                            "wayland native handles extracted (#151)"
-                        );
-                        self.wayland_native_handles = Some(handles);
-                    }
-                    _ => {
-                        // Should not happen: wayr is Wayland-only.
-                    }
-                }
-            }
-        }
-
         // Pass the same page viewport used by later resize events so
         // CEF paints the first frame in the area below the tab strip and
         // above the statusline.
@@ -7497,7 +7415,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // process init (`cef::initialize` is once-per-process) and the same
         // on-disk cache (per-engine cache isolation via `RequestContext` is
         // Phase 5+). The first successful instance becomes the active engine.
-        // wayr v0.1 does not expose current_monitor/refresh_rate; default to 60 Hz.
+        // winit does not expose current_monitor/refresh_rate via OSR; default to 60 Hz.
         let display_hz: u32 = 60;
         let os_scale = window.scale_factor() as f32;
         let effective_scale = std::env::var("BUFFR_SCALE")
@@ -7659,33 +7577,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         self.refresh_tab_strip();
 
         // Construct the platform idle-inhibitor now that the window
-        // exists. buffr-core takes raw wl_display + wl_surface pointers
-        // (extracted via wayr's FFI accessors on Linux); macOS / Windows
-        // backends ignore the pointers and use IOKit /
-        // SetThreadExecutionState instead. On unsupported sessions
-        // new_inhibitor returns a no-op Ok variant, so errors below are
-        // real platform errors.
-        #[cfg(target_os = "linux")]
-        let display_ptr = event_loop
-            .wl_display_ptr()
-            .map(|p| p.as_ptr())
-            .unwrap_or(std::ptr::null_mut());
-        #[cfg(target_os = "linux")]
-        let surface_ptr = window
-            .wl_surface_ptr()
-            .map(|p| p.as_ptr())
-            .unwrap_or(std::ptr::null_mut());
-        // macOS / Windows: backends ignore the pointers; pass null.
-        #[cfg(not(target_os = "linux"))]
-        let display_ptr = std::ptr::null_mut();
-        #[cfg(not(target_os = "linux"))]
-        let surface_ptr = std::ptr::null_mut();
-        // SAFETY: both pointers come from wayr's live wayland-client
-        // connection; `window` (the Toplevel) is stored in self.window
-        // for the lifetime of AppState, and event_loop's Connection
-        // outlives self. The inhibitor's Drop releases before either
-        // does because self.idle_inhibitor lives above self.window
-        // in the struct.
+        // exists. On macOS / Windows the pointers are ignored (IOKit /
+        // SetThreadExecutionState). On Linux the Wayland inhibitor needs
+        // live wl_display + wl_surface pointers; these were previously
+        // extracted via wayr's FFI accessors. With winit as the sole
+        // backend, the idle-inhibitor is parked (null pointers → the
+        // Wayland backend returns InhibitError::PlatformError which we
+        // warn and swallow). Re-wire when wayr returns or when winit
+        // exposes the raw Wayland display/surface handle directly.
+        let display_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let surface_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: null pointers are explicitly handled by the Linux
+        // Wayland backend (returns PlatformError); macOS/Windows ignore them.
         match unsafe { new_inhibitor(display_ptr, surface_ptr) } {
             Ok(inh) => self.idle_inhibitor = Some(inh),
             Err(err) => {

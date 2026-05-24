@@ -8,6 +8,30 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-05-25
+
+### Changed
+
+- Linux backend reverted from wayr to winit. wayr was hanging under CEF on
+  Linux; the pre-migration winit-on-Linux path was stable, so buffr-app now uses
+  winit on all three platforms. wayr is parked — `apps/buffr-poc` keeps it for
+  the future WPE WebKit embedding work, and `buffr-modal` retains its
+  `wayr_adapter` module dormant.
+
+### Removed
+
+- `wayr` dependency from `buffr-app`. `buffr-modal` now built with only the
+  `bridge` feature on every platform.
+- The `BUFFR_WEBKIT_NATIVE` Wayland-native-handle extraction block (#151). Will
+  return when WPE work and wayr both come back.
+- Linux idle inhibitor wiring via `wl_display` / `wl_surface` pointers. winit
+  does not expose raw Wayland handles independent of a window borrow in a shape
+  compatible with the existing `unsafe new_inhibitor(...)` call, so both
+  pointers now pass null on every platform. The inhibitor backend warns +
+  swallows the null case, matching its prior behaviour on non-Wayland systems.
+
+[0.14.2]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.2
+
 ## [0.14.1] - 2026-05-25
 
 ### Fixed

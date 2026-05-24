@@ -25,10 +25,7 @@ buffr-bookmarks.workspace = true
 buffr-downloads.workspace = true
 buffr-zoom.workspace = true
 buffr-permissions = { workspace = true, features = ["store"] }
-# buffr-modal feature is selected per target below: `wayr` on Linux,
-# `winit` on macOS/Windows. Without features here so the platform-
-# specific target.cfg blocks add them.
-buffr-modal.workspace = true
+buffr-modal = { workspace = true, features = ["bridge"] }
 buffr-ui.workspace = true
 buffr-config.workspace = true
 hjkl-splash.workspace = true
@@ -50,6 +47,19 @@ hex = "0.4"
 globset = "0.4"
 url.workspace = true
 thiserror.workspace = true
+# winit provides cross-platform windowing on all platforms. CEF runs in
+# OSR mode and renders into a wgpu surface; no native window embedding
+# is needed. buffr-modal's `bridge` adapter translates winit KeyEvents
+# into the engine's KeyChord type.
+#
+# default-features=false + `rwh_06`: avoids pulling in the `wayland` /
+# `x11` feature flags on macOS/Windows runners where pkg-config Wayland
+# probes would fail. AppKit / Win32 backends are cfg-gated by target_os
+# inside winit itself, so they stay active regardless.
+# Linux gets the `wayland` feature added via the target block below.
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+# Used by windowing/other/ime.rs for ContentHint flags.
+bitflags.workspace = true
 
 [dev-dependencies]
 proptest = "1"
@@ -57,45 +67,17 @@ proptest = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Linux: wayr is the Wayland-native windowing toolkit. WPE WebKit
-# subsurface embedding (planned engine path) requires direct Wayland
-# dispatch ownership, which winit can't provide without rewriting its
-# Wayland backend. On macOS/Windows where WPE isn't shippable anyway,
-# the buffr-app build switches to winit (see below).
+# Linux: add winit's Wayland backend. buffr requires a Wayland session on
+# Linux (enforced at runtime); winit on Linux without `wayland` fails to
+# compile. `wayland-dlopen` loads libwayland at runtime rather than link-
+# time, keeping the binary runnable on minimal systems that have libwayland
+# in a non-standard path.
 [target.'cfg(target_os = "linux")'.dependencies]
-wayr = { version = "0.2.1", features = [
-    "subsurface",
-    "text-input",
-    "cursor-shape",
-    "fractional-scale",
-    "xdg-activation",
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "wayland",
+    "wayland-dlopen",
 ] }
-buffr-modal = { workspace = true, features = ["wayr"] }
-
-# macOS / Windows: winit provides cross-platform windowing. CEF in OSR
-# mode renders into a wgpu surface; the browser content doesn't need
-# any platform-specific window embedding. buffr-modal's winit_adapter
-# (parallel to wayr_adapter) translates winit KeyEvents into the
-# engine's KeyChord type.
-#
-# winit with default-features=false + only `rwh_06`: drops the
-# `wayland` / `x11` features that would force a pkg-config wayland
-# probe on macOS/Windows runners. AppKit / Win32 backends are
-# cfg-gated by target_os inside winit, not by Cargo features, so they
-# stay active regardless. `rwh_06` adds the raw-window-handle 0.6
-# trait impls wgpu needs.
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-# buffr-modal's `bridge` feature owns its own toolkit-agnostic
-# KeyEvent / KeyCode / Modifiers / KeyState types (same shape as
-# wayr's, but with no wayr dep). The windowing/other backend
-# constructs these from winit events; main.rs routes them through
-# `bridge_key_event_to_chord` (cfg-gated alias to the same symbol
-# `key_event_to_chord` used on Linux).
-buffr-modal = { workspace = true, features = ["bridge"] }
-# Used by windowing/other/ime.rs for ContentHint flags. Linux gets
-# bitflags transitively through wayr; non-linux pulls it directly.
-bitflags.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
