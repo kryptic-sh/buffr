@@ -406,10 +406,10 @@ impl<'a, T: 'static, A: ApplicationHandler<T>> WinitAppHandler<T> for Bridge<'a,
         if let WinitWindowEvent::Focused(true) = &event {
             self.ev.focused_window = Some(window_id);
         }
-        if let WinitWindowEvent::Focused(false) = &event {
-            if self.ev.focused_window == Some(window_id) {
-                self.ev.focused_window = None;
-            }
+        if let WinitWindowEvent::Focused(false) = &event
+            && self.ev.focused_window == Some(window_id)
+        {
+            self.ev.focused_window = None;
         }
 
         // Resolve our SurfaceId. If we haven't seen this winit
