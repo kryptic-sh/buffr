@@ -7788,9 +7788,33 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // we just don't pre-empt that by going to sleep on
                 // every Alt-Tab.
             }
-            // WindowEvent::Occluded — no wayr equivalent in v0.1; sleep policy
-            // continues to rely on present-latency heuristic (SLOW_PRESENT_THRESHOLD_US).
-            // TODO(wayr): wire occlude when wayr adds a wl_surface.enter/leave mechanism.
+            WindowEvent::Occluded(occluded) => {
+                // wayr 0.1.9+ surfaces xdg_toplevel.state.suspended as
+                // an authoritative occlusion signal (xdg-shell v6+).
+                // On v6 sessions this is more accurate than the
+                // present-latency heuristic — fires the moment the
+                // compositor marks the surface obscured (workspace
+                // switch, minimize, opaque cover) instead of waiting
+                // for the rolling window of slow frames to fill.
+                //
+                // The heuristic stays as fallback for v5 compositors
+                // that never advertise Suspended; both signals feed the
+                // same `self.occluded` flag so paint policy doesn't
+                // need to know which source flipped it.
+                tracing::debug!(occluded, "WindowEvent::Occluded (wayr)");
+                self.occluded = occluded;
+                if !occluded {
+                    // Reveal: invalidate any stale CEF OSR buffer that
+                    // accumulated while we were sleeping, and clear the
+                    // probe deadline so paint resumes immediately.
+                    self.present_us_history.clear();
+                    self.next_probe_at = None;
+                }
+                self.recompute_paint_policy();
+                if !occluded && let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::PointerLeft => {
                 if let Some(host) = self.active_engine_dyn() {
                     let mods = wayr_mods_to_cef(&self.modifiers);
