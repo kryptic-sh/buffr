@@ -780,7 +780,7 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -1209,7 +1209,7 @@ mod windows {
     // ── Child spawn ───────────────────────────────────────────────────────────
 
     fn spawn_child_suspended(
-        bin: &PathBuf,
+        bin: &Path,
         args: &[OsString],
         pipe_path: Option<&str>,
     ) -> anyhow::Result<PROCESS_INFORMATION> {
