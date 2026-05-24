@@ -191,15 +191,26 @@ jobs:
           # so the dynamic linker finds it at process spawn.
           export LD_LIBRARY_PATH="$PWD/vendor/cef/linux64/Release:${LD_LIBRARY_PATH:-}"
 
+          # Stage CEF Linux resources (icudtl.dat, *.pak, locales/) next
+          # to the binary — CEF defaults to looking beside the exe and
+          # crashes with "Invalid file descriptor to ICU data received"
+          # otherwise. Production builds bundle these via AppImage/.deb
+          # but the dev cargo binary needs manual staging.
+          cp -r vendor/cef/linux64/Resources/* target/debug/ 2>/dev/null || true
+          cp vendor/cef/linux64/Release/*.bin target/debug/ 2>/dev/null || true
+
           cat > /tmp/sway-cmd.sh <<EOF
           #!/usr/bin/env bash
-          set -e
+          # Intentionally no \`set -e\`: a SIGTRAP / panic from buffr-app
+          # must still flow through to /tmp/buffr-smoke-exit + swaymsg
+          # exit so the outer wait loop doesn't hit 150s every crash.
           export LD_LIBRARY_PATH='$LD_LIBRARY_PATH'
           # sway sets WAYLAND_DISPLAY for its children but not
           # XDG_SESSION_TYPE; buffr-app refuses non-Wayland sessions.
           export XDG_SESSION_TYPE=wayland
           ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 120000
-          echo \$? > /tmp/buffr-smoke-exit
+          code=\$?
+          echo \$code > /tmp/buffr-smoke-exit
           swaymsg exit
           EOF
           chmod +x /tmp/sway-cmd.sh
