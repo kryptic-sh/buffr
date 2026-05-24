@@ -175,6 +175,17 @@ wrap_app! {
             // No-sandbox is set in `Settings`, but a redundant switch
             // keeps CEF from re-enabling on certain code paths.
             append_switch(command_line, "no-sandbox");
+            // BUFFR_DISABLE_ZYGOTE=1 opts out of Chromium's zygote
+            // pre-fork model. On headless Linux CI (pixman-sway, no
+            // DBus, etc.) the zygote subprocess crashes at init with
+            // "Invalid file descriptor to ICU data received" — the
+            // parent's ICU fd doesn't survive the fork. Skipping the
+            // zygote forks each renderer/gpu process fresh, which
+            // costs a few ms at startup but sidesteps the fd issue.
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("BUFFR_DISABLE_ZYGOTE").is_some() {
+                append_switch(command_line, "no-zygote");
+            }
             // macOS Chromium tries to access the user's "Chromium Safe Storage"
             // Keychain item through OSCrypt for cookie/password encryption.
             // buffr does not intentionally use that store, and prompting on
