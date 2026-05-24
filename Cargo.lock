@@ -1978,9 +1978,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-splash"
-version = "0.2.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e38f603523defba5c303f13b8c4d2a998f77c0d656296f1a79efd4a3ac73707a"
+checksum = "5561355a7c5fa5dcb1a688c090d7110ab1b427c714df0152cc9605df7fb27024"
 
 [[package]]
 name = "hjkl-xdg"

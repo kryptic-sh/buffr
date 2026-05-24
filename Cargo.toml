@@ -116,7 +116,7 @@ buffr-view-source = { path = "crates/buffr-view-source" }
 hjkl-engine = "0.5"
 hjkl-buffer = "0.6"
 hjkl-clipboard = "0.25"
-hjkl-splash = "0.2"
+hjkl-splash = "0.27"
 hjkl-config = "0.25"
 hjkl-bonsai = "0.6"
 
