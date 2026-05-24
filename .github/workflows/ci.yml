@@ -196,8 +196,14 @@ jobs:
           # crashes with "Invalid file descriptor to ICU data received"
           # otherwise. Production builds bundle these via AppImage/.deb
           # but the dev cargo binary needs manual staging.
-          cp -r vendor/cef/linux64/Resources/* target/debug/ 2>/dev/null || true
-          cp vendor/cef/linux64/Release/*.bin target/debug/ 2>/dev/null || true
+          echo "--- vendor/cef/linux64 layout ---"
+          ls -la vendor/cef/linux64/ || true
+          echo "--- vendor/cef/linux64/Resources ---"
+          ls -la vendor/cef/linux64/Resources/ || true
+          cp -rv vendor/cef/linux64/Resources/* target/debug/
+          cp -v vendor/cef/linux64/Release/*.bin target/debug/
+          echo "--- target/debug after staging ---"
+          ls target/debug/icudtl.dat target/debug/resources.pak target/debug/v8_context_snapshot.bin
 
           cat > /tmp/sway-cmd.sh <<EOF
           #!/usr/bin/env bash
