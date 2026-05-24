@@ -186,6 +186,11 @@ mod loading_anim;
 mod render;
 mod session;
 mod single_instance;
+// Bridge types on non-Linux mirror wayr's surface for shape parity even
+// where main.rs's current dispatch path doesn't read every field/variant
+// yet (Touch, ContentPurpose, Rect, …). Future phases will exercise
+// them; allow the dead-code lints crate-wide here.
+#[allow(dead_code)]
 mod windowing;
 use crate::windowing::{
     ApplicationHandler, CursorIcon, EventLoop, EventLoopProxy, Modifiers, Surface, SurfaceId,
@@ -8559,6 +8564,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::Ime(ime_event) => {
                 use crate::windowing::ImeEvent;
                 if let Some(engine) = self.active_engine_dyn() {
+                    // wayr's ImeEvent is #[non_exhaustive] from another
+                    // crate, so the `_` arm is reachable on Linux. On
+                    // non-Linux the bridge ImeEvent is same-crate so
+                    // clippy flags it unreachable — allow either way
+                    // since we want the forward-compat catch-all to
+                    // survive.
+                    #[allow(unreachable_patterns)]
                     match ime_event {
                         ImeEvent::Preedit { text, cursor } => {
                             if text.is_empty() {
@@ -9329,12 +9341,12 @@ fn pump_cef_message_loop(backend: &dyn Backend, next_pump_at: &mut Option<Instan
         tracing::trace!(delay_ms, ?at, "cef: schedule next pump");
         *next_pump_at = Some(at);
     }
-    if let Some(at) = *next_pump_at {
-        if Instant::now() >= at {
-            tracing::trace!("cef: do_message_loop_work");
-            backend.pump_message_loop();
-            *next_pump_at = None;
-        }
+    if let Some(at) = *next_pump_at
+        && Instant::now() >= at
+    {
+        tracing::trace!("cef: do_message_loop_work");
+        backend.pump_message_loop();
+        *next_pump_at = None;
     }
 }
 
