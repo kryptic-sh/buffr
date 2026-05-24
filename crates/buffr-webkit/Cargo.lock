@@ -269,7 +269,6 @@ dependencies = [
 name = "buffr-config"
 version = "0.4.2"
 dependencies = [
- "anyhow",
  "buffr-modal",
  "dirs",
  "hjkl-config",
@@ -284,22 +283,13 @@ dependencies = [
 name = "buffr-core"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "base64",
  "buffr-config",
- "buffr-downloads",
  "buffr-engine",
- "buffr-history",
- "buffr-modal",
- "buffr-permissions",
- "buffr-view-source",
- "buffr-zoom",
  "chrono",
  "core-foundation",
  "hjkl-clipboard 0.25.1",
- "hjkl-config",
  "image",
- "raw-window-handle",
  "rusqlite",
  "semver",
  "serde",
@@ -331,7 +321,6 @@ dependencies = [
 name = "buffr-engine"
 version = "0.2.0"
 dependencies = [
- "base64",
  "buffr-modal",
  "buffr-permissions",
  "getrandom 0.2.17",
@@ -343,29 +332,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "buffr-history"
-version = "0.1.2"
-dependencies = [
- "chrono",
- "rusqlite",
- "serde",
- "thiserror 2.0.18",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "buffr-modal"
 version = "0.1.5"
 dependencies = [
- "anyhow",
  "bitflags 2.11.1",
  "crossterm",
  "hjkl-buffer",
  "hjkl-engine",
  "serde",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -378,24 +353,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "buffr-view-source"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "hjkl-bonsai",
- "tracing",
-]
-
-[[package]]
 name = "buffr-webkit"
 version = "0.1.0"
 dependencies = [
  "bindgen",
- "buffr-config",
  "buffr-core",
  "buffr-downloads",
  "buffr-engine",
- "buffr-history",
  "buffr-modal",
  "buffr-permissions",
  "cc",
@@ -403,23 +367,12 @@ dependencies = [
  "hjkl-clipboard 0.5.5",
  "image",
  "khronos-egl",
- "libloading 0.8.9",
+ "libloading",
  "pkg-config",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "ureq",
-]
-
-[[package]]
-name = "buffr-zoom"
-version = "0.1.2"
-dependencies = [
- "rusqlite",
- "serde",
- "thiserror 2.0.18",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -516,7 +469,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading 0.8.9",
+ "libloading",
 ]
 
 [[package]]
@@ -793,7 +746,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading",
 ]
 
 [[package]]
@@ -1260,25 +1213,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "hjkl-bonsai"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3776cfca536a004ae962cb8cac098571f9222caaef85fe80d16fa06c134e601"
-dependencies = [
- "anyhow",
- "dirs",
- "hjkl-xdg",
- "libloading 0.9.0",
- "ratatui",
- "serde",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "tree-sitter",
- "tree-sitter-language",
-]
-
-[[package]]
 name = "hjkl-buffer"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1337,16 +1271,6 @@ dependencies = [
  "ratatui",
  "regex",
  "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "hjkl-xdg"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a9818d4389b1cc9d8ea54f57f388f3a58d3f80315e0ceb66903813a26c3fa1f"
-dependencies = [
- "dirs",
  "thiserror 2.0.18",
 ]
 
@@ -1641,7 +1565,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
 dependencies = [
  "libc",
- "libloading 0.8.9",
+ "libloading",
 ]
 
 [[package]]
@@ -1693,16 +1617,6 @@ name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
-
-[[package]]
-name = "libloading"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -2580,7 +2494,6 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
- "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -2703,12 +2616,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
 name = "strsim"
@@ -3035,26 +2942,6 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
-
-[[package]]
-name = "tree-sitter"
-version = "0.26.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "887bd495d0582c5e3e0d8ece2233666169fa56a9644d172fc22ad179ab2d0538"
-dependencies = [
- "cc",
- "regex",
- "regex-syntax",
- "serde_json",
- "streaming-iterator",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-language"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "typenum"

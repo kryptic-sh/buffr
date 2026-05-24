@@ -10,10 +10,10 @@ homepage.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = []
+
 [dependencies]
-anyhow = "1"
-tracing = "0.1"
 buffr-modal.workspace = true
-softbuffer = "0.4"
 fontdb = { version = "0.23", default-features = false, features = ["fs", "memmap"] }
 fontdue = "0.9"

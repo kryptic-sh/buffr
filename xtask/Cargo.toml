@@ -14,10 +14,12 @@ publish = false
 name = "xtask"
 path = "src/main.rs"
 
+[package.metadata.cargo-machete]
+ignored = []
+
 [dependencies]
 anyhow.workspace = true
 ureq.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 tar.workspace = true
 bzip2.workspace = true

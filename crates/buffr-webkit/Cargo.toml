@@ -10,15 +10,16 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 description = "WPE WebKit (Linux native) backend for buffr-engine — phase 1 scaffold"
 publish = false
 
+[package.metadata.cargo-machete]
+ignored = []
+
 [dependencies]
 buffr-core = { path = "../buffr-core" }
 buffr-engine = { path = "../buffr-engine" }
 buffr-permissions = { path = "../buffr-permissions", default-features = false }
 serde_json = "1"
 buffr-modal = { path = "../buffr-modal" }
-buffr-history = { path = "../buffr-history" }
 buffr-downloads = { path = "../buffr-downloads" }
-buffr-config = { path = "../buffr-config" }
 hjkl-clipboard = "0.5"
 tracing = "0.1"
 thiserror = "2"

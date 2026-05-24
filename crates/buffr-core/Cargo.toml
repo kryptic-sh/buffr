@@ -10,29 +10,23 @@ homepage.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = []
+
 [features]
 # Off-screen rendering path (Linux default; always compiled in).
 osr = []
 
 [dependencies]
-anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-hjkl-config.workspace = true
-raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 ureq = { version = "3", features = ["json"] }
 semver = { version = "1", features = ["serde"] }
 buffr-engine.workspace = true
-buffr-modal.workspace = true
-buffr-history.workspace = true
-buffr-downloads.workspace = true
 buffr-config.workspace = true
-buffr-zoom.workspace = true
-buffr-permissions.workspace = true
-buffr-view-source.workspace = true
 hjkl-clipboard.workspace = true
 # Image decode / re-encode for context-menu "Copy Image"
 image = { version = "0.25", default-features = false, features = [

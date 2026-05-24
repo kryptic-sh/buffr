@@ -63,9 +63,17 @@ fn heartbeat_disable_does_not_pass_sock_env_to_child() {
 }
 
 /// With --heartbeat-disable, crash-restart still works (Round-1 behaviour).
+///
+/// The script SIGABRT-self (kill -ABRT $$) so the child dies via signal,
+/// not via `exit 1`. The supervisor distinguishes the two: normal
+/// non-zero exits are treated as CLI / panic errors and propagated
+/// without restart (added in the Phase A supervisor fix), while
+/// signal-style deaths still go through the restart-with-backoff
+/// path. Using `exit 1` here would test the new no-restart path,
+/// not the legacy crash-restart path the test name claims.
 fn crasher_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = dir.join("fake-buffr-crash");
-    fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write script");
+    fs::write(&script, "#!/bin/sh\nkill -ABRT $$\n").expect("write script");
     let mut perms = fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&script, perms).unwrap();
