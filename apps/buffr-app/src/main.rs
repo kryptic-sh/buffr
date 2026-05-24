@@ -4467,6 +4467,17 @@ impl AppState {
             );
         }
 
+        // Smoke-test: a completed paint proves the backend reached steady
+        // state. Headless Windows runners never deliver WM_PAINT so the
+        // RedrawRequested-based signal alone misses every successful run
+        // that paints via Resized → paint_chrome.
+        if SMOKE_TEST_ACTIVE.load(Ordering::SeqCst)
+            && !SMOKE_TEST_SAW_REDRAW.swap(true, Ordering::SeqCst)
+        {
+            tracing::info!("smoke-test: first paint completed; exiting 0");
+            std::process::exit(0);
+        }
+
         // Observe THIS frame's submit_done_us: when wgpu's GPU queue is
         // backpressured by the compositor, queue.write_texture and
         // queue.submit block on the UI thread (chrome_us / osr_us / submit_us
