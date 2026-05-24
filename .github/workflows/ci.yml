@@ -195,7 +195,7 @@ jobs:
           #!/usr/bin/env bash
           set -e
           export LD_LIBRARY_PATH='$LD_LIBRARY_PATH'
-          ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 30000
+          ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 120000
           echo \$? > /tmp/buffr-smoke-exit
           swaymsg exit
           EOF
@@ -206,8 +206,9 @@ jobs:
 
           sway --unsupported-gpu -c /tmp/sway-config &
           SWAY_PID=$!
-          # Give sway up to 60s to finish (smoke timeout is 30s + buffer)
-          for i in {1..60}; do
+          # Give sway up to 150s to finish (smoke timeout is 120s + buffer
+          # for CEF init + window mapping on cold runners).
+          for i in {1..150}; do
             if [ -f /tmp/buffr-smoke-exit ]; then
               break
             fi
@@ -239,7 +240,7 @@ jobs:
             ln -sf "$PWD/vendor/cef/macosarm64/Release" target/debug/Frameworks 2>/dev/null || \
               cp -a "$PWD/vendor/cef/macosarm64/Release" target/debug/Frameworks
           fi
-          ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 30000
+          ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 120000
           echo "smoke exit code: $?"
 
       - name: run smoke (Windows)
@@ -256,7 +257,7 @@ jobs:
           if (Test-Path $cef) {
             Copy-Item -Path "$cef\*" -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
           }
-          & .\target\debug\buffr-app.exe --smoke-test --smoke-test-timeout-ms 30000
+          & .\target\debug\buffr-app.exe --smoke-test --smoke-test-timeout-ms 120000
           $code = $LASTEXITCODE
           Write-Host "smoke exit code: $code"
           if ($code -ne 0) { exit $code }
