@@ -7275,10 +7275,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // Browser not yet created — queue as pending tabs so they open on resumed.
                     self.pending_new_tabs.extend(urls.clone());
                 }
-                // Bring the window to the front so the user sees it.
-                // TODO(wayr-focus): wayr v0.1 has no set_visible/focus_window;
-                // the compositor should already raise the window on new activity.
-                let _ = &self.window;
+                // Bring the window to the front via xdg_activation_v1 so the
+                // user actually sees the forwarded tab(s). Best-effort: the
+                // compositor will reject the request if it doesn't trust the
+                // serial we attach (e.g. no recent user input on our surfaces
+                // — likely when this process has been backgrounded for a
+                // while). The downgrade-on-reject is benign; the tab is open.
+                if let Some(window) = self.window.as_ref()
+                    && let Err(err) = window.request_activation(event_loop)
+                {
+                    debug!(?err, "xdg_activation request skipped");
+                }
             }
             BuffrUserEvent::ClipboardPasteText(text) => {
                 let Some(text) = text else { return };
