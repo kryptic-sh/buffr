@@ -286,6 +286,16 @@ impl<T: 'static> EventLoop<T> {
         let win = active
             .create_window(attrs)
             .map_err(|e| BuildError(e.to_string()))?;
+        // Bootstrap the first paint. wayr fires its own initial
+        // `WindowEvent::RedrawRequested` after the empty commit that
+        // kicks off the configure cycle, but winit only fires
+        // `RedrawRequested` when the OS issues `WM_PAINT` (or we ask
+        // for one). On headless / non-interactive Windows sessions
+        // (e.g. CI runners with no logged-in user) `WM_PAINT` never
+        // arrives. Asking explicitly here matches wayr's behaviour
+        // and lets the buffr-app dispatch loop reach steady state on
+        // every platform.
+        win.request_redraw();
         let raw_id = win.id();
         let nz = NonZeroU64::new(self.next_surface_id)
             .expect("surface-id counter starts at 1 and only increments");
