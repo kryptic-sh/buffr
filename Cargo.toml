@@ -125,11 +125,3 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-
-# TEMP: patch wayr to the sibling kryptic-sh/wayr checkout while
-# v0.1.4 is in flight on crates.io (Toplevel Send+Sync +
-# HasDisplayHandle so Arc<Toplevel> satisfies wgpu's safe
-# create_surface bound — fixes shutdown SIGSEGV). Remove once
-# 0.1.4 is live and the dep range below picks it up.
-[patch.crates-io]
-wayr = { path = "../wayr" }
