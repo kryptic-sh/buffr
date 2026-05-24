@@ -157,23 +157,19 @@ pub fn cef_initialize(cache_path: &str, app: &mut cef::App) -> Result<(), String
     #[cfg(target_os = "macos")]
     {
         settings.external_message_pump = 1;
-        if let Ok(exe) = std::env::current_exe() {
-            // Inside a real .app bundle the path already contains "Contents";
-            // skip the cargo-run framework override.
-            if !exe.components().any(|c| c.as_os_str() == "Contents") {
-                if let Some(exe_dir) = exe.parent() {
-                    let fw = exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
-                    if let Ok(fw) = fw.canonicalize() {
-                        let res = fw.join("Resources");
-                        settings.browser_subprocess_path =
-                            cef::CefString::from(exe.to_string_lossy().as_ref());
-                        settings.framework_dir_path =
-                            cef::CefString::from(fw.to_string_lossy().as_ref());
-                        settings.resources_dir_path =
-                            cef::CefString::from(res.to_string_lossy().as_ref());
-                    }
-                }
-            }
+        // Inside a real .app bundle the path already contains "Contents";
+        // skip the cargo-run framework override.
+        if let Ok(exe) = std::env::current_exe()
+            && !exe.components().any(|c| c.as_os_str() == "Contents")
+            && let Some(exe_dir) = exe.parent()
+            && let Ok(fw) = exe_dir
+                .join("../Frameworks/Chromium Embedded Framework.framework")
+                .canonicalize()
+        {
+            let res = fw.join("Resources");
+            settings.browser_subprocess_path = cef::CefString::from(exe.to_string_lossy().as_ref());
+            settings.framework_dir_path = cef::CefString::from(fw.to_string_lossy().as_ref());
+            settings.resources_dir_path = cef::CefString::from(res.to_string_lossy().as_ref());
         }
     }
 
