@@ -6634,6 +6634,11 @@ impl AppState {
 ///
 /// wayr `ScrollEvent` carries a single axis per event; the orthogonal axis
 /// delta is always 0.
+///
+/// Sign: Wayland's `wl_pointer.axis` uses "positive vertical = scroll down,
+/// positive horizontal = scroll right." CEF `send_mouse_wheel_event` uses
+/// "positive deltaY = scroll up, positive deltaX = scroll right." Horizontal
+/// matches; vertical is inverted, so negate dy here.
 fn wayr_scroll_to_cef_delta(ev: &crate::windowing::ScrollEvent) -> (i32, i32, bool) {
     use crate::windowing::{AxisDirection, AxisSource};
     const PIXEL_DELTA_SCALE: f32 = 10.0;
@@ -6650,7 +6655,7 @@ fn wayr_scroll_to_cef_delta(ev: &crate::windowing::ScrollEvent) -> (i32, i32, bo
     };
     match ev.axis {
         AxisDirection::Horizontal => (scaled, 0, is_pixel),
-        AxisDirection::Vertical => (0, scaled, is_pixel),
+        AxisDirection::Vertical => (0, -scaled, is_pixel),
     }
 }
 
