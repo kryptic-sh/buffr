@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "buffr"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-app"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "buffr-cef",
 ]
@@ -4941,9 +4941,9 @@ dependencies = [
 
 [[package]]
 name = "wayr"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67dd4d6fddd7e61ea89ff3afd6746ddf36250747a27c944a34901675dfbc7939"
+checksum = "25c17d2acfe2417de1047f1daeb9b36f8d62e55702886436a879bca6f1c2a8ae"
 dependencies = [
  "bitflags 2.11.1",
  "calloop 0.14.4",
@@ -5731,7 +5731,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "bzip2",

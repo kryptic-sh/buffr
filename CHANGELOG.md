@@ -8,6 +8,23 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-05-25
+
+### Fixed
+
+- Mouse wheel vertical scroll direction. The buggy commit `6967500` worked
+  around inverted scroll by negating dy in the wayr → CEF helper; the root cause
+  was wayr passing Wayland's "positive = scroll down" sign through unchanged.
+  Wayr 0.2.1 now normalises to winit's "positive = scroll up" convention at the
+  emission site, so the buffr-side negation is reverted and the helper just
+  passes the signed delta straight to CEF.
+
+### Changed
+
+- Bumped wayr dep `0.2.0 → 0.2.1` for the scroll-sign fix above.
+
+[0.14.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.1
+
 ## [0.14.0] - 2026-05-25
 
 ### Added

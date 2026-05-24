@@ -63,7 +63,7 @@ libc = "0.2"
 # Wayland backend. On macOS/Windows where WPE isn't shippable anyway,
 # the buffr-app build switches to winit (see below).
 [target.'cfg(target_os = "linux")'.dependencies]
-wayr = { version = "0.2.0", features = [
+wayr = { version = "0.2.1", features = [
     "subsurface",
     "text-input",
     "cursor-shape",
