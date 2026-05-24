@@ -26,17 +26,34 @@ jobs:
     # cuts the critical path even though it costs a duplicated CEF +
     # rust toolchain setup. Uses a separate Swatinem shared-key so the
     # parallel job doesn't fight `linux-build` for the same cache.
-    name: lint (fmt + clippy)
-    runs-on: ubuntu-latest
+    #
+    # Matrix across 3 OSes so clippy catches lints inside
+    # `#[cfg(target_os = "windows")]` / `#[cfg(target_os = "macos")]`
+    # blocks (idle-inhibit backends in buffr-core, Windows job-object
+    # plumbing in apps/buffr) that an ubuntu-only run silently skips.
+    # See issue #156.
+    name: lint (fmt + clippy) ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cef_platform: linux64
+          - os: macos-latest
+            cef_platform: macosarm64
+          - os: windows-latest
+            cef_platform: windows64
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/${{ matrix.cef_platform }}
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: install CEF runtime deps
+      - name: install CEF runtime deps (Linux only)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -58,13 +75,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: linux-lint
+          shared-key: lint-${{ matrix.os }}
 
       - name: cache CEF binary distribution
         uses: actions/cache@v5
         with:
           path: vendor/cef
-          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+          key:
+            cef-${{ matrix.cef_platform }}-${{ hashFiles('xtask/src/main.rs')
+            }}
 
       - name: fetch CEF
         run: cargo xtask fetch-cef
