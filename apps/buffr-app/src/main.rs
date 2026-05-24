@@ -474,7 +474,31 @@ struct Cli {
     /// this process exits 0. Combined with `--new-tab` URLs for forwarding.
     #[arg(value_name = "URL")]
     urls: Vec<String>,
+    /// Hidden smoke-test flag: launch the event loop, wait for the
+    /// first `WindowEvent::RedrawRequested` (proves the windowing
+    /// backend reached steady state and the compositor / window
+    /// manager accepted the surface), then exit 0. Bounded by
+    /// `--smoke-test-timeout-ms` (default 30 000) so CI never hangs.
+    /// Used by the cross-platform CI smoke harness to catch
+    /// regressions in the wayr / winit backends that don't surface
+    /// at compile time.
+    #[arg(long, hide = true)]
+    smoke_test: bool,
+    /// Smoke-test timeout in milliseconds. Process exits non-zero if
+    /// no `RedrawRequested` event arrives within this budget. Only
+    /// honoured when `--smoke-test` is set.
+    #[arg(long, default_value = "30000", hide = true)]
+    smoke_test_timeout_ms: u64,
 }
+
+// ── smoke-test plumbing ──────────────────────────────────────────────────────
+//
+// Two static atomics drive the `--smoke-test` flag in main and the
+// `WindowEvent::RedrawRequested` handler. Statics (not AppState
+// fields) so the watchdog thread + the dispatch arm can both reach
+// them without threading.
+static SMOKE_TEST_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SMOKE_TEST_SAW_REDRAW: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     // -------- backend construction ------------------------------------
@@ -526,6 +550,31 @@ fn main() -> Result<()> {
     let backend: Arc<dyn Backend> = Arc::new(cef_backend);
 
     let cli = Cli::parse();
+
+    // -------- smoke-test mode ---------------------------------------
+    //
+    // CI cross-platform smoke harness: launch the windowing backend,
+    // wait for the first `WindowEvent::RedrawRequested` (proves wayr
+    // / winit reached steady state and the compositor / window
+    // manager accepted the surface), then exit 0. Bounded by a
+    // watchdog thread so a hung event loop fails the test instead of
+    // wedging CI.
+    if cli.smoke_test {
+        SMOKE_TEST_ACTIVE.store(true, Ordering::SeqCst);
+        let timeout_ms = cli.smoke_test_timeout_ms;
+        std::thread::Builder::new()
+            .name("smoke-test-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
+                if !SMOKE_TEST_SAW_REDRAW.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "smoke-test: no RedrawRequested within {timeout_ms} ms; exiting non-zero"
+                    );
+                    std::process::exit(3);
+                }
+            })
+            .expect("spawn smoke-test watchdog");
+    }
 
     // -------- --engine validation (before CEF init) ------------------
     if let Some(raw) = cli.engine.as_deref() {
@@ -7661,6 +7710,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             WindowEvent::RedrawRequested => {
                 tracing::trace!("redraw: RedrawRequested");
                 self.paint_chrome();
+                // Smoke-test mode: first RedrawRequested proves the
+                // windowing backend reached steady state. Mark and
+                // exit cleanly; the watchdog thread will be a no-op
+                // when it eventually fires.
+                if SMOKE_TEST_ACTIVE.load(Ordering::SeqCst) {
+                    SMOKE_TEST_SAW_REDRAW.store(true, Ordering::SeqCst);
+                    tracing::info!("smoke-test: RedrawRequested received; exiting 0");
+                    event_loop.exit();
+                }
             }
             WindowEvent::Resized(new_size) => {
                 // crate::windowing::Size is logical pixels. Get physical via window.physical_size().

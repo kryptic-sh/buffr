@@ -98,6 +98,134 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  smoke:
+    # Cross-platform event-loop smoke. Builds buffr-app + supervisor
+    # for the target OS, then launches `buffr-app --smoke-test`. The
+    # binary fires its windowing backend (wayr on Linux, winit on
+    # macOS / Windows), creates the toplevel surface, paints once,
+    # and exits 0 on the first `RedrawRequested`. A watchdog thread
+    # forces exit 3 if no redraw arrives within
+    # `--smoke-test-timeout-ms`. Catches hangs / regressions in the
+    # windowing layer that compile-time clippy can't.
+    #
+    # Linux runs under headless sway so the wayr Wayland client has a
+    # compositor to talk to. macOS and Windows runners have native GUI
+    # subsystems available, no virtual display setup needed.
+    name: smoke (event loop) ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cef_platform: linux64
+            bin_suffix: ""
+          - os: macos-latest
+            cef_platform: macosarm64
+            bin_suffix: ""
+          - os: windows-latest
+            cef_platform: windows64
+            bin_suffix: ".exe"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/${{ matrix.cef_platform }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: install CEF runtime deps + sway (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
+            libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
+            libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
+            libgl1 libegl1 libgles2 \
+            libglib2.0-dev \
+            sway xwayland
+
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: smoke-${{ matrix.os }}
+
+      - name: cache CEF binary distribution
+        uses: actions/cache@v5
+        with:
+          path: vendor/cef
+          key:
+            cef-${{ matrix.cef_platform }}-${{ hashFiles('xtask/src/main.rs')
+            }}
+
+      - name: fetch CEF
+        run: cargo xtask fetch-cef
+
+      - name: build buffr-app (debug)
+        run: cargo build -p buffr-app
+
+      - name: run smoke under headless sway (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Launch sway with a smoke-runner that invokes buffr-app and
+          # writes the exit code to a file the outer shell reads after
+          # sway exits. Mirrors the e2e suite's pattern.
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export WLR_BACKENDS=headless
+          export WLR_LIBINPUT_NO_DEVICES=1
+          export WLR_RENDERER=pixman
+          mkdir -p "$XDG_RUNTIME_DIR"
+
+          cat > /tmp/sway-cmd.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 30000
+          echo $? > /tmp/buffr-smoke-exit
+          swaymsg exit
+          EOF
+          chmod +x /tmp/sway-cmd.sh
+
+          sway --unsupported-gpu -c <(echo "exec /tmp/sway-cmd.sh") &
+          SWAY_PID=$!
+          # Give sway up to 60s to finish (smoke timeout is 30s + buffer)
+          for i in {1..60}; do
+            if [ -f /tmp/buffr-smoke-exit ]; then
+              break
+            fi
+            sleep 1
+          done
+          wait $SWAY_PID 2>/dev/null || true
+          if [ ! -f /tmp/buffr-smoke-exit ]; then
+            echo "smoke: buffr-app never exited under sway"
+            exit 1
+          fi
+          exit_code=$(cat /tmp/buffr-smoke-exit)
+          if [ "$exit_code" != "0" ]; then
+            echo "smoke: buffr-app exited $exit_code"
+            exit "$exit_code"
+          fi
+
+      - name: run smoke (macOS / Windows)
+        if: matrix.os != 'ubuntu-latest'
+        shell: bash
+        run: |
+          # GH Actions runners on macOS / Windows have native GUI
+          # subsystems; no extra setup needed. The 30s smoke timeout
+          # + 60s CI cap means we surface hangs explicitly instead of
+          # waiting for the job-level timeout.
+          ./target/debug/buffr-app${{ matrix.bin_suffix }} --smoke-test --smoke-test-timeout-ms 30000
+          echo "smoke exit code: $?"
+
   linux:
     name: linux build + test
     runs-on: ubuntu-latest
