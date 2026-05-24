@@ -125,3 +125,7 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+
+# TEMP: patch wayr to local checkout while v0.1.6 publishes.
+[patch.crates-io]
+wayr = { path = "../wayr" }

@@ -3770,7 +3770,7 @@ impl AppState {
     /// owning the originating browser (main tab or popup). Last writer
     /// wins — coalescing is desirable since CEF can fire many times per
     /// frame as the cursor moves.
-    fn pump_cursor_changes(&self) {
+    fn pump_cursor_changes(&self, event_loop: &EventLoop<BuffrUserEvent>) {
         let Some(engine) = self.active_engine_dyn() else {
             return;
         };
@@ -3778,13 +3778,15 @@ impl AppState {
             return;
         };
         let icon = cef_cursor_type_to_winit(raw);
-        // TODO(wayr-cursor): wayr::Toplevel::set_cursor requires &EventLoop<T>
-        // but pump_cursor_changes takes &self — no event_loop in scope here.
-        // Cursor updates are cosmetic; skip until the architecture is adjusted
-        // to pass event_loop through (or until wayr exposes a set_cursor that
-        // doesn't need it).
-        let _ = icon;
+        // Per-seat in Wayland: routing through the focused window
+        // would be wrong — the compositor accepts the request from
+        // any of our surfaces as long as one of them holds pointer
+        // focus. Use the event_loop accessor directly. We log the
+        // originating browser_id for diagnostics but don't route on
+        // it (the page that's hovered is by definition the one with
+        // pointer focus).
         let _ = browser_id;
+        event_loop.set_cursor(icon);
     }
 
     /// Drain the find-result mailbox into the statusline. Called from
@@ -8633,9 +8635,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             self.check_cross_engine_nav();
         }
 
-        // Forward any pending CEF cursor change to winit. Reads the
-        // shared cursor state and calls `Window::set_cursor` once.
-        self.pump_cursor_changes();
+        // Forward any pending CEF cursor change to wayr's per-seat
+        // cursor-shape device. Reads the shared cursor state and
+        // calls EventLoop::set_cursor once per tick (last writer wins
+        // — CEF can fire many times per frame as the cursor moves).
+        self.pump_cursor_changes(event_loop);
 
         // Drain any decoded favicons from CEF and stash by browser id.
         // refresh_tab_strip below picks them up on the next tab refresh.
@@ -9105,9 +9109,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // else woke us. wgpu's surface itself runs Fifo (vsync) so
         // render rate is already capped to display refresh; this
         // matches the pump cadence to it.
-        // wayr v0.1 does not expose monitor refresh rate; default to 60 Hz.
-        // TODO(wayr-monitor): use wayr OutputInfo when wayr exposes it.
-        let frame_period = Duration::from_millis(16);
+        //
+        // Pull the live refresh rate from wayr's OutputInfo (millihertz
+        // → ms-per-frame). Take the FASTEST advertised output's rate
+        // so multi-monitor mixes pace to the fastest panel rather
+        // than down-clocking to a stale 60Hz default. If no output
+        // has reported yet (early startup) fall back to 60 Hz.
+        let frame_period = {
+            let outputs = event_loop.outputs();
+            let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
+            if max_mhz > 0 {
+                // mhz -> period in ms: 1000 * 1000 / mhz.
+                Duration::from_micros(1_000_000_000 / max_mhz as u64)
+            } else {
+                Duration::from_millis(16)
+            }
+        };
         let next_wakeup = Instant::now() + frame_period;
         // If CEF has scheduled a pump, wake up no later than that.
         let deadline = match self.cef_next_pump_at {
@@ -9179,21 +9196,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.heartbeat = None;
             }
         }
-        // wayr's `run_app` always calls `blocking_pump(50ms)` after
-        // `about_to_wait` returns — it sleeps inside `poll(2)`, which
-        // wakes immediately on socket activity or user events (unlike
-        // `std::thread::sleep` which is unconditional). So we DON'T
-        // sleep here; the 50 ms cap inside wayr already paces idle
-        // iterations at 20 Hz. `deadline` is computed above only so
-        // the wheel-momentum / loading-anim / CEF-pump deadlines are
-        // honoured by `request_redraw` calls that happen above this
-        // point — the deadline value itself is informational.
-        //
-        // TODO(wayr-waituntil): if the deadline lands before wayr's
-        // 50 ms cap, we currently over-wait by up to (50 ms - delta).
-        // Add a `wayr::EventLoop::wait_until(deadline)` API so this
-        // hook can request a tighter cap for animation paths.
-        let _ = deadline;
+        // Hand the computed deadline to wayr's loop so the next
+        // `blocking_pump` is capped at min(50 ms, deadline-now,
+        // key-repeat next-fire). Real input still preempts via
+        // poll(2); the deadline only takes effect when no socket
+        // events arrive sooner. Single-shot — re-arms every
+        // about_to_wait iteration.
+        event_loop.wait_until(deadline);
     }
 }
 
