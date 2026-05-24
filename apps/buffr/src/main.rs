@@ -380,7 +380,8 @@ mod unix {
             // (covers segfaults during CEF / wgpu teardown after the
             // user explicitly closed the window — see the
             // `SUPERVISOR_CLEAN_FLAG_ENV` doc).
-            let exit_zero = status.as_ref().and_then(|s| s.code()) == Some(0) && !hang_detected;
+            let exit_code = status.as_ref().and_then(|s| s.code());
+            let exit_zero = exit_code == Some(0) && !hang_detected;
             let flag_present = clean_flag_path
                 .as_ref()
                 .is_some_and(|p| p.exists());
@@ -409,6 +410,27 @@ mod unix {
                     "child exited after supervisor shutdown signal; not restarting"
                 );
                 return Ok(());
+            }
+
+            // Normal exit with a non-zero code (CLI parse error, panic
+            // → exit(101), config validation failure, …) — the child
+            // chose to die with a real exit code, not killed by a
+            // signal. Respawning would just re-run the same failure;
+            // propagate the code and exit. `ExitStatus::code()`
+            // returns `Some(_)` only for normal exits — `None` means
+            // killed by signal, which is the genuine crash case we
+            // still want to handle below.
+            if !hang_detected
+                && let Some(code) = exit_code
+                && code != 0
+            {
+                tracing::info!(
+                    pid = %child_pid,
+                    elapsed_ms = elapsed.as_millis(),
+                    exit_code = code,
+                    "child exited normally with non-zero code; not restarting (likely CLI or config error)"
+                );
+                std::process::exit(code);
             }
 
             // Crash / hang path.
