@@ -4261,9 +4261,6 @@ impl AppState {
                         );
                     },
                     None,
-                    // Animation ticks change the browser-region pixels
-                    // every frame; full damage.
-                    crate::render::DamageHint::Full,
                 )
             }
             PaintPath::FreshOsr => {
@@ -4297,8 +4294,6 @@ impl AppState {
                         );
                     },
                     Some(osr_upload),
-                    // Fresh CEF on_paint → OSR rect's pixels changed.
-                    crate::render::DamageHint::Full,
                 )
             }
             PaintPath::SyntheticScratch => {
@@ -4324,13 +4319,6 @@ impl AppState {
                     generation: self.last_osr_generation,
                     dst_rect: (0, browser_y, browser_w, browser_h),
                 };
-                let damage = Self::chrome_strip_damage_hint(
-                    chrome_dirty_effective,
-                    width,
-                    height,
-                    browser_y,
-                    browser_h,
-                );
                 renderer.frame(
                     chrome_dirty_effective,
                     |buf, w, _h| {
@@ -4350,10 +4338,6 @@ impl AppState {
                         );
                     },
                     Some(osr_upload),
-                    // SyntheticScratch reuses the cached OSR
-                    // texture — OSR rect pixels = previous frame's
-                    // OSR rect pixels. Only chrome strips changed.
-                    damage,
                 )
             }
             PaintPath::DeadFallback => {
@@ -4379,8 +4363,6 @@ impl AppState {
                         );
                     },
                     None,
-                    // No OSR ever — chrome covers the whole surface.
-                    crate::render::DamageHint::Full,
                 )
             }
         };
@@ -4482,45 +4464,6 @@ impl AppState {
     fn cef_child_rect(&self, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
         let has_notice = buffr_core::download_notice_queue_len(&self.download_notice_queue) > 0;
         cef_child_rect_pure(full_w, full_h, self.current_scale(), has_notice)
-    }
-
-    /// Compute the chrome-strip damage hint for the SyntheticScratch
-    /// paint path: the OSR rect's pixels are guaranteed identical to
-    /// the previous committed buffer (cached OSR texture, no new
-    /// CEF on_paint since last present), so we only need to damage
-    /// the strips above + below the CEF child rect.
-    ///
-    /// All inputs are in buffer (physical) pixels — the
-    /// `wl_surface.damage_buffer` request uses buffer coords.
-    fn chrome_strip_damage_hint(
-        chrome_dirty: bool,
-        full_w: u32,
-        full_h: u32,
-        browser_y: u32,
-        browser_h: u32,
-    ) -> crate::render::DamageHint {
-        if !chrome_dirty {
-            // No content change anywhere — safest to declare full
-            // damage rather than zero. wgpu still calls commit, and
-            // the cached chrome + OSR textures produce pixel-identical
-            // output, so Full is correct (just wasteful).
-            return crate::render::DamageHint::Full;
-        }
-        let mut rects = Vec::with_capacity(2);
-        if browser_y > 0 {
-            rects.push(wayr::Rect::new(
-                wayr::Position::new(0, 0),
-                wayr::Size::new(full_w, browser_y),
-            ));
-        }
-        let bottom_y = browser_y + browser_h;
-        if bottom_y < full_h {
-            rects.push(wayr::Rect::new(
-                wayr::Position::new(0, bottom_y as i32),
-                wayr::Size::new(full_w, full_h - bottom_y),
-            ));
-        }
-        crate::render::DamageHint::Rects(rects)
     }
 
     /// Same layout as [`Self::cef_child_rect`] but operates in **logical**
@@ -6327,8 +6270,6 @@ impl AppState {
                 chrome_dirty,
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 Some(osr_upload),
-                // Fresh OSR push → OSR rect pixels changed.
-                crate::render::DamageHint::Full,
             )
         } else if let Some((cached_w, cached_h)) = popup.last_osr_dims {
             // Between-paints fallback: reuse osr_scratch from previous paint.
@@ -6348,23 +6289,10 @@ impl AppState {
                 generation: popup.last_osr_generation,
                 dst_rect: (0, bar_h, width, height.saturating_sub(bar_h).max(1)),
             };
-            // Popup chrome occupies just the top bar; CEF area
-            // pixels reuse the cached OSR texture and render
-            // pixel-identical to the previously-committed buffer.
-            // Mirror main-window SyntheticScratch damage logic.
-            let damage = if chrome_dirty && bar_h > 0 {
-                crate::render::DamageHint::Rects(vec![wayr::Rect::new(
-                    wayr::Position::new(0, 0),
-                    wayr::Size::new(width, bar_h),
-                )])
-            } else {
-                crate::render::DamageHint::Full
-            };
             popup.renderer.frame(
                 chrome_dirty,
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 Some(osr_upload),
-                damage,
             )
         } else {
             // No paint received yet for this popup.
@@ -6373,7 +6301,6 @@ impl AppState {
                 chrome_dirty,
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 None,
-                crate::render::DamageHint::Full,
             )
         };
 
@@ -9214,29 +9141,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // render rate is already capped to display refresh; this
         // matches the pump cadence to it.
         //
-        // Prefer wayr's `wp_presentation_feedback`-derived next-vblank
-        // estimate over the static `wl_output.mode.refresh_mhz` hint:
-        // the feedback path reflects the *actual* hardware refresh
-        // (matters on VRR displays where the period drifts per frame
-        // and on multi-monitor setups where the synced output may
-        // not be the fastest one). Falls back to the `refresh_mhz`
-        // → frame_period path when no frame has been presented yet
-        // (early startup) or when the compositor doesn't advertise
-        // `wp_presentation` (rare; almost everything does).
-        let next_wakeup = self
-            .window
-            .as_ref()
-            .and_then(|w| w.estimated_next_vblank())
-            .unwrap_or_else(|| {
-                let outputs = event_loop.outputs();
-                let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
-                let frame_period = if max_mhz > 0 {
-                    Duration::from_micros(1_000_000_000 / max_mhz as u64)
-                } else {
-                    Duration::from_millis(16)
-                };
-                Instant::now() + frame_period
-            });
+        // Pull the live refresh rate from wayr's OutputInfo (millihertz
+        // → ms-per-frame). Take the FASTEST advertised output's rate
+        // so multi-monitor mixes pace to the fastest panel rather
+        // than down-clocking to a stale 60Hz default. If no output
+        // has reported yet (early startup) fall back to 60 Hz.
+        let frame_period = {
+            let outputs = event_loop.outputs();
+            let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
+            if max_mhz > 0 {
+                // mhz -> period in ms: 1000 * 1000 / mhz.
+                Duration::from_micros(1_000_000_000 / max_mhz as u64)
+            } else {
+                Duration::from_millis(16)
+            }
+        };
+        let next_wakeup = Instant::now() + frame_period;
         // If CEF has scheduled a pump, wake up no later than that.
         let deadline = match self.cef_next_pump_at {
             Some(at) if at < next_wakeup => at,

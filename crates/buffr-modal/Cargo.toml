@@ -47,7 +47,7 @@ winit = { version = "0.30", optional = true, default-features = false, features 
 
 # Optional: only enabled by the `wayr` feature. Used by the
 # `wayr_adapter` module — parallel to `winit_adapter`.
-wayr = { version = "0.1", optional = true }
+wayr = { version = "0.2", optional = true }
 
 [dev-dependencies]
 toml = "1.1"
