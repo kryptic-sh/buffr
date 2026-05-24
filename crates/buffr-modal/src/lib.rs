@@ -37,6 +37,14 @@ pub mod winit_adapter;
 #[cfg(feature = "wayr")]
 pub mod wayr_adapter;
 
+/// Toolkit-agnostic bridge `KeyEvent` → [`KeyChord`] adapter. Owns
+/// its own `KeyEvent` / `KeyCode` / `BridgeModifiers` / `KeyState` /
+/// `ScanCode` types (same shape as wayr's, but defined locally so
+/// the adapter compiles on macOS / Windows where `wayr` can't link).
+/// Used by `buffr-app`'s non-Linux windowing backend.
+#[cfg(feature = "bridge")]
+pub mod bridge_adapter;
+
 pub use actions::{Mode, PageAction, PageMode};
 pub use edit_mode::EditSession;
 pub use engine::{DEFAULT_TIMEOUT, EditModeStep, Engine, Step};
@@ -59,4 +67,12 @@ pub use winit_adapter::{
 pub use wayr_adapter::{
     key_event_to_chord as wayr_key_event_to_chord,
     key_event_to_chord_with_repeat as wayr_key_event_to_chord_with_repeat,
+};
+
+#[cfg(feature = "bridge")]
+pub use bridge_adapter::{
+    BridgeModifiers, KeyCode as BridgeKeyCode, KeyEvent as BridgeKeyEvent,
+    KeyState as BridgeKeyState, ScanCode as BridgeScanCode,
+    key_event_to_chord as bridge_key_event_to_chord,
+    key_event_to_chord_with_repeat as bridge_key_event_to_chord_with_repeat,
 };

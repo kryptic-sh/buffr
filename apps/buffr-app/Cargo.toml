@@ -86,7 +86,13 @@ buffr-modal = { workspace = true, features = ["wayr"] }
 # trait impls wgpu needs.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-buffr-modal = { workspace = true, features = ["winit"] }
+# buffr-modal's `bridge` feature owns its own toolkit-agnostic
+# KeyEvent / KeyCode / Modifiers / KeyState types (same shape as
+# wayr's, but with no wayr dep). The windowing/other backend
+# constructs these from winit events; main.rs routes them through
+# `bridge_key_event_to_chord` (cfg-gated alias to the same symbol
+# `key_event_to_chord` used on Linux).
+buffr-modal = { workspace = true, features = ["bridge"] }
 # Used by windowing/other/ime.rs for ContentHint flags. Linux gets
 # bitflags transitively through wayr; non-linux pulls it directly.
 bitflags.workspace = true

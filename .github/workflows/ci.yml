@@ -195,7 +195,10 @@ jobs:
           EOF
           chmod +x /tmp/sway-cmd.sh
 
-          sway --unsupported-gpu -c <(echo "exec /tmp/sway-cmd.sh") &
+          # Real config file — sway rejects `<()` process substitution.
+          echo "exec /tmp/sway-cmd.sh" > /tmp/sway-config
+
+          sway --unsupported-gpu -c /tmp/sway-config &
           SWAY_PID=$!
           # Give sway up to 60s to finish (smoke timeout is 30s + buffer)
           for i in {1..60}; do

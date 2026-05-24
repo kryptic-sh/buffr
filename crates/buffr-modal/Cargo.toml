@@ -18,8 +18,14 @@ default = []
 winit = ["dep:winit"]
 # Bring in the wayr `KeyEvent` → `KeyChord` adapter. Parallel to the
 # `winit` feature; pulls in `wayr` instead. `buffr-app` enables this
-# after the migration from winit lands.
+# on Linux where the wayr windowing toolkit is the backend.
 wayr = ["dep:wayr"]
+# Bring in the toolkit-agnostic bridge `KeyEvent` → `KeyChord`
+# adapter. The bridge types are defined locally in `bridge_adapter`
+# (same shape as wayr's but no `wayr` dep), so this feature compiles
+# on platforms where wayr's wayland-client transitive can't link
+# (macOS / Windows). buffr-app enables this on non-Linux.
+bridge = []
 
 [package.metadata.cargo-machete]
 ignored = []

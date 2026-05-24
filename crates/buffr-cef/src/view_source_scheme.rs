@@ -24,6 +24,11 @@ use crate::host::BUFFR_SRC_PREFIX;
 /// `cef::initialize`. Mirrors the flags used for `buffr://` in `new_tab.rs`.
 pub fn register_buffr_src_scheme(registrar: &mut cef::SchemeRegistrar) {
     let scheme = CefString::from("buffr-src");
+    // SchemeOptions::get_raw() returns u32 on Linux but i32 on Windows
+    // (cef-sys bindings reflect the underlying C int width). Allow the
+    // platform-dependent cast — on Windows clippy sees i32 → i32 as
+    // redundant; on Linux the cast is real.
+    #[allow(clippy::unnecessary_cast)]
     let opts = (SchemeOptions::STANDARD.get_raw()
         | SchemeOptions::SECURE.get_raw()
         | SchemeOptions::CORS_ENABLED.get_raw()

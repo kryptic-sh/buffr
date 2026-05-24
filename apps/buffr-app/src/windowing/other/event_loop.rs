@@ -590,12 +590,5 @@ fn bridge_key_event(ke: winit::event::KeyEvent, modifiers: Modifiers) -> KeyEven
         winit::event::ElementState::Pressed => KeyState::Pressed,
         winit::event::ElementState::Released => KeyState::Released,
     };
-    KeyEvent {
-        scancode,
-        key_code,
-        modifiers,
-        state,
-        text,
-        repeat: ke.repeat,
-    }
+    KeyEvent::new(scancode, key_code, modifiers, state, text, ke.repeat)
 }

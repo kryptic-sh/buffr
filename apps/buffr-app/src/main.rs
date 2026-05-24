@@ -161,15 +161,15 @@ use buffr_modal::{
 // KeyEvent → KeyChord translation lives in buffr-modal; the adapter
 // module is selected per target since the underlying KeyEvent shape
 // (wayr vs winit) differs.
+#[cfg(not(target_os = "linux"))]
+use buffr_modal::{
+    bridge_key_event_to_chord as key_event_to_chord,
+    bridge_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
+};
 #[cfg(target_os = "linux")]
 use buffr_modal::{
     wayr_key_event_to_chord as key_event_to_chord,
     wayr_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
-};
-#[cfg(not(target_os = "linux"))]
-use buffr_modal::{
-    winit_key_event_to_chord as key_event_to_chord,
-    winit_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
 };
 use buffr_permissions::Permissions;
 use buffr_ui::{
