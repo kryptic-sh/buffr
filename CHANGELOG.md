@@ -8,6 +8,77 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-25
+
+### Added
+
+- Cross-platform support: buffr-app now builds and runs on macOS and Windows in
+  addition to Linux. Wayr stays Linux-only (Wayland-only by design); macOS and
+  Windows use winit 0.30 behind a `crate::windowing::*` re-export that mirrors
+  wayr's API shape. A new `bridge` feature on `buffr-modal` introduces a
+  toolkit-agnostic `KeyEvent` / `KeyCode` / `Modifiers` / `ScanCode` shape
+  consumed on non-Linux; Linux keeps using `wayr_key_event_to_chord`.
+- Hidden `--smoke-test [--smoke-test-timeout-ms <N>]` flag on `buffr-app`.
+  Launches the windowing backend, paints once, exits 0 on first paint, exits 3
+  if a watchdog timer fires. Wired into CI as a 3-OS event-loop smoke matrix.
+- `BUFFR_DISABLE_ZYGOTE=1` env switch appends `--no-zygote` to the CEF command
+  line on Linux. Off by default; intended for headless / containerized
+  environments where Chromium's zygote subprocess fork can't pass the ICU file
+  descriptor.
+- Authoritative compositor occlusion via wayr 0.1.9 `Occluded` events: paint
+  pacing now stops when the compositor reports the surface fully occluded
+  instead of inferring from `present_us` heuristics.
+- Damage tracking via wayr 0.1.11: chrome paints attach damage rectangles so the
+  compositor can skip recomposite for unchanged regions.
+- Focus existing window on `--new-tab` via `xdg_activation`: a second buffr
+  invocation now raises the existing window before opening the tab instead of
+  spawning a duplicate toplevel.
+- Per-platform smoke jobs (Linux, macOS, Windows) cover the full event-loop
+  startup path, including CEF init and first paint. Ubuntu smoke is marked
+  `continue-on-error` while CEF's subprocess ICU fd-passing remains broken under
+  pixman-headless sway on GHA runners (unrelated to the migration — affects real
+  Linux desktops only in headless contexts).
+
+### Changed
+
+- Migrated buffr-app from winit to wayr on Linux. Wayr owns wl_display dispatch
+  so wayr globals can be bound against the same display without the EAGAIN race
+  winit's calloop integration causes.
+- Workspace resolver bumped to `"3"` (matches edition 2024).
+- Renderer decoupled from `winit::Window`: takes a `Surface` trait so wayr
+  toplevels and winit windows go through the same path.
+- All wgpu mutating calls run on a worker thread (`render_worker`); UI thread
+  only does CPU prep + memcpy + `try_send`. Eliminates Wayland backpressure
+  hangs when the compositor queues frames.
+- CI smoke timeout bumped 30s → 120s for cold-runner CEF init; smoke success
+  signal moved from `RedrawRequested` to first `paint_chrome` completion so
+  headless Windows runners (no DWM → no WM_PAINT) still satisfy it.
+
+### Fixed
+
+- buffr-cef: collapse nested `if let` blocks for macOS clippy.
+- buffr-app: keep `modifiers` in sync from `KeyEvent.modifiers` on every key
+  event, not only on a dedicated `ModifiersChanged` event (wayr's model).
+- buffr-app: ASCII-control text now routed through the named-key path so Ctrl-A
+  / Ctrl-B etc. produce the right chord instead of garbled bytes.
+- buffr-app: leak the renderer on shutdown instead of dropping (wayr 0.1.4
+  wgpu-surface path is safe; the leak avoids a tear-down race that fired Vulkan
+  validation warnings on exit).
+- supervisor: respect an explicit clean-shutdown intent via env-var flag, and
+  don't respawn when the child exits with a non-zero code if it was a clean exit
+  (e.g., `--smoke-test`).
+- Build a child process suspended on Windows via `&Path` not `&PathBuf` (clippy
+  `ptr_arg`).
+- Windows headless smoke: `request_redraw()` after window creation forces a
+  paint cycle when the runner's WM never delivers WM_PAINT.
+
+### Removed
+
+- `[patch.crates-io]` overrides for wayr — published wayr versions now drive
+  buffr's wayr surface directly.
+
+[0.14.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.0
+
 ## [0.13.11] - 2026-05-19
 
 ### Fixed
