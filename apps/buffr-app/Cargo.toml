@@ -87,6 +87,9 @@ buffr-modal = { workspace = true, features = ["wayr"] }
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 buffr-modal = { workspace = true, features = ["winit"] }
+# Used by windowing/other/ime.rs for ContentHint flags. Linux gets
+# bitflags transitively through wayr; non-linux pulls it directly.
+bitflags.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [

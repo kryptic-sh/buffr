@@ -157,8 +157,19 @@ use buffr_engine::{
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
+};
+// KeyEvent → KeyChord translation lives in buffr-modal; the adapter
+// module is selected per target since the underlying KeyEvent shape
+// (wayr vs winit) differs.
+#[cfg(target_os = "linux")]
+use buffr_modal::{
     wayr_key_event_to_chord as key_event_to_chord,
     wayr_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
+};
+#[cfg(not(target_os = "linux"))]
+use buffr_modal::{
+    winit_key_event_to_chord as key_event_to_chord,
+    winit_key_event_to_chord_with_repeat as key_event_to_chord_with_repeat,
 };
 use buffr_permissions::Permissions;
 use buffr_ui::{
@@ -7580,17 +7591,26 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
         // Construct the platform idle-inhibitor now that the window
         // exists. buffr-core takes raw wl_display + wl_surface pointers
-        // (extracted via wayr's FFI accessors); macOS / Windows backends
-        // ignore them. On unsupported sessions new_inhibitor returns a
-        // no-op Ok variant, so errors below are real platform errors.
+        // (extracted via wayr's FFI accessors on Linux); macOS / Windows
+        // backends ignore the pointers and use IOKit /
+        // SetThreadExecutionState instead. On unsupported sessions
+        // new_inhibitor returns a no-op Ok variant, so errors below are
+        // real platform errors.
+        #[cfg(target_os = "linux")]
         let display_ptr = event_loop
             .wl_display_ptr()
             .map(|p| p.as_ptr())
             .unwrap_or(std::ptr::null_mut());
+        #[cfg(target_os = "linux")]
         let surface_ptr = window
             .wl_surface_ptr()
             .map(|p| p.as_ptr())
             .unwrap_or(std::ptr::null_mut());
+        // macOS / Windows: backends ignore the pointers; pass null.
+        #[cfg(not(target_os = "linux"))]
+        let display_ptr = std::ptr::null_mut();
+        #[cfg(not(target_os = "linux"))]
+        let surface_ptr = std::ptr::null_mut();
         // SAFETY: both pointers come from wayr's live wayland-client
         // connection; `window` (the Toplevel) is stored in self.window
         // for the lifetime of AppState, and event_loop's Connection

@@ -421,6 +421,7 @@ name = "buffr-app"
 version = "0.13.11"
 dependencies = [
  "anyhow",
+ "bitflags 2.11.1",
  "buffr-bookmarks",
  "buffr-cef",
  "buffr-config",

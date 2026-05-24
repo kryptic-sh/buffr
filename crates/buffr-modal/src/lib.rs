@@ -50,7 +50,10 @@ pub use keymap::{BindError, Keymap, Lookup};
 pub use hjkl_engine::{Modifiers as EngineModifiers, PlannedInput, SpecialKey, VimMode};
 
 #[cfg(feature = "winit")]
-pub use winit_adapter::{key_event_to_chord, key_event_to_chord_with_repeat};
+pub use winit_adapter::{
+    key_event_to_chord as winit_key_event_to_chord,
+    key_event_to_chord_with_repeat as winit_key_event_to_chord_with_repeat,
+};
 
 #[cfg(feature = "wayr")]
 pub use wayr_adapter::{
