@@ -91,23 +91,12 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      # apps/buffr-app pulls `wayr` (Wayland-only) + enables
-      # `buffr-modal/wayr` unconditionally, which transitively forces
-      # `wayland-sys` to build. `wayland-sys`'s build script does a
-      # pkg-config probe that has no chance on macOS / Windows runners,
-      # so we exclude buffr-app from clippy on non-linux. The remaining
-      # workspace members (buffr / buffr-helper / buffr-core /
-      # buffr-cef / buffr-engine / buffr-config) are intended to compile
-      # cross-platform and carry the `#[cfg(target_os = "windows")]` /
-      # `#[cfg(target_os = "macos")]` blocks that motivated #156.
+      # buffr-app now selects its windowing toolkit per target — wayr
+      # on Linux, winit on macOS / Windows — via the `windowing/`
+      # abstraction. Both targets build the full workspace; the lint
+      # matrix covers all three OSes uniformly.
       - name: cargo clippy
-        shell: bash
-        run: |
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            cargo clippy --workspace --all-targets -- -D warnings
-          else
-            cargo clippy --workspace --exclude buffr-app --all-targets -- -D warnings
-          fi
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   linux:
     name: linux build + test
