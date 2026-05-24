@@ -5112,9 +5112,9 @@ dependencies = [
 
 [[package]]
 name = "wayr"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aec2fbaf2c16e068eac38934a167434bc2199d403da008b75b7ea8bad02e7d48"
+checksum = "943ec8cda7d6ba5c442966ef9cab4596048627633d578b6ae0499f3c1df6d499"
 dependencies = [
  "bitflags 2.11.1",
  "calloop 0.14.4",

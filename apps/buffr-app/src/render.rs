@@ -41,7 +41,6 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 /// Per-quad uniform: NDC rect (`[x0, y0, x1, y1]`) and UV rect
 /// (`[u0, v0, u1, v1]`). Passed via a uniform buffer so we don't need
@@ -155,6 +154,36 @@ struct RenderCommand {
     chrome_pixels: Option<Vec<u32>>,
     /// Owned OSR upload. `None` in windowed/no-OSR mode.
     osr: Option<OsrUploadOwned>,
+    /// Pre-commit damage hint applied via wayr just before
+    /// `surface_texture.present()`. See [`DamageHint`].
+    damage: DamageHint,
+}
+
+/// Tells the render worker which surface region(s) to mark damaged on
+/// the wl_surface before wgpu commits the next frame. The compositor
+/// reads only damaged rects from our buffer; unchanged rects keep the
+/// cached composition from the previously-displayed frame.
+///
+/// Correctness invariant: pixels OUTSIDE the damaged region in the
+/// new wgpu buffer must equal the pixels at the same coordinates in
+/// the previously-committed buffer. wgpu rendering is deterministic
+/// for the same UI state, so as long as the consumer only narrows the
+/// damage when state didn't change in the omitted region, the
+/// invariant holds.
+#[derive(Debug, Clone, Default)]
+pub enum DamageHint {
+    /// Damage the entire surface. Always correct; the compositor
+    /// re-reads everything.
+    #[default]
+    Full,
+    /// Damage one or more rects, in buffer (physical) pixels. Used
+    /// for chrome-only-dirty paints: the chrome strips above /
+    /// below the CEF child rect get fresh pixels every frame, while
+    /// the CEF child rect itself reuses the cached OSR texture and
+    /// therefore renders pixel-identical to the previously
+    /// committed buffer. Damaging only the strips lets the
+    /// compositor skip blitting the (large) browser region.
+    Rects(Vec<wayr::Rect>),
 }
 
 /// Channel pair owned by `Renderer` on the UI side.
@@ -280,6 +309,13 @@ struct RenderState {
     height: u32,
 
     surface_format: wgpu::TextureFormat,
+
+    /// Wayr handle for pre-commit damage hooks. The render worker
+    /// calls `set_damage` / `set_damage_full` immediately before
+    /// `surface_texture.present()` so the next commit (wgpu's, inside
+    /// `present`) carries the queued damage. See `apply_damage` for
+    /// the chrome-strip rect computation.
+    damage_target: Arc<wayr::Toplevel>,
 }
 
 impl RenderState {
@@ -463,6 +499,21 @@ fn render_worker(
         state.queue.submit(once(encoder.finish()));
         let submit_done_us = render_start.elapsed().as_micros() as u64;
 
+        // Queue damage hints on the wl_surface BEFORE present(). wgpu's
+        // present() internally calls wl_surface.commit through the
+        // WSI bridge; our queued damage_buffer requests take effect
+        // on that commit. On compositors with damage-aware blit
+        // optimization (KWin / Mutter), telling them "only chrome
+        // changed" lets them skip blitting the (large) OSR region.
+        match &cmd.damage {
+            DamageHint::Full => state.damage_target.set_damage_full(),
+            DamageHint::Rects(rects) => {
+                for rect in rects {
+                    state.damage_target.set_damage(*rect);
+                }
+            }
+        }
+
         cmd.surface_texture.present();
         let present_us = (render_start.elapsed().as_micros() as u64).saturating_sub(submit_done_us);
 
@@ -561,10 +612,12 @@ impl Renderer {
     /// where the wl_* objects would otherwise be destroyed out from
     /// under wgpu's Vulkan cleanup. Don't switch back to
     /// `create_surface_unsafe` with raw handles unless wayr regresses.
-    pub fn new<W>(window: Arc<W>, initial_physical_size: (u32, u32)) -> Result<Self>
-    where
-        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
-    {
+    pub fn new(window: Arc<wayr::Toplevel>, initial_physical_size: (u32, u32)) -> Result<Self> {
+        // Hold a second Arc clone for the worker thread's damage hooks
+        // (set_damage / set_damage_full before each present). The first
+        // clone is consumed by wgpu's create_surface; this one stays
+        // with us and is moved into the render worker below.
+        let damage_target = Arc::clone(&window);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -865,6 +918,7 @@ impl Renderer {
             width,
             height,
             surface_format,
+            damage_target,
         };
 
         let handle = std::thread::Builder::new()
@@ -1002,6 +1056,7 @@ impl Renderer {
         chrome_dirty: bool,
         paint_chrome: F,
         osr: Option<OsrUpload<'_>>,
+        damage: DamageHint,
     ) -> Result<FrameStats>
     where
         F: FnOnce(&mut [u32], usize, usize),
@@ -1170,6 +1225,7 @@ impl Renderer {
             chrome_lh: self.chrome_lh,
             chrome_pixels,
             osr: osr_owned,
+            damage,
         };
 
         match self.render_chan.tx_cmd.try_send(cmd) {
