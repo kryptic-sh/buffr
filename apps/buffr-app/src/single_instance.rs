@@ -284,7 +284,7 @@ pub fn try_acquire(profile_id: &str, urls: &[String]) -> Result<AcquireResult> {
 /// continues (no crash on bad clients).
 pub fn spawn_accept_thread(
     handle: SingletonHandle,
-    proxy: wayr::EventLoopProxy<crate::BuffrUserEvent>,
+    proxy: crate::windowing::EventLoopProxy<crate::BuffrUserEvent>,
 ) {
     std::thread::Builder::new()
         .name("buffr-ipc-accept".into())

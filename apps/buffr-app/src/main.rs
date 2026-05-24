@@ -176,14 +176,14 @@ mod render;
 mod session;
 mod single_instance;
 mod windowing;
+use crate::windowing::{
+    ApplicationHandler, CursorIcon, EventLoop, EventLoopProxy, Modifiers, Surface, SurfaceId,
+    Window as Toplevel, WindowEvent,
+};
 use buffr_engine::MouseButton as NeutralMouseButton;
 use clap::Parser;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
-use wayr::{
-    ApplicationHandler, CursorIcon, EventLoop, EventLoopProxy, Modifiers, Surface, SurfaceId,
-    Toplevel, WindowEvent,
-};
 
 // ── Context menu helpers ──────────────────────────────────────────────────────
 
@@ -5300,12 +5300,12 @@ impl AppState {
     /// Up/Down move selection. Enter activates + dismisses. Esc dismisses.
     /// Any other key dismisses and returns `false` so the key still reaches
     /// the normal page-mode dispatcher.
-    fn context_menu_handle_key(&mut self, event: &wayr::KeyEvent) -> bool {
+    fn context_menu_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         if self.context_menu.is_none() {
             return false;
         }
         // Only handle key-press, not release.
-        if event.state != wayr::KeyState::Pressed {
+        if event.state != crate::windowing::KeyState::Pressed {
             return true; // swallow release events while menu is open
         }
         let Some(chord) = key_event_to_chord_with_repeat(event) else {
@@ -5357,7 +5357,7 @@ impl AppState {
 
     /// Route a wayr `KeyEvent` to the open overlay. Returns `true` if
     /// the event was consumed (caller skips the engine path).
-    fn overlay_handle_key(&mut self, event: &wayr::KeyEvent) -> bool {
+    fn overlay_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         if self.overlay.is_none() {
             return false;
         }
@@ -5597,7 +5597,7 @@ impl AppState {
     /// chars (no Ctrl / Alt / Meta) are fed to `feed_hint_key`. Every
     /// other chord is silently swallowed so the modal trie can't fire
     /// on `j` / `k` etc. while a session is live.
-    fn hint_mode_handle_key(&mut self, event: &wayr::KeyEvent) -> bool {
+    fn hint_mode_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         let Some(engine) = self.active_engine_dyn() else {
             return false;
         };
@@ -5807,8 +5807,11 @@ impl AppState {
     ///
     /// Mirrors `buffr_modal::wayr_adapter::key_event_to_chord` but targets
     /// `hjkl_engine::PlannedInput` rather than our internal `KeyChord`.
-    fn wayr_key_to_planned(event: &wayr::KeyEvent, modifiers: &Modifiers) -> Option<PlannedInput> {
-        if event.state != wayr::KeyState::Pressed {
+    fn wayr_key_to_planned(
+        event: &crate::windowing::KeyEvent,
+        modifiers: &Modifiers,
+    ) -> Option<PlannedInput> {
+        if event.state != crate::windowing::KeyState::Pressed {
             return None;
         }
         let mods = EngineModifiers {
@@ -5832,7 +5835,7 @@ impl AppState {
             return Some(PlannedInput::Char(first, mods));
         }
         // No printable text — check for named keys via xkb keysym name.
-        use wayr::KeyCode;
+        use crate::windowing::KeyCode;
         match &event.key_code {
             KeyCode::Named(name) => {
                 let sk = match name.as_str() {
@@ -5878,7 +5881,7 @@ impl AppState {
     /// arrow keys, selection, copy/paste, IME, etc.). The only key
     /// intercepted is `Esc`, which exits Insert mode and returns to
     /// Normal page mode.
-    fn edit_mode_handle_key(&mut self, event: &wayr::KeyEvent) -> bool {
+    fn edit_mode_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         let planned = Self::wayr_key_to_planned(event, &self.modifiers);
         let is_esc_pressed = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
         let mode = self.engine.lock().ok().map(|e| e.mode());
@@ -5925,7 +5928,7 @@ impl AppState {
         // only. The browser's native Tab handler also lands on links
         // and buttons; routing through `__buffrCycleInput` keeps focus
         // inside the editable set.
-        if event.state == wayr::KeyState::Pressed
+        if event.state == crate::windowing::KeyState::Pressed
             && matches!(planned, Some(PlannedInput::Key(SpecialKey::Tab, _)))
         {
             if let Some(engine) = self.active_engine_dyn() {
@@ -5938,7 +5941,7 @@ impl AppState {
         // work even while typing in an input: `<C-t>`, `<C-S-t>`,
         // `<C-w>`. Dispatch the matching PageAction directly so the
         // user doesn't have to leave Insert first.
-        if event.state == wayr::KeyState::Pressed
+        if event.state == crate::windowing::KeyState::Pressed
             && self.modifiers.ctrl
             && let Some(PlannedInput::Char(c, _)) = planned
         {
@@ -6104,11 +6107,11 @@ impl AppState {
     /// is modal). `y` / `<Enter>` confirms, `n` / `<Esc>` dismisses,
     /// everything else is swallowed without changing state so a stray
     /// keypress can't accidentally close the tab.
-    fn confirm_handle_key(&mut self, event: &wayr::KeyEvent) -> bool {
+    fn confirm_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         if self.confirm_close_pinned.is_none() {
             return false;
         }
-        if event.state != wayr::KeyState::Pressed {
+        if event.state != crate::windowing::KeyState::Pressed {
             return true;
         }
         // Use the resolved text for character matching; fall back to key_code
@@ -6121,7 +6124,7 @@ impl AppState {
                 _ => {}
             }
         } else {
-            use wayr::KeyCode;
+            use crate::windowing::KeyCode;
             match &event.key_code {
                 KeyCode::Named(name) if name == "Return" || name == "KP_Enter" => {
                     self.resolve_pinned_close(true);
@@ -6141,7 +6144,7 @@ impl AppState {
     /// Bindings: `a`/`y` allow once, `A`/`Y` allow + remember, `d`/`n`
     /// deny once, `D`/`N` deny + remember, `s` deny + remember
     /// (qutebrowser parity for "stop"), `Esc` defer.
-    fn permissions_handle_key(&mut self, event: &wayr::KeyEvent) -> bool {
+    fn permissions_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         if self.permissions_prompt.is_none() {
             return false;
         }
@@ -6412,7 +6415,7 @@ impl AppState {
                 button,
                 modifiers,
             } => {
-                use wayr::PointerButtonState::Pressed;
+                use crate::windowing::PointerButtonState::Pressed;
                 let Some(popup) = self.popups.get_mut(&window_id) else {
                     return;
                 };
@@ -6481,7 +6484,7 @@ impl AppState {
                 // as the main window, routed to the popup's own history.
                 let is_pixel = matches!(
                     scroll_ev.source,
-                    wayr::AxisSource::Finger | wayr::AxisSource::Continuous
+                    crate::windowing::AxisSource::Finger | crate::windowing::AxisSource::Continuous
                 );
                 if is_pixel {
                     if let Some(action) = self.detect_swipe(scroll_ev.delta as f32, 0.0) {
@@ -6555,8 +6558,8 @@ impl AppState {
 ///
 /// wayr `ScrollEvent` carries a single axis per event; the orthogonal axis
 /// delta is always 0.
-fn wayr_scroll_to_cef_delta(ev: &wayr::ScrollEvent) -> (i32, i32, bool) {
-    use wayr::{AxisDirection, AxisSource};
+fn wayr_scroll_to_cef_delta(ev: &crate::windowing::ScrollEvent) -> (i32, i32, bool) {
+    use crate::windowing::{AxisDirection, AxisSource};
     const PIXEL_DELTA_SCALE: f32 = 10.0;
     let is_pixel = matches!(ev.source, AxisSource::Finger | AxisSource::Continuous);
     let scaled = if is_pixel {
@@ -6740,7 +6743,7 @@ fn wayr_mods_to_cef(m: &Modifiers) -> u32 {
 /// that route through `zwp_virtual_keyboard_v1` still deliver VK codes.
 /// Unknowns map to 0 (CEF ignores `windows_key_code == 0` for non-printable
 /// keys; printable keys use `character` instead).
-fn scan_code_to_vk(sc: wayr::ScanCode) -> i32 {
+fn scan_code_to_vk(sc: crate::windowing::ScanCode) -> i32 {
     // wayr surfaces the raw evdev scancode directly — no offset.
     match sc.0 {
         // Row 1 — number row (evdev 2-13).
@@ -6899,7 +6902,7 @@ fn char_to_vk(ch: u16) -> Option<i32> {
 ///
 /// Returns an empty vec for modifier-only presses (no VK code, no character).
 fn wayr_key_to_neutral_events(
-    event: &wayr::KeyEvent,
+    event: &crate::windowing::KeyEvent,
     modifiers: u32,
     focus_on_editable_field: bool,
 ) -> Vec<buffr_engine::NeutralKeyEvent> {
@@ -6921,7 +6924,7 @@ fn wayr_key_to_neutral_events(
     }
 
     match event.state {
-        wayr::KeyState::Pressed => {
+        crate::windowing::KeyState::Pressed => {
             let raw = NeutralKeyEvent {
                 kind: KeyEventKind::RawDown,
                 windows_key_code: vk,
@@ -6948,7 +6951,7 @@ fn wayr_key_to_neutral_events(
                 vec![raw]
             }
         }
-        wayr::KeyState::Released => {
+        crate::windowing::KeyState::Released => {
             vec![NeutralKeyEvent {
                 kind: KeyEventKind::Up,
                 windows_key_code: vk,
@@ -7164,8 +7167,10 @@ const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 /// Map a wayr `PointerButton` to a neutral [`buffr_engine::MouseButton`].
 /// Returns `None` for `Other(_)` buttons — callers that need a fallback
 /// use [`buffr_engine::MouseButton::Other`] directly.
-fn wayr_button_to_neutral(button: &wayr::PointerButton) -> Option<buffr_engine::MouseButton> {
-    use wayr::PointerButton;
+fn wayr_button_to_neutral(
+    button: &crate::windowing::PointerButton,
+) -> Option<buffr_engine::MouseButton> {
+    use crate::windowing::PointerButton;
     match button {
         PointerButton::Left => Some(buffr_engine::MouseButton::Left),
         PointerButton::Right => Some(buffr_engine::MouseButton::Right),
@@ -7318,7 +7323,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         let window = match Toplevel::builder()
             .with_title(self.title_for(self.current_mode_label, &self.statusline.url))
             .with_app_id("sh.kryptic.buffr")
-            .with_initial_size(wayr::Size::new(1280, 800))
+            .with_initial_size(crate::windowing::Size::new(1280, 800))
             .build(event_loop)
         {
             Ok(w) => w,
@@ -7638,7 +7643,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.paint_chrome();
             }
             WindowEvent::Resized(new_size) => {
-                // wayr::Size is logical pixels. Get physical via window.physical_size().
+                // crate::windowing::Size is logical pixels. Get physical via window.physical_size().
                 let phys = self
                     .window
                     .as_ref()
@@ -7931,8 +7936,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 button,
                 modifiers,
             } => {
-                use wayr::PointerButton as MouseButton;
-                use wayr::PointerButtonState::Pressed;
+                use crate::windowing::PointerButton as MouseButton;
+                use crate::windowing::PointerButtonState::Pressed;
                 // Update cached modifier state from pointer event payload.
                 self.modifiers = modifiers;
                 tracing::trace!(?state, ?button, cursor = ?self.osr_cursor, "input: mouse_button");
@@ -8147,7 +8152,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 if let Some(host) = self.active_engine_dyn()
                     && let Some(cef_button) = wayr_button_to_neutral(&button)
                 {
-                    use wayr::PointerButtonState::Released;
+                    use crate::windowing::PointerButtonState::Released;
                     let mouse_up = state == Released;
                     // Track held mouse buttons so subsequent CursorMoved
                     // events carry the *_MOUSE_BUTTON event flag — without
@@ -8266,7 +8271,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // doesn't also scroll the page.
                 let is_pixel = matches!(
                     scroll_ev.source,
-                    wayr::AxisSource::Finger | wayr::AxisSource::Continuous
+                    crate::windowing::AxisSource::Finger | crate::windowing::AxisSource::Continuous
                 );
                 if is_pixel {
                     if let Some(action) = self.detect_swipe(scroll_ev.delta as f32, 0.0) {
@@ -8474,7 +8479,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             // backend (via CDP `Input.imeSetComposition` / `Input.insertText`)
             // implement these methods; the default no-op handles future backends.
             WindowEvent::Ime(ime_event) => {
-                use wayr::ImeEvent;
+                use crate::windowing::ImeEvent;
                 if let Some(engine) = self.active_engine_dyn() {
                     match ime_event {
                         ImeEvent::Preedit { text, cursor } => {
@@ -8772,7 +8777,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             #[allow(clippy::arc_with_non_send_sync)]
             let popup_win = match Toplevel::builder()
                 .with_title(&title)
-                .with_initial_size(wayr::Size::new(800, 600))
+                .with_initial_size(crate::windowing::Size::new(800, 600))
                 .build(event_loop)
             {
                 Ok(w) => Arc::new(w),
@@ -10279,7 +10284,7 @@ mod tests {
     // TODO(wayr-port): winit_key_to_planned_tests and virtual_keyboard_tests
     // were written against winit KeyEvent / PhysicalKey / logical Key types.
     // They are gated out below until a wayr-native seam is available for
-    // constructing wayr::KeyEvent in unit tests.
+    // constructing crate::windowing::KeyEvent in unit tests.
     //
     // The production code paths (wayr_key_to_planned, scan_code_to_vk,
     // resolve_char_unit, wayr_key_to_neutral_events) are covered at the
@@ -10915,7 +10920,7 @@ mod tests {
                 (40, 0xDE), // KEY_APOSTROPHE → VK_OEM_7
             ];
             for &(sc, want) in cases {
-                let got = scan_code_to_vk(wayr::ScanCode(sc));
+                let got = scan_code_to_vk(crate::windowing::ScanCode(sc));
                 assert_eq!(got, want, "VK for evdev scancode {sc}");
             }
         }
