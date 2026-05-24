@@ -10253,125 +10253,6 @@ mod tests {
     // resolve_char_unit, wayr_key_to_neutral_events) are covered at the
     // integration level.
 
-    #[cfg(any())] // TODO(wayr-port): re-enable when wayr KeyEvent is constructible in tests
-    mod winit_key_to_planned_tests {
-        use super::*;
-        use winit::keyboard::{Key as WKey, NamedKey as WNamed, SmolStr};
-
-        /// Thin mirror of `AppState::winit_key_to_planned` that accepts the
-        /// logical key directly, sidestepping the `KeyEvent` construction.
-        fn translate(
-            logical: &WKey<SmolStr>,
-            modifiers: winit::keyboard::ModifiersState,
-            pressed: bool,
-        ) -> Option<PlannedInput> {
-            if !pressed {
-                return None;
-            }
-            let mods = EngineModifiers {
-                ctrl: modifiers.control_key(),
-                shift: modifiers.shift_key(),
-                alt: modifiers.alt_key(),
-                super_: modifiers.super_key(),
-            };
-            match logical {
-                WKey::Character(s) => {
-                    let mut chars = s.chars();
-                    let first = chars.next()?;
-                    if chars.next().is_some() {
-                        return None;
-                    }
-                    Some(PlannedInput::Char(first, mods))
-                }
-                WKey::Named(named) => {
-                    let sk = match named {
-                        WNamed::Escape => SpecialKey::Esc,
-                        WNamed::Enter => SpecialKey::Enter,
-                        WNamed::Backspace => SpecialKey::Backspace,
-                        WNamed::Tab => SpecialKey::Tab,
-                        WNamed::ArrowUp => SpecialKey::Up,
-                        WNamed::ArrowDown => SpecialKey::Down,
-                        WNamed::ArrowLeft => SpecialKey::Left,
-                        WNamed::ArrowRight => SpecialKey::Right,
-                        WNamed::Home => SpecialKey::Home,
-                        WNamed::End => SpecialKey::End,
-                        WNamed::PageUp => SpecialKey::PageUp,
-                        WNamed::PageDown => SpecialKey::PageDown,
-                        WNamed::Insert => SpecialKey::Insert,
-                        WNamed::Delete => SpecialKey::Delete,
-                        WNamed::F1 => SpecialKey::F(1),
-                        WNamed::F2 => SpecialKey::F(2),
-                        WNamed::F3 => SpecialKey::F(3),
-                        WNamed::F4 => SpecialKey::F(4),
-                        WNamed::F5 => SpecialKey::F(5),
-                        WNamed::F6 => SpecialKey::F(6),
-                        WNamed::F7 => SpecialKey::F(7),
-                        WNamed::F8 => SpecialKey::F(8),
-                        WNamed::F9 => SpecialKey::F(9),
-                        WNamed::F10 => SpecialKey::F(10),
-                        WNamed::F11 => SpecialKey::F(11),
-                        WNamed::F12 => SpecialKey::F(12),
-                        _ => return None,
-                    };
-                    Some(PlannedInput::Key(sk, mods))
-                }
-                _ => None,
-            }
-        }
-
-        #[test]
-        fn char_a_maps_to_planned_char() {
-            let p = translate(&WKey::Character(SmolStr::new("a")), no_mods(), true);
-            assert!(matches!(p, Some(PlannedInput::Char('a', _))));
-        }
-
-        #[test]
-        fn esc_maps_to_planned_esc() {
-            let p = translate(&WKey::Named(WNamed::Escape), no_mods(), true);
-            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::Esc, _))));
-        }
-
-        #[test]
-        fn enter_maps_to_planned_enter() {
-            let p = translate(&WKey::Named(WNamed::Enter), no_mods(), true);
-            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::Enter, _))));
-        }
-
-        #[test]
-        fn tab_maps_to_planned_tab() {
-            let p = translate(&WKey::Named(WNamed::Tab), no_mods(), true);
-            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::Tab, _))));
-        }
-
-        #[test]
-        fn arrows_map_correctly() {
-            let cases = [
-                (WNamed::ArrowUp, SpecialKey::Up),
-                (WNamed::ArrowDown, SpecialKey::Down),
-                (WNamed::ArrowLeft, SpecialKey::Left),
-                (WNamed::ArrowRight, SpecialKey::Right),
-            ];
-            for (named, expected) in cases {
-                let p = translate(&WKey::Named(named), no_mods(), true);
-                assert!(
-                    matches!(p, Some(PlannedInput::Key(sk, _)) if sk == expected),
-                    "expected {expected:?} for {named:?}"
-                );
-            }
-        }
-
-        #[test]
-        fn f1_maps_to_planned_f1() {
-            let p = translate(&WKey::Named(WNamed::F1), no_mods(), true);
-            assert!(matches!(p, Some(PlannedInput::Key(SpecialKey::F(1), _))));
-        }
-
-        #[test]
-        fn release_returns_none() {
-            let p = translate(&WKey::Character(SmolStr::new("a")), no_mods(), false);
-            assert!(p.is_none());
-        }
-    }
 
     /// Test the `EditFocus` FSM state transitions (None ↔ Editing).
     mod edit_focus_fsm_tests {
@@ -10978,50 +10859,40 @@ mod tests {
     }
 
     /// Tests for the wtype / virtual_keyboard fix (#36):
-    /// - punctuation `KeyCode::*` must map to `VK_OEM_*` (non-zero)
-    /// - `resolve_char_unit` must fall back to `logical_key.to_text()` when
-    ///   `event.text` is `None` (the virtual_keyboard case).
+    /// - punctuation scancodes must map to `VK_OEM_*` (non-zero)
+    /// - `resolve_char_unit` returns the byte for ASCII text, 0 otherwise
     /// - `char_to_vk` must return the character-derived VK so wtype's
     ///   "character on arbitrary scancode" keymap doesn't deliver
     ///   `VK_ESCAPE`/`VK_BACK`/`VK_TAB` with the typed letter.
-    ///
-    /// TODO(wayr-port): punctuation_keys_have_vk_codes and resolve_char_*
-    /// tests need wayr equivalents; scan_code_to_vk replaces physical_key_to_vk.
-    /// resolve_char_unit no longer takes a logical key; char_to_vk tests still
-    /// compile and run unchanged.
-    #[cfg(any())] // TODO(wayr-port): re-enable punctuation+resolve_char tests with wayr ScanCode seam
-    mod virtual_keyboard_tests_winit {
+    mod virtual_keyboard_tests {
         use super::*;
-        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey, SmolStr};
 
         #[test]
-        fn punctuation_keys_have_vk_codes() {
-            let cases = [
-                (KeyCode::Period, 0xBE_i32),
-                (KeyCode::Comma, 0xBC),
-                (KeyCode::Minus, 0xBD),
-                (KeyCode::Equal, 0xBB),
-                (KeyCode::Semicolon, 0xBA),
-                (KeyCode::Slash, 0xBF),
-                (KeyCode::Backquote, 0xC0),
-                (KeyCode::BracketLeft, 0xDB),
-                (KeyCode::Backslash, 0xDC),
-                (KeyCode::BracketRight, 0xDD),
-                (KeyCode::Quote, 0xDE),
+        fn punctuation_scancodes_have_vk_codes() {
+            // (evdev scancode, expected VK)
+            let cases: &[(u32, i32)] = &[
+                (52, 0xBE),  // KEY_DOT     → VK_OEM_PERIOD
+                (51, 0xBC),  // KEY_COMMA   → VK_OEM_COMMA
+                (12, 0xBD),  // KEY_MINUS   → VK_OEM_MINUS
+                (13, 0xBB),  // KEY_EQUAL   → VK_OEM_PLUS
+                (39, 0xBA),  // KEY_SEMICOLON → VK_OEM_1
+                (53, 0xBF),  // KEY_SLASH   → VK_OEM_2
+                (41, 0xC0),  // KEY_GRAVE   → VK_OEM_3
+                (26, 0xDB),  // KEY_LBRACE  → VK_OEM_4
+                (43, 0xDC),  // KEY_BACKSLASH → VK_OEM_5
+                (27, 0xDD),  // KEY_RBRACE  → VK_OEM_6
+                (40, 0xDE),  // KEY_APOSTROPHE → VK_OEM_7
             ];
-            for (code, want) in cases {
-                let got = physical_key_to_vk(&PhysicalKey::Code(code));
-                assert_eq!(got, want, "VK for {code:?}");
+            for &(sc, want) in cases {
+                let got = scan_code_to_vk(wayr::ScanCode(sc));
+                assert_eq!(got, want, "VK for evdev scancode {sc}");
             }
         }
 
-        #[test]
-        fn resolve_char_prefers_event_text() {
-            let logical = Key::Character(SmolStr::new_static("x"));
-            assert_eq!(resolve_char_unit(Some("."), &logical), b'.' as u16);
-        }
+        // (resolve_char_unit coverage lives in `resolve_char_unit_from_text`
+        // at the end of this mod — same shape, no duplication.)
 
-        // ---- char_to_vk tests (in gated module, compiled with winit feature) ----
+        // ---- char_to_vk tests (pure-function — no winit / wayr deps) ----
 
         #[test]
         fn char_to_vk_letters_lowercase() {
