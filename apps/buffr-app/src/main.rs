@@ -9141,22 +9141,29 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // render rate is already capped to display refresh; this
         // matches the pump cadence to it.
         //
-        // Pull the live refresh rate from wayr's OutputInfo (millihertz
-        // → ms-per-frame). Take the FASTEST advertised output's rate
-        // so multi-monitor mixes pace to the fastest panel rather
-        // than down-clocking to a stale 60Hz default. If no output
-        // has reported yet (early startup) fall back to 60 Hz.
-        let frame_period = {
-            let outputs = event_loop.outputs();
-            let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
-            if max_mhz > 0 {
-                // mhz -> period in ms: 1000 * 1000 / mhz.
-                Duration::from_micros(1_000_000_000 / max_mhz as u64)
-            } else {
-                Duration::from_millis(16)
-            }
-        };
-        let next_wakeup = Instant::now() + frame_period;
+        // Prefer wayr's `wp_presentation_feedback`-derived next-vblank
+        // estimate over the static `wl_output.mode.refresh_mhz` hint:
+        // the feedback path reflects the *actual* hardware refresh
+        // (matters on VRR displays where the period drifts per frame
+        // and on multi-monitor setups where the synced output may
+        // not be the fastest one). Falls back to the `refresh_mhz`
+        // → frame_period path when no frame has been presented yet
+        // (early startup) or when the compositor doesn't advertise
+        // `wp_presentation` (rare; almost everything does).
+        let next_wakeup = self
+            .window
+            .as_ref()
+            .and_then(|w| w.estimated_next_vblank())
+            .unwrap_or_else(|| {
+                let outputs = event_loop.outputs();
+                let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
+                let frame_period = if max_mhz > 0 {
+                    Duration::from_micros(1_000_000_000 / max_mhz as u64)
+                } else {
+                    Duration::from_millis(16)
+                };
+                Instant::now() + frame_period
+            });
         // If CEF has scheduled a pump, wake up no later than that.
         let deadline = match self.cef_next_pump_at {
             Some(at) if at < next_wakeup => at,
