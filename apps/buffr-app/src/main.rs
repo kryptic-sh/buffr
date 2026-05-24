@@ -10253,7 +10253,6 @@ mod tests {
     // resolve_char_unit, wayr_key_to_neutral_events) are covered at the
     // integration level.
 
-
     /// Test the `EditFocus` FSM state transitions (None ↔ Editing).
     mod edit_focus_fsm_tests {
         use super::*;
@@ -10871,17 +10870,17 @@ mod tests {
         fn punctuation_scancodes_have_vk_codes() {
             // (evdev scancode, expected VK)
             let cases: &[(u32, i32)] = &[
-                (52, 0xBE),  // KEY_DOT     → VK_OEM_PERIOD
-                (51, 0xBC),  // KEY_COMMA   → VK_OEM_COMMA
-                (12, 0xBD),  // KEY_MINUS   → VK_OEM_MINUS
-                (13, 0xBB),  // KEY_EQUAL   → VK_OEM_PLUS
-                (39, 0xBA),  // KEY_SEMICOLON → VK_OEM_1
-                (53, 0xBF),  // KEY_SLASH   → VK_OEM_2
-                (41, 0xC0),  // KEY_GRAVE   → VK_OEM_3
-                (26, 0xDB),  // KEY_LBRACE  → VK_OEM_4
-                (43, 0xDC),  // KEY_BACKSLASH → VK_OEM_5
-                (27, 0xDD),  // KEY_RBRACE  → VK_OEM_6
-                (40, 0xDE),  // KEY_APOSTROPHE → VK_OEM_7
+                (52, 0xBE), // KEY_DOT     → VK_OEM_PERIOD
+                (51, 0xBC), // KEY_COMMA   → VK_OEM_COMMA
+                (12, 0xBD), // KEY_MINUS   → VK_OEM_MINUS
+                (13, 0xBB), // KEY_EQUAL   → VK_OEM_PLUS
+                (39, 0xBA), // KEY_SEMICOLON → VK_OEM_1
+                (53, 0xBF), // KEY_SLASH   → VK_OEM_2
+                (41, 0xC0), // KEY_GRAVE   → VK_OEM_3
+                (26, 0xDB), // KEY_LBRACE  → VK_OEM_4
+                (43, 0xDC), // KEY_BACKSLASH → VK_OEM_5
+                (27, 0xDD), // KEY_RBRACE  → VK_OEM_6
+                (40, 0xDE), // KEY_APOSTROPHE → VK_OEM_7
             ];
             for &(sc, want) in cases {
                 let got = scan_code_to_vk(wayr::ScanCode(sc));

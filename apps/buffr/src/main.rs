@@ -382,9 +382,7 @@ mod unix {
             // `SUPERVISOR_CLEAN_FLAG_ENV` doc).
             let exit_code = status.as_ref().and_then(|s| s.code());
             let exit_zero = exit_code == Some(0) && !hang_detected;
-            let flag_present = clean_flag_path
-                .as_ref()
-                .is_some_and(|p| p.exists());
+            let flag_present = clean_flag_path.as_ref().is_some_and(|p| p.exists());
             // Remove the flag eagerly — whether or not we restart, the
             // next spawn re-creates its own.
             if let Some(ref p) = clean_flag_path {
