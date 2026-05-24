@@ -186,11 +186,17 @@ jobs:
           export WLR_RENDERER=pixman
           mkdir -p "$XDG_RUNTIME_DIR"
 
-          cat > /tmp/sway-cmd.sh <<'EOF'
+          # buffr-app DT_NEEDEDs libcef.so. CEF was fetched to
+          # vendor/cef/linux64/Release/; point LD_LIBRARY_PATH there
+          # so the dynamic linker finds it at process spawn.
+          export LD_LIBRARY_PATH="$PWD/vendor/cef/linux64/Release:${LD_LIBRARY_PATH:-}"
+
+          cat > /tmp/sway-cmd.sh <<EOF
           #!/usr/bin/env bash
           set -e
+          export LD_LIBRARY_PATH='$LD_LIBRARY_PATH'
           ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 30000
-          echo $? > /tmp/buffr-smoke-exit
+          echo \$? > /tmp/buffr-smoke-exit
           swaymsg exit
           EOF
           chmod +x /tmp/sway-cmd.sh
@@ -218,16 +224,42 @@ jobs:
             exit "$exit_code"
           fi
 
-      - name: run smoke (macOS / Windows)
-        if: matrix.os != 'ubuntu-latest'
+      - name: run smoke (macOS)
+        if: matrix.os == 'macos-latest'
         shell: bash
         run: |
-          # GH Actions runners on macOS / Windows have native GUI
-          # subsystems; no extra setup needed. The 30s smoke timeout
-          # + 60s CI cap means we surface hangs explicitly instead of
-          # waiting for the job-level timeout.
-          ./target/debug/buffr-app${{ matrix.bin_suffix }} --smoke-test --smoke-test-timeout-ms 30000
+          # macOS loads the CEF framework via cef::LibraryLoader
+          # explicitly inside buffr-app's main; vendor/cef/macosarm64
+          # contents are picked up via `cef_backend.load_library`
+          # against current_exe's neighbouring `Frameworks/`. The
+          # cargo-build target/debug layout doesn't have a Frameworks
+          # sibling, so symlink it before launching.
+          if [ ! -e target/debug/Frameworks ]; then
+            mkdir -p target/debug
+            ln -sf "$PWD/vendor/cef/macosarm64/Release" target/debug/Frameworks 2>/dev/null || \
+              cp -a "$PWD/vendor/cef/macosarm64/Release" target/debug/Frameworks
+          fi
+          ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 30000
           echo "smoke exit code: $?"
+
+      - name: run smoke (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Windows resolves libcef.dll relative to the executable
+          # directory. Copy the CEF Release contents next to
+          # buffr-app.exe so the loader finds it without modifying PATH
+          # (PATH modifications inside pwsh don't reliably propagate to
+          # CreateProcess on Server runners).
+          $cef = "$pwd\vendor\cef\windows64\Release"
+          $dst = "$pwd\target\debug"
+          if (Test-Path $cef) {
+            Copy-Item -Path "$cef\*" -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          & .\target\debug\buffr-app.exe --smoke-test --smoke-test-timeout-ms 30000
+          $code = $LASTEXITCODE
+          Write-Host "smoke exit code: $code"
+          if ($code -ne 0) { exit $code }
 
   linux:
     name: linux build + test
