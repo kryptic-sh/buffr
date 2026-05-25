@@ -115,7 +115,7 @@ buffr-view-source = { path = "crates/buffr-view-source" }
 # breakage is gated by the leading-zero version.
 hjkl-engine = "0.5"
 hjkl-buffer = "0.6"
-hjkl-clipboard = "0.25"
+hjkl-clipboard = "0.27"
 hjkl-splash = "0.2"
 hjkl-config = "0.25"
 hjkl-bonsai = "0.6"
