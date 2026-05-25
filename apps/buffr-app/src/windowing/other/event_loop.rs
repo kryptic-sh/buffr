@@ -141,12 +141,6 @@ pub struct EventLoop<T: 'static> {
     /// `set_control_flow(Wait | WaitUntil)` from inside the dispatch
     /// callback. Single-shot — matches wayr.
     wait_until: Option<Instant>,
-    /// Cached cursor request from `set_cursor` calls made between
-    /// dispatch callbacks; applied to whichever window currently
-    /// holds pointer focus.
-    pending_cursor: Option<CursorIcon>,
-    /// Currently focused window — receives `pending_cursor`.
-    focused_window: Option<WinitWindowId>,
     /// Stash any `Window`s created via the builder during a
     /// callback. The callback returns the `Window` to the caller
     /// once the borrow ends.
@@ -170,8 +164,6 @@ impl<T: 'static> EventLoop<T> {
             last_cursor_pos_per_window: HashMap::new(),
             exit_requested: false,
             wait_until: None,
-            pending_cursor: None,
-            focused_window: None,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -230,33 +222,6 @@ impl<T: 'static> EventLoop<T> {
             });
         }
         out
-    }
-
-    /// Set the cursor shape shown over the focused window.
-    pub fn set_cursor(&self, icon: CursorIcon) {
-        // We can't directly call `set_cursor` here because we don't
-        // hold a `Window` reference. Stash the request and apply it
-        // on the next dispatch via the focused-window cache below.
-        // Use interior-mutability cell? Self is `&self`. wayr's
-        // signature is also `&self` because the call routes through
-        // shared compositor state. We piggyback on the focused-window
-        // tracker — but it needs interior mutability. Wrap it in a
-        // RefCell? Simpler: provide a `set_cursor(&mut self)` shape
-        // diverges from wayr. Instead: walk every known winit window
-        // (we keep an id_map) — and call set_cursor on each. winit
-        // only honours the request for the focused window anyway.
-        let _ = icon;
-        // Implementation detail: we cannot call winit set_cursor
-        // without an `Arc<winit::Window>` handle (the bridge `Window`
-        // owns it). The caller path (`pump_cursor_changes` in
-        // main.rs) holds the focused window via the `Window` wrapper
-        // already — refactoring there is out of scope. For now this
-        // is a no-op; the cursor matches the OS default. The active
-        // wayr backend does the per-seat compositor call.
-        //
-        // TODO(windowing/other): expose a `set_cursor` path that
-        // takes the focused `Arc<Window>` (the buffr-app code already
-        // has it) so this stops being a no-op on macOS / Windows.
     }
 
     /// Construct a window via the builder. Called by
@@ -412,16 +377,6 @@ impl<'a, T: 'static, A: ApplicationHandler<T>> WinitAppHandler<T> for Bridge<'a,
                 .last_cursor_pos_per_window
                 .insert(window_id, *position);
         }
-        // Track focused window for cursor routing.
-        if let WinitWindowEvent::Focused(true) = &event {
-            self.ev.focused_window = Some(window_id);
-        }
-        if let WinitWindowEvent::Focused(false) = &event
-            && self.ev.focused_window == Some(window_id)
-        {
-            self.ev.focused_window = None;
-        }
-
         // Resolve our SurfaceId. If we haven't seen this winit
         // WindowId before, drop the event — it can't possibly belong
         // to a buffr-app surface.

@@ -8,6 +8,22 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-05-25
+
+### Fixed
+
+- Cursor shape no longer updated on hover (link → hand, text → I-beam, etc.).
+  The winit-backed `EventLoop::set_cursor` shipped as a no-op in v0.14.0; it was
+  masked on Linux until v0.14.2 (where the wayr revert dropped the wayr
+  re-export that had a real implementation). `pump_cursor_changes` now routes
+  through the per-window `Window::set_cursor` on the main toplevel and every
+  popup — winit silently ignores the request for non-focused windows, so
+  whichever surface holds pointer focus picks up the cursor. The no-op
+  `EventLoop::set_cursor` stub + its `pending_cursor` / `focused_window`
+  scaffolding are deleted.
+
+[0.14.3]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.3
+
 ## [0.14.2] - 2026-05-25
 
 ### Changed

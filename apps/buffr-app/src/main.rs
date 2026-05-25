@@ -3827,15 +3827,19 @@ impl AppState {
             return;
         };
         let icon = cef_cursor_type_to_winit(raw);
-        // Per-seat in Wayland: routing through the focused window
-        // would be wrong — the compositor accepts the request from
-        // any of our surfaces as long as one of them holds pointer
-        // focus. Use the event_loop accessor directly. We log the
-        // originating browser_id for diagnostics but don't route on
-        // it (the page that's hovered is by definition the one with
-        // pointer focus).
+        // winit's set_cursor is per-window (not per-seat the way wayr /
+        // raw Wayland are), so apply to every live window: the main
+        // toplevel + every popup. winit silently ignores the request
+        // for non-focused windows, so whichever surface holds pointer
+        // focus picks up the cursor. We log the originating browser_id
+        // for diagnostics but don't route on it.
         let _ = browser_id;
-        event_loop.set_cursor(icon);
+        if let Some(win) = self.window.as_ref() {
+            win.set_cursor(event_loop, icon);
+        }
+        for popup in self.popups.values() {
+            popup.window.set_cursor(event_loop, icon);
+        }
     }
 
     /// Drain the find-result mailbox into the statusline. Called from
