@@ -6423,8 +6423,15 @@ impl AppState {
                 }
                 self.paint_popup_window(window_id);
             }
-            // wayr carries modifiers inside PointerButton and Key events;
-            // there is no separate ModifiersChanged event.
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // Same Ctrl-sticky fix as the main window — winit may
+                // dispatch ModifiersChanged after the key release on
+                // some backends, so mirror the modifier state into
+                // the popup's cache here too.
+                if let Some(popup) = self.popups.get_mut(&window_id) {
+                    popup.modifiers = modifiers;
+                }
+            }
             WindowEvent::Focused => {
                 if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
@@ -8311,16 +8318,23 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 tracing::trace!(dx, dy, bx, by, "input: scroll -> CEF");
                 host.osr_mouse_wheel(bx, by, dx, dy, mods);
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // winit may dispatch ModifiersChanged AFTER the
+                // matching key-release event on some backends. Without
+                // this arm `self.modifiers` would stay at the
+                // pre-release state because the key event carries the
+                // cached (still-pre-release) modifiers — the v0.14.3
+                // Ctrl-sticky regression.
+                self.modifiers = modifiers;
+            }
             WindowEvent::Key(event) => {
-                // wayr's KeyEvent carries the modifier state inline
-                // (winit's separate ModifiersChanged event doesn't
-                // exist here). Sync `self.modifiers` from the event
-                // FIRST so every downstream consumer that still reads
-                // the cached field (CEF VK forwarding, edit-mode
-                // chord routing, pointer paths between key events)
-                // sees the live state. Without this, holding Ctrl
-                // and pressing X arrived as `mods=(false, …)` and
-                // CEF saw an unmodified VK_X.
+                // Sync `self.modifiers` from the event so downstream
+                // consumers that read the cached field (CEF VK
+                // forwarding, edit-mode chord routing, pointer paths
+                // between key events) see the modifiers that were
+                // live AT THE TIME of this key event. The bridge also
+                // emits ModifiersChanged for modifier-only transitions
+                // (see arm above) — both paths run, last writer wins.
                 self.modifiers = event.modifiers;
                 // Pinned-close confirmation takes precedence over
                 // everything else: `y` or `<Enter>` confirms, `n` /

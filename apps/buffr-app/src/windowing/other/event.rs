@@ -71,6 +71,18 @@ pub enum WindowEvent {
     /// Keyboard key event.
     Key(KeyEvent),
 
+    /// Modifier state changed without an accompanying key event.
+    ///
+    /// Diverges from wayr — wayr bakes the modifier state into every
+    /// `Key` / `PointerButton` event because Wayland delivers it that
+    /// way. winit fires a separate `ModifiersChanged` and may dispatch
+    /// it AFTER the corresponding key release on some backends,
+    /// stranding consumers that only sync modifiers from key events
+    /// (caused the Ctrl-sticky regression in v0.14.2). Bridge exposes
+    /// it so `self.modifiers` can be kept in lockstep with winit's
+    /// authoritative cache.
+    ModifiersChanged(Modifiers),
+
     /// IME composition event.
     Ime(ImeEvent),
 }

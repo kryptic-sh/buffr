@@ -8,6 +8,22 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-05-25
+
+### Fixed
+
+- Ctrl (and other modifier keys) stayed "stuck" after release: subsequent key +
+  pointer events behaved as if the modifier were still held. winit may dispatch
+  `ModifiersChanged` _after_ the corresponding key-release on some backends, so
+  the v0.14.0 strategy of syncing `self.modifiers` only from
+  `KeyEvent.modifiers` missed the actual release transition (the release key
+  event carried the pre-release cached state). The bridge windowing layer now
+  surfaces a `WindowEvent::ModifiersChanged(Modifiers)` variant and `AppState`
+  mirrors it into `self.modifiers` independent of key-event ordering. Main
+  window + popup paths both updated.
+
+[0.14.4]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.4
+
 ## [0.14.3] - 2026-05-25
 
 ### Fixed

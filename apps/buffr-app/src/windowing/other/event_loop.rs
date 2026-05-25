@@ -364,13 +364,13 @@ impl<'a, T: 'static, A: ApplicationHandler<T>> WinitAppHandler<T> for Bridge<'a,
         window_id: WinitWindowId,
         event: WinitWindowEvent,
     ) {
-        // ModifiersChanged is consumed inline — we cache the state so
-        // subsequent PointerButton / Key events can attach it (wayr
-        // bakes modifiers into each event).
-        if let WinitWindowEvent::ModifiersChanged(mods) = &event {
-            self.ev.modifiers = mods.state();
-            return;
-        }
+        // ModifiersChanged updates the cache (so PointerButton + Key
+        // events can attach the current state) AND emits a bridge
+        // event so consumers that mirror `self.modifiers` stay in
+        // sync independent of key-event ordering. winit may dispatch
+        // ModifiersChanged after a modifier-key release on some
+        // backends; without the bridge event the consumer's mirror
+        // stays stuck on the pre-release state.
         // Track cursor position so PointerEntered carries one too.
         if let WinitWindowEvent::CursorMoved { position, .. } = &event {
             self.ev
@@ -451,6 +451,12 @@ impl<'a, T: 'static, A: ApplicationHandler<T>> WinitAppHandler<T> for Bridge<'a,
                 let bridge_key = bridge_key_event(ke, modifiers);
                 Some(WindowEvent::Key(bridge_key))
             }
+            WinitWindowEvent::ModifiersChanged(mods) => {
+                self.ev.modifiers = mods.state();
+                Some(WindowEvent::ModifiersChanged(modifiers_from_winit(
+                    self.ev.modifiers,
+                )))
+            }
             WinitWindowEvent::Ime(ime) => match ime {
                 winit::event::Ime::Preedit(text, cursor) => {
                     Some(WindowEvent::Ime(ImeEvent::Preedit {
@@ -468,7 +474,6 @@ impl<'a, T: 'static, A: ApplicationHandler<T>> WinitAppHandler<T> for Bridge<'a,
             },
             // Variants we deliberately drop — no wayr equivalent or
             // not used by buffr-app:
-            //   - ModifiersChanged (handled above, cached)
             //   - Moved, Destroyed, DroppedFile, HoveredFile,
             //     HoveredFileCancelled
             //   - PinchGesture, PanGesture, DoubleTapGesture,
