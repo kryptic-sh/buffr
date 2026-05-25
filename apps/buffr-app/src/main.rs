@@ -8382,7 +8382,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // Per-action filtering happens after resolution: see
                 // `PageAction::is_repeatable`.
                 let is_repeat = event.repeat;
-                let Some(chord) = key_event_to_chord_with_repeat(&event) else {
+                let chord_opt = key_event_to_chord_with_repeat(&event);
+                tracing::debug!(
+                    text = ?event.text,
+                    key_code = ?event.key_code,
+                    state = ?event.state,
+                    repeat = event.repeat,
+                    mods = ?(event.modifiers.shift, event.modifiers.ctrl, event.modifiers.alt, event.modifiers.logo),
+                    chord = ?chord_opt,
+                    "page-mode: Key event -> chord",
+                );
+                let Some(chord) = chord_opt else {
                     return;
                 };
                 let now = self.startup.elapsed();
@@ -8394,6 +8404,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     }
                     Err(_) => return,
                 };
+                tracing::debug!(?step, mode = ?post_mode, "page-mode: engine.feed result");
                 match step {
                     Step::Resolved(action) => {
                         // Drop auto-repeat events for actions that

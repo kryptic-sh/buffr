@@ -141,11 +141,38 @@ fn chord_from_event(event: &KeyEvent) -> Option<KeyChord> {
                 key: Key::Char(' '),
             });
         }
-        let mapped = map_named(name)?;
-        return Some(KeyChord {
-            modifiers: mods,
-            key: Key::Named(mapped),
-        });
+        if let Some(mapped) = map_named(name) {
+            return Some(KeyChord {
+                modifiers: mods,
+                key: Key::Named(mapped),
+            });
+        }
+        // Defense-in-depth: winit stuffs `logical_key.Character("0")`
+        // into `KeyCode::Named("0")` (the bridge KeyCode enum has no
+        // Char variant). If `text` was empty and the named-key table
+        // doesn't recognise the name, fall back to treating a single
+        // printable codepoint as a Char chord. Matches the vim
+        // bindings on the digit / punctuation rows (`0`, `-`, `=`).
+        let mut chars = name.chars();
+        if let (Some(first), None) = (chars.next(), chars.next())
+            && !first.is_ascii_control()
+        {
+            let mut effective = mods;
+            let mut ch = first;
+            if effective.contains(Modifiers::SHIFT)
+                && first.is_ascii()
+                && !first.is_ascii_alphabetic()
+            {
+                effective.remove(Modifiers::SHIFT);
+            }
+            if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
+                ch = ch.to_ascii_lowercase();
+            }
+            return Some(KeyChord {
+                modifiers: effective,
+                key: Key::Char(ch),
+            });
+        }
     }
     None
 }
