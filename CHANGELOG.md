@@ -8,6 +8,22 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-05-25
+
+### Fixed
+
+- Page-mode bindings `0` (ZoomReset), `-` (ZoomOut), `=` (ZoomIn) and other
+  printable non-letter keys stopped working after the v0.14.2 wayr→winit revert.
+  Root cause: winit's `KeyEvent.text` is sometimes `None` for digit /
+  punctuation keys on Wayland xkb configs, and the bridge stuffed the
+  logical-key character into `KeyCode::Named("0")` — the chord builder's
+  text-first path returned None and the named-key path didn't recognise
+  single-printable names. Fall back to `logical_key.Character` when `text` is
+  absent so a single printable codepoint always reaches the chord builder.
+  Affects the entire vim-style chord set, not just zoom.
+
+[0.14.5]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.5
+
 ## [0.14.4] - 2026-05-25
 
 ### Fixed

@@ -547,15 +547,30 @@ fn scroll_event_from_winit(delta: winit::event::MouseScrollDelta) -> ScrollEvent
 fn bridge_key_event(ke: winit::event::KeyEvent, modifiers: Modifiers) -> KeyEvent {
     let scancode = scancode_from_winit_physical(ke.physical_key);
     let key_code = key_code_from_winit_logical(&ke.logical_key);
-    let text = ke.text.as_deref().map(|s| s.to_string()).filter(|s| {
-        // wayr filters single ASCII controls. Match the filter.
-        if s.chars().count() == 1 {
-            let c = s.chars().next().unwrap();
-            !c.is_ascii_control()
-        } else {
-            !s.is_empty()
-        }
-    });
+    // winit's `text` is sometimes None for printable keys (e.g. digit /
+    // punctuation rows on certain Wayland xkb configs), which would
+    // strand consumers' text-first chord paths — buffr's vim-style
+    // `0` / `-` / `=` page bindings disappeared after the v0.14.2
+    // wayr→winit revert because of this. Fall back to the logical
+    // `Character` payload when `text` is absent so a single printable
+    // codepoint always reaches the consumer.
+    let text = ke
+        .text
+        .as_deref()
+        .map(|s| s.to_string())
+        .or_else(|| match &ke.logical_key {
+            winit::keyboard::Key::Character(s) => Some(s.as_str().to_string()),
+            _ => None,
+        })
+        .filter(|s| {
+            // wayr filters single ASCII controls. Match the filter.
+            if s.chars().count() == 1 {
+                let c = s.chars().next().unwrap();
+                !c.is_ascii_control()
+            } else {
+                !s.is_empty()
+            }
+        });
     let state = match ke.state {
         winit::event::ElementState::Pressed => KeyState::Pressed,
         winit::event::ElementState::Released => KeyState::Released,
