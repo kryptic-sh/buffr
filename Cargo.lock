@@ -1909,15 +1909,16 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hjkl-bonsai"
-version = "0.6.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "908041907d7f641e54b094e3c86febd9b485df253b92508dfe523ef60223605f"
+checksum = "929b24df85cc209f54e584fb84d6d19adb1c064489b4af7542fd71f36d433dad"
 dependencies = [
  "anyhow",
  "dirs",
+ "hjkl-theme",
  "hjkl-xdg",
  "libloading 0.9.0",
- "ratatui",
+ "regex",
  "serde",
  "thiserror 2.0.18",
  "toml",
@@ -1983,10 +1984,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e38f603523defba5c303f13b8c4d2a998f77c0d656296f1a79efd4a3ac73707a"
 
 [[package]]
-name = "hjkl-xdg"
-version = "0.1.0"
+name = "hjkl-theme"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a9818d4389b1cc9d8ea54f57f388f3a58d3f80315e0ceb66903813a26c3fa1f"
+checksum = "5e3ee6a2c5cc91fb6f2510d28328a3a05ef44e0f21d44c399344d28535a60f7b"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "716f38128ab2768ff3a47d98f041846f3fa1d1f6bb41209dd95e568c6d5ba734"
 dependencies = [
  "dirs",
  "thiserror 2.0.18",
