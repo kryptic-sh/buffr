@@ -3156,6 +3156,18 @@ impl buffr_engine::BrowserEngine for BrowserHost {
         self.active_zoom_level()
     }
 
+    fn zoom_in(&self) {
+        self.adjust_zoom(0.25);
+    }
+
+    fn zoom_out(&self) {
+        self.adjust_zoom(-0.25);
+    }
+
+    fn zoom_reset(&self) {
+        self.reset_zoom();
+    }
+
     // ── Audio / video ────────────────────────────────────────────────────────
 
     fn any_audio_active(&self) -> bool {
