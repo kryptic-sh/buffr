@@ -8,6 +8,21 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-05-25
+
+### Fixed
+
+- `0` / `-` / `=` page-mode bindings now actually zoom the page. The v0.14.5
+  chord-build fix made the keys reach `dispatch_action` with `Resolved(ZoomIn)`
+  / `Resolved(ZoomOut)` / `Resolved(ZoomReset)`, but `BrowserHost`'s
+  `impl BrowserEngine` never overrode `zoom_in` / `zoom_out` / `zoom_reset` — so
+  the calls hit the trait's default no-op `{}` stubs. `BrowserHost` had
+  `adjust_zoom(±0.25)` and `reset_zoom()` helpers all along (used by an older
+  `dispatch(action)` path), they just weren't wired to the trait. Three-line
+  override on the BrowserEngine impl.
+
+[0.14.6]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.6
+
 ## [0.14.5] - 2026-05-25
 
 ### Fixed
