@@ -113,7 +113,7 @@ buffr-view-source = { path = "crates/buffr-view-source" }
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
 # at their latest majors — patch bumps roll in automatically; major-bump
 # breakage is gated by the leading-zero version.
-hjkl-engine = "0.5"
+hjkl-engine = "0.27"
 hjkl-buffer = "0.6"
 hjkl-clipboard = "0.25"
 hjkl-splash = "0.2"
