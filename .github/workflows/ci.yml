@@ -78,7 +78,7 @@ jobs:
           shared-key: lint-${{ matrix.os }}
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key:
@@ -171,7 +171,7 @@ jobs:
           shared-key: smoke-${{ matrix.os }}
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key:
@@ -332,7 +332,7 @@ jobs:
           shared-key: linux-build
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
@@ -398,7 +398,7 @@ jobs:
           shared-key: linux-build-osr
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
@@ -492,7 +492,7 @@ jobs:
           shared-key: linux-build
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
@@ -576,7 +576,7 @@ jobs:
           shared-key: linux-package-${{ matrix.platform }}
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
@@ -723,7 +723,7 @@ jobs:
           shared-key: macos-build-macosarm64
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key: cef-macosarm64-${{ hashFiles('xtask/src/main.rs') }}
@@ -862,7 +862,7 @@ jobs:
         shell: powershell
 
       - name: cache CEF binary distribution
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/cef
           key: cef-${{ matrix.platform }}-${{ hashFiles('xtask/src/main.rs') }}
@@ -1007,7 +1007,7 @@ jobs:
       # hit, `flatpak install` is a near-instant no-op. Key includes the
       # runtime version so a bump to //48 invalidates cleanly.
       - name: Cache flatpak GNOME runtime
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.local/share/flatpak
           key: flatpak-runtime-gnome47-${{ matrix.arch }}-v1
@@ -1027,7 +1027,7 @@ jobs:
       # restore-key so a manifest tweak still warm-starts from the
       # previous run's cache.
       - name: Cache flatpak-builder build cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: flatpak/.flatpak-builder
           key:
