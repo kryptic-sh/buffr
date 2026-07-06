@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://buffr.kryptic.sh/sitemap.xml

@@ -2,9 +2,9 @@
 #
 # Generates a static HTML site from `docs/*.md`. The rendered output
 # lives in `docs-site/` (gitignored target dir) and is mounted under
-# `https://buffr.kryptic.sh/docs/` by the unified `pages.yml` workflow,
-# which assembles `web/` (marketing) + `docs-site/` (this output)
-# into a single Pages deploy with CNAME `buffr.kryptic.sh`.
+# `https://www.kryptic.sh/buffr/docs/` by the kryptic.sh site's Pages
+# workflow, which checks out this repo and runs `mdbook build` while
+# assembling the unified site.
 #
 # Run locally:
 #   mdbook build       -> emits HTML into docs-site/
@@ -27,4 +27,4 @@ default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/kryptic-sh/buffr"
 edit-url-template = "https://github.com/kryptic-sh/buffr/edit/main/{path}"
-site-url = "/docs/"
+site-url = "/buffr/docs/"

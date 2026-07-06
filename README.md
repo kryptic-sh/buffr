@@ -5,7 +5,7 @@ Vim-inspired browser. Native, GPU-accelerated. Rust + CEF.
 [![CI](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/buffr/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/kryptic-sh/buffr)](https://github.com/kryptic-sh/buffr/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Website](https://img.shields.io/badge/website-buffr.kryptic.sh-7ee787)](https://buffr.kryptic.sh)
+[![Website](https://img.shields.io/badge/website-kryptic.sh%2Fbuffr-7ee787)](https://www.kryptic.sh/buffr/)
 
 Modal browser built on
 [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef) via
