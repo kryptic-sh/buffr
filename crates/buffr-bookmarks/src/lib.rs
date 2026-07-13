@@ -558,7 +558,7 @@ fn load_tags(conn: &Connection, bookmark_id: i64) -> Result<Vec<String>, Bookmar
 
 fn ts_to_dt(secs: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch"))
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 
 /// Parse + canonicalise a URL string.
@@ -584,9 +584,10 @@ fn normalise_tags(tags: &[&str]) -> Vec<String> {
 /// occasionally contain `<B>`, `<I>`, `<BR>`. We don't need a real
 /// HTML parser — just drop the angle-bracketed bits.
 fn strip_html(s: &str) -> String {
-    // SAFETY: regex is a constant; compile error only on programmer
-    // mistake, which would surface in tests.
-    let re = Regex::new(r"<[^>]+>").expect("strip_html regex");
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"<[^>]+>").expect("strip_html regex is a constant")
+    });
     re.replace_all(s, "").trim().to_string()
 }
 

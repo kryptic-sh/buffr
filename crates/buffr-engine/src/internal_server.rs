@@ -211,9 +211,9 @@ fn accept_loop(
     token: String,
 ) {
     // 50 ms poll cadence: keeps Drop responsive without burning a core.
-    listener
-        .set_nonblocking(false)
-        .expect("TcpListener::set_nonblocking should not fail");
+    listener.set_nonblocking(false).unwrap_or_else(
+        |e| tracing::warn!(error = %e, "internal_server: set_nonblocking(false) failed"),
+    );
 
     while !shutdown.load(Ordering::SeqCst) {
         // Apply a short read timeout so accept doesn't block forever; the
@@ -234,13 +234,16 @@ fn accept_loop(
                 // Per-connection thread so a slow client can't block the
                 // accept loop. Internal pages are small; we don't need
                 // keep-alive or HTTP/2.
-                let _ = thread::Builder::new()
+                if let Err(e) = thread::Builder::new()
                     .name("buffr-internal-conn".into())
                     .spawn(move || {
                         if let Err(e) = handle_connection(stream, &routes_snapshot, &token) {
                             tracing::debug!(error = %e, "internal_server: connection error");
                         }
-                    });
+                    })
+                {
+                    tracing::warn!(error = %e, "internal_server: failed to spawn connection handler");
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -258,8 +261,34 @@ fn handle_connection(stream: TcpStream, routes: &Routes, token: &str) -> io::Res
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
     let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+
+    // Read the request line with a 32 KiB cap to prevent OOM from a
+    // pathological request path (loopback-only, but defence-in-depth).
+    let mut request_line = Vec::<u8>::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break; // EOF
+        }
+        let cap_remaining = 32 * 1024 - request_line.len();
+        let limit = available.len().min(cap_remaining);
+        let newline_pos = available[..limit].iter().position(|&b| b == b'\n');
+        match newline_pos {
+            Some(pos) => {
+                request_line.extend_from_slice(&available[..=pos]);
+                reader.consume(pos + 1);
+                break;
+            }
+            None => {
+                request_line.extend_from_slice(&available[..limit]);
+                reader.consume(limit);
+                if limit == 0 || cap_remaining <= limit {
+                    // Hit the 32 KiB cap without seeing a newline.
+                    return write_status(reader.into_inner(), 414, "URI Too Long", b"");
+                }
+            }
+        }
+    }
 
     // Drain request headers (we don't use any). Bail if the client sends
     // pathological garbage past 16 KiB.
@@ -280,6 +309,12 @@ fn handle_connection(stream: TcpStream, routes: &Routes, token: &str) -> io::Res
     }
 
     let stream = reader.into_inner();
+    let request_line = match String::from_utf8(request_line) {
+        Ok(s) => s,
+        Err(_) => {
+            return write_status(stream, 400, "Bad Request", b"non-UTF-8 request line");
+        }
+    };
     let parsed = match parse_request_line(&request_line) {
         Some(p) => p,
         None => return write_status(stream, 400, "Bad Request", b""),

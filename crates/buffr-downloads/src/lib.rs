@@ -83,7 +83,10 @@ impl DownloadStatus {
             "completed" => DownloadStatus::Completed,
             "canceled" => DownloadStatus::Canceled,
             "failed" => DownloadStatus::Failed,
-            _ => DownloadStatus::Failed,
+            _ => {
+                tracing::warn!(unknown_status = %s, "downloads: unknown status string in database, treating as Failed");
+                DownloadStatus::Failed
+            }
         }
     }
 }
@@ -406,7 +409,7 @@ fn row_to_download(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
 
 fn ts_to_dt(secs: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch"))
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 
 #[cfg(test)]

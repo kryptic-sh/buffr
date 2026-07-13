@@ -68,40 +68,51 @@ where
     let cb = Arc::new(Mutex::new(callback));
     let path_for_thread = path.clone();
     let handle = thread::spawn(move || {
-        let mut last: Option<Instant> = None;
-        loop {
-            // Block until at least one event arrives (or sender dropped).
-            match rx.recv() {
-                Ok(()) => {}
-                Err(_) => return,
-            }
-            // Drain anything else queued in the debounce window.
-            let deadline = Instant::now() + DEBOUNCE;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut last: Option<Instant> = None;
             loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
+                // Block until at least one event arrives (or sender dropped).
+                match rx.recv() {
+                    Ok(()) => {}
+                    Err(_) => return,
                 }
-                match rx.recv_timeout(deadline - now) {
-                    Ok(()) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                // Drain anything else queued in the debounce window.
+                let deadline = Instant::now() + DEBOUNCE;
+                loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match rx.recv_timeout(deadline - now) {
+                        Ok(()) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                // Coarse rate-limit: never fire twice within DEBOUNCE.
+                if let Some(prev) = last
+                    && prev.elapsed() < DEBOUNCE
+                {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                last = Some(Instant::now());
+                let result = load_from_path(&path_for_thread).and_then(|(cfg, _)| {
+                    validate(&cfg)?;
+                    Ok(cfg)
+                });
+                if let Ok(cb) = cb.lock() {
+                    cb(result);
                 }
             }
-            // Coarse rate-limit: never fire twice within DEBOUNCE.
-            if let Some(prev) = last
-                && prev.elapsed() < DEBOUNCE
-            {
-                continue;
-            }
-            last = Some(Instant::now());
-            let result = load_from_path(&path_for_thread).and_then(|(cfg, _)| {
-                validate(&cfg)?;
-                Ok(cfg)
-            });
-            if let Ok(cb) = cb.lock() {
-                cb(result);
-            }
+        }));
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            eprintln!("[buffr-config] config watcher thread panicked: {msg}");
         }
     });
 

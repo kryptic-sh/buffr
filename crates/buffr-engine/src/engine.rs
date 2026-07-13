@@ -565,8 +565,9 @@ pub trait BrowserEngine: Send + Sync {
     /// must happen off-thread. Returns `None` when the clipboard is empty,
     /// non-text, or unavailable.
     ///
-    /// Default: `None`.
+    /// Default: debug-log and return `None` (CEF backend overrides).
     fn clipboard_text(&self) -> Option<String> {
+        tracing::debug!("BrowserEngine::clipboard_text: not implemented by this backend");
         None
     }
 
