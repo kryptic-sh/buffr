@@ -23,8 +23,22 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// RAII guard for an active config watcher. Drop to stop watching.
 pub struct ConfigWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: Option<RecommendedWatcher>,
     _thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ConfigWatcher {
+    fn drop(&mut self) {
+        // Drop the watcher first so the notification channel closes and
+        // the background thread's rx.recv() returns Err, causing the
+        // thread to exit quickly.
+        drop(self._watcher.take());
+        // Join the background thread so the callback is guaranteed to
+        // have finished before any teardown callers of this struct.
+        if let Some(handle) = self._thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Watch `path` for changes; on each debounced change, re-load + validate
@@ -117,7 +131,7 @@ where
     });
 
     Ok(ConfigWatcher {
-        _watcher: watcher,
+        _watcher: Some(watcher),
         _thread: Some(handle),
     })
 }

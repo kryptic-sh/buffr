@@ -68,8 +68,7 @@ pub fn record_start_at(path: &Path, now: u64) -> bool {
     log.attempts.push(now);
     let loop_detected = log.attempts.len() >= LOOP_THRESHOLD;
     if let Err(err) = write(path, &log) {
-        warn!(error = %err, path = %path.display(), "crash_guard: failed to update launch log");
-        return false;
+        warn!(error = %err, path = %path.display(), "crash_guard: failed to update launch log (crash detection may be unreliable)");
     }
     if loop_detected {
         warn!(
