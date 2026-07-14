@@ -427,6 +427,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_unknown_status_returns_failed() {
+        // Database rows with an unknown status discriminant must decode
+        // to Failed (with a logged warning).
+        let result = DownloadStatus::parse("some_random_garbage");
+        assert_eq!(result, DownloadStatus::Failed);
+    }
+
+    #[test]
     fn record_started_inserts_in_flight_row() {
         let d = Downloads::open_in_memory().unwrap();
         let id = d

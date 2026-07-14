@@ -1087,4 +1087,11 @@ mod tests {
         eng.start_download("https://example.com/file.zip");
         eng.show_dev_tools_at(0, 0);
     }
+
+    #[test]
+    fn trait_default_clipboard_text_is_none() {
+        // The default impl returns None (with a debug log).
+        let eng = NoOpEngine;
+        assert_eq!(eng.clipboard_text(), None);
+    }
 }

@@ -650,6 +650,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_request_line() {
+        // A request-line path longer than 32 KiB must be rejected with 414.
+        let routes = Routes::new();
+        let server = InternalServer::start(routes).expect("start");
+        let token = server.token();
+        let target = format!("/{}/a", token);
+        // Total path must exceed 32 KiB. Account for "/<token>/" prefix.
+        let pad = (32 * 1024 + 1usize).saturating_sub(target.len());
+        let oversized = format!("{}/{}", target, "a".repeat(pad));
+
+        let mut stream =
+            TcpStream::connect_timeout(&server.addr(), Duration::from_secs(2)).unwrap();
+        let req =
+            format!("GET {oversized} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        // Send the request. The server may close before the write
+        // completes — that's fine, the cap was enforced.
+        let _ = stream.write_all(req.as_bytes());
+        // Give the server a moment to send the 414 response before
+        // the RST packet arrives.
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                // EOF = server closed without sending data; acceptable.
+            }
+            Ok(n) => {
+                let resp = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                assert!(
+                    resp.starts_with("HTTP/1.1 414"),
+                    "oversized path should get 414, got: {resp}"
+                );
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                // Server reset after sending 414; the cap was enforced.
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
     fn constant_time_eq_matches_normal_eq() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));

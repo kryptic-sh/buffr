@@ -150,6 +150,8 @@ fn write(path: &Path, log: &LaunchLog) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn first_launch_not_a_loop() {
@@ -237,5 +239,40 @@ mod tests {
         assert!(!loop_detected);
         let log = read(&path).unwrap();
         assert_eq!(log.attempts, vec![1000]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loop_detection_proceeds_on_write_failure() {
+        // When the launch log can't be written (e.g. read-only
+        // directory), crash-loop detection must still run and report
+        // the correct result. The file on disk may be stale, but the
+        // in-memory count should drive the decision.
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_path(dir.path());
+
+        // Build up a crash-loop state (3 launches in the window).
+        assert!(!record_start_at(&path, 100));
+        assert!(!record_start_at(&path, 110));
+        assert!(record_start_at(&path, 120));
+
+        // Verify the file exists with 3 attempts.
+        let log = read(&path).unwrap();
+        assert_eq!(log.attempts.len(), 3);
+
+        // Make the parent directory read-only so the next write fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Even though the write fails, loop detection must still work.
+        assert!(
+            record_start_at(&path, 130),
+            "loop detection should report true even when write fails"
+        );
+
+        // Restore permissions and verify the file was NOT updated
+        // (the write did indeed fail).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = read(&path).unwrap();
+        assert_eq!(log.attempts.len(), 3, "write must have failed");
     }
 }
