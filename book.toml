@@ -36,3 +36,29 @@ git-repository-url = "https://github.com/kryptic-sh/buffr"
 edit-url-template = "https://github.com/kryptic-sh/buffr/edit/main/{path}"
 # Served at the domain root now, not under a /buffr/docs/ prefix.
 site-url = "/"
+
+
+# The book lived at www.kryptic.sh/buffr/docs/ until it moved here. GitHub
+# redirects www.kryptic.sh/buffr/<path> to buffr.kryptic.sh/<path>, so every
+# old link arrives as /docs/... and would 404 against a book served at the
+# root. One entry per chapter, so a bookmark to a specific page still lands
+# on that page rather than the index.
+[output.html.redirect]
+"/docs/index.html" = "/index.html"
+"/docs/README.html" = "/index.html"
+"/docs/accessibility.html" = "/accessibility.html"
+"/docs/backlog.html" = "/backlog.html"
+"/docs/code-review.html" = "/code-review.html"
+"/docs/config.html" = "/config.html"
+"/docs/context-menu.html" = "/context-menu.html"
+"/docs/dev.html" = "/dev.html"
+"/docs/hint-mode.html" = "/hint-mode.html"
+"/docs/keymap.html" = "/keymap.html"
+"/docs/macos-running.html" = "/macos-running.html"
+"/docs/macos-signing.html" = "/macos-signing.html"
+"/docs/multi-tab.html" = "/multi-tab.html"
+"/docs/packaging.html" = "/packaging.html"
+"/docs/privacy.html" = "/privacy.html"
+"/docs/ui-stack.html" = "/ui-stack.html"
+"/docs/updates.html" = "/updates.html"
+"/docs/windows-packaging.html" = "/windows-packaging.html"
