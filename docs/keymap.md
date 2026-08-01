@@ -1,9 +1,14 @@
 # buffr default keymap (page mode)
 
 Reference for the default page-mode bindings shipped by
-`buffr_modal::Keymap::default_bindings`. All entries assume the leader key is
-`\` (vim default); the leader is configurable per-profile via
-`Keymap::set_leader`.
+`buffr_modal::Keymap::default_bindings`.
+
+**Leader key:** the default is a single **space** (`general.leader = " "` in
+`Config`), so the one `<leader>` binding below (`<leader>p` → `PinTab`) is typed
+as `<Space>p` out of the box. Set `[general] leader = "\\"` for the vim
+convention; `build_keymap` feeds that character to `Keymap::default_bindings`,
+so every `<leader>` chord follows the config. (`buffr --audit-keymap` currently
+renders the audit table with `\` regardless of your config — cosmetic only.)
 
 > **Defaults mirror Vieb** (stock `app/renderer/input.js`). Intentional
 > divergences are flagged inline with **[buffr]**.
@@ -14,14 +19,14 @@ Shift, `<M-...>` / `<A-...>` = Alt, `<D-...>` = Super (Cmd on macOS), `<leader>`
 
 ## Modes
 
-| Mode      | Trigger           | Notes                                                  |
-| --------- | ----------------- | ------------------------------------------------------ |
-| `Normal`  | initial / `<Esc>` | Default; bindings below.                               |
-| `Visual`  | (Phase 3)         | Selection-bearing motions. `<Esc>` returns to Normal.  |
-| `Command` | `:` or `e`        | Command line / omnibar focused. `<Esc>` returns.       |
-| `Hint`    | `f` / `F`         | DOM hint overlay active. `<Esc>` returns.              |
-| `Pending` | (transient)       | Multi-key prefix in flight. Not user-bindable.         |
-| `Insert`  | text-field focus  | Forwarded to `hjkl_editor::Editor` once Phase 2 ships. |
+| Mode      | Trigger           | Notes                                                   |
+| --------- | ----------------- | ------------------------------------------------------- |
+| `Normal`  | initial / `<Esc>` | Default; bindings below.                                |
+| `Visual`  | left-drag ≥ 4 px  | Text selection in the page. `y` yanks, `<Esc>` cancels. |
+| `Command` | `:` or `e`        | Command line / omnibar focused. `<Esc>` returns.        |
+| `Hint`    | `f` / `F`         | DOM hint overlay active. `<Esc>` returns.               |
+| `Pending` | (transient)       | Multi-key prefix in flight. Not user-bindable.          |
+| `Insert`  | text-field focus  | Forwarded to `hjkl_editor::Editor` once Phase 2 ships.  |
 
 ## Count and register prefixes
 
@@ -67,23 +72,29 @@ the shorter action fires.
 
 ### Tabs
 
-| Keys     | Action         | Notes                                                                         |
-| -------- | -------------- | ----------------------------------------------------------------------------- |
-| `H`      | `TabPrev`      | **[buffr]** Vieb uses `H` for history-back.                                   |
-| `L`      | `TabNext`      | **[buffr]** Vieb uses `L` for history-forward.                                |
-| `gt`     | `TabNext`      |                                                                               |
-| `gT`     | `TabPrev`      |                                                                               |
-| `o`      | `TabNewRight`  | **[buffr]** Open tab to the right of active; omnibar opens so you type a URL. |
-| `O`      | `TabNewLeft`   | **[buffr]** Open tab to the left of active; omnibar opens so you type a URL.  |
-| `d`      | `TabClose`     |                                                                               |
-| `<C-w>c` | `TabClose`     |                                                                               |
-| `<C-w>n` | `DuplicateTab` |                                                                               |
-| `<C-w>p` | `PinTab`       | **[buffr]** Vieb uses `<C-w>p` for prev-buffer.                               |
+| Keys        | Action                      | Notes                                                                         |
+| ----------- | --------------------------- | ----------------------------------------------------------------------------- |
+| `H`         | `TabPrev`                   | **[buffr]** Vieb uses `H` for history-back.                                   |
+| `L`         | `TabNext`                   | **[buffr]** Vieb uses `L` for history-forward.                                |
+| `gt`        | `TabNext`                   |                                                                               |
+| `gT`        | `TabPrev`                   |                                                                               |
+| `o`         | `TabNewRight`               | **[buffr]** Open tab to the right of active; omnibar opens so you type a URL. |
+| `O`         | `TabNewLeft`                | **[buffr]** Open tab to the left of active; omnibar opens so you type a URL.  |
+| `<C-t>`     | `TabNewRight`               | Conventional-browser alternate for `o`.                                       |
+| `d`         | `TabClose`                  |                                                                               |
+| `<C-w>`     | `TabClose`                  | Deliberately a **leaf** — there are no `<C-w>X` prefix chords.                |
+| `u`         | `ReopenClosedTab`           | Stack-based: repeated `u` undoes successive closes.                           |
+| `<C-S-t>`   | `ReopenClosedTab`           | Conventional-browser alternate for `u`.                                       |
+| `<leader>p` | `PinTab`                    | Default leader is space, i.e. `<Space>p`.                                     |
+| `p`         | `PasteUrl { after: true }`  | Open the clipboard URL in a tab to the right. Non-URL clipboard = no-op.      |
+| `P`         | `PasteUrl { after: false }` | Same, to the left.                                                            |
+| `<C-S-h>`   | `MoveTabLeft`               | Shuffle the active tab one slot left.                                         |
+| `<C-S-l>`   | `MoveTabRight`              | Shuffle the active tab one slot right.                                        |
 
 `TabClose` (and `:q`) close the active tab. The application only exits when the
-last tab is gone. `DuplicateTab` clones the active tab's URL into a fresh tab;
-`PinTab` toggles the pinned bit (sort hint only — pin does not prevent close).
-See [`multi-tab.md`](./multi-tab.md).
+last tab is gone. `PinTab` toggles the pinned bit (pinned tabs sort to the front
+— pin does not prevent close). There is **no** `DuplicateTab` action. See
+[`multi-tab.md`](./multi-tab.md).
 
 ### History
 
@@ -96,16 +107,25 @@ See [`multi-tab.md`](./multi-tab.md).
 
 ### Reload / stop
 
-| Keys    | Action        | Notes                                                                |
-| ------- | ------------- | -------------------------------------------------------------------- |
-| `r`     | `Reload`      |                                                                      |
-| `R`     | `ReloadHard`  |                                                                      |
-| `<C-r>` | `ReloadHard`  |                                                                      |
-| `<C-c>` | `StopLoading` | **[buffr]** Vieb uses `<C-c>` for copyText; buffr keeps StopLoading. |
+| Keys    | Action       | Notes |
+| ------- | ------------ | ----- |
+| `r`     | `Reload`     |       |
+| `R`     | `ReloadHard` |       |
+| `<C-r>` | `ReloadHard` |       |
 
-> **Note:** `<Esc>` is no longer bound to `StopLoading` in Normal mode. Use
-> `<C-c>` to stop a page load. `<Esc>` is now `ExitInsertMode` — it blurs the
-> focused DOM element and resets the engine to Normal unconditionally.
+> **Note:** `<Esc>` is not bound to `StopLoading` in Normal mode; it is
+> `ExitInsertMode` — it blurs the focused DOM element and resets the engine to
+> Normal unconditionally.
+>
+> **`StopLoading` has no working default binding.** `DEFAULT_BINDINGS` lists
+> `<C-c>` twice in Normal mode — once as `StopLoading` and again, later, as
+> `YankUrl` — and the later row wins when the trie is built, so `<C-c>` yanks
+> the URL. Bind it yourself if you want it back:
+>
+> ```toml
+> [keymap.normal]
+> "<C-s>" = "stop_loading"
+> ```
 
 ### Omnibar / command line
 
@@ -134,19 +154,22 @@ See [`multi-tab.md`](./multi-tab.md).
 
 ### Yank
 
-| Keys | Action    |
-| ---- | --------- |
-| `y`  | `YankUrl` |
+| Keys    | Action    | Notes                                                        |
+| ------- | --------- | ------------------------------------------------------------ |
+| `y`     | `YankUrl` |                                                              |
+| `<C-c>` | `YankUrl` | Shadows the earlier `<C-c>` → `StopLoading` row (see above). |
 
 ### Zoom
 
-| Keys    | Action      | Notes                                                                                    |
-| ------- | ----------- | ---------------------------------------------------------------------------------------- |
-| `+`     | `ZoomIn`    |                                                                                          |
-| `-`     | `ZoomOut`   |                                                                                          |
-| `_`     | `ZoomOut`   |                                                                                          |
-| `=`     | `ZoomReset` | **[buffr]** Vieb maps `=` to zoomIn; buffr keeps `=` as ZoomReset (more useful default). |
-| `<C-0>` | `ZoomReset` |                                                                                          |
+| Keys    | Action      | Notes                                          |
+| ------- | ----------- | ---------------------------------------------- |
+| `+`     | `ZoomIn`    |                                                |
+| `=`     | `ZoomIn`    | Matches Chromium's `Ctrl+=` alias for zoom-in. |
+| `-`     | `ZoomOut`   |                                                |
+| `_`     | `ZoomOut`   |                                                |
+| `0`     | `ZoomReset` |                                                |
+| `)`     | `ZoomReset` |                                                |
+| `<C-0>` | `ZoomReset` | Vieb-style alias for the conventional chord.   |
 
 ### DevTools
 
@@ -165,6 +188,28 @@ See [`multi-tab.md`](./multi-tab.md).
 
 > `EnterInsertMode` remains in the action enum for advanced user config (e.g.
 > `[keymap.normal] "<F2>" = "enter_insert_mode"`) but is unbound by default.
+
+## Visual-mode bindings
+
+Visual mode is entered automatically by dragging with the left mouse button in
+the page area (more than a 4 px threshold); the embedded CEF view renders the
+selection itself. There is no key that enters Visual mode by default.
+
+| Keys    | Action              | Notes                                                      |
+| ------- | ------------------- | ---------------------------------------------------------- |
+| `y`     | `YankSelection`     | Copies the page selection via CEF's native `frame.copy()`. |
+| `<C-c>` | `YankSelection`     | Same.                                                      |
+| `<Esc>` | `EnterMode(Normal)` | Cancels without yanking.                                   |
+
+## Hint- and Command-mode bindings
+
+| Mode      | Keys    | Action              |
+| --------- | ------- | ------------------- |
+| `Hint`    | `<Esc>` | `EnterMode(Normal)` |
+| `Command` | `<Esc>` | `EnterMode(Normal)` |
+
+Every other keystroke in those modes is consumed by the hint filter or the input
+bar — see the overlay table below.
 
 ## Mode transitions
 
@@ -241,20 +286,22 @@ are skipped until those features land:
 
 | Vieb chord(s)           | Vieb action              | Reason not mapped                                                    |
 | ----------------------- | ------------------------ | -------------------------------------------------------------------- |
-| `p` / `P`               | openFromClipboard        | No `OpenFromClipboard` action                                        |
-| `v`                     | startVisualSelect        | Visual mode not yet wired                                            |
-| `<C-v>`                 | toVisualMode             | Visual mode not yet wired                                            |
+| `v`                     | startVisualSelect        | Visual mode is mouse-entered; no keyboard entry chord yet            |
+| `<C-v>`                 | toVisualMode             | Same                                                                 |
 | `<C-p>`                 | previousTab (pointer)    | Pointer mode not implemented                                         |
 | `<C-n>`                 | nextTab (pointer)        | Pointer mode not implemented                                         |
 | `m` / `M`               | setMark / restoreMark    | Marks not implemented                                                |
 | `<C-s>`                 | downloadLink             | No `DownloadLink` action                                             |
-| `<C-f>` (pointer)       | scrollPageDown (pointer) | Pointer mode not implemented                                         |
 | `s` / `S`               | toSearchMode (special)   | Covered by `/` / `?`                                                 |
 | `<C-a>` / `<C-x>`       | incrementUrl / decrement | No URL increment action                                              |
 | `<kPlus>` / `<kMinus>`  | zoomIn / zoomOut         | `kPlus`/`kMinus` not a named key in buffr parser; covered by `+`/`-` |
-| `<C-t>`                 | openNewTab               | No default binding; use `o`/`O` for adjacent-tab open.               |
-| `u`                     | reopenTab                | No `ReopenTab` action                                                |
-| `<C-Tab>` / `<C-S-Tab>` | nextTab / prevTab        | Covered by `J`/`K`                                                   |
+| `<C-Tab>` / `<C-S-Tab>` | nextTab / prevTab        | Covered by `H`/`L` and `gt`/`gT`                                     |
+
+Note that `p` / `P`, `u`, `<C-t>`, and `<C-f>` **are** bound — see the Tabs and
+Scroll tables above. Only their Vieb _semantics_ differ: buffr's `p`/`P` paste a
+clipboard URL into a new tab, `u` reopens the last closed tab, `<C-t>` opens a
+tab to the right, and `<C-f>` is a full-page scroll (Vieb's pointer-mode variant
+is what is unmapped).
 
 ## Customising
 

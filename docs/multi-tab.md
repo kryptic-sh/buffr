@@ -48,11 +48,11 @@ dispatches synthesized focus events internally when the host's focus bit flips.
 ## Session restore
 
 On startup `buffr` reads `~/.local/share/buffr/session.json` (resolved via
-`directories::ProjectDirs("sh", "kryptic", "buffr").data_dir()`). When the file
-exists, the first entry navigates the initial tab; the rest open in the
-background. CLI `--new-tab <url>` URLs append after the session list. Each entry
-is `{ url, pinned }`; the schema is versioned so a future format bump can ignore
-stale files.
+`hjkl_config::data_dir` — XDG on every platform, `buffr-debug` in debug builds).
+When the file exists, the first entry navigates the initial tab; the rest open
+in the background. CLI `--new-tab <url>` URLs append after the session list.
+Each entry is `{ url, pinned }`; the schema is versioned so a future format bump
+can ignore stale files.
 
 ```jsonc
 {
@@ -73,20 +73,20 @@ CEF. Schema version is printed on stderr for diagnostic clarity.
 
 On the very first launch, `session.json` does not exist. The runtime opens a
 single tab loading `general.homepage` from the user's TOML config (default
-`about:blank`).
+`buffr://new`).
 
 ### `:q` semantics
 
-`:q`, `:quit`, and `<C-w>c` all close the **active tab**. Only when the last tab
-is closed does the application exit. There is no separate "force-quit the whole
-app" command yet — close the OS window.
+`:q`, `:quit`, `d`, and `<C-w>` all close the **active tab**. Only when the last
+tab is closed does the application exit. There is no separate "force-quit the
+whole app" command yet — close the OS window.
 
 ## Pinned tabs
 
-Pinned tabs are marked with a leading `*` in the tab strip. The flag is purely
-informational today: pin does **not** prevent close, only signals sort order to
-chrome (the host stores tabs in user-visible order; pin-first sorting is left to
-the renderer).
+Pinned tabs are marked with a leading `*` in the tab strip and are toggled with
+`<leader>p` (a space plus `p` with the default leader). Pinning does **not**
+prevent close; it does reorder — `enforce_pinned_ordering` moves pinned tabs
+ahead of unpinned ones in the strip while keeping the active tab selected.
 
 ## Private mode
 

@@ -2,8 +2,9 @@
 
 Phase 3 of `PLAN.md` ships Vimium-style follow-by-letter-label hints: press `f`
 to enter hint mode, type a few letters, the matched element gets clicked. `F` is
-the background-tab variant — single-tab buffr falls back to a same-tab click
-with a `tracing::warn!` breadcrumb until the tab strip lands.
+the background-tab variant — it still commits as a same-tab click today and logs
+a `tracing::warn!` breadcrumb; routing the commit through `open_tab_background`
+is outstanding work.
 
 ## Architecture: DOM injection
 
@@ -14,10 +15,10 @@ page DOM. The host injects `crates/buffr-core/assets/hint.js` via
 matching elements, assigns sequential `data-buffr-hint-id` attributes, and
 renders an overlay div per target.
 
-This sidesteps the cross-process compositor work the OSR + wgpu path would have
-required. `docs/ui-stack.md` records that compositing overlays on top of CEF's
-surface is the trigger to migrate the chrome layer to OSR; we deferred that by
-punting the rendering into the page itself instead.
+This sidesteps compositing the labels ourselves. The chrome layer has since
+moved to OSR + `wgpu` (see [`ui-stack.md`](./ui-stack.md)), but the hints stayed
+in the page DOM: they need per-element geometry that the renderer already knows,
+and keeping them there costs no extra compositor work.
 
 ## IPC: console-log scraping (chosen)
 
@@ -27,8 +28,9 @@ The injected JS calls
     console.log("__buffr_hint__:" + JSON.stringify(payload))
 
 and `BuffrDisplayHandler::on_console_message` (in
-`crates/buffr-core/src/handlers.rs`) pattern-matches the sentinel, parses the
-JSON tail with `serde_json`, and writes into a one-slot `HintEventSink`
+`crates/buffr-cef/src/handlers.rs`) pattern-matches the sentinel via the shared
+`buffr_core::console_sentinel` helper, parses the JSON tail with `serde_json`,
+and writes into a one-slot `HintEventSink`
 (`Arc<Mutex<Option<HintConsoleEvent>>>`). The host drains the sink each tick
 from `BrowserHost::pump_hint_events`.
 
@@ -63,8 +65,8 @@ Every overlay carries the class `buffr-hint-overlay`. The injected
 `<style id="buffr-hint-style">` tag pins:
 
 - `position: fixed`
-- `z-index: 2147483647` (`HINT_OVERLAY_Z_INDEX`, max int32 — page stacking
-  contexts can't shadow the hints)
+- `z-index: 2147483647` (max int32 — page stacking contexts can't shadow the
+  hints); the literal lives in `crates/buffr-core/assets/hint.js`
 - vivid yellow background (`#FFD83A`), dark text, monospace 11px
 - `pointer-events: none` so the page below stays interactive
 - additional `buffr-hint-typed` (dimmed) and `buffr-hint-hidden` (display:none)

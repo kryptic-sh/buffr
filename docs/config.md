@@ -7,43 +7,74 @@ type. A copy-pasteable defaults-equivalent lives at
 
 ## File location
 
-| Platform | Path                                              |
-| -------- | ------------------------------------------------- |
-| Linux    | `$XDG_CONFIG_HOME/buffr/config.toml`              |
-| macOS    | `~/Library/Application Support/buffr/config.toml` |
-| Windows  | `%APPDATA%\buffr\config.toml`                     |
+buffr is **XDG-everywhere**: the same path on all three platforms.
 
-Path resolution goes through
-`directories::ProjectDirs::from("sh", "kryptic", "buffr")`. Override per-run
-with `--config <PATH>`.
+| Platform | Path                                                        |
+| -------- | ----------------------------------------------------------- |
+| Linux    | `$XDG_CONFIG_HOME/buffr/config.toml` (`~/.config/buffr/…`)  |
+| macOS    | `$XDG_CONFIG_HOME/buffr/config.toml` (`~/.config/buffr/…`)  |
+| Windows  | `%XDG_CONFIG_HOME%\buffr\config.toml` (`~\.config\buffr\…`) |
 
-## CLI flags
+Path resolution goes through `hjkl_config::config_path::<Config>()` (see
+`crates/buffr-config/src/loader.rs`). `$XDG_CONFIG_HOME` is honored on every
+platform; there is no `~/Library/Application Support` or `%APPDATA%` fallback,
+and buffr does **not** depend on the `directories` crate. Debug builds use
+`buffr-debug` instead of `buffr` as the directory name so a dev tree never
+shares state with an installed release.
+
+Sibling profile trees resolve the same way: data in `~/.local/share/buffr/`
+(`XDG_DATA_HOME`), CEF cache in `~/.cache/buffr/` (`XDG_CACHE_HOME`).
+
+Override the config file per-run with `--config <PATH>`.
+
+## Config-related CLI flags
+
+These are the flags that touch config specifically. They are **not** the full
+CLI surface — `buffr --help` lists ~30 flags (bookmark/history/download/zoom/
+permission dumps, `--private`, `--audit-keymap`, update flags, and so on).
 
 | Flag               | Effect                                                           |
 | ------------------ | ---------------------------------------------------------------- |
 | `--print-config`   | Print the resolved (defaults + user overrides) config; exit 0.   |
 | `--check-config`   | Validate the config file; exit non-zero on parse / schema error. |
-| `--config <PATH>`  | Override XDG-discovered config path.                             |
+| `--config <PATH>`  | Override the XDG-discovered config path.                         |
 | `--homepage <URL>` | Override `general.homepage` for this run only.                   |
+| `--engine <NAME>`  | Ignore `[engines]` and route every tab through `<NAME>` (`cef`). |
+| `--private`        | In-memory stores + throwaway CEF cache; forces telemetry off.    |
+| `--audit-keymap`   | Print every default-bound `PageAction` and its keys; exit 0.     |
 
 Both `--print-config` and `--check-config` short-circuit before CEF initializes,
 so they're safe to run on a headless host.
 
+> The flags above are parsed by the **browser** binary (`buffr-app`,
+> `apps/buffr-app/src/main.rs`). The `buffr` supervisor takes only
+> `--heartbeat-timeout`, `--heartbeat-disable`, and `--help`/`--version`;
+> everything else it forwards verbatim to the child, so `buffr --check-config`
+> works from the user's point of view.
+
 ## Schema
+
+The 13 sections below are the complete `Config` surface
+(`crates/buffr-config/src/lib.rs`).
 
 ### `[general]`
 
-| Key        | Type   | Default               | Notes                             |
-| ---------- | ------ | --------------------- | --------------------------------- |
-| `homepage` | string | `https://example.com` | Initial URL on first window.      |
-| `leader`   | string | `\`                   | Exactly one character. Validated. |
+| Key             | Type   | Default       | Notes                                                    |
+| --------------- | ------ | ------------- | -------------------------------------------------------- |
+| `homepage`      | string | `buffr://new` | Initial URL on first window.                             |
+| `leader`        | string | `" "` (space) | Exactly one character. Validated.                        |
+| `show_favicons` | bool   | `true`        | `false` skips favicon render **and** the CEF icon fetch. |
 
 ### `[startup]`
 
-| Key               | Type   | Default       | Notes                                   |
-| ----------------- | ------ | ------------- | --------------------------------------- |
-| `restore_session` | bool   | `false`       | Phase 5 work; parsed but no-op for now. |
-| `new_tab_url`     | string | `about:blank` | URL for `tab_new`.                      |
+Both keys are parsed and validated but **not read yet**: session restore is
+gated on `--no-restore` / `--private` / crash-loop detection only, and a new tab
+opens `general.homepage`.
+
+| Key               | Type   | Default       | Notes                    |
+| ----------------- | ------ | ------------- | ------------------------ |
+| `restore_session` | bool   | `false`       | Not consumed at runtime. |
+| `new_tab_url`     | string | `about:blank` | Not consumed at runtime. |
 
 ### `[search]`
 
@@ -74,17 +105,94 @@ across engines are rejected at config validation time.
 
 ### `[theme]`
 
-| Key      | Type   | Default   | Notes                               |
-| -------- | ------ | --------- | ----------------------------------- |
-| `accent` | string | `#7aa2f7` | Hex color used for the status line. |
-| `mode`   | enum   | `auto`    | `auto` \| `dark` \| `light`.        |
+Every colour is a 7-character `#RRGGBB` string. An unparseable value is a
+**hard** config error (`--check-config` exits non-zero) — it is no longer
+silently replaced by the built-in default.
+
+| Key             | Type   | Default   | Notes                                                                     |
+| --------------- | ------ | --------- | ------------------------------------------------------------------------- |
+| `accent`        | string | `#7aa2f7` | Statusline mode block, omnibar caret, hint labels, active tab.            |
+| `cert_secure`   | string | `#66e08a` | Secure cert indicator (lock dot, find counts).                            |
+| `cert_insecure` | string | `#e05a5a` | Insecure cert indicator.                                                  |
+| `private`       | string | `#ffc8c8` | `PRIVATE` marker on the statusline.                                       |
+| `progress`      | string | `#66c2ff` | Page-load progress bar.                                                   |
+| `update`        | string | `#e0c85a` | Update-available indicator (`* upd`).                                     |
+| `mode`          | enum   | `auto`    | `auto` \| `dark` \| `light`. Validated but not read yet.                  |
+| `high_contrast` | bool   | `false`   | Overrides every colour above; see [accessibility.md](./accessibility.md). |
 
 ### `[privacy]`
 
-| Key                | Type     | Default | Notes                                    |
-| ------------------ | -------- | ------- | ---------------------------------------- |
-| `enable_telemetry` | bool     | `false` | Reserved. buffr never sends telemetry.   |
-| `clear_on_exit`    | string[] | `[]`    | Phase 5+; e.g. `["cookies", "history"]`. |
+| Key                | Type     | Default                                      | Notes                                                                            |
+| ------------------ | -------- | -------------------------------------------- | -------------------------------------------------------------------------------- |
+| `enable_telemetry` | bool     | `false`                                      | Opt-in **local-only** counters. No network endpoint exists.                      |
+| `clear_on_exit`    | string[] | `[]`                                         | Any of `cookies`, `cache`, `history`, `bookmarks`, `downloads`, `local_storage`. |
+| `skip_schemes`     | string[] | `["about", "cef", "chrome", "data", "file"]` | URL schemes never recorded in history (case-insensitive).                        |
+
+### `[downloads]`
+
+| Key                  | Type  | Default | Notes                                                                                    |
+| -------------------- | ----- | ------- | ---------------------------------------------------------------------------------------- |
+| `default_dir`        | path? | _unset_ | Unset resolves at runtime: `dirs::download_dir()`, then `$HOME/Downloads`, then the cwd. |
+| `open_on_finish`     | bool  | `false` | Launch the file via `xdg-open` / `open` / `start` on completion.                         |
+| `ask_each_time`      | bool  | `false` | `true` shows the OS Save-As dialog and suppresses the notification strip.                |
+| `show_notifications` | bool  | `true`  | Chrome strip on download start/finish (2 s started, 4 s finished).                       |
+
+### `[hint]`
+
+| Key        | Type   | Default            | Notes                                                            |
+| ---------- | ------ | ------------------ | ---------------------------------------------------------------- |
+| `alphabet` | string | `asdfghjkl;weruio` | Label alphabet. Validated: non-empty, ASCII-only, no duplicates. |
+
+See [hint-mode.md](./hint-mode.md).
+
+### `[crash_reporter]`
+
+| Key                | Type | Default | Notes                                                                 |
+| ------------------ | ---- | ------- | --------------------------------------------------------------------- |
+| `enabled`          | bool | `false` | Opt-in Rust panic hook writing JSON under `<data>/crashes/`.          |
+| `purge_after_days` | u32  | `30`    | Cutoff for `--purge-crashes`. Must be `> 0`; `0` is rejected at load. |
+
+### `[updates]`
+
+| Key                    | Type   | Default            | Notes                                              |
+| ---------------------- | ------ | ------------------ | -------------------------------------------------- |
+| `enabled`              | bool   | `true`             | The only network request buffr makes by default.   |
+| `channel`              | string | `stable`           | `stable` \| `nightly`. Validated but not read yet. |
+| `check_interval_hours` | u32    | `24`               | Must be `> 0`.                                     |
+| `github_repo`          | string | `kryptic-sh/buffr` | `owner/repo` slug; shape-validated.                |
+
+See [updates.md](./updates.md).
+
+### `[accessibility]`
+
+| Key                            | Type | Default | Notes                                                         |
+| ------------------------------ | ---- | ------- | ------------------------------------------------------------- |
+| `force_renderer_accessibility` | bool | `false` | Passes `--force-renderer-accessibility` to the CEF renderers. |
+
+### `[engines]`
+
+| Key         | Type    | Default | Notes                                                           |
+| ----------- | ------- | ------- | --------------------------------------------------------------- |
+| `default`   | string  | `cef`   | Engine id used when no rule matches. Must name an instance.     |
+| `instances` | table[] | `[]`    | `[[engines.instances]]` — empty synthesises one `cef` instance. |
+| `rules`     | table[] | `[]`    | `[[engines.rules]]` — ordered; first host-glob match wins.      |
+
+```toml
+[engines]
+default = "cef"
+
+[[engines.instances]]
+id      = "cef"
+backend = "cef"
+# data_dir = "/tmp/cef-b-cache"   # parsed, but advisory only
+
+[[engines.rules]]
+match  = "*.figma.com"
+engine = "cef"
+```
+
+`backend` accepts only `"cef"` today. `--engine <NAME>` overrides the whole
+section for one run.
 
 ### `[keymap.<mode>]`
 
@@ -123,12 +231,11 @@ focused window. Backed by four platform implementations:
 - **Windows** — `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` on a worker
   thread.
 
-The inhibitor is acquired and released at runtime; no restart needed.
-
-> **Note (v0.3.0):** The JS→Rust read-back path for `__buffr_video_active` is
-> scaffolded but not yet wired end-to-end. The section parses and the inhibitor
-> plumbing compiles on all platforms, but the inhibitor will not activate until
-> the signal path lands in a future release.
+The inhibitor is acquired and released at runtime; no restart needed. The
+video/audio signal comes from the JS media probe (`__buffr_media__` console
+sentinel) plus CEF's audio callbacks, re-evaluated every frame in
+`about_to_wait`:
+`enabled && (video || (inhibit_audio_only && audio)) && (!require_focus || window_focused)`.
 
 | Key                  | Type | Default | Notes                                                                                                                                                                           |
 | -------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -158,6 +265,15 @@ config stays live.
   block.
 - `search.engines.<name>.prefix` (when set) must be non-empty and unique across
   all engines.
+- `hint.alphabet` must be non-empty, ASCII-only, duplicate-free, and at least
+  two characters.
+- All six `[theme]` colours must parse as `#RRGGBB`. A typo is a hard error — it
+  is no longer silently swapped for the built-in colour.
+- `crash_reporter.purge_after_days` must be `> 0`.
+- `updates.check_interval_hours` must be `> 0`; `updates.channel` must be
+  `stable` or `nightly`; `updates.github_repo` must be an `owner/repo` slug.
+- `engines.default` must be non-empty and name a declared (or synthesised)
+  instance; instance ids must be unique; every rule's `engine` must resolve.
 - Every keymap binding's key sequence must parse via the engine's `parse_keys`,
   and its action notation must match the table above.
 - Unknown top-level keys, unknown nested keys, and unknown enum variants all

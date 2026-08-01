@@ -26,26 +26,31 @@ From the workspace root:
 
 ```sh
 cargo xtask fetch-cef
-cargo run
+cargo build
+cargo run --bin buffr-app
 ```
 
 `cargo xtask fetch-cef` downloads the host CEF binary distribution and extracts
 it under `vendor/cef/macosarm64` on Apple Silicon or `vendor/cef/macosx64` on
 Intel Macs. `vendor/cef/` is intentionally gitignored.
 
-`cargo run` builds the default `buffr` binary, stages the CEF framework under
-`target/Frameworks/`, stages the CEF GPU support dylibs next to
-`target/debug/buffr`, and starts the browser. The macOS runtime uses CEF
-off-screen rendering (OSR), so page content and buffr's tabbar/statusbar are
-composited into the same `winit` window.
+Bare `cargo run` does not work — the workspace has three binaries (`buffr`,
+`buffr-app`, `buffr-helper`) and cargo cannot pick one.
+`cargo run --bin buffr-app` runs the browser directly; `cargo run --bin buffr`
+runs it under the crash-restart supervisor (build first so `buffr-app` sits next
+to it). The build stages the CEF framework under `target/Frameworks/` and the
+CEF GPU support dylibs next to the binary in `target/debug/`. The macOS runtime
+uses CEF off-screen rendering (OSR), so page content and buffr's
+tabbar/statusbar are composited into the same `winit` window.
 
 ## Runtime paths
 
-The normal dev run writes profile state to the standard macOS app directories:
+buffr is XDG-everywhere, so the dev run writes profile state to the same
+directories it uses on Linux (a debug build adds the `-debug` suffix):
 
 ```text
-~/Library/Caches/sh.kryptic.buffr/
-~/Library/Application Support/sh.kryptic.buffr/
+~/.cache/buffr-debug/
+~/.local/share/buffr-debug/
 ```
 
 That includes CEF cache data plus SQLite stores for history, bookmarks,
@@ -53,23 +58,23 @@ downloads, permissions, and zoom. Use `--private` for an in-memory/private data
 session:
 
 ```sh
-cargo run -- --private
+cargo run --bin buffr-app -- --private
 ```
 
 ## Useful commands
 
 ```sh
 # More startup detail.
-RUST_LOG=buffr=debug,buffr_core=debug cargo run
+RUST_LOG=buffr_app=debug,buffr_core=debug cargo run --bin buffr-app
 
 # Validate config without starting CEF.
-cargo run -- --check-config
+cargo run --bin buffr-app -- --check-config
 
 # Build the macOS app bundle under target/release/Buffr.app.
 cargo xtask bundle-macos --release
 ```
 
 The `.app` bundle path is still the right shape for packaging and signing. The
-plain `cargo run` path is for local development and uses explicit CEF settings
-so the loose binary can find the staged framework, resources, and subprocess
-path.
+loose `cargo run --bin …` path is for local development and uses explicit CEF
+settings so the loose binary can find the staged framework, resources, and
+subprocess path.

@@ -14,13 +14,13 @@ the [`cef`](https://crates.io/crates/cef) Rust crate. Vim keybindings powered by
 
 ## Status
 
-`0.1.0` — first tagged release. Multi-tab browsing; popup windows
-(`window.open`, OAuth) render in dedicated buffr windows with read-only address
-bars and preserve `window.opener`; `target="_blank"` and Ctrl+click open in
-tabs; two-finger horizontal swipe navigates browser history; vim modal engine
-(`hjkl 0.1.0`) wired for page-mode dispatch and insert-mode text editing;
-history / downloads / bookmarks / permissions / zoom data layers wired and
-persisted to SQLite. See [CHANGELOG.md](CHANGELOG.md).
+`0.14.6` — pre-1.0, tagged releases on every version bump. Multi-tab browsing;
+popup windows (`window.open`, OAuth) render in dedicated buffr windows with
+read-only address bars and preserve `window.opener`; `target="_blank"` and
+Ctrl+click open in tabs; two-finger horizontal swipe navigates browser history;
+vim modal engine (`hjkl-engine 0.5`) wired for page-mode dispatch and
+insert-mode text editing; history / downloads / bookmarks / permissions / zoom
+data layers wired and persisted to SQLite. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Supported platforms
 
@@ -50,24 +50,29 @@ is just absent from the release pipeline, not from the code.
 
 ## Apps
 
-| Binary         | Role                                                               |
-| -------------- | ------------------------------------------------------------------ |
-| `buffr`        | Main browser binary. Owns the winit window, CEF lifecycle, keymap. |
-| `buffr-helper` | CEF subprocess helper (renderer / GPU / utility processes).        |
+| Binary         | Role                                                                          |
+| -------------- | ----------------------------------------------------------------------------- |
+| `buffr`        | Supervisor / entrypoint. Spawns `buffr-app`, restarts it on crash or UI hang. |
+| `buffr-app`    | The browser itself. Owns the window, CEF lifecycle, chrome, keymap, stores.   |
+| `buffr-helper` | CEF subprocess helper (renderer / GPU / utility processes).                   |
 
 ## Crates
 
-| Crate               | Role                                                             |
-| ------------------- | ---------------------------------------------------------------- |
-| `buffr-core`        | CEF integration, `BrowserHost`, multi-tab host, OSR, IPC.        |
-| `buffr-modal`       | Vim page-mode FSM, keymap trie, `hjkl-engine` edit-mode bridge.  |
-| `buffr-ui`          | Statusline, tab strip, input bar, permission / confirm prompts.  |
-| `buffr-config`      | TOML config loader, validator, hot-reload watcher.               |
-| `buffr-history`     | SQLite-backed browsing history (frecency search).                |
-| `buffr-bookmarks`   | SQLite-backed bookmark store with tags + Netscape import.        |
-| `buffr-downloads`   | SQLite-backed download tracking; CEF handler integration.        |
-| `buffr-permissions` | SQLite-backed per-origin permission store (camera, mic, geo, …). |
-| `buffr-zoom`        | SQLite-backed per-domain zoom-level persistence.                 |
+| Crate               | Role                                                                |
+| ------------------- | ------------------------------------------------------------------- |
+| `buffr-engine`      | `BrowserEngine` trait, engine routing, internal `buffr://` server.  |
+| `buffr-cef`         | CEF integration: `BrowserHost`, multi-tab host, OSR, handlers, IPC. |
+| `buffr-core`        | Engine-agnostic core: hints, edit mode, updates, crash reporter, …  |
+| `buffr-modal`       | Vim page-mode FSM, keymap trie, `hjkl-engine` edit-mode bridge.     |
+| `buffr-ui`          | Statusline, tab strip, input bar, permission / confirm prompts.     |
+| `buffr-config`      | TOML config loader, validator, hot-reload watcher.                  |
+| `buffr-store`       | Shared SQLite open/tune + migration runner behind the five stores.  |
+| `buffr-history`     | SQLite-backed browsing history (frecency search).                   |
+| `buffr-bookmarks`   | SQLite-backed bookmark store with tags + Netscape import.           |
+| `buffr-downloads`   | SQLite-backed download tracking; CEF handler integration.           |
+| `buffr-permissions` | SQLite-backed per-origin permission store (camera, mic, geo, …).    |
+| `buffr-zoom`        | SQLite-backed per-domain zoom-level persistence.                    |
+| `buffr-view-source` | Syntax highlighting + HTML rendering for `buffr-src:` pages.        |
 
 Not yet published to crates.io — consume via path or git dep.
 
@@ -107,13 +112,17 @@ Pre-built packages on every tag, on the
 # Vendor the CEF binary distribution (~500 MB extracted).
 cargo xtask fetch-cef
 
-# Build the workspace.
+# Build the workspace. `default-members` covers all three binaries
+# (buffr, buffr-app, buffr-helper), which the next step needs.
 cargo build
 
-# Run (the workspace's default-members points at the real binary,
-# so bare `cargo run` works; use `-p buffr-bin` if you want to be
-# explicit).
-cargo run
+# Run. The workspace has three binaries, so bare `cargo run` is
+# ambiguous ("could not determine which binary to run") — name one.
+# `buffr` is the supervisor; it finds `buffr-app` next to itself.
+cargo run --bin buffr
+
+# Or skip supervision and run the browser directly:
+cargo run --bin buffr-app
 ```
 
 > **Heads-up:** `cargo install buffr` is **not** a supported install path. The

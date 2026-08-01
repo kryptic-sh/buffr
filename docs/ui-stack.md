@@ -21,11 +21,13 @@ batch of chrome — statusline today, tab strip + command line later in Phase 3.
   Pulls in `wgpu`, `naga`, shaders, plus the OSR plumbing the `osr` feature
   already scaffolds.
 
-## Decision — Option C with `wgpu` OSR on Linux and macOS
+## Decision — Option C, `wgpu` OSR on every platform
 
 CEF paints the page into an off-screen buffer, then the app composites that
 buffer plus the tab strip, overlays, and statusline into the same `winit` window
-with `wgpu`. Windows still uses the native child-window path for now.
+with `wgpu`. This is now the path on **all** platforms — `windowless_rendering`
+is enabled unconditionally and there is no native child-window mode left in the
+tree.
 
 Linux needs OSR because X11/XWayland child-window embedding is not supported.
 macOS also uses OSR because AppKit child views do not layer predictably with
@@ -40,11 +42,12 @@ land at a different origin than the chrome compositor.
   in z-order by the renderer.
 - CEF child-view geometry does not need platform-specific AppKit/X11 resizing.
 
-### Windowed Exception
+### Historical: the windowed exception
 
-Windows maps `RawWindowHandle::Win32(_)` to `HostMode::Windowed`. That path
-parents CEF as a native child window and calls `was_resized()` after winit
-resize events.
+Earlier revisions mapped `RawWindowHandle::Win32(_)` onto a `HostMode::Windowed`
+path that parented CEF as a native child window. That mode has been removed —
+`HostMode` no longer has a windowed variant and Windows composites through OSR
+like everything else.
 
 ## Layout
 

@@ -1,21 +1,39 @@
-# buffr configuration — copy to ~/.config/buffr/config.toml on Linux,
-# ~/Library/Application Support/buffr/config.toml on macOS, or
-# %APPDATA%\buffr\config.toml on Windows. Every key has a default;
-# omitted entries fall back to the values shown below.
+# buffr configuration — copy to ~/.config/buffr/config.toml.
+#
+# The path is XDG-everywhere: the SAME ~/.config/buffr/config.toml on
+# Linux, macOS, and Windows (resolution goes through
+# `hjkl_config::config_path`, not `directories`/`ProjectDirs`).
+# $XDG_CONFIG_HOME is honored on every platform. Debug builds read
+# ~/.config/buffr-debug/config.toml so dev runs don't trample release
+# state. Override per-run with `--config <PATH>`.
+#
+# Every key has a default; omitted entries fall back to the values
+# shown below, which ARE the built-in defaults unless a comment says
+# otherwise.
 
 [general]
 # Initial URL on first window when no session is restored.
-homepage = "https://example.com"
-# Single-character leader. Vim default is "\\". Engine validates this
-# is exactly one Unicode scalar value at startup; multi-char strings
-# are rejected with an error pointing at general.leader.
-leader = "\\"
+homepage = "buffr://new"
+# Single-character leader. Default is a single space (" "); vim's
+# traditional "\\" also works. The loader validates this is exactly
+# one Unicode scalar value at startup; multi-char strings are rejected
+# with an error pointing at general.leader.
+leader = " "
+# Render per-tab favicons. When false the tab strip skips favicon
+# rendering and the host suppresses the CEF favicon download.
+# `--private` also forces this off for the run.
+show_favicons = true
 
 [startup]
-# Reopen the previous session's tabs on launch. Phase 5 work — the
-# field is parsed but the session-store glue lands later.
+# NOTE: both keys below are parsed and validated but NOT yet read by
+# the browser. Session restore is currently gated on `--no-restore` /
+# `--private` / crash-loop detection only, and a new tab opens
+# `general.homepage`. Left in place so configs don't break when the
+# wiring lands.
+#
+# Reopen the previous session's tabs on launch.
 restore_session = false
-# URL the `t` (tab_new) action navigates to on a fresh tab.
+# URL a fresh tab navigates to.
 new_tab_url = "about:blank"
 
 [search]
@@ -33,13 +51,29 @@ url = "https://www.google.com/search?q={query}"
 prefix = "g"
 
 [theme]
-# Hex accent. Status line, omnibar caret, hint label background.
+# Every colour below must be a 7-character `#RRGGBB` string. An
+# unparseable value is a hard config error (`--check-config` exits
+# non-zero); it is no longer silently ignored.
+#
+# Base accent. Status line, omnibar caret, hint label background,
+# active-tab indicator.
 accent = "#7aa2f7"
-# auto | dark | light. `auto` follows the desktop's appearance hint.
+# Cert-state secure indicator (lock dot, find counts).
+cert_secure = "#66e08a"
+# Cert-state insecure indicator.
+cert_insecure = "#e05a5a"
+# PRIVATE marker on the right-hand statusline cell.
+private = "#ffc8c8"
+# Page-load progress bar at the top of the statusline.
+progress = "#66c2ff"
+# Update-available indicator (`* upd`).
+update = "#e0c85a"
+# auto | dark | light. Parsed and validated, but NOT yet read — the
+# palette builder ignores it today.
 mode = "auto"
 # Phase 6 a11y: switch chrome to a high-contrast palette
-# (white-on-black with a saturated yellow accent). See
-# `docs/accessibility.md` for the colour values.
+# (white-on-black with a saturated yellow accent). Overrides every
+# colour above. See `docs/accessibility.md` for the values.
 high_contrast = false
 
 [privacy]
@@ -87,9 +121,10 @@ skip_schemes = ["about", "cef", "chrome", "data", "file"]
 [downloads]
 # Directory downloads land in. If unset (the default), buffr resolves
 # at runtime in this order:
-#   1. directories::UserDirs::download_dir() (XDG_DOWNLOAD_DIR on
-#      Linux; ~/Downloads on macOS; %USERPROFILE%\Downloads on Windows)
-#   2. $HOME/Downloads as a last-resort fallback.
+#   1. dirs::download_dir() (XDG_DOWNLOAD_DIR on Linux; ~/Downloads on
+#      macOS; %USERPROFILE%\Downloads on Windows)
+#   2. $HOME/Downloads as a last-resort fallback
+#   3. the current working directory if even that is unavailable.
 # default_dir = "/home/me/Downloads"
 #
 # Open the file via the platform's launcher (xdg-open / open / start)
@@ -120,7 +155,8 @@ alphabet = "asdfghjkl;weruio"
 # configured — see `docs/privacy.md`.
 enabled = false
 # Cutoff for `--purge-crashes`. Reports older than this many days are
-# removed. Default 30.
+# removed. Default 30. Must be > 0 — `0` is rejected at load time
+# (it would make `--purge-crashes` delete every report).
 purge_after_days = 30
 
 [updates]
@@ -131,7 +167,8 @@ purge_after_days = 30
 # `docs/privacy.md` and `docs/updates.md`.
 enabled = true
 # `stable` (today) or `nightly` (reserved for the post-1.0 nightly
-# tag stream).
+# tag stream). Validated against that allow-list, but not yet read —
+# the checker always queries `/releases/latest`.
 channel = "stable"
 # Minimum hours between live `--check-for-updates` queries. Reads
 # inside the window come from the on-disk cache.
@@ -147,6 +184,55 @@ github_repo = "kryptic-sh/buffr"
 # building the tree adds a non-trivial per-frame cost; users with an
 # AT should turn it on. See `docs/accessibility.md`.
 force_renderer_accessibility = false
+
+[idle_inhibit]
+# Prevent the screen locking / blanking while a video signal is active
+# in the focused window. Backed by zwp_idle_inhibit_manager_v1
+# (Wayland), org.freedesktop.ScreenSaver (X11 D-Bus),
+# IOPMAssertionCreateWithName (macOS), and SetThreadExecutionState
+# (Windows).
+#
+# Master switch. `true` (the default) allows the inhibitor to be
+# acquired; `false` disables the feature entirely — no platform call
+# is ever made.
+enabled = true
+# When true, audio-only activity (no video) also holds the inhibitor.
+# Default false — music playback should not keep the screen on.
+inhibit_audio_only = false
+# When true (the default) the inhibitor is only held while the buffr
+# window has OS focus. Set false to inhibit in the background (PiP).
+require_focus = true
+
+# ----------------------------------------------------------------------
+# Engine routing
+# ----------------------------------------------------------------------
+#
+# `default` is the engine id used for every URL that does not match a
+# rule. `instances` registers the backends constructed at startup; when
+# it is EMPTY (the default) a single `{ id = "cef", backend = "cef" }`
+# instance is synthesised, so single-engine setups need nothing here.
+# `rules` is an ordered list — first match wins; `match` is a glob
+# tested case-insensitively against the URL host.
+#
+# Validation: `default` must be non-empty and must name a declared (or
+# synthesised) instance, instance ids must be unique, and every rule's
+# `engine` must resolve to an instance. `backend` accepts only "cef"
+# today. `data_dir` is parsed but advisory — CEF's cache path is
+# process-global.
+
+[engines]
+default = "cef"
+# instances = []   # default: empty -> synthesised `cef` instance
+# rules = []       # default: empty
+
+# [[engines.instances]]
+# id      = "cef"
+# backend = "cef"
+# data_dir = "/tmp/cef-b-cache"  # advisory only
+
+# [[engines.rules]]
+# match  = "*.figma.com"
+# engine = "cef"
 
 # ----------------------------------------------------------------------
 # Keymap overrides
@@ -165,6 +251,12 @@ force_renderer_accessibility = false
 # Every binding is validated at load time. An invalid action name or
 # unparseable key sequence aborts startup with a line/column-tagged
 # error.
+#
+# The block below is an EXAMPLE of overrides, not a copy of the
+# defaults — several rows here deliberately differ from the shipped
+# keymap (e.g. buffr's default `H`/`L` are tab prev/next and `o` opens
+# a new tab to the right). The authoritative default table is
+# `docs/keymap.md`, or run `buffr --audit-keymap`.
 
 [keymap.normal]
 "j" = "scroll_down"
@@ -187,6 +279,7 @@ force_renderer_accessibility = false
 "y" = "yank_url"
 
 [keymap.visual]
+"y" = "yank_selection"
 "<Esc>" = "enter_mode(\"normal\")"
 
 [keymap.command]

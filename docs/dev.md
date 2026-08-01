@@ -25,11 +25,12 @@ cd buffr
 # Drops files under `vendor/cef/<platform>/`.
 cargo xtask fetch-cef
 
-# Build the workspace.
+# Build the workspace (default-members builds all three binaries).
 cargo build
 
-# Run (supervisor spawns buffr-app automatically on Linux).
-cargo run
+# Run. Three binaries exist, so bare `cargo run` is ambiguous — name one.
+# `buffr` is the supervisor and spawns `buffr-app` from its own directory.
+cargo run --bin buffr
 ```
 
 `cargo xtask fetch-cef` accepts:
@@ -37,7 +38,9 @@ cargo run
 - `--platform <linux64 | macosarm64 | macosx64 | windows64>` — override the host
   detection (useful when cross-prepping).
 - `--version <X.Y>` — version prefix to match in the Spotify CDN (`index.json`).
-  Defaults to `147.` to track the `cef` crate.
+  Defaults to `CEF_VERSION_PREFIX` in `xtask/src/main.rs`, which must match the
+  libcef version the `cef` crate binds (crate `148.x` wraps libcef `147.0.14`,
+  so the prefix is `147.`).
 
 Override the CEF tree location with `CEF_PATH=...` (mirrors
 `tauri-apps/cef-rs`). When unset, `buffr-core/build.rs` falls back to
@@ -77,37 +80,25 @@ buffr/
 ## Running
 
 ```sh
-RUST_LOG=buffr=debug,buffr_core=debug cargo run
+RUST_LOG=buffr=debug,buffr_core=debug cargo run --bin buffr
 ```
 
 To run the browser directly (without supervision):
 
 ```sh
-RUST_LOG=buffr_app=debug,buffr_core=debug cargo run -p buffr-app
+RUST_LOG=buffr_app=debug,buffr_core=debug cargo run --bin buffr-app
 ```
 
 ### Wayland
 
-The default build embeds CEF as a windowed child of an X11 window — that's the
-only mode CEF supports on Linux. On Wayland sessions buffr forces winit's X11
-backend at startup (`EventLoopBuilderExtX11::with_x11()`), so the compositor
-transparently proxies the X11 traffic through XWayland.
+**Linux requires a Wayland session.** `buffr-app` checks `XDG_SESSION_TYPE` at
+startup — before CEF init or any window creation — and exits with a clear
+message when it is not `wayland`. X11/XWayland is not a supported target.
 
-This works on every major Wayland desktop that ships XWayland — GNOME, KDE,
-Sway, Hyprland — which is the default on essentially every distribution. Minimal
-compositors without XWayland (e.g. a stock `weston` build) won't work until
-native Wayland support lands.
-
-Native Wayland (no XWayland round-trip) is Phase 3 work, gated behind the `osr`
-feature:
-
-```sh
-# Currently panics at runtime — only compiles. Tracking issue: PLAN.md Phase 3.
-cargo run -p buffr-app --features osr
-```
-
-The OSR path will run CEF in windowless mode, blitting paint events onto a
-winit-owned Wayland surface via wgpu.
+The page is rendered off-screen (CEF windowless mode) and composited with the
+chrome into one window via `wgpu` on every platform; there is no XWayland
+round-trip and no CEF child window on Linux. See
+[`docs/ui-stack.md`](./ui-stack.md).
 
 ## macOS bundling
 
@@ -176,20 +167,28 @@ Full guide (layout, depends, glibc, sandbox caveats, signing TODO):
 ## Crash-restart supervisor
 
 `buffr` IS the supervisor — it spawns `buffr-app` (the browser binary) as a
-child process group, detects non-zero exit, and relaunches it with a 250 ms
-cooldown. After 3 crashes in 30 seconds it halts and points at
-`~/.local/share/buffr/crashes/`. Linux only in this release (Round 3/5 of #28).
+child process group, detects non-zero exit and UI hangs (via a heartbeat
+socket), and relaunches it with a 250 ms cooldown. After 3 crashes/hangs in 30
+seconds it halts and points at `~/.local/share/buffr/crashes/`. Unix and Windows
+both have supervisor implementations (the Windows half uses Job Objects and a
+named-pipe heartbeat).
+
+The heartbeat socket and the clean-shutdown flag live inside a private per-uid
+directory — `$XDG_RUNTIME_DIR/buffr`, else `$TMPDIR/buffr-<uid>` created `0700`
+and re-verified (owner + mode + not-a-symlink) after creation.
 
 ```sh
-# Default: supervisor auto-spawns buffr-app.
+# Default: supervisor auto-spawns buffr-app (found next to its own exe,
+# then on $PATH).
 ./buffr
 
 # Smoke-test the supervisor without a real browser binary:
 BUFFR_CHILD_BIN=/bin/true ./buffr
-```
 
-macOS and Windows still run `buffr-app` directly (supervision wires up in Rounds
-4-5).
+# Tune or disable the hang watchdog:
+./buffr --heartbeat-timeout 8
+./buffr --heartbeat-disable
+```
 
 ## Useful commands
 
@@ -201,39 +200,44 @@ cargo test --workspace
 
 ## Where things live
 
-| Concern                   | File                                |
-| ------------------------- | ----------------------------------- |
-| Subprocess dispatch       | `apps/buffr-app/src/main.rs::main`  |
-| `cef::App` impl           | `crates/buffr-core/src/app.rs`      |
-| Browser creation          | `crates/buffr-core/src/host.rs`     |
-| CEF callback handlers     | `crates/buffr-core/src/handlers.rs` |
-| CEF link + resource copy  | `crates/buffr-core/build.rs`        |
-| CEF download              | `xtask/src/main.rs::fetch_cef`      |
-| Page mode FSM             | `crates/buffr-modal/src/lib.rs`     |
-| `hjkl-engine` integration | `crates/buffr-modal/src/host.rs`    |
-| Statusline + bitmap font  | `crates/buffr-ui/src/lib.rs`        |
-| Find-in-page sink         | `crates/buffr-core/src/find.rs`     |
-| Config schema + loader    | `crates/buffr-config/src/lib.rs`    |
-| History store             | `crates/buffr-history/src/lib.rs`   |
-| Bookmarks store           | `crates/buffr-bookmarks/src/lib.rs` |
-| Downloads store           | `crates/buffr-downloads/src/lib.rs` |
+| Concern                   | File                                        |
+| ------------------------- | ------------------------------------------- |
+| Supervisor / restart loop | `apps/buffr/src/main.rs`                    |
+| Subprocess dispatch       | `apps/buffr-app/src/main.rs::main`          |
+| `cef::App` impl           | `crates/buffr-cef/src/app.rs`               |
+| Browser creation          | `crates/buffr-cef/src/host.rs`              |
+| CEF callback handlers     | `crates/buffr-cef/src/handlers.rs`          |
+| CEF link + resource copy  | `crates/buffr-cef/build.rs`                 |
+| CEF download              | `xtask/src/main.rs::fetch_cef`              |
+| Engine trait + routing    | `crates/buffr-engine/src/engine.rs`         |
+| Page mode FSM             | `crates/buffr-modal/src/lib.rs`             |
+| `hjkl-engine` integration | `crates/buffr-modal/src/edit_mode.rs`       |
+| Statusline + font         | `crates/buffr-ui/src/lib.rs`                |
+| Find-in-page sink         | `crates/buffr-core/src/find.rs`             |
+| Hint / edit console IPC   | `crates/buffr-core/src/console_sentinel.rs` |
+| Config schema + loader    | `crates/buffr-config/src/lib.rs`            |
+| Shared SQLite plumbing    | `crates/buffr-store/src/lib.rs`             |
+| History store             | `crates/buffr-history/src/lib.rs`           |
+| Bookmarks store           | `crates/buffr-bookmarks/src/lib.rs`         |
+| Downloads store           | `crates/buffr-downloads/src/lib.rs`         |
 
 ## UI
 
-Phase 3 chrome (statusline today; tab strip / command bar / hint mode later)
-lives in `crates/buffr-ui`. Rendering decisions are in
-[`docs/ui-stack.md`](./ui-stack.md): the page and chrome are composited into the
-buffr `winit` window on Linux/macOS, while Windows uses a native CEF child
-window for the page area. The 24-pixel statusline draws via a hand-rolled 6x10
-bitmap font in `crates/buffr-ui/src/font.rs`. Find-in-page is wired through
-`BrowserHost::start_find` / `stop_find`; a `--find <query>` CLI flag on
-`apps/buffr` exercises the round trip without a command bar (the Phase 3b
-dependency that blocks `Find { forward }` action UI).
+Chrome (statusline, tab strip, input bar, prompts) lives in `crates/buffr-ui`.
+Rendering decisions are in [`docs/ui-stack.md`](./ui-stack.md): CEF renders the
+page off-screen and the app composites page + chrome into one `winit` window
+with `wgpu` on every platform. The 24-pixel statusline rasterizes glyphs with
+`fontdue` at a fixed 15 px, with per-glyph advance widths
+(`crates/buffr-ui/src/font.rs`). Find-in-page is wired through
+`BrowserHost::start_find` / `stop_find`; the `--find <query>` flag on
+`buffr-app` exercises the round trip headlessly.
 
 ## Storage
 
-Per-user state buffr writes lives under `directories::ProjectDirs` resolution
-for `sh.kryptic.buffr`. On Linux that's:
+Per-user state resolves through `hjkl-config`'s XDG helpers — `$XDG_DATA_HOME`
+(default `~/.local/share`) and `$XDG_CACHE_HOME` (default `~/.cache`), with
+`buffr` as the directory name (`buffr-debug` in debug builds). The `directories`
+crate is not used:
 
 | Path                                       | Owner                                                           |
 | ------------------------------------------ | --------------------------------------------------------------- |
@@ -244,7 +248,8 @@ for `sh.kryptic.buffr`. On Linux that's:
 | `~/.local/share/buffr/zoom.sqlite`         | Per-site zoom levels (Phase 5, `buffr-zoom`).                   |
 | `~/.local/share/buffr/permissions.sqlite`  | Per-origin permission decisions (Phase 5, `buffr-permissions`). |
 | `~/.local/share/buffr/usage-counters.json` | Opt-in local telemetry counters (Phase 6; off by default).      |
-| `~/.local/share/buffr/crashes/`            | Opt-in panic reports (Phase 6; off by default).                 |
+| `~/.local/share/buffr/crashes/`            | Opt-in panic reports, `<stamp>_<seq>.json` (off by default).    |
+| `~/.local/share/buffr/update-cache.json`   | Cached GitHub release check (see `docs/updates.md`).            |
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
@@ -252,17 +257,18 @@ migrations are forward-only and recorded in a `schema_version` table; see
 [`crates/buffr-history/README.md`](../crates/buffr-history/README.md) for the
 schema and frecency formula.
 
-macOS uses `~/Library/Application Support/sh.kryptic.buffr/` and
-`~/Library/Caches/sh.kryptic.buffr/`; Windows uses
-`%APPDATA%\kryptic\buffr\data\` / `%LOCALAPPDATA%\kryptic\buffr\cache\`.
+macOS and Windows use the **same** XDG layout (`~/.local/share/buffr/`,
+`~/.cache/buffr/`) — there is no `~/Library/Application Support` or `%APPDATA%`
+special case, and `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` are honored everywhere.
 
 ## Config
 
-`buffr-config` reads `~/.config/buffr/config.toml` (or the OS-specific XDG
-equivalent). Schema reference: [`docs/config.md`](./config.md). A copy-pasteable
-defaults file ships at [`config.example.toml`](../config.example.toml) at the
-repo root — drop it into `$XDG_CONFIG_HOME/buffr/config.toml` to start
-customising.
+`buffr-config` reads `~/.config/buffr/config.toml` — the same path on Linux,
+macOS, and Windows, with `$XDG_CONFIG_HOME` honored everywhere (debug builds use
+`buffr-debug`). Schema reference: [`docs/config.md`](./config.md). A
+copy-pasteable defaults file ships at
+[`config.example.toml`](../config.example.toml) at the repo root — drop it into
+`$XDG_CONFIG_HOME/buffr/config.toml` to start customising.
 
 ```sh
 buffr --check-config            # validate ~/.config/buffr/config.toml

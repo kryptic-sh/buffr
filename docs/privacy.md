@@ -11,18 +11,17 @@ There is **one** network request buffr makes by default — see
 
 ## Update channel — one HTTP GET per day
 
-Default-on. `[updates] enabled = true` in the user config. buffr makes
-**one** HTTP GET per `check_interval_hours` (default 24 h) against
+Default-on. `[updates] enabled = true` in the user config. buffr makes **one**
+HTTP GET per `check_interval_hours` (default 24 h) against
 `https://api.github.com/repos/kryptic-sh/buffr/releases/latest`. The request
 carries no PII: only a `User-Agent: buffr/<version>` header (which GitHub
 mandates) and an `Accept: application/vnd.github+json` header. No cookies, no
 auth token, no telemetry payload. GitHub logs the request like any public API
 request (IP + timestamp); buffr does not run its own collector.
 
-To disable entirely, set `[updates] enabled = false` in `config.toml`. That
-path makes **zero** network calls — the `--check-for-updates` CLI flag
-short-circuits without opening a socket. See
-[Updates](./updates.md) for the full surface.
+To disable entirely, set `[updates] enabled = false` in `config.toml`. That path
+makes **zero** network calls — the `--check-for-updates` CLI flag short-circuits
+without opening a socket. See [Updates](./updates.md) for the full surface.
 
 ## Telemetry — opt-in usage counters
 
@@ -33,8 +32,9 @@ in. When enabled, buffr writes anonymous integer counters to:
 ~/.local/share/buffr/usage-counters.json
 ```
 
-(macOS: `~/Library/Application Support/sh.kryptic.buffr/usage-counters.json`;
-Windows: `%APPDATA%\kryptic\buffr\data\usage-counters.json`.)
+The data directory is XDG-everywhere — the same `~/.local/share/buffr/` on
+Linux, macOS, and Windows (`$XDG_DATA_HOME` is honored on every platform). Debug
+builds use `buffr-debug` instead of `buffr`.
 
 The file is pretty-printed JSON. After one app start it looks like:
 
@@ -81,16 +81,20 @@ panic-site location, and a `Backtrace::force_capture` (always on, regardless of
 `RUST_BACKTRACE`) and writes a JSON report to:
 
 ```
-~/.local/share/buffr/crashes/<RFC3339-timestamp>.json
+~/.local/share/buffr/crashes/<RFC3339-timestamp>_<seq>.json
 ```
 
-Filename pattern: `YYYY-MM-DDTHH-MM-SS.sssZ.json` (colons swapped for dashes so
-the path is portable to FAT/Windows).
+Filename pattern: `YYYY-MM-DDTHH-MM-SS.sssZ_<N>.json` — colons swapped for
+dashes so the path is portable to FAT/Windows, plus a process-wide counter. The
+timestamp is only millisecond-precise, so the counter (and an `O_EXCL`-style
+`create_new` open with retry) keeps two threads that unwind in the same
+millisecond from overwriting each other's report.
 
 CEF's `BrowserProcessHandler` does **not** expose an `on_uncaught_exception`
-callback in libcef-147 — the only `on_uncaught_exception` is on the renderer-
-process `RenderProcessHandler` and only fires for V8 exceptions (JavaScript
-errors). Native CEF crashes are caught by Chromium's internal crashpad/ breakpad
+callback in the libcef buffr links (`147.0.14`, via the `cef` crate `148.x`) —
+the only `on_uncaught_exception` is on the renderer- process
+`RenderProcessHandler` and only fires for V8 exceptions (JavaScript errors).
+Native CEF crashes are caught by Chromium's internal crashpad/ breakpad
 pipeline, which buffr does not currently configure (it requires a
 `crashpad_handler` binary plus a symbol-server URL — both Phase 7 work). Phase 6
 ships the panic-hook reporter only.

@@ -130,6 +130,22 @@ file all store the `buffr-src:` prefixed form uniformly.
 You can also type `buffr-src:https://example.com` directly in the omnibar to
 view source without using the menu.
 
+### What `buffr-src:` refuses to fetch
+
+The scheme handler runs in the **browser** process, outside Chromium's network
+stack, so it enforces its own allowlist before fetching:
+
+- The underlying URL must be `http:` or `https:`. Everything else (`file:`,
+  `data:`, `ftp:`, a nested `buffr-src:`, …) is refused.
+- Non-public destinations — loopback, link-local `169.254/16` (including the
+  cloud metadata endpoint), and RFC1918 ranges — are refused **unless** the page
+  that initiated the navigation is already on that same host. That keeps "view
+  source" working for buffr's own `buffr://` pages (served from `127.0.0.1`)
+  while stopping a public page from pivoting into your LAN.
+
+A rejected target still renders: you get an error page explaining which rule
+fired, not a silent failure.
+
 ## Known issues
 
 - **`PictureInPicture` no-ops on YouTube.** The item fires
