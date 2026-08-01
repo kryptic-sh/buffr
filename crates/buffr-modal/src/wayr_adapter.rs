@@ -19,6 +19,10 @@
 //!   surfaces xkbcommon's symbolic name (`"Escape"`, `"Return"`,
 //!   `"Tab"`, `"BackSpace"`, `"Up"`, `"F1"`, ...). We translate the
 //!   named keys vim notation has dedicated names for.
+//!   A named key that is itself a single printable codepoint (some
+//!   sources report the digit row that way) falls back to a `Char`
+//!   chord, and `"space"` / `" "` land on `Char(' ')` so a
+//!   `leader = ' '` binding matches.
 //! - [`wayr::Modifiers`] maps straight to our internal [`Modifiers`].
 //!   wayr's `logo` field becomes `SUPER`; `caps_lock` / `num_lock`
 //!   stay out of the chord (they're toggles, not modifiers in the
@@ -31,7 +35,8 @@
 //! the modifier state has shift held. This matches the winit adapter
 //! so the same keymap tables work under both backends.
 
-use crate::key::{Key, KeyChord, Modifiers, NamedKey};
+use crate::adapter::chord_from_parts;
+use crate::key::{KeyChord, Modifiers};
 use wayr::{KeyCode as WKey, KeyEvent, KeyState, Modifiers as WMods};
 
 /// Convert a wayr `KeyEvent` into a [`KeyChord`]. Returns `None` for
@@ -58,64 +63,21 @@ pub fn key_event_to_chord_with_repeat(event: &KeyEvent) -> Option<KeyChord> {
 }
 
 fn chord_from_event(event: &KeyEvent) -> Option<KeyChord> {
-    let mods = modifiers_to_internal(event.modifiers);
-
-    // Prefer the layout-composed text — matches the winit adapter's
-    // "logical_key" behaviour where Shift+j arrives as "J". wayr
-    // (≥ 0.1.2) filters ASCII control characters out of `text` at
-    // the source, so anything we see here is a printable scalar
-    // (or a multi-codepoint composition string we drop below).
-    if let Some(text) = event.text.as_deref()
-        && !text.is_empty()
-    {
-        let mut chars = text.chars();
-        let first = chars.next()?;
-        if chars.next().is_some() {
-            // Multi-codepoint composition — IME path's job.
-            return None;
-        }
-        let mut effective = mods;
-        let mut ch = first;
-        // Drop SHIFT when the layout has already baked it into a
-        // non-alphabetic glyph (`+` from Shift+=, `!` from Shift+1).
-        // Alphabetic stays untouched so `Shift+a` → `(SHIFT, 'A')`
-        // matches the parser's canonical form.
-        if effective.contains(Modifiers::SHIFT) && first.is_ascii() && !first.is_ascii_alphabetic()
-        {
-            effective.remove(Modifiers::SHIFT);
-        }
-        // Ctrl+letter is case-insensitive in the parser (`<C-h>` and
-        // `<C-H>` both produce `(CTRL, 'h')`), so normalize alphabetic
-        // chars to lowercase under CTRL.
-        if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-            ch = ch.to_ascii_lowercase();
-        }
-        return Some(KeyChord {
-            modifiers: effective,
-            key: Key::Char(ch),
-        });
-    }
-
-    // Named-key path. Used when `text` is absent — including the
-    // control-key family (Return, BackSpace, Tab, Escape, Delete, …)
-    // that wayr's source-side filter routes here instead of through
-    // `text`.
-    if let WKey::Named(name) = &event.key_code {
-        // Space comes through as text " " in practice — this branch
-        // catches the rare "space without text" edge case.
-        if name == "space" {
-            return Some(KeyChord {
-                modifiers: mods,
-                key: Key::Char(' '),
-            });
-        }
-        let mapped = map_named(name)?;
-        return Some(KeyChord {
-            modifiers: mods,
-            key: Key::Named(mapped),
-        });
-    }
-    None
+    // Both inputs go to the shared translator: prefer the
+    // layout-composed text (matches the winit adapter's `logical_key`
+    // behaviour where Shift+j arrives as "J"; wayr ≥ 0.1.2 filters
+    // ASCII control characters out at the source), falling back to
+    // the xkb keysym name for the control-key family (Return,
+    // BackSpace, Tab, Escape, Delete, …).
+    let named = match &event.key_code {
+        WKey::Named(name) => Some(name.as_str()),
+        _ => None,
+    };
+    chord_from_parts(
+        event.text.as_deref(),
+        named,
+        modifiers_to_internal(event.modifiers),
+    )
 }
 
 fn modifiers_to_internal(m: WMods) -> Modifiers {
@@ -135,105 +97,24 @@ fn modifiers_to_internal(m: WMods) -> Modifiers {
     out
 }
 
-/// Map an xkbcommon keysym name to our [`NamedKey`]. The names come
-/// from `/usr/include/X11/keysymdef.h` (the canonical xkb keysym
-/// table). Anything outside the vim-notation set returns `None`.
-fn map_named(name: &str) -> Option<NamedKey> {
-    Some(match name {
-        "Escape" => NamedKey::Esc,
-        "Return" | "KP_Enter" => NamedKey::CR,
-        "Tab" | "ISO_Left_Tab" => NamedKey::Tab,
-        "BackSpace" => NamedKey::BS,
-        "space" => NamedKey::Space,
-        "Up" => NamedKey::Up,
-        "Down" => NamedKey::Down,
-        "Left" => NamedKey::Left,
-        "Right" => NamedKey::Right,
-        "Home" => NamedKey::Home,
-        "End" => NamedKey::End,
-        "Prior" | "Page_Up" => NamedKey::PageUp,
-        "Next" | "Page_Down" => NamedKey::PageDown,
-        "Insert" => NamedKey::Insert,
-        "Delete" => NamedKey::Delete,
-        "F1" => NamedKey::F(1),
-        "F2" => NamedKey::F(2),
-        "F3" => NamedKey::F(3),
-        "F4" => NamedKey::F(4),
-        "F5" => NamedKey::F(5),
-        "F6" => NamedKey::F(6),
-        "F7" => NamedKey::F(7),
-        "F8" => NamedKey::F(8),
-        "F9" => NamedKey::F(9),
-        "F10" => NamedKey::F(10),
-        "F11" => NamedKey::F(11),
-        "F12" => NamedKey::F(12),
-        _ => return None,
-    })
-}
-
-/// Internal testing seam: do the chord translation without
-/// constructing a full [`wayr::KeyEvent`] (which is `#[non_exhaustive]`
-/// and can't be built outside the wayr crate). Mirrors the
-/// `translate_key_test_only` helper in `winit_adapter`.
-///
-/// Reproduces the exact branching of [`chord_from_event`] modulo the
-/// state / repeat gating that the public entry points enforce.
-#[cfg(test)]
-fn translate_test_only(
-    text: Option<&str>,
-    named: Option<&str>,
-    modifiers: WMods,
-) -> Option<KeyChord> {
-    let mods = modifiers_to_internal(modifiers);
-    // Test seam: wayr ≥ 0.1.2 strips ASCII control text at the
-    // source, so the regression tests below pass `text = None` for
-    // Return / BackSpace / Tab / Escape / Delete and exercise the
-    // named-key fallback path.
-    if let Some(text) = text
-        && !text.is_empty()
-    {
-        let mut chars = text.chars();
-        let first = chars.next()?;
-        if chars.next().is_some() {
-            return None;
-        }
-        let mut effective = mods;
-        let mut ch = first;
-        if effective.contains(Modifiers::SHIFT) && first.is_ascii() && !first.is_ascii_alphabetic()
-        {
-            effective.remove(Modifiers::SHIFT);
-        }
-        if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-            ch = ch.to_ascii_lowercase();
-        }
-        return Some(KeyChord {
-            modifiers: effective,
-            key: Key::Char(ch),
-        });
-    }
-    if let Some(name) = named {
-        if name == "space" {
-            return Some(KeyChord {
-                modifiers: mods,
-                key: Key::Char(' '),
-            });
-        }
-        let mapped = map_named(name)?;
-        return Some(KeyChord {
-            modifiers: mods,
-            key: Key::Named(mapped),
-        });
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::key::{Key, NamedKey};
     use wayr::Modifiers as WMods;
 
+    /// Test seam: `wayr::KeyEvent` is `#[non_exhaustive]` and can't be
+    /// built outside the wayr crate, so tests drive the *production*
+    /// translator [`chord_from_parts`] with the same three inputs
+    /// [`chord_from_event`] extracts from an event. Only the
+    /// state / repeat gating of the public entry points is skipped.
+    ///
+    /// wayr ≥ 0.1.2 strips ASCII control text at the source, so the
+    /// regression tests below pass `text = None` for Return /
+    /// BackSpace / Tab / Escape / Delete and exercise the named-key
+    /// fallback path.
     fn mk(text: Option<&str>, named: Option<&str>, mods: WMods) -> Option<KeyChord> {
-        translate_test_only(text, named, mods)
+        chord_from_parts(text, named, modifiers_to_internal(mods))
     }
 
     #[test]

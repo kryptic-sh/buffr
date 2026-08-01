@@ -273,6 +273,13 @@ impl Engine {
     /// Tick — fire the longest-prefix action when the ambiguity
     /// timeout has elapsed. Returns `Some(action)` if an action
     /// fired; the engine is reset.
+    ///
+    /// The pending buffer is *always* flushed once the timeout has
+    /// elapsed, even when no prefix of it carries an action (a "pure
+    /// prefix" like `g` in `gg`/`gt`/`gi`). Vim does the same at
+    /// `timeoutlen`: an abandoned prefix is dropped, so the next
+    /// keystroke starts a fresh sequence instead of being swallowed
+    /// as `[g, j]` → `NoMatch`.
     pub fn tick(&mut self, now: Duration) -> Option<PageAction> {
         let started = self.pending_started?;
         if now < started + self.timeout {
@@ -281,8 +288,15 @@ impl Engine {
         let action = self
             .keymap
             .resolve_timeout(self.mode, &self.pending)
-            .cloned()?;
-        Some(self.finalise_action(action))
+            .cloned();
+        match action {
+            // `finalise_action` resets the pending state itself.
+            Some(action) => Some(self.finalise_action(action)),
+            None => {
+                self.reset_pending();
+                None
+            }
+        }
     }
 
     /// Insert-mode key path. Returns a stub today — once
@@ -463,6 +477,35 @@ mod tests {
         assert_eq!(r, Step::Pending);
         let r2 = e.feed(parse_key("c").unwrap(), t(50));
         assert_eq!(r2, Step::Resolved(PageAction::TabClose));
+    }
+
+    #[test]
+    fn abandoned_pure_prefix_flushes_at_timeout() {
+        // Regression (H11): `g` is a *pure* prefix under the shipped
+        // defaults (`gg`, `gt`, `gT`, `gi` — no action on `g` itself),
+        // so `resolve_timeout` yields nothing. `tick` must still drop
+        // the stale prefix, otherwise the next `j` looks up `[g, j]`,
+        // gets NoMatch and the page never scrolls.
+        let mut e = engine_with(&[
+            (PageMode::Normal, "gg", PageAction::ScrollTop),
+            (PageMode::Normal, "gt", PageAction::TabNext),
+            (PageMode::Normal, "gT", PageAction::TabPrev),
+            (PageMode::Normal, "j", PageAction::ScrollDown(1)),
+        ]);
+        let r = e.feed(parse_key("g").unwrap(), t(0));
+        assert_eq!(r, Step::Pending);
+        // Before the timeout the prefix is still live.
+        assert_eq!(e.tick(t(500)), None);
+        assert_eq!(e.pending().len(), 1);
+        // After the timeout: no action fires, but the buffer is flushed.
+        assert_eq!(e.tick(t(2000)), None);
+        assert!(
+            e.pending().is_empty(),
+            "abandoned prefix must be cleared at timeout"
+        );
+        // …so the next keystroke resolves on its own.
+        let r2 = e.feed(parse_key("j").unwrap(), t(2001));
+        assert_eq!(r2, Step::Resolved(PageAction::ScrollDown(1)));
     }
 
     #[test]

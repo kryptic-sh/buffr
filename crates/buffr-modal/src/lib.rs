@@ -20,6 +20,11 @@
 //! - [`host`] — [`BuffrHost`] adapter implementing
 //!   `hjkl_engine::Host`
 
+/// Chord-normalisation helpers shared by the platform key adapters
+/// below. Private: adapters are the public surface.
+#[cfg(any(feature = "winit", feature = "wayr", feature = "bridge"))]
+mod adapter;
+
 pub mod actions;
 pub mod edit_mode;
 pub mod engine;

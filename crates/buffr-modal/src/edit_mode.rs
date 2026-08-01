@@ -19,14 +19,23 @@ use std::sync::Arc;
 ///
 /// Uses the crossterm-free `feed_input` path so the engine and buffr
 /// can carry different crossterm major versions without a type mismatch.
-fn key_event_to_planned(key: KeyEvent) -> PlannedInput {
+///
+/// Returns `None` for key codes the engine has no representation for
+/// (`Menu`, `Media(..)`, `Null`, `CapsLock` / `ScrollLock` / … ,
+/// modifier-only events).
+/// These must **not** be folded onto some arbitrary live
+/// [`SpecialKey`]: the vim FSM acts on every variant it models, so
+/// e.g. mapping them to `Insert` would silently toggle insert/replace
+/// mode while the user edits a form field. Callers treat `None` as
+/// "not consumed" and let the page see the key.
+fn key_event_to_planned(key: KeyEvent) -> Option<PlannedInput> {
     let mods = Modifiers {
         ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
         shift: key.modifiers.contains(KeyModifiers::SHIFT),
         alt: key.modifiers.contains(KeyModifiers::ALT),
         super_: key.modifiers.contains(KeyModifiers::SUPER),
     };
-    match key.code {
+    Some(match key.code {
         KeyCode::Char(c) => PlannedInput::Char(c, mods),
         KeyCode::Esc => PlannedInput::Key(SpecialKey::Esc, mods),
         KeyCode::Enter => PlannedInput::Key(SpecialKey::Enter, mods),
@@ -44,10 +53,9 @@ fn key_event_to_planned(key: KeyEvent) -> PlannedInput {
         KeyCode::Insert => PlannedInput::Key(SpecialKey::Insert, mods),
         KeyCode::Delete => PlannedInput::Key(SpecialKey::Delete, mods),
         KeyCode::F(n) => PlannedInput::Key(SpecialKey::F(n), mods),
-        // Anything else the engine can't model — treat as consumed no-op
-        // by wrapping a Null-equivalent char that the FSM ignores.
-        _ => PlannedInput::Key(SpecialKey::Insert, mods),
-    }
+        // Anything else the engine can't model: no input at all.
+        _ => return None,
+    })
 }
 
 /// One active edit-mode session bound to a single text field.
@@ -79,9 +87,13 @@ impl EditSession {
 
     /// Feed one keystroke. Returns `true` when the keystroke was
     /// consumed by the engine; `false` means the caller should let
-    /// the page see it (`<Esc>` in normal mode, etc.).
+    /// the page see it (`<Esc>` in normal mode, keys the engine has
+    /// no representation for, etc.).
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        self.editor.feed_input(key_event_to_planned(key))
+        match key_event_to_planned(key) {
+            Some(input) => self.editor.feed_input(input),
+            None => false,
+        }
     }
 
     /// Feed a [`hjkl_engine::PlannedInput`] directly. Bypasses the
@@ -236,6 +248,41 @@ mod tests {
             "expected content to start with 'Hi', got {:?}",
             s.content()
         );
+    }
+
+    #[test]
+    fn unmapped_keys_are_inert_and_not_consumed() {
+        // Regression (M37): keys crossterm models but we don't used to
+        // be folded onto `SpecialKey::Insert`, which the vim FSM acts
+        // on — pressing e.g. the Menu key while typing in a form field
+        // toggled insert/replace mode. They must now be dropped
+        // entirely, and reported as *not* consumed so the page sees
+        // them.
+        for code in [
+            KeyCode::Menu,
+            KeyCode::Null,
+            KeyCode::CapsLock,
+            KeyCode::ScrollLock,
+            KeyCode::PrintScreen,
+            KeyCode::Media(crossterm::event::MediaKeyCode::Play),
+            KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+        ] {
+            assert!(
+                key_event_to_planned(KeyEvent::new(code, KeyModifiers::NONE)).is_none(),
+                "{code:?} must not map to a PlannedInput"
+            );
+
+            let mut s = EditSession::new("abc");
+            s.type_char('i');
+            assert_eq!(s.vim_mode(), VimMode::Insert);
+            assert!(!s.press(code), "{code:?} must be reported as not consumed");
+            assert_eq!(
+                s.vim_mode(),
+                VimMode::Insert,
+                "{code:?} must not change the vim mode"
+            );
+            assert_eq!(s.content(), EditSession::new("abc").content());
+        }
     }
 
     #[test]

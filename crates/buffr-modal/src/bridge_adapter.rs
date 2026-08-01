@@ -7,10 +7,13 @@
 //! `wayland-client`'s pkg-config probe fails) can still translate key
 //! events into the modal `KeyChord` representation.
 //!
-//! The mapping logic is identical in semantics to [`crate::wayr_adapter`].
-//! Only the source struct is owned here.
+//! The mapping logic is literally the same code as
+//! [`crate::wayr_adapter`]'s — both peel their source event down to
+//! `(text, named, modifiers)` and hand it to the shared translator in
+//! `crate::adapter`. Only the source struct is owned here.
 
-use crate::key::{Key, KeyChord, Modifiers, NamedKey};
+use crate::adapter::chord_from_parts;
+use crate::key::{KeyChord, Modifiers};
 
 // ── Bridge types (mirror wayr::keyboard) ────────────────────────────────────
 
@@ -82,7 +85,7 @@ impl KeyEvent {
     }
 }
 
-// ── Chord translation (mirrors wayr_adapter::chord_from_event) ─────────────
+// ── Chord translation (shared with wayr_adapter) ───────────────────────────
 
 /// Convert a bridge `KeyEvent` into a [`KeyChord`]. Returns `None` for
 /// releases, repeats, and anything outside the chord set we route
@@ -109,72 +112,15 @@ pub fn key_event_to_chord_with_repeat(event: &KeyEvent) -> Option<KeyChord> {
 }
 
 fn chord_from_event(event: &KeyEvent) -> Option<KeyChord> {
-    let mods = modifiers_to_internal(event.modifiers);
-
-    if let Some(text) = event.text.as_deref()
-        && !text.is_empty()
-    {
-        let mut chars = text.chars();
-        let first = chars.next()?;
-        if chars.next().is_some() {
-            return None;
-        }
-        let mut effective = mods;
-        let mut ch = first;
-        if effective.contains(Modifiers::SHIFT) && first.is_ascii() && !first.is_ascii_alphabetic()
-        {
-            effective.remove(Modifiers::SHIFT);
-        }
-        if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-            ch = ch.to_ascii_lowercase();
-        }
-        return Some(KeyChord {
-            modifiers: effective,
-            key: Key::Char(ch),
-        });
-    }
-
-    if let KeyCode::Named(name) = &event.key_code {
-        if name == "space" || name == " " {
-            return Some(KeyChord {
-                modifiers: mods,
-                key: Key::Char(' '),
-            });
-        }
-        if let Some(mapped) = map_named(name) {
-            return Some(KeyChord {
-                modifiers: mods,
-                key: Key::Named(mapped),
-            });
-        }
-        // Defense-in-depth: winit stuffs `logical_key.Character("0")`
-        // into `KeyCode::Named("0")` (the bridge KeyCode enum has no
-        // Char variant). If `text` was empty and the named-key table
-        // doesn't recognise the name, fall back to treating a single
-        // printable codepoint as a Char chord. Matches the vim
-        // bindings on the digit / punctuation rows (`0`, `-`, `=`).
-        let mut chars = name.chars();
-        if let (Some(first), None) = (chars.next(), chars.next())
-            && !first.is_ascii_control()
-        {
-            let mut effective = mods;
-            let mut ch = first;
-            if effective.contains(Modifiers::SHIFT)
-                && first.is_ascii()
-                && !first.is_ascii_alphabetic()
-            {
-                effective.remove(Modifiers::SHIFT);
-            }
-            if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-                ch = ch.to_ascii_lowercase();
-            }
-            return Some(KeyChord {
-                modifiers: effective,
-                key: Key::Char(ch),
-            });
-        }
-    }
-    None
+    let named = match &event.key_code {
+        KeyCode::Named(name) => Some(name.as_str()),
+        KeyCode::Sym(_) => None,
+    };
+    chord_from_parts(
+        event.text.as_deref(),
+        named,
+        modifiers_to_internal(event.modifiers),
+    )
 }
 
 fn modifiers_to_internal(m: BridgeModifiers) -> Modifiers {
@@ -194,35 +140,163 @@ fn modifiers_to_internal(m: BridgeModifiers) -> Modifiers {
     out
 }
 
-fn map_named(name: &str) -> Option<NamedKey> {
-    Some(match name {
-        "Escape" => NamedKey::Esc,
-        "Return" | "KP_Enter" => NamedKey::CR,
-        "Tab" | "ISO_Left_Tab" => NamedKey::Tab,
-        "BackSpace" => NamedKey::BS,
-        "space" => NamedKey::Space,
-        "Up" => NamedKey::Up,
-        "Down" => NamedKey::Down,
-        "Left" => NamedKey::Left,
-        "Right" => NamedKey::Right,
-        "Home" => NamedKey::Home,
-        "End" => NamedKey::End,
-        "Prior" | "Page_Up" => NamedKey::PageUp,
-        "Next" | "Page_Down" => NamedKey::PageDown,
-        "Insert" => NamedKey::Insert,
-        "Delete" => NamedKey::Delete,
-        "F1" => NamedKey::F(1),
-        "F2" => NamedKey::F(2),
-        "F3" => NamedKey::F(3),
-        "F4" => NamedKey::F(4),
-        "F5" => NamedKey::F(5),
-        "F6" => NamedKey::F(6),
-        "F7" => NamedKey::F(7),
-        "F8" => NamedKey::F(8),
-        "F9" => NamedKey::F(9),
-        "F10" => NamedKey::F(10),
-        "F11" => NamedKey::F(11),
-        "F12" => NamedKey::F(12),
-        _ => return None,
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key::{Key, NamedKey};
+
+    fn ev(text: Option<&str>, named: &str, mods: BridgeModifiers) -> KeyEvent {
+        KeyEvent::new(
+            ScanCode(0),
+            KeyCode::Named(named.to_string()),
+            mods,
+            KeyState::Pressed,
+            text.map(str::to_string),
+            false,
+        )
+    }
+
+    #[test]
+    fn plain_j_via_text() {
+        let chord = key_event_to_chord(&ev(Some("j"), "j", BridgeModifiers::default())).unwrap();
+        assert_eq!(chord.key, Key::Char('j'));
+        assert!(chord.modifiers.is_empty());
+    }
+
+    #[test]
+    fn shift_j_carries_uppercase_and_shift_flag() {
+        let mods = BridgeModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let chord = key_event_to_chord(&ev(Some("J"), "J", mods)).unwrap();
+        assert_eq!(chord.key, Key::Char('J'));
+        assert!(chord.modifiers.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn shift_plus_drops_shift_modifier() {
+        // `+` is the shifted form of `=` on US — the parser writes `+`
+        // directly without `<S->`, so the adapter must shed SHIFT.
+        let mods = BridgeModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let chord = key_event_to_chord(&ev(Some("+"), "plus", mods)).unwrap();
+        assert_eq!(chord.key, Key::Char('+'));
+        assert!(!chord.modifiers.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn ctrl_shift_h_normalizes_to_lowercase() {
+        let mods = BridgeModifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let chord = key_event_to_chord(&ev(Some("H"), "H", mods)).unwrap();
+        assert_eq!(chord.key, Key::Char('h'));
+        assert!(chord.modifiers.contains(Modifiers::CTRL));
+        assert!(chord.modifiers.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn named_keys_map_without_text() {
+        for (name, expect) in [
+            ("Escape", NamedKey::Esc),
+            ("Return", NamedKey::CR),
+            ("BackSpace", NamedKey::BS),
+            ("Tab", NamedKey::Tab),
+            ("Delete", NamedKey::Delete),
+            ("Prior", NamedKey::PageUp),
+            ("F7", NamedKey::F(7)),
+        ] {
+            let chord = key_event_to_chord(&ev(None, name, BridgeModifiers::default())).unwrap();
+            assert_eq!(chord.key, Key::Named(expect), "{name}");
+        }
+    }
+
+    #[test]
+    fn space_alias_lands_on_char_space() {
+        for name in ["space", " "] {
+            let chord = key_event_to_chord(&ev(None, name, BridgeModifiers::default())).unwrap();
+            assert_eq!(chord.key, Key::Char(' '), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn single_printable_named_falls_back_to_char() {
+        // winit stuffs `logical_key.Character("0")` into
+        // `KeyCode::Named("0")`; the digit / punctuation rows must
+        // still reach the trie.
+        for ch in ['0', '-', '='] {
+            let chord =
+                key_event_to_chord(&ev(None, &ch.to_string(), BridgeModifiers::default())).unwrap();
+            assert_eq!(chord.key, Key::Char(ch));
+        }
+    }
+
+    #[test]
+    fn modifiers_map_across_the_board() {
+        let mods = BridgeModifiers {
+            ctrl: true,
+            alt: true,
+            logo: true,
+            caps_lock: true,
+            num_lock: true,
+            ..Default::default()
+        };
+        let chord = key_event_to_chord(&ev(None, "Tab", mods)).unwrap();
+        assert_eq!(
+            chord.modifiers,
+            Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
+            "caps/num lock are toggles, never chord modifiers"
+        );
+    }
+
+    #[test]
+    fn releases_and_repeats_drop() {
+        let released = KeyEvent::new(
+            ScanCode(0),
+            KeyCode::Named("j".into()),
+            BridgeModifiers::default(),
+            KeyState::Released,
+            Some("j".into()),
+            false,
+        );
+        assert!(key_event_to_chord(&released).is_none());
+        assert!(key_event_to_chord_with_repeat(&released).is_none());
+
+        let repeat = KeyEvent::new(
+            ScanCode(0),
+            KeyCode::Named("j".into()),
+            BridgeModifiers::default(),
+            KeyState::Pressed,
+            Some("j".into()),
+            true,
+        );
+        assert!(key_event_to_chord(&repeat).is_none());
+        // …but the text-input path accepts auto-repeat.
+        assert!(key_event_to_chord_with_repeat(&repeat).is_some());
+    }
+
+    #[test]
+    fn unmapped_and_multi_codepoint_drop() {
+        // Multi-char symbolic name outside the table.
+        assert!(key_event_to_chord(&ev(None, "Caps_Lock", BridgeModifiers::default())).is_none());
+        // Dead-key composition text — IME path's job.
+        assert!(
+            key_event_to_chord(&ev(Some("a\u{0302}"), "a", BridgeModifiers::default())).is_none()
+        );
+        // Raw keysym with no text at all.
+        let sym = KeyEvent::new(
+            ScanCode(0),
+            KeyCode::Sym(0x1008ff11),
+            BridgeModifiers::default(),
+            KeyState::Pressed,
+            None,
+            false,
+        );
+        assert!(key_event_to_chord(&sym).is_none());
+    }
 }

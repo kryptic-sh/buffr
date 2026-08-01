@@ -34,6 +34,7 @@
 //! also include SHIFT (see `parse_char` in `key.rs`), keeping
 //! lookups consistent.
 
+use crate::adapter::char_chord;
 use crate::key::{Key, KeyChord, Modifiers, NamedKey};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey as WNamed};
@@ -75,34 +76,12 @@ fn chord_from_logical(logical: &WKey, modifiers: ModifiersState) -> Option<KeyCh
             if chars.next().is_some() {
                 return None;
             }
-            // Drop the SHIFT bit when the keyboard layout has already
-            // baked it into the produced glyph. `+`, `!`, `?` etc. are
-            // shifted forms of `=`, `1`, `/` — typing them always
-            // requires Shift on a US layout, but the parser writes
-            // these bindings without `<S->` because the glyph is the
-            // canonical form. ASCII alphabetic stays untouched: `Shift+a`
-            // → `A` keeps SHIFT so it matches the parser's `(SHIFT, 'A')`.
-            let mut effective = mods;
-            let mut ch = first;
-            if effective.contains(Modifiers::SHIFT)
-                && first.is_ascii()
-                && !first.is_ascii_alphabetic()
-            {
-                effective.remove(Modifiers::SHIFT);
-            }
-            // Ctrl+letter is case-insensitive in the parser
-            // (`<C-h>` and `<C-H>` both produce `(CTRL, 'h')`),
-            // so the adapter normalizes uppercase letters to
-            // lowercase whenever CTRL is set. Without this,
-            // `<C-S-h>` (parsed as `(CTRL|SHIFT, 'h')`) never
-            // matched the adapter's `(CTRL|SHIFT, 'H')`.
-            if effective.contains(Modifiers::CTRL) && ch.is_ascii_alphabetic() {
-                ch = ch.to_ascii_lowercase();
-            }
-            Some(KeyChord {
-                modifiers: effective,
-                key: Key::Char(ch),
-            })
+            // Shared normalisation: sheds SHIFT for layout-baked
+            // non-alphabetic glyphs (`+`, `!`, `?`) and folds
+            // uppercase to lowercase under CTRL so `<C-S-h>`
+            // (parsed as `(CTRL|SHIFT, 'h')`) matches. See
+            // `crate::adapter::char_chord`.
+            Some(char_chord(first, mods))
         }
         WKey::Named(named) => {
             // Space lands as Char(' ') so a leader=' ' binding (the
@@ -174,56 +153,18 @@ fn map_named(n: WNamed) -> Option<NamedKey> {
     })
 }
 
-/// Internal helper exposed for testing: do the logical_key →
-/// (Key/None) translation step, given an already-decided pressed-and-
-/// not-repeating event. The public [`key_event_to_chord`] also gates
-/// on `state` and `repeat`; this helper is the rest of the work.
-///
-/// We test through this seam because winit's `KeyEvent` has a
-/// `pub(crate)` `platform_specific` field, so we can't synthesize one
-/// directly in our unit tests without a real platform backend.
-#[cfg(test)]
-fn translate_key_test_only(logical_key: &WKey, modifiers: ModifiersState) -> Option<KeyChord> {
-    let mods = modifiers_to_internal(modifiers);
-    match logical_key {
-        WKey::Character(s) => {
-            let mut chars = s.chars();
-            let first = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            Some(KeyChord {
-                modifiers: mods,
-                key: Key::Char(first),
-            })
-        }
-        WKey::Named(named) => {
-            // Space lands as Char(' ') so a leader=' ' binding (the
-            // default) matches the canonical form the keymap parser
-            // emits for both `<Space>` and `<leader>` after resolution.
-            if matches!(named, WNamed::Space) {
-                return Some(KeyChord {
-                    modifiers: mods,
-                    key: Key::Char(' '),
-                });
-            }
-            let mapped = map_named(*named)?;
-            Some(KeyChord {
-                modifiers: mods,
-                key: Key::Named(mapped),
-            })
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::keyboard::SmolStr;
 
+    /// Test seam: winit's `KeyEvent` has a `pub(crate)`
+    /// `platform_specific` field, so we can't synthesize one without a
+    /// real platform backend. Tests therefore call the *production*
+    /// [`chord_from_logical`] directly — everything the public entry
+    /// points do beyond it is the `state` / `repeat` gating.
     fn translate(k: WKey, m: ModifiersState) -> Option<KeyChord> {
-        translate_key_test_only(&k, m)
+        chord_from_logical(&k, m)
     }
 
     #[test]
@@ -252,6 +193,38 @@ mod tests {
             translate(WKey::Character(SmolStr::new("w")), ModifiersState::CONTROL).expect("some");
         assert!(chord.modifiers.contains(Modifiers::CTRL));
         assert_eq!(chord.key, Key::Char('w'));
+    }
+
+    #[test]
+    fn ctrl_shift_h_normalizes_to_lowercase() {
+        // Regression (M38): `<C-S-h>` parses to `(CTRL|SHIFT, 'h')`,
+        // so the adapter must fold winit's post-shift `Character("H")`
+        // down to lowercase whenever CTRL is held. Previously untested
+        // because the tests ran against a copy that skipped the fold.
+        let chord = translate(
+            WKey::Character(SmolStr::new("H")),
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+        )
+        .expect("some");
+        assert_eq!(chord.key, Key::Char('h'));
+        assert!(chord.modifiers.contains(Modifiers::CTRL));
+        assert!(chord.modifiers.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn shift_plus_drops_shift_modifier() {
+        // `+` is the shifted form of `=` on US — the parser writes `+`
+        // directly without `<S->`, so the adapter must shed SHIFT.
+        let chord =
+            translate(WKey::Character(SmolStr::new("+")), ModifiersState::SHIFT).expect("some");
+        assert_eq!(chord.key, Key::Char('+'));
+        assert!(!chord.modifiers.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn space_named_key_lands_on_char_space() {
+        let chord = translate(WKey::Named(WNamed::Space), ModifiersState::empty()).expect("some");
+        assert_eq!(chord.key, Key::Char(' '));
     }
 
     #[test]

@@ -106,10 +106,7 @@ pub fn peek_front(queue: &PermissionsQueue) -> Option<(String, Vec<Capability>)>
 /// discards the neutral entries — callers that need callback-side cleanup
 /// must drain manually.
 pub fn drain_queue(queue: &PermissionsQueue) -> Vec<PendingPermission> {
-    match queue.lock() {
-        Ok(mut g) => g.drain(..).collect(),
-        Err(_) => Vec::new(),
-    }
+    crate::popup::drain(queue)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
