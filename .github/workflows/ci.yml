@@ -127,10 +127,12 @@ jobs:
           # Linux was informational-only because of a CEF ICU crash
           # that turned out to be this job's own LD_LIBRARY_PATH
           # shadowing the staged libcef.so (see the smoke step below).
-          # Kept non-blocking for one more cycle to confirm it is
-          # genuinely stable on a GPU-less runner — wgpu had never been
-          # reached here before, since the crash happened during CEF
-          # init. Flip to `false` once it has passed a few runs.
+          # Fixing that exposed a second problem: the runner has no
+          # Vulkan ICD, wgpu init failed, and buffr-app exited 0 without
+          # painting — a green but entirely vacuous pass. That now exits
+          # 4, and mesa-vulkan-drivers is installed so the real path
+          # runs. Kept non-blocking for one more cycle to confirm the
+          # software-Vulkan path is stable; flip to `false` after that.
           - os: ubuntu-latest
             cef_platform: linux64
             bin_suffix: ""
@@ -165,7 +167,12 @@ jobs:
             libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
             libgl1 libegl1 libgles2 \
             libglib2.0-dev \
-            sway xwayland
+            sway xwayland \
+            mesa-vulkan-drivers vulkan-tools
+          # The runner has no GPU, so wgpu needs a software Vulkan ICD
+          # (lavapipe / llvmpipe) or renderer init fails and the smoke
+          # test can never reach a first paint.
+          vulkaninfo --summary || true
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1

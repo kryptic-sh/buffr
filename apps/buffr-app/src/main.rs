@@ -7736,6 +7736,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             Ok(r) => self.renderer = Some(r),
             Err(err) => {
                 warn!(error = %err, "wgpu renderer init failed");
+                // Under --smoke-test this must be a hard failure. The
+                // smoke contract is "the windowing backend reached a
+                // first paint"; exiting the event loop here would exit
+                // 0 without ever painting, so a renderer regression --
+                // or simply a runner with no Vulkan driver -- would
+                // report a green, entirely vacuous pass.
+                if SMOKE_TEST_ACTIVE.load(Ordering::SeqCst) {
+                    eprintln!("smoke-test: wgpu renderer init failed: {err}");
+                    std::process::exit(4);
+                }
                 event_loop.exit();
                 return;
             }
