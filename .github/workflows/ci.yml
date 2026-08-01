@@ -1402,8 +1402,13 @@ jobs:
         # command via `sh -c`, but tilde expansion never applies to the
         # result of a parameter expansion, and ssh does not expand `~` in
         # a `-o` value either. So `UserKnownHostsFile=~/.ssh/known_hosts`
-        # looks for a directory literally named `~`, finds no pin, and
-        # fails with "No ED25519 host key is known" (v0.14.7's release).
+        # names a directory literally called `~` and no pin is ever read.
+        #
+        # That was harmless under the previous `accept-new`, which trusts
+        # whatever the host offers on first connect and so never consults
+        # the file — every release up to v0.14.6 published this way. It
+        # became fatal the moment this switched to `StrictHostKeyChecking
+        # =yes`, which failed v0.14.7 with "No ED25519 host key is known".
         # Assigning in the step expands `$HOME` before git ever sees it.
         run: |
           set -euo pipefail
@@ -1488,8 +1493,10 @@ jobs:
       - name: Push cask to homebrew-tap
         # Absolute paths, built here not in `env:` — see the AUR push step
         # for why a `~` inside an `env:` value never gets expanded. This
-        # job only ever passed because the runner image also pins
-        # github.com in the global known_hosts, masking the same bug.
+        # job survived the switch to `StrictHostKeyChecking=yes` only
+        # because the runner image appends github.com's keys to
+        # /etc/ssh/ssh_known_hosts, so ssh verified against the global
+        # file while this job's own pin sat unread.
         run: |
           set -euo pipefail
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/brew -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
@@ -1575,8 +1582,10 @@ jobs:
       - name: Push manifest to scoop-bucket
         # Absolute paths, built here not in `env:` — see the AUR push step
         # for why a `~` inside an `env:` value never gets expanded. This
-        # job only ever passed because the runner image also pins
-        # github.com in the global known_hosts, masking the same bug.
+        # job survived the switch to `StrictHostKeyChecking=yes` only
+        # because the runner image appends github.com's keys to
+        # /etc/ssh/ssh_known_hosts, so ssh verified against the global
+        # file while this job's own pin sat unread.
         run: |
           set -euo pipefail
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/scoop -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"

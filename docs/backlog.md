@@ -135,11 +135,23 @@ slices.
   was written correctly, but `GIT_SSH_COMMAND` was supplied through an `env:`
   block containing a literal `~`, and neither git's `sh -c` (tilde expansion
   does not apply to the result of a parameter expansion) nor ssh itself expands
-  it in a `-o` value. Fixed in `ci.yml` by assigning `GIT_SSH_COMMAND` inside
-  the step so `$HOME` expands first; reproduced and re-verified in an
-  `archlinux:latest` container against `HOME=/github/home`. Everything else in
-  the release published — GitHub release, homebrew-tap, scoop-bucket, all 20
-  build/package jobs.
+  it in a `-o` value.
+
+  The tilde is **not** the regression — it has been there since the job was
+  written, is present in the AUR jobs of every sibling repo (`gpur`, `hjkl`,
+  `hodl`, `hrdr`, `inbx`, `krypt`, `pikr`, `sqeel`), and never mattered: under
+  the previous `StrictHostKeyChecking=accept-new`, ssh trusts the host on first
+  connect and never reads the file. The regression was flipping that to `yes` in
+  `2702edc`, which made verification depend on a path that had always been
+  broken. Confirmed against this repo's own runs — `v0.14.6` aur-bin=success
+  with the same tilde, `v0.14.7` aur-bin=failure after the flip.
+
+  Fixed in `ci.yml` by assigning `GIT_SSH_COMMAND` inside the step so `$HOME`
+  expands first; reproduced and re-verified in an `archlinux:latest` container
+  against `HOME=/github/home`. Reverting to `accept-new` would also go green,
+  but on an ephemeral runner that is trust-on-first-use with no prior state — it
+  accepts any key presented. Everything else in the release published — GitHub
+  release, homebrew-tap, scoop-bucket, all 20 build/package jobs.
 
   The fix cannot be applied retroactively: re-running the job checks out the
   workflow file as of the `v0.14.7` tag, which still has the bug, and the tag
@@ -147,12 +159,19 @@ slices.
   to do here beyond cutting one.
 
 - **The `known_hosts` pin was inert in all three publish jobs**, not just AUR.
-  `brew-tap` and `scoop-bucket` passed only because the runner image appends
-  github.com's keys to `/etc/ssh/ssh_known_hosts`
+  `brew-tap` and `scoop-bucket` survived the same flip only because the runner
+  image appends github.com's keys to `/etc/ssh/ssh_known_hosts`
   (`images/ubuntu/scripts/build/install-git.sh` in `actions/runner-images`), so
   ssh verified against the global file while the per-job pin was never read. Now
   fixed alongside AUR, but it means the pin has never actually been exercised
   for github.com — a wrong pin there would still pass today.
+
+- **The sibling repos still use `accept-new` with the same unexpanded `~`.** So
+  their AUR/brew/scoop pushes have no effective host verification: nothing is
+  pinned, and TOFU on an ephemeral runner accepts whatever key is offered. They
+  publish fine, so this is not urgent, but the fix here (absolute path +
+  `StrictHostKeyChecking=yes` + pinned keys) is worth propagating. Not done —
+  out of scope for this repo's session.
 
 ---
 
