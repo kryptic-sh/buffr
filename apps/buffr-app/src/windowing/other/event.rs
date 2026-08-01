@@ -5,7 +5,6 @@ use super::ime::ImeEvent;
 use super::keyboard::KeyEvent;
 use super::keyboard::Modifiers;
 use super::pointer::{PointerButton, PointerButtonState, PointerPosition, ScrollEvent};
-use super::touch::TouchEvent;
 
 /// Per-surface event variants — verbatim shape of wayr's `WindowEvent`.
 #[derive(Debug, Clone)]
@@ -64,9 +63,6 @@ pub enum WindowEvent {
 
     /// Scroll / wheel event.
     Scroll(ScrollEvent),
-
-    /// Touch event.
-    Touch(TouchEvent),
 
     /// Keyboard key event.
     Key(KeyEvent),

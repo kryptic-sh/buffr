@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::cursor::CursorIcon;
 use super::event_loop::EventLoop;
 use super::geometry::Size;
-use super::surface::{RawWindowHandlePlaceholder, Surface, SurfaceId};
+use super::surface::{Surface, SurfaceId};
 
 /// A regular top-level window. Wraps `winit::window::Window`.
 pub struct Window {
@@ -56,30 +56,6 @@ impl Window {
         }
     }
 
-    /// Whether the OS has marked this window as obscured. winit
-    /// doesn't expose a synchronous query for this on macOS / Windows,
-    /// so this always returns `false` — the `WindowEvent::Occluded`
-    /// path remains the source of truth.
-    pub fn is_occluded(&self) -> bool {
-        false
-    }
-
-    /// Programmatically request the OS close this window.
-    /// winit has no direct equivalent; the consumer typically drops
-    /// the `Window` after receiving `CloseRequested`. This method
-    /// exists for API symmetry with the Linux backend.
-    pub fn request_close(&self) {
-        // No-op on winit. Consumers detect the close via
-        // `WindowEvent::CloseRequested`.
-    }
-
-    /// Linux-only API — returns `None` on macOS / Windows. Kept for
-    /// signature parity; the Wayland-native handle extraction path
-    /// in `main.rs` is `#[cfg(target_os = "linux")]`-gated.
-    pub fn wl_surface_ptr(&self) -> Option<std::ptr::NonNull<std::ffi::c_void>> {
-        None
-    }
-
     /// Physical buffer size in pixels.
     pub fn physical_size(&self) -> Size {
         let s = self.inner.inner_size();
@@ -96,18 +72,6 @@ impl Window {
         self.inner.set_cursor(icon.to_winit());
     }
 
-    /// IME accessor. winit does not expose a per-surface IME handle
-    /// on macOS / Windows the way wayr does (text-input-v3 is a
-    /// Wayland-only protocol). Returns `None`; the consumer should
-    /// treat IME as unsupported on this platform.
-    ///
-    /// TODO(windowing): wire `winit::Window::set_ime_allowed` +
-    /// `set_ime_cursor_area` once the buffr IME story needs the
-    /// platform-IME path.
-    pub fn ime<T>(&self, _event_loop: &EventLoop<T>) -> Option<()> {
-        None
-    }
-
     /// Request the OS focus this window. Maps to
     /// `winit::Window::focus_window`. The OS may reject focus-steal
     /// attempts depending on platform policy.
@@ -116,17 +80,6 @@ impl Window {
         _event_loop: &mut EventLoop<T>,
     ) -> Result<(), ActivationError> {
         self.inner.focus_window();
-        Ok(())
-    }
-
-    /// Bypass the activation-token handshake — winit always treats
-    /// `focus_window` as best-effort, and no activation tokens are
-    /// involved on macOS / Windows.
-    pub fn set_activation_token<T>(
-        &self,
-        _event_loop: &EventLoop<T>,
-        _token: impl Into<String>,
-    ) -> Result<(), ActivationError> {
         Ok(())
     }
 
@@ -156,20 +109,6 @@ impl Surface for Window {
 
     fn request_redraw(&self) {
         self.inner.request_redraw();
-    }
-
-    fn raw_window_handle(&self) -> RawWindowHandlePlaceholder {
-        // No native handle exposed through this path — consumers use
-        // the `raw_window_handle` 0.6 traits directly on
-        // `Arc<Window>` via the `HasWindowHandle` impl below.
-        // Returning a dangling NonNull would be unsound; instead we
-        // hand back a non-null placeholder pointing at our inner
-        // Arc, which the consumer must NOT dereference. This method
-        // exists only for API parity with the Linux backend; nothing
-        // in buffr-app calls it on non-Linux.
-        let ptr = (Arc::as_ptr(&self.inner) as *const std::ffi::c_void) as *mut std::ffi::c_void;
-        let nn = std::ptr::NonNull::new(ptr).expect("Arc::as_ptr never null");
-        RawWindowHandlePlaceholder { wl_surface: nn }
     }
 }
 
@@ -267,10 +206,9 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-/// Error returned by [`Window::request_activation`] /
-/// [`Window::set_activation_token`]. Kept for shape-parity with wayr;
-/// winit's `focus_window` never reports failure, so this is
-/// effectively dead on macOS / Windows.
+/// Error returned by [`Window::request_activation`]. Kept for
+/// shape-parity with wayr; winit's `focus_window` never reports
+/// failure, so neither variant is constructed on macOS / Windows.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ActivationError {

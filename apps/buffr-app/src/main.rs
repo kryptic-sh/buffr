@@ -74,6 +74,15 @@ const IMMEDIATE_OCCLUDE_THRESHOLD_US: u64 = 500_000;
 /// full present cycle that may itself block 100+ ms if still occluded).
 const OCCLUSION_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Throttle between retries after [`crate::render::Renderer::frame`]
+/// skipped a frame (worker still presenting, swapchain texture
+/// unavailable, command channel full).  The dirty state is deliberately
+/// NOT retired on those paths (H8), so something has to ask for another
+/// paint — but re-requesting inside the redraw handler would spin the
+/// event loop at 100% CPU while the worker is blocked.  Scheduling the
+/// retry as an `about_to_wait` deadline caps the retry rate instead.
+const SKIPPED_FRAME_RETRY_DELAY: Duration = Duration::from_millis(8);
+
 /// How often the media-activity probe JS is fired while the window is
 /// occluded.  Two seconds balances detection latency against JS-execution
 /// overhead.  The CEF AudioHandler fires immediately on stream start/stop,
@@ -326,6 +335,10 @@ struct PopupWindow {
     /// `host.popup_resize` will actually be called. Refreshed on every
     /// Resized event; fired once quiet for `CEF_RESIZE_DEBOUNCE`.
     pending_cef_resize: Option<(u32, u32, std::time::Instant)>,
+    /// Deadline for retrying a frame this popup's renderer skipped. Same
+    /// contract as [`AppState::repaint_retry_at`] — throttled through the
+    /// event-loop deadline so a busy render worker can't spin the loop.
+    repaint_retry_at: Option<Instant>,
 }
 
 /// ASCII-art banner. Regenerate with:
@@ -880,12 +893,9 @@ fn main() -> Result<()> {
     // still constructed (so call sites don't have to branch) but the
     // `enabled` flag is forced off.
     let telemetry_enabled = config.privacy.enable_telemetry && !cli.private;
-    let counters_path = if cli.private {
-        // Private mode tempdir; nothing persists past Drop.
-        paths.data.join("usage-counters.json")
-    } else {
-        paths.data.join("usage-counters.json")
-    };
+    // In private mode `paths.data` is already a tempdir that nothing
+    // survives, so the path is the same either way.
+    let counters_path = paths.data.join("usage-counters.json");
     let counters = Arc::new(buffr_core::UsageCounters::open(
         &counters_path,
         telemetry_enabled,
@@ -2443,10 +2453,18 @@ struct AppState {
     /// serves as a probe via the sleep-guard bypass).
     next_probe_at: Option<Instant>,
     /// Set true by `about_to_wait` immediately before requesting a
-    /// wake-probe redraw; cleared at the bottom of `paint_chrome_with`
-    /// after the probe paints.  Bypasses the sleep guard for exactly
-    /// one paint so we can measure `present_us` and decide stay/wake.
+    /// wake-probe redraw; read-and-cleared at the TOP of
+    /// `paint_chrome_with` so every early-return path consumes it (M33).
+    /// Bypasses the sleep guard for exactly one paint so we can measure
+    /// `present_us` and decide stay/wake.
     probe_pending: bool,
+    /// Deadline for re-requesting a redraw after the renderer skipped a
+    /// frame ([`crate::render::Submitted::No`]).  The chrome/OSR update
+    /// is still pending in that case, so the paint has to be retried —
+    /// throttled by [`SKIPPED_FRAME_RETRY_DELAY`] so a wedged render
+    /// worker can't turn the retry into a busy loop.  `None` when the
+    /// last paint reached the GPU.
+    repaint_retry_at: Option<Instant>,
 
     // ── Idle-inhibit (issue #22) ─────────────────────────────────────────────
     /// Idle-inhibit config snapshot. Shared so hot-reload (if added later)
@@ -2583,17 +2601,6 @@ impl ActiveContextMenu {
                 self.selected = idx;
                 break;
             }
-        }
-    }
-
-    /// Set selection by display-row index (direct hover). If the target
-    /// row is a separator the call is a no-op.
-    #[allow(dead_code)]
-    fn select_row(&mut self, row: usize) {
-        if let Some(item) = self.request.items.get(row)
-            && !item.is_separator()
-        {
-            self.selected = row;
         }
     }
 
@@ -2800,6 +2807,7 @@ impl AppState {
             present_us_history: VecDeque::with_capacity(PRESENT_HISTORY_SIZE),
             next_probe_at: None,
             probe_pending: false,
+            repaint_retry_at: None,
             idle_inhibit_config,
             idle_inhibitor: None,
             video_active: false,
@@ -2848,52 +2856,12 @@ impl AppState {
         self.engines.get(&self.active_engine).cloned()
     }
 
-    /// Open a new foreground tab, routing through the engine router.
-    ///
-    /// Currently unused — `TabNew` was changed to open on the active
-    /// engine directly (routing the placeholder homepage URL would send
-    /// the new tab to the default engine instead of the engine the user
-    /// is viewing). Kept for the future omnibar-submit cross-engine flow.
-    #[allow(dead_code)]
-    fn routed_open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
-        if let Some(router) = &self.engine_router {
-            router.engine_for(url).open_tab(url)
-        } else if let Some(engine) = self.active_engine_dyn() {
-            engine.open_tab(url)
-        } else {
-            Err(buffr_engine::EngineError::Other(
-                "no engine available".into(),
-            ))
-        }
-    }
-
     /// Open a new background tab, routing through the engine router.
     fn routed_open_tab_background(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
         if let Some(router) = &self.engine_router {
             router.engine_for(url).open_tab_background(url)
         } else if let Some(engine) = self.active_engine_dyn() {
             engine.open_tab_background(url)
-        } else {
-            Err(buffr_engine::EngineError::Other(
-                "no engine available".into(),
-            ))
-        }
-    }
-
-    /// Open a new tab at a specific index, routing through the engine router.
-    ///
-    /// Currently unused for the same reason as [`Self::routed_open_tab`] —
-    /// see that method's note.
-    #[allow(dead_code)]
-    fn routed_open_tab_at(
-        &self,
-        url: &str,
-        insert_idx: usize,
-    ) -> Result<TabId, buffr_engine::EngineError> {
-        if let Some(router) = &self.engine_router {
-            router.engine_for(url).open_tab_at(url, insert_idx)
-        } else if let Some(engine) = self.active_engine_dyn() {
-            engine.open_tab_at(url, insert_idx)
         } else {
             Err(buffr_engine::EngineError::Other(
                 "no engine available".into(),
@@ -4003,7 +3971,40 @@ impl AppState {
     /// can leave `window.inner_size()` reporting the previous dims at
     /// the moment `WindowEvent::Resized` fires; passing the event's
     /// `new_size` directly avoids painting at stale width/height.
+    ///
+    /// Thin wrapper around [`Self::paint_chrome_inner`] that owns the
+    /// wake-probe lifecycle (M33): `probe_pending` is read-and-cleared
+    /// here, ONCE, so it can never survive one of the inner function's
+    /// four early returns.  Before this split, the idle short-circuit
+    /// could leave `probe_pending == true` with `next_probe_at == None`
+    /// forever, permanently bypassing the occlusion sleep guard.
     fn paint_chrome_with(&mut self, override_size: Option<(u32, u32)>) {
+        let probe_pending = std::mem::take(&mut self.probe_pending);
+        let submitted = self.paint_chrome_inner(override_size, probe_pending);
+        // A probe that never reached the GPU produced no timing sample, so
+        // `observe_present_us` never got the chance to either wake us or
+        // reschedule.  Re-arm the cadence so the window cannot get stuck
+        // asleep with no probe pending.  (When the probe DID wake us the
+        // policy is no longer Sleeping and this is a no-op.)
+        if probe_pending
+            && !submitted
+            && self.paint_policy == PaintPolicy::Sleeping
+            && self.next_probe_at.is_none()
+        {
+            self.next_probe_at = Some(Instant::now() + OCCLUSION_PROBE_INTERVAL);
+        }
+    }
+
+    /// Body of [`Self::paint_chrome_with`].
+    ///
+    /// `probe_pending` is the consumed wake-probe flag (see the wrapper).
+    /// Returns `true` when the renderer actually handed a frame to the
+    /// wgpu worker — callers use it to decide whether the probe was spent.
+    fn paint_chrome_inner(
+        &mut self,
+        override_size: Option<(u32, u32)>,
+        probe_pending: bool,
+    ) -> bool {
         // Drain async-present stats from the worker thread BEFORE doing any
         // wgpu work this frame.  Once a present has blocked on compositor
         // backpressure, subsequent queue.write_texture / queue.submit calls
@@ -4011,10 +4012,13 @@ impl AppState {
         // on the frame following a 6.29s present.  Polling here means the
         // occlusion heuristic trips before we touch the GPU, so the sleep
         // guard below catches us instead.
+        //
+        // These stats come from a frame the worker really did present, so
+        // unlike the post-`frame()` sample below they are always safe to
+        // observe.
         let new_stats = self.renderer.as_mut().and_then(|r| r.poll_present_stats());
         if let Some(stats) = new_stats {
-            let was_probe = self.probe_pending;
-            self.observe_present_us(stats.present_us, was_probe);
+            self.observe_present_us(stats.present_us, probe_pending);
         }
 
         // OSR sleep guard: skip the wgpu present while the policy is
@@ -4034,14 +4038,11 @@ impl AppState {
         // multiple seconds (Wayland compositor refusing to release the
         // buffer for a hidden surface).  The next probe (≤2 s away) will
         // wake us if visible; chrome catches up then.
-        if self.paint_policy == PaintPolicy::Sleeping
-            && !self.surface_drifted
-            && !self.probe_pending
-        {
-            return;
+        if self.paint_policy == PaintPolicy::Sleeping && !self.surface_drifted && !probe_pending {
+            return false;
         }
         let Some(window) = self.window.as_ref() else {
-            return;
+            return false;
         };
         let inner = window.physical_size();
         let (width, height) = match override_size {
@@ -4053,10 +4054,7 @@ impl AppState {
         // bilinear sampler. At integer scales (1×, 2×) the chrome bitmap-font
         // glyphs sample at exact pixel boundaries, producing crisp text.
         let scale = window.scale_factor() as f32;
-        let lwidth = ((width as f32) / scale).round() as u32;
-        let lheight = ((height as f32) / scale).round() as u32;
-        let lwidth = lwidth.max(1);
-        let lheight = lheight.max(1);
+        let (lwidth, lheight) = logical_chrome_dims(width, height, scale);
 
         // Precompute geometry before the renderer call — helpers need `&self`.
         // Use logical dims for chrome layout so strip heights are in DIPs.
@@ -4156,7 +4154,7 @@ impl AppState {
             .unwrap_or(false);
 
         let Some(renderer) = self.renderer.as_mut() else {
-            return;
+            return false;
         };
 
         // Resize bumps chrome_generation via the caller's resize event;
@@ -4238,7 +4236,7 @@ impl AppState {
             && !want_anim
             && want_anim == self.loading_anim_active
         {
-            return;
+            return false;
         }
 
         // Detect the animation→OSR transition. While the animation was
@@ -4278,6 +4276,25 @@ impl AppState {
         let chrome_dirty_effective =
             should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated);
         let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
+        // Single chrome-strip painter shared by every `PaintPath` arm — the
+        // arms differ only in what they hand the renderer as the OSR layer
+        // (and, for `Animation`, in the splash blit layered on top).
+        let paint_strips = |buf: &mut [u32], w: usize| {
+            paint_chrome_strips(
+                buf,
+                w,
+                lheight,
+                &statusline,
+                &tab_strip,
+                tab_y,
+                notice_y,
+                current_notice.as_ref(),
+                confirm_close_pinned,
+                permissions_prompt.as_ref(),
+                overlay_data.as_ref(),
+                context_menu_overlay.as_ref(),
+            );
+        };
         let res = match paint_path {
             PaintPath::Animation => {
                 // Animation path: paint animation into chrome buffer at the browser
@@ -4287,20 +4304,7 @@ impl AppState {
                 renderer.frame(
                     chrome_dirty_effective,
                     |buf, w, h| {
-                        paint_chrome_strips(
-                            buf,
-                            w,
-                            lheight,
-                            &statusline,
-                            &tab_strip,
-                            tab_y,
-                            notice_y,
-                            current_notice.as_ref(),
-                            confirm_close_pinned,
-                            permissions_prompt.as_ref(),
-                            overlay_data.as_ref(),
-                            context_menu_overlay.as_ref(),
-                        );
+                        paint_strips(buf, w);
                         // Paint the animation into the browser region so it is
                         // opaque and composites as chrome (no OSR quad shown).
                         crate::loading_anim::paint(
@@ -4330,22 +4334,7 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, _h| {
-                        paint_chrome_strips(
-                            buf,
-                            w,
-                            lheight,
-                            &statusline,
-                            &tab_strip,
-                            tab_y,
-                            notice_y,
-                            current_notice.as_ref(),
-                            confirm_close_pinned,
-                            permissions_prompt.as_ref(),
-                            overlay_data.as_ref(),
-                            context_menu_overlay.as_ref(),
-                        );
-                    },
+                    |buf, w, _h| paint_strips(buf, w),
                     Some(osr_upload),
                 )
             }
@@ -4374,22 +4363,7 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, _h| {
-                        paint_chrome_strips(
-                            buf,
-                            w,
-                            lheight,
-                            &statusline,
-                            &tab_strip,
-                            tab_y,
-                            notice_y,
-                            current_notice.as_ref(),
-                            confirm_close_pinned,
-                            permissions_prompt.as_ref(),
-                            overlay_data.as_ref(),
-                            context_menu_overlay.as_ref(),
-                        );
-                    },
+                    |buf, w, _h| paint_strips(buf, w),
                     Some(osr_upload),
                 )
             }
@@ -4399,31 +4373,22 @@ impl AppState {
                 new_osr_generation = self.last_osr_generation;
                 renderer.frame(
                     chrome_dirty_effective,
-                    |buf, w, _h| {
-                        paint_chrome_strips(
-                            buf,
-                            w,
-                            lheight,
-                            &statusline,
-                            &tab_strip,
-                            tab_y,
-                            notice_y,
-                            current_notice.as_ref(),
-                            confirm_close_pinned,
-                            permissions_prompt.as_ref(),
-                            overlay_data.as_ref(),
-                            context_menu_overlay.as_ref(),
-                        );
-                    },
+                    |buf, w, _h| paint_strips(buf, w),
                     None,
                 )
             }
         };
 
+        // `last_osr_generation` tracks what we have CONSUMED out of the
+        // shared CEF frame (the mem::swap above), not what reached the GPU,
+        // so it advances even when the renderer skipped the frame.  Leaving
+        // it behind would let the freshness gate swap the same generation a
+        // second time on the next paint and push the previous (already
+        // consumed) buffer back into `osr_scratch` — see `is_osr_frame_fresh`
+        // condition 4.  The skipped pixels are not lost: they live in
+        // `osr_scratch` and the retry below re-uploads them through the
+        // SyntheticScratch path, which the worker dedupes by generation.
         self.last_osr_generation = new_osr_generation;
-        if chrome_dirty_effective {
-            self.last_painted_chrome_gen = self.chrome_generation;
-        }
 
         // Schedule the next wake while the loading-anim path is active.
         // `Splash` reads the wall clock each `cells()` call, so we just
@@ -4465,23 +4430,44 @@ impl AppState {
             std::process::exit(0);
         }
 
-        // Observe THIS frame's submit_done_us: when wgpu's GPU queue is
-        // backpressured by the compositor, queue.write_texture and
-        // queue.submit block on the UI thread (chrome_us / osr_us / submit_us
-        // ballooning to seconds).  This is a same-frame signal that catches
-        // occlusion modes the lagged present_us misses entirely (observed
-        // chrome_us=4.6 s with present_us_prev=164 µs — present looked
-        // healthy, but the very next chrome upload blocked).
-        let probe_was_pending = self.probe_pending;
-        self.probe_pending = false;
-        match res {
-            Ok(stats) => {
-                self.observe_present_us(stats.submit_done_us, probe_was_pending);
-            }
+        // Post-frame bookkeeping.  Everything here is gated on the frame
+        // having actually been handed to the wgpu worker (H8 / M34):
+        //
+        // - Retiring `last_painted_chrome_gen` after a skip erases the dirty
+        //   state for pixels that were never uploaded, so the update is lost
+        //   until an unrelated event marks chrome dirty again.
+        // - The `submit_done_us` sample on a skip is the PREVIOUS frame's
+        //   number, so re-observing it double-counts one real measurement:
+        //   one slow frame plus two skips fills the history with the same
+        //   sample and falsely trips the 3-of-5 occlusion rule, and a
+        //   skipped probe re-observes a stale FAST value and "wakes" without
+        //   ever having presented.
+        //
+        // The surviving observation is a same-frame signal: when wgpu's GPU
+        // queue is backpressured by the compositor, queue.write_texture and
+        // queue.submit block on the worker thread (submit_done_us ballooning
+        // to seconds) — catching occlusion modes the lagged present_us
+        // misses entirely.
+        let outcome = match &res {
+            Ok((stats, submitted)) => Some((stats.submit_done_us, *submitted)),
             Err(err) => {
                 warn!(error = %err, "wgpu frame failed");
+                None
             }
+        };
+        let commit = decide_frame_commit(outcome, chrome_dirty_effective);
+        if commit.advance_chrome_gen {
+            self.last_painted_chrome_gen = self.chrome_generation;
         }
+        if let Some(us) = commit.observe_us {
+            self.observe_present_us(us, probe_pending);
+        }
+        self.repaint_retry_at = if commit.retry_paint {
+            tracing::trace!("paint_chrome: frame skipped by renderer; scheduling retry");
+            Some(Instant::now() + SKIPPED_FRAME_RETRY_DELAY)
+        } else {
+            None
+        };
 
         // Surface-drift detection. We just presented a buffer at
         // (width, height). If `window.inner_size()` has since advanced past
@@ -4511,6 +4497,8 @@ impl AppState {
         } else {
             self.surface_drifted = false;
         }
+
+        matches!(outcome, Some((_, crate::render::Submitted::Yes)))
     }
 
     /// Compute the CEF page rect for the current overlay state.
@@ -6292,7 +6280,16 @@ impl AppState {
         let inner = popup.window.physical_size();
         let width = inner.width.max(1);
         let height = inner.height.max(1);
+        // The popup chrome buffer is LOGICAL-sized (same contract as the main
+        // window) so the bitmap font rasterises at DIP resolution and the GPU
+        // stretches it. `bar_h` (STATUSLINE_HEIGHT) is a logical constant: use
+        // it as-is inside the chrome buffer, and its scaled twin wherever it
+        // meets physical coordinates — the OSR dst_rect here, the cursor
+        // offset in `PointerMoved` (M31).
+        let scale = popup.window.scale_factor() as f32;
+        let (lwidth, lheight) = logical_chrome_dims(width, height, scale);
         let bar_h = STATUSLINE_HEIGHT;
+        let phys_bar_h = popup_bar_h_physical(scale);
 
         // Same freshness gate as the main window's paint_chrome_with —
         // including stale-dim rejection via popup.view atomics.
@@ -6322,6 +6319,7 @@ impl AppState {
 
         let chrome_dirty = popup.chrome_generation != popup.last_painted_chrome_gen;
         popup.renderer.resize(width, height);
+        popup.renderer.set_logical_size(lwidth, lheight);
         let url = popup.url.clone();
         let new_gen;
         let res = if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
@@ -6331,7 +6329,12 @@ impl AppState {
                 width: osr_w,
                 height: osr_h,
                 generation: osr_gen,
-                dst_rect: (0, bar_h, width, height.saturating_sub(bar_h).max(1)),
+                dst_rect: (
+                    0,
+                    phys_bar_h,
+                    width,
+                    height.saturating_sub(phys_bar_h).max(1),
+                ),
             };
             popup.renderer.frame(
                 chrome_dirty,
@@ -6354,7 +6357,12 @@ impl AppState {
                 width: cached_w,
                 height: cached_h,
                 generation: popup.last_osr_generation,
-                dst_rect: (0, bar_h, width, height.saturating_sub(bar_h).max(1)),
+                dst_rect: (
+                    0,
+                    phys_bar_h,
+                    width,
+                    height.saturating_sub(phys_bar_h).max(1),
+                ),
             };
             popup.renderer.frame(
                 chrome_dirty,
@@ -6371,13 +6379,29 @@ impl AppState {
             )
         };
 
+        // Same H8 bookkeeping split as the main window: the OSR generation
+        // tracks what we consumed from the shared frame (so the freshness
+        // gate can't double-swap), but the chrome dirty flag may only be
+        // retired when the renderer really submitted the frame — otherwise
+        // a popup URL change that lands while the worker is still
+        // presenting is silently dropped.
         popup.last_osr_generation = new_gen;
-        if chrome_dirty {
+        let outcome = match &res {
+            Ok((stats, submitted)) => Some((stats.submit_done_us, *submitted)),
+            Err(err) => {
+                warn!(error = %err, "popup: wgpu frame failed");
+                None
+            }
+        };
+        let commit = decide_frame_commit(outcome, chrome_dirty);
+        if commit.advance_chrome_gen {
             popup.last_painted_chrome_gen = popup.chrome_generation;
         }
-        if let Err(err) = res {
-            warn!(error = %err, "popup: wgpu frame failed");
-        }
+        popup.repaint_retry_at = if commit.retry_paint {
+            Some(Instant::now() + SKIPPED_FRAME_RETRY_DELAY)
+        } else {
+            None
+        };
     }
 
     /// Handle a `WindowEvent` for a popup window.
@@ -6464,14 +6488,16 @@ impl AppState {
                 let Some(popup) = self.popups.get_mut(&window_id) else {
                     return;
                 };
-                let bar_h = STATUSLINE_HEIGHT as i32;
+                // `position` is physical; STATUSLINE_HEIGHT is logical, so the
+                // strip height must be scaled before it is subtracted (M31).
+                let pop_scale = popup.window.scale_factor() as f32;
+                let bar_h = popup_bar_h_physical(pop_scale) as i32;
                 let phys_bx = position.0.x;
                 // Cursor y relative to the content area (below address bar).
                 let phys_by = position.0.y.saturating_sub(bar_h);
                 // Store physical coords for any chrome hit-tests.
                 popup.cursor = (phys_bx, phys_by);
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
-                let pop_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_scale);
                 let mods = wayr_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 if let Some(engine) = self.active_engine_dyn()
@@ -7064,11 +7090,120 @@ fn paint_popup_chrome(buf: &mut [u32], w: usize, h: usize, url: &str, bar_h: u32
     font::draw_text(buf, w, h, 8, text_y, url, fg);
 }
 
+/// Physical height of a popup window's address-bar strip.
+///
+/// [`STATUSLINE_HEIGHT`] is a LOGICAL (DIP) constant — correct inside the
+/// popup's logical-sized chrome buffer, wrong everywhere it meets physical
+/// coordinates (the OSR `dst_rect`, the pointer offset). Mixing the two is
+/// invisible at scale 1 and halves the address bar at scale 2 (M31).
+///
+/// Degenerate `scale <= 0.0` is clamped to 1.0, matching
+/// [`physical_cursor_to_dip`].
+fn popup_bar_h_physical(scale: f32) -> u32 {
+    let scale = if scale <= 0.0 { 1.0 } else { scale };
+    ((STATUSLINE_HEIGHT as f32) * scale).round() as u32
+}
+
 /// Omnibar / command-line popup geometry.
 const OMNIBAR_POPUP_MAX_WIDTH: u32 = 800;
 const OMNIBAR_POPUP_BORDER: u32 = 2;
 const OMNIBAR_POPUP_BG: u32 = 0xFF_1A_1B_26;
 const OMNIBAR_POPUP_BORDER_COLOR: u32 = 0xFF_7A_A2_F7;
+/// Minimum logical width of the confirm / permissions modal.
+const CONFIRM_POPUP_MIN_WIDTH: u32 = 300;
+/// Minimum logical width of the omnibar / command / find popup.
+const OMNIBAR_POPUP_MIN_WIDTH: u32 = 200;
+
+/// Geometry of a centred modal popup, in **logical** (DIP) pixels.
+///
+/// Single source of truth for both the chrome painter and the click
+/// hit-tests. Before this existed the two computed the rect independently
+/// — the painter in logical space, the hit-tests from
+/// `window.physical_size()` — so on any HiDPI scale the confirm buttons
+/// were drawn in one place and tested in another (M30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModalPanel {
+    /// Border-box origin / size.
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    /// Content box (border-box inset by [`OMNIBAR_POPUP_BORDER`]).
+    inner_x: u32,
+    inner_y: u32,
+    inner_w: u32,
+    inner_h: u32,
+}
+
+impl ModalPanel {
+    /// Lay out a modal `content_h` logical pixels tall, centred
+    /// horizontally in a `win_w`-wide chrome buffer and pinned to the
+    /// upper third of `win_h`.
+    ///
+    /// `min_w` is a *desired* floor: it is capped at `win_w` first, so a
+    /// window narrower than the floor yields `w == win_w` instead of
+    /// `w > win_w`. The old code clamped unconditionally and then did
+    /// `win_w - popup_w`, which underflows below the floor — debug panic,
+    /// release wrap to ~4.29e9 and a popup painted off-screen. Reachable
+    /// at a 500 px window on scale 2 (`lwidth == 250`, floor 300) (M32).
+    fn new(win_w: u32, win_h: u32, min_w: u32, content_h: u32) -> Self {
+        let min_w = min_w.min(win_w);
+        let max_w = OMNIBAR_POPUP_MAX_WIDTH.min(win_w).max(min_w);
+        // u64 for the percentage so a pathological width can't overflow.
+        let w = (((win_w as u64) * 60 / 100) as u32).clamp(min_w, max_w);
+        let x = (win_w - w) / 2;
+        let y = win_h / 3;
+        let h = (content_h + 2 * OMNIBAR_POPUP_BORDER).min(win_h.saturating_sub(y));
+        Self {
+            x,
+            y,
+            w,
+            h,
+            inner_x: x + OMNIBAR_POPUP_BORDER,
+            inner_y: y + OMNIBAR_POPUP_BORDER,
+            inner_w: w.saturating_sub(2 * OMNIBAR_POPUP_BORDER),
+            inner_h: h.saturating_sub(2 * OMNIBAR_POPUP_BORDER),
+        }
+    }
+
+    /// The confirm / permissions modal.
+    fn confirm(win_w: u32, win_h: u32) -> Self {
+        Self::new(
+            win_w,
+            win_h,
+            CONFIRM_POPUP_MIN_WIDTH,
+            buffr_ui::CONFIRM_PROMPT_HEIGHT,
+        )
+    }
+
+    /// The omnibar / command / find popup, `content_h` tall.
+    fn omnibar(win_w: u32, win_h: u32, content_h: u32) -> Self {
+        Self::new(win_w, win_h, OMNIBAR_POPUP_MIN_WIDTH, content_h)
+    }
+}
+
+/// Hit-test the pinned-close confirmation buttons in **logical** space.
+///
+/// `lwidth` / `lheight` are the logical chrome dims and `(lx, ly)` the
+/// cursor converted to DIPs. Returns `Some(true)` for Yes, `Some(false)`
+/// for No, `None` when the click missed both.
+fn hit_test_confirm_buttons(lwidth: u32, lheight: u32, lx: i32, ly: i32) -> Option<bool> {
+    let panel = ModalPanel::confirm(lwidth, lheight);
+    // Labels must match the paint site — `button_rects_at` measures them.
+    let confirm = buffr_ui::ConfirmPrompt {
+        message: String::new(),
+        yes_label: "Yes (y)".to_string(),
+        no_label: "No (n)".to_string(),
+    };
+    let (yes_rect, no_rect) = confirm.button_rects_at(panel.inner_x, panel.inner_y, panel.inner_w);
+    if buffr_ui::rect_contains(yes_rect, lx, ly) {
+        return Some(true);
+    }
+    if buffr_ui::rect_contains(no_rect, lx, ly) {
+        return Some(false);
+    }
+    None
+}
 
 /// Fill a rectangle in a u32 pixel buffer with stride `buf_w`.
 #[allow(clippy::too_many_arguments)]
@@ -7131,11 +7266,17 @@ fn paint_chrome_strips(
     let win_w = w as u32;
     let has_prompt = confirm_close_pinned.is_some() || permissions_prompt.is_some();
     if has_prompt {
-        let popup_w = ((win_w * 60) / 100).clamp(300, OMNIBAR_POPUP_MAX_WIDTH);
-        let popup_x = (win_w - popup_w) / 2;
-        let popup_y = height / 3;
-        let content_h = buffr_ui::CONFIRM_PROMPT_HEIGHT;
-        let popup_h = (content_h + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
+        // Shared with `hit_test_confirm_buttons` — see `ModalPanel`.
+        let ModalPanel {
+            x: popup_x,
+            y: popup_y,
+            w: popup_w,
+            h: popup_h,
+            inner_x,
+            inner_y,
+            inner_w,
+            inner_h,
+        } = ModalPanel::confirm(win_w, height);
         fill_rect_u32(
             buf,
             w,
@@ -7146,10 +7287,6 @@ fn paint_chrome_strips(
             popup_h as usize,
             OMNIBAR_POPUP_BORDER_COLOR,
         );
-        let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
-        let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
-        let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-        let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
         fill_rect_u32(
             buf,
             w,
@@ -7188,11 +7325,16 @@ fn paint_chrome_strips(
 
     // Overlay popup (omnibar / command / find).
     if let Some(bar) = overlay_data {
-        let popup_w = ((win_w * 60) / 100).clamp(200, OMNIBAR_POPUP_MAX_WIDTH);
-        let popup_x = (win_w - popup_w) / 2;
-        let popup_y = height / 3;
-        let popup_h =
-            (bar.total_height() + 2 * OMNIBAR_POPUP_BORDER).min(height.saturating_sub(popup_y));
+        let ModalPanel {
+            x: popup_x,
+            y: popup_y,
+            w: popup_w,
+            h: popup_h,
+            inner_x,
+            inner_y,
+            inner_w,
+            inner_h,
+        } = ModalPanel::omnibar(win_w, height, bar.total_height());
         fill_rect_u32(
             buf,
             w,
@@ -7203,10 +7345,6 @@ fn paint_chrome_strips(
             popup_h as usize,
             OMNIBAR_POPUP_BORDER_COLOR,
         );
-        let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
-        let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
-        let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-        let inner_h = popup_h.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
         fill_rect_u32(
             buf,
             w,
@@ -7300,6 +7438,39 @@ impl AppState {
         }
         self.splash_js_next_push = Some(Instant::now() + hjkl_splash::DEFAULT_PERIOD);
     }
+
+    /// Stamp the supervisor liveness atomic for this event-loop iteration.
+    ///
+    /// The background heartbeat thread owns the socket and does the actual
+    /// 1 Hz ping; all the UI thread does is prove it is still turning over.
+    /// Drops the handle when the bg thread reported a fatal write error, so
+    /// the supervisor sees silence and restarts us.
+    fn tick_heartbeat(&mut self) {
+        if let Some(h) = self.heartbeat.as_ref() {
+            h.mark_alive();
+            if !h.is_alive() {
+                self.heartbeat = None;
+            }
+        }
+    }
+
+    /// Handle a pending Ctrl+C / signal shutdown.
+    ///
+    /// Returns `true` when the caller must return immediately — the session
+    /// has been saved, the clean-shutdown flag written and the event loop
+    /// asked to exit. Called at the top of every event hook so the exit is
+    /// clean regardless of which one fires first (relying on
+    /// `about_to_wait` alone has a known Wayland failure mode where the
+    /// loop never reaches it).
+    fn check_shutdown(&mut self, event_loop: &mut EventLoop<BuffrUserEvent>) -> bool {
+        if !self.shutdown_flag.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.save_session_now();
+        self.mark_clean_shutdown();
+        event_loop.exit();
+        true
+    }
 }
 
 impl ApplicationHandler<BuffrUserEvent> for AppState {
@@ -7307,18 +7478,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Heartbeat + shutdown check: fold the logic that was in new_events (winit)
         // here so it runs at the top of every user_event delivery (the earliest hook
         // wayr offers aside from about_to_wait).
-        if self.shutdown_flag.load(Ordering::SeqCst) {
-            self.save_session_now();
-            self.mark_clean_shutdown();
-            event_loop.exit();
+        if self.check_shutdown(event_loop) {
             return;
         }
-        if let Some(h) = self.heartbeat.as_ref() {
-            h.mark_alive();
-            if !h.is_alive() {
-                self.heartbeat = None;
-            }
-        }
+        self.tick_heartbeat();
         match event {
             BuffrUserEvent::Shutdown => {
                 // ctrl+c handler set shutdown_flag and posted this event.
@@ -7617,18 +7780,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         event: WindowEvent,
     ) {
         // Heartbeat stamp + shutdown on every window event.
-        if self.shutdown_flag.load(Ordering::SeqCst) {
-            self.save_session_now();
-            self.mark_clean_shutdown();
-            event_loop.exit();
+        if self.check_shutdown(event_loop) {
             return;
         }
-        if let Some(h) = self.heartbeat.as_ref() {
-            h.mark_alive();
-            if !h.is_alive() {
-                self.heartbeat = None;
-            }
-        }
+        self.tick_heartbeat();
         // Dispatch popup windows before the main window path.
         if self.popups.contains_key(&surface_id) {
             self.handle_popup_window_event(event_loop, surface_id, event);
@@ -7886,16 +8041,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // CEF — otherwise the page sees hover events and
                     // changes its cursor (text I-beam over text, link
                     // pointer over links, etc).
-                    let abs_x = position.0.x;
-                    let abs_y = position.0.y;
+                    //
+                    // Logical space, matching the paint site (M30): the panel
+                    // is drawn into the logical chrome buffer, so a physical
+                    // cursor never lands on it at scale != 1.
+                    let hover_scale = self.current_scale();
+                    let (lwidth, lheight) = logical_chrome_dims(win_w, win_h, hover_scale);
+                    let (abs_x, abs_y) =
+                        physical_cursor_to_dip(position.0.x, position.0.y, 0, hover_scale);
                     if let Some(cm) = self.context_menu.as_ref() {
-                        let overlay = cm.to_overlay(win_w, win_h);
-                        if overlay.contains(win_w as usize, win_h as usize, abs_x, abs_y) {
+                        let overlay = cm.to_overlay(lwidth, lheight);
+                        if overlay.contains(lwidth as usize, lheight as usize, abs_x, abs_y) {
                             // set_cursor needs event_loop but we don't have it here;
                             // cursor reset is a best-effort cosmetic — skip in this path.
                             // TODO(wayr): pass event_loop down to pump_cursor_changes.
                             if let Some(row) =
-                                overlay.row_at(win_w as usize, win_h as usize, abs_x, abs_y)
+                                overlay.row_at(lwidth as usize, lheight as usize, abs_x, abs_y)
                                 && let Some(cm_mut) = self.context_menu.as_mut()
                                 && cm_mut.selected != row
                             {
@@ -7961,6 +8122,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     && button == MouseButton::Left
                     && self.confirm_close_pinned.is_some()
                 {
+                    // The prompt is painted into the LOGICAL chrome buffer, so
+                    // the hit-test has to run in logical space too — testing
+                    // physical coords against it missed the buttons entirely
+                    // on every HiDPI scale (M30).
                     let (px, py) = self.osr_cursor;
                     let size = self
                         .window
@@ -7969,28 +8134,22 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or_default();
                     let win_w = size.width.max(1);
                     let win_h = size.height.max(1);
-                    let abs_x = px;
-                    let abs_y = py + self.cef_child_rect(win_w, win_h).1 as i32;
-                    // Mirror popup geometry from the paint site exactly.
-                    let popup_w = ((win_w * 60) / 100).clamp(300, OMNIBAR_POPUP_MAX_WIDTH);
-                    let popup_x = (win_w - popup_w) / 2;
-                    let popup_y = win_h / 3;
-                    let inner_x = popup_x + OMNIBAR_POPUP_BORDER;
-                    let inner_y = popup_y + OMNIBAR_POPUP_BORDER;
-                    let inner_w = popup_w.saturating_sub(2 * OMNIBAR_POPUP_BORDER);
-                    let confirm = buffr_ui::ConfirmPrompt {
-                        message: String::new(),
-                        yes_label: "Yes (y)".to_string(),
-                        no_label: "No (n)".to_string(),
-                    };
-                    let (yes_rect, no_rect) = confirm.button_rects_at(inner_x, inner_y, inner_w);
-                    if buffr_ui::rect_contains(yes_rect, abs_x, abs_y) {
-                        self.resolve_pinned_close(true);
-                        return;
-                    }
-                    if buffr_ui::rect_contains(no_rect, abs_x, abs_y) {
-                        self.resolve_pinned_close(false);
-                        return;
+                    let scale = self.current_scale();
+                    let (lwidth, lheight) = logical_chrome_dims(win_w, win_h, scale);
+                    // osr_cursor is browser-region-relative physical; make it
+                    // window-absolute, then convert to DIPs.
+                    let phys_abs_y = py + self.cef_child_rect(win_w, win_h).1 as i32;
+                    let (lx, ly) = physical_cursor_to_dip(px, phys_abs_y, 0, scale);
+                    match hit_test_confirm_buttons(lwidth, lheight, lx, ly) {
+                        Some(true) => {
+                            self.resolve_pinned_close(true);
+                            return;
+                        }
+                        Some(false) => {
+                            self.resolve_pinned_close(false);
+                            return;
+                        }
+                        None => {}
                     }
                     // Click missed the buttons — swallow the event so
                     // it doesn't fall through to tab-strip / page hit
@@ -8009,15 +8168,21 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or_default();
                     let win_w = size.width.max(1);
                     let win_h = size.height.max(1);
+                    // The menu is painted into the LOGICAL chrome buffer
+                    // (`cm.to_overlay(lwidth, lheight)`), so build and test the
+                    // overlay in logical space as well — at scale 2 the
+                    // physical-coordinate version missed the visible panel and
+                    // fell into the "clicked outside → dismiss" branch (M30).
+                    let scale = self.current_scale();
+                    let (lwidth, lheight) = logical_chrome_dims(win_w, win_h, scale);
                     // osr_cursor is browser-region-relative; convert to
                     // full-window coords by adding the browser y-offset.
                     let cef_y_offset = self.cef_child_rect(win_w, win_h).1 as i32;
-                    let abs_x = px;
-                    let abs_y = py + cef_y_offset;
+                    let (abs_x, abs_y) = physical_cursor_to_dip(px, py + cef_y_offset, 0, scale);
                     if let Some(cm) = self.context_menu.as_ref() {
-                        let overlay = cm.to_overlay(win_w, win_h);
-                        if overlay.contains(win_w as usize, win_h as usize, abs_x, abs_y) {
-                            match overlay.row_at(win_w as usize, win_h as usize, abs_x, abs_y) {
+                        let overlay = cm.to_overlay(lwidth, lheight);
+                        if overlay.contains(lwidth as usize, lheight as usize, abs_x, abs_y) {
+                            match overlay.row_at(lwidth as usize, lheight as usize, abs_x, abs_y) {
                                 Some(row) if overlay.entries[row].enabled => {
                                     // Activate by clicking — same as Enter.
                                     let cm = self.context_menu.take().unwrap();
@@ -8076,9 +8241,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .unwrap_or((false, String::new()));
                     let tab_count = self.tab_ids.len().max(1);
                     let items = buffr_core::build_tab_context_menu_model(tab_count, idx, pinned);
-                    // Cursor → chrome-buffer (physical full-window) coords,
-                    // matching the click hit-test path. osr_cursor is
-                    // browser-region-relative; add the CEF y-offset.
+                    // Cursor → chrome-buffer coords. The chrome buffer is
+                    // LOGICAL, so the anchor has to be in DIPs or the menu
+                    // is drawn at 2x the cursor position on HiDPI (M30).
+                    // osr_cursor is browser-region-relative; add the CEF
+                    // y-offset first, then convert.
                     let size = self
                         .window
                         .as_ref()
@@ -8087,9 +8254,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let win_w = size.width.max(1);
                     let win_h = size.height.max(1);
                     let cef_y_offset = self.cef_child_rect(win_w, win_h).1 as i32;
+                    let (anchor_x, anchor_y) = physical_cursor_to_dip(
+                        self.osr_cursor.0,
+                        self.osr_cursor.1 + cef_y_offset,
+                        0,
+                        self.current_scale(),
+                    );
                     let request = ContextMenuRequest {
-                        x: self.osr_cursor.0,
-                        y: self.osr_cursor.1 + cef_y_offset,
+                        x: anchor_x,
+                        y: anchor_y,
                         browser_id: 0,
                         items,
                         target: ContextMenuTarget::Tab { index: idx },
@@ -8537,19 +8710,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
 
     fn about_to_wait(&mut self, event_loop: &mut EventLoop<BuffrUserEvent>) {
         // Heartbeat stamp at every loop iteration (replaces winit's new_events).
-        if let Some(h) = self.heartbeat.as_ref() {
-            h.mark_alive();
-            if !h.is_alive() {
-                self.heartbeat = None;
-            }
-        }
+        self.tick_heartbeat();
         // Ctrl+C single-press exit: the ctrlc handler sets this flag;
         // we check it here before doing any other work so the exit is
         // clean (session saved, CEF not left in a wedged state).
-        if self.shutdown_flag.load(Ordering::SeqCst) {
-            self.save_session_now();
-            self.mark_clean_shutdown();
-            event_loop.exit();
+        if self.check_shutdown(event_loop) {
             return;
         }
 
@@ -8856,6 +9021,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     last_osr_generation: 0,
                     last_osr_dims: None,
                     pending_cef_resize: None,
+                    repaint_retry_at: None,
                     osr_scratch: Vec::new(),
                     chrome_generation: 1,
                     last_painted_chrome_gen: 0,
@@ -9130,6 +9296,14 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 }
                 self.request_redraw();
             }
+
+            // Skipped-frame retry for this popup (see AppState::repaint_retry_at).
+            if let Some(popup) = self.popups.get_mut(&wid)
+                && popup.repaint_retry_at.is_some_and(|t| Instant::now() >= t)
+            {
+                popup.repaint_retry_at = None;
+                popup.window.request_redraw();
+            }
         }
 
         // Resize-paint watchdog: if CEF hasn't produced an on_paint at the
@@ -9155,6 +9329,18 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             self.resize_paint_watchdog
                 .record_force_repaint(Instant::now(), RESIZE_PAINT_WATCHDOG_TIMEOUT);
+            self.request_redraw();
+        }
+
+        // Skipped-frame retry: the renderer dropped the last frame (worker
+        // still presenting, swapchain texture unavailable, channel full) so
+        // the chrome dirty flag is still set and the pixels are still only
+        // in `osr_scratch`. Re-request the paint once the throttle window
+        // elapses — going through the event-loop deadline instead of
+        // request_redraw()-ing straight from the redraw handler is what
+        // keeps a wedged render worker from spinning the loop.
+        if self.repaint_retry_at.is_some_and(|t| Instant::now() >= t) {
+            self.repaint_retry_at = None;
             self.request_redraw();
         }
 
@@ -9216,6 +9402,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             .filter_map(|p| p.pending_cef_resize)
             .map(|(_, _, at)| at)
             .fold(deadline, |acc, at| if at < acc { at } else { acc });
+        // ...and for any popup frame the renderer skipped.
+        let deadline = self
+            .popups
+            .values()
+            .filter_map(|p| p.repaint_retry_at)
+            .fold(deadline, |acc, at| if at < acc { at } else { acc });
         // If the resize-paint watchdog is armed, wake up no later than its
         // deadline so the force-repaint nudge fires on time.
         let deadline = match self.resize_paint_watchdog.deadline() {
@@ -9241,6 +9433,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             Some(at) if at < deadline => at,
             _ => deadline,
         };
+        // Skipped-frame retry: wake up to re-attempt a paint the renderer
+        // dropped, so the pending chrome/OSR update isn't stranded until
+        // the next unrelated event.
+        let deadline = match self.repaint_retry_at {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        };
         // New-tab splash JS push: clamp wake to the next splash period so
         // the animation advances without input.
         let deadline = match self.splash_js_next_push {
@@ -9253,12 +9452,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // own 1 Hz timer, so the wakeup deadline does NOT need to be
         // clamped to a heartbeat-driven instant any more.  Drop the
         // handle if the bg thread observed a fatal write error.
-        if let Some(h) = self.heartbeat.as_ref() {
-            h.mark_alive();
-            if !h.is_alive() {
-                self.heartbeat = None;
-            }
-        }
+        self.tick_heartbeat();
         // Hand the computed deadline to wayr's loop so the next
         // `blocking_pump` is capped at min(50 ms, deadline-now,
         // key-repeat next-fire). Real input still preempts via
@@ -9333,31 +9527,24 @@ enum PaintPath {
 /// Degenerate `scale <= 0.0` is clamped to 1.0 to avoid division by zero.
 /// Cursor above the CEF region (phys_y < cef_y_offset) produces a negative
 /// DIP y — callers that care about clamping must do so themselves.
+/// Convert physical window dims to the logical (DIP) chrome-buffer dims.
+///
+/// The chrome CPU buffer is allocated at logical size and GPU-stretched,
+/// so every chrome-space geometry computation — painting AND hit-testing
+/// — must agree on this conversion. Both results are clamped to ≥1.
+fn logical_chrome_dims(phys_w: u32, phys_h: u32, scale: f32) -> (u32, u32) {
+    let scale = if scale <= 0.0 { 1.0 } else { scale };
+    let lw = ((phys_w as f32) / scale).round() as u32;
+    let lh = ((phys_h as f32) / scale).round() as u32;
+    (lw.max(1), lh.max(1))
+}
+
 fn physical_cursor_to_dip(phys_x: i32, phys_y: i32, cef_y_offset: u32, scale: f32) -> (i32, i32) {
     let scale = if scale <= 0.0 { 1.0 } else { scale };
     let region_y = (phys_y).saturating_sub(cef_y_offset as i32);
     let bx = ((phys_x as f32) / scale).round() as i32;
     let by = ((region_y as f32) / scale).round() as i32;
     (bx, by)
-}
-
-/// Scale physical-pixel wheel deltas to DIP units.
-///
-/// CEF's `send_mouse_wheel_event` takes DIP-space deltas. `winit_wheel_to_cef_delta`
-/// already converts line / pixel delta to a CEF-tick count; the remaining
-/// step is dividing by the device scale so the per-pixel magnitude stays
-/// proportional to page logical pixels.
-///
-/// Degenerate `scale <= 0.0` is clamped to 1.0.
-///
-/// Currently only called from tests; kept separate from `physical_cursor_to_dip`
-/// so it can be promoted to a production call site if wheel scaling is tuned.
-#[cfg(test)]
-fn physical_wheel_to_dip(dx_phys: i32, dy_phys: i32, scale: f32) -> (i32, i32) {
-    let scale = if scale <= 0.0 { 1.0 } else { scale };
-    let dx = ((dx_phys as f32) / scale).round() as i32;
-    let dy = ((dy_phys as f32) / scale).round() as i32;
-    (dx, dy)
 }
 
 // ---------------------------------------------------------------------------
@@ -9719,6 +9906,55 @@ fn is_osr_frame_fresh(
         && frame_h == expected_h
         && pixels_len == expected_len
         && frame_generation != last_seen_generation
+}
+
+/// Post-frame bookkeeping decision for one `Renderer::frame` call.
+///
+/// See [`decide_frame_commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FrameCommit {
+    /// Retire the chrome dirty state (`last_painted_chrome_gen =
+    /// chrome_generation`).
+    advance_chrome_gen: bool,
+    /// Feed this `submit_done_us` sample into the occlusion heuristic.
+    observe_us: Option<u64>,
+    /// Ask for another paint: the pixels never reached the GPU.
+    retry_paint: bool,
+}
+
+/// Decide what may be committed after a `Renderer::frame` call.
+///
+/// `outcome` is `None` when `frame()` returned `Err`, otherwise
+/// `Some((submit_done_us, submitted))`.
+///
+/// Rules (H8 / M34):
+///
+/// - Only a frame that was actually submitted to the render worker may
+///   retire the chrome dirty state; a skipped frame uploaded nothing, so
+///   erasing the dirty flag would drop the update on the floor.
+/// - Only a submitted frame yields a fresh timing sample; a skip returns
+///   the previous frame's stats and re-observing them double-counts a
+///   single real measurement.
+/// - A skip means the paint still owes the user pixels, so it schedules a
+///   retry. An `Err` does NOT: errors are sticky in practice and retrying
+///   them just burns wakeups.
+fn decide_frame_commit(
+    outcome: Option<(u64, crate::render::Submitted)>,
+    chrome_dirty_effective: bool,
+) -> FrameCommit {
+    match outcome {
+        Some((submit_done_us, crate::render::Submitted::Yes)) => FrameCommit {
+            advance_chrome_gen: chrome_dirty_effective,
+            observe_us: Some(submit_done_us),
+            retry_paint: false,
+        },
+        Some((_, crate::render::Submitted::No)) => FrameCommit {
+            advance_chrome_gen: false,
+            observe_us: None,
+            retry_paint: true,
+        },
+        None => FrameCommit::default(),
+    }
 }
 
 /// Whether the chrome buffer must be re-uploaded to the GPU this frame.
@@ -10752,24 +10988,6 @@ mod tests {
         assert_eq!(physical_cursor_to_dip(200, 400, 0, -1.0), (200, 400));
     }
 
-    // ---- physical_wheel_to_dip tests ----------------------------------------
-
-    #[test]
-    fn wheel_dip_scale_1x_identity() {
-        assert_eq!(physical_wheel_to_dip(120, -120, 1.0), (120, -120));
-    }
-
-    #[test]
-    fn wheel_dip_scale_2x_halves() {
-        assert_eq!(physical_wheel_to_dip(120, -240, 2.0), (60, -120));
-    }
-
-    #[test]
-    fn wheel_dip_zero_scale_safe() {
-        // Degenerate scale must not divide-by-zero.
-        assert_eq!(physical_wheel_to_dip(60, 60, 0.0), (60, 60));
-    }
-
     // ---- Group 3: proptest on cef_child_rect_pure ---------------------------
     //
     // Random (full_w, full_h, scale, has_notice) inputs drive the pure
@@ -11040,65 +11258,6 @@ mod tests {
             assert_eq!(char_to_vk(b'c' as u16), Some(0x43));
             assert_eq!(char_to_vk(b'o' as u16), Some(0x4F));
         }
-    }
-
-    // ---- char_to_vk tests (always compiled — no winit dep) ---------------
-
-    mod char_to_vk_tests {
-        use super::*;
-
-        #[test]
-        fn char_to_vk_letters_lowercase() {
-            assert_eq!(char_to_vk(b'a' as u16), Some(0x41)); // VK_A
-            assert_eq!(char_to_vk(b's' as u16), Some(0x53)); // VK_S
-            assert_eq!(char_to_vk(b'z' as u16), Some(0x5A)); // VK_Z
-        }
-
-        #[test]
-        fn char_to_vk_letters_uppercase() {
-            assert_eq!(char_to_vk(b'A' as u16), Some(0x41)); // VK_A
-            assert_eq!(char_to_vk(b'Z' as u16), Some(0x5A)); // VK_Z
-        }
-
-        #[test]
-        fn char_to_vk_digits() {
-            assert_eq!(char_to_vk(b'0' as u16), Some(0x30));
-            assert_eq!(char_to_vk(b'5' as u16), Some(0x35));
-            assert_eq!(char_to_vk(b'9' as u16), Some(0x39));
-        }
-
-        #[test]
-        fn char_to_vk_punctuation() {
-            assert_eq!(char_to_vk(b'.' as u16), Some(0xBE));
-            assert_eq!(char_to_vk(b',' as u16), Some(0xBC));
-            assert_eq!(char_to_vk(b'-' as u16), Some(0xBD));
-            assert_eq!(char_to_vk(b'/' as u16), Some(0xBF));
-            assert_eq!(char_to_vk(b'\'' as u16), Some(0xDE));
-        }
-
-        #[test]
-        fn char_to_vk_control_chars() {
-            assert_eq!(char_to_vk(b' ' as u16), Some(0x20)); // VK_SPACE
-            assert_eq!(char_to_vk(b'\r' as u16), Some(0x0D)); // VK_RETURN
-            assert_eq!(char_to_vk(b'\t' as u16), Some(0x09)); // VK_TAB
-            assert_eq!(char_to_vk(0x08), Some(0x08)); // VK_BACK
-            assert_eq!(char_to_vk(0x1B), Some(0x1B)); // VK_ESCAPE
-        }
-
-        #[test]
-        fn char_to_vk_shifted_symbols_have_no_direct_vk() {
-            for c in [
-                '@', '#', '$', '%', '^', '&', '*', '(', ')', '!', '~', '_', '+',
-            ] {
-                assert_eq!(char_to_vk(c as u16), None, "no direct VK for {c:?}");
-            }
-        }
-
-        #[test]
-        fn char_to_vk_non_ascii_returns_none() {
-            assert_eq!(char_to_vk(0x00E9), None); // é
-            assert_eq!(char_to_vk(0x4E2D), None); // 中
-        }
 
         #[test]
         fn resolve_char_unit_from_text() {
@@ -11106,5 +11265,301 @@ mod tests {
             assert_eq!(resolve_char_unit(Some(".")), b'.' as u16);
             assert_eq!(resolve_char_unit(None), 0);
         }
+    }
+
+    // ---- Group 8: frame-submission bookkeeping (H8 / M34) ----------------
+    //
+    // Invariant: nothing that consumes dirty state or feeds the occlusion
+    // heuristic may run for a frame the renderer never submitted.
+    // `Renderer::frame` returns Ok(..) on five skip paths (worker busy,
+    // channel full, Timeout / Occluded / Validation / stale-size acquire
+    // failures) carrying either the PREVIOUS frame's stats or defaults.
+
+    use crate::render::Submitted;
+
+    #[test]
+    fn frame_commit_submitted_retires_dirty_and_samples() {
+        let c = decide_frame_commit(Some((1234, Submitted::Yes)), true);
+        assert!(c.advance_chrome_gen, "submitted + dirty must retire dirty");
+        assert_eq!(c.observe_us, Some(1234), "submitted frame yields a sample");
+        assert!(!c.retry_paint, "submitted frame needs no retry");
+    }
+
+    #[test]
+    fn frame_commit_submitted_clean_chrome_does_not_advance() {
+        // Nothing was dirty, so there is nothing to retire — but the
+        // timing sample is still real.
+        let c = decide_frame_commit(Some((10, Submitted::Yes)), false);
+        assert!(!c.advance_chrome_gen);
+        assert_eq!(c.observe_us, Some(10));
+    }
+
+    #[test]
+    fn frame_commit_skipped_keeps_dirty_state() {
+        // H8: the omnibar keystroke repro. Chrome was dirty, the worker was
+        // still presenting, so the pixels never went up — the dirty flag
+        // must survive or the character is lost until an unrelated event.
+        let c = decide_frame_commit(Some((999_999, Submitted::No)), true);
+        assert!(
+            !c.advance_chrome_gen,
+            "a skipped frame must not retire the chrome dirty state"
+        );
+        assert!(c.retry_paint, "a skipped frame must be retried");
+    }
+
+    #[test]
+    fn frame_commit_skipped_does_not_resample_stale_stats() {
+        // M34(a): a skip returns the previous frame's numbers. Feeding a
+        // 150 ms sample back in twice fills the history and falsely trips
+        // the 3-of-5 rule.
+        let c = decide_frame_commit(Some((150_000, Submitted::No)), true);
+        assert_eq!(
+            c.observe_us, None,
+            "stale stats from a skipped frame must not be observed"
+        );
+    }
+
+    #[test]
+    fn frame_commit_error_neither_retires_nor_samples() {
+        let c = decide_frame_commit(None, true);
+        assert!(!c.advance_chrome_gen);
+        assert_eq!(c.observe_us, None);
+        assert!(
+            !c.retry_paint,
+            "errors are sticky; retrying just burns wakeups"
+        );
+    }
+
+    #[test]
+    fn skipped_frames_cannot_fill_the_occlusion_history() {
+        // M34(a) end to end against the real heuristic: one genuinely slow
+        // frame followed by four skips must NOT trip the 3-of-5 rule,
+        // because only the submitted frame contributes a sample.
+        let mut history = VecDeque::with_capacity(PRESENT_HISTORY_SIZE);
+        let outcomes = [
+            Some((150_000u64, Submitted::Yes)),
+            Some((150_000, Submitted::No)),
+            Some((150_000, Submitted::No)),
+            Some((150_000, Submitted::No)),
+            Some((150_000, Submitted::No)),
+        ];
+        for o in outcomes {
+            if let Some(us) = decide_frame_commit(o, false).observe_us {
+                record_present_us(&mut history, us);
+            }
+        }
+        assert_eq!(history.len(), 1, "only the submitted frame is a sample");
+        assert!(
+            !detect_occluded_from_history(
+                &history,
+                SLOW_PRESENT_THRESHOLD_US,
+                SLOW_FRAMES_TO_OCCLUDE
+            ),
+            "one slow frame plus skips must not declare occlusion"
+        );
+        // Sanity: three real slow frames still do.
+        let mut history = VecDeque::with_capacity(PRESENT_HISTORY_SIZE);
+        for _ in 0..3 {
+            if let Some(us) = decide_frame_commit(Some((150_000, Submitted::Yes)), false).observe_us
+            {
+                record_present_us(&mut history, us);
+            }
+        }
+        assert!(detect_occluded_from_history(
+            &history,
+            SLOW_PRESENT_THRESHOLD_US,
+            SLOW_FRAMES_TO_OCCLUDE
+        ));
+    }
+
+    #[test]
+    fn skipped_probe_cannot_fake_a_wake() {
+        // M34(b): while Sleeping, a skipped probe used to re-observe the
+        // previous frame's FAST value with was_probe = true and take the
+        // "probe fast → wake" branch without ever presenting. No sample
+        // means no wake decision.
+        assert_eq!(
+            decide_frame_commit(Some((100, Submitted::No)), false).observe_us,
+            None
+        );
+    }
+
+    // ---- Group 9: modal geometry, shared by paint and hit-test ----------
+    //
+    // Invariant (M30): the painter and the click hit-test derive the panel
+    // from the SAME `ModalPanel`, in logical space. Invariant (M32): the
+    // panel never exceeds the buffer width, so the centring subtraction
+    // cannot underflow.
+
+    #[test]
+    fn modal_panel_is_60_percent_within_the_clamp_band() {
+        let p = ModalPanel::confirm(1000, 800);
+        assert_eq!(p.w, 600);
+        assert_eq!(p.x, 200);
+        assert_eq!(p.y, 800 / 3);
+        assert_eq!(p.inner_x, p.x + OMNIBAR_POPUP_BORDER);
+        assert_eq!(p.inner_w, p.w - 2 * OMNIBAR_POPUP_BORDER);
+    }
+
+    #[test]
+    fn modal_panel_clamps_to_max_width() {
+        // 60% of 4000 = 2400, above the 800 px cap.
+        assert_eq!(ModalPanel::confirm(4000, 800).w, OMNIBAR_POPUP_MAX_WIDTH);
+    }
+
+    #[test]
+    fn modal_panel_narrow_window_does_not_underflow() {
+        // M32: a 500 px window at scale 2 gives lwidth = 250, below the
+        // 300 px floor. The old `.clamp(300, 800)` produced popup_w = 300
+        // and then `250 - 300` — debug panic, release wrap.
+        for win_w in [0u32, 1, 10, 199, 250, 299, 300, 301] {
+            let p = ModalPanel::confirm(win_w, 800);
+            assert!(p.w <= win_w, "panel {} wider than window {win_w}", p.w);
+            assert!(p.x + p.w <= win_w, "panel spills past window {win_w}");
+            let o = ModalPanel::omnibar(win_w, 800, 40);
+            assert!(o.w <= win_w, "omnibar {} wider than window {win_w}", o.w);
+            assert!(o.x + o.w <= win_w);
+        }
+    }
+
+    #[test]
+    fn modal_panel_height_clamped_to_window() {
+        // Panel pinned to the upper third; a short window truncates it
+        // instead of running past the bottom edge.
+        let p = ModalPanel::confirm(1000, 90);
+        assert!(p.y + p.h <= 90);
+    }
+
+    #[test]
+    fn confirm_buttons_hit_at_scale_1() {
+        // Logical == physical at 1×: the centre of the Yes rect resolves
+        // to Yes and the centre of No to No.
+        let (lw, lh) = logical_chrome_dims(1000, 800, 1.0);
+        let panel = ModalPanel::confirm(lw, lh);
+        let confirm = buffr_ui::ConfirmPrompt {
+            message: String::new(),
+            yes_label: "Yes (y)".to_string(),
+            no_label: "No (n)".to_string(),
+        };
+        let (yes, no) = confirm.button_rects_at(panel.inner_x, panel.inner_y, panel.inner_w);
+        let centre = |r: buffr_ui::ConfirmRect| (r.0 + r.2 / 2, r.1 + r.3 / 2);
+        let (yx, yy) = centre(yes);
+        let (nx, ny) = centre(no);
+        let (lx, ly) = physical_cursor_to_dip(yx, yy, 0, 1.0);
+        assert_eq!(hit_test_confirm_buttons(lw, lh, lx, ly), Some(true));
+        let (lx, ly) = physical_cursor_to_dip(nx, ny, 0, 1.0);
+        assert_eq!(hit_test_confirm_buttons(lw, lh, lx, ly), Some(false));
+        // A point well away from both buttons misses.
+        assert_eq!(hit_test_confirm_buttons(lw, lh, 5, 5), None);
+    }
+
+    #[test]
+    fn confirm_buttons_hit_at_scale_2() {
+        // M30: the panel is painted into the LOGICAL buffer, so a physical
+        // cursor over the drawn "Yes" is at 2x its logical coords. Testing
+        // the physical value directly (the old behaviour) misses.
+        let scale = 2.0;
+        let (phys_w, phys_h) = (2000u32, 1600u32);
+        let (lw, lh) = logical_chrome_dims(phys_w, phys_h, scale);
+        assert_eq!((lw, lh), (1000, 800));
+        let panel = ModalPanel::confirm(lw, lh);
+        let confirm = buffr_ui::ConfirmPrompt {
+            message: String::new(),
+            yes_label: "Yes (y)".to_string(),
+            no_label: "No (n)".to_string(),
+        };
+        let (yes, _no) = confirm.button_rects_at(panel.inner_x, panel.inner_y, panel.inner_w);
+        let (yes_cx, yes_cy) = (yes.0 + yes.2 / 2, yes.1 + yes.3 / 2);
+        // Where the user's cursor physically is when hovering that pixel.
+        let (phys_x, phys_y) = (yes_cx * 2, yes_cy * 2);
+        let (lx, ly) = physical_cursor_to_dip(phys_x, phys_y, 0, scale);
+        assert_eq!(
+            hit_test_confirm_buttons(lw, lh, lx, ly),
+            Some(true),
+            "converted cursor must land on Yes at scale 2"
+        );
+        // The pre-fix behaviour — physical coords against the logical
+        // panel — must be a miss, which is exactly the reported bug.
+        assert_ne!(
+            hit_test_confirm_buttons(lw, lh, phys_x, phys_y),
+            Some(true),
+            "raw physical coords should NOT hit; that was the bug"
+        );
+    }
+
+    #[test]
+    fn context_menu_overlay_hit_matches_paint_space_at_scale_2() {
+        // The menu is painted from `to_overlay(lwidth, lheight)` into the
+        // logical buffer; the hit-test must use the same dims and DIP
+        // cursor coords.
+        let scale = 2.0;
+        let (lw, lh) = logical_chrome_dims(2000, 1600, scale);
+        let overlay = buffr_ui::ContextMenuOverlay {
+            entries: vec![
+                buffr_ui::ContextMenuEntry {
+                    label: "Back".to_string(),
+                    is_separator: false,
+                    enabled: true,
+                },
+                buffr_ui::ContextMenuEntry {
+                    label: "Reload".to_string(),
+                    is_separator: false,
+                    enabled: true,
+                },
+            ],
+            selected: 0,
+            x: 100,
+            y: 120,
+        };
+        let (px, py, pw, ph) = overlay.panel_rect(lw as usize, lh as usize);
+        let (cx, cy) = (px + pw / 2, py + ph / 2);
+        // Physical cursor over that logical pixel.
+        let (lx, ly) = physical_cursor_to_dip(cx * 2, cy * 2, 0, scale);
+        assert!(
+            overlay.contains(lw as usize, lh as usize, lx, ly),
+            "converted cursor must be inside the panel"
+        );
+        assert!(
+            !overlay.contains(lw as usize, lh as usize, cx * 2, cy * 2),
+            "raw physical coords fall outside the logical panel; that was the bug"
+        );
+    }
+
+    // ---- Group 10: popup address-bar strip scaling (M31) -----------------
+
+    #[test]
+    fn popup_bar_height_scales_with_the_popup() {
+        assert_eq!(popup_bar_h_physical(1.0), STATUSLINE_HEIGHT);
+        assert_eq!(popup_bar_h_physical(2.0), STATUSLINE_HEIGHT * 2);
+        // Fractional scale rounds to the nearest physical row.
+        assert_eq!(
+            popup_bar_h_physical(1.5),
+            ((STATUSLINE_HEIGHT as f32) * 1.5).round() as u32
+        );
+        // Degenerate scale is clamped, never zero-height or NaN.
+        assert_eq!(popup_bar_h_physical(0.0), STATUSLINE_HEIGHT);
+        assert_eq!(popup_bar_h_physical(-4.0), STATUSLINE_HEIGHT);
+    }
+
+    #[test]
+    fn popup_content_rect_leaves_room_below_the_bar_at_scale_2() {
+        // The OSR dst_rect starts below the address bar in PHYSICAL rows.
+        // Using the logical constant left the bar half-drawn and the page
+        // shifted up by STATUSLINE_HEIGHT physical pixels.
+        let (phys_h, scale) = (1600u32, 2.0);
+        let bar = popup_bar_h_physical(scale);
+        assert_eq!(bar, STATUSLINE_HEIGHT * 2);
+        let content_h = phys_h.saturating_sub(bar).max(1);
+        assert_eq!(content_h, phys_h - STATUSLINE_HEIGHT * 2);
+    }
+
+    #[test]
+    fn logical_chrome_dims_round_and_clamp() {
+        assert_eq!(logical_chrome_dims(1000, 800, 1.0), (1000, 800));
+        assert_eq!(logical_chrome_dims(2000, 1600, 2.0), (1000, 800));
+        assert_eq!(logical_chrome_dims(1000, 800, 1.5), (667, 533));
+        // Never zero, even for a degenerate surface or scale.
+        assert_eq!(logical_chrome_dims(0, 0, 2.0), (1, 1));
+        assert_eq!(logical_chrome_dims(10, 10, 0.0), (10, 10));
     }
 }

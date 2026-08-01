@@ -6,7 +6,7 @@
 //! maps winit's `Ime::Preedit` / `Ime::Commit` events through to the
 //! shape below. winit's `Enabled` / `Disabled` lifecycle variants are
 //! discarded (wayr doesn't emit them — IME enable is consumer-driven
-//! via `Toplevel::ime`).
+//! on the Linux backend).
 
 /// Semantic purpose of a text input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,34 +40,6 @@ pub enum ContentPurpose {
     Datetime,
     /// Terminal / shell command line.
     Terminal,
-}
-
-bitflags::bitflags! {
-    /// Hint flags. Matches wayr's `ContentHint` bit positions so a
-    /// future shared `buffr_ime` crate can rely on them.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-    pub struct ContentHint: u32 {
-        /// Suggest completions.
-        const COMPLETION    = 1 << 0;
-        /// Auto-correct.
-        const SPELLCHECK    = 1 << 1;
-        /// Auto-capitalize.
-        const AUTO_CAPITAL  = 1 << 2;
-        /// Lowercase only.
-        const LOWERCASE     = 1 << 3;
-        /// Uppercase only.
-        const UPPERCASE     = 1 << 4;
-        /// Title-case (first letter of each word).
-        const TITLECASE     = 1 << 5;
-        /// Hide visible feedback (passwords).
-        const HIDDEN_TEXT   = 1 << 6;
-        /// Sensitive (don't expose to clipboard managers / dictation).
-        const SENSITIVE_DATA = 1 << 7;
-        /// Latin script only.
-        const LATIN         = 1 << 8;
-        /// Allow multiple lines.
-        const MULTILINE     = 1 << 9;
-    }
 }
 
 /// IME event dispatched as part of [`crate::windowing::WindowEvent::Ime`].

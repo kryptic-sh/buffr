@@ -58,8 +58,6 @@ thiserror.workspace = true
 # inside winit itself, so they stay active regardless.
 # Linux gets the `wayland` feature added via the target block below.
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-# Used by windowing/other/ime.rs for ContentHint flags.
-bitflags.workspace = true
 
 [dev-dependencies]
 proptest = "1"

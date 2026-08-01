@@ -25,7 +25,6 @@ use winit::event::WindowEvent as WinitWindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId as WinitWindowId;
 
-use super::cursor::CursorIcon;
 use super::event::WindowEvent;
 use super::geometry::{Position, Size};
 use super::ime::ImeEvent;
@@ -395,20 +394,13 @@ impl<'a, T: 'static, A: ApplicationHandler<T>> WinitAppHandler<T> for Bridge<'a,
             WinitWindowEvent::Focused(false) => Some(WindowEvent::Unfocused),
             WinitWindowEvent::Occluded(occ) => Some(WindowEvent::Occluded(occ)),
             WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // winit's InnerSizeWriter is opaque; "suggested" size
-                // is approximated as the current physical size since
-                // we can't read the writer without applying.
-                let phys = self
-                    .ev
-                    .id_map
-                    .iter()
-                    .find(|(_wid, sid_)| **sid_ == sid)
-                    .map(|(_, _)| ())
-                    .and(None::<Size>) // placeholder — winit doesn't expose size pre-write
-                    .unwrap_or_default();
+                // winit's `InnerSizeWriter` is opaque — the new size
+                // cannot be read before it is applied — so there is no
+                // suggestion to forward. Consumers read the live size
+                // from the window instead (nothing reads this field).
                 Some(WindowEvent::ScaleFactorChanged {
                     new_scale_factor: scale_factor,
-                    suggested_size: phys,
+                    suggested_size: Size::default(),
                 })
             }
             WinitWindowEvent::CursorEntered { .. } => {

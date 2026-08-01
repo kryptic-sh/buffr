@@ -997,12 +997,16 @@ impl Renderer {
     /// - `osr`: when `Some`, pixels are cloned and sent to the worker which
     ///   conditionally uploads to the OSR texture (only when generation
     ///   changed or dims differ). When `None`, only the chrome pass runs.
+    ///
+    /// The second tuple element reports whether a command actually reached
+    /// the worker. See [`Submitted`] — callers MUST NOT retire dirty state
+    /// or sample the returned [`FrameStats`] when it is `Submitted::No`.
     pub fn frame<F>(
         &mut self,
         chrome_dirty: bool,
         paint_chrome: F,
         osr: Option<OsrUpload<'_>>,
-    ) -> Result<FrameStats>
+    ) -> Result<(FrameStats, Submitted)>
     where
         F: FnOnce(&mut [u32], usize, usize),
     {
@@ -1033,7 +1037,7 @@ impl Renderer {
                 in_flight = self.frames_in_flight,
                 "renderer.frame: worker still busy with previous frame, skipping"
             );
-            return Ok(self.last_present_stats);
+            return Ok((self.last_present_stats, Submitted::No));
         }
 
         // Chrome CPU paint — only when dirty. The closure runs on the UI
@@ -1129,15 +1133,15 @@ impl Renderer {
                         tracing::warn!(
                             "wgpu surface: get_current_texture timed out, skipping frame"
                         );
-                        return Ok(FrameStats::default());
+                        return Ok((FrameStats::default(), Submitted::No));
                     }
                     wgpu::CurrentSurfaceTexture::Occluded => {
                         tracing::debug!("wgpu surface: occluded, skipping frame");
-                        return Ok(FrameStats::default());
+                        return Ok((FrameStats::default(), Submitted::No));
                     }
                     wgpu::CurrentSurfaceTexture::Validation => {
                         tracing::warn!("wgpu surface: validation error, skipping frame");
-                        return Ok(FrameStats::default());
+                        return Ok((FrameStats::default(), Submitted::No));
                     }
                 }
             }
@@ -1152,11 +1156,11 @@ impl Renderer {
                             actual_h = actual.1,
                             "wgpu surface: still mismatched after retry — skipping frame"
                         );
-                        return Ok(FrameStats::default());
+                        return Ok((FrameStats::default(), Submitted::No));
                     }
                     f
                 }
-                None => return Ok(FrameStats::default()),
+                None => return Ok((FrameStats::default(), Submitted::No)),
             }
         };
 
@@ -1172,22 +1176,25 @@ impl Renderer {
             osr: osr_owned,
         };
 
-        match self.render_chan.tx_cmd.try_send(cmd) {
+        let submitted = match self.render_chan.tx_cmd.try_send(cmd) {
             Ok(()) => {
                 // Track outstanding frame so the next call to `frame()` won't
                 // try to acquire another swapchain texture before this one is
                 // presented.
                 self.frames_in_flight += 1;
+                Submitted::Yes
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 // Should be unreachable now that we gate acquire on
                 // frames_in_flight, but stays defensive.
                 tracing::trace!("renderer.frame: render worker busy, dropping frame");
+                Submitted::No
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 tracing::warn!("renderer.frame: render worker thread exited unexpectedly");
+                Submitted::No
             }
-        }
+        };
 
         let chrome_us = t_chrome.as_micros() as u64;
         let osr_clone_us = (t_osr_clone - t_chrome).as_micros() as u64;
@@ -1221,10 +1228,13 @@ impl Renderer {
             );
         }
 
-        Ok(FrameStats {
-            present_us: self.last_present_stats.present_us,
-            submit_done_us,
-        })
+        Ok((
+            FrameStats {
+                present_us: self.last_present_stats.present_us,
+                submit_done_us,
+            },
+            submitted,
+        ))
     }
 }
 
@@ -1299,6 +1309,35 @@ pub struct FrameStats {
     /// balloons to seconds — a SAME-frame signal that complements the
     /// lagged `present_us`.
     pub submit_done_us: u64,
+}
+
+/// Whether [`Renderer::frame`] actually handed a `RenderCommand` to the
+/// render worker.
+///
+/// `frame()` returns `Ok(..)` on several paths that never upload a single
+/// pixel — the worker is still presenting the previous frame, the swapchain
+/// texture could not be acquired (Timeout / Occluded / Validation /
+/// stale-size), or the command channel was full. On those paths the
+/// accompanying [`FrameStats`] are stale (the previous frame's numbers) or
+/// zeroed, and the caller's dirty state was NOT consumed.
+///
+/// Callers must therefore gate two things on `Submitted::Yes`:
+///
+/// 1. Retiring "these pixels are on the GPU" state (`last_painted_chrome_gen`).
+///    Advancing it after a skip loses the update entirely until an unrelated
+///    event marks chrome dirty again. (State that tracks "these pixels were
+///    consumed from the shared CEF frame" — the embedder's
+///    `last_osr_generation` — is a different thing and must still advance.)
+/// 2. Feeding [`FrameStats`] into any timing heuristic. A skip returns the
+///    previous frame's sample, so counting it again double-counts one real
+///    measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submitted {
+    /// A `RenderCommand` was queued to the worker; the returned stats
+    /// describe real GPU work.
+    Yes,
+    /// The frame was skipped; the returned stats are stale or zeroed.
+    No,
 }
 
 fn make_texture(

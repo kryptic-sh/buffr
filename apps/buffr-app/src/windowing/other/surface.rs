@@ -16,12 +16,6 @@ use super::geometry::Size;
 pub struct SurfaceId(NonZeroU64);
 
 impl SurfaceId {
-    /// Construct a `SurfaceId` from a raw `u64`. `0` is reserved and
-    /// returns `None`.
-    pub fn from_raw(raw: u64) -> Option<Self> {
-        NonZeroU64::new(raw).map(Self)
-    }
-
     /// Extract the raw `u64`.
     pub fn as_u64(self) -> u64 {
         self.0.get()
@@ -48,24 +42,4 @@ pub trait Surface {
 
     /// Request the compositor schedule a redraw.
     fn request_redraw(&self);
-
-    /// Raw window handle placeholder. The concrete
-    /// `raw-window-handle 0.6` traits are implemented directly on
-    /// the [`super::Window`] type — consumers usually go through
-    /// those traits instead of this method.
-    fn raw_window_handle(&self) -> RawWindowHandlePlaceholder;
 }
-
-/// Placeholder kept for API parity with wayr; the real
-/// `raw-window-handle 0.6` impls live on [`super::Window`].
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub struct RawWindowHandlePlaceholder {
-    /// Opaque platform-specific pointer.
-    pub wl_surface: std::ptr::NonNull<std::ffi::c_void>,
-}
-
-// SAFETY: opaque pointer; carrying across threads is caller's
-// responsibility (matches wayr's safety statement).
-unsafe impl Send for RawWindowHandlePlaceholder {}
-unsafe impl Sync for RawWindowHandlePlaceholder {}

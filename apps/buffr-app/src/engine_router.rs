@@ -65,16 +65,6 @@ pub enum RouterError {
     /// `build()` was called with zero registered engines.
     #[error("empty engine registry")]
     EmptyRegistry,
-    /// The URL scheme is not allowed for navigation (e.g. `javascript:`,
-    /// `data:`). The caller should drop the navigation request.
-    ///
-    /// Note: scheme blocking in `classify_navigation` uses the
-    /// [`NavigationVerdict::DisallowedScheme`] path. This error variant exists
-    /// for future callers (e.g. direct `resolve_safe()`) that prefer
-    /// `Result`-based error propagation.
-    #[allow(dead_code)]
-    #[error("disallowed URL scheme `{0}` — navigation rejected")]
-    DisallowedScheme(String),
 }
 
 impl std::fmt::Debug for EngineRouter {
@@ -183,15 +173,6 @@ impl EngineRouter {
             return None;
         }
         Some(badge_label_text(id.as_str()))
-    }
-
-    /// Direct lookup by id (e.g. for issuing engine-wide commands like
-    /// resize-all or close-all). Used by Phase 3 multi-engine fan-out paths
-    /// in `main.rs`; suppressed here because `main.rs` accesses engines via
-    /// `AppState::engines` directly for the concrete `BrowserHost` type.
-    #[allow(dead_code)]
-    pub fn get(&self, id: &EngineId) -> Option<&Arc<dyn BrowserEngine>> {
-        self.engines.get(id)
     }
 }
 

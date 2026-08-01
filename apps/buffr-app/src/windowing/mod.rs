@@ -14,11 +14,6 @@
 //! Migration is incremental — see the `windowing/` module commits
 //! for the Phase-by-Phase log.
 
-// During Phases 1-2 the re-exports above are scaffolding; main.rs
-// hasn't migrated yet so the names look unused. Phase 3 flips
-// main.rs to import from here, at which point the allow comes off.
-#![allow(unused_imports)]
-
 // Concrete backend re-exports. The `other` module re-exports winit
 // types shaped so that buffr-app can use one set of names regardless
 // of which toolkit is underneath.
