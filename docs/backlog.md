@@ -166,12 +166,12 @@ slices.
   fixed alongside AUR, but it means the pin has never actually been exercised
   for github.com — a wrong pin there would still pass today.
 
-- **The sibling repos still use `accept-new` with the same unexpanded `~`.** So
-  their AUR/brew/scoop pushes have no effective host verification: nothing is
-  pinned, and TOFU on an ephemeral runner accepts whatever key is offered. They
-  publish fine, so this is not urgent, but the fix here (absolute path +
-  `StrictHostKeyChecking=yes` + pinned keys) is worth propagating. Not done —
-  out of scope for this repo's session.
+- **The sibling repos are fixed but unexercised.** `gpur`, `hjkl`, `hodl`,
+  `hrdr`, `inbx`, `krypt`, `pikr` and `sqeel` all carried the same unexpanded
+  `~` under `accept-new`, so none of them had real host verification either.
+  Each now pins the host keys and uses `StrictHostKeyChecking=yes` with absolute
+  `$HOME` paths. Their publish jobs are tag-gated too, so the change is unproven
+  until each cuts its next release — worth watching the first one.
 
 ---
 
