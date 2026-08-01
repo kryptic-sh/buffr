@@ -1,0 +1,123 @@
+name: Pages
+
+# buffr's documentation site: https://buffr.kryptic.sh/
+#
+# The book used to be built by the kryptic.sh website, which checked this
+# repo out and ran `mdbook build` while assembling the unified site. Two
+# things were wrong with that. A broken `SUMMARY.md` link here failed the
+# *website's* deploy instead of the pull request that introduced it, and
+# docs edits only reached the web on that site's daily cron. Both are fixed
+# by building where the docs are: the check below runs on every PR, and a
+# merge to main publishes.
+#
+# The split mirrors the one the org uses elsewhere — prose pages live on
+# www.kryptic.sh, and anything with a real build pipeline gets its own
+# subdomain and owns its own deploy. www.kryptic.sh/buffr/ remains the
+# project's landing page and links here.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/pages.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch: {}
+
+# Least privilege by default, as in ci.yml. Only `deploy` widens it, and
+# that job compiles and runs nothing — it just moves an artifact.
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned deliberately: the artifacts are compared to nothing, but an
+  # mdBook that changes its output between runs makes a docs diff
+  # unreadable. This is the version the kryptic.sh site used to build with.
+  MDBOOK_VERSION: '0.4.40'
+
+jobs:
+  # Runs on pull requests too, so a broken link fails the change that made
+  # it rather than the next deploy.
+  build:
+    name: build the docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # `create-missing = false` means mdBook does not invent a file for a
+      # SUMMARY entry that points at nothing — it just omits the page, so a
+      # typo'd path silently drops a chapter from the site. This is the
+      # check that catches it, moved here from the website's workflow.
+      - name: Check SUMMARY.md references files that exist
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r path; do
+            if [ -n "$path" ] && [ ! -f "docs/$path" ]; then
+              echo "::error::SUMMARY.md references missing file: docs/$path"
+              missing=1
+            fi
+          done < <(grep -oE '\(\./[^)]+\)' docs/SUMMARY.md | sed 's/(\.\///;s/)$//')
+          test "$missing" -eq 0
+
+      - name: Build
+        run: mdbook build
+
+      # GitHub reads CNAME on every deploy and *clears* the custom domain
+      # when it is absent, so losing this file does not fail anything — it
+      # quietly moves the site to kryptic-sh.github.io/buffr/ and breaks
+      # every link. It arrives via mdBook's copy of non-chapter files out of
+      # `docs/`, which is behaviour worth asserting rather than trusting.
+      - name: Check the custom domain survived the build
+        run: |
+          set -euo pipefail
+          test -f docs-site/CNAME || {
+            echo "::error::docs-site/CNAME is missing — the deploy would drop buffr.kryptic.sh"
+            exit 1
+          }
+          domain="$(tr -d '[:space:]' < docs-site/CNAME)"
+          test "$domain" = "buffr.kryptic.sh" || {
+            echo "::error::docs-site/CNAME says '$domain', expected buffr.kryptic.sh"
+            exit 1
+          }
+          test -f docs-site/index.html
+          echo "custom domain: $domain"
+
+      - name: Upload the site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs-site
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - id: deployment
+        uses: actions/deploy-pages@v4

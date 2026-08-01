@@ -1,10 +1,17 @@
 # mdBook configuration for buffr's docs site.
 #
 # Generates a static HTML site from `docs/*.md`. The rendered output
-# lives in `docs-site/` (gitignored target dir) and is mounted under
-# `https://www.kryptic.sh/buffr/docs/` by the kryptic.sh site's Pages
-# workflow, which checks out this repo and runs `mdbook build` while
-# assembling the unified site.
+# lives in `docs-site/` (gitignored target dir) and is published to
+# `https://buffr.kryptic.sh/` by this repo's own Pages workflow.
+#
+# It used to be built by the kryptic.sh site instead, which checked this
+# repo out and ran `mdbook build` while assembling the unified site. That
+# meant a broken `SUMMARY.md` link here failed the *website's* deploy
+# rather than the pull request that caused it, and the docs only went live
+# on the website's daily cron. The build now lives with the docs.
+#
+# `docs/CNAME` is the custom domain; mdBook copies non-chapter files out of
+# `src` into the build directory, and the workflow checks it arrived.
 #
 # Run locally:
 #   mdbook build       -> emits HTML into docs-site/
@@ -27,4 +34,5 @@ default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/kryptic-sh/buffr"
 edit-url-template = "https://github.com/kryptic-sh/buffr/edit/main/{path}"
-site-url = "/buffr/docs/"
+# Served at the domain root now, not under a /buffr/docs/ prefix.
+site-url = "/"
