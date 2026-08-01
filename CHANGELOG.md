@@ -8,6 +8,38 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-08-02
+
+A release-pipeline fix. v0.14.7 published everywhere except the AUR, so
+`buffr-bin` never left 0.14.6; this is the release that lets it catch up. No
+changes to the browser itself.
+
+### Fixed
+
+- **`buffr-bin` publishes to the AUR again.** The publish jobs passed ssh
+  options through a workflow `env:` block whose value held a literal `~`. That
+  is never expanded — git runs the command via `sh -c`, tilde expansion does not
+  apply to the result of a parameter expansion, and ssh does not expand `~` in a
+  `-o` value either — so `UserKnownHostsFile` named a directory literally called
+  `~`. It went unnoticed for as long as the jobs used
+  `StrictHostKeyChecking=accept-new`, which never reads the file; v0.14.7
+  switched to `yes`, and the AUR push failed with
+  `No ED25519 host key is known for aur.archlinux.org`. `GIT_SSH_COMMAND` is now
+  assigned inside the step so `$HOME` expands before git sees it.
+- **Host-key pinning in the publish jobs is now actually in effect.** Because
+  the path never resolved, `brew-tap` and `scoop-bucket` were verifying against
+  the runner image's global `/etc/ssh/ssh_known_hosts` rather than the pin the
+  workflow shipped. The pinned keys are re-verified against
+  `https://api.github.com/meta` and `ssh-keyscan aur.archlinux.org`.
+
+### Added
+
+- The user guide is published from this repository at
+  <https://buffr.kryptic.sh>, with the previous `/docs/` URLs redirecting to the
+  new root.
+
+[0.14.8]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.8
+
 ## [0.14.7] - 2026-08-01
 
 A full-codebase review (see `docs/code-review.md`) and the fixes for everything
@@ -1974,7 +2006,7 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.7...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.8...HEAD
 [0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
