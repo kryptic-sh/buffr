@@ -6,12 +6,25 @@
 //! notice and execs the child binary directly without a watchdog loop.
 //! This keeps `cargo build --workspace` green on every platform's CI.
 //!
-//! ## macOS socket path
+//! The platform-independent parts of the loop — waiting for the child to
+//! connect, watching the heartbeat, the rolling crash window and the
+//! restart/propagate/stop decision — live in [`supervisor`] and are generic
+//! over a [`supervisor::ChildHandle`].  Each platform only supplies its own
+//! "is the child alive / how did it die / kill it" primitive.
 //!
-//! Filesystem UDS only (abstract sockets do not exist on Darwin).
-//! `XDG_RUNTIME_DIR` is typically unset on macOS so the socket lands in
-//! `/tmp/buffr-<pid>.sock` — well within macOS's stricter `sun_path` limit
-//! (~104 bytes; `/tmp/buffr-99999.sock` is 23 bytes).
+//! ## Runtime files
+//!
+//! Both the heartbeat socket and the clean-shutdown flag live inside a
+//! private per-uid directory (`$XDG_RUNTIME_DIR/buffr`, else
+//! `$TMPDIR/buffr-<uid>` created `0700` and verified after creation).  A
+//! world-writable `/tmp/buffr-<pid>.*` is derivable by any local user, who
+//! could pre-create the clean flag to disable the crash watchdog or squat
+//! the socket path to disable hang detection.
+//!
+//! On macOS `XDG_RUNTIME_DIR` is normally unset, so the socket lands in
+//! `$TMPDIR/buffr-<uid>/buffr-<pid>.sock`.  `$TMPDIR` there is roughly
+//! `/var/folders/xx/<hash>/T/` (~50 bytes), leaving the full path well
+//! inside Darwin's ~104-byte `sun_path` limit.
 //!
 //! ## Usage
 //!
@@ -31,6 +44,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::Parser;
+
+#[cfg(any(unix, windows))]
+mod supervisor;
 
 /// Crash-restart + hang watchdog supervisor for the buffr browser.
 ///
@@ -79,10 +95,16 @@ fn resolve_child_bin() -> anyhow::Result<PathBuf> {
     // 1. Env override — for testing / dev.
     if let Ok(val) = std::env::var("BUFFR_CHILD_BIN") {
         let p = PathBuf::from(val);
-        if p.is_file() {
-            return Ok(p);
+        // The override must name a real file. Falling through with an
+        // unusable path only produces an opaque `spawn` failure later.
+        if !p.is_file() {
+            anyhow::bail!(
+                "BUFFR_CHILD_BIN is set to {} but that is not a file. \
+                 Point it at the buffr-app executable (an absolute path), \
+                 or unset it to use the sibling / PATH lookup.",
+                p.display()
+            );
         }
-        // Still return it — let exec fail with a clear OS error.
         return Ok(p);
     }
 
@@ -166,15 +188,20 @@ fn main() -> anyhow::Result<()> {
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsString;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::time::{Duration, Instant};
 
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
+
+    use crate::supervisor::{
+        ChildHandle, ConnectResult, CrashWindow, Disposition, ExitInfo, HeartbeatEvent,
+        WatchOutcome, classify, wait_for_connect, watch_heartbeat,
+    };
 
     /// Rolling window for crash backoff detection.
     const WINDOW_SECS: u64 = 30;
@@ -190,6 +217,10 @@ mod unix {
     const DEFAULT_CONNECT_GRACE: Duration = Duration::from_secs(20);
     /// Additional grace after the child connects before enforcing heartbeat.
     const POST_CONNECT_GRACE: Duration = Duration::from_millis(1500);
+    /// Slack added to the connect grace to derive the accept thread's own
+    /// deadline, so the thread always outlives the main loop's wait but
+    /// still terminates instead of spinning forever (M7).
+    const ACCEPT_DEADLINE_SLACK: Duration = Duration::from_secs(2);
 
     fn connect_grace() -> Duration {
         std::env::var("BUFFR_CONNECT_GRACE_MS")
@@ -210,15 +241,189 @@ mod unix {
     /// trigger a respawn after the user explicitly closed the window.
     pub const SUPERVISOR_CLEAN_FLAG_ENV: &str = "BUFFR_SUPERVISOR_CLEAN_FLAG";
 
-    /// Events the heartbeat listener thread sends back to the main loop.
-    pub enum HeartbeatEvent {
-        /// Child successfully connected.
-        Connected,
-        /// A ping byte arrived from the child.
-        Ping,
-        /// The connection was closed (EOF or error).
-        Disconnected,
+    // ── Child handle ─────────────────────────────────────────────────────────
+
+    /// A spawned `buffr-app` plus its process group, exposed to the shared
+    /// supervisor logic through [`ChildHandle`].
+    ///
+    /// `exit` memoises the reaped status: `try_wait`/`wait` may only be
+    /// harvested once, but the shared logic polls repeatedly.
+    struct UnixChild {
+        child: std::process::Child,
+        /// The child called `setsid()`, so its pid IS its process-group id.
+        pgid: Pid,
+        exit: Option<ExitInfo>,
     }
+
+    impl UnixChild {
+        fn new(child: std::process::Child) -> Self {
+            let pgid = Pid::from_raw(child.id() as i32);
+            Self {
+                child,
+                pgid,
+                exit: None,
+            }
+        }
+    }
+
+    /// `ExitStatus::code()` is `Some(_)` only for a normal exit; `None` means
+    /// the child was killed by a signal, which is the genuine crash case.
+    fn exit_info(status: std::process::ExitStatus) -> ExitInfo {
+        ExitInfo {
+            code: status.code(),
+            crashed: status.code().is_none(),
+        }
+    }
+
+    impl ChildHandle for UnixChild {
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn poll_exit(&mut self) -> Option<ExitInfo> {
+            if let Some(e) = self.exit {
+                return Some(e);
+            }
+            match self.child.try_wait() {
+                Ok(Some(s)) => {
+                    let e = exit_info(s);
+                    self.exit = Some(e);
+                    Some(e)
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(error = %err, "child.try_wait() failed; treating as crash");
+                    let e = ExitInfo {
+                        code: None,
+                        crashed: true,
+                    };
+                    self.exit = Some(e);
+                    Some(e)
+                }
+            }
+        }
+
+        fn wait_exit(&mut self) -> ExitInfo {
+            if let Some(e) = self.exit {
+                return e;
+            }
+            let e = match self.child.wait() {
+                Ok(s) => exit_info(s),
+                Err(err) => {
+                    tracing::warn!(error = %err, "child.wait() failed");
+                    ExitInfo {
+                        code: None,
+                        crashed: true,
+                    }
+                }
+            };
+            self.exit = Some(e);
+            e
+        }
+
+        fn kill_and_reap(&mut self) -> ExitInfo {
+            if let Some(e) = self.exit {
+                return e;
+            }
+            // killpg, not kill: the child is a session leader, so this takes
+            // out the whole CEF helper tree in one shot.
+            let _ = signal::killpg(self.pgid, Signal::SIGKILL);
+            self.wait_exit()
+        }
+    }
+
+    // ── Private runtime directory ────────────────────────────────────────────
+
+    fn own_uid() -> u32 {
+        nix::unistd::getuid().as_raw()
+    }
+
+    /// Create (if needed) and validate a directory that only we can enter.
+    ///
+    /// Rejects anything that is not a real directory owned by our uid with no
+    /// group/other permission bits — that covers a symlink, a squatted path,
+    /// and a shared directory another local user could write into.
+    fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => anyhow::bail!("creating {}: {e}", path.display()),
+        }
+
+        // symlink_metadata, not metadata: a symlink planted at this path must
+        // be rejected, not silently followed to whatever it points at.
+        let md = std::fs::symlink_metadata(path)
+            .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?;
+        if !md.is_dir() {
+            anyhow::bail!("{} exists but is not a directory", path.display());
+        }
+        let uid = own_uid();
+        if md.uid() != uid {
+            anyhow::bail!("{} is owned by uid {}, not {uid}", path.display(), md.uid());
+        }
+        if md.mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "{} is group/other accessible (mode {:o})",
+                path.display(),
+                md.mode() & 0o7777
+            );
+        }
+        Ok(())
+    }
+
+    /// Private per-uid directory holding the heartbeat socket and the
+    /// clean-shutdown flag.
+    ///
+    /// `$XDG_RUNTIME_DIR/buffr` when usable (that tree is already 0700 and
+    /// per-uid), otherwise `$TMPDIR/buffr-<uid>` created 0700. Both are
+    /// verified after creation — see [`ensure_private_dir`].
+    fn private_runtime_dir() -> anyhow::Result<PathBuf> {
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            let p = PathBuf::from(xdg).join("buffr");
+            match ensure_private_dir(&p) {
+                Ok(()) => return Ok(p),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %e,
+                        "supervisor: XDG_RUNTIME_DIR unusable; falling back to temp dir"
+                    );
+                }
+            }
+        }
+        let p = std::env::temp_dir().join(format!("buffr-{}", own_uid()));
+        ensure_private_dir(&p)?;
+        Ok(p)
+    }
+
+    /// Is the clean-shutdown flag genuinely present and ours?
+    ///
+    /// `Path::exists()` follows symlinks and does not check ownership, so a
+    /// pre-planted symlink (or, before the private-directory change, a file
+    /// created by any local user) would permanently suppress crash restarts.
+    fn clean_flag_present(path: &Path) -> bool {
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if !md.is_file() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "supervisor: clean-shutdown flag is not a regular file; ignoring"
+                );
+                false
+            }
+            Ok(md) if md.uid() != own_uid() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    owner_uid = md.uid(),
+                    "supervisor: clean-shutdown flag not owned by us; ignoring"
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    // ── Supervisor loop ──────────────────────────────────────────────────────
 
     pub fn run_supervisor(
         child_bin: PathBuf,
@@ -226,8 +431,7 @@ mod unix {
         heartbeat_timeout: Duration,
         heartbeat_disable: bool,
     ) -> anyhow::Result<()> {
-        // Timestamps of the last CRASH_LIMIT crashes/hangs (rolling window).
-        let mut crash_times: Vec<Instant> = Vec::new();
+        let mut crashes = CrashWindow::new(Duration::from_secs(WINDOW_SECS), CRASH_LIMIT);
         let mut restart_count: u32 = 0;
 
         // Flag set when supervisor receives SIGINT/SIGTERM so we know
@@ -237,12 +441,40 @@ mod unix {
         // Our own PID used for the socket path.
         let supervisor_pid = std::process::id();
 
+        let runtime_dir = match private_runtime_dir() {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "supervisor: no private runtime directory; heartbeat and \
+                     clean-shutdown detection are disabled"
+                );
+                None
+            }
+        };
+
+        // Clean-shutdown flag path. Deliberately independent of the heartbeat
+        // socket: it is what stops a segfault during CEF/wgpu teardown (after
+        // the user closed the window) from being read as a crash, and that
+        // matters just as much under `--heartbeat-disable` or after a bind
+        // failure.
+        let clean_flag_path = runtime_dir
+            .as_ref()
+            .map(|d| d.join(format!("buffr-{supervisor_pid}.clean")));
+
+        // Install signal forwarding exactly ONCE. The handler thread blocks
+        // in `signals.forever()` for the lifetime of the process, so calling
+        // this per iteration leaked one thread per restart, each holding a
+        // stale child pid that it would later `killpg` — a reused pid then
+        // gets an unrelated process group killed.
+        let child_pid_slot = Arc::new(AtomicI32::new(0));
+        let _signal_guard =
+            install_signal_forwarding(Arc::clone(&child_pid_slot), Arc::clone(&shutdown_requested));
+
         loop {
             // ── bind socket for this spawn ─────────────────────────────────
-            let (sock_path, listener, hb_rx) = if heartbeat_disable {
-                (None, None, None)
-            } else {
-                match setup_heartbeat_socket(supervisor_pid) {
+            let (sock_path, listener, hb_chan) = match (heartbeat_disable, runtime_dir.as_ref()) {
+                (false, Some(dir)) => match setup_heartbeat_socket(dir, supervisor_pid) {
                     Ok((path, listener)) => {
                         let (tx, rx) = std::sync::mpsc::channel::<HeartbeatEvent>();
                         (Some(path), Some(listener), Some((tx, rx)))
@@ -254,24 +486,15 @@ mod unix {
                         );
                         (None, None, None)
                     }
-                }
+                },
+                _ => (None, None, None),
             };
 
-            // ── clean-shutdown flag path ──────────────────────────────────
-            // Sibling of the heartbeat socket; supervisor owns it. Child
-            // touches the file when it's about to do an intentional
-            // exit; supervisor checks it after the child exits and
-            // suppresses restart when present, regardless of the
-            // actual exit status. Each spawn gets a fresh path so a
-            // stale flag from a prior child can't suppress a real
-            // crash restart.
-            let clean_flag_path = sock_path.as_ref().map(|p| {
-                let mut q = p.clone();
-                q.set_extension("clean");
-                // Remove any stale flag from a prior spawn.
-                let _ = std::fs::remove_file(&q);
-                q
-            });
+            // Remove any stale flag from a prior spawn so it cannot suppress
+            // a real crash restart.
+            if let Some(ref p) = clean_flag_path {
+                let _ = std::fs::remove_file(p);
+            }
 
             // ── spawn child ───────────────────────────────────────────────
             let spawn_time = Instant::now();
@@ -281,92 +504,76 @@ mod unix {
                 sock_path.as_deref(),
                 clean_flag_path.as_deref(),
             );
-            let mut child = match cmd.spawn() {
+            let child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     anyhow::bail!("failed to spawn child {}: {e}", child_bin.display());
                 }
             };
-
-            let child_pid = Pid::from_raw(child.id() as i32);
-            tracing::info!(pid = %child_pid, "child spawned");
+            let mut child = UnixChild::new(child);
+            let child_pid = child.pid();
+            child_pid_slot.store(child_pid as i32, Ordering::SeqCst);
+            tracing::info!(pid = child_pid, "child spawned");
 
             // ── start heartbeat listener thread ───────────────────────────
-            let hb_rx = hb_rx.map(|(tx, rx)| {
-                let listener = listener.expect("listener present when hb_rx present");
-                std::thread::spawn(move || heartbeat_accept_loop(listener, tx));
-                rx
-            });
-
-            // ── install signal forwarding ─────────────────────────────────
-            let sr = Arc::clone(&shutdown_requested);
-            let _signal_guard = install_signal_forwarding(child_pid, sr);
+            let hb_cancel = Arc::new(AtomicBool::new(false));
+            let (hb_rx, hb_join) = match hb_chan {
+                Some((tx, rx)) => {
+                    let listener = listener.expect("listener present when channel present");
+                    let cancel = Arc::clone(&hb_cancel);
+                    let accept_deadline = Instant::now() + connect_grace() + ACCEPT_DEADLINE_SLACK;
+                    let join = std::thread::spawn(move || {
+                        heartbeat_accept_loop(listener, tx, cancel, accept_deadline)
+                    });
+                    (Some(rx), Some(join))
+                }
+                None => (None, None),
+            };
 
             // ── wait for heartbeat connect within grace window ────────────
             //
-            // While waiting we also poll child.try_wait() so a fast-exiting
-            // child (e.g. /bin/true, --help, short subcommand) is detected
-            // before the 5 s grace window expires and is NOT treated as a
-            // connect-timeout "crash".
-            enum WatchResult {
-                HangDetected,
-                ChildExited(Option<std::process::ExitStatus>),
-            }
-
-            let watch_result = if let Some(ref rx) = hb_rx {
+            // While waiting we also poll the child so a fast-exiting child
+            // (e.g. /bin/true, --help, short subcommand) is detected before
+            // the grace window expires and is NOT treated as a connect-
+            // timeout "crash".
+            let outcome = if let Some(ref rx) = hb_rx {
                 match wait_for_connect(rx, &mut child, connect_grace()) {
                     ConnectResult::Connected => {
-                        tracing::info!(pid = %child_pid, "child connected to heartbeat socket");
+                        tracing::info!(pid = child_pid, "child connected to heartbeat socket");
                         // Post-connect grace: give CEF time to initialise.
-                        let post_connect_deadline =
+                        let first_deadline =
                             Instant::now() + POST_CONNECT_GRACE + heartbeat_timeout;
-                        // Now run the main ping-watch loop alongside the child.
-                        if watch_heartbeat(rx, &mut child, post_connect_deadline, heartbeat_timeout)
-                        {
-                            WatchResult::HangDetected
-                        } else {
-                            WatchResult::ChildExited(child.try_wait().ok().flatten())
-                        }
+                        watch_heartbeat(rx, &mut child, first_deadline, heartbeat_timeout)
                     }
                     ConnectResult::TimedOut => {
-                        // Child didn't connect within 5 s — treat as crash.
                         tracing::warn!(
-                            pid = %child_pid,
-                            "child did not connect to heartbeat socket within 5s; \
-                             treating as crash"
+                            pid = child_pid,
+                            grace_ms = connect_grace().as_millis(),
+                            "child did not connect to heartbeat socket within the grace \
+                             window; treating as crash"
                         );
-                        // Kill the child so child.wait() below doesn't block.
-                        let _ = signal::killpg(child_pid, Signal::SIGKILL);
-                        let _ = child.wait();
-                        WatchResult::HangDetected
+                        child.kill_and_reap();
+                        WatchOutcome::Hang
                     }
-                    ConnectResult::ChildExited(s) => WatchResult::ChildExited(s),
+                    ConnectResult::ChildExited(info) => WatchOutcome::Exited(info),
                 }
             } else {
                 // Heartbeat disabled or socket setup failed — just wait.
-                WatchResult::ChildExited(None)
+                WatchOutcome::Exited(child.wait_exit())
             };
 
-            // ── reap if still running ─────────────────────────────────────
-            let (hang_detected, status) = match watch_result {
-                WatchResult::HangDetected => (true, None),
-                WatchResult::ChildExited(s) => {
-                    // Reap if we haven't already.
-                    let status = if s.is_some() {
-                        s
-                    } else {
-                        match child.wait() {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "child.wait() failed");
-                                None
-                            }
-                        }
-                    };
-                    (false, status)
-                }
-            };
+            // ── stop the accept thread and release its fd (M7) ────────────
+            hb_cancel.store(true, Ordering::SeqCst);
+            drop(hb_rx);
+            if let Some(join) = hb_join {
+                let _ = join.join();
+            }
+            child_pid_slot.store(0, Ordering::SeqCst);
 
+            let (hang_detected, exit) = match outcome {
+                WatchOutcome::Hang => (true, None),
+                WatchOutcome::Exited(info) => (false, Some(info)),
+            };
             let elapsed = spawn_time.elapsed();
 
             // ── clean up socket ───────────────────────────────────────────
@@ -375,91 +582,77 @@ mod unix {
             }
 
             // ── decide whether to restart ─────────────────────────────────
-            // "Clean" means EITHER exit code 0 with no hang, OR the
-            // child touched the clean-shutdown flag before exiting
-            // (covers segfaults during CEF / wgpu teardown after the
-            // user explicitly closed the window — see the
-            // `SUPERVISOR_CLEAN_FLAG_ENV` doc).
-            let exit_code = status.as_ref().and_then(|s| s.code());
-            let exit_zero = exit_code == Some(0) && !hang_detected;
-            let flag_present = clean_flag_path.as_ref().is_some_and(|p| p.exists());
+            let flag_present = clean_flag_path.as_deref().is_some_and(clean_flag_present);
             // Remove the flag eagerly — whether or not we restart, the
             // next spawn re-creates its own.
             if let Some(ref p) = clean_flag_path {
                 let _ = std::fs::remove_file(p);
             }
-            let is_clean = exit_zero || flag_present;
 
-            if is_clean {
-                tracing::info!(
-                    pid = %child_pid,
-                    elapsed_ms = elapsed.as_millis(),
-                    exit_zero,
-                    flag_present,
-                    "child exited cleanly; supervisor done"
-                );
-                return Ok(());
+            match classify(hang_detected, exit.as_ref(), flag_present) {
+                Disposition::Done => {
+                    tracing::info!(
+                        pid = child_pid,
+                        elapsed_ms = elapsed.as_millis(),
+                        flag_present,
+                        "child exited cleanly; supervisor done"
+                    );
+                    return Ok(());
+                }
+                Disposition::Propagate(code) => {
+                    // If the supervisor itself was asked to shut down, the
+                    // child's exit is intentional — don't propagate a failure.
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        tracing::info!(
+                            pid = child_pid,
+                            "child exited after supervisor shutdown signal; not restarting"
+                        );
+                        return Ok(());
+                    }
+                    tracing::info!(
+                        pid = child_pid,
+                        elapsed_ms = elapsed.as_millis(),
+                        exit_code = code,
+                        "child exited normally with non-zero code; not restarting \
+                         (likely CLI or config error)"
+                    );
+                    std::process::exit(code);
+                }
+                Disposition::Restart => {}
             }
 
-            // If the supervisor itself was asked to shut down, don't restart.
             if shutdown_requested.load(Ordering::SeqCst) {
                 tracing::info!(
-                    pid = %child_pid,
+                    pid = child_pid,
                     "child exited after supervisor shutdown signal; not restarting"
                 );
                 return Ok(());
             }
 
-            // Normal exit with a non-zero code (CLI parse error, panic
-            // → exit(101), config validation failure, …) — the child
-            // chose to die with a real exit code, not killed by a
-            // signal. Respawning would just re-run the same failure;
-            // propagate the code and exit. `ExitStatus::code()`
-            // returns `Some(_)` only for normal exits — `None` means
-            // killed by signal, which is the genuine crash case we
-            // still want to handle below.
-            if !hang_detected
-                && let Some(code) = exit_code
-                && code != 0
-            {
-                tracing::info!(
-                    pid = %child_pid,
-                    elapsed_ms = elapsed.as_millis(),
-                    exit_code = code,
-                    "child exited normally with non-zero code; not restarting (likely CLI or config error)"
-                );
-                std::process::exit(code);
-            }
-
             // Crash / hang path.
             restart_count += 1;
-            let now = Instant::now();
-            crash_times.push(now);
-
-            // Evict entries older than WINDOW_SECS.
-            let window_start = now - Duration::from_secs(WINDOW_SECS);
-            crash_times.retain(|t| *t >= window_start);
+            let in_window = crashes.record(Instant::now());
 
             if hang_detected {
                 tracing::info!(
-                    pid = %child_pid,
+                    pid = child_pid,
                     restart_count,
-                    crashes_in_window = crash_times.len(),
+                    crashes_in_window = in_window,
                     elapsed_ms = elapsed.as_millis(),
                     "child hang detected; considering restart"
                 );
             } else {
                 tracing::info!(
-                    pid = %child_pid,
-                    exit_status = ?status,
+                    pid = child_pid,
+                    exit = ?exit,
                     restart_count,
-                    crashes_in_window = crash_times.len(),
+                    crashes_in_window = in_window,
                     elapsed_ms = elapsed.as_millis(),
                     "child crashed; considering restart"
                 );
             }
 
-            if crash_times.len() >= CRASH_LIMIT {
+            if crashes.limit_reached() {
                 tracing::error!(
                     "watchdog: {CRASH_LIMIT} crashes/hangs in {WINDOW_SECS}s, \
                      refusing to restart. Run buffr-app directly to capture \
@@ -477,23 +670,22 @@ mod unix {
         }
     }
 
-    /// Bind a Unix-domain socket the child will connect to.
+    /// Bind a Unix-domain socket the child will connect to, inside the
+    /// caller-supplied private runtime directory.
     ///
-    /// Path: `${XDG_RUNTIME_DIR}/buffr-<pid>.sock`
-    /// Fallback: `/tmp/buffr-<pid>.sock`
+    /// Path: `<runtime_dir>/buffr-<pid>.sock`.
     ///
-    /// Unlinks any stale socket at that path before binding.
+    /// Unlinks any stale socket at that path before binding — safe because
+    /// the directory is 0700 and per-uid, so only we could have created it.
     /// Sets permissions to 0600 (owner-only).
-    pub fn setup_heartbeat_socket(pid: u32) -> anyhow::Result<(PathBuf, UnixListener)> {
-        let filename = format!("buffr-{pid}.sock");
-        let path = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            PathBuf::from(xdg).join(&filename)
-        } else {
-            PathBuf::from("/tmp").join(&filename)
-        };
+    pub fn setup_heartbeat_socket(
+        runtime_dir: &Path,
+        pid: u32,
+    ) -> anyhow::Result<(PathBuf, UnixListener)> {
+        let path = runtime_dir.join(format!("buffr-{pid}.sock"));
 
         // Remove stale socket from a prior crash.
-        if path.exists() {
+        if std::fs::symlink_metadata(&path).is_ok() {
             let _ = std::fs::remove_file(&path);
         }
 
@@ -508,13 +700,29 @@ mod unix {
     }
 
     /// Accept exactly one connection; send events to `tx` until disconnected.
-    fn heartbeat_accept_loop(listener: UnixListener, tx: std::sync::mpsc::Sender<HeartbeatEvent>) {
+    ///
+    /// Terminates on `cancel`, on `accept_deadline`, when the receiver goes
+    /// away, or when the connection ends. Without those exits the thread
+    /// polled `accept()` at 20 Hz forever after a connect timeout, leaking a
+    /// thread and the listener fd on every restart.
+    fn heartbeat_accept_loop(
+        listener: UnixListener,
+        tx: std::sync::mpsc::Sender<HeartbeatEvent>,
+        cancel: Arc<AtomicBool>,
+        accept_deadline: Instant,
+    ) {
         use std::io::Read;
 
-        // Block until a client connects (we set non-blocking above; poll manually).
-        // The main thread uses wait_for_connect with its own timeout, so we just
-        // loop with short sleeps here.
+        // Poll for a client (the listener is non-blocking).
         let stream = loop {
+            if cancel.load(Ordering::SeqCst) {
+                tracing::debug!("heartbeat: accept loop cancelled before connect");
+                return;
+            }
+            if Instant::now() >= accept_deadline {
+                tracing::debug!("heartbeat: accept deadline expired; listener released");
+                return;
+            }
             match listener.accept() {
                 Ok((s, _)) => break s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -540,6 +748,9 @@ mod unix {
             .ok();
         let mut buf = [0u8; 64];
         loop {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
             match stream.read(&mut buf) {
                 Ok(0) => {
                     // EOF — child closed the socket.
@@ -570,118 +781,6 @@ mod unix {
         }
     }
 
-    enum ConnectResult {
-        /// Child successfully connected to the heartbeat socket.
-        Connected,
-        /// Grace window elapsed with no connection.
-        TimedOut,
-        /// Child exited before connecting (may be a clean exit).
-        ChildExited(Option<std::process::ExitStatus>),
-    }
-
-    /// Wait up to `grace` for the child to connect.
-    ///
-    /// Also polls `child.try_wait()` so a fast-exiting child (clean exit,
-    /// short subcommand, --help flag) is not misclassified as a hang.
-    fn wait_for_connect(
-        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
-        child: &mut std::process::Child,
-        grace: Duration,
-    ) -> ConnectResult {
-        let deadline = Instant::now() + grace;
-        loop {
-            // Check if child already exited before the grace window ends.
-            match child.try_wait() {
-                Ok(Some(s)) => return ConnectResult::ChildExited(Some(s)),
-                Ok(None) => {}
-                Err(_) => return ConnectResult::ChildExited(None),
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return ConnectResult::TimedOut;
-            }
-            match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
-                Ok(HeartbeatEvent::Connected) => return ConnectResult::Connected,
-                Ok(_) => continue, // ping before Connected — shouldn't happen but fine
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() >= deadline {
-                        return ConnectResult::TimedOut;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return ConnectResult::TimedOut;
-                }
-            }
-        }
-    }
-
-    /// Watch heartbeat pings; kill child on hang. Returns true if a hang was
-    /// detected (child was killed by us); false if the child exited normally.
-    fn watch_heartbeat(
-        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
-        child: &mut std::process::Child,
-        first_deadline: Instant,
-        timeout: Duration,
-    ) -> bool {
-        let child_pid = Pid::from_raw(child.id() as i32);
-        let mut last_ping = Instant::now();
-        let mut deadline = first_deadline;
-
-        loop {
-            // Check if child already exited (non-blocking).
-            match child.try_wait() {
-                Ok(Some(_)) => return false, // exited on its own
-                Ok(None) => {}
-                Err(_) => return false,
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                // Hang detected.
-                tracing::error!(
-                    "watchdog: ui hang detected (no heartbeat for {}s); \
-                     killing child pgid={}",
-                    timeout.as_secs(),
-                    child_pid
-                );
-                let _ = signal::killpg(child_pid, Signal::SIGKILL);
-                let _ = child.wait();
-                return true;
-            }
-
-            match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
-                Ok(HeartbeatEvent::Ping) => {
-                    let now = Instant::now();
-                    tracing::debug!(
-                        lag_ms = now.duration_since(last_ping).as_millis(),
-                        "heartbeat: ping received"
-                    );
-                    last_ping = now;
-                    deadline = now + timeout;
-                }
-                Ok(HeartbeatEvent::Connected) => {
-                    // Shouldn't arrive here (already connected) but reset.
-                    last_ping = Instant::now();
-                    deadline = last_ping + timeout;
-                }
-                Ok(HeartbeatEvent::Disconnected) => {
-                    tracing::warn!("heartbeat: child disconnected socket");
-                    // Child closed the socket — treat as crash/exit, let
-                    // child.wait() handle it.
-                    return false;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // No event in this slice — loop back and check deadline.
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Listener thread gone — child probably exited.
-                    return false;
-                }
-            }
-        }
-    }
-
     fn build_command(
         bin: &PathBuf,
         args: &[OsString],
@@ -696,6 +795,10 @@ mod unix {
         // Pass the socket path to the child via env var (if heartbeat active).
         if let Some(path) = sock_path {
             cmd.env(SUPERVISOR_SOCK_ENV, path);
+        } else {
+            // A stale value inherited from our own environment would make the
+            // child try to connect to somebody else's socket.
+            cmd.env_remove(SUPERVISOR_SOCK_ENV);
         }
 
         // Pass the clean-shutdown flag path so the child can signal
@@ -703,6 +806,8 @@ mod unix {
         // overrides exit-status crash detection.
         if let Some(path) = clean_flag_path {
             cmd.env(SUPERVISOR_CLEAN_FLAG_ENV, path);
+        } else {
+            cmd.env_remove(SUPERVISOR_CLEAN_FLAG_ENV);
         }
 
         // setsid: child becomes session leader + new process group.
@@ -719,17 +824,19 @@ mod unix {
         cmd
     }
 
-    /// Install handlers for SIGINT and SIGTERM.
+    /// Install handlers for SIGINT and SIGTERM, once for the whole process.
     ///
-    /// On receipt, forward the signal to the child's process group via
-    /// `killpg`, wait up to GRACEFUL_TIMEOUT for the child to exit, then
+    /// On receipt, forward the signal to the *current* child's process group
+    /// via `killpg`, wait up to `GRACEFUL_TIMEOUT` for it to exit, then
     /// SIGKILL if still alive. Sets `shutdown_requested` so the main loop
     /// knows not to restart after the forwarded signal.
     ///
-    /// Returns a join handle; dropping it leaves the thread running but
-    /// that's fine — the process is exiting anyway at that point.
+    /// The child pid is read from `child_pid_slot` at signal time rather than
+    /// captured at install time: the supervisor restarts the child, and a
+    /// handler holding a stale (possibly reused) pid would signal an
+    /// unrelated process group.
     fn install_signal_forwarding(
-        child_pid: Pid,
+        child_pid_slot: Arc<AtomicI32>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
         use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -752,7 +859,13 @@ mod unix {
                 );
                 shutdown_requested.store(true, Ordering::SeqCst);
 
+                let raw = child_pid_slot.load(Ordering::SeqCst);
+                if raw <= 0 {
+                    tracing::info!("no live child to forward the signal to");
+                    return;
+                }
                 // child_pid IS the pgid since the child called setsid().
+                let child_pid = Pid::from_raw(raw);
                 if let Err(e) = signal::killpg(child_pid, Signal::SIGTERM) {
                     tracing::warn!(error = %e, "killpg SIGTERM failed");
                 }
@@ -774,11 +887,80 @@ mod unix {
             }
         })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ensure_private_dir_creates_0700_and_accepts_it() {
+            let base = tempfile::tempdir().expect("tempdir");
+            let p = base.path().join("buffr-runtime");
+            ensure_private_dir(&p).expect("first create");
+            let md = std::fs::symlink_metadata(&p).unwrap();
+            assert_eq!(md.mode() & 0o7777, 0o700, "expected 0700");
+            // Idempotent.
+            ensure_private_dir(&p).expect("second call");
+        }
+
+        #[test]
+        fn ensure_private_dir_rejects_group_writable() {
+            let base = tempfile::tempdir().expect("tempdir");
+            let p = base.path().join("loose");
+            std::fs::create_dir(&p).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let err = ensure_private_dir(&p).expect_err("0777 dir must be rejected");
+            assert!(
+                err.to_string().contains("group/other"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn ensure_private_dir_rejects_symlink() {
+            let base = tempfile::tempdir().expect("tempdir");
+            let target = base.path().join("real");
+            std::fs::create_dir(&target).unwrap();
+            let link = base.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let err = ensure_private_dir(&link).expect_err("symlink must be rejected");
+            assert!(
+                err.to_string().contains("not a directory"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn clean_flag_present_requires_a_regular_file_we_own() {
+            let base = tempfile::tempdir().expect("tempdir");
+            let missing = base.path().join("nope.clean");
+            assert!(!clean_flag_present(&missing), "absent flag must be false");
+
+            let real = base.path().join("yes.clean");
+            std::fs::write(&real, b"").unwrap();
+            assert!(clean_flag_present(&real), "our own regular file counts");
+
+            // A symlink pointing at a file we own must NOT count: the
+            // symlink itself is what an attacker plants.
+            let link = base.path().join("link.clean");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(
+                !clean_flag_present(&link),
+                "symlinked flag must be rejected (Path::exists would follow it)"
+            );
+
+            // A directory is not a flag either.
+            let dir = base.path().join("dir.clean");
+            std::fs::create_dir(&dir).unwrap();
+            assert!(!clean_flag_present(&dir), "directory must be rejected");
+        }
+    }
 }
 
 // ── Windows supervisor (Job Objects + named-pipe heartbeat) ─────────────────
 #[cfg(windows)]
 mod windows {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -802,8 +984,15 @@ mod windows {
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, INFINITE,
-        PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
+        TerminateProcess, WaitForSingleObject,
+    };
+
+    use crate::supervisor::{
+        ChildHandle, ConnectResult, CrashWindow, Disposition, ExitInfo, HeartbeatEvent,
+        WatchOutcome, build_command_line, classify, is_crash_exit_code, wait_for_connect,
+        watch_heartbeat,
     };
 
     /// Rolling window for crash backoff detection.
@@ -830,6 +1019,11 @@ mod windows {
 
     /// Env var passed to the child with the named-pipe path.
     pub const SUPERVISOR_PIPE_ENV: &str = "BUFFR_SUPERVISOR_PIPE";
+    /// Env var passed to the child with the clean-shutdown flag path.
+    /// Mirrors the Unix side: the child touches this file before an
+    /// intentional exit so a segfault during CEF/wgpu teardown after the
+    /// user closed the window is not mistaken for a crash.
+    pub const SUPERVISOR_CLEAN_FLAG_ENV: &str = "BUFFR_SUPERVISOR_CLEAN_FLAG";
 
     /// Named pipe path: `\\.\pipe\buffr-supervisor-<pid>`.
     fn pipe_name(pid: u32) -> Vec<u16> {
@@ -874,12 +1068,129 @@ mod windows {
     // synchronisation.
     unsafe impl Send for OwnedHandle {}
 
-    /// Events the named-pipe reader thread sends back to the main loop.
-    pub enum HeartbeatEvent {
-        Connected,
-        Ping,
-        Disconnected,
+    // ── Child handle ─────────────────────────────────────────────────────────
+
+    /// A spawned `buffr-app.exe`, exposed to the shared supervisor logic
+    /// through [`ChildHandle`].
+    ///
+    /// The process handle is owned here and closed on drop.
+    struct WindowsChild {
+        handle: OwnedHandle,
+        pid: u32,
+        exit: Option<ExitInfo>,
     }
+
+    impl WindowsChild {
+        fn new(handle: HANDLE, pid: u32) -> Self {
+            Self {
+                handle: OwnedHandle(handle),
+                pid,
+                exit: None,
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.handle.raw()
+        }
+
+        /// Read the exit code of a process already known to have exited.
+        fn harvest(&mut self) -> ExitInfo {
+            let mut code: u32 = 0;
+            // SAFETY: handle is valid; code is initialised.
+            let ok = unsafe { GetExitCodeProcess(self.raw(), std::ptr::addr_of_mut!(code)) };
+            let info = if ok != 0 {
+                ExitInfo {
+                    code: Some(code as i32),
+                    crashed: is_crash_exit_code(code),
+                }
+            } else {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "GetExitCodeProcess failed; treating as crash"
+                );
+                ExitInfo {
+                    code: None,
+                    crashed: true,
+                }
+            };
+            self.exit = Some(info);
+            info
+        }
+    }
+
+    impl ChildHandle for WindowsChild {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        fn poll_exit(&mut self) -> Option<ExitInfo> {
+            if let Some(e) = self.exit {
+                return Some(e);
+            }
+            // GetExitCodeProcess on a live process succeeds and yields
+            // STILL_ACTIVE (259) — indistinguishable from a real exit code
+            // of 259. Gate it on the process actually being signalled.
+            // SAFETY: handle is valid; 0 timeout → non-blocking poll.
+            let r = unsafe { WaitForSingleObject(self.raw(), 0) };
+            if r == WAIT_OBJECT_0 {
+                Some(self.harvest())
+            } else {
+                None
+            }
+        }
+
+        fn wait_exit(&mut self) -> ExitInfo {
+            if let Some(e) = self.exit {
+                return e;
+            }
+            // SAFETY: handle is valid; INFINITE is a documented sentinel.
+            unsafe { WaitForSingleObject(self.raw(), INFINITE) };
+            self.harvest()
+        }
+
+        fn kill_and_reap(&mut self) -> ExitInfo {
+            if let Some(e) = self.exit {
+                return e;
+            }
+            // SAFETY: handle is valid; exit code 1 signals abnormal termination.
+            unsafe { TerminateProcess(self.raw(), 1) };
+            self.wait_exit()
+        }
+    }
+
+    // ── Clean-shutdown flag ──────────────────────────────────────────────────
+
+    /// Directory holding the clean-shutdown flag.
+    ///
+    /// `%TEMP%` on Windows is already per-user (`%LOCALAPPDATA%\Temp`), which
+    /// is the equivalent of the Unix side's 0700 per-uid directory; we add a
+    /// `buffr` subdirectory so the files are grouped.
+    fn clean_flag_dir() -> anyhow::Result<PathBuf> {
+        let dir = std::env::temp_dir().join("buffr");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+
+    /// Is the clean-shutdown flag genuinely present?
+    ///
+    /// `symlink_metadata` + `is_file()` so a directory junction or symlink
+    /// planted at the path is not honoured.
+    fn clean_flag_present(path: &Path) -> bool {
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if md.is_file() => true,
+            Ok(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "supervisor: clean-shutdown flag is not a regular file; ignoring"
+                );
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    // ── Supervisor loop ──────────────────────────────────────────────────────
 
     pub fn run_supervisor(
         child_bin: PathBuf,
@@ -887,7 +1198,7 @@ mod windows {
         heartbeat_timeout: Duration,
         heartbeat_disable: bool,
     ) -> anyhow::Result<()> {
-        let mut crash_times: Vec<Instant> = Vec::new();
+        let mut crashes = CrashWindow::new(Duration::from_secs(WINDOW_SECS), CRASH_LIMIT);
         let mut restart_count: u32 = 0;
 
         let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -901,6 +1212,20 @@ mod windows {
 
         // Install Ctrl+C / Ctrl+Break / close handler.
         install_ctrl_handler(Arc::clone(&shutdown_requested), job.raw());
+
+        // Clean-shutdown flag path, computed independently of the heartbeat
+        // pipe so `--heartbeat-disable` (or a pipe failure) does not silently
+        // turn a clean teardown segfault into a restart loop.
+        let clean_flag_path = match clean_flag_dir() {
+            Ok(d) => Some(d.join(format!("buffr-{supervisor_pid}.clean"))),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "supervisor: no clean-flag directory; clean-shutdown detection disabled"
+                );
+                None
+            }
+        };
 
         loop {
             // ── bind named pipe for this spawn ────────────────────────────────
@@ -922,24 +1247,34 @@ mod windows {
                 }
             };
 
+            // Remove any stale flag from a prior spawn.
+            if let Some(ref p) = clean_flag_path {
+                let _ = std::fs::remove_file(p);
+            }
+
             // ── spawn child (suspended) + assign to job ───────────────────────
             let spawn_time = Instant::now();
-            let proc_info =
-                match spawn_child_suspended(&child_bin, &child_args, pipe_path_str.as_deref()) {
-                    Ok(pi) => pi,
-                    Err(e) => {
-                        anyhow::bail!("failed to spawn child {}: {e}", child_bin.display());
-                    }
-                };
+            let proc_info = match spawn_child_suspended(
+                &child_bin,
+                &child_args,
+                pipe_path_str.as_deref(),
+                clean_flag_path.as_deref(),
+            ) {
+                Ok(pi) => pi,
+                Err(e) => {
+                    anyhow::bail!("failed to spawn child {}: {e}", child_bin.display());
+                }
+            };
 
-            let child_pid = proc_info.dwProcessId;
+            let mut child = WindowsChild::new(proc_info.hProcess, proc_info.dwProcessId);
+            let child_pid = child.pid();
             tracing::info!(pid = child_pid, "child spawned (suspended)");
 
             // ── assign-before-resume (critical ordering) ──────────────────────
             // SAFETY: job and process handles are valid. Assign before
             // ResumeThread so any descendants the child spawns after resume
             // also land in the job automatically.
-            let assign_ok = unsafe { AssignProcessToJobObject(job.raw(), proc_info.hProcess) != 0 };
+            let assign_ok = unsafe { AssignProcessToJobObject(job.raw(), child.raw()) != 0 };
             if !assign_ok {
                 let err = std::io::Error::last_os_error();
                 // Non-fatal if the process is already in a job (Windows 8+
@@ -967,60 +1302,75 @@ mod windows {
             };
 
             // ── wait for child + heartbeat ────────────────────────────────────
-            enum WatchResult {
-                HangDetected,
-                ChildExited(Option<u32>),
-            }
-
-            let watch_result = if let Some(ref rx) = hb_rx {
-                match wait_for_connect(rx, proc_info.hProcess, connect_grace()) {
+            let outcome = if let Some(ref rx) = hb_rx {
+                match wait_for_connect(rx, &mut child, connect_grace()) {
                     ConnectResult::Connected => {
                         tracing::info!(pid = child_pid, "child connected to heartbeat pipe");
-                        let post_connect_deadline =
+                        let first_deadline =
                             Instant::now() + POST_CONNECT_GRACE + heartbeat_timeout;
-                        if watch_heartbeat(
-                            rx,
-                            proc_info.hProcess,
-                            post_connect_deadline,
-                            heartbeat_timeout,
-                        ) {
-                            WatchResult::HangDetected
-                        } else {
-                            WatchResult::ChildExited(get_exit_code(proc_info.hProcess))
-                        }
+                        watch_heartbeat(rx, &mut child, first_deadline, heartbeat_timeout)
                     }
                     ConnectResult::TimedOut => {
                         tracing::warn!(
                             pid = child_pid,
-                            "child did not connect to heartbeat pipe within 5s; treating as crash"
+                            grace_ms = connect_grace().as_millis(),
+                            "child did not connect to heartbeat pipe within the grace \
+                             window; treating as crash"
                         );
-                        kill_process(proc_info.hProcess);
-                        WatchResult::HangDetected
+                        child.kill_and_reap();
+                        WatchOutcome::Hang
                     }
-                    ConnectResult::ChildExited(code) => WatchResult::ChildExited(code),
+                    ConnectResult::ChildExited(info) => WatchOutcome::Exited(info),
                 }
             } else {
                 // Heartbeat disabled — block until child exits.
-                // SAFETY: process handle is valid; INFINITE is a safe sentinel.
-                unsafe { WaitForSingleObject(proc_info.hProcess, INFINITE) };
-                WatchResult::ChildExited(get_exit_code(proc_info.hProcess))
+                WatchOutcome::Exited(child.wait_exit())
             };
+            drop(hb_rx);
 
-            // SAFETY: process handle is valid and owned.
-            unsafe { CloseHandle(proc_info.hProcess) };
+            let (hang_detected, exit) = match outcome {
+                WatchOutcome::Hang => (true, None),
+                WatchOutcome::Exited(info) => (false, Some(info)),
+            };
+            // Releases the process handle.
+            drop(child);
 
             let elapsed = spawn_time.elapsed();
 
             // ── decide whether to restart ─────────────────────────────────────
-            let is_clean = matches!(&watch_result, WatchResult::ChildExited(Some(0)));
+            let flag_present = clean_flag_path.as_deref().is_some_and(clean_flag_present);
+            if let Some(ref p) = clean_flag_path {
+                let _ = std::fs::remove_file(p);
+            }
 
-            if is_clean {
-                tracing::info!(
-                    pid = child_pid,
-                    elapsed_ms = elapsed.as_millis(),
-                    "child exited cleanly (exit 0); supervisor done"
-                );
-                return Ok(());
+            match classify(hang_detected, exit.as_ref(), flag_present) {
+                Disposition::Done => {
+                    tracing::info!(
+                        pid = child_pid,
+                        elapsed_ms = elapsed.as_millis(),
+                        flag_present,
+                        "child exited cleanly; supervisor done"
+                    );
+                    return Ok(());
+                }
+                Disposition::Propagate(code) => {
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        tracing::info!(
+                            pid = child_pid,
+                            "child exited after shutdown signal; not restarting"
+                        );
+                        return Ok(());
+                    }
+                    tracing::info!(
+                        pid = child_pid,
+                        elapsed_ms = elapsed.as_millis(),
+                        exit_code = code,
+                        "child exited normally with non-zero code; not restarting \
+                         (likely CLI or config error)"
+                    );
+                    std::process::exit(code);
+                }
+                Disposition::Restart => {}
             }
 
             if shutdown_requested.load(Ordering::SeqCst) {
@@ -1033,31 +1383,28 @@ mod windows {
 
             // Crash / hang path.
             restart_count += 1;
-            let now = Instant::now();
-            crash_times.push(now);
-            let window_start = now - Duration::from_secs(WINDOW_SECS);
-            crash_times.retain(|t| *t >= window_start);
+            let in_window = crashes.record(Instant::now());
 
-            let hang_detected = matches!(watch_result, WatchResult::HangDetected);
             if hang_detected {
                 tracing::info!(
                     pid = child_pid,
                     restart_count,
-                    crashes_in_window = crash_times.len(),
+                    crashes_in_window = in_window,
                     elapsed_ms = elapsed.as_millis(),
                     "child hang detected; considering restart"
                 );
             } else {
                 tracing::info!(
                     pid = child_pid,
+                    exit = ?exit,
                     restart_count,
-                    crashes_in_window = crash_times.len(),
+                    crashes_in_window = in_window,
                     elapsed_ms = elapsed.as_millis(),
                     "child crashed; considering restart"
                 );
             }
 
-            if crash_times.len() >= CRASH_LIMIT {
+            if crashes.limit_reached() {
                 tracing::error!(
                     "watchdog: {CRASH_LIMIT} crashes/hangs in {WINDOW_SECS}s, \
                      refusing to restart. Run buffr-app directly from a \
@@ -1208,25 +1555,60 @@ mod windows {
 
     // ── Child spawn ───────────────────────────────────────────────────────────
 
+    /// Build an explicit `CREATE_UNICODE_ENVIRONMENT` block for the child.
+    ///
+    /// The previous approach mutated the *supervisor's* own environment
+    /// around `CreateProcessW`. That is a data race on any restart iteration,
+    /// where the previous iteration's heartbeat thread is still live —
+    /// `set_var`/`remove_var` are not thread-safe.
+    ///
+    /// Format: `KEY=VALUE\0KEY=VALUE\0\0`, sorted.
+    fn build_environment_block(extra: &[(&str, OsString)]) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut vars: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+        for (k, v) in extra {
+            vars.insert(OsString::from(*k), v.clone());
+        }
+
+        let mut block: Vec<u16> = Vec::new();
+        for (k, v) in vars {
+            if k.is_empty() {
+                continue;
+            }
+            block.extend(k.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(v.encode_wide());
+            block.push(0);
+        }
+        // An empty block still needs the leading NUL of the "empty string"
+        // entry before the terminator.
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
     fn spawn_child_suspended(
         bin: &Path,
         args: &[OsString],
         pipe_path: Option<&str>,
+        clean_flag_path: Option<&Path>,
     ) -> anyhow::Result<PROCESS_INFORMATION> {
-        // Build a Windows command line: `"bin" arg1 arg2 ...`
-        let mut cmdline = format!("\"{}\"", bin.display());
-        for a in args {
-            cmdline.push(' ');
-            cmdline.push_str(&a.to_string_lossy());
-        }
+        // Build a Windows command line with MSVCRT quoting so paths with
+        // spaces survive and an embedded `"` cannot inject extra flags.
+        let cmdline = build_command_line(bin, args);
         let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
 
-        // Pass the pipe path to the child via env var.
-        // We set it on the process env so it applies only to the child.
+        let mut extra: Vec<(&str, OsString)> = Vec::new();
         if let Some(path) = pipe_path {
-            // SAFETY: setting env var in a single-threaded context before spawn.
-            unsafe { std::env::set_var(SUPERVISOR_PIPE_ENV, path) };
+            extra.push((SUPERVISOR_PIPE_ENV, OsString::from(path)));
         }
+        if let Some(path) = clean_flag_path {
+            extra.push((SUPERVISOR_CLEAN_FLAG_ENV, path.as_os_str().to_os_string()));
+        }
+        let env_block = build_environment_block(&extra);
 
         let mut si: STARTUPINFOW =
             // SAFETY: zero-initialising a POD struct.
@@ -1241,10 +1623,13 @@ mod windows {
         // CREATE_BREAKAWAY_FROM_JOB: needed if the supervisor is itself inside
         // a job (e.g. under VS Test runner or some CI systems) so the child
         // can then be placed into *our* job without nesting conflicts.
-        let flags = CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB;
+        // CREATE_UNICODE_ENVIRONMENT: lpEnvironment below is UTF-16.
+        let flags = CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB | CREATE_UNICODE_ENVIRONMENT;
 
-        // SAFETY: cmdline_wide is NUL-terminated; si/pi point to valid zeroed
-        // structs; NULL for application name uses the cmdline parsing path.
+        // SAFETY: cmdline_wide is NUL-terminated; env_block is a double-NUL
+        // terminated UTF-16 environment block that outlives the call; si/pi
+        // point to valid zeroed structs; NULL for application name uses the
+        // cmdline parsing path.
         let ok = unsafe {
             CreateProcessW(
                 std::ptr::null(),
@@ -1253,19 +1638,12 @@ mod windows {
                 std::ptr::null(),
                 0, // bInheritHandles = FALSE
                 flags,
-                std::ptr::null(),
+                env_block.as_ptr().cast(),
                 std::ptr::null(),
                 std::ptr::addr_of!(si),
                 std::ptr::addr_of_mut!(pi),
             )
         };
-
-        // Clear the env var so it doesn't leak into subsequent spawns in case
-        // of restarts (each restart re-sets it with the current pipe path).
-        if pipe_path.is_some() {
-            // SAFETY: single-threaded context here.
-            unsafe { std::env::remove_var(SUPERVISOR_PIPE_ENV) };
-        }
 
         if ok == 0 {
             anyhow::bail!("CreateProcessW failed: {}", std::io::Error::last_os_error());
@@ -1325,120 +1703,6 @@ mod windows {
             for _ in 0..bytes_read {
                 if tx.send(HeartbeatEvent::Ping).is_err() {
                     return;
-                }
-            }
-        }
-    }
-
-    // ── Process helpers ───────────────────────────────────────────────────────
-
-    fn get_exit_code(handle: HANDLE) -> Option<u32> {
-        let mut code: u32 = 0;
-        // SAFETY: handle is valid; code is initialised.
-        let ok = unsafe { GetExitCodeProcess(handle, std::ptr::addr_of_mut!(code)) };
-        if ok != 0 { Some(code) } else { None }
-    }
-
-    fn kill_process(handle: HANDLE) {
-        // SAFETY: handle is valid; exit code 1 signals abnormal termination.
-        unsafe { TerminateProcess(handle, 1) };
-    }
-
-    fn process_exited(handle: HANDLE) -> Option<u32> {
-        // SAFETY: handle is valid; 0 timeout → non-blocking poll.
-        let r = unsafe { WaitForSingleObject(handle, 0) };
-        if r == WAIT_OBJECT_0 {
-            get_exit_code(handle)
-        } else {
-            None
-        }
-    }
-
-    // ── Connect + heartbeat watch ─────────────────────────────────────────────
-
-    enum ConnectResult {
-        Connected,
-        TimedOut,
-        ChildExited(Option<u32>),
-    }
-
-    fn wait_for_connect(
-        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
-        proc_handle: HANDLE,
-        grace: Duration,
-    ) -> ConnectResult {
-        let deadline = Instant::now() + grace;
-        loop {
-            if let Some(code) = process_exited(proc_handle) {
-                return ConnectResult::ChildExited(Some(code));
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return ConnectResult::TimedOut;
-            }
-            match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
-                Ok(HeartbeatEvent::Connected) => return ConnectResult::Connected,
-                Ok(_) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() >= deadline {
-                        return ConnectResult::TimedOut;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return ConnectResult::TimedOut;
-                }
-            }
-        }
-    }
-
-    fn watch_heartbeat(
-        rx: &std::sync::mpsc::Receiver<HeartbeatEvent>,
-        proc_handle: HANDLE,
-        first_deadline: Instant,
-        timeout: Duration,
-    ) -> bool {
-        let mut last_ping = Instant::now();
-        let mut deadline = first_deadline;
-
-        loop {
-            if let Some(_code) = process_exited(proc_handle) {
-                return false; // exited on its own
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tracing::error!(
-                    "watchdog: ui hang detected (no heartbeat for {}s); killing child",
-                    timeout.as_secs(),
-                );
-                kill_process(proc_handle);
-                // SAFETY: INFINITE wait; we just killed the process so it will exit.
-                unsafe { WaitForSingleObject(proc_handle, INFINITE) };
-                return true;
-            }
-
-            match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
-                Ok(HeartbeatEvent::Ping) => {
-                    let now = Instant::now();
-                    tracing::debug!(
-                        lag_ms = now.duration_since(last_ping).as_millis(),
-                        "heartbeat: ping received"
-                    );
-                    last_ping = now;
-                    deadline = now + timeout;
-                }
-                Ok(HeartbeatEvent::Connected) => {
-                    last_ping = Instant::now();
-                    deadline = last_ping + timeout;
-                }
-                Ok(HeartbeatEvent::Disconnected) => {
-                    tracing::warn!("heartbeat: child disconnected pipe");
-                    return false;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return false;
                 }
             }
         }

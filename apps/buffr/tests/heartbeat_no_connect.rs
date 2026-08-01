@@ -4,33 +4,18 @@
 //! of the production default (currently 20 s, sized for cold-disk first runs).
 #![cfg(unix)]
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::tempdir;
 
-fn supervisor_bin() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p.push("target");
-    p.push("debug");
-    p.push("buffr");
-    p
-}
+mod common;
+use common::{supervisor_bin, write_script};
 
 /// A child that sees BUFFR_SUPERVISOR_SOCK in its env but never connects.
-/// After 5 s the supervisor kills it (connect-grace timeout) and restarts.
+/// After the grace window the supervisor kills it and restarts.
 /// Three such failures → backoff halt.
 fn no_connect_script(dir: &std::path::Path) -> std::path::PathBuf {
-    let script = dir.join("fake-buffr-no-connect");
     // Just sleep without touching the socket.
-    let content = "#!/bin/sh\nsleep 30\n";
-    fs::write(&script, content).expect("write script");
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
+    write_script(dir, "fake-buffr-no-connect", "#!/bin/sh\nsleep 30\n")
 }
 
 #[test]

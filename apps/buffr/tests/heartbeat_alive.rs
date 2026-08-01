@@ -2,22 +2,13 @@
 //! Supervisor must NOT kill it (i.e. it must exit 0 at the end).
 #![cfg(unix)]
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::tempdir;
 
-fn supervisor_bin() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // apps/buffr → apps
-    p.pop(); // apps → workspace root
-    p.push("target");
-    p.push("debug");
-    p.push("buffr");
-    p
-}
+mod common;
+use common::{supervisor_bin, write_script};
 
-/// Write a shell script that:
+/// Write a script that:
 ///   1. Reads BUFFR_SUPERVISOR_SOCK and connects.
 ///   2. Pings every 500 ms for 12 s.
 ///   3. Exits 0.
@@ -25,9 +16,7 @@ fn supervisor_bin() -> std::path::PathBuf {
 /// This proves the supervisor does NOT fire the hang detector while
 /// the child is alive and pinging.
 fn pinger_script(dir: &std::path::Path) -> std::path::PathBuf {
-    let script = dir.join("fake-buffr-alive");
-    // We use socat to send bytes, or a small Python one-liner.
-    // To avoid a socat dependency we write a tiny Python3 script.
+    // We use a tiny Python3 script to avoid a socat dependency.
     let content = r#"#!/usr/bin/env python3
 import os, socket, time, sys
 
@@ -48,11 +37,7 @@ while time.monotonic() < end:
 s.close()
 sys.exit(0)
 "#;
-    fs::write(&script, content).expect("write script");
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
+    write_script(dir, "fake-buffr-alive", content)
 }
 
 #[test]

@@ -9,6 +9,13 @@
 //! at which point the supervisor's deadline expires and the child is
 //! restarted.
 //!
+//! **The connection stays open while pings are withheld.**  Dropping it
+//! would make the supervisor read EOF, which it interprets as "the child
+//! is on its way out" — it would then block in `wait()` on a browser that
+//! is very much still running and never restart it.  Holding the socket
+//! open and simply not writing is what makes the supervisor's own
+//! heartbeat deadline expire, which is the documented contract above.
+//!
 //! Decoupling the write from the event loop fixes two failure modes:
 //!
 //!   1. winit's `ControlFlow::WaitUntil` is not honoured reliably on
@@ -105,7 +112,14 @@ mod inner {
             thread::Builder::new()
                 .name("buffr-heartbeat".into())
                 .spawn(move || {
-                    run_heartbeat_loop(stream, epoch, alive_clone, thread_alive_clone);
+                    run_heartbeat_loop(
+                        stream,
+                        epoch,
+                        alive_clone,
+                        thread_alive_clone,
+                        HEARTBEAT_INTERVAL,
+                        UI_LIVENESS_TIMEOUT,
+                    );
                 })
                 .ok()?;
 
@@ -134,18 +148,33 @@ mod inner {
         }
     }
 
-    /// Background thread: send a ping every `HEARTBEAT_INTERVAL` while
-    /// the UI thread is fresh.  Exits when the UI thread stops marking
-    /// itself for `UI_LIVENESS_TIMEOUT` — the supervisor watchdog then
-    /// declares a hang on its own deadline and restarts us.
+    /// Background thread: send a ping every `interval` while the UI
+    /// thread is fresh.  When the UI thread stops marking itself for
+    /// `liveness_timeout` the loop **withholds pings but keeps the
+    /// socket open** so the supervisor's own deadline expires and it
+    /// kills + restarts the frozen child.
+    ///
+    /// Returning here (and thereby closing the socket) would be wrong:
+    /// the supervisor reads EOF, concludes the child exited, and blocks
+    /// forever in `wait()` on a process that is still running.
+    ///
+    /// `interval` / `liveness_timeout` are parameters rather than the
+    /// module constants so the unit tests can drive the loop in
+    /// milliseconds instead of seconds.
     fn run_heartbeat_loop(
         mut stream: UnixStream,
         epoch: Instant,
         last_alive_us: Arc<AtomicU64>,
         thread_alive: Arc<AtomicBool>,
+        interval: Duration,
+        liveness_timeout: Duration,
     ) {
+        // Set once we enter the "UI is wedged" state so the error is
+        // logged a single time rather than every interval.
+        let mut stalled = false;
+
         loop {
-            thread::sleep(HEARTBEAT_INTERVAL);
+            thread::sleep(interval);
 
             // Liveness check.  `last_alive_us == 0` is the seeded value
             // — treat it as "fresh enough" so the first ping fires even
@@ -157,14 +186,26 @@ mod inner {
             } else {
                 elapsed.saturating_sub(Duration::from_micros(last_us))
             };
-            if staleness > UI_LIVENESS_TIMEOUT {
-                tracing::error!(
-                    staleness_ms = staleness.as_millis(),
-                    "heartbeat: UI thread silent for >{}s; stopping pings so supervisor restarts us",
-                    UI_LIVENESS_TIMEOUT.as_secs()
-                );
-                thread_alive.store(false, Ordering::Relaxed);
-                return;
+            if staleness > liveness_timeout {
+                if !stalled {
+                    tracing::error!(
+                        staleness_ms = staleness.as_millis(),
+                        "heartbeat: UI thread silent for >{}s; withholding pings (socket stays \
+                         open) so the supervisor's deadline expires and restarts us",
+                        liveness_timeout.as_secs()
+                    );
+                    thread_alive.store(false, Ordering::Relaxed);
+                    stalled = true;
+                }
+                continue;
+            }
+
+            if stalled {
+                // The UI thread came back before the supervisor killed
+                // us — resume pinging rather than staying wedged.
+                tracing::warn!("heartbeat: UI thread recovered; resuming pings");
+                thread_alive.store(true, Ordering::Relaxed);
+                stalled = false;
             }
 
             match stream.write_all(b"\x01") {
@@ -211,6 +252,186 @@ mod inner {
         }
 
         Ok(stream)
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        /// Millisecond-scale stand-ins for `HEARTBEAT_INTERVAL` /
+        /// `UI_LIVENESS_TIMEOUT` so the tests finish in well under a second.
+        const TEST_INTERVAL: Duration = Duration::from_millis(20);
+        const TEST_LIVENESS: Duration = Duration::from_millis(60);
+
+        /// Bind a socketpair-ish UDS in a temp dir and return
+        /// `(server_side, client_side)`.
+        fn socket_pair() -> (UnixStream, UnixStream, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("hb.sock");
+            let listener = UnixListener::bind(&path).expect("bind");
+            let client = UnixStream::connect(&path).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            (server, client, dir)
+        }
+
+        #[test]
+        fn pings_flow_while_ui_is_fresh() {
+            let (mut server, client, _dir) = socket_pair();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            let last_alive_us = Arc::new(AtomicU64::new(0));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+            let epoch = Instant::now();
+            let ta = Arc::clone(&thread_alive);
+            let la = Arc::clone(&last_alive_us);
+            let h = thread::spawn(move || {
+                run_heartbeat_loop(client, epoch, la, ta, TEST_INTERVAL, TEST_LIVENESS);
+            });
+
+            let mut buf = [0u8; 1];
+            let n = server.read(&mut buf).expect("expected a ping byte");
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], 0x01);
+            assert!(thread_alive.load(Ordering::Relaxed));
+
+            drop(server);
+            let _ = h.join();
+        }
+
+        /// Block until `flag` is false, panicking after `limit`.
+        fn wait_until_stale(flag: &AtomicBool, limit: Duration) {
+            let deadline = Instant::now() + limit;
+            while flag.load(Ordering::Relaxed) {
+                assert!(
+                    Instant::now() < deadline,
+                    "heartbeat thread never declared the UI stale"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Read and discard everything currently buffered. Panics on EOF,
+        /// which is the exact failure H12 describes.
+        fn drain_pings(server: &mut UnixStream) {
+            server
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set_read_timeout");
+            let mut buf = [0u8; 256];
+            loop {
+                match server.read(&mut buf) {
+                    Ok(0) => panic!(
+                        "heartbeat thread closed the socket — the supervisor would read EOF \
+                         and never restart the hung child"
+                    ),
+                    Ok(_) => continue,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        return;
+                    }
+                    Err(e) => panic!("unexpected read error: {e}"),
+                }
+            }
+        }
+
+        /// H12 regression: a wedged UI must NOT close the socket.
+        ///
+        /// If the loop returns (dropping the stream), the supervisor reads
+        /// EOF, concludes the child exited, and blocks in `wait()` forever
+        /// on a still-running frozen browser. The loop must instead stop
+        /// writing and hold the connection open so the supervisor's own
+        /// heartbeat deadline expires and it kills + restarts the child.
+        #[test]
+        fn stale_ui_withholds_pings_but_keeps_socket_open() {
+            let (mut server, client, _dir) = socket_pair();
+
+            let epoch = Instant::now();
+            // Mark "alive" 1 µs after the epoch and never again: staleness
+            // grows past TEST_LIVENESS within a couple of intervals.
+            let last_alive_us = Arc::new(AtomicU64::new(1));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+            let ta = Arc::clone(&thread_alive);
+            let la = Arc::clone(&last_alive_us);
+            let h = thread::spawn(move || {
+                run_heartbeat_loop(client, epoch, la, ta, TEST_INTERVAL, TEST_LIVENESS);
+            });
+
+            wait_until_stale(&thread_alive, Duration::from_secs(5));
+            drain_pings(&mut server);
+
+            // The decisive assertion: still no EOF and no further pings —
+            // a read must time out rather than return Ok(0) or data.
+            server
+                .set_read_timeout(Some(TEST_LIVENESS * 4))
+                .expect("set_read_timeout");
+            let mut buf = [0u8; 64];
+            match server.read(&mut buf) {
+                Ok(0) => panic!("socket was closed by the heartbeat thread; supervisor sees EOF"),
+                Ok(n) => panic!("unexpected ping burst ({n} bytes) after the UI went stale"),
+                Err(e) => assert!(
+                    e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut,
+                    "expected a read timeout (socket held open, no pings), got {e}"
+                ),
+            }
+
+            // Tear down: close the server end, then un-stale the UI so the
+            // loop resumes writing, hits EPIPE, and returns. (While stalled
+            // it never writes, so it would never notice the closed socket —
+            // which is exactly the property under test.)
+            drop(server);
+            last_alive_us.store(epoch.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let _ = h.join();
+        }
+
+        /// A UI that recovers before the supervisor kills it resumes pinging.
+        #[test]
+        fn recovered_ui_resumes_pinging() {
+            let (mut server, client, _dir) = socket_pair();
+
+            let epoch = Instant::now();
+            let last_alive_us = Arc::new(AtomicU64::new(1));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+            let ta = Arc::clone(&thread_alive);
+            let la = Arc::clone(&last_alive_us);
+            let h = thread::spawn(move || {
+                run_heartbeat_loop(client, epoch, la, ta, TEST_INTERVAL, TEST_LIVENESS);
+            });
+
+            wait_until_stale(&thread_alive, Duration::from_secs(5));
+            drain_pings(&mut server);
+
+            // Start marking alive again from a background thread.
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_c = Arc::clone(&stop);
+            let la2 = Arc::clone(&last_alive_us);
+            let marker = thread::spawn(move || {
+                while !stop_c.load(Ordering::Relaxed) {
+                    la2.store(epoch.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(5));
+                }
+            });
+
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set_read_timeout");
+            let mut buf = [0u8; 1];
+            let n = server.read(&mut buf).expect("expected pings to resume");
+            assert_eq!(n, 1);
+            assert!(thread_alive.load(Ordering::Relaxed));
+
+            stop.store(true, Ordering::Relaxed);
+            let _ = marker.join();
+            drop(server);
+            let _ = h.join();
+        }
     }
 }
 
@@ -285,7 +506,14 @@ mod inner {
             thread::Builder::new()
                 .name("buffr-heartbeat".into())
                 .spawn(move || {
-                    run_heartbeat_loop(file, epoch, alive_clone, thread_alive_clone);
+                    run_heartbeat_loop(
+                        file,
+                        epoch,
+                        alive_clone,
+                        thread_alive_clone,
+                        HEARTBEAT_INTERVAL,
+                        UI_LIVENESS_TIMEOUT,
+                    );
                 })
                 .ok()?;
 
@@ -306,14 +534,20 @@ mod inner {
         }
     }
 
+    /// See the Unix twin for why a wedged UI must keep the pipe **open**
+    /// while withholding pings instead of closing it.
     fn run_heartbeat_loop(
         mut file: std::fs::File,
         epoch: Instant,
         last_alive_us: Arc<AtomicU64>,
         thread_alive: Arc<AtomicBool>,
+        interval: Duration,
+        liveness_timeout: Duration,
     ) {
+        let mut stalled = false;
+
         loop {
-            thread::sleep(HEARTBEAT_INTERVAL);
+            thread::sleep(interval);
 
             let last_us = last_alive_us.load(Ordering::Relaxed);
             let elapsed = epoch.elapsed();
@@ -322,14 +556,24 @@ mod inner {
             } else {
                 elapsed.saturating_sub(Duration::from_micros(last_us))
             };
-            if staleness > UI_LIVENESS_TIMEOUT {
-                tracing::error!(
-                    staleness_ms = staleness.as_millis(),
-                    "heartbeat: UI thread silent for >{}s; stopping pings so supervisor restarts us",
-                    UI_LIVENESS_TIMEOUT.as_secs()
-                );
-                thread_alive.store(false, Ordering::Relaxed);
-                return;
+            if staleness > liveness_timeout {
+                if !stalled {
+                    tracing::error!(
+                        staleness_ms = staleness.as_millis(),
+                        "heartbeat: UI thread silent for >{}s; withholding pings (pipe stays \
+                         open) so the supervisor's deadline expires and restarts us",
+                        liveness_timeout.as_secs()
+                    );
+                    thread_alive.store(false, Ordering::Relaxed);
+                    stalled = true;
+                }
+                continue;
+            }
+
+            if stalled {
+                tracing::warn!("heartbeat: UI thread recovered; resuming pings");
+                thread_alive.store(true, Ordering::Relaxed);
+                stalled = false;
             }
 
             match file.write_all(b"\x01") {

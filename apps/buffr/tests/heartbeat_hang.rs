@@ -1,31 +1,26 @@
 //! Integration tests for hang detection and backoff.
 //!
-//! - `hang_triggers_restart`: child connects, sends one ping, then sleeps
-//!   20 s. With `--heartbeat-timeout 2` the supervisor kills at ~2 s and
-//!   restarts. We verify the supervisor eventually halts (3 hangs in 30 s).
+//! - `three_hangs_trigger_backoff_halt`: the child connects, sends one ping,
+//!   then sleeps 30 s while holding the socket open. With
+//!   `--heartbeat-timeout 2` the supervisor kills at ~2 s and restarts; after
+//!   three hangs in the window it halts non-zero.
 //!
-//! - `three_hangs_trigger_backoff_halt`: same scenario fires 3 times,
-//!   supervisor exits non-zero after the third hang.
+//! - `disconnect_while_alive_triggers_restart` (H12): the child connects,
+//!   pings once, **closes the socket**, and then keeps running. The
+//!   supervisor used to read EOF, conclude the child had exited, and block
+//!   forever in `wait()` on a frozen browser. It must instead give the child
+//!   a short grace to actually exit, then kill and restart it.
 #![cfg(unix)]
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-fn supervisor_bin() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p.push("target");
-    p.push("debug");
-    p.push("buffr");
-    p
-}
+mod common;
+use common::{supervisor_bin, write_script};
 
-/// Child that connects, pings once, then hangs for 30 s.
+/// Child that connects, pings once, then hangs for 30 s holding the socket.
 fn one_ping_then_hang_script(dir: &std::path::Path) -> std::path::PathBuf {
-    let script = dir.join("fake-buffr-hang");
     let content = r#"#!/usr/bin/env python3
 import os, socket, time, sys
 
@@ -40,11 +35,32 @@ s.send(b"\x01")
 time.sleep(30)
 sys.exit(0)
 "#;
-    fs::write(&script, content).expect("write script");
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
+    write_script(dir, "fake-buffr-hang", content)
+}
+
+/// Child that connects, pings once, CLOSES the socket, then keeps running.
+///
+/// This is what a wedged UI looked like before the heartbeat thread was
+/// changed to hold the socket open: the supervisor sees EOF while the
+/// process is still very much alive.
+fn ping_then_close_then_hang_script(dir: &std::path::Path) -> std::path::PathBuf {
+    let content = r#"#!/usr/bin/env python3
+import os, socket, time, sys
+
+sock_path = os.environ.get("BUFFR_SUPERVISOR_SOCK")
+if not sock_path:
+    time.sleep(60)
+    sys.exit(0)
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.send(b"\x01")
+s.close()
+# Still running, but the supervisor can no longer hear us.
+time.sleep(60)
+sys.exit(0)
+"#;
+    write_script(dir, "fake-buffr-disconnect", content)
 }
 
 /// The supervisor detects a hang (timeout=2), kills the child, and restarts.
@@ -81,5 +97,51 @@ fn three_hangs_trigger_backoff_halt() {
     assert!(
         stderr.contains("refusing to restart") || stderr.contains("crashes/hangs"),
         "expected backoff halt message in stderr; got:\n{stderr}"
+    );
+}
+
+/// H12 regression: a child that drops the heartbeat socket but stays alive
+/// must be killed and restarted.
+///
+/// Before the fix the supervisor mapped EOF to `Disconnected` → "not a hang"
+/// → `try_wait()` returns `None` → `wait()` blocks forever, so this test
+/// would hang until the harness timeout instead of halting.
+#[test]
+fn disconnect_while_alive_triggers_restart() {
+    let dir = tempdir().expect("tempdir");
+    let script = ping_then_close_then_hang_script(dir.path());
+    let bin = supervisor_bin();
+
+    let start = Instant::now();
+    let output = Command::new(&bin)
+        .env("BUFFR_CHILD_BIN", &script)
+        .env("RUST_LOG", "info")
+        .arg("--heartbeat-timeout")
+        .arg("2")
+        .output()
+        .expect("failed to run buffr");
+    let elapsed = start.elapsed();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "supervisor should exit non-zero after 3 disconnect-while-alive hangs; \
+         got: {:?}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("refusing to restart"),
+        "expected the backoff halt message (i.e. it actually restarted); got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("still running"),
+        "expected the disconnect-while-alive diagnostic; got:\n{stderr}"
+    );
+    // Three cycles of (≈2 s grace + 250 ms cooldown). Comfortably below the
+    // child's own 60 s sleep, which is what a blocked `wait()` would cost.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "supervisor took {elapsed:?} — it likely blocked in wait() on the live child"
     );
 }

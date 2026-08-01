@@ -3,17 +3,8 @@
 
 use std::process::Command;
 
-fn supervisor_bin() -> std::path::PathBuf {
-    // Built by `cargo test --test clean_exit -p buffr`.
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // Walk up to workspace root, then into target.
-    p.pop(); // apps/buffr → apps
-    p.pop(); // apps → workspace root
-    p.push("target");
-    p.push("debug");
-    p.push("buffr");
-    p
-}
+mod common;
+use common::supervisor_bin;
 
 #[test]
 fn child_exit_zero_causes_supervisor_exit_zero() {
@@ -28,5 +19,27 @@ fn child_exit_zero_causes_supervisor_exit_zero() {
     assert!(
         status.success(),
         "supervisor should exit 0 when child exits 0; got: {status:?}"
+    );
+}
+
+/// `BUFFR_CHILD_BIN` pointing at something that is not a file must fail
+/// loudly rather than producing an opaque spawn error later.
+#[test]
+fn bogus_child_bin_override_fails_with_a_clear_error() {
+    let bin = supervisor_bin();
+    let output = Command::new(&bin)
+        .env("BUFFR_CHILD_BIN", "/definitely/not/a/real/binary")
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("failed to run buffr");
+
+    assert!(
+        !output.status.success(),
+        "supervisor should fail when BUFFR_CHILD_BIN is not a file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BUFFR_CHILD_BIN"),
+        "expected a BUFFR_CHILD_BIN diagnostic; got:\n{stderr}"
     );
 }

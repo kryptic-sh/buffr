@@ -5,27 +5,17 @@
 //!   - Round-1 crash-only behaviour is preserved.
 #![cfg(unix)]
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::tempdir;
 
-fn supervisor_bin() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p.push("target");
-    p.push("debug");
-    p.push("buffr");
-    p
-}
+mod common;
+use common::{crasher_script, supervisor_bin, write_script};
 
 /// Write a script that:
 ///   1. Checks whether BUFFR_SUPERVISOR_SOCK is set.
 ///   2. If set → exits 2 (test failure signal).
 ///   3. If unset → exits 0 (correct behaviour under --heartbeat-disable).
 fn env_check_script(dir: &std::path::Path) -> std::path::PathBuf {
-    let script = dir.join("fake-buffr-env-check");
     let content = r#"#!/bin/sh
 if [ -n "$BUFFR_SUPERVISOR_SOCK" ]; then
     echo "FAIL: BUFFR_SUPERVISOR_SOCK is set but should not be" >&2
@@ -33,11 +23,7 @@ if [ -n "$BUFFR_SUPERVISOR_SOCK" ]; then
 fi
 exit 0
 "#;
-    fs::write(&script, content).expect("write script");
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
+    write_script(dir, "fake-buffr-env-check", content)
 }
 
 #[test]
@@ -49,6 +35,8 @@ fn heartbeat_disable_does_not_pass_sock_env_to_child() {
     let output = Command::new(&bin)
         .env("BUFFR_CHILD_BIN", &script)
         .env("RUST_LOG", "info")
+        // A stale value in our own environment must not leak to the child.
+        .env("BUFFR_SUPERVISOR_SOCK", "/nonexistent/stale.sock")
         .arg("--heartbeat-disable")
         .output()
         .expect("failed to run buffr");
@@ -64,22 +52,10 @@ fn heartbeat_disable_does_not_pass_sock_env_to_child() {
 
 /// With --heartbeat-disable, crash-restart still works (Round-1 behaviour).
 ///
-/// The script SIGABRT-self (kill -ABRT $$) so the child dies via signal,
-/// not via `exit 1`. The supervisor distinguishes the two: normal
-/// non-zero exits are treated as CLI / panic errors and propagated
-/// without restart (added in the Phase A supervisor fix), while
-/// signal-style deaths still go through the restart-with-backoff
-/// path. Using `exit 1` here would test the new no-restart path,
-/// not the legacy crash-restart path the test name claims.
-fn crasher_script(dir: &std::path::Path) -> std::path::PathBuf {
-    let script = dir.join("fake-buffr-crash");
-    fs::write(&script, "#!/bin/sh\nkill -ABRT $$\n").expect("write script");
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
-}
-
+/// `crasher_script` SIGABRTs itself so the child dies via signal, not via
+/// `exit 1`. The supervisor distinguishes the two: normal non-zero exits are
+/// treated as CLI / panic errors and propagated without restart, while
+/// signal-style deaths still go through the restart-with-backoff path.
 #[test]
 fn heartbeat_disable_preserves_crash_restart_backoff() {
     let dir = tempdir().expect("tempdir");
