@@ -559,24 +559,35 @@ mod tests {
                 })
                 .unwrap();
 
+            // Synchronise on `flipped`, not on `is_active()`. The worker
+            // sets `active` *before* bumping the counter, so a loop that
+            // waits on `is_active()` can return while the fetch_add is
+            // still in flight — the idempotence assertion below would then
+            // race the worker and see the count move under it.
+            let await_flips = |n: usize| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while flipped.load(Ordering::SeqCst) < n && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    flipped.load(Ordering::SeqCst),
+                    n,
+                    "worker never applied {n} command(s)"
+                );
+            };
+
             assert!(!inhibitor.is_active());
             inhibitor.acquire().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !inhibitor.is_active() && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
+            await_flips(1);
             assert!(inhibitor.is_active(), "worker never applied Acquire");
 
-            // Idempotent: a second acquire is a pure no-op.
-            let before = flipped.load(Ordering::SeqCst);
+            // Idempotent: a second acquire is a pure no-op, so the worker
+            // never sees it and the count stays put.
             inhibitor.acquire().unwrap();
-            assert_eq!(flipped.load(Ordering::SeqCst), before);
+            assert_eq!(flipped.load(Ordering::SeqCst), 1);
 
             inhibitor.release().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while inhibitor.is_active() && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
+            await_flips(2);
             assert!(!inhibitor.is_active(), "worker never applied Release");
         }
 

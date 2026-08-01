@@ -115,21 +115,36 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
 
     let spans = highlighter.highlight(text.as_bytes());
 
-    // Build highlighted HTML: walk spans in order, emitting spans and
-    // unstyled text between them.
+    Some(render_spans(
+        text,
+        spans
+            .iter()
+            .map(|span| (span.byte_range.clone(), span.capture())),
+    ))
+}
+
+/// Walks `spans` in order, emitting `<span>`s for highlighted ranges and
+/// escaped plain text in between.
+///
+/// Split out from [`try_highlight`] so the slicing can be tested without a
+/// grammar: loading one depends on the embedded registry, which is not
+/// available in every build, and this loop is where H3 lived.
+///
+/// `spans` carry byte offsets into `text`, and every slice goes through
+/// `str::get`, so a span that is out of order, inverted, past the end, or
+/// not on a char boundary is skipped rather than panicking. That matters
+/// because `text` is lossy-decoded page source: nothing upstream guarantees
+/// the grammar's offsets line up with it.
+fn render_spans<'a>(
+    text: &str,
+    spans: impl IntoIterator<Item = (std::ops::Range<usize>, &'a str)>,
+) -> String {
     let mut html = String::with_capacity(text.len() * 2);
     html.push_str("<pre><code>");
 
     let mut cursor = 0usize;
 
-    for span in &spans {
-        let range = &span.byte_range;
-
-        // Defensive: the grammar's spans are *supposed* to be ordered,
-        // non-overlapping and byte-boundary aligned, but nothing here
-        // enforces that. Skip any span that goes backwards, is inverted, or
-        // whose slices don't land on char boundaries — indexing on any of
-        // those would panic on user-supplied page source.
+    for (range, capture) in spans {
         if range.start < cursor || range.end < range.start {
             continue;
         }
@@ -144,7 +159,7 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
         html.push_str(&html_escape(plain));
 
         // Emit this highlighted span.
-        let class = capture_to_class(span.capture());
+        let class = capture_to_class(capture);
         let escaped = html_escape(content);
         html.push_str(&format!("<span class=\"{class}\">{escaped}</span>"));
 
@@ -159,7 +174,7 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
 
     html.push_str("</code></pre>");
 
-    Some(html)
+    html
 }
 
 /// Converts a capture name like `function.macro` to a CSS class `hl-function-macro`.
@@ -302,9 +317,6 @@ mod tests {
         let source = b"fn main() {\n    let s = \"\xff\xfe caf\xe9\";\n}\n";
         let html = render("https://example.com/main.rs", source);
         assert!(html.starts_with("<!DOCTYPE html>"));
-        // The highlighter path really did run (tokens are wrapped in spans,
-        // so `fn main` is not contiguous in the output).
-        assert!(html.contains("<span class=\"hl-"), "expected highlighting");
         // Every invalid byte survives as exactly one U+FFFD — nothing was
         // dropped by the boundary guard and nothing was duplicated.
         assert_eq!(
@@ -315,6 +327,73 @@ mod tests {
         assert!(html.contains("main"));
         // `let s` is emitted verbatim; nothing before the bad bytes is lost.
         assert!(html.contains("let"));
+        // NOTE: deliberately no assertion that highlighting ran. Whether a
+        // grammar loads depends on the embedded registry being present,
+        // which is not true in every build (it is absent on CI), so
+        // requiring `<span class="hl-` here made the test environment
+        // dependent. The slicing this test exists to guard is covered
+        // directly by the `render_spans_*` tests below, which need no
+        // grammar.
+    }
+
+    /// H3 lived in the span walk: spans index the raw bytes, the string
+    /// being sliced is lossy-decoded, and each invalid byte grows from 1
+    /// byte to 3 as U+FFFD — so offsets drift and land mid-character.
+    /// These drive that loop directly, without a grammar.
+    #[test]
+    fn render_spans_skips_offsets_that_are_not_char_boundaries() {
+        // "a\u{FFFD}b": the replacement char occupies bytes 1..4, so 2 and
+        // 3 are interior. A span landing there must be skipped, not panic.
+        let text = "a\u{FFFD}b";
+        for (start, end) in [(0, 2), (2, 4), (1, 3), (3, 5)] {
+            let html = render_spans(text, [(start..end, "keyword")]);
+            assert!(html.starts_with("<pre><code>"), "{start}..{end}");
+            assert!(html.ends_with("</code></pre>"), "{start}..{end}");
+        }
+    }
+
+    #[test]
+    fn render_spans_skips_out_of_order_inverted_and_past_the_end() {
+        let text = "let x = 1;";
+        // Out of order (second starts before the first ended), inverted,
+        // and past the end. None may panic; none may lose the text.
+        // The inverted range is built from variables — a `9..2` literal is
+        // a clippy `reversed_empty_ranges` error.
+        let (hi, lo) = (9usize, 2usize);
+        let html = render_spans(
+            text,
+            [(4..7, "variable"), (0..3, "keyword"), (hi..lo, "operator")],
+        );
+        assert!(html.contains("<span class=\"hl-variable\">x =</span>"));
+        assert!(
+            !html.contains("hl-keyword"),
+            "backwards span must be skipped"
+        );
+        let html = render_spans(text, [(0..999, "keyword")]);
+        assert!(
+            html.contains("let x = 1;"),
+            "past-the-end span must be skipped"
+        );
+    }
+
+    #[test]
+    fn render_spans_emits_all_text_exactly_once() {
+        let text = "fn main() {}";
+        let html = render_spans(text, [(0..2, "keyword"), (3..7, "function")]);
+        assert_eq!(
+            html,
+            "<pre><code><span class=\"hl-keyword\">fn</span> \
+             <span class=\"hl-function\">main</span>() {}</code></pre>"
+        );
+    }
+
+    #[test]
+    fn render_spans_escapes_inside_and_outside_spans() {
+        let text = "<a> & <b>";
+        let html = render_spans(text, [(0..3, "tag")]);
+        assert!(html.contains("<span class=\"hl-tag\">&lt;a&gt;</span>"));
+        assert!(html.contains("&amp;"));
+        assert!(!html.contains("<a>"), "raw markup must not survive");
     }
 
     #[test]

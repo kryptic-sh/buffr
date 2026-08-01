@@ -8029,8 +8029,9 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             .filter(|t| t.engine_badge.is_some())
                             .and_then(|_| {
                                 let router = self.engine_router.as_ref()?;
-                                Some(self.active_engine.as_str().to_owned())
-                                    .filter(|_| router.show_badges())
+                                router
+                                    .show_badges()
+                                    .then(|| self.active_engine.as_str().to_owned())
                             });
                         if self.statusline.engine_hint != badge_engine {
                             self.statusline.engine_hint = badge_engine;
