@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use buffr_core::ConsoleNonces;
 use buffr_core::cursor::{CursorState, SharedCursorState};
 use buffr_core::edit::EditEventSink;
 use buffr_core::favicon::{FaviconSink, new_favicon_sink};
@@ -49,6 +50,10 @@ use super::runtime::{
 /// Thread-safe engine snapshot. Updated by the worker thread; read from any
 /// thread behind `Mutex<EngineState>`.
 pub(crate) struct EngineState {
+    /// True when this engine runs in private (incognito) mode. Threaded in
+    /// from `BackendOpenOptions::private` so every `TabInfo` — and therefore
+    /// every `TabSummary` the apps layer reads — reports it (W7).
+    pub private: bool,
     /// Open tabs in strip order.
     pub tabs: Vec<TabInfo>,
     /// Index of the active tab.
@@ -68,8 +73,9 @@ pub(crate) struct EngineState {
 }
 
 impl EngineState {
-    pub(crate) fn new(width: u32, height: u32) -> Self {
+    pub(crate) fn new(width: u32, height: u32, private: bool) -> Self {
         Self {
+            private,
             tabs: Vec::new(),
             active_idx: None,
             next_id: 1,
@@ -194,7 +200,7 @@ pub(crate) enum Command {
     ///
     /// Standard names: `"Undo"`, `"Redo"`, `"Cut"`, `"Copy"`, `"Paste"`,
     /// `"PasteAsPlainText"`, `"SelectAll"`.
-    ExecEditingCommand {
+    ExecEditing {
         command: &'static str,
     },
     /// Trigger a download of `url` on the active WebView.
@@ -214,7 +220,7 @@ pub(crate) enum Command {
         resolve_id: String,
         outcome: PromptOutcome,
     },
-    /// Fire `MEDIA_PROBE_POLL_JS` on the active tab (#135). The result is
+    /// Fire the media-probe poll script on the active tab (#135). The result is
     /// delivered asynchronously via the `buffrMediaProbe` UCM handler, which
     /// stores the `video` flag in the runtime-wide `video_active` atomic.
     RunMediaProbe,
@@ -275,6 +281,10 @@ pub(crate) struct WorkerHandle {
     /// every TabEntry's UCM script-message handler. `WebKitEngine` reads this
     /// via `pump_hint_events`.
     pub hint_sink: HintEventSink,
+    /// Per-tab console-IPC nonce table (H5). Shared with `WpeRuntime`, every
+    /// UCM script-message handler, and `WebKitEngine::enter_hint_mode`.
+    /// Keyed by `TabId.0 as i32`, matching `TabSummary::browser_id`.
+    pub console_nonces: ConsoleNonces,
     /// Shared popup URL queue. Written by the `create` signal handler on each
     /// WebView when JS calls `window.open(url)` or a link has `target=_blank`.
     /// Drained by the apps layer via `BrowserEngine::popup_queue`.
@@ -349,6 +359,11 @@ impl Drop for WorkerHandle {
 /// - `downloads` — when `Some`, the worker wires the `download-started`
 ///   signal on the default `WebKitNetworkSession` and records lifecycle
 ///   events (`started` / `finished` / `failed`) into the shared store.
+/// - `private` — incognito mode. Recorded on [`EngineState`] so every
+///   `TabSummary` reports it, and used as a hard gate on the persistent
+///   cookie store: a private engine never calls
+///   `webkit_cookie_manager_set_persistent_storage`, even if a caller hands
+///   in a `cookie_db_path` anyway (W7).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     initial_url: &str,
@@ -365,18 +380,25 @@ pub(crate) fn spawn(
     prefer_native: bool,
     wayland_handles: Option<buffr_engine::WaylandNativeHandles>,
     using_native: Arc<AtomicBool>,
+    private: bool,
 ) -> Result<WorkerHandle, WebKitError> {
     // No FDO bootstrap on the new wpe-platform path — the BuffrDisplay
     // subclass owns its own EGL display and view lifecycle. `wpe_loader_init`
     // / `wpe_fdo_initialize_*` are gone with the Phase 2 scaffold.
 
-    let engine_state = Arc::new(Mutex::new(EngineState::new(width, height)));
+    let engine_state = Arc::new(Mutex::new(EngineState::new(width, height, private)));
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(64);
 
     // Shared hint event mailbox. Allocated here so both `WebKitEngine`
     // (reader) and the GLib worker thread (writer, via TabEntry's UCM
     // signal handler) share the same Arc.
     let hint_sink: HintEventSink = new_hint_event_sink();
+
+    // Per-tab console-IPC nonce table (H5). Allocated here so `WebKitEngine`
+    // (which mints the hint nonce in `enter_hint_mode`) and the GLib worker
+    // thread (which mints the page nonce in `TabEntry::new` and verifies
+    // every inbound line) share the same table.
+    let console_nonces = ConsoleNonces::new();
 
     // Shared popup URL queue. Allocated here so both `WebKitEngine` (drainer)
     // and the GLib worker thread (writer, via TabEntry's `create` signal)
@@ -439,6 +461,7 @@ pub(crate) fn spawn(
     let cursor_state_worker = Arc::clone(&cursor_state);
     let video_active_worker = Arc::clone(&video_active);
     let edit_sink_worker = Arc::clone(&edit_sink);
+    let console_nonces_worker = console_nonces.clone();
 
     let thread = thread::Builder::new()
         .name("buffr-webkit-worker".into())
@@ -498,6 +521,7 @@ pub(crate) fn spawn(
                 cursor_state_worker,
                 video_active_worker,
                 edit_sink_worker,
+                console_nonces_worker,
                 prefer_native,
                 wayland_handles,
             ) {
@@ -524,7 +548,14 @@ pub(crate) fn spawn(
             // Called at most once per engine instance; per-tab calls are NOT
             // needed — the default WebKitNetworkSession is shared by all
             // WebViews in the process.
-            if let Some(path) = cookie_db_path {
+            //
+            // W7: `private` is a hard gate here as well as in the caller —
+            // an incognito engine must never touch the on-disk cookie DB.
+            if private {
+                tracing::info!(
+                    "webkit: private mode — skipping persistent cookie store, cookies stay in memory"
+                );
+            } else if let Some(path) = cookie_db_path {
                 match std::ffi::CString::new(path.as_str()) {
                     Ok(path_c) => {
                         // SAFETY: webkit_network_session_get_default() returns
@@ -681,6 +712,7 @@ pub(crate) fn spawn(
         cmd_tx,
         engine_state,
         hint_sink,
+        console_nonces,
         popup_queue,
         context_menu_sink,
         favicon_sink,
@@ -715,7 +747,12 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
             rt.resize(width, height);
         }
         Command::KeyEvent { ev } => {
-            rt.dispatch_keyboard(ev.key_code, ev.pressed, ev.modifiers);
+            // W4: `NeutralKeyEvent::modifiers` is a CEF `EVENTFLAG_*` mask,
+            // not a WPE one. Forwarding it verbatim delivered CEF CONTROL
+            // (0x04) as WPE alt(4) and CEF ALT (0x08) as WPE meta(8), so
+            // Ctrl+A inside a page textarea arrived as Alt+A. Every mouse arm
+            // below already translates; the key arm must too.
+            rt.dispatch_keyboard(ev.key_code, ev.pressed, translate_modifiers(ev.modifiers));
         }
         Command::MouseMove { x, y, modifiers } => {
             rt.dispatch_pointer_motion(x, y, translate_modifiers(modifiers));
@@ -777,7 +814,7 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         Command::StopFind => {
             rt.stop_find();
         }
-        Command::ExecEditingCommand { command } => {
+        Command::ExecEditing { command } => {
             rt.execute_editing_command(command);
         }
         Command::StartDownload { url } => {
@@ -997,15 +1034,32 @@ pub(crate) unsafe extern "C" fn on_download_started(
         }
     };
 
-    // Set destination to $HOME/Downloads/<suggested>.
-    unsafe {
+    // Set destination to $HOME/Downloads/<sanitised suggested>.
+    //
+    // W5: `suggested` is server-controlled (Content-Disposition or the URL's
+    // last path segment). It used to be handed straight to `dir.join(...)`,
+    // and `Path::join` with an absolute component *discards* `dir`, so
+    // `filename="/home/u/.bashrc"` wrote outside `~/Downloads`; `..` escaped
+    // too. Reduce to a basename and re-verify containment.
+    {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
         let dir = std::path::Path::new(&home).join("Downloads");
         let _ = std::fs::create_dir_all(&dir);
-        let dest = dir.join(&suggested);
-        if let Some(s) = dest.to_str() {
-            if let Ok(c) = CString::new(s) {
-                webkit_download_set_destination(dl, c.as_ptr());
+        match download_destination(&dir, &suggested) {
+            Some(dest) => {
+                if let Some(s) = dest.to_str()
+                    && let Ok(c) = CString::new(s)
+                {
+                    // SAFETY: `dl` is the live WebKitDownload handed to this
+                    // signal handler; `c` outlives the call.
+                    unsafe { webkit_download_set_destination(dl, c.as_ptr()) };
+                }
+            }
+            None => {
+                tracing::warn!(
+                    suggested,
+                    "webkit: refusing download — filename escapes the download directory"
+                );
             }
         }
     }
@@ -1088,6 +1142,71 @@ pub(crate) unsafe extern "C" fn on_download_started(
     }
 }
 
+// ── Download destination sanitising (W5) ─────────────────────────────────────
+
+/// Fallback basename used when a server-supplied filename sanitises away to
+/// nothing.
+pub(crate) const DOWNLOAD_FALLBACK_NAME: &str = "download";
+
+/// Reduce a server-supplied download filename to a safe single path component.
+///
+/// `suggested` originates from the site's `Content-Disposition` header (via
+/// `webkit_uri_response_get_suggested_filename`) or, failing that, the last
+/// segment of the download URL. Both are fully attacker-controlled.
+///
+/// Returns `None` when nothing usable survives; callers should substitute
+/// [`DOWNLOAD_FALLBACK_NAME`].
+///
+/// Rejects, in order:
+/// - anything that isn't a plain final component (`/`, `\`, absolute paths,
+///   `..`, `.`) — `Path::join` with an *absolute* component silently discards
+///   the download directory entirely, so `"/home/u/.bashrc"` used to escape
+///   `~/Downloads` outright;
+/// - NUL bytes, which would truncate the `CString` handed to
+///   `webkit_download_set_destination`;
+/// - leading/trailing whitespace, and names that are empty afterwards.
+pub(crate) fn sanitize_download_filename(suggested: &str) -> Option<String> {
+    // Backslash is not a separator on Unix, so `Path::file_name` would keep
+    // `..\..\x` whole. Normalise it to `/` first — a literal backslash in a
+    // Linux filename is legal but vanishingly rare, and dropping the prefix
+    // is the safe reading of a Windows-style path.
+    let normalized = suggested.replace('\\', "/");
+    let name = std::path::Path::new(&normalized).file_name()?.to_str()?;
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('\0')
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// Build the on-disk destination for a download.
+///
+/// Joins the sanitised basename onto `dir` and re-verifies the result is
+/// still inside `dir` — a cheap second gate in case `sanitize_download_filename`
+/// ever loosens. Returns `None` if the join escapes.
+pub(crate) fn download_destination(
+    dir: &std::path::Path,
+    suggested: &str,
+) -> Option<std::path::PathBuf> {
+    let name =
+        sanitize_download_filename(suggested).unwrap_or_else(|| DOWNLOAD_FALLBACK_NAME.to_owned());
+    let dest = dir.join(&name);
+    if !dest.starts_with(dir) {
+        return None;
+    }
+    // `dir.join(name)` on a single component must add exactly one component.
+    if dest.parent() != Some(dir) {
+        return None;
+    }
+    Some(dest)
+}
+
 /// Map CEF EVENTFLAG_* bitmask → WPE `wpe_input_modifier`.
 ///
 /// CEF flags (from `cef_event_flags_t`):
@@ -1113,4 +1232,228 @@ fn translate_modifiers(cef: u32) -> u32 {
         wpe |= 8; // wpe meta
     }
     wpe
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── translate_modifiers (W4) ─────────────────────────────────────────────
+
+    // CEF `cef_event_flags_t` values, as carried in `NeutralKeyEvent::modifiers`.
+    const CEF_SHIFT: u32 = 0x02;
+    const CEF_CONTROL: u32 = 0x04;
+    const CEF_ALT: u32 = 0x08;
+    const CEF_COMMAND: u32 = 0x20;
+
+    // WPE `wpe_input_modifier` values.
+    const WPE_CONTROL: u32 = 1;
+    const WPE_SHIFT: u32 = 2;
+    const WPE_ALT: u32 = 4;
+    const WPE_META: u32 = 8;
+
+    #[test]
+    fn modifiers_translate_one_for_one() {
+        assert_eq!(translate_modifiers(CEF_SHIFT), WPE_SHIFT);
+        assert_eq!(translate_modifiers(CEF_CONTROL), WPE_CONTROL);
+        assert_eq!(translate_modifiers(CEF_ALT), WPE_ALT);
+        assert_eq!(translate_modifiers(CEF_COMMAND), WPE_META);
+        assert_eq!(translate_modifiers(0), 0);
+    }
+
+    /// W4 regression: forwarding a CEF mask verbatim (as `Command::KeyEvent`
+    /// used to) reinterprets CONTROL as alt and ALT as meta. Ctrl+A in a page
+    /// textarea arrived as Alt+A.
+    #[test]
+    fn untranslated_cef_control_would_read_as_wpe_alt() {
+        assert_eq!(
+            CEF_CONTROL, WPE_ALT,
+            "the raw bit collision this fix targets"
+        );
+        assert_eq!(CEF_ALT, WPE_META, "and the second collision");
+        assert_eq!(translate_modifiers(CEF_CONTROL), WPE_CONTROL);
+        assert_ne!(translate_modifiers(CEF_CONTROL), WPE_ALT);
+    }
+
+    #[test]
+    fn modifiers_combine() {
+        assert_eq!(
+            translate_modifiers(CEF_CONTROL | CEF_SHIFT),
+            WPE_CONTROL | WPE_SHIFT
+        );
+        assert_eq!(
+            translate_modifiers(CEF_SHIFT | CEF_CONTROL | CEF_ALT | CEF_COMMAND),
+            WPE_SHIFT | WPE_CONTROL | WPE_ALT | WPE_META
+        );
+    }
+
+    #[test]
+    fn modifiers_ignore_unknown_bits() {
+        // EVENTFLAG_CAPS_LOCK_ON (0x01), NUM_LOCK_ON (0x100), etc.
+        assert_eq!(translate_modifiers(0x01), 0);
+        assert_eq!(translate_modifiers(0x100 | CEF_SHIFT), WPE_SHIFT);
+        // Every bit except the four we map.
+        let unmapped = !(CEF_SHIFT | CEF_CONTROL | CEF_ALT | CEF_COMMAND);
+        assert_eq!(translate_modifiers(unmapped), 0);
+    }
+
+    // ── sanitize_download_filename (W5) ──────────────────────────────────────
+
+    #[test]
+    fn filename_keeps_a_plain_basename() {
+        assert_eq!(
+            sanitize_download_filename("report.pdf").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            sanitize_download_filename("hello world (1).tar.gz").as_deref(),
+            Some("hello world (1).tar.gz")
+        );
+        // Leading dot is a legal (hidden) filename, not traversal.
+        assert_eq!(
+            sanitize_download_filename(".hidden").as_deref(),
+            Some(".hidden")
+        );
+    }
+
+    /// The headline W5 case: `Path::join` with an ABSOLUTE component discards
+    /// the base entirely, so an unsanitised `"/home/u/.bashrc"` wrote outside
+    /// `~/Downloads`.
+    #[test]
+    fn filename_reduces_absolute_path_to_its_basename() {
+        assert_eq!(
+            sanitize_download_filename("/home/u/.bashrc").as_deref(),
+            Some(".bashrc")
+        );
+        assert_eq!(
+            sanitize_download_filename("/etc/passwd").as_deref(),
+            Some("passwd")
+        );
+    }
+
+    #[test]
+    fn filename_strips_traversal_segments() {
+        assert_eq!(
+            sanitize_download_filename("../../../etc/passwd").as_deref(),
+            Some("passwd")
+        );
+        assert_eq!(
+            sanitize_download_filename("a/b/c/evil.sh").as_deref(),
+            Some("evil.sh")
+        );
+    }
+
+    #[test]
+    fn filename_rejects_pure_traversal_and_empties() {
+        assert_eq!(sanitize_download_filename(".."), None);
+        assert_eq!(sanitize_download_filename("."), None);
+        assert_eq!(sanitize_download_filename(""), None);
+        assert_eq!(sanitize_download_filename("   "), None);
+        assert_eq!(sanitize_download_filename("/"), None);
+        assert_eq!(sanitize_download_filename("../.."), None);
+        assert_eq!(sanitize_download_filename("foo/.."), None);
+    }
+
+    #[test]
+    fn filename_rejects_nul_bytes() {
+        // A NUL in the final component would truncate the CString handed to
+        // `webkit_download_set_destination`.
+        assert_eq!(sanitize_download_filename("safe\0.txt"), None);
+        assert_eq!(sanitize_download_filename("\0"), None);
+        // A NUL earlier in the path is irrelevant — `file_name` already
+        // discarded everything before the last separator, and what survives
+        // is still a contained basename.
+        assert_eq!(
+            sanitize_download_filename("safe.txt\0../../evil").as_deref(),
+            Some("evil")
+        );
+    }
+
+    #[test]
+    fn filename_handles_windows_style_separators() {
+        assert_eq!(
+            sanitize_download_filename(r"..\..\Windows\System32\evil.dll").as_deref(),
+            Some("evil.dll")
+        );
+        assert_eq!(sanitize_download_filename(r"C:\..\..").as_deref(), None);
+    }
+
+    #[test]
+    fn filename_trims_surrounding_whitespace() {
+        assert_eq!(
+            sanitize_download_filename("  spaced.txt \t").as_deref(),
+            Some("spaced.txt")
+        );
+    }
+
+    // ── download_destination (W5) ────────────────────────────────────────────
+
+    #[test]
+    fn destination_stays_inside_the_download_dir() {
+        let dir = Path::new("/home/u/Downloads");
+        for suggested in [
+            "report.pdf",
+            "/home/u/.bashrc",
+            "../../../etc/passwd",
+            r"..\..\evil.dll",
+            "",
+            "..",
+        ] {
+            let dest = download_destination(dir, suggested)
+                .unwrap_or_else(|| panic!("no destination for {suggested:?}"));
+            assert!(
+                dest.starts_with(dir),
+                "{suggested:?} escaped the download dir: {dest:?}"
+            );
+            assert_eq!(
+                dest.parent(),
+                Some(dir),
+                "{suggested:?} added more than one component: {dest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_substitutes_the_fallback_name() {
+        let dir = Path::new("/home/u/Downloads");
+        assert_eq!(
+            download_destination(dir, "..").unwrap(),
+            dir.join(DOWNLOAD_FALLBACK_NAME)
+        );
+        assert_eq!(
+            download_destination(dir, "").unwrap(),
+            dir.join(DOWNLOAD_FALLBACK_NAME)
+        );
+    }
+
+    #[test]
+    fn destination_joins_a_normal_name_verbatim() {
+        let dir = Path::new("/home/u/Downloads");
+        assert_eq!(
+            download_destination(dir, "report.pdf").unwrap(),
+            Path::new("/home/u/Downloads/report.pdf")
+        );
+    }
+
+    /// The pre-fix behaviour, kept as an explicit statement of the bug so a
+    /// future refactor cannot quietly reintroduce it.
+    #[test]
+    fn raw_join_with_an_absolute_component_discards_the_base() {
+        let dir = Path::new("/home/u/Downloads");
+        // The absolute component is deliberate — that is the bug.
+        let absolute: &Path = Path::new("/home/u/.bashrc");
+        #[allow(clippy::join_absolute_paths)]
+        let naive = dir.join(absolute);
+        assert_eq!(naive, Path::new("/home/u/.bashrc"));
+        assert!(!naive.starts_with(dir), "this is exactly W5");
+        // The sanitised path does not.
+        assert!(
+            download_destination(dir, "/home/u/.bashrc")
+                .unwrap()
+                .starts_with(dir)
+        );
+    }
 }

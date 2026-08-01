@@ -212,19 +212,52 @@ impl WebKitEngine {
         // Build the cookie DB path.  See `compute_cookie_db_path` for
         // the per-engine namespacing rules; extracted as a pure fn so
         // the doubled-path regression has a unit test.
+        //
+        // W7: private (incognito) engines get `None`, which leaves WebKit's
+        // default in-memory cookie store active. Previously `options.private`
+        // was never read, so a `--private` window wrote cookies straight into
+        // the real profile's `cookies.sqlite`.
+        let private = options.private;
         let xdg_fallback = compute_xdg_data_home();
-        let cookie_db_path = compute_cookie_db_path(
-            options.data_dir,
-            options.engine_id.as_str(),
-            xdg_fallback.as_deref(),
-        );
+        let cookie_db_path = if private {
+            tracing::info!("webkit: private mode — cookies stay in memory");
+            None
+        } else {
+            compute_cookie_db_path(
+                options.data_dir,
+                options.engine_id.as_str(),
+                xdg_fallback.as_deref(),
+            )
+        };
 
         // Downcast the downloads sink from BackendOpenOptions if provided.
-        let downloads: Option<Arc<Downloads>> = options
-            .downloads
-            .as_ref()
-            .and_then(|any| any.downcast_ref::<Arc<Downloads>>())
-            .cloned();
+        //
+        // W9: `options.downloads` is `Arc<dyn Any + Send + Sync>`. The old
+        // `any.downcast_ref::<Arc<Downloads>>()` auto-deref'd through the Arc
+        // and asked the *inner* `dyn Any` whether it was an `Arc<Downloads>`
+        // — which only holds if the caller erased an `Arc<Arc<Downloads>>`.
+        // A caller passing the natural `Arc<Downloads>` silently got `None`
+        // and every download became invisible to the store. Use
+        // `Arc::downcast` (which inspects the erased type itself), keep the
+        // legacy double-Arc shape working, and warn loudly when a non-`None`
+        // sink matches neither.
+        let downloads: Option<Arc<Downloads>> = match options.downloads.as_ref() {
+            None => None,
+            Some(any) => match Arc::clone(any).downcast::<Downloads>() {
+                Ok(store) => Some(store),
+                // Legacy shape: the caller erased an `Arc<Arc<Downloads>>`.
+                Err(orig) => match orig.downcast_ref::<Arc<Downloads>>() {
+                    Some(nested) => Some(Arc::clone(nested)),
+                    None => {
+                        tracing::warn!(
+                            "webkit: BackendOpenOptions.downloads is not an Arc<Downloads> — \
+                             download tracking disabled for this engine"
+                        );
+                        None
+                    }
+                },
+            },
+        };
 
         let using_native = Arc::new(AtomicBool::new(false));
         let worker = spawn(
@@ -242,6 +275,7 @@ impl WebKitEngine {
             options.prefer_native,
             options.wayland_handles,
             Arc::clone(&using_native),
+            private,
         )?;
 
         // Share the popup_queue that the worker already created and wired to
@@ -302,9 +336,12 @@ impl WebKitEngine {
                 // from spawn's idle handler. Pre-record the display URL so
                 // the omnibar shows `buffr://new` rather than the
                 // translated http://127.0.0.1:.../data: URL from the very
-                // first frame.
+                // first frame. W6: only for schemes we actually rewrite —
+                // a plain https:// homepage must track live navigations.
                 let mut m = HashMap::new();
-                m.insert(TabId(1), options.initial_url.to_owned());
+                if should_record_display_url(options.initial_url) {
+                    m.insert(TabId(1), options.initial_url.to_owned());
+                }
                 m
             }),
             is_loading_atomic,
@@ -404,6 +441,17 @@ impl WebKitEngine {
         }
     }
 
+    /// Record `url` as `tab_id`'s display override when the scheme warrants
+    /// one, otherwise drop any override the tab already carried.
+    /// See [`should_record_display_url`] (W6).
+    fn sync_display_url(&self, tab_id: TabId, url: &str) {
+        if should_record_display_url(url) {
+            self.record_display_url(tab_id, url);
+        } else {
+            self.forget_display_url(tab_id);
+        }
+    }
+
     fn forget_display_url(&self, tab_id: TabId) {
         if let Ok(mut guard) = self.display_urls.lock() {
             guard.remove(&tab_id);
@@ -412,6 +460,16 @@ impl WebKitEngine {
 
     fn display_url_for(&self, tab_id: TabId) -> Option<String> {
         self.display_urls.lock().ok()?.get(&tab_id).cloned()
+    }
+
+    /// [`TabId`] of the currently active tab, if any. `None` when there is no
+    /// active tab or the engine-state mutex is poisoned.
+    fn active_tab_id(&self) -> Option<TabId> {
+        self.worker
+            .engine_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_tab_info().map(|t| t.id))
     }
 
     /// Apply our per-tab display URL on top of a worker-built [`TabSummary`].
@@ -425,11 +483,23 @@ impl WebKitEngine {
     /// Inject hint.js into the active tab and initialise a `HintSession`.
     ///
     /// Mirrors `WebKitGtkEngine::enter_hint_mode` 1:1.
+    ///
+    /// H5: mints a fresh hint nonce for the active tab on every entry, so a
+    /// nonce leaked to a hostile top-level document during one hint session is
+    /// dead by the next one. `hint.js` is evaluated via
+    /// `webkit_web_view_evaluate_javascript`, which targets the main frame in
+    /// the default JS world — subframes never receive it, and therefore never
+    /// learn the nonce.
     fn enter_hint_mode(&self, background: bool) {
         const LABEL_BUDGET: usize = 256;
+        let Some(active) = self.active_tab_id() else {
+            tracing::warn!("webkit: enter_hint_mode with no active tab");
+            return;
+        };
+        let nonce = self.worker.console_nonces.rotate_hint(active.0 as i32);
         let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
         let alphabet_str = self.hint_alphabet.as_string();
-        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
+        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS, &nonce);
 
         let alphabet = self.hint_alphabet.clone();
         if let Ok(mut g) = self.hint_session.lock() {
@@ -468,12 +538,32 @@ impl WebKitEngine {
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| EngineError::Other("open_tab timed out".into()))?
             .map_err(EngineError::Other)?;
-        self.record_display_url(tab_id, &original);
+        self.sync_display_url(tab_id, &original);
         Ok(tab_id)
     }
 }
 
 // ── Pure helpers (extracted for unit testing) ────────────────────────────────
+
+/// Prefix for buffr's view-source scheme. Mirrors
+/// `buffr_cef::host::BUFFR_SRC_PREFIX` (that crate is not a dependency here).
+pub(crate) const BUFFR_SRC_PREFIX: &str = "buffr-src:";
+
+/// Should `url` be kept as a per-tab *display* override?
+///
+/// W6: only buffr's own schemes get an override. Those are rewritten before
+/// they reach WebKit (`buffr://new` → `http://127.0.0.1:<port>/<token>/new`),
+/// so the loaded URL is unusable in the omnibar and the typed form has to be
+/// stashed. Every other scheme is loaded verbatim, and pinning the typed URL
+/// there froze the omnibar on the entry URL forever — an in-page link click
+/// still reported the original address because the entry was only dropped on
+/// tab close.
+///
+/// Mirrors `buffr-cef`'s record/forget policy in `BrowserHost::navigate` /
+/// `open_tab`.
+pub(crate) fn should_record_display_url(url: &str) -> bool {
+    url.starts_with("buffr://") || url.starts_with(BUFFR_SRC_PREFIX)
+}
 
 /// Apply a display URL on top of a [`TabSummary`].
 ///
@@ -508,6 +598,17 @@ impl BrowserEngine for WebKitEngine {
     fn close_all_browsers(&self) {
         tracing::debug!("webkit: close_all_browsers — sending Shutdown");
         self.send(Command::Shutdown);
+    }
+
+    // ── Internal server ───────────────────────────────────────────────────────
+
+    /// W1: real override of the trait's default no-op. Without this, a call
+    /// through `Arc<dyn BrowserEngine>` silently hit the default and left
+    /// `buffr://` URLs untranslated. Delegates to the inherent method
+    /// (inherent methods win on a concrete `WebKitEngine`, so both spellings
+    /// end up here).
+    fn set_internal_server(&self, server: Arc<InternalServer>) {
+        WebKitEngine::set_internal_server(self, server);
     }
 
     // ── Tabs ──────────────────────────────────────────────────────────────────
@@ -683,10 +784,10 @@ impl BrowserEngine for WebKitEngine {
             .ok()
             .and_then(|st| st.active_tab_info().map(|t| t.id))
         {
-            // For non-buffr:// URLs we still record so subsequent calls
-            // return the user-typed input rather than the loaded URL,
-            // which may differ after redirects.
-            self.record_display_url(active, url);
+            // W6: buffr:// / buffr-src: keep the typed form (the loaded URL
+            // is the rewritten loopback address); every other scheme clears
+            // any stale override so in-page navigations are reported live.
+            self.sync_display_url(active, url);
         }
         self.send(Command::Navigate {
             url: self.resolve_url(url),
@@ -884,33 +985,33 @@ impl BrowserEngine for WebKitEngine {
     // ── Frame editing commands ────────────────────────────────────────────────
 
     fn frame_undo(&self) {
-        self.send(Command::ExecEditingCommand { command: "Undo" });
+        self.send(Command::ExecEditing { command: "Undo" });
     }
 
     fn frame_redo(&self) {
-        self.send(Command::ExecEditingCommand { command: "Redo" });
+        self.send(Command::ExecEditing { command: "Redo" });
     }
 
     fn frame_cut(&self) {
-        self.send(Command::ExecEditingCommand { command: "Cut" });
+        self.send(Command::ExecEditing { command: "Cut" });
     }
 
     fn frame_copy(&self) {
-        self.send(Command::ExecEditingCommand { command: "Copy" });
+        self.send(Command::ExecEditing { command: "Copy" });
     }
 
     fn frame_paste(&self) {
-        self.send(Command::ExecEditingCommand { command: "Paste" });
+        self.send(Command::ExecEditing { command: "Paste" });
     }
 
     fn frame_paste_plain(&self) {
-        self.send(Command::ExecEditingCommand {
+        self.send(Command::ExecEditing {
             command: "PasteAsPlainText",
         });
     }
 
     fn frame_select_all(&self) {
-        self.send(Command::ExecEditingCommand {
+        self.send(Command::ExecEditing {
             command: "SelectAll",
         });
     }
@@ -1296,10 +1397,8 @@ impl BrowserEngine for WebKitEngine {
             let js = format!("if (window.__buffrHintCommit) window.__buffrHintCommit({id})");
             self.send(Command::EvalJs { script: js });
         }
-        if clear {
-            if let Ok(mut g) = self.hint_session.lock() {
-                *g = None;
-            }
+        if clear && let Ok(mut g) = self.hint_session.lock() {
+            *g = None;
         }
         if cancel {
             self.cancel_hint();
@@ -1560,15 +1659,15 @@ fn scroll_lines_to_px(count: u32) -> u32 {
 /// `PathBuf` rather than a `&Path` so the caller can hold it across
 /// multiple `compute_cookie_db_path` calls without re-querying env.
 fn compute_xdg_data_home() -> Option<std::path::PathBuf> {
-    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
-        if !v.is_empty() {
-            return Some(std::path::PathBuf::from(v));
-        }
+    if let Ok(v) = std::env::var("XDG_DATA_HOME")
+        && !v.is_empty()
+    {
+        return Some(std::path::PathBuf::from(v));
     }
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            return Some(std::path::PathBuf::from(h).join(".local/share"));
-        }
+    if let Ok(h) = std::env::var("HOME")
+        && !h.is_empty()
+    {
+        return Some(std::path::PathBuf::from(h).join(".local/share"));
     }
     None
 }
@@ -1989,5 +2088,62 @@ mod tests {
         };
         let ev = neutral_key_to_wpe(e).expect("Enter RawDown must dispatch");
         assert_eq!(ev.modifiers, 0b1010);
+    }
+
+    // ── should_record_display_url (W6) ───────────────────────────────────────
+
+    #[test]
+    fn display_url_recorded_for_buffr_schemes() {
+        assert!(should_record_display_url("buffr://new"));
+        assert!(should_record_display_url("buffr://settings"));
+        assert!(should_record_display_url("buffr-src:https://example.com"));
+    }
+
+    /// W6 regression: recording an override for a normal web URL pinned the
+    /// omnibar to the entry URL forever — the entry was only dropped on tab
+    /// close, so clicking through to `/foo` still reported the landing page.
+    #[test]
+    fn display_url_not_recorded_for_web_schemes() {
+        assert!(!should_record_display_url("https://example.com"));
+        assert!(!should_record_display_url("https://example.com/foo"));
+        assert!(!should_record_display_url("http://127.0.0.1:9/tok/new"));
+        assert!(!should_record_display_url("file:///tmp/x.html"));
+        assert!(!should_record_display_url("data:text/html,<p>hi"));
+        assert!(!should_record_display_url("about:blank"));
+        assert!(!should_record_display_url(""));
+    }
+
+    /// Near-misses must not be mistaken for the real schemes.
+    #[test]
+    fn display_url_policy_is_prefix_exact() {
+        assert!(!should_record_display_url("https://buffr://new"));
+        assert!(!should_record_display_url("buffr:new"));
+        assert!(!should_record_display_url("xbuffr://new"));
+        assert!(!should_record_display_url("buffr-source:https://x"));
+    }
+
+    /// The end-to-end shape of the fix: with no override the summary tracks
+    /// whatever WebKit loaded, which is what an https:// tab needs.
+    #[test]
+    fn web_url_summary_tracks_the_live_url_after_the_policy_change() {
+        let typed = "https://example.com";
+        assert!(!should_record_display_url(typed));
+        let s = TabSummary {
+            id: TabId(1),
+            browser_id: 1,
+            url: "https://example.com/foo".into(),
+            title: "Foo".into(),
+            progress: 1.0,
+            is_loading: false,
+            pinned: false,
+            private: false,
+        };
+        // No override recorded → summary passes through untouched.
+        let out = apply_display_overrides_pure(s.clone(), None);
+        assert_eq!(out.url, "https://example.com/foo");
+        assert_eq!(out.title, "Foo");
+        // The old behaviour, for contrast: the typed URL wins forever.
+        let stale = apply_display_overrides_pure(s, Some(typed));
+        assert_eq!(stale.url, typed, "this is exactly W6");
     }
 }

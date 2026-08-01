@@ -40,7 +40,13 @@ impl Backend for WebKitBackend {
         options: BackendOpenOptions<'_>,
     ) -> Result<Arc<dyn BrowserEngine>, String> {
         tracing::debug!("webkit: WebKitBackend::open_engine (phase 1 stub)");
-        let engine = WebKitEngine::new(&options).map_err(|e| e.to_string())?;
+        // W1: bind the shared InternalServer up front. `WebKitEngine::new`
+        // passes `None`, which leaves `buffr://` URLs untranslated — the
+        // worker's very first `open_tab` fires from a GLib idle handler
+        // before any post-construction setter could run, so the initial
+        // tab would fail to load.
+        let engine = WebKitEngine::new_with_server(&options, options.internal_server.clone())
+            .map_err(|e| e.to_string())?;
         Ok(Arc::new(engine) as Arc<dyn BrowserEngine>)
     }
 }

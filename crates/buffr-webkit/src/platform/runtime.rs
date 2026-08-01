@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::collections::VecDeque;
 
 use buffr_core::cursor::SharedCursorState;
-use buffr_core::hint::{HintConsoleEvent, HintEventSink, parse_console_event};
+use buffr_core::hint::{HintEventSink, parse_console_event};
 use buffr_engine::permissions::{PendingPermission, PermissionsQueue};
 use buffr_engine::popup::PopupQueue;
 use buffr_engine::types::MediaType;
@@ -74,10 +74,14 @@ pub(crate) struct TabInfo {
     pub is_loading: bool,
     pub progress: f64,
     pub is_pinned: bool,
+    /// True when the owning engine runs in private (incognito) mode. Copied
+    /// from `EngineState::private` at construction and surfaced in
+    /// [`TabInfo::to_summary`] — this used to be hardcoded `false` (W7).
+    pub is_private: bool,
 }
 
 impl TabInfo {
-    pub(crate) fn new(id: TabId, url: &str) -> Self {
+    pub(crate) fn new(id: TabId, url: &str, is_private: bool) -> Self {
         Self {
             id,
             url: url.to_owned(),
@@ -85,6 +89,7 @@ impl TabInfo {
             is_loading: false,
             progress: 0.0,
             is_pinned: false,
+            is_private,
         }
     }
 
@@ -97,7 +102,7 @@ impl TabInfo {
             progress: self.progress as f32,
             is_loading: self.is_loading,
             pinned: self.is_pinned,
-            private: false,
+            private: self.is_private,
         }
     }
 }
@@ -187,6 +192,16 @@ unsafe impl Sync for WpePermissionRequestPtr {}
 // script-message handler registered via WebKitUserContentManager.
 //
 // Pattern: scrape sentinel-prefixed console.log lines from the JS side.
+//
+// H5 / nonce note: this bridge deliberately matches on the BARE sentinel and
+// forwards the WHOLE line, nonce included. It is untrusted transport — it runs
+// in the page's own JS context, and `window.webkit.messageHandlers.buffrHint`
+// is registered on the UCM so *any* frame can postMessage into it directly,
+// bridge or no bridge. Authentication therefore happens on the Rust side, in
+// `on_hint_script_message`, via `hint::parse_console_event(line, nonce)`.
+// Splicing the nonce into this bridge instead would move the check into
+// page-controlled JS and buy nothing, and would force a re-injection of the
+// bridge on every nonce rotation.
 const HINT_CONSOLE_BRIDGE_JS: &str = r#"
 (function() {
   var orig = console.log;
@@ -387,21 +402,25 @@ pub(crate) const CURSOR_BRIDGE_JS: &str = r#"
 /// Console.log shim for the media probe (#135).
 ///
 /// Intercepts `console.log` calls whose first argument starts with the
-/// `__buffr_media__:` sentinel emitted by `MEDIA_PROBE_POLL_JS` and forwards
-/// the JSON payload via the `buffrMediaProbe` UCM handler. All other calls
-/// pass through to the original `console.log` unchanged.
+/// `__buffr_media__:` sentinel emitted by the media-probe poll script and
+/// forwards the **whole line** (sentinel + nonce + JSON) via the
+/// `buffrMediaProbe` UCM handler. All other calls pass through to the
+/// original `console.log` unchanged.
 ///
 /// Installed at document-start on the top frame only (the poll script also
 /// runs in the top frame). A try/catch wrapper prevents any breakage if the
 /// UCM handler isn't registered yet.
+///
+/// H5 / nonce note: matches on the BARE sentinel and does not strip. See
+/// `HINT_CONSOLE_BRIDGE_JS` — the nonce is verified in Rust by
+/// `media_probe::parse(line, nonce)`, not here.
 const MEDIA_PROBE_CONSOLE_SHIM_JS: &str = r#"
 (() => {
   const orig = console.log.bind(console);
   console.log = function(...args) {
     try {
       if (typeof args[0] === 'string' && args[0].startsWith('__buffr_media__:')) {
-        const json = args[0].substring('__buffr_media__:'.length);
-        window.webkit.messageHandlers.buffrMediaProbe.postMessage(json);
+        window.webkit.messageHandlers.buffrMediaProbe.postMessage(args[0]);
       }
     } catch (_) {}
     return orig.apply(console, args);
@@ -412,20 +431,23 @@ const MEDIA_PROBE_CONSOLE_SHIM_JS: &str = r#"
 /// Console.log shim for edit mode (#134).
 ///
 /// Intercepts `console.log` calls whose first argument starts with the
-/// `__buffr_edit__:` sentinel emitted by `edit.js` and forwards the JSON
-/// payload (without the sentinel prefix) to the native `buffrEdit` UCM
-/// handler. All other calls pass through to the original `console.log`.
+/// `__buffr_edit__:` sentinel emitted by `edit.js` and forwards the **whole
+/// line** (sentinel + nonce + JSON) to the native `buffrEdit` UCM handler.
+/// All other calls pass through to the original `console.log`.
 ///
 /// Installed at document-start so the shim is in place before `edit.js`
 /// (injected at document-end) fires its first event.
+///
+/// H5 / nonce note: matches on the BARE sentinel and does not strip. See
+/// `HINT_CONSOLE_BRIDGE_JS` — the nonce is verified in Rust by
+/// `edit::parse_console_event(line, nonce)`, not here.
 const EDIT_CONSOLE_SHIM_JS: &str = r#"
 (() => {
   const orig = console.log.bind(console);
   console.log = function(...args) {
     try {
       if (typeof args[0] === 'string' && args[0].startsWith('__buffr_edit__:')) {
-        const json = args[0].substring('__buffr_edit__:'.length);
-        window.webkit.messageHandlers.buffrEdit.postMessage(json);
+        window.webkit.messageHandlers.buffrEdit.postMessage(args[0]);
       }
     } catch (_) {}
     return orig.apply(console, args);
@@ -672,14 +694,29 @@ unsafe extern "C" fn drop_tab_signal_ctx(
 
 // ── Hint script-message signal ────────────────────────────────────────────────
 
+/// Per-tab heap context for the `buffrHint` UCM signal handler.
+///
+/// Carries the shared one-slot sink plus everything needed to authenticate an
+/// inbound line: the nonce table and the tab it belongs to (H5).
+pub(crate) struct HintSignalCtx {
+    tab_id: TabId,
+    sink: HintEventSink,
+    console_nonces: buffr_core::ConsoleNonces,
+}
+
 /// `script-message-received::buffrHint` handler on the WebKitUserContentManager.
 ///
 /// Prototype (GLib signal): `(WebKitUserContentManager*, JSCValue*, user_data*)`.
-/// `js_value` carries the string the page posted via
+/// `js_value` carries the full console line the page posted via
 /// `window.webkit.messageHandlers.buffrHint.postMessage(msg)`.
-/// We call `jsc_value_to_string` (malloc'd, must g_free), parse the sentinel
-/// prefix with `buffr_core::hint::parse_console_event`, and write the result
-/// into the shared `HintEventSink`.
+/// We call `jsc_value_to_string` (malloc'd, must g_free), verify
+/// sentinel + nonce with `buffr_core::hint::parse_console_event`, and write the
+/// result into the shared `HintEventSink`.
+///
+/// H5: the nonce check is the authentication boundary. The UCM handler name is
+/// registered on the whole web view, so any frame can postMessage here; only a
+/// frame that was injected with the current hint nonce can produce a line that
+/// verifies.
 unsafe extern "C" fn on_hint_script_message(
     _ucm: *mut std::os::raw::c_void,
     js_value: *mut std::os::raw::c_void,
@@ -688,9 +725,9 @@ unsafe extern "C" fn on_hint_script_message(
     if js_value.is_null() || user_data.is_null() {
         return;
     }
-    // SAFETY: user_data is an Arc<Mutex<Option<HintConsoleEvent>>> leaked via
-    // Arc::into_raw; we borrow it here without consuming (no from_raw).
-    let sink = unsafe { &*(user_data as *const Mutex<Option<HintConsoleEvent>>) };
+    // SAFETY: user_data is a Box<HintSignalCtx> owned until
+    // drop_hint_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const HintSignalCtx) };
 
     // SAFETY: jsc_value_to_string allocates a gchar* that we must g_free.
     let raw_ptr = unsafe { jsc_value_to_string(js_value) };
@@ -701,9 +738,10 @@ unsafe extern "C" fn on_hint_script_message(
     let raw: &str = &raw_str;
     tracing::debug!(raw, "webkit: buffrHint script-message received");
 
-    match parse_console_event(raw) {
+    let nonce = ctx.console_nonces.hint(ctx.tab_id.0 as i32);
+    match parse_console_event(raw, &nonce) {
         Some(Ok(event)) => {
-            if let Ok(mut guard) = sink.lock() {
+            if let Ok(mut guard) = ctx.sink.lock() {
                 *guard = Some(event);
             }
         }
@@ -711,22 +749,25 @@ unsafe extern "C" fn on_hint_script_message(
             tracing::warn!(error = %e, raw, "webkit: malformed hint event");
         }
         None => {
-            tracing::debug!("webkit: buffrHint message missing sentinel (ignored)");
+            // Either not one of our lines at all, or a forgery from a frame
+            // that never learned the nonce. Indistinguishable by design, and
+            // logging the body would hand any page a log-spam primitive.
+            tracing::debug!("webkit: buffrHint message failed sentinel/nonce check (ignored)");
         }
     }
     // SAFETY: g_free the malloc'd string from jsc_value_to_string.
     unsafe { g_free(raw_ptr as *mut _) };
 }
 
-/// GLib `GClosureNotify` for the `Arc<HintEventSink>` pointer leaked in
+/// GLib `GClosureNotify` for the `Box<HintSignalCtx>` pointer leaked in
 /// `TabEntry::new` for the `script-message-received::buffrHint` connection.
-unsafe extern "C" fn drop_hint_sink_arc(
+unsafe extern "C" fn drop_hint_signal_ctx(
     user_data: *mut std::os::raw::c_void,
     _closure: *mut _GClosure,
 ) {
     if !user_data.is_null() {
-        // SAFETY: user_data was produced by Arc::into_raw.
-        drop(unsafe { Arc::from_raw(user_data as *const Mutex<Option<HintConsoleEvent>>) });
+        // SAFETY: user_data was produced by Box::into_raw.
+        drop(unsafe { Box::from_raw(user_data as *mut HintSignalCtx) });
     }
 }
 
@@ -740,9 +781,10 @@ unsafe extern "C" fn drop_hint_sink_arc(
 /// We call `jsc_value_to_string`, then push the text to the system clipboard
 /// via `hjkl_clipboard`.
 ///
-/// `user_data` is a raw `*const hjkl_clipboard::Clipboard` produced by
+/// `user_data` is a raw `*const Arc<hjkl_clipboard::Clipboard>` produced by
 /// `Box::into_raw`; the matching `GClosureNotify` (`drop_clipboard_box`)
-/// drops it on disconnect.
+/// drops it on disconnect. The `Arc` points at the process-wide handle from
+/// `super::clipboard::shared_clipboard()` (W10).
 unsafe extern "C" fn on_clipboard_script_message(
     _ucm: *mut std::os::raw::c_void,
     js_value: *mut std::os::raw::c_void,
@@ -769,24 +811,26 @@ unsafe extern "C" fn on_clipboard_script_message(
         "webkit: buffrClipboard — pushing selection to system clipboard"
     );
 
-    // SAFETY: user_data is a `*const hjkl_clipboard::Clipboard` owned by a
-    // Box that lives until `drop_clipboard_box` fires on disconnect.
-    let cb = unsafe { &*(user_data as *const hjkl_clipboard::Clipboard) };
+    // SAFETY: user_data is a `*const Arc<hjkl_clipboard::Clipboard>` owned by
+    // a Box that lives until `drop_clipboard_box` fires on disconnect.
+    let cb = unsafe { &*(user_data as *const Arc<hjkl_clipboard::Clipboard>) };
     use hjkl_clipboard::{MimeType, Selection};
     if let Err(e) = cb.set(Selection::Clipboard, MimeType::Text, text_str.as_bytes()) {
         tracing::warn!(error = %e, "webkit: clipboard_set_text failed");
     }
 }
 
-/// GLib `GClosureNotify` for the `Box<hjkl_clipboard::Clipboard>` pointer
+/// GLib `GClosureNotify` for the `Box<Arc<hjkl_clipboard::Clipboard>>` pointer
 /// leaked in `TabEntry::new` for the clipboard script-message connection.
+/// Dropping the Box only releases this tab's `Arc` ref; the shared handle
+/// outlives every tab.
 unsafe extern "C" fn drop_clipboard_box(
     user_data: *mut std::os::raw::c_void,
     _closure: *mut _GClosure,
 ) {
     if !user_data.is_null() {
         // SAFETY: user_data was produced by Box::into_raw.
-        drop(unsafe { Box::from_raw(user_data as *mut hjkl_clipboard::Clipboard) });
+        drop(unsafe { Box::from_raw(user_data as *mut Arc<hjkl_clipboard::Clipboard>) });
     }
 }
 
@@ -1155,6 +1199,10 @@ pub(crate) struct MediaProbeSignalCtx {
     /// Last-writer-wins across tabs — correct for the "any tab has video"
     /// aggregate that `any_video_active` exposes.
     pub video_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Tab this handler belongs to — the key into `console_nonces` (H5).
+    pub tab_id: TabId,
+    /// Nonce table used to authenticate inbound lines (H5).
+    pub console_nonces: buffr_core::ConsoleNonces,
 }
 
 /// GLib `GClosureNotify` for `Box<MediaProbeSignalCtx>` leaked for the
@@ -1173,7 +1221,7 @@ unsafe extern "C" fn drop_media_probe_signal_ctx(
 ///
 /// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
 /// `js_value` carries the JSON string forwarded by `MEDIA_PROBE_CONSOLE_SHIM_JS`
-/// from the `__buffr_media__:` console.log sentinel emitted by `MEDIA_PROBE_POLL_JS`.
+/// from the `__buffr_media__:` console.log sentinel emitted by the poll script.
 /// Expected shape: `{ "media": bool, "video": bool }`.
 ///
 /// Stores the `video` field into the runtime-wide `video_active` atomic.
@@ -1192,30 +1240,40 @@ unsafe extern "C" fn on_media_probe_script_message(
     if raw_ptr.is_null() {
         return;
     }
-    let json_str = unsafe { CStr::from_ptr(raw_ptr) }
+    let line = unsafe { CStr::from_ptr(raw_ptr) }
         .to_string_lossy()
         .into_owned();
     unsafe { g_free(raw_ptr as *mut _) };
 
-    if json_str.is_empty() {
+    if line.is_empty() {
         return;
     }
 
-    let video: bool = match serde_json::from_str::<serde_json::Value>(&json_str) {
-        Ok(v) => v.get("video").and_then(|b| b.as_bool()).unwrap_or(false),
-        Err(e) => {
+    // SAFETY: user_data is a Box<MediaProbeSignalCtx> owned until
+    // drop_media_probe_signal_ctx fires on disconnect.
+    let ctx = unsafe { &*(user_data as *const MediaProbeSignalCtx) };
+
+    // H5: verify sentinel + nonce before believing anything. The old code
+    // poked at `serde_json::Value["video"]` on whatever the shim handed over,
+    // so any frame could pin the idle inhibitor on.
+    let nonce = ctx.console_nonces.page(ctx.tab_id.0 as i32);
+    let video: bool = match buffr_core::media_probe::parse(&line, &nonce) {
+        Some(Ok(event)) => event.video,
+        Some(Err(e)) => {
             tracing::warn!(
                 error = %e,
-                json = json_str,
-                "webkit: buffrMediaProbe — JSON parse failed"
+                "webkit: buffrMediaProbe — authentic line but JSON parse failed"
+            );
+            return;
+        }
+        None => {
+            tracing::debug!(
+                "webkit: buffrMediaProbe message failed sentinel/nonce check (ignored)"
             );
             return;
         }
     };
 
-    // SAFETY: user_data is a Box<MediaProbeSignalCtx> owned until
-    // drop_media_probe_signal_ctx fires on disconnect.
-    let ctx = unsafe { &*(user_data as *const MediaProbeSignalCtx) };
     use std::sync::atomic::Ordering;
     ctx.video_active.store(video, Ordering::Relaxed);
     tracing::debug!(video, "webkit: buffrMediaProbe — video state updated");
@@ -1228,6 +1286,10 @@ pub(crate) struct EditSignalCtx {
     /// Shared with `WebKitEngine::edit_sink`. When the inner `Option` is
     /// `Some`, decoded `EditConsoleEvent`s are pushed to the `VecDeque`.
     pub edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
+    /// Tab this handler belongs to — the key into `console_nonces` (H5).
+    pub tab_id: TabId,
+    /// Nonce table used to authenticate inbound lines (H5).
+    pub console_nonces: buffr_core::ConsoleNonces,
 }
 
 /// GLib `GClosureNotify` for `Box<EditSignalCtx>` leaked for the
@@ -1245,12 +1307,12 @@ unsafe extern "C" fn drop_edit_signal_ctx(
 /// `script-message-received::buffrEdit` handler on the UCM.
 ///
 /// Prototype: `(WebKitUserContentManager*, JSCValue*, user_data*)`.
-/// `js_value` carries the JSON string forwarded by `EDIT_CONSOLE_SHIM_JS`
+/// `js_value` carries the full console line forwarded by `EDIT_CONSOLE_SHIM_JS`
 /// from the `__buffr_edit__:` console.log sentinel emitted by `edit.js`.
 ///
-/// Reconstructs the full sentinel-prefixed line, calls
-/// `buffr_core::edit::parse_console_event`, and pushes `Ok` events to the
-/// shared sink. Errors and missing-sentinel messages are logged and dropped.
+/// Verifies sentinel + nonce with `buffr_core::edit::parse_console_event` and
+/// pushes `Ok` events to the shared sink. Errors are logged; lines that fail
+/// the nonce check are dropped quietly (H5).
 unsafe extern "C" fn on_edit_script_message(
     _ucm: *mut std::os::raw::c_void,
     js_value: *mut std::os::raw::c_void,
@@ -1264,39 +1326,38 @@ unsafe extern "C" fn on_edit_script_message(
     if raw_ptr.is_null() {
         return;
     }
-    let json_str = unsafe { CStr::from_ptr(raw_ptr) }
+    let line = unsafe { CStr::from_ptr(raw_ptr) }
         .to_string_lossy()
         .into_owned();
     unsafe { g_free(raw_ptr as *mut _) };
 
-    if json_str.is_empty() {
+    if line.is_empty() {
         return;
     }
 
-    // Reconstruct the full sentinel-prefixed line so parse_console_event's
-    // sentinel scan succeeds — the shim strips the prefix before postMessage.
-    let line = format!("{}{}", buffr_core::edit::EDIT_CONSOLE_SENTINEL, json_str);
     tracing::debug!(line, "webkit: buffrEdit script-message received");
 
     // SAFETY: user_data is a Box<EditSignalCtx> owned until
     // drop_edit_signal_ctx fires on disconnect.
     let ctx = unsafe { &*(user_data as *const EditSignalCtx) };
 
-    match buffr_core::edit::parse_console_event(&line) {
+    // H5: the shim now forwards the whole line, nonce included, and the check
+    // happens here on the trusted side rather than in page-controlled JS.
+    let nonce = ctx.console_nonces.page(ctx.tab_id.0 as i32);
+    match buffr_core::edit::parse_console_event(&line, &nonce) {
         Some(Ok(event)) => {
-            if let Ok(guard) = ctx.edit_sink.lock() {
-                if let Some(sink) = guard.as_ref() {
-                    if let Ok(mut q) = sink.lock() {
-                        q.push_back(event);
-                    }
-                }
+            if let Ok(guard) = ctx.edit_sink.lock()
+                && let Some(sink) = guard.as_ref()
+                && let Ok(mut q) = sink.lock()
+            {
+                q.push_back(event);
             }
         }
         Some(Err(e)) => {
-            tracing::warn!(error = %e, raw = json_str, "webkit: malformed edit event");
+            tracing::warn!(error = %e, "webkit: authentic edit line but decode failed");
         }
         None => {
-            tracing::debug!("webkit: buffrEdit message missing sentinel (ignored)");
+            tracing::debug!("webkit: buffrEdit message failed sentinel/nonce check (ignored)");
         }
     }
 }
@@ -1315,9 +1376,9 @@ unsafe extern "C" fn on_edit_script_message(
 /// on the same thread via `g_idle_add` to ensure the call lands on the
 /// GLib main loop as required.
 ///
-/// `user_data` is NULL — hjkl_clipboard::Clipboard::new() is called fresh
-/// per request because Clipboard is not Send (Wayland back-end uses a
-/// per-thread Wayland connection proxy via a static lazy thread).
+/// `user_data` is NULL — the worker pulls the process-wide `Arc<Clipboard>`
+/// from `super::clipboard::shared_clipboard()` (W10) rather than opening a
+/// fresh Wayland connection per request.
 unsafe extern "C" fn on_clipboard_paste_scheme_request(
     request: *mut super::ffi::WebKitURISchemeRequest,
     _user_data: *mut std::os::raw::c_void,
@@ -1340,19 +1401,14 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
     std::thread::spawn(move || {
         use hjkl_clipboard::{MimeType, Selection};
 
-        // Read host clipboard text. Clipboard::new() probes the best backend
-        // (Wayland bg thread → X11 → OSC52). The Wayland backend is safe to
-        // call from any OS thread — it has its own dedicated Wayland socket
-        // and does not share state with the main GLib/Wayland compositor thread.
-        let text: Option<String> = match hjkl_clipboard::Clipboard::new() {
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "webkit: buffr-clipboard — clipboard init failed, returning empty"
-                );
-                None
-            }
-            Ok(cb) => match cb.get(Selection::Clipboard, MimeType::Text) {
+        // Read host clipboard text through the process-wide handle (W10).
+        // The backend was probed once (Wayland bg thread → X11 → OSC52) and
+        // is `Send + Sync`; the Wayland backend is safe to call from any OS
+        // thread — it has its own dedicated Wayland socket and does not share
+        // state with the main GLib/Wayland compositor thread.
+        let text: Option<String> = match super::clipboard::shared_clipboard() {
+            None => None,
+            Some(cb) => match cb.get(Selection::Clipboard, MimeType::Text) {
                 Ok(bytes) => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
                 Err(e) => {
                     tracing::debug!(
@@ -1393,11 +1449,11 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
                             // GLib calls g_free(data_ptr) when the stream is
                             // fully consumed — GLib's allocator matches Rust's
                             // global allocator on Linux (both use the system
-                            // malloc), so this is safe.
-                            Some(std::mem::transmute::<
-                                unsafe extern "C" fn(*mut std::os::raw::c_void),
-                                unsafe extern "C" fn(*mut std::os::raw::c_void),
-                            >(g_free)),
+                            // malloc), so this is safe. `g_free` already has
+                            // the GDestroyNotify signature, so no transmute is
+                            // needed (the old identity `transmute::<T, T>` was
+                            // a clippy error).
+                            Some(g_free),
                         )
                     };
                     if stream.is_null() {
@@ -1594,7 +1650,7 @@ fn extract_origin_from_uri(uri: &str) -> String {
     let after_scheme = &uri[scheme_end + 3..];
     // Take up to the first path separator.
     let host_port = after_scheme
-        .split(|c| c == '/' || c == '?' || c == '#')
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
     format!("{scheme}://{host_port}")
@@ -2085,6 +2141,9 @@ impl TabEntry {
     /// [`WpeRuntime`]. The display ref count is bumped by WebKit (one ref
     /// per WebView via the `display` construct property), and dropped when
     /// the WebView is unreffed — independent of WpeRuntime's own ref.
+    /// Same rationale as `WpeRuntime::new` — a flat list of per-tab shared
+    /// sinks, not independently meaningful groups.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: TabId,
         url: &str,
@@ -2108,11 +2167,30 @@ impl TabEntry {
         cursor_state: SharedCursorState,
         video_active: Arc<std::sync::atomic::AtomicBool>,
         edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
+        console_nonces: buffr_core::ConsoleNonces,
     ) -> Option<Self> {
         if display.is_null() {
             tracing::error!("webkit: TabEntry::new called with NULL display");
             return None;
         }
+
+        // ── H5: mint this tab's console-IPC nonces ──────────────────────────
+        //
+        // Rotation granularity differs from `buffr-cef` on purpose. CEF
+        // injects `edit.js` / the media poll imperatively from `on_load_end`,
+        // so it can call `rotate_page` on every main-frame load. WebKit's
+        // `WebKitUserContentManager` scripts are *declarative*: they are added
+        // once here and WebKit re-runs them itself on every document load,
+        // with whatever nonce was baked into the source at add time. Rotating
+        // per load would therefore need every UCM script torn down and
+        // re-added mid-navigation (and `remove_all_scripts` would take the
+        // clipboard / favicon / audio / cursor bridges with it, and race
+        // document-start). So the *page* nonce here is per-tab, not per-load.
+        //
+        // The hint nonce is unaffected — `hint.js` is evaluated imperatively
+        // per `enter_hint_mode`, so `WebKitEngine::enter_hint_mode` calls
+        // `rotate_hint` each time and gets true per-session rotation.
+        let page_nonce = console_nonces.rotate_page(id.0 as i32);
 
         // WebKitWebView via the platform path. WebKit calls our display's
         // create_view vmethod during construction; we recover the view
@@ -2293,7 +2371,7 @@ impl TabEntry {
         // WPE 2.52 bindings (see build/buffr-webkit-*/out/wpe_bindings.rs).
         let hint_script_message_received_id: u64 = unsafe {
             use super::ffi::{
-                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_TOP_FRAME as INJECT_TOP,
                 WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
                 webkit_user_content_manager_add_script,
                 webkit_user_content_manager_register_script_message_handler,
@@ -2316,11 +2394,16 @@ impl TabEntry {
                     std::ptr::null(),
                 );
 
-                // Inject console bridge at document-start on all frames.
+                // Inject console bridge at document-start on the top frame
+                // only. `hint.js` itself is evaluated via
+                // `webkit_web_view_evaluate_javascript` (main frame, default
+                // world), so a subframe copy of the bridge would never see one
+                // of our lines — and injecting there is exactly what would
+                // leak the nonce to a frame we do not trust (H5).
                 let source_c = CString::new(HINT_CONSOLE_BRIDGE_JS).unwrap();
                 let script = webkit_user_script_new(
                     source_c.as_ptr(),
-                    INJECT_ALL,
+                    INJECT_TOP,
                     INJECT_START,
                     std::ptr::null(),
                     std::ptr::null(),
@@ -2336,7 +2419,12 @@ impl TabEntry {
                 // Signal prototype:
                 //   void script_message_received(WebKitUserContentManager*,
                 //                                JSCValue* js_value, gpointer)
-                let sink_arc = Arc::into_raw(Arc::clone(&hint_sink)) as *mut std::os::raw::c_void;
+                let ctx_box = Box::new(HintSignalCtx {
+                    tab_id: id,
+                    sink: Arc::clone(&hint_sink),
+                    console_nonces: console_nonces.clone(),
+                });
+                let sink_arc = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
                 let signal_name = CString::new("script-message-received::buffrHint").unwrap();
                 g_signal_connect_data(
                     ucm as *mut _,
@@ -2350,7 +2438,7 @@ impl TabEntry {
                         unsafe extern "C" fn(),
                     >(on_hint_script_message)),
                     sink_arc,
-                    Some(drop_hint_sink_arc),
+                    Some(drop_hint_signal_ctx),
                     0,
                 )
             }
@@ -2378,17 +2466,17 @@ impl TabEntry {
             if ucm.is_null() {
                 0
             } else {
-                // Build a per-tab Clipboard handle. Clipboard::new() probes the best
-                // available Wayland/X11 backend. Failure is non-fatal — just logs.
-                match hjkl_clipboard::Clipboard::new() {
-                    Err(e) => {
+                // Take a handle on the process-wide Clipboard (W10) — this used
+                // to probe a fresh Wayland connection per tab. Failure is
+                // non-fatal; the probe already logged.
+                match super::clipboard::shared_clipboard() {
+                    None => {
                         tracing::warn!(
-                            error = %e,
-                            "webkit: clipboard init failed — copy/cut will not reach system clipboard"
+                            "webkit: no system clipboard — copy/cut will not reach system clipboard"
                         );
                         0
                     }
-                    Ok(cb) => {
+                    Some(cb) => {
                         // Register the native message handler name.
                         let handler_name = CString::new("buffrClipboard").unwrap();
                         let _ok = webkit_user_content_manager_register_script_message_handler(
@@ -2699,7 +2787,7 @@ impl TabEntry {
         // 4. Connect `script-message-received::buffrMediaProbe` →
         //    on_media_probe_script_message, which stores `video_active`.
         //
-        // run_media_probe (eval MEDIA_PROBE_POLL_JS) is called by the apps
+        // run_media_probe (evals the nonce-bearing poll script) is called by the apps
         // layer on its own polling cadence (~2 s); we just handle the response.
         let media_probe_script_message_received_id: u64 = unsafe {
             use super::ffi::{
@@ -2757,6 +2845,8 @@ impl TabEntry {
                 // drop_media_probe_signal_ctx reconstitutes + drops it on disconnect.
                 let ctx_box = Box::new(MediaProbeSignalCtx {
                     video_active: Arc::clone(&video_active),
+                    tab_id: id,
+                    console_nonces: console_nonces.clone(),
                 });
                 let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
                 let signal_name = CString::new("script-message-received::buffrMediaProbe").unwrap();
@@ -2781,17 +2871,25 @@ impl TabEntry {
         // ── Edit bridge: UCM script-message handler (#134) ───────────────────
         //
         // 1. Register `buffrEdit` native handler on the UCM.
-        // 2. Inject EDIT_CONSOLE_SHIM_JS at document-start on all frames so
+        // 2. Inject EDIT_CONSOLE_SHIM_JS at document-start on the TOP FRAME so
         //    `console.log('__buffr_edit__:…')` calls from `edit.js` are
         //    forwarded to the native handler via postMessage.
-        // 3. Inject the substituted `edit.js` at document-end on all frames
+        // 3. Inject the substituted `edit.js` at document-end on the TOP FRAME
         //    so the focus/blur/mutate listeners are installed once per load.
         // 4. Connect `script-message-received::buffrEdit` →
-        //    on_edit_script_message, which parses the JSON and pushes decoded
-        //    EditConsoleEvents to the shared sink.
+        //    on_edit_script_message, which verifies the nonce and pushes
+        //    decoded EditConsoleEvents to the shared sink.
+        //
+        // H5 / top-frame restriction: `edit.js` carries the page nonce, so it
+        // must only ever run somewhere we trust — handing a cross-origin ad
+        // iframe the nonce would hand it the forgery it exists to prevent.
+        // This matches `buffr-cef`, which injects from `on_load_end` for the
+        // main frame only. The accepted cost is that edit-mode events no
+        // longer fire for inputs *inside* iframes (framed rich-text editors,
+        // iframed login forms); the top-level document is unaffected.
         let edit_script_message_received_id: u64 = unsafe {
             use super::ffi::{
-                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES as INJECT_ALL,
+                WebKitUserContentInjectedFrames_WEBKIT_USER_CONTENT_INJECT_TOP_FRAME as INJECT_TOP,
                 WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END as INJECT_END,
                 WebKitUserScriptInjectionTime_WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START as INJECT_START,
                 webkit_user_content_manager_add_script,
@@ -2811,12 +2909,12 @@ impl TabEntry {
                     std::ptr::null(),
                 );
 
-                // Inject console.log shim at document-start on all frames so
-                // the shim is in place before edit.js fires at document-end.
+                // Inject console.log shim at document-start on the top frame
+                // so the shim is in place before edit.js fires at document-end.
                 let shim_src = CString::new(EDIT_CONSOLE_SHIM_JS).unwrap();
                 let shim_script = webkit_user_script_new(
                     shim_src.as_ptr(),
-                    INJECT_ALL,
+                    INJECT_TOP,
                     INJECT_START,
                     std::ptr::null(),
                     std::ptr::null(),
@@ -2827,12 +2925,13 @@ impl TabEntry {
                     tracing::debug!("webkit: EDIT_CONSOLE_SHIM_JS injected for tab {id:?}");
                 }
 
-                // Inject the substituted edit.js at document-end on all frames.
-                let edit_js = buffr_core::edit::build_inject_script();
+                // Inject the substituted edit.js at document-end on the top
+                // frame, carrying this tab's page nonce (H5).
+                let edit_js = buffr_core::edit::build_inject_script(&page_nonce);
                 let edit_src = CString::new(edit_js.as_str()).unwrap();
                 let edit_script = webkit_user_script_new(
                     edit_src.as_ptr(),
-                    INJECT_ALL,
+                    INJECT_TOP,
                     INJECT_END,
                     std::ptr::null(),
                     std::ptr::null(),
@@ -2848,6 +2947,8 @@ impl TabEntry {
                 // drop_edit_signal_ctx reconstitutes + drops it on disconnect.
                 let ctx_box = Box::new(EditSignalCtx {
                     edit_sink: Arc::clone(&edit_sink),
+                    tab_id: id,
+                    console_nonces: console_nonces.clone(),
                 });
                 let ctx_raw = Box::into_raw(ctx_box) as *mut std::os::raw::c_void;
                 let signal_name = CString::new("script-message-received::buffrEdit").unwrap();
@@ -3209,7 +3310,7 @@ impl Drop for TabEntry {
                 );
             }
             // Disconnect UCM signals (hint, clipboard) before unref so the
-            // GClosureNotify (drop_hint_sink_arc, drop_clipboard_box) fires while
+            // GClosureNotify (drop_hint_signal_ctx, drop_clipboard_box) fires while
             // the UCM is still alive, not after it's freed by g_object_unref.
             let ucm = super::ffi::webkit_web_view_get_user_content_manager(self.web_view);
             if !ucm.is_null() {
@@ -3378,9 +3479,18 @@ pub(crate) struct WpeRuntime {
     /// per-tab `buffrEdit` UCM handlers. Inner `Option` is populated by
     /// `WebKitEngine::set_edit_sink` post-construction.
     pub edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
+    /// Per-tab console-IPC nonce table (H5). Same handle as
+    /// `WorkerHandle::console_nonces`; cloned into every UCM signal ctx so
+    /// inbound lines are verified against the nonce currently minted for the
+    /// emitting tab.
+    pub console_nonces: buffr_core::ConsoleNonces,
 }
 
 impl WpeRuntime {
+    /// Every argument is a distinct shared sink/atomic wired straight through
+    /// from `worker::spawn` (which carries the same allow). Bundling them into
+    /// a params struct would just move the list one level out.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         frame: SharedOsrFrame,
         view: SharedOsrViewState,
@@ -3401,6 +3511,7 @@ impl WpeRuntime {
         cursor_state: SharedCursorState,
         video_active: Arc<std::sync::atomic::AtomicBool>,
         edit_sink: Arc<Mutex<Option<buffr_core::edit::EditEventSink>>>,
+        console_nonces: buffr_core::ConsoleNonces,
         prefer_native: bool,
         wayland_handles: Option<buffr_engine::WaylandNativeHandles>,
     ) -> Result<Self, String> {
@@ -3460,7 +3571,7 @@ impl WpeRuntime {
                 .unwrap_or(false);
 
             // ── Path 1: BuffrDisplayWayland (preferred, #152) ─────────────
-            let handles_complete = wayland_handles.as_ref().map_or(false, |h| {
+            let handles_complete = wayland_handles.as_ref().is_some_and(|h| {
                 !h.wl_display.is_null()
                     && !h.wl_compositor.is_null()
                     && !h.wl_subcompositor.is_null()
@@ -3636,6 +3747,7 @@ impl WpeRuntime {
             cursor_state,
             video_active,
             edit_sink,
+            console_nonces,
         })
     }
 
@@ -3685,23 +3797,21 @@ impl WpeRuntime {
         // ViewCtx would clobber the shared frame and its TabSignalCtx would
         // clobber is_loading_atomic during the switch.
         let prev_active_idx = self.active_idx;
-        if !background {
-            if let Some(prev) = self.active_tab() {
-                prev.is_active
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                prev.hide();
-            }
+        if !background && let Some(prev) = self.active_tab() {
+            prev.is_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            prev.hide();
         }
 
         // TabInfo must exist before signal handlers fire — load-changed
         // can race the return from TabEntry::new because webkit_web_view_load_uri
         // emits LOAD_STARTED synchronously. Push it now; roll back on failure.
-        let info = TabInfo::new(id, url);
         let pushed_es_idx = {
             let mut st = self
                 .engine_state
                 .lock()
                 .map_err(|e| format!("mutex poison (push): {e}"))?;
+            let info = TabInfo::new(id, url, st.private);
             st.tabs.push(info);
             let pushed = st.tabs.len() - 1;
             if !background {
@@ -3735,6 +3845,7 @@ impl WpeRuntime {
             Arc::clone(&self.cursor_state),
             Arc::clone(&self.video_active),
             Arc::clone(&self.edit_sink),
+            self.console_nonces.clone(),
         );
 
         let entry = match entry {
@@ -3753,21 +3864,20 @@ impl WpeRuntime {
                     }
                 }
                 // Re-activate the previous tab if we deactivated it.
-                if !background {
-                    if let Some(idx) = prev_active_idx {
-                        if let Some(prev) = self.tabs.get(idx) {
-                            prev.is_active
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            // Read dims inside a fresh lock to avoid borrowing
-                            // self while self.tabs is also borrowed.
-                            let (w, h) = self
-                                .engine_state
-                                .lock()
-                                .map(|st| (st.width, st.height))
-                                .unwrap_or((800, 600));
-                            prev.show(w, h);
-                        }
-                    }
+                if !background
+                    && let Some(idx) = prev_active_idx
+                    && let Some(prev) = self.tabs.get(idx)
+                {
+                    prev.is_active
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Read dims inside a fresh lock to avoid borrowing
+                    // self while self.tabs is also borrowed.
+                    let (w, h) = self
+                        .engine_state
+                        .lock()
+                        .map(|st| (st.width, st.height))
+                        .unwrap_or((800, 600));
+                    prev.show(w, h);
                 }
                 return Err("TabEntry::new returned None".to_string());
             }
@@ -3934,10 +4044,10 @@ impl WpeRuntime {
         let _ = self.tabs.remove(idx);
         // If the closed index was below the active index, the active entry
         // has shifted left by one — correct for that.
-        if let Some(ref mut active) = self.active_idx {
-            if idx < *active {
-                *active -= 1;
-            }
+        if let Some(ref mut active) = self.active_idx
+            && idx < *active
+        {
+            *active -= 1;
         }
         // Mirror removal into engine_state.
         if let Ok(mut st) = self.engine_state.lock() {
@@ -3945,10 +4055,10 @@ impl WpeRuntime {
                 st.tabs.remove(idx);
             }
             // Adjust engine_state.active_idx by the same rule.
-            if let Some(ref mut a) = st.active_idx {
-                if idx < *a {
-                    *a -= 1;
-                }
+            if let Some(ref mut a) = st.active_idx
+                && idx < *a
+            {
+                *a -= 1;
             }
         }
         tracing::info!(?id, idx, "webkit: close_tab (background tab)");
@@ -3997,13 +4107,12 @@ impl WpeRuntime {
         if let Ok(mut frame) = self.frame.lock() {
             frame.needs_fresh = true;
         }
-        if let Ok(mut st) = self.engine_state.lock() {
-            if let Some(idx) = st.active_idx {
-                if let Some(tab_info) = st.tabs.get_mut(idx) {
-                    tab_info.url = url.to_owned();
-                    tab_info.is_loading = true;
-                }
-            }
+        if let Ok(mut st) = self.engine_state.lock()
+            && let Some(idx) = st.active_idx
+            && let Some(tab_info) = st.tabs.get_mut(idx)
+        {
+            tab_info.url = url.to_owned();
+            tab_info.is_loading = true;
         }
     }
 
@@ -4213,14 +4322,22 @@ impl WpeRuntime {
 
     /// Fire the media probe poll script on the active tab (#135).
     ///
-    /// Evaluates `MEDIA_PROBE_POLL_JS` which recomputes `__buffr_media_active` /
-    /// `__buffr_video_active` from five signal sources and, on any state
-    /// transition, emits `console.log('__buffr_media__:' + JSON)`. The shim
-    /// installed by `MEDIA_PROBE_CONSOLE_SHIM_JS` intercepts that prefix and
-    /// forwards the JSON to the `buffrMediaProbe` UCM handler, which updates
+    /// Evaluates the media-probe poll script, which recomputes
+    /// `__buffr_media_active` / `__buffr_video_active` from five signal sources
+    /// and, on any state transition, emits
+    /// `console.log('__buffr_media__:' + nonce + ':' + JSON)`. The shim
+    /// installed by `MEDIA_PROBE_CONSOLE_SHIM_JS` forwards the whole line to
+    /// the `buffrMediaProbe` UCM handler, which verifies the nonce and updates
     /// the runtime-wide `video_active` atomic.
+    ///
+    /// H5: the script is built with the *active tab's* page nonce, the same one
+    /// `TabEntry::new` minted, and `eval_js` runs it in the main frame only.
     pub(crate) fn run_media_probe(&self) {
-        self.eval_js(buffr_core::scripts::MEDIA_PROBE_POLL_JS);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let nonce = self.console_nonces.page(tab.id.0 as i32);
+        self.eval_js(&buffr_core::media_probe::build_poll_script(&nonce));
     }
 
     /// Update the active tab's `BuffrViewWayland` subsurface position + render
@@ -4620,5 +4737,203 @@ impl Drop for WpeRuntime {
                 }
             }
         }
+    }
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{EDIT_CONSOLE_SHIM_JS, HINT_CONSOLE_BRIDGE_JS, MEDIA_PROBE_CONSOLE_SHIM_JS};
+    use buffr_core::console_nonce::CONSOLE_NONCE_SEPARATOR;
+    use buffr_core::edit::EDIT_CONSOLE_SENTINEL;
+    use buffr_core::hint::HINT_CONSOLE_SENTINEL;
+    use buffr_core::media_probe::MEDIA_PROBE_SENTINEL;
+    use buffr_core::{CONSOLE_NONCE_LEN, ConsoleNonces, new_console_nonce};
+
+    /// Build the wire line an injected script emits: `<sentinel><nonce>:<json>`.
+    fn wire(sentinel: &str, nonce: &str, json: &str) -> String {
+        format!("{sentinel}{nonce}{CONSOLE_NONCE_SEPARATOR}{json}")
+    }
+
+    // ── JS bridge ↔ buffr-core sentinel drift guards (H5) ────────────────────
+
+    /// Each console bridge hardcodes its sentinel as a JS string literal. If
+    /// `buffr-core` ever renames one, the bridge silently stops matching and
+    /// hint / edit / media-probe die with no error anywhere. Pin them.
+    #[test]
+    fn bridges_hardcode_the_current_sentinels() {
+        for (name, src, sentinel) in [
+            ("buffrHint", HINT_CONSOLE_BRIDGE_JS, HINT_CONSOLE_SENTINEL),
+            ("buffrEdit", EDIT_CONSOLE_SHIM_JS, EDIT_CONSOLE_SENTINEL),
+            (
+                "buffrMediaProbe",
+                MEDIA_PROBE_CONSOLE_SHIM_JS,
+                MEDIA_PROBE_SENTINEL,
+            ),
+        ] {
+            assert!(
+                src.contains(&format!("'{sentinel}'")),
+                "{name} bridge JS must match on the live sentinel {sentinel:?}"
+            );
+        }
+    }
+
+    /// The bridges must match on the BARE sentinel, never on a
+    /// sentinel+nonce prefix. They are injected once per tab and re-run by
+    /// WebKit on every document load; baking a nonce into them would mean
+    /// re-injecting the bridge on every rotation, and would move the
+    /// authentication check into page-controlled JS. See the comment on
+    /// `HINT_CONSOLE_BRIDGE_JS`.
+    #[test]
+    fn bridges_do_not_bake_in_a_nonce() {
+        for (name, src) in [
+            ("buffrHint", HINT_CONSOLE_BRIDGE_JS),
+            ("buffrEdit", EDIT_CONSOLE_SHIM_JS),
+            ("buffrMediaProbe", MEDIA_PROBE_CONSOLE_SHIM_JS),
+        ] {
+            assert!(
+                !src.contains("%%SENTINEL%%") && !src.contains("{nonce}"),
+                "{name} bridge JS must not carry a nonce placeholder"
+            );
+        }
+    }
+
+    /// The bridges must forward the WHOLE line. Stripping the prefix in JS
+    /// (as the edit / media-probe shims used to) throws the nonce away before
+    /// Rust ever sees it, leaving `parse_payload` with nothing to verify.
+    #[test]
+    fn bridges_forward_the_whole_line() {
+        assert!(
+            HINT_CONSOLE_BRIDGE_JS.contains("postMessage(msg)"),
+            "hint bridge must forward the unmodified line"
+        );
+        for (name, src, handler) in [
+            ("buffrEdit", EDIT_CONSOLE_SHIM_JS, "buffrEdit"),
+            (
+                "buffrMediaProbe",
+                MEDIA_PROBE_CONSOLE_SHIM_JS,
+                "buffrMediaProbe",
+            ),
+        ] {
+            assert!(
+                src.contains(&format!("messageHandlers.{handler}.postMessage(args[0])")),
+                "{name} shim must forward args[0] unmodified"
+            );
+            assert!(
+                !src.contains(".substring("),
+                "{name} shim must not strip the prefix — that discards the nonce"
+            );
+        }
+    }
+
+    /// A line the bridge would forward must still be anchored-parseable on
+    /// the Rust side. Guards the exact concatenation order.
+    #[test]
+    fn bridge_prefix_check_agrees_with_the_rust_parser() {
+        let nonce = new_console_nonce();
+        let line = wire(
+            HINT_CONSOLE_SENTINEL,
+            &nonce,
+            r#"{"kind":"error","message":"x"}"#,
+        );
+        // What the JS `indexOf(sentinel) === 0` check sees:
+        assert!(line.starts_with(HINT_CONSOLE_SENTINEL));
+        // What Rust sees:
+        assert!(buffr_core::hint::parse_console_event(&line, &nonce).is_some());
+    }
+
+    // ── End-to-end nonce discrimination over the UCM transport ───────────────
+
+    #[test]
+    fn nonce_is_128_bits_of_hex() {
+        let n = new_console_nonce();
+        assert_eq!(n.len(), CONSOLE_NONCE_LEN);
+        assert!(n.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(n, new_console_nonce(), "nonces must not repeat");
+    }
+
+    /// The core property: a frame that never learned the nonce cannot drive
+    /// the media probe, even though `window.webkit.messageHandlers
+    /// .buffrMediaProbe` is reachable from any frame in the web view.
+    #[test]
+    fn media_probe_rejects_a_forged_line() {
+        let real = new_console_nonce();
+        let forged = new_console_nonce();
+        let json = r#"{"media":true,"video":true}"#;
+
+        let authentic = wire(MEDIA_PROBE_SENTINEL, &real, json);
+        let event = buffr_core::media_probe::parse(&authentic, &real)
+            .expect("authentic line must verify")
+            .expect("payload must decode");
+        assert!(event.video);
+
+        let attack = wire(MEDIA_PROBE_SENTINEL, &forged, json);
+        assert!(
+            buffr_core::media_probe::parse(&attack, &real).is_none(),
+            "a line bearing an unknown nonce must be rejected"
+        );
+        // And the pre-H5 shape (bare sentinel, no nonce) must not verify either.
+        let legacy = format!("{MEDIA_PROBE_SENTINEL}{json}");
+        assert!(buffr_core::media_probe::parse(&legacy, &real).is_none());
+    }
+
+    #[test]
+    fn edit_rejects_a_forged_line() {
+        let real = new_console_nonce();
+        let forged = new_console_nonce();
+        let json = r#"{"type":"blur","field_id":"f3"}"#;
+
+        assert!(
+            buffr_core::edit::parse_console_event(&wire(EDIT_CONSOLE_SENTINEL, &real, json), &real)
+                .is_some_and(|r| r.is_ok()),
+            "authentic edit line must verify and decode"
+        );
+        assert!(
+            buffr_core::edit::parse_console_event(
+                &wire(EDIT_CONSOLE_SENTINEL, &forged, json),
+                &real
+            )
+            .is_none(),
+            "forged edit line must be rejected"
+        );
+    }
+
+    /// The handlers look the nonce up by `TabId.0 as i32`, matching
+    /// `TabSummary::browser_id`. Two tabs must not share a nonce, and a tab
+    /// that was never injected into must not verify anything.
+    #[test]
+    fn nonces_are_keyed_per_tab() {
+        let nonces = ConsoleNonces::new();
+        let a = nonces.rotate_page(1);
+        let b = nonces.rotate_page(2);
+        assert_ne!(a, b, "distinct tabs must get distinct page nonces");
+        assert_eq!(nonces.page(1), a, "page nonce must be stable per tab");
+        assert_eq!(nonces.page(2), b);
+
+        // An unknown tab mints a fresh entry that matches nothing already emitted.
+        let unknown = nonces.page(99);
+        assert_ne!(unknown, a);
+        assert_ne!(unknown, b);
+    }
+
+    /// `enter_hint_mode` rotates the hint nonce on every entry while leaving
+    /// the page nonce (baked into the tab's UCM scripts) alone — rotating it
+    /// would silently kill edit mode, since WebKit re-runs the already-added
+    /// `edit.js` with the old nonce.
+    #[test]
+    fn rotating_hint_leaves_the_page_nonce_intact() {
+        let nonces = ConsoleNonces::new();
+        let page = nonces.rotate_page(1);
+        let hint1 = nonces.rotate_hint(1);
+        let hint2 = nonces.rotate_hint(1);
+
+        assert_ne!(hint1, hint2, "each hint session must get a fresh nonce");
+        assert_eq!(
+            nonces.page(1),
+            page,
+            "rotating the hint nonce must not disturb the page nonce"
+        );
+        assert_eq!(nonces.hint(1), hint2);
     }
 }

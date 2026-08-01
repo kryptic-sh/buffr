@@ -12,7 +12,7 @@
 //! via `g_object_set_data_full`; GLib drops it (running our destroy
 //! callback) when the view is finalised, which lets us free the box safely.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -219,6 +219,90 @@ pub(crate) fn ack_pending_buffer(view: *mut WPEView) -> bool {
     true
 }
 
+// ── OSR frame ingest bounds (W3) ─────────────────────────────────────────────
+
+// SAFETY: `g_type_check_instance_is_a` is a GLib type-system function that is
+// not in the bindgen allowlist (the GTypeInstance introspection helpers were
+// excluded). Returns TRUE when `instance` is-a `iface_type`, inherited types
+// included — the C `G_TYPE_CHECK_INSTANCE_TYPE` macro.
+unsafe extern "C" {
+    fn g_type_check_instance_is_a(
+        instance: *mut c_void,
+        iface_type: super::ffi::GType,
+    ) -> super::ffi::gboolean;
+}
+
+/// Real row stride of `buffer`, when WPE exposes one.
+///
+/// Only `WPEBufferSHM` has a stride getter, and its `import_to_pixels` returns
+/// the SHM data verbatim (padding included), so the value is exact for that
+/// path. `WPEBuffer` / `WPEBufferDMABuf` expose nothing usable here — the
+/// generic `import_to_pixels` converts into a fresh GBytes whose layout is not
+/// described by the DMA-BUF plane strides — so those return `None` and the
+/// caller infers a stride instead.
+///
+/// # Safety
+///
+/// `buffer` must be a live `WPEBuffer` (or NULL).
+unsafe fn shm_stride(buffer: *mut WPEBuffer) -> Option<usize> {
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `buffer` is a live GObject; the type check
+    // only reads the instance's GTypeClass pointer.
+    let is_shm = unsafe {
+        g_type_check_instance_is_a(buffer as *mut c_void, wpe_buffer_shm_get_type()) != 0
+    };
+    if !is_shm {
+        return None;
+    }
+    // SAFETY: the type check above established the downcast is valid.
+    let stride = unsafe { wpe_buffer_shm_get_stride(buffer as *mut WPEBufferSHM) };
+    if stride == 0 {
+        return None;
+    }
+    Some(stride as usize)
+}
+
+/// Decide the source row stride for an `import_to_pixels` buffer, or `None`
+/// when the buffer cannot be read safely and the frame must be dropped.
+///
+/// `real_stride` is WPE's own stride when it exposes one (see [`shm_stride`]).
+/// Otherwise the stride is *inferred* as `size_us.div_ceil(h)` so a
+/// hardware-padded buffer (total size not evenly divisible by `h`) doesn't
+/// truncate — truncation would start every row copy at the wrong offset.
+///
+/// W3: inferring from the total byte count over-estimates when the buffer
+/// carries trailing slack. The old code guarded only `src_stride >= row_bytes`,
+/// so `w=100` (`row_bytes=400`), `h=1000`, `size_us=400_001` inferred a stride
+/// of 401 and the last row read ~600 bytes past the end of the GBytes. The
+/// full extent — `(h-1) * stride + row_bytes` — must fit in `size_us`.
+pub(crate) fn validated_src_stride(
+    size_us: usize,
+    w: u32,
+    h: u32,
+    real_stride: Option<usize>,
+) -> Option<usize> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let h = h as usize;
+    let row_bytes = (w as usize).checked_mul(4)?;
+    let src_stride = match real_stride {
+        Some(s) => s,
+        None => size_us.div_ceil(h),
+    };
+    if src_stride < row_bytes {
+        return None;
+    }
+    // Last row starts at `(h-1) * stride` and runs for `row_bytes`.
+    let extent = (h - 1).checked_mul(src_stride)?.checked_add(row_bytes)?;
+    if extent > size_us {
+        return None;
+    }
+    Some(src_stride)
+}
+
 // ── Per-frame callback invoked by C ──────────────────────────────────────────
 
 /// Called by `buffr_view_render_buffer_vfunc` in `wpe_subclasses.c` on every
@@ -268,12 +352,7 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     // we still ack every frame here — just skip the import + memcpy +
     // wake when the previous ingest was too recent.
     let now_us = process_epoch().elapsed().as_micros() as u64;
-    let hz = ctx
-        .view
-        .frame_rate_hz
-        .load(Ordering::Relaxed)
-        .max(1)
-        .min(240);
+    let hz = ctx.view.frame_rate_hz.load(Ordering::Relaxed).clamp(1, 240);
     let min_interval_us = 1_000_000u64 / hz as u64;
     let last_us = ctx.last_ingest_us.load(Ordering::Relaxed);
     // `last_us == 0` means we haven't ingested anything yet — let the first
@@ -313,8 +392,6 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
         }
         return;
     }
-    let _ = CStr::from_bytes_with_nul(b"\0"); // suppress unused CStr import warning when error message path is gone
-
     // Copy bytes into OsrFrame.
     let mut size: u64 = 0;
     // SAFETY: bytes is non-null; bindgen's g_bytes_get_data signature uses
@@ -323,28 +400,20 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
     let size_us = size as usize;
     let row_bytes = (w as usize) * 4;
     let need = row_bytes * (h as usize);
-    if !data_ptr.is_null() && size_us >= need && h > 0 {
-        // import_to_pixels returns ARGB8888 but each row may be padded to a
-        // hardware-friendly stride (e.g. multiples of 64 / cache lines). Use
-        // div_ceil so a padded buffer (size_us not evenly divisible by h)
-        // doesn't truncate — truncation would cause each row copy to start
-        // from the wrong offset, corrupting every row after the first.
-        let src_stride = size_us.div_ceil(h as usize);
-        if src_stride < row_bytes {
-            tracing::warn!(
-                w,
-                h,
-                size_us,
-                src_stride,
-                row_bytes,
-                "webkit: import_to_pixels stride < row_bytes — skipping frame"
-            );
-            // SAFETY: view + buffer are valid.
-            unsafe {
-                wpe_view_buffer_rendered(view, buffer);
-            }
-            return;
-        }
+
+    // Prefer the buffer's real stride when WPE exposes one. `WPEBufferSHM`
+    // does (`wpe_buffer_shm_get_stride`) and its `import_to_pixels` hands
+    // back the SHM data verbatim, padding included, so that value is exact.
+    // The generic `WPEBuffer` / `WPEBufferDMABuf` path exposes no stride, so
+    // we fall back to inferring one — see `validated_src_stride`.
+    // SAFETY: `buffer` is a live WPEBuffer; the type check is a read-only
+    // GObject introspection call and the getter is only reached when it says
+    // the instance really is a WPEBufferSHM.
+    let real_stride: Option<usize> = unsafe { shm_stride(buffer) };
+
+    if !data_ptr.is_null()
+        && let Some(src_stride) = validated_src_stride(size_us, w, h, real_stride)
+    {
         let mut generation = 0u64;
         if let Ok(mut frame) = ctx.frame.lock() {
             // WebKit/WPE may deliver a buffer slightly smaller than the host
@@ -414,7 +483,8 @@ pub unsafe extern "C" fn buffr_rust_render_buffer(view: *mut WPEView, buffer: *m
             h,
             size_us,
             need,
-            "webkit: import_to_pixels returned undersized buffer"
+            real_stride,
+            "webkit: import_to_pixels buffer failed the stride/extent check — dropping frame"
         );
     }
 
@@ -563,11 +633,11 @@ impl WpeDisplayKind {
 
 impl Drop for WpeDisplayKind {
     fn drop(&mut self) {
-        if let WpeDisplayKind::Wayland(p) = self {
-            if !p.is_null() {
-                // SAFETY: *p is a live WPEDisplayWayland GObject we own a ref on.
-                unsafe { g_object_unref(*p as *mut c_void) };
-            }
+        if let WpeDisplayKind::Wayland(p) = self
+            && !p.is_null()
+        {
+            // SAFETY: *p is a live WPEDisplayWayland GObject we own a ref on.
+            unsafe { g_object_unref(*p as *mut c_void) };
         }
         // Osr variant: BuffrDisplayHandle's own Drop handles the unref.
         // BuffrWayland variant: BuffrDisplayWaylandHandle's Drop handles it.
@@ -625,5 +695,99 @@ mod tests {
         let h: usize = 4;
         let size_us: usize = 64;
         assert_eq!(size_us / h, size_us.div_ceil(h));
+    }
+
+    // ── validated_src_stride (W3) ────────────────────────────────────────────
+
+    use super::validated_src_stride;
+
+    #[test]
+    fn stride_accepts_tightly_packed_buffer() {
+        // w=100 → row_bytes=400, h=10, exactly 4000 bytes.
+        assert_eq!(validated_src_stride(4000, 100, 10, None), Some(400));
+    }
+
+    #[test]
+    fn stride_accepts_evenly_padded_buffer() {
+        // row_bytes=400, padded to 448 per row, 10 rows.
+        assert_eq!(validated_src_stride(4480, 100, 10, None), Some(448));
+    }
+
+    /// The W3 repro. `w=100` (row_bytes=400), `h=1000`, `size_us=400_001`:
+    /// `div_ceil` infers 401, and the last row would read
+    /// `999*401 + 400 = 401_000` bytes — ~1 KiB past the end of a 400_001-byte
+    /// GBytes. The old guard (`src_stride >= row_bytes`) let this through.
+    #[test]
+    fn stride_rejects_extent_overrun_from_inferred_stride() {
+        let size_us = 400_001usize;
+        let inferred = size_us.div_ceil(1000);
+        assert_eq!(inferred, 401, "precondition: div_ceil over-estimates here");
+        assert!(
+            inferred >= 400,
+            "precondition: the old stride >= row_bytes guard passes"
+        );
+        assert_eq!(
+            validated_src_stride(size_us, 100, 1000, None),
+            None,
+            "full extent does not fit — frame must be dropped"
+        );
+    }
+
+    /// One byte of slack over the tight packing is still an overrun for any
+    /// h > 1, because div_ceil rounds the whole extra byte up into every row.
+    #[test]
+    fn stride_rejects_single_byte_of_slack() {
+        // row_bytes=8, h=4 → tight = 32. 33 bytes infers stride 9, extent
+        // 3*9+8 = 35 > 33.
+        assert_eq!(validated_src_stride(33, 2, 4, None), None);
+        // Exactly tight is fine.
+        assert_eq!(validated_src_stride(32, 2, 4, None), Some(8));
+    }
+
+    #[test]
+    fn stride_rejects_undersized_buffer() {
+        // row_bytes=400, h=10 needs 4000; only 3999 available.
+        assert_eq!(validated_src_stride(3999, 100, 10, None), None);
+    }
+
+    #[test]
+    fn stride_rejects_stride_narrower_than_a_row() {
+        // A real stride WPE reported that is narrower than w*4 is nonsense.
+        assert_eq!(validated_src_stride(100_000, 100, 10, Some(399)), None);
+    }
+
+    #[test]
+    fn stride_rejects_zero_dimensions() {
+        assert_eq!(validated_src_stride(4000, 0, 10, None), None);
+        assert_eq!(validated_src_stride(4000, 100, 0, None), None);
+    }
+
+    /// A real stride from `wpe_buffer_shm_get_stride` wins over inference,
+    /// including when the buffer has trailing slack that would have made
+    /// `div_ceil` over-estimate.
+    #[test]
+    fn stride_prefers_real_stride_over_inference() {
+        // row_bytes=400, real stride 512, h=10 → extent 9*512+400 = 5008.
+        assert_eq!(validated_src_stride(5120, 100, 10, Some(512)), Some(512));
+        // Inference on the same buffer would have said 512 as well, but a
+        // buffer with slack shows the difference: 5200 bytes infers 520,
+        // extent 9*520+400 = 5080 <= 5200 → accepted at the WRONG stride.
+        assert_eq!(validated_src_stride(5200, 100, 10, Some(512)), Some(512));
+        assert_eq!(validated_src_stride(5200, 100, 10, None), Some(520));
+    }
+
+    /// A real stride is still bounds-checked — a lying/stale stride must not
+    /// be trusted blindly.
+    #[test]
+    fn stride_bounds_checks_real_stride_too() {
+        // real stride 1024, h=10 → extent 9*1024+400 = 9616 > 5120.
+        assert_eq!(validated_src_stride(5120, 100, 10, Some(1024)), None);
+    }
+
+    /// Single-row buffers only need `row_bytes`, whatever the stride says.
+    #[test]
+    fn stride_single_row_ignores_padding() {
+        assert_eq!(validated_src_stride(400, 100, 1, None), Some(400));
+        assert_eq!(validated_src_stride(400, 100, 1, Some(4096)), Some(4096));
     }
 }
