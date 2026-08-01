@@ -124,13 +124,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux is informational-only: CEF's subprocess ICU
-          # fd-passing crashes ("Invalid file descriptor to ICU data
-          # received") under pixman-headless sway on the GHA runner,
-          # independent of buffr's windowing layer (reproduces with
-          # --no-zygote, with Resources/ staged next to the binary,
-          # with BUFFR_DISABLE_ZYGOTE=1). Real Linux desktops are
-          # fine. macOS + Windows smoke remain blocking.
+          # Linux was informational-only because of a CEF ICU crash
+          # that turned out to be this job's own LD_LIBRARY_PATH
+          # shadowing the staged libcef.so (see the smoke step below).
+          # Kept non-blocking for one more cycle to confirm it is
+          # genuinely stable on a GPU-less runner — wgpu had never been
+          # reached here before, since the crash happened during CEF
+          # init. Flip to `false` once it has passed a few runs.
           - os: ubuntu-latest
             cef_platform: linux64
             bin_suffix: ""
@@ -205,37 +205,43 @@ jobs:
           export WLR_RENDERER=pixman
           mkdir -p "$XDG_RUNTIME_DIR"
 
-          # buffr-app DT_NEEDEDs libcef.so. CEF was fetched to
-          # vendor/cef/linux64/Release/; point LD_LIBRARY_PATH there
-          # so the dynamic linker finds it at process spawn.
-          export LD_LIBRARY_PATH="$PWD/vendor/cef/linux64/Release:${LD_LIBRARY_PATH:-}"
-
-          # Stage CEF Linux resources (icudtl.dat, *.pak, locales/) next
-          # to the binary — CEF defaults to looking beside the exe and
-          # crashes with "Invalid file descriptor to ICU data received"
-          # otherwise. Production builds bundle these via AppImage/.deb
-          # but the dev cargo binary needs manual staging.
-          echo "--- vendor/cef/linux64 layout ---"
-          ls -la vendor/cef/linux64/ || true
-          echo "--- vendor/cef/linux64/Resources ---"
-          ls -la vendor/cef/linux64/Resources/ || true
-          cp -rv vendor/cef/linux64/Resources/* target/debug/
-          cp -v vendor/cef/linux64/Release/*.bin target/debug/
-          echo "--- target/debug after staging ---"
-          ls target/debug/icudtl.dat target/debug/resources.pak target/debug/v8_context_snapshot.bin
+          # Deliberately NO LD_LIBRARY_PATH and no resource staging.
+          #
+          # `buffr-cef`'s build script already copies libcef.so, the
+          # sibling runtime .so files, icudtl.dat, the .pak files, the
+          # locales/ tree and v8_context_snapshot.bin into the cargo
+          # target dir, and links the binary with `-rpath,$ORIGIN`. So
+          # target/debug is a complete, self-consistent CEF layout.
+          #
+          # Pointing LD_LIBRARY_PATH at vendor/cef/linux64/Release used
+          # to override that rpath, so the process loaded *that*
+          # libcef.so — and CEF resolves icudtl.dat and the .pak files
+          # relative to the directory holding libcef.so, not the exe.
+          # vendor/.../Release has no icudtl.dat (it lives in
+          # ../Resources), so ICU init failed and Chromium CHECK-crashed
+          # with SIGTRAP. The "Invalid file descriptor to ICU data
+          # received" message is Chromium's wording for that mmap
+          # failing; it has nothing to do with fd passing, the zygote,
+          # or headless sway — it reproduces with no compositor at all.
+          echo "--- target/debug CEF layout ---"
+          ls target/debug/libcef.so target/debug/icudtl.dat \
+             target/debug/resources.pak target/debug/v8_context_snapshot.bin
+          ls -d target/debug/locales
 
           cat > /tmp/sway-cmd.sh <<EOF
           #!/usr/bin/env bash
           # Intentionally no \`set -e\`: a SIGTRAP / panic from buffr-app
           # must still flow through to /tmp/buffr-smoke-exit + swaymsg
           # exit so the outer wait loop doesn't hit 150s every crash.
-          export LD_LIBRARY_PATH='$LD_LIBRARY_PATH'
+          #
           # sway sets WAYLAND_DISPLAY for its children but not
           # XDG_SESSION_TYPE; buffr-app refuses non-Wayland sessions.
           export XDG_SESSION_TYPE=wayland
-          # Headless sway has no DBus etc. — CEF's zygote model crashes
-          # at "Invalid file descriptor to ICU data received". Skip the
-          # zygote so subprocesses fork from a fresh state instead.
+          # Runner has no session bus and no seat. Skipping the zygote
+          # keeps subprocess startup off that path. Kept as a
+          # precaution, not for the ICU crash it was once blamed for
+          # (see above) — worth retrying without it once this job has
+          # been stable for a while.
           export BUFFR_DISABLE_ZYGOTE=1
           ./target/debug/buffr-app --smoke-test --smoke-test-timeout-ms 120000
           code=\$?
