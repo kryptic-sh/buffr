@@ -53,6 +53,7 @@ pub mod backend;
 pub(crate) mod convert;
 pub mod handlers;
 pub mod host;
+pub(crate) mod html;
 pub mod new_tab;
 pub mod osr;
 pub mod permissions;
@@ -80,7 +81,7 @@ pub use buffr_engine::ProfilePaths;
 pub use buffr_engine::{BrowserEngine, TabId, TabSummary};
 pub use new_tab::{
     NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
-    NewTabHtmlProvider, SETTINGS_URL, SettingsHtmlProvider, settings_html,
+    SETTINGS_URL,
 };
 pub use osr::{OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState};
 // Popup types and helpers promoted to buffr-engine in Phase 6a (#95).
@@ -92,13 +93,21 @@ pub use buffr_engine::{
     new_popup_close_sink, new_popup_create_sink, new_popup_queue,
 };
 pub use permissions::{
-    CefCallbackRegistry, PendingPermission, PermissionsQueue, PromptOutcome,
-    capabilities_for_media_mask, capabilities_for_request_mask,
-    drain_registry_with_defer as drain_permissions_registry_with_defer,
-    drain_with_defer as drain_permissions_with_defer, enqueue_to_both,
-    new_queue as new_permissions_queue, next_resolve_id, peek_front as peek_permission_front,
-    pop_front as pop_permission_front, precheck as precheck_permission,
-    queue_len as permissions_queue_len,
+    CefCallbackRegistry, PendingPermission, PromptOutcome, capabilities_for_media_mask,
+    capabilities_for_request_mask,
+    drain_registry_with_defer as drain_permissions_registry_with_defer, enqueue_to_both,
+    next_resolve_id, precheck as precheck_permission,
+};
+// L16: the legacy `PermissionsQueue` is dead — nothing in this crate pushes
+// into it any more. These re-exports survive only for
+// `apps/buffr-app/src/main.rs`, which still declares a
+// `buffr_cef::PermissionsQueue` field and drains it at shutdown. Delete this
+// block (and `permissions.rs`'s shim section, plus
+// `CefEngineSinks::permissions_queue`) once that call site is gone.
+pub use permissions::{
+    PermissionsQueue, drain_with_defer as drain_permissions_with_defer,
+    new_queue as new_permissions_queue, peek_front as peek_permission_front,
+    pop_front as pop_permission_front, queue_len as permissions_queue_len,
 };
 pub use view_source_scheme::{register_buffr_src_handler_factory, register_buffr_src_scheme};
 
@@ -112,9 +121,14 @@ pub fn init_cef_api() {
 
 /// Execute the CEF subprocess entry point. Returns the process exit
 /// code for child processes (renderer/GPU/utility), or -1 for the
-/// browser process.
+/// browser process. Call ONLY when `--type=` is present in argv (the
+/// single-binary dispatch) or from the dedicated helper binary.
 ///
-/// Call `init_cef_api()` before this.
+/// Calls `init_cef_api()` internally; calling it beforehand is harmless.
+///
+/// L17: this used to have a byte-identical twin named
+/// `execute_process_for_subprocess`. The twin is gone; `CefBackend::execute_subprocess`
+/// now calls this.
 pub fn execute_subprocess() -> i32 {
     init_cef_api();
     let args = cef::args::Args::new();
@@ -214,20 +228,6 @@ pub fn delete_all_cookies() {
         tracing::info!("delete_all_cookies: delete dispatched");
     }
     let _ = manager.flush_store(None);
-}
-
-/// Run `cef::execute_process` for the subprocess dispatch in single-binary
-/// mode. Returns the exit code for child processes (>= 0) or -1 for the
-/// browser process. Call ONLY when `--type=` is present in argv.
-pub fn execute_process_for_subprocess() -> i32 {
-    init_cef_api();
-    let args = cef::args::Args::new();
-    let mut app = BuffrApp::new();
-    cef::execute_process(
-        Some(args.as_main_args()),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    )
 }
 
 /// Load the CEF framework shared library on platforms that require it.

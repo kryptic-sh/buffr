@@ -39,7 +39,7 @@
 //! - found in `popup_frames` → use that pair
 //! - unknown → skip with a trace log
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +54,41 @@ pub use buffr_engine::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewStat
 /// Shared between `BrowserHost` (which inserts/removes entries) and
 /// `OsrPaintHandler` (which reads them on CEF IO callbacks).
 pub type PopupFrameMap = Arc<Mutex<HashMap<i32, (SharedOsrFrame, SharedOsrViewState)>>>;
+
+/// One popup's OSR allocation, made in `on_before_popup` before CEF has
+/// assigned a browser id and claimed in `on_after_created` once it has.
+pub type PopupAlloc = (SharedOsrFrame, SharedOsrViewState, String);
+
+/// FIFO of pending popup allocations (M16).
+///
+/// This replaces `buffr_engine::PendingPopupAlloc`, which was a single
+/// `Option` slot: two `window.open()` calls in one task fire
+/// `on_before_popup` twice before either `on_after_created`, so the second
+/// alloc overwrote the first. The first popup then rendered the second's
+/// URL and the second was dropped entirely — never inserted into
+/// `popup_frames`/`popup_browsers`, so `close_all_browsers` missed it and a
+/// live CEF browser leaked into `cef::shutdown()`.
+///
+/// A FIFO is the correct shape rather than a `HashMap<popup_id, _>`:
+/// `cef_life_span_handler_t::on_after_created` takes only `(self, browser)`
+/// — the `popup_id` that `on_before_popup` receives is **not** available on
+/// the creation side, so there is nothing to key on. CEF creates popups in
+/// the order they were requested and both callbacks are sequenced on the
+/// browser-process UI thread, so front-of-queue is the matching alloc.
+pub type PendingPopupAllocQueue = Arc<Mutex<VecDeque<PopupAlloc>>>;
+
+/// Upper bound on queued-but-unclaimed popup allocations.
+///
+/// Each entry holds an 800×600 BGRA frame buffer (~1.9 MiB), so an
+/// unbounded queue is a memory-growth vector for a page that calls
+/// `window.open()` in a loop while CEF blocks the popups. Oldest entries
+/// are evicted first.
+pub const PENDING_POPUP_ALLOC_CAP: usize = 32;
+
+/// Build an empty [`PendingPopupAllocQueue`].
+pub fn new_pending_popup_alloc_queue() -> PendingPopupAllocQueue {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
 
 // ── RenderHandler impl ─────────────────────────────────────────────────────────
 
@@ -149,16 +184,28 @@ wrap_render_handler! {
             }
 
             let browser_id = browser.as_deref().map(|b| b.identifier());
-            let w = width as u32;
-            let h = height as u32;
-            let len = (w as usize) * (h as usize) * 4;
+
+            // Validate the FFI inputs BEFORE touching the pointer (M17).
+            // `width`/`height` are `c_int`: a negative value would
+            // sign-extend through `as u32` into a ~4-billion-element `len`,
+            // and `slice::from_raw_parts(null, 0)` is UB even at zero
+            // length. CEF should never hand us either, but this is the
+            // trust boundary.
+            let Some((w, h, len)) = paint_buffer_len(buffer, width, height) else {
+                tracing::warn!(
+                    width,
+                    height,
+                    buffer_null = buffer.is_null(),
+                    ?browser_id,
+                    "osr: on_paint — invalid buffer/dimensions, skipping"
+                );
+                return;
+            };
             tracing::trace!(w, h, ?browser_id, "osr: on_paint fired");
 
-            // SAFETY: CEF guarantees `buffer` points to `width * height * 4`
-            // valid bytes for the duration of this call.
-            let src = unsafe { std::slice::from_raw_parts(buffer, len) };
-
-            // Route to the correct (frame, view) pair.
+            // Route to the correct (frame, view) pair FIRST — no reason to
+            // materialise a slice over CEF's buffer for a paint we are
+            // going to drop.
             let (frame, view) = match self.resolve_frame_view(browser_id) {
                 Some(pair) => pair,
                 None => {
@@ -169,6 +216,11 @@ wrap_render_handler! {
                     return;
                 }
             };
+
+            // SAFETY: `buffer` is non-null and `len == width * height * 4`
+            // with both dimensions validated positive above; CEF guarantees
+            // those bytes stay valid for the duration of this call.
+            let src = unsafe { std::slice::from_raw_parts(buffer, len) };
 
             let Ok(mut guard) = frame.lock() else {
                 tracing::warn!("osr: on_paint — frame mutex poisoned, skipping");
@@ -211,6 +263,24 @@ wrap_render_handler! {
             }
         }
     }
+}
+
+/// Validate CEF's `on_paint` buffer + dimensions and compute the BGRA
+/// byte length.
+///
+/// Returns `None` — meaning "drop this paint" — when the buffer pointer is
+/// null, either dimension is non-positive, or `width * height * 4` would
+/// overflow `usize`. See M17: `width`/`height` arrive as `c_int` and a
+/// negative value sign-extends through `as u32` into a ~4-billion-element
+/// length, and `slice::from_raw_parts(null, 0)` is UB even at zero length.
+fn paint_buffer_len(buffer: *const u8, width: i32, height: i32) -> Option<(u32, u32, usize)> {
+    if buffer.is_null() || width <= 0 || height <= 0 {
+        return None;
+    }
+    let w = width as u32;
+    let h = height as u32;
+    let len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    Some((w, h, len))
 }
 
 impl OsrPaintHandler {
@@ -319,6 +389,50 @@ mod tests {
     // (which leaves osr_view untouched) with `osr_resize` (which writes
     // them) — the regression bites when chrome layout changes without
     // a window resize.
+
+    // ── M17: on_paint FFI-input validation ────────────────────────────────
+
+    #[test]
+    fn paint_buffer_len_rejects_null_buffer() {
+        assert!(paint_buffer_len(std::ptr::null(), 1280, 800).is_none());
+        // Null is rejected even at a zero-area rect — `from_raw_parts(null, 0)`
+        // is UB regardless of length.
+        assert!(paint_buffer_len(std::ptr::null(), 0, 0).is_none());
+    }
+
+    #[test]
+    fn paint_buffer_len_rejects_non_positive_dims() {
+        let buf = [0u8; 16];
+        let p = buf.as_ptr();
+        assert!(paint_buffer_len(p, 0, 800).is_none());
+        assert!(paint_buffer_len(p, 1280, 0).is_none());
+        // The sign-extension bug: `-1 as u32` == 4_294_967_295.
+        assert!(paint_buffer_len(p, -1, 800).is_none());
+        assert!(paint_buffer_len(p, 1280, -1).is_none());
+        assert!(paint_buffer_len(p, i32::MIN, i32::MIN).is_none());
+    }
+
+    #[test]
+    fn paint_buffer_len_accepts_valid_dims() {
+        let buf = [0u8; 16];
+        let p = buf.as_ptr();
+        assert_eq!(paint_buffer_len(p, 2, 2), Some((2, 2, 16)));
+        assert_eq!(paint_buffer_len(p, 1280, 800), Some((1280, 800, 4_096_000)));
+    }
+
+    #[test]
+    fn paint_buffer_len_rejects_overflow() {
+        let buf = [0u8; 16];
+        let p = buf.as_ptr();
+        // Only reachable on 32-bit targets; on 64-bit the product fits, so
+        // just assert the function is total (never panics) for i32::MAX.
+        let got = paint_buffer_len(p, i32::MAX, i32::MAX);
+        if usize::BITS <= 32 {
+            assert!(got.is_none());
+        } else {
+            assert!(got.is_some());
+        }
+    }
 
     #[test]
     fn default_view_dims_and_scale() {

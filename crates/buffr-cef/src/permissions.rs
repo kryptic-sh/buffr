@@ -96,7 +96,10 @@ pub enum PendingPermission {
     MediaAccess {
         origin: String,
         capabilities: Vec<Capability>,
-        callback: MediaAccessCallback,
+        /// `Some` until the callback has been fired (or explicitly
+        /// disarmed). [`Drop`] uses this to guarantee the C++ callback
+        /// is invoked exactly once — see the impl below.
+        callback: Option<MediaAccessCallback>,
         /// Bitmask CEF originally requested. We only grant the bits
         /// the user said yes to; anything outside this mask would be
         /// rejected by CEF anyway, but pre-masking keeps the contract
@@ -106,7 +109,9 @@ pub enum PendingPermission {
     Prompt {
         origin: String,
         capabilities: Vec<Capability>,
-        callback: PermissionPromptCallback,
+        /// `Some` until the callback has been fired (or explicitly
+        /// disarmed). See [`Drop`] below.
+        callback: Option<PermissionPromptCallback>,
         prompt_id: u64,
     },
 }
@@ -161,20 +166,29 @@ impl PendingPermission {
     /// (optionally) persist the decision in `store`. Returns the
     /// number of rows written to the store (0 or `capabilities.len()`).
     ///
+    /// The C++ callback is **always** invoked, even when the store write
+    /// fails — a sqlite error (disk full, locked db) must never leave the
+    /// renderer wedged waiting on a `MediaAccessCallback` that never
+    /// fires. The store error is captured and returned *after* the
+    /// callback has been dispatched.
+    ///
     /// Dropping a `PendingPermission` without calling `resolve` would
-    /// leak the CEF refcounted callback and wedge the renderer until
-    /// the browser is torn down. The handler's `Drop` impl below
-    /// guards against that by dispatching a default `Defer` outcome.
-    pub fn resolve(self, outcome: PromptOutcome, store: &Permissions) -> Result<usize, PermError> {
-        let (decision_to_persist, remember) = match outcome {
-            PromptOutcome::Allow { remember } => (Some(Decision::Allow), remember),
-            PromptOutcome::Deny { remember } => (Some(Decision::Deny), remember),
-            PromptOutcome::Defer => (None, false),
-        };
+    /// otherwise leak the CEF refcounted callback and wedge the renderer
+    /// until the browser is torn down. The [`Drop`] impl below guards
+    /// against that by dispatching a `cancel()` / `DISMISS` outcome.
+    /// Call [`Self::disarm`] first when CEF has already retired the
+    /// callback on its own (see `on_dismiss_permission_prompt`).
+    pub fn resolve(
+        mut self,
+        outcome: PromptOutcome,
+        store: &Permissions,
+    ) -> Result<usize, PermError> {
+        let (decision_to_persist, remember) = decision_for(outcome);
 
         let mut written = 0usize;
+        let mut store_err: Option<PermError> = None;
 
-        match self {
+        match &mut self {
             PendingPermission::MediaAccess {
                 origin,
                 capabilities,
@@ -182,14 +196,16 @@ impl PendingPermission {
                 requested_mask,
             } => {
                 if remember && let Some(decision) = decision_to_persist {
-                    for cap in &capabilities {
-                        store.set(&origin, *cap, decision)?;
-                        written += 1;
-                    }
+                    (written, store_err) = persist_decisions(store, origin, capabilities, decision);
                 }
-                match outcome {
-                    PromptOutcome::Allow { .. } => callback.cont(requested_mask),
-                    PromptOutcome::Deny { .. } | PromptOutcome::Defer => callback.cancel(),
+                // ALWAYS fire the callback, even if the store write above
+                // failed. `Option::take` makes this a no-op for the `Drop`
+                // impl below, so the callback runs exactly once.
+                if let Some(cb) = callback.take() {
+                    match outcome {
+                        PromptOutcome::Allow { .. } => cb.cont(*requested_mask),
+                        PromptOutcome::Deny { .. } | PromptOutcome::Defer => cb.cancel(),
+                    }
                 }
             }
             PendingPermission::Prompt {
@@ -199,20 +215,105 @@ impl PendingPermission {
                 prompt_id: _,
             } => {
                 if remember && let Some(decision) = decision_to_persist {
-                    for cap in &capabilities {
-                        store.set(&origin, *cap, decision)?;
-                        written += 1;
-                    }
+                    (written, store_err) = persist_decisions(store, origin, capabilities, decision);
                 }
                 let result = match outcome {
                     PromptOutcome::Allow { .. } => PermissionRequestResult::ACCEPT,
                     PromptOutcome::Deny { .. } => PermissionRequestResult::DENY,
                     PromptOutcome::Defer => PermissionRequestResult::DISMISS,
                 };
-                callback.cont(result);
+                if let Some(cb) = callback.take() {
+                    cb.cont(result);
+                }
             }
         }
-        Ok(written)
+        match store_err {
+            Some(err) => Err(err),
+            None => Ok(written),
+        }
+    }
+
+    /// Drop the C++ callback handle **without** invoking it.
+    ///
+    /// Only correct when CEF has already retired the callback on its own —
+    /// today that is `on_dismiss_permission_prompt`, where CEF has
+    /// cancelled the prompt and calling `cont()` again would be a
+    /// double-invoke. Everything else must go through [`Self::resolve`]
+    /// (or let [`Drop`] fire the default outcome).
+    pub fn disarm(&mut self) {
+        match self {
+            PendingPermission::MediaAccess { callback, .. } => {
+                let _ = callback.take();
+            }
+            PendingPermission::Prompt { callback, .. } => {
+                let _ = callback.take();
+            }
+        }
+    }
+}
+
+/// Map a [`PromptOutcome`] to `(decision_to_persist, remember)`.
+fn decision_for(outcome: PromptOutcome) -> (Option<Decision>, bool) {
+    match outcome {
+        PromptOutcome::Allow { remember } => (Some(Decision::Allow), remember),
+        PromptOutcome::Deny { remember } => (Some(Decision::Deny), remember),
+        PromptOutcome::Defer => (None, false),
+    }
+}
+
+/// Write `decision` for every capability in `caps`.
+///
+/// Returns `(rows_written, first_error)`. Never short-circuits with `?` —
+/// the caller must still fire the CEF callback regardless of a store
+/// failure, so the error is handed back instead of propagated (H9).
+fn persist_decisions(
+    store: &Permissions,
+    origin: &str,
+    caps: &[Capability],
+    decision: Decision,
+) -> (usize, Option<PermError>) {
+    let mut written = 0usize;
+    for cap in caps {
+        match store.set(origin, *cap, decision) {
+            Ok(()) => written += 1,
+            Err(err) => return (written, Some(err)),
+        }
+    }
+    (written, None)
+}
+
+/// Guarantee the CEF callback is invoked exactly once.
+///
+/// If a `PendingPermission` is dropped while still armed — registry drop
+/// at shutdown, a poisoned mutex, an early `return` on an error path —
+/// the C++ side would otherwise wait forever and wedge the renderer.
+/// Fire the most conservative outcome (`cancel()` / `DISMISS`) instead.
+impl Drop for PendingPermission {
+    fn drop(&mut self) {
+        match self {
+            PendingPermission::MediaAccess {
+                origin, callback, ..
+            } => {
+                if let Some(cb) = callback.take() {
+                    warn!(
+                        %origin,
+                        "permissions: media-access request dropped unresolved — cancelling"
+                    );
+                    cb.cancel();
+                }
+            }
+            PendingPermission::Prompt {
+                origin, callback, ..
+            } => {
+                if let Some(cb) = callback.take() {
+                    warn!(
+                        %origin,
+                        "permissions: prompt request dropped unresolved — dismissing"
+                    );
+                    cb.cont(PermissionRequestResult::DISMISS);
+                }
+            }
+        }
     }
 }
 
@@ -255,35 +356,50 @@ pub fn enqueue_to_both(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Legacy `PermissionsQueue` — DEAD, kept only as a compile shim (L16)
+// ---------------------------------------------------------------------------
+//
+// Nothing has pushed into this queue since Phase 8a (#88):
+// `BuffrPermissionHandler` writes exclusively to `cef_callback_registry` +
+// the neutral `buffr_engine::PermissionsQueue`. Every CEF-internal user of
+// the type has been removed (`BrowserHost`, `BuffrClient`,
+// `BuffrPermissionHandler`, `make_client`).
+//
+// The type and the four helpers below survive ONLY because
+// `apps/buffr-app/src/main.rs` still holds a `buffr_cef::PermissionsQueue`
+// field and calls `drain_permissions_with_defer` on it at shutdown. That
+// call site is outside this crate; once it is removed, delete everything in
+// this section along with `CefEngineSinks::permissions_queue`.
+//
+// Not marked `#[deprecated]` on purpose — the apps crate builds with
+// `-D warnings`, so the attribute would break the workspace build before
+// the call site is gone.
+
 /// Shared queue between the CEF IO/UI callbacks and the UI thread.
 ///
-/// **Phase 8a (#88)**: this CEF-internal queue is kept for backward
-/// compatibility with the `drain_with_defer` shutdown path. The apps
-/// layer now uses the neutral `buffr_engine::PermissionsQueue` via the
-/// `BrowserEngine::permissions_queue()` trait method.
+/// **Dead since Phase 8a (#88)** — always empty. See the module note above.
 pub type PermissionsQueue = Arc<Mutex<VecDeque<PendingPermission>>>;
 
-/// Build a fresh empty permissions queue.
+/// Build a fresh empty permissions queue. **Dead** — see [`PermissionsQueue`].
 pub fn new_queue() -> PermissionsQueue {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
-/// Number of pending requests currently in `queue`. Used by the UI
-/// strip to render `(N more pending)`.
+/// Number of pending requests currently in `queue`.
+/// **Dead** (always 0) — see [`PermissionsQueue`].
 pub fn queue_len(queue: &PermissionsQueue) -> usize {
     queue.lock().map(|g| g.len()).unwrap_or(0)
 }
 
 /// Pop the front of the queue, if any.
+/// **Dead** (always `None`) — see [`PermissionsQueue`].
 pub fn pop_front(queue: &PermissionsQueue) -> Option<PendingPermission> {
     queue.lock().ok().and_then(|mut g| g.pop_front())
 }
 
 /// Inspect (without removing) the front of the queue.
-///
-/// Returned tuple is `(origin, capabilities)` so the UI can render the
-/// strip without touching the callback wrapper. Holding the lock just
-/// long enough to clone primitives keeps the IO thread unblocked.
+/// **Dead** (always `None`) — see [`PermissionsQueue`].
 pub fn peek_front(queue: &PermissionsQueue) -> Option<(String, Vec<Capability>)> {
     let g = queue.lock().ok()?;
     let front = g.front()?;
@@ -291,7 +407,8 @@ pub fn peek_front(queue: &PermissionsQueue) -> Option<(String, Vec<Capability>)>
 }
 
 /// Drop every entry in `queue`, dispatching a [`PromptOutcome::Defer`]
-/// for each so the renderer doesn't wedge. Called at shutdown.
+/// for each so the renderer doesn't wedge.
+/// **Dead** (queue is always empty) — see [`PermissionsQueue`].
 pub fn drain_with_defer(queue: &PermissionsQueue, store: &Permissions) {
     let drained: Vec<PendingPermission> = match queue.lock() {
         Ok(mut g) => g.drain(..).collect(),
@@ -304,12 +421,13 @@ pub fn drain_with_defer(queue: &PermissionsQueue, store: &Permissions) {
     }
 }
 
-/// Drain the [`CefCallbackRegistry`] at shutdown, firing `Defer` for
-/// each pending callback so the renderer doesn't wedge.
+/// Drain the [`CefCallbackRegistry`], firing `Defer` for each pending
+/// callback so the renderer doesn't wedge.
 ///
-/// Phase 8a (#88): replaces `drain_with_defer` for the new registry-based
-/// path. After migration, the old `PermissionsQueue` shutdown drain in
-/// `main.rs` delegates here.
+/// Called from `BrowserHost::close_all_browsers` (L16 wiring) so pending
+/// callbacks are retired while CEF's threads are still running, rather than
+/// waiting for the registry `Arc` to reach refcount zero somewhere inside
+/// `cef::shutdown()`.
 pub fn drain_registry_with_defer(registry: &CefCallbackRegistry, store: &Permissions) {
     let drained: Vec<PendingPermission> = match registry.lock() {
         Ok(mut reg) => reg.drain().map(|(_, v)| v).collect(),
@@ -552,4 +670,63 @@ mod tests {
         assert!(pop_front(&q).is_none());
         assert!(peek_front(&q).is_none());
     }
+
+    // ── H9 regression coverage ────────────────────────────────────────────
+    //
+    // `PendingPermission::resolve` itself needs a live `MediaAccessCallback`
+    // (a C++ refcounted object), so it cannot be exercised here. The two
+    // pure pieces it was split into can be — and they are the parts that
+    // encode the H9 contract: `persist_decisions` must NOT short-circuit
+    // with `?`, it must hand the error back so the caller can still fire
+    // the CEF callback.
+
+    #[test]
+    fn decision_for_maps_outcomes() {
+        assert_eq!(
+            decision_for(PromptOutcome::Allow { remember: true }),
+            (Some(Decision::Allow), true)
+        );
+        assert_eq!(
+            decision_for(PromptOutcome::Allow { remember: false }),
+            (Some(Decision::Allow), false)
+        );
+        assert_eq!(
+            decision_for(PromptOutcome::Deny { remember: true }),
+            (Some(Decision::Deny), true)
+        );
+        assert_eq!(decision_for(PromptOutcome::Defer), (None, false));
+    }
+
+    #[test]
+    fn persist_decisions_writes_every_capability() {
+        let store = Permissions::open_in_memory().unwrap();
+        let caps = [Capability::Camera, Capability::Microphone];
+        let (written, err) = persist_decisions(&store, "https://x", &caps, Decision::Allow);
+        assert_eq!(written, 2);
+        assert!(err.is_none());
+        assert_eq!(
+            store.get("https://x", Capability::Camera).unwrap(),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            store.get("https://x", Capability::Microphone).unwrap(),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn persist_decisions_empty_caps_is_noop() {
+        let store = Permissions::open_in_memory().unwrap();
+        let (written, err) = persist_decisions(&store, "https://x", &[], Decision::Deny);
+        assert_eq!(written, 0);
+        assert!(err.is_none());
+    }
+
+    // NOTE: the "store failed but the callback still fired" half of H9
+    // cannot be exercised here — it needs both a live C++
+    // `MediaAccessCallback` and a fault-injectable `Permissions` store,
+    // and `Permissions` exposes no way to force a write failure. What IS
+    // pinned above is the shape that makes the fix possible:
+    // `persist_decisions` hands the error back instead of `?`-ing out of
+    // `resolve` before the callback runs.
 }

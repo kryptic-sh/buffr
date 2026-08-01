@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::host::BUFFR_SRC_PREFIX;
+use crate::html::html_escape;
 
 /// Register the `buffr-src` scheme with CEF.
 ///
@@ -28,11 +29,16 @@ pub fn register_buffr_src_scheme(registrar: &mut cef::SchemeRegistrar) {
     // (cef-sys bindings reflect the underlying C int width). Allow the
     // platform-dependent cast — on Windows clippy sees i32 → i32 as
     // redundant; on Linux the cast is real.
+    //
+    // M13: `CORS_ENABLED | FETCH_ENABLED` are deliberately NOT set. With
+    // them, ordinary web content could `fetch('buffr-src:http://…')` and
+    // `fetch_and_render` would perform the request from the *browser*
+    // process — outside Chromium's network stack, so same-origin policy,
+    // CSP and private-network-access checks are all bypassed. View-source
+    // only ever needs a browser-initiated top-level navigation, which
+    // `STANDARD | SECURE` already allows.
     #[allow(clippy::unnecessary_cast)]
-    let opts = (SchemeOptions::STANDARD.get_raw()
-        | SchemeOptions::SECURE.get_raw()
-        | SchemeOptions::CORS_ENABLED.get_raw()
-        | SchemeOptions::FETCH_ENABLED.get_raw()) as i32;
+    let opts = (SchemeOptions::STANDARD.get_raw() | SchemeOptions::SECURE.get_raw()) as i32;
     registrar.add_custom_scheme(Some(&scheme), opts);
 }
 
@@ -73,7 +79,7 @@ wrap_scheme_handler_factory! {
         fn create(
             &self,
             _browser: Option<&mut cef::Browser>,
-            _frame: Option<&mut cef::Frame>,
+            frame: Option<&mut cef::Frame>,
             _scheme_name: Option<&CefString>,
             request: Option<&mut cef::Request>,
         ) -> Option<cef::ResourceHandler> {
@@ -84,13 +90,178 @@ wrap_scheme_handler_factory! {
 
             let underlying = underlying_url(&buffr_src_url).to_owned();
 
+            // The URL of the page that triggered this load. For a
+            // browser-initiated top-level navigation this is the page the
+            // user was on when they hit "view source", which is exactly
+            // the origin allowed to reach its own private-network host.
+            let initiator = frame.map(|f| CefStringUtf16::from(&f.url()).to_string());
+
+            // M13: validate before the handler is ever constructed. A
+            // rejected target still gets a handler so the user sees the
+            // reason instead of a bare CEF error overlay — the handler just
+            // starts with the error page pre-rendered and never fetches.
+            let rejection = validate_target(&underlying, initiator.as_deref()).err();
+            if let Some(reason) = rejection.as_deref() {
+                tracing::warn!(
+                    url = %underlying,
+                    initiator = initiator.as_deref().unwrap_or("<none>"),
+                    %reason,
+                    "buffr-src: refusing to fetch"
+                );
+            }
+
             Some(BuffrSrcResourceHandler::new(
-                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(
+                    rejection.map(|r| error_page(&underlying, &r).into_bytes()),
+                )),
                 underlying,
                 Arc::new(AtomicUsize::new(0)),
             ))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Target validation (M13)
+// ---------------------------------------------------------------------------
+
+/// Reject anything `buffr-src:` must never fetch.
+///
+/// Two rules:
+///
+/// 1. The underlying URL must be `http` or `https`. Everything else
+///    (`file:`, `data:`, `ftp:`, another `buffr-src:`, …) is refused —
+///    `fetch_and_render` runs in the **browser** process, so a `file:` URL
+///    would be a direct local-disk read with no Chromium mediation.
+/// 2. Non-public destinations — loopback, link-local (169.254/16 incl. the
+///    cloud metadata endpoint), and RFC1918 — are refused **unless** the
+///    page that triggered the navigation is already on that same host.
+///    That keeps "view source of a `buffr://` internal page" working (the
+///    internal server is on 127.0.0.1) while blocking a public page from
+///    pivoting into the local network.
+fn validate_target(url: &str, initiator: Option<&str>) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("no URL to fetch (buffr-src: prefix with empty suffix)".to_string());
+    }
+    let Some(host) = http_host(url) else {
+        return Err("only http:// and https:// URLs can be viewed as source".to_string());
+    };
+    if !is_non_public_host(&host) {
+        return Ok(());
+    }
+    let initiator_host = initiator.and_then(http_host);
+    if initiator_host.as_deref() == Some(host.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to fetch private-network host `{host}` from a page on \
+         `{}` — view-source of a local address is only allowed from that \
+         same host",
+        initiator_host.as_deref().unwrap_or("<unknown origin>")
+    ))
+}
+
+/// Extract the lower-cased host of an `http`/`https` URL.
+///
+/// Returns `None` for any other scheme or a malformed authority. Strips
+/// `userinfo@`, the `:port` suffix, and `[...]` around IPv6 literals — a
+/// deliberately small parser so this crate does not take a `url` dep for
+/// one call site.
+fn http_host(url: &str) -> Option<String> {
+    let rest = {
+        let lower = url.get(..8).unwrap_or_default().to_ascii_lowercase();
+        if lower.starts_with("http://") {
+            &url[7..]
+        } else if lower.starts_with("https://") {
+            &url[8..]
+        } else {
+            return None;
+        }
+    };
+    // Authority runs to the first '/', '?' or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Drop any userinfo (everything up to the LAST '@' — a password may
+    // itself contain '@').
+    let hostport = match authority.rsplit_once('@') {
+        Some((_, after)) => after,
+        None => authority,
+    };
+    if hostport.is_empty() {
+        return None;
+    }
+    // IPv6 literal: `[::1]:8080`.
+    let host = if let Some(stripped) = hostport.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or_default()
+    } else {
+        hostport.split(':').next().unwrap_or_default()
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// `true` when `host` names a loopback, link-local, unique-local or
+/// RFC1918 destination. Conservative: an unparseable literal that *looks*
+/// numeric is treated as non-public.
+fn is_non_public_host(host: &str) -> bool {
+    // Hostname forms.
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return true;
+    }
+    // IPv6 literals (already unbracketed by `http_host`).
+    if host.contains(':') {
+        let h = host.split('%').next().unwrap_or(host); // strip zone id
+        if h == "::1" || h == "::" {
+            return true;
+        }
+        // fe80::/10 link-local, fc00::/7 unique-local.
+        if h.starts_with("fe8")
+            || h.starts_with("fe9")
+            || h.starts_with("fea")
+            || h.starts_with("feb")
+            || h.starts_with("fc")
+            || h.starts_with("fd")
+        {
+            return true;
+        }
+        // IPv4-mapped (::ffff:127.0.0.1).
+        if let Some((_, v4)) = h.rsplit_once(':')
+            && v4.contains('.')
+            && is_non_public_v4(v4)
+        {
+            return true;
+        }
+        return false;
+    }
+    is_non_public_v4(host)
+}
+
+/// `true` when `host` is a dotted-quad IPv4 literal in a non-public range.
+/// Non-numeric hosts return `false` (DNS names are resolved by the fetch
+/// itself; DNS-rebinding is out of scope for this guard).
+fn is_non_public_v4(host: &str) -> bool {
+    let octets: Vec<&str> = host.split('.').collect();
+    if octets.len() != 4 {
+        return false;
+    }
+    let mut parsed = [0u16; 4];
+    for (i, o) in octets.iter().enumerate() {
+        match o.parse::<u16>() {
+            Ok(v) if v <= 255 && !o.is_empty() => parsed[i] = v,
+            // Not a plain dotted quad — treat as a DNS name.
+            _ => return false,
+        }
+    }
+    let [a, b, _, _] = parsed;
+    a == 0                                    // 0.0.0.0/8 "this network"
+        || a == 127                           // loopback
+        || a == 10                            // RFC1918
+        || (a == 172 && (16..=31).contains(&b))// RFC1918
+        || (a == 192 && b == 168)             // RFC1918
+        || (a == 169 && b == 254)             // link-local + cloud metadata
+        || (a == 100 && (64..=127).contains(&b)) // CGNAT
+        || a >= 224 // multicast + reserved
 }
 
 // ---------------------------------------------------------------------------
@@ -124,21 +295,25 @@ wrap_resource_handler! {
             handle_request: Option<&mut ::std::os::raw::c_int>,
             callback: Option<&mut cef::Callback>,
         ) -> ::std::os::raw::c_int {
-            // Signal that we will handle this request but NOT synchronously:
-            // returning `false` (0) from `open` makes CEF wait for the
-            // callback before proceeding.
-            if let Some(hr) = handle_request {
-                *hr = 0;
-            }
+            // Rebound as `mut` so the `handle_request` out-param can be
+            // written on whichever exit path we end up taking.
+            let mut handle_request = handle_request;
 
-            let body_slot = Arc::clone(&self.body);
-            let url = self.underlying_url.clone();
+            // If `create` already rejected the target (M13) the body is
+            // pre-filled with the error page — serve it synchronously and
+            // never touch the network.
+            let already_resolved = self.body.lock().map(|g| g.is_some()).unwrap_or(false);
 
             // CEF callback must be called from another thread to continue
             // the resource load once the body is ready.
             //
             // Safety: cef::Callback is Send per cef-rs's design; we ship it
             // across the thread boundary via the closure.
+            //
+            // L33: `callback` is `None` when CEF hands us a null Callback.
+            // Spawning the worker then would leave the load pending forever
+            // with nothing to call `cont()` — the tab spins until the user
+            // kills it. Fall through to the synchronous path instead.
             let callback_arc: Option<cef::Callback> = callback.map(|c| {
                 // `c` is `&mut cef::Callback`; we need an owned copy.
                 // The CEF wrapper objects are ref-counted, so this clone
@@ -146,18 +321,77 @@ wrap_resource_handler! {
                 c.clone()
             });
 
-            std::thread::spawn(move || {
-                let html = fetch_and_render(&url);
-                let bytes = html.into_bytes();
-                if let Ok(mut slot) = body_slot.lock() {
-                    *slot = Some(bytes);
+            // Synchronous completion: `handle_request = 1` + return 1 tells
+            // CEF to read whatever is in `self.body` right now.
+            let mut serve_now = |slf: &Self, reason: Option<&str>| {
+                if let Some(reason) = reason
+                    && let Ok(mut slot) = slf.body.lock()
+                {
+                    *slot = Some(error_page(&slf.underlying_url, reason).into_bytes());
                 }
-                // Tell CEF the response is ready.
-                if let Some(cb) = callback_arc {
-                    cb.cont();
+                if let Some(hr) = handle_request.as_deref_mut() {
+                    *hr = 1;
                 }
-            });
+                1
+            };
 
+            let Some(callback_arc) = callback_arc.filter(|_| !already_resolved) else {
+                let reason = if already_resolved {
+                    None
+                } else {
+                    tracing::warn!(
+                        url = %self.underlying_url,
+                        "buffr-src: no resource callback from CEF — serving error page"
+                    );
+                    Some("internal error: CEF supplied no resource callback")
+                };
+                return serve_now(self, reason);
+            };
+
+            // M14: bound the worker-thread fan-out. Without this an
+            // attacker-controlled request loop spawns one OS thread per
+            // request, each parked on a 10 s connect + 10 s recv timeout.
+            let Some(permit) = FetchPermit::acquire() else {
+                tracing::warn!(
+                    url = %self.underlying_url,
+                    cap = MAX_INFLIGHT_FETCHES,
+                    "buffr-src: fetch pool saturated — refusing request"
+                );
+                return serve_now(
+                    self,
+                    Some("too many concurrent view-source fetches — try again"),
+                );
+            };
+
+            let body_slot = Arc::clone(&self.body);
+            let url = self.underlying_url.clone();
+
+            let spawned = std::thread::Builder::new()
+                .name("buffr-src-fetch".to_string())
+                .spawn(move || {
+                    // Held for the whole fetch; released on every exit path.
+                    let _permit = permit;
+                    let html = fetch_and_render(&url);
+                    let bytes = html.into_bytes();
+                    if let Ok(mut slot) = body_slot.lock() {
+                        *slot = Some(bytes);
+                    }
+                    // Tell CEF the response is ready.
+                    callback_arc.cont();
+                });
+
+            if let Err(err) = spawned {
+                // Thread spawn failed (fd/thread exhaustion). Complete
+                // synchronously rather than leaving CEF waiting forever.
+                tracing::warn!(error = %err, "buffr-src: worker spawn failed");
+                return serve_now(self, Some("worker spawn failed"));
+            }
+
+            // Signal that we will handle this request but NOT synchronously:
+            // CEF waits for `callback.cont()` before proceeding.
+            if let Some(hr) = handle_request {
+                *hr = 0;
+            }
             // Return 0 (false): request is pending, wait for callback.cont().
             0
         }
@@ -251,14 +485,69 @@ wrap_resource_handler! {
 /// Maximum response body size before aborting (10 MiB, matches the renderer).
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// Maximum number of `buffr-src:` fetches in flight at once (M14).
+///
+/// View-source is a deliberate, one-at-a-time user action; a handful of
+/// concurrent fetches covers reload-spam and a few pinned tabs restoring at
+/// startup. Anything beyond that is a runaway loop, and each worker parks on
+/// a 10 s connect + 10 s recv timeout, so an unbounded spawn is a
+/// thread-exhaustion DoS.
+const MAX_INFLIGHT_FETCHES: usize = 8;
+
+/// Number of `buffr-src:` worker threads currently running.
+static INFLIGHT_FETCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII slot in the bounded fetch pool. Decrements [`INFLIGHT_FETCHES`] on
+/// drop, so a panicking or early-returning worker cannot leak capacity.
+struct FetchPermit;
+
+impl FetchPermit {
+    /// Claim a slot, or `None` when the pool is saturated.
+    fn acquire() -> Option<Self> {
+        let mut current = INFLIGHT_FETCHES.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_INFLIGHT_FETCHES {
+                return None;
+            }
+            match INFLIGHT_FETCHES.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(FetchPermit),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for FetchPermit {
+    fn drop(&mut self) {
+        INFLIGHT_FETCHES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Fetch `url` via ureq and render it with `buffr_view_source::render`.
 ///
 /// On any error (empty URL, network failure, non-2xx, body too large)
 /// returns an HTML error page so the user sees *something* useful rather
 /// than a CEF error overlay.
 fn fetch_and_render(url: &str) -> String {
+    // Belt-and-braces: `create` already validated the target, but this is
+    // the function that actually touches the network so it re-checks.
+    // `initiator = None` here — a same-host private destination that was
+    // approved at `create` time would be rejected again, so the caller must
+    // not reach this path for one (it doesn't: rejected targets never spawn
+    // a worker).
     if url.is_empty() {
         return error_page(url, "no URL to fetch (buffr-src: prefix with empty suffix)");
+    }
+    if http_host(url).is_none() {
+        return error_page(
+            url,
+            "only http:// and https:// URLs can be viewed as source",
+        );
     }
 
     let result = (|| -> Result<Vec<u8>, String> {
@@ -318,22 +607,6 @@ font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px;line-height:1.5}}
     )
 }
 
-/// Minimal HTML escaping for error page content.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -372,5 +645,146 @@ mod tests {
     #[test]
     fn html_escape_special_chars() {
         assert_eq!(html_escape("<>&\"'"), "&lt;&gt;&amp;&quot;&#39;");
+    }
+
+    // ── M13: scheme + private-network validation ──────────────────────────
+
+    #[test]
+    fn http_host_extracts_host() {
+        assert_eq!(
+            http_host("http://example.com/a/b"),
+            Some("example.com".into())
+        );
+        assert_eq!(http_host("https://example.com"), Some("example.com".into()));
+        assert_eq!(
+            http_host("https://EXAMPLE.com:8443/x?y#z"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            http_host("http://user:p@ss@127.0.0.1:8080/admin"),
+            Some("127.0.0.1".into())
+        );
+        assert_eq!(http_host("http://[::1]:8080/x"), Some("::1".into()));
+    }
+
+    #[test]
+    fn http_host_rejects_other_schemes() {
+        assert_eq!(http_host("file:///etc/passwd"), None);
+        assert_eq!(http_host("data:text/html,<b>x"), None);
+        assert_eq!(http_host("ftp://example.com/x"), None);
+        assert_eq!(http_host("buffr-src:https://example.com"), None);
+        assert_eq!(http_host(""), None);
+        assert_eq!(http_host("http://"), None);
+        assert_eq!(http_host("http:///path-only"), None);
+    }
+
+    #[test]
+    fn non_public_hosts_are_detected() {
+        for h in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "localhost",
+            "foo.localhost",
+            "printer.local",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+        ] {
+            assert!(is_non_public_host(h), "{h} should be non-public");
+        }
+    }
+
+    #[test]
+    fn public_hosts_are_allowed() {
+        for h in [
+            "example.com",
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1",
+            "172.15.0.1",
+            "192.169.0.1",
+            "169.253.0.1",
+            "2606:4700::1111",
+        ] {
+            assert!(!is_non_public_host(h), "{h} should be public");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_http_schemes() {
+        assert!(validate_target("file:///etc/passwd", None).is_err());
+        assert!(validate_target("data:text/html,<b>hi", None).is_err());
+        assert!(validate_target("", None).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_ssrf_from_public_page() {
+        // The exact payload from the finding.
+        let err = validate_target("http://127.0.0.1:8080/admin", Some("https://evil.example/"))
+            .unwrap_err();
+        assert!(err.contains("127.0.0.1"), "{err}");
+        assert!(
+            validate_target(
+                "http://169.254.169.254/latest/meta-data/",
+                Some("https://evil.example/")
+            )
+            .is_err()
+        );
+        // No initiator at all is treated as untrusted.
+        assert!(validate_target("http://192.168.1.1/", None).is_err());
+    }
+
+    #[test]
+    fn validate_allows_same_host_private_target() {
+        // View-source of a `buffr://` internal page: the page is already
+        // served from the loopback internal server.
+        assert!(
+            validate_target(
+                "http://127.0.0.1:41235/tok/new",
+                Some("http://127.0.0.1:41235/tok/new")
+            )
+            .is_ok()
+        );
+        // Different port on the same host is fine; different host is not.
+        assert!(validate_target("http://127.0.0.1:9/x", Some("http://127.0.0.1:41235/y")).is_ok());
+        assert!(validate_target("http://10.0.0.5/x", Some("http://127.0.0.1:41235/y")).is_err());
+    }
+
+    #[test]
+    fn validate_allows_ordinary_public_pages() {
+        assert!(
+            validate_target("https://example.com/page", Some("https://other.example/")).is_ok()
+        );
+        assert!(validate_target("http://example.com/page", None).is_ok());
+    }
+
+    // ── M14: bounded fetch pool ───────────────────────────────────────────
+
+    #[test]
+    fn fetch_permits_are_capped_and_released() {
+        let baseline = INFLIGHT_FETCHES.load(Ordering::Acquire);
+        let mut held = Vec::new();
+        while let Some(p) = FetchPermit::acquire() {
+            held.push(p);
+            assert!(
+                held.len() <= MAX_INFLIGHT_FETCHES,
+                "acquire() handed out more than the cap"
+            );
+        }
+        assert_eq!(held.len(), MAX_INFLIGHT_FETCHES - baseline);
+        assert!(FetchPermit::acquire().is_none(), "pool should be saturated");
+        drop(held);
+        assert_eq!(INFLIGHT_FETCHES.load(Ordering::Acquire), baseline);
+        assert!(
+            FetchPermit::acquire().is_some(),
+            "capacity must come back after the permits drop"
+        );
     }
 }

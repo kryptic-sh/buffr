@@ -36,8 +36,7 @@ use buffr_zoom::ZoomStore;
 
 use crate::audio::{AudioEventQueue, AudioStateSink, BuffrAudioHandler};
 use crate::permissions::{
-    PendingPermission, PermissionsQueue, capabilities_for_media_mask,
-    capabilities_for_request_mask, precheck,
+    PendingPermission, capabilities_for_media_mask, capabilities_for_request_mask, precheck,
 };
 use buffr_core::context_menu::{
     CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuRequest, ContextMenuSink, ContextMenuTarget,
@@ -73,9 +72,66 @@ type CefCursorArg = ::std::os::raw::c_ulong;
 type CefCursorArg = cef::sys::cef_cursor_handle_t;
 #[cfg(target_os = "macos")]
 type CefCursorArg = *mut u8;
-use crate::osr::{OsrFrame, OsrViewState, PopupFrameMap};
-use crate::{PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
+use crate::osr::{
+    OsrFrame, OsrViewState, PENDING_POPUP_ALLOC_CAP, PendingPopupAllocQueue, PopupFrameMap,
+};
+use crate::{PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
 use buffr_core::open_finder::{OsSpawn, open_path};
+
+// ── Console-message logging policy (L34) ────────────────────────────────────
+
+/// Env var that opts in to mirroring page `console.*` output into tracing.
+///
+/// Off by default: pages routinely log session tokens and API responses, and
+/// the previous unconditional `debug!` wrote all of it to disk under
+/// `RUST_LOG=debug` — including in private mode.
+pub const CONSOLE_LOG_ENV: &str = "BUFFR_LOG_CONSOLE";
+
+/// Byte budget for a non-sentinel console line before it is truncated.
+const CONSOLE_LOG_MAX_LEN: usize = 120;
+
+/// Sentinel prefixes emitted by buffr's own injected scripts. These are
+/// protocol, not user content, so they are logged in full.
+const CONSOLE_SENTINEL_PREFIXES: &[&str] =
+    &["__buffr_hint__:", "__buffr_edit__:", "__buffr_media__:"];
+
+/// `true` when [`CONSOLE_LOG_ENV`] is set to anything other than
+/// `""` / `0` / `false` / `off` / `no`.
+fn console_logging_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var(CONSOLE_LOG_ENV) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    })
+}
+
+/// Truncate a console line unless it is one of buffr's own sentinels.
+///
+/// Truncation is on a char boundary so page-controlled UTF-8 can never
+/// panic the slicing.
+fn redact_console_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if CONSOLE_SENTINEL_PREFIXES
+        .iter()
+        .any(|p| text.starts_with(p))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    if text.len() <= CONSOLE_LOG_MAX_LEN {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = CONSOLE_LOG_MAX_LEN;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}… <{} bytes truncated>",
+        &text[..end],
+        text.len() - end
+    ))
+}
 
 /// Build a CEF `Client` that returns our load + display + download
 /// handlers when CEF asks for them. This is the entry point
@@ -91,7 +147,6 @@ pub fn make_client(
     downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
     permissions: Arc<Permissions>,
-    permissions_queue: PermissionsQueue,
     neutral_permissions_queue: buffr_engine::PermissionsQueue,
     cef_callback_registry: crate::permissions::CefCallbackRegistry,
     find_sink: FindResultSink,
@@ -104,7 +159,7 @@ pub fn make_client(
     address_sink: crate::host::AddressSink,
     popup_title_sink: crate::host::AddressSink,
     popup_frames: PopupFrameMap,
-    pending_popup_alloc: PendingPopupAlloc,
+    pending_popup_alloc: PendingPopupAllocQueue,
     popup_create_sink: PopupCreateSink,
     popup_close_sink: PopupCloseSink,
     popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
@@ -123,7 +178,6 @@ pub fn make_client(
         downloads_config,
         zoom,
         permissions,
-        permissions_queue,
         neutral_permissions_queue,
         cef_callback_registry,
         find_sink,
@@ -151,88 +205,15 @@ pub fn make_client(
     )
 }
 
-/// Standalone factory for the load handler — exposed so future
-/// `BrowserHost` flavors (OSR, multi-tab) can build their own client
-/// while still funnelling visits into the same history store.
-pub fn make_load_handler(
-    history: Arc<History>,
-    zoom: Arc<ZoomStore>,
-    counters: Option<Arc<UsageCounters>>,
-    edit_sink: EditEventSink,
-    loading_busy: Arc<AtomicBool>,
-) -> LoadHandler {
-    BuffrLoadHandler::new(
-        history,
-        zoom,
-        counters,
-        Arc::new(Mutex::new(HashMap::new())),
-        edit_sink,
-        loading_busy,
-    )
-}
-
-/// Standalone factory for the display handler — same rationale as
-/// [`make_load_handler`].
-pub fn make_display_handler(
-    history: Arc<History>,
-    hint_sink: HintEventSink,
-    edit_sink: EditEventSink,
-    address_sink: crate::host::AddressSink,
-    popup_title_sink: crate::host::AddressSink,
-    cursor_state: SharedCursorState,
-    favicon_sink: FaviconSink,
-    favicon_enabled: FaviconEnabled,
-    video_active: Arc<AtomicBool>,
-) -> DisplayHandler {
-    BuffrDisplayHandler::new(
-        history,
-        hint_sink,
-        edit_sink,
-        address_sink,
-        popup_title_sink,
-        cursor_state,
-        favicon_sink,
-        favicon_enabled,
-        video_active,
-    )
-}
-
-/// Standalone factory for the download handler.
-pub fn make_download_handler(
-    downloads: Arc<Downloads>,
-    downloads_config: Arc<DownloadsConfig>,
-    counters: Option<Arc<UsageCounters>>,
-    notice_queue: DownloadNoticeQueue,
-) -> DownloadHandler {
-    BuffrDownloadHandler::new(downloads, downloads_config, counters, notice_queue)
-}
-
-/// Standalone factory for the find handler. Takes the same
-/// [`FindResultSink`] [`BrowserHost`] uses so callbacks land in one
-/// place.
-pub fn make_find_handler(sink: FindResultSink) -> FindHandler {
-    BuffrFindHandler::new(sink)
-}
-
-/// Standalone factory for the permission handler. Pre-checks the
-/// store synchronously; otherwise enqueues the request for the UI
-/// thread.
-///
-/// Phase 8a (#88): `neutral_queue` and `callback_registry` are the new
-/// dual-push targets; `queue` is kept for backward-compat shutdown drain.
-pub fn make_permission_handler(
-    permissions: Arc<Permissions>,
-    queue: PermissionsQueue,
-    neutral_queue: buffr_engine::PermissionsQueue,
-    callback_registry: crate::permissions::CefCallbackRegistry,
-) -> PermissionHandler {
-    BuffrPermissionHandler::new(permissions, queue, neutral_queue, callback_registry)
-}
+// L17: `make_load_handler` / `make_display_handler` /
+// `make_download_handler` / `make_find_handler` / `make_permission_handler`
+// were standalone factories with zero call sites — `BuffrClient` constructs
+// every handler inline in its `impl Client` block below. Deleted.
 
 wrap_life_span_handler! {
     pub struct BuffrLifeSpanHandler {
         popup_queue: PopupQueue,
-        pending_popup_alloc: PendingPopupAlloc,
+        pending_popup_alloc: PendingPopupAllocQueue,
         popup_frames: PopupFrameMap,
         popup_create_sink: PopupCreateSink,
         popup_close_sink: PopupCloseSink,
@@ -295,9 +276,21 @@ wrap_life_span_handler! {
             view.width.store(800, std::sync::atomic::Ordering::Relaxed);
             view.height.store(600, std::sync::atomic::Ordering::Relaxed);
 
-            // Stash for on_after_created to pick up.
-            if let Ok(mut slot) = self.pending_popup_alloc.lock() {
-                *slot = Some((frame, view, url_str));
+            // Stash for on_after_created to pick up. FIFO, not a single
+            // slot (M16): a page can fire `window.open()` twice in one task,
+            // so two `on_before_popup` calls land before the first
+            // `on_after_created`. A single slot would drop the first alloc
+            // and orphan the second popup — never registered, never closed
+            // at shutdown, leaked into `cef::shutdown()`.
+            if let Ok(mut queue) = self.pending_popup_alloc.lock() {
+                while queue.len() >= PENDING_POPUP_ALLOC_CAP {
+                    tracing::warn!(
+                        cap = PENDING_POPUP_ALLOC_CAP,
+                        "on_before_popup: pending-alloc queue full — evicting oldest"
+                    );
+                    queue.pop_front();
+                }
+                queue.push_back((frame, view, url_str));
             }
 
             // Configure the popup browser for OSR.
@@ -324,18 +317,29 @@ wrap_life_span_handler! {
             }
             let browser_id = cef::ImplBrowser::identifier(browser);
 
-            // Consume the pending alloc.
+            // Consume the OLDEST pending alloc (M16). CEF creates popups in
+            // the order `on_before_popup` was called and sequences both
+            // callbacks on the browser-process UI thread, and
+            // `on_after_created` carries no `popup_id` to key on, so
+            // front-of-queue is the matching allocation.
             let alloc = match self.pending_popup_alloc.lock() {
-                Ok(mut slot) => slot.take(),
+                Ok(mut queue) => queue.pop_front(),
                 Err(_) => None,
             };
             let (frame, view, url) = match alloc {
                 Some(a) => a,
                 None => {
+                    // Registering the browser anyway is what keeps
+                    // `close_all_browsers` able to see it — an unregistered
+                    // live browser is leaked into `cef::shutdown()`.
                     tracing::warn!(
                         browser_id,
-                        "on_after_created: no pending alloc for popup — skipping"
+                        "on_after_created: no pending alloc for popup — \
+                         registering without OSR routing so shutdown can close it"
                     );
+                    if let Ok(mut browsers) = self.popup_browsers.lock() {
+                        browsers.insert(browser_id, browser.clone());
+                    }
                     return;
                 }
             };
@@ -423,7 +427,6 @@ wrap_client! {
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
         permissions: Arc<Permissions>,
-        permissions_queue: PermissionsQueue,
         neutral_permissions_queue: buffr_engine::PermissionsQueue,
         cef_callback_registry: crate::permissions::CefCallbackRegistry,
         find_sink: FindResultSink,
@@ -436,7 +439,7 @@ wrap_client! {
         address_sink: crate::host::AddressSink,
         popup_title_sink: crate::host::AddressSink,
         popup_frames: PopupFrameMap,
-        pending_popup_alloc: PendingPopupAlloc,
+        pending_popup_alloc: PendingPopupAllocQueue,
         popup_create_sink: PopupCreateSink,
         popup_close_sink: PopupCloseSink,
         popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
@@ -508,7 +511,6 @@ wrap_client! {
         fn permission_handler(&self) -> Option<PermissionHandler> {
             Some(BuffrPermissionHandler::new(
                 self.permissions.clone(),
-                self.permissions_queue.clone(),
                 self.neutral_permissions_queue.clone(),
                 self.cef_callback_registry.clone(),
             ))
@@ -875,9 +877,21 @@ wrap_display_handler! {
                 for i in 0..count {
                     let mut value: cef::sys::cef_string_t = std::mem::zeroed();
                     if cef::sys::cef_string_list_value(raw, i, &mut value) == 0 {
+                        // M18: `cef_string_list_value` may have allocated
+                        // before failing; clear unconditionally.
+                        cef::sys::cef_string_utf16_clear(&mut value);
                         continue;
                     }
                     let s = CefStringUtf16::from(std::ptr::from_ref(&value)).to_string();
+                    // M18: `cef_string_list_value` calls `cef_string_set(…,
+                    // copy = true)` internally — it heap-allocates and
+                    // installs a dtor on `value`. The `CefStringUtf16` built
+                    // from `ptr::from_ref` lands in the `Borrowed` arm,
+                    // whose `Drop` frees nothing, so without this the
+                    // buffer leaks once per icon URL on every
+                    // `on_favicon_urlchange`. `.to_string()` above has
+                    // already copied the bytes out.
+                    cef::sys::cef_string_utf16_clear(&mut value);
                     if !s.is_empty() {
                         first = Some(s);
                         break;
@@ -948,9 +962,18 @@ wrap_display_handler! {
             let Some(message) = message else { return 0; };
             let text = message.to_string();
 
-            // Diagnostic: log every console message so we can see whether
-            // edit.js focus events reach on_console_message at all.
-            tracing::debug!(target: "buffr_core::console", %text, "on_console_message");
+            // Diagnostic console mirroring (L34).
+            //
+            // Pages routinely `console.log` session tokens, API responses
+            // and PII. Logging every line verbatim at `debug` wrote all of
+            // it to disk under `RUST_LOG=debug` — including in private
+            // mode. Gated behind an explicit opt-in env var now, and
+            // anything that is not one of our own `__buffr_*` sentinels is
+            // truncated to a short prefix.
+            if console_logging_enabled() {
+                let redacted = redact_console_text(&text);
+                tracing::debug!(target: "buffr_core::console", text = %redacted, "on_console_message");
+            }
 
             // ---- hint mode IPC ------------------------------------------
             // hint.js emits `__buffr_hint__:{...}` lines.
@@ -962,7 +985,7 @@ wrap_display_handler! {
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, line = %text, "hint: malformed console event");
+                        tracing::warn!(error = %err, line = %redact_console_text(&text), "hint: malformed console event");
                     }
                 }
             }
@@ -977,7 +1000,7 @@ wrap_display_handler! {
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, line = %text, "edit: malformed console event");
+                        tracing::warn!(error = %err, line = %redact_console_text(&text), "edit: malformed console event");
                     }
                 }
             }
@@ -999,7 +1022,7 @@ wrap_display_handler! {
                         );
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, line = %text, "media_probe: malformed sentinel");
+                        tracing::warn!(error = %err, line = %redact_console_text(&text), "media_probe: malformed sentinel");
                     }
                 }
             }
@@ -1301,7 +1324,6 @@ wrap_download_handler! {
 wrap_permission_handler! {
     pub struct BuffrPermissionHandler {
         permissions: Arc<Permissions>,
-        queue: PermissionsQueue,
         neutral_queue: buffr_engine::PermissionsQueue,
         callback_registry: crate::permissions::CefCallbackRegistry,
     }
@@ -1362,7 +1384,7 @@ wrap_permission_handler! {
             let pending = PendingPermission::MediaAccess {
                 origin,
                 capabilities: caps,
-                callback: callback.clone(),
+                callback: Some(callback.clone()),
                 requested_mask: requested_permissions,
             };
             let resolve_id = crate::permissions::next_resolve_id();
@@ -1420,7 +1442,7 @@ wrap_permission_handler! {
             let pending = PendingPermission::Prompt {
                 origin,
                 capabilities: caps,
-                callback: callback.clone(),
+                callback: Some(callback.clone()),
                 prompt_id,
             };
             let resolve_id = crate::permissions::next_resolve_id();
@@ -1457,7 +1479,12 @@ wrap_permission_handler! {
                             _ => None,
                         });
                     if let Some(ref id) = found_id {
-                        reg.remove(id);
+                        // CEF has already retired this callback; firing it
+                        // again from `Drop for PendingPermission` would be a
+                        // double-invoke. Disarm before the entry is dropped.
+                        if let Some(mut p) = reg.remove(id) {
+                            p.disarm();
+                        }
                     }
                     found_id
                 }

@@ -23,8 +23,8 @@ use buffr_engine::{Backend, BackendOpenOptions, BrowserEngine, NewTabHtmlProvide
 
 use crate::{
     BrowserHost, BuffrApp, PermissionsQueue, cef_initialize, cef_shutdown, delete_all_cookies,
-    do_message_loop_work, execute_process_for_subprocess, load_cef_library,
-    register_buffr_src_handler_factory, set_device_scale_factor, set_force_renderer_accessibility,
+    do_message_loop_work, execute_subprocess, load_cef_library, register_buffr_src_handler_factory,
+    set_device_scale_factor, set_force_renderer_accessibility,
     take_scheduled_message_pump_delay_ms,
 };
 
@@ -40,6 +40,10 @@ pub struct CefEngineSinks {
     pub downloads_config: Arc<DownloadsConfig>,
     pub zoom: Arc<ZoomStore>,
     pub permissions: Arc<Permissions>,
+    /// **Dead** (L16). The legacy CEF permissions queue is never populated
+    /// and `BrowserHost` no longer takes it. Retained only so
+    /// `apps/buffr-app` keeps compiling; drop this field together with the
+    /// shim block in `permissions.rs` once that struct literal is updated.
     pub permissions_queue: PermissionsQueue,
     pub notice_queue: DownloadNoticeQueue,
     pub find_sink: FindResultSink,
@@ -90,7 +94,7 @@ impl Backend for CefBackend {
     /// Dispatch subprocess (renderer/GPU/utility) and return its exit
     /// code, or -1 for the browser process.
     fn execute_subprocess(&self) -> i32 {
-        execute_process_for_subprocess()
+        execute_subprocess()
     }
 
     /// Initialize CEF. Internally constructs a [`BuffrApp`] instance
@@ -159,7 +163,6 @@ impl Backend for CefBackend {
             sinks.downloads_config,
             sinks.zoom,
             sinks.permissions,
-            sinks.permissions_queue,
             sinks.notice_queue,
             sinks.find_sink,
             sinks.hint_sink,

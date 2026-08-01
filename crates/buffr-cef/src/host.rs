@@ -42,13 +42,12 @@ use crate::audio::{
 };
 use crate::handlers;
 use crate::osr::{
-    OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrViewState,
-    make_osr_paint_handler,
+    OsrFrame, OsrViewState, PendingPopupAllocQueue, PopupFrameMap, SharedOsrFrame,
+    SharedOsrViewState, make_osr_paint_handler, new_pending_popup_alloc_queue,
 };
-use crate::permissions::PermissionsQueue;
 use crate::{
-    PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupQueue, new_pending_popup_alloc,
-    new_popup_close_sink, new_popup_create_sink, new_popup_queue,
+    PopupCloseSink, PopupCreateSink, PopupQueue, new_popup_close_sink, new_popup_create_sink,
+    new_popup_queue,
 };
 use buffr_core::CoreError;
 use buffr_core::context_menu::{ContextMenuRequest, ContextMenuSink, new_context_menu_sink};
@@ -59,7 +58,7 @@ use buffr_core::favicon::favicon_is_enabled;
 use buffr_core::favicon::{FaviconEnabled, FaviconSink, new_favicon_enabled, new_favicon_sink};
 use buffr_core::find::FindResultSink;
 use buffr_core::hint::{
-    DEFAULT_HINT_SELECTORS, Hint, HintAlphabet, HintEventSink, HintSession, build_inject_script,
+    DEFAULT_HINT_SELECTORS, HintAlphabet, HintEventSink, HintSession, build_inject_script,
 };
 use buffr_core::telemetry::{KEY_TABS_OPENED, UsageCounters};
 use buffr_engine::{HintAction, HintStatus};
@@ -202,7 +201,6 @@ pub struct BrowserHost {
     downloads_config: Arc<DownloadsConfig>,
     zoom: Arc<ZoomStore>,
     permissions: Arc<Permissions>,
-    permissions_queue: PermissionsQueue,
     /// Download notification queue — shared between the CEF IO thread
     /// (which pushes notices) and the UI render loop (which drains and
     /// paints them). `DownloadHandler` pushes into this; `AppState`
@@ -273,7 +271,7 @@ pub struct BrowserHost {
     /// known, then consumed by `on_after_created` once CEF assigns an id.
     /// Assumption: `on_before_popup` and the matching `on_after_created`
     /// are sequenced on the same CEF UI thread without interleaving.
-    pending_popup_alloc: PendingPopupAlloc,
+    pending_popup_alloc: PendingPopupAllocQueue,
     /// Events emitted when a popup browser is fully created. The apps
     /// layer drains these each tick and spawns a winit window per entry.
     popup_create_sink: PopupCreateSink,
@@ -360,6 +358,15 @@ pub struct BrowserHost {
 struct ClosedTab {
     tab: Tab,
     index: usize,
+    /// The tab's `display_urls` override at close time, if it had one.
+    ///
+    /// M19: `close_index` used to call `forget_display_url` unconditionally
+    /// even though the stashable branch keeps the `Tab` alive on this stack.
+    /// After `reopen_closed_tab` the override was gone, so the omnibar — and
+    /// the session file — showed the raw loopback `InternalServer` URL
+    /// *including its auth token* for what the user knows as `buffr://new`.
+    /// Carrying it here lets reopen restore the friendly form.
+    display_url: Option<String>,
 }
 
 // Each stashed entry keeps a live CEF browser hidden in memory so
@@ -415,7 +422,6 @@ impl BrowserHost {
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
         permissions: Arc<Permissions>,
-        permissions_queue: PermissionsQueue,
         notice_queue: DownloadNoticeQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
@@ -430,7 +436,6 @@ impl BrowserHost {
             downloads_config,
             zoom,
             permissions,
-            permissions_queue,
             notice_queue,
             find_sink,
             hint_sink,
@@ -457,7 +462,6 @@ impl BrowserHost {
         downloads_config: Arc<DownloadsConfig>,
         zoom: Arc<ZoomStore>,
         permissions: Arc<Permissions>,
-        permissions_queue: PermissionsQueue,
         notice_queue: DownloadNoticeQueue,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
@@ -498,7 +502,7 @@ impl BrowserHost {
         let popup_frames: PopupFrameMap = Arc::new(Mutex::new(HashMap::new()));
         let popup_create_sink = new_popup_create_sink();
         let popup_close_sink = new_popup_close_sink();
-        let pending_popup_alloc = new_pending_popup_alloc();
+        let pending_popup_alloc = new_pending_popup_alloc_queue();
         let host = Self {
             tabs: Mutex::new(Vec::new()),
             active: Mutex::new(None),
@@ -510,7 +514,6 @@ impl BrowserHost {
             downloads_config,
             zoom,
             permissions,
-            permissions_queue,
             notice_queue,
             find_sink,
             hint_sink,
@@ -602,12 +605,6 @@ impl BrowserHost {
     /// prompt.
     pub fn permissions(&self) -> &Arc<Permissions> {
         &self.permissions
-    }
-
-    /// Borrow the shared permissions queue. The UI thread drains this
-    /// each tick.
-    pub fn permissions_queue(&self) -> &PermissionsQueue {
-        &self.permissions_queue
     }
 
     /// Clone the popup URL queue. The main loop drains it each tick
@@ -708,18 +705,8 @@ impl BrowserHost {
     /// CEF's "default" baseline. Each integer step is roughly a 20%
     /// change (1.0 ≈ 120%, -1.0 ≈ 83%).
     pub fn active_zoom_level(&self) -> f64 {
-        let Ok(tabs) = self.tabs.lock() else {
-            return 0.0;
-        };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
-            host.zoom_level()
-        } else {
-            0.0
-        }
+        self.with_active_host(|host| host.zoom_level())
+            .unwrap_or(0.0)
     }
 
     /// Clone the shared OSR frame buffer handle.
@@ -794,44 +781,28 @@ impl BrowserHost {
             view.height.store(height, Ordering::Relaxed);
         }
         // Poke CEF so it schedules a repaint at the new size.
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
+        self.with_popup_host(browser_id, |host| {
             host.was_resized();
             host.invalidate(cef::PaintElementType::VIEW);
-        }
+        });
         tracing::debug!(browser_id, width, height, "popup_resize");
     }
 
     /// Navigate the popup browser back in its own history.
     pub fn popup_history_back(&self, browser_id: i32) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-        {
-            b.go_back();
-        }
+        self.with_popup_browser(browser_id, |b| b.go_back());
     }
 
     /// Navigate the popup browser forward in its own history.
     pub fn popup_history_forward(&self, browser_id: i32) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-        {
-            b.go_forward();
-        }
+        self.with_popup_browser(browser_id, |b| b.go_forward());
     }
 
     /// Request CEF to close a popup browser. The actual teardown is
     /// asynchronous — `on_before_close` → handler deregisters →
     /// `PopupCloseSink` is the cleanup path.
     pub fn popup_close(&self, browser_id: i32) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
-            host.close_browser(0);
-        }
+        self.with_popup_host(browser_id, |host| host.close_browser(0));
         tracing::debug!(browser_id, "popup_close requested");
     }
 
@@ -846,13 +817,10 @@ impl BrowserHost {
 
     /// Forward a mouse-move to a popup browser.
     pub fn popup_osr_mouse_move(&self, browser_id: i32, x: i32, y: i32, modifiers: u32) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
+        self.with_popup_host(browser_id, |host| {
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_move_event(Some(&event), 0);
-        }
+        });
     }
 
     /// Forward a mouse-click to a popup browser.
@@ -867,14 +835,11 @@ impl BrowserHost {
         click_count: i32,
         modifiers: u32,
     ) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
+        self.with_popup_host(browser_id, |host| {
             let cef_button = crate::convert::neutral_to_cef_button(button);
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_click_event(Some(&event), cef_button, mouse_up as i32, click_count);
-        }
+        });
     }
 
     /// Forward a mouse-wheel event to a popup browser.
@@ -887,34 +852,25 @@ impl BrowserHost {
         delta_y: i32,
         modifiers: u32,
     ) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
+        self.with_popup_host(browser_id, |host| {
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_wheel_event(Some(&event), delta_x, delta_y);
-        }
+        });
     }
 
     /// Forward a keyboard event to a popup browser.
     pub fn popup_osr_key_event(&self, browser_id: i32, event: buffr_engine::NeutralKeyEvent) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
+        self.with_popup_host(browser_id, |host| {
             let cef_ev = crate::convert::neutral_to_cef_key(event);
             host.send_key_event(Some(&cef_ev));
-        }
+        });
     }
 
     /// Set focus on a popup browser.
     pub fn popup_osr_focus(&self, browser_id: i32, focused: bool) {
-        if let Ok(browsers) = self.popup_browsers.lock()
-            && let Some(b) = browsers.get(&browser_id)
-            && let Some(host) = b.host()
-        {
+        self.with_popup_host(browser_id, |host| {
             host.set_focus(if focused { 1 } else { 0 });
-        }
+        });
     }
 
     // ---- OSR input forwarding -------------------------------------------
@@ -923,15 +879,10 @@ impl BrowserHost {
     ///
     /// No-op when the host is in `Windowed` mode (native child window routes input).
     pub fn osr_mouse_move(&self, x: i32, y: i32, modifiers: u32) {
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        self.with_active_host(|host| {
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_move_event(Some(&event), 0);
-        }
+        });
     }
 
     /// Forward a mouse-click to the active tab's browser host.
@@ -952,15 +903,11 @@ impl BrowserHost {
             x, y, ?cef_button, mouse_up, click_count, modifiers,
             "osr_mouse_click"
         );
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        let sent = self.with_active_host(|host| {
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_click_event(Some(&event), cef_button, mouse_up as i32, click_count);
-        } else {
+        });
+        if sent.is_none() {
             warn!(target: "buffr_core::host", "osr_mouse_click: no active browser host — click dropped");
         }
     }
@@ -969,19 +916,14 @@ impl BrowserHost {
     ///
     /// No-op when the host is in `Windowed` mode.
     pub fn osr_mouse_leave(&self, modifiers: u32) {
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        self.with_active_host(|host| {
             let event = cef::MouseEvent {
                 x: 0,
                 y: 0,
                 modifiers,
             };
             host.send_mouse_move_event(Some(&event), 1);
-        }
+        });
     }
 
     /// Notify CEF that the screen / monitor info has changed (e.g. the window
@@ -1037,6 +979,16 @@ impl BrowserHost {
     /// `cef::do_message_loop_work()` afterwards until OnBeforeClose
     /// fires for each browser.
     pub fn close_all_browsers(&self) {
+        // Retire any permission requests still awaiting a UI decision while
+        // CEF's threads are still running. Without this the registry `Arc`
+        // is only released when the last CEF-held client ref drops, which
+        // happens somewhere inside `cef::shutdown()` — far too late to be
+        // invoking C++ callbacks (L16 wiring for
+        // `drain_registry_with_defer`).
+        crate::permissions::drain_registry_with_defer(
+            &self.cef_callback_registry,
+            &self.permissions,
+        );
         let tabs = match self.tabs.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -1081,15 +1033,10 @@ impl BrowserHost {
     ///
     /// No-op when the host is in `Windowed` mode.
     pub fn osr_mouse_wheel(&self, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        self.with_active_host(|host| {
             let event = cef::MouseEvent { x, y, modifiers };
             host.send_mouse_wheel_event(Some(&event), delta_x, delta_y);
-        }
+        });
     }
 
     /// Forward a keyboard event to the active tab's browser host.
@@ -1097,28 +1044,14 @@ impl BrowserHost {
     /// No-op when the host is in `Windowed` mode.
     pub fn osr_key_event(&self, event: buffr_engine::NeutralKeyEvent) {
         let cef_ev = crate::convert::neutral_to_cef_key(event);
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
-            host.send_key_event(Some(&cef_ev));
-        }
+        self.with_active_host(|host| host.send_key_event(Some(&cef_ev)));
     }
 
     /// Notify CEF of focus changes.
     ///
     /// No-op when the host is in `Windowed` mode.
     pub fn osr_focus(&self, focused: bool) {
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
-            host.set_focus(if focused { 1 } else { 0 });
-        }
+        self.with_active_host(|host| host.set_focus(if focused { 1 } else { 0 }));
     }
 
     /// Notify CEF that the viewport has been resized.
@@ -1146,15 +1079,7 @@ impl BrowserHost {
     }
 
     fn notify_was_resized(&self, width: u32, height: u32) {
-        let Ok(tabs) = self.tabs.lock() else {
-            tracing::debug!(width, height, "notify_was_resized: tabs mutex poisoned");
-            return;
-        };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        let notified = self.with_active_host_idx(|host, idx| {
             tracing::debug!(
                 width,
                 height,
@@ -1163,14 +1088,9 @@ impl BrowserHost {
             );
             host.was_resized();
             host.invalidate(cef::PaintElementType::VIEW);
-        } else {
-            tracing::debug!(
-                width,
-                height,
-                ?active_idx,
-                tab_count = tabs.len(),
-                "notify_was_resized: no active browser host",
-            );
+        });
+        if notified.is_none() {
+            tracing::debug!(width, height, "notify_was_resized: no active browser host",);
         }
     }
 
@@ -1206,6 +1126,13 @@ impl BrowserHost {
             return Ok(None);
         };
         let id = entry.tab.id;
+        // Restore the display-URL override before the tab becomes visible,
+        // so the first `summarize` / `active_tab_live_url` after reopen
+        // already reports `buffr://new` rather than the tokenised loopback
+        // URL `pump_address_changes` wrote into `Tab::url` (M19).
+        if let Some(display_url) = entry.display_url.as_deref() {
+            self.record_display_url(id, display_url);
+        }
         // Insert the live Tab back into the strip at its original
         // index (clamped). Doing the insert before un-hiding ensures
         // tab_count / set_active_index see the right slot.
@@ -1357,7 +1284,6 @@ impl BrowserHost {
             self.downloads_config.clone(),
             self.zoom.clone(),
             self.permissions.clone(),
-            self.permissions_queue.clone(),
             self.neutral_permissions_queue.clone(),
             self.cef_callback_registry.clone(),
             self.find_sink.clone(),
@@ -1410,22 +1336,28 @@ impl BrowserHost {
             session: TabSession::default(),
         };
 
-        let mut tabs = self
-            .tabs
-            .lock()
-            .map_err(|_| CoreError::CreateBrowserFailed)?;
-        tabs.push(tab);
-        let new_idx = tabs.len() - 1;
-        drop(tabs);
-
-        if background {
-            // Hide the new browser; keep the existing active one.
-            if let Ok(tabs) = self.tabs.lock()
-                && let Some(host) = tabs[new_idx].browser.host()
-            {
-                host.was_hidden(1);
+        let new_idx = {
+            let mut tabs = self
+                .tabs
+                .lock()
+                .map_err(|_| CoreError::CreateBrowserFailed)?;
+            tabs.push(tab);
+            let new_idx = tabs.len() - 1;
+            if background {
+                // M47: hide the new browser inside the SAME guard that
+                // pushed it. The old code dropped the guard, re-locked, and
+                // did a bare `tabs[new_idx]` — if another holder of the
+                // `Arc<dyn BrowserEngine>` closed a tab in that window the
+                // index panics, and with `panic = "unwind"` and no
+                // `catch_unwind` in cef-rs the process aborts at the
+                // `extern "C"` boundary.
+                if let Some(host) = tabs[new_idx].browser.host() {
+                    host.was_hidden(1);
+                }
             }
-        } else {
+            new_idx
+        };
+        if !background {
             self.set_active_index(new_idx);
         }
         info!(target: "buffr_core::host", %id, background, "tab opened");
@@ -1444,11 +1376,14 @@ impl BrowserHost {
     }
 
     fn set_active_index(&self, new_idx: usize) {
-        let mut active = match self.active.lock() {
+        // Lock order: `tabs` BEFORE `active` (M15). This used to be
+        // reversed, which deadlocked against every other path the moment a
+        // second thread touched the engine.
+        let tabs = match self.tabs.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        let tabs = match self.tabs.lock() {
+        let mut active = match self.active.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
@@ -1539,21 +1474,13 @@ impl BrowserHost {
     /// renderer-side timers. The window is sub-millisecond in practice,
     /// so observable side effects are negligible.
     pub fn force_repaint_active(&self) {
-        let Ok(tabs) = self.tabs.lock() else {
-            tracing::debug!("force_repaint_active: tabs mutex poisoned");
-            return;
-        };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        self.with_active_host_idx(|host, idx| {
             tracing::debug!(idx, "force_repaint_active: was_hidden cycle");
             host.was_hidden(1);
             host.was_hidden(0);
             host.was_resized();
             host.invalidate(cef::PaintElementType::VIEW);
-        }
+        });
     }
 
     // ── OSR sleep / wake helpers ─────────────────────────────────────────────
@@ -1571,12 +1498,7 @@ impl BrowserHost {
     /// skip the wgpu `surface.acquire_texture` call in the apps layer.  That
     /// fallback is not implemented here; the simpler path is tried first.
     pub fn osr_sleep(&self, sleep: bool) {
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        self.with_active_host_idx(|host, idx| {
             host.was_hidden(if sleep { 1 } else { 0 });
             tracing::debug!(
                 target: "buffr_core::host",
@@ -1584,7 +1506,7 @@ impl BrowserHost {
                 idx,
                 "osr_sleep"
             );
-        }
+        });
     }
 
     /// Wake helper: nudge CEF to deliver a fresh paint after waking from
@@ -1592,12 +1514,7 @@ impl BrowserHost {
     /// tab — same sequence as [`Self::set_active_index`] uses for the
     /// newly-activated browser so CEF deduplications are bypassed.
     pub fn osr_invalidate_view(&self) {
-        let Ok(tabs) = self.tabs.lock() else { return };
-        let active_idx = self.active.lock().ok().and_then(|g| *g);
-        if let Some(idx) = active_idx
-            && let Some(t) = tabs.get(idx)
-            && let Some(host) = t.browser.host()
-        {
+        self.with_active_host_idx(|host, idx| {
             host.was_resized();
             host.invalidate(cef::PaintElementType::VIEW);
             tracing::debug!(
@@ -1605,7 +1522,7 @@ impl BrowserHost {
                 idx,
                 "osr_invalidate_view"
             );
-        }
+        });
     }
 
     // ── Audio-state accessors (for OSR sleep policy) ──────────────────────────
@@ -1718,8 +1635,11 @@ impl BrowserHost {
             tabs.remove(idx)
         };
 
-        // Clean up display-URL override for the removed tab.
-        self.forget_display_url(removed.id);
+        // Snapshot the display-URL override before deciding what to do
+        // with the tab. It is only *forgotten* on the paths that genuinely
+        // retire the tab — a stashed tab keeps it so reopen can restore it
+        // (M19).
+        let display_url = self.display_url_for(removed.id);
 
         // Decide whether this tab is worth stashing on the closed-tabs
         // undo stack: blank pages aren't (re-opening them is the same
@@ -1739,6 +1659,7 @@ impl BrowserHost {
                 stack.push(ClosedTab {
                     tab: removed,
                     index: idx,
+                    display_url,
                 });
                 let extra = stack.len().saturating_sub(CLOSED_STACK_CAP);
                 if extra > 0 {
@@ -1749,14 +1670,17 @@ impl BrowserHost {
             } else {
                 Vec::new()
             };
-            // Tear down any stack-evicted browsers outside the lock.
+            // Tear down any stack-evicted browsers outside the lock. These
+            // are gone for good, so their overrides go too (M19).
             for t in evicted {
+                self.forget_display_url(t.id);
                 if let Some(host) = t.browser.host() {
                     host.close_browser(1);
                 }
             }
         } else {
-            // Not stashable — close immediately.
+            // Not stashable — close immediately and drop the override.
+            self.forget_display_url(removed.id);
             if let Some(host) = removed.browser.host() {
                 host.close_browser(1);
             }
@@ -1841,20 +1765,19 @@ impl BrowserHost {
     /// Repositions the tab so pinned tabs always occupy the leading
     /// slots in the strip.
     pub fn toggle_pin_active(&self) {
-        let id = match self.active.lock().ok().and_then(|g| *g) {
-            Some(idx) => match self.tabs.lock() {
-                Ok(mut tabs) => match tabs.get_mut(idx) {
-                    Some(t) => {
-                        t.pinned = !t.pinned;
-                        t.id
-                    }
-                    None => return,
-                },
-                Err(_) => return,
-            },
-            None => return,
-        };
-        let _ = id;
+        {
+            // Lock order: `tabs` BEFORE `active` (M15).
+            let Ok(mut tabs) = self.tabs.lock() else {
+                return;
+            };
+            let Some(idx) = self.active.lock().ok().and_then(|g| *g) else {
+                return;
+            };
+            let Some(t) = tabs.get_mut(idx) else {
+                return;
+            };
+            t.pinned = !t.pinned;
+        }
         self.enforce_pinned_ordering();
     }
 
@@ -1875,11 +1798,12 @@ impl BrowserHost {
     /// re-resolved against the same `TabId` so the user's focus
     /// follows its tab through the rearrangement.
     fn enforce_pinned_ordering(&self) {
+        // Lock order: `tabs` BEFORE `active` (M15).
         let active_id = {
-            let Ok(active) = self.active.lock() else {
+            let Ok(tabs) = self.tabs.lock() else {
                 return;
             };
-            let Ok(tabs) = self.tabs.lock() else {
+            let Ok(active) = self.active.lock() else {
                 return;
             };
             (*active).and_then(|i| tabs.get(i).map(|t| t.id))
@@ -1898,21 +1822,9 @@ impl BrowserHost {
         }
     }
 
-    /// Update the URL field on the tab whose `Browser::identifier`
-    /// matches `cef_id`. Used by the load handler to keep the chrome
-    /// in sync. Returns the [`TabId`] of the affected tab, if any.
-    pub fn record_url(&self, cef_id: i32, url: &str) -> Option<TabId> {
-        let mut tabs = self.tabs.lock().ok()?;
-        for t in tabs.iter_mut() {
-            if t.browser.identifier() == cef_id {
-                if let Some(new_url) = merge_navigation_url(&t.url, url) {
-                    t.url = new_url;
-                }
-                return Some(t.id);
-            }
-        }
-        None
-    }
+    // L17: `record_url` had no callers — `pump_address_changes` is the live
+    // path that folds CEF's `on_address_change` events into `Tab::url`
+    // (and it is what actually calls `merge_navigation_url`). Deleted.
 
     /// Reflow every tab's CEF child window after the host winit window
     /// resized. Caller passes the *child* rect (the page area, not
@@ -1965,13 +1877,84 @@ impl BrowserHost {
         .ok_or(CoreError::CreateBrowserFailed)?
     }
 
+    // ── Tab-strip lock discipline ────────────────────────────────────────
+    //
+    // LOCK ORDER INVARIANT (M15): whenever both `self.tabs` and
+    // `self.active` are held at the same time, `tabs` MUST be acquired
+    // FIRST. `BrowserHost` is handed to the apps layer as
+    // `Arc<dyn BrowserEngine>` (`Send + Sync`), so the moment a second
+    // thread calls any engine method, a path that takes `active → tabs`
+    // deadlocks against a path that takes `tabs → active`, and the UI is
+    // wedged permanently with no recovery.
+    //
+    // `set_active_index`, `enforce_pinned_ordering` and `toggle_pin_active`
+    // used to take them the other way round. Everything now funnels through
+    // the helpers below (or states the order explicitly), so the ordering
+    // lives in one place instead of being re-derived at 19 call sites (L1).
+
     /// Borrow the active tab mutably under the manager mutex.
     /// Returns `None` only when there is no active tab.
+    ///
+    /// Takes `tabs` then `active` — see the lock-order invariant above.
     fn with_active<R>(&self, f: impl FnOnce(&mut Tab) -> R) -> Option<R> {
         let mut tabs = self.tabs.lock().ok()?;
         let idx = (*self.active.lock().ok()?)?;
         let t = tabs.get_mut(idx)?;
         Some(f(t))
+    }
+
+    /// Run `f` against the active tab's `cef::BrowserHost`.
+    ///
+    /// Returns `None` — and does not call `f` — when either mutex is
+    /// poisoned, there is no active tab, the index is stale, or CEF has
+    /// already torn the browser host down.
+    ///
+    /// This is the single place the `lock tabs → read active → get host`
+    /// prologue lives (L1). Both mutexes are held for the duration of `f`,
+    /// which is exactly what the open-coded copies did; keep `f` to CEF
+    /// calls and cheap logging, and never re-enter `BrowserHost` from it.
+    fn with_active_host<R>(&self, f: impl FnOnce(cef::BrowserHost) -> R) -> Option<R> {
+        let tabs = self.tabs.lock().ok()?;
+        let idx = (*self.active.lock().ok()?)?;
+        let host = tabs.get(idx)?.browser.host()?;
+        Some(f(host))
+    }
+
+    /// Like [`Self::with_active_host`] but also hands `f` the active index —
+    /// only used by call sites that log it.
+    fn with_active_host_idx<R>(&self, f: impl FnOnce(cef::BrowserHost, usize) -> R) -> Option<R> {
+        let tabs = self.tabs.lock().ok()?;
+        let idx = (*self.active.lock().ok()?)?;
+        let host = tabs.get(idx)?.browser.host()?;
+        Some(f(host, idx))
+    }
+
+    /// Run `f` against a popup browser's `cef::BrowserHost`.
+    ///
+    /// The popup equivalent of [`Self::with_active_host`] — popups live in
+    /// `popup_browsers`, keyed by CEF `browser.identifier()`, and are not
+    /// part of the tab strip, so this touches neither `tabs` nor `active`.
+    fn with_popup_host<R>(
+        &self,
+        browser_id: i32,
+        f: impl FnOnce(cef::BrowserHost) -> R,
+    ) -> Option<R> {
+        let browsers = self.popup_browsers.lock().ok()?;
+        let host = browsers.get(&browser_id)?.host()?;
+        Some(f(host))
+    }
+
+    /// Run `f` against a popup `cef::Browser` itself (not its host) — for
+    /// the navigation calls that live on `Browser` rather than
+    /// `BrowserHost`.
+    fn with_popup_browser<R>(
+        &self,
+        browser_id: i32,
+        f: impl FnOnce(&cef::Browser) -> R,
+    ) -> Option<R> {
+        let browsers = self.popup_browsers.lock().ok()?;
+        let b = browsers.get(&browser_id)?;
+        Some(f(b))
     }
 
     /// Begin a fresh find session on the active tab.
@@ -2383,37 +2366,40 @@ impl BrowserHost {
         });
     }
 
-    /// Push a new value into the focused field via `__buffrEditApply`.
-    pub fn run_edit_apply(&self, field_id: &str, value: &str) {
-        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
-        let escaped_value = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    /// Call an `edit.js` entry point on the active tab's main frame.
+    ///
+    /// L3: `run_edit_apply` / `run_edit_attach` / `run_edit_focus` /
+    /// `run_edit_detach` were four copies of the same
+    /// `serde_json::to_string(..).unwrap_or_else(..)` + `format!` against
+    /// `"buffr://edit"`. `args` are raw JS expressions — pass them through
+    /// [`js_arg`] so page-supplied field ids can't break out of the call.
+    fn call_edit_fn(&self, name: &str, args: &[String], prelude: &str) {
+        let joined = args.join(", ");
         self.run_main_frame_js(
-            &format!("if (window.__buffrEditApply) window.__buffrEditApply({escaped_id}, {escaped_value})"),
+            &format!("{prelude}if (window.{name}) window.{name}({joined})"),
             "buffr://edit",
         );
+    }
+
+    /// Push a new value into the focused field via `__buffrEditApply`.
+    pub fn run_edit_apply(&self, field_id: &str, value: &str) {
+        self.call_edit_fn("__buffrEditApply", &[js_arg(field_id), js_arg(value)], "");
     }
 
     /// Add the edit-active CSS class to the field via `__buffrEditAttach`.
     pub fn run_edit_attach(&self, field_id: &str) {
-        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
-        self.run_main_frame_js(
-            &format!("if (window.__buffrEditAttach) window.__buffrEditAttach({escaped_id})"),
-            "buffr://edit",
-        );
+        self.call_edit_fn("__buffrEditAttach", &[js_arg(field_id)], "");
     }
 
     /// Re-focus a field by its buffr-assigned ID via `__buffrEditFocus`.
     pub fn run_edit_focus(&self, field_id: &str) {
-        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
         // Mark user gesture so edit.js's focusin gate doesn't blur the
         // re-focus call. This is invoked from `i` / FocusFirstInput
         // when last_focused_field is set — both are deliberate.
-        self.run_main_frame_js(
-            &format!(
-                "window.__buffrUserGesture = true; \
-                 if (window.__buffrEditFocus) window.__buffrEditFocus({escaped_id})"
-            ),
-            "buffr://edit",
+        self.call_edit_fn(
+            "__buffrEditFocus",
+            &[js_arg(field_id)],
+            "window.__buffrUserGesture = true; ",
         );
     }
 
@@ -2493,19 +2479,12 @@ impl BrowserHost {
 
     pub fn run_edit_cycle(&self, forward: bool) {
         let arg = if forward { "true" } else { "false" };
-        self.run_main_frame_js(
-            &format!("if (window.__buffrCycleInput) window.__buffrCycleInput({arg})"),
-            "buffr://edit",
-        );
+        self.call_edit_fn("__buffrCycleInput", &[arg.to_string()], "");
     }
 
     /// Remove the edit-active CSS class from the field via `__buffrEditDetach`.
     pub fn run_edit_detach(&self, field_id: &str) {
-        let escaped_id = serde_json::to_string(field_id).unwrap_or_else(|_| "\"\"".to_string());
-        self.run_main_frame_js(
-            &format!("if (window.__buffrEditDetach) window.__buffrEditDetach({escaped_id})"),
-            "buffr://edit",
-        );
+        self.call_edit_fn("__buffrEditDetach", &[js_arg(field_id)], "");
     }
 
     pub fn run_js(&self, code: &str) {
@@ -2655,22 +2634,14 @@ impl BrowserHost {
 
     /// Update the active browser's IME preedit string.
     ///
-    /// `cursor` is `(start, end)` as byte offsets within `text` for CEF's
-    /// `selection_range`.  `None` collapses the selection to the end of `text`.
+    /// `cursor` is `(start, end)` as **byte** offsets within `text`; `None`
+    /// collapses the selection to the end of `text`. Both are converted to
+    /// UTF-16 code units before they reach CEF — see
+    /// [`utf16_selection_range`].
     pub fn ime_set_composition(&self, text: &str, cursor: Option<(usize, usize)>) {
-        self.with_active(|t| {
-            let Some(host) = t.browser.host() else {
-                warn!("ime_set_composition: browser.host() returned None");
-                return;
-            };
+        let (sel_from, sel_to) = utf16_selection_range(text, cursor);
+        self.with_active_host(|host| {
             let cef_text = cef::CefString::from(text);
-            let (sel_from, sel_to) =
-                cursor
-                    .map(|(s, e)| (s as u32, e as u32))
-                    .unwrap_or_else(|| {
-                        let end = text.len() as u32;
-                        (end, end)
-                    });
             let selection_range = cef::Range {
                 from: sel_from,
                 to: sel_to,
@@ -2707,7 +2678,7 @@ impl BrowserHost {
     /// The poll script (see [`buffr_core::scripts::MEDIA_PROBE_POLL_JS`]) reads all
     /// five signal sources and writes a boolean result to
     /// `window.__buffr_media_active`.  A follow-up JS snippet can read it
-    /// back on the next tick via [`Self::read_media_probe_result`].
+    /// back on the next tick by a follow-up snippet.
     ///
     /// The patched-constructor signals (signals 3–5) only work after the init
     /// script ([`buffr_core::scripts::MEDIA_PROBE_INIT_JS`]) has been injected at
@@ -2726,23 +2697,10 @@ impl BrowserHost {
         self.run_js(buffr_core::scripts::MEDIA_PROBE_POLL_JS);
     }
 
-    /// Read the result written by the last [`Self::run_media_probe`] call.
-    ///
-    /// Executes a tiny inline JS snippet that reads `window.__buffr_media_active`
-    /// (a boolean written by the probe) and pushes the result via the audio
-    /// event queue as a synthetic entry so the UI thread can consume it with
-    /// the same `drain_audio_events` path.
-    ///
-    /// Currently not implemented: cef-rs `execute_java_script` has no
-    /// synchronous return-value mechanism and the async visitor path would
-    /// require a custom scheme.  Phase-1 relies solely on the CEF
-    /// `AudioHandler` for media detection; this method is a placeholder.
-    /// See `MEDIA_PROBE_JS` doc comment for the rationale.
-    pub fn read_media_probe_result(&self) {
-        // Phase-1: no-op. Detection relies on BuffrAudioHandler alone.
-        // Phase-2 can implement a custom-scheme IPC to read
-        // window.__buffr_media_active from the JS side.
-    }
+    // L17: `read_media_probe_result` was a documented no-op with no
+    // callers. Media detection runs entirely through `BuffrAudioHandler`
+    // plus the `__buffr_media__:` console sentinel scraped in
+    // `BuffrDisplayHandler::on_console_message`. Deleted.
 
     fn scroll_by(&self, dx: i64, dy: i64) {
         let code = format!("window.scrollBy({dx}, {dy});");
@@ -2792,90 +2750,36 @@ impl BrowserHost {
 
     /// Toggle `.paused` on the `<video>`/`<audio>` element under `(x, y)`.
     pub fn media_play_pause(&self, x: i32, y: i32) {
-        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-        let js = format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               if(el.paused)el.play();else el.pause();\
-             }})({x},{y});"
+        self.run_main_frame_js(
+            &media_op(x, y, MEDIA_BODY_PLAY_PAUSE),
+            "buffr://context-menu",
         );
-        self.run_main_frame_js(&js, "buffr://context-menu");
     }
 
     /// Toggle `.muted` on the media element under `(x, y)`.
     pub fn media_toggle_mute(&self, x: i32, y: i32) {
-        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-        let js = format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               el.muted=!el.muted;\
-             }})({x},{y});"
-        );
-        self.run_main_frame_js(&js, "buffr://context-menu");
+        self.run_main_frame_js(&media_op(x, y, MEDIA_BODY_MUTE), "buffr://context-menu");
     }
 
     /// Toggle `.loop` on the media element under `(x, y)`.
     pub fn media_toggle_loop(&self, x: i32, y: i32) {
-        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-        let js = format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               el.loop=!el.loop;\
-             }})({x},{y});"
-        );
-        self.run_main_frame_js(&js, "buffr://context-menu");
+        self.run_main_frame_js(&media_op(x, y, MEDIA_BODY_LOOP), "buffr://context-menu");
     }
 
     /// Toggle `.controls` on the media element under `(x, y)`.
     pub fn media_toggle_controls(&self, x: i32, y: i32) {
-        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-        let js = format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               el.controls=!el.controls;\
-             }})({x},{y});"
-        );
-        self.run_main_frame_js(&js, "buffr://context-menu");
+        self.run_main_frame_js(&media_op(x, y, MEDIA_BODY_CONTROLS), "buffr://context-menu");
     }
 
     /// Request Picture-in-Picture for the media element under `(x, y)`,
     /// or exit PiP if it's already the PiP element. Wrapped in try/catch
     /// because some hosts disable PiP.
+    ///
+    /// The only one of the five that does not go through [`media_op`]: it
+    /// walks `HTMLVideoElement` rather than `HTMLMediaElement` and wraps the
+    /// whole body in try/catch, so it has its own builder.
     pub fn media_picture_in_picture(&self, x: i32, y: i32) {
-        let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
-        let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
-        let js = format!(
-            "(function(x,y){{\
-               try{{\
-                 var el=document.elementFromPoint(x,y);\
-                 while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
-                 if(!el)el=document.querySelector('video');\
-                 if(!el)return;\
-                 if(document.pictureInPictureElement===el){{\
-                   document.exitPictureInPicture();\
-                 }}else{{\
-                   el.requestPictureInPicture();\
-                 }}\
-               }}catch(e){{}}\
-             }})({x},{y});"
-        );
-        self.run_main_frame_js(&js, "buffr://context-menu");
+        self.run_main_frame_js(&media_pip_js(x, y), "buffr://context-menu");
     }
 
     fn current_domain(&self) -> String {
@@ -2918,8 +2822,118 @@ fn json_string_literal(s: &str) -> String {
     out
 }
 
-#[allow(dead_code)]
-fn _hint_used(_: Hint) {}
+// L17: `fn _hint_used(_: Hint) {}` was a literal `#[allow(dead_code)]`
+// placeholder with no callers. Deleted.
+
+/// Encode `value` as a JS literal safe to splice into a call expression.
+///
+/// Falls back to an empty string literal if serialization somehow fails, so
+/// a malformed field id degrades to a no-op call rather than injecting raw
+/// text into the page.
+fn js_arg(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Convert a caller-supplied `(start, end)` **byte** range within `text`
+/// into the UTF-16 code-unit range CEF's `selection_range` expects (M20).
+///
+/// `None` collapses the selection to the end of `text`. Byte offsets that
+/// are out of range or not on a `char` boundary are clamped to the nearest
+/// valid boundary at or below the offset — never a panic, and never an
+/// out-of-range selection handed to CEF.
+///
+/// A 3-character Japanese preedit `"こんに"` is 9 bytes but 3 UTF-16 units;
+/// passing the byte length made CEF see an out-of-range selection on
+/// exactly the input class IME exists to support.
+fn utf16_selection_range(text: &str, cursor: Option<(usize, usize)>) -> (u32, u32) {
+    let total = text.encode_utf16().count() as u32;
+    let Some((start, end)) = cursor else {
+        return (total, total);
+    };
+    let from = byte_offset_to_utf16(text, start);
+    let to = byte_offset_to_utf16(text, end);
+    (from.min(to), from.max(to))
+}
+
+/// UTF-16 code-unit index of byte offset `byte` within `text`.
+///
+/// Clamps past-the-end to the string's UTF-16 length and rounds a
+/// non-boundary offset down to the previous `char` boundary.
+fn byte_offset_to_utf16(text: &str, byte: usize) -> u32 {
+    if byte >= text.len() {
+        return text.encode_utf16().count() as u32;
+    }
+    let mut b = byte;
+    while b > 0 && !text.is_char_boundary(b) {
+        b -= 1;
+    }
+    text[..b].encode_utf16().count() as u32
+}
+
+// ── Context-menu media JS (L2) ───────────────────────────────────────────────
+//
+// `media_play_pause` / `media_toggle_mute` / `media_toggle_loop` /
+// `media_toggle_controls` were four copies of the same twelve-line
+// `elementFromPoint` walk with a single statement swapped. Only the body
+// differs, so only the body is stored.
+//
+// (`crates/buffr-engine/src/media_js.rs` holds a second set of copies; that
+// file is outside this change.)
+
+/// Body for [`media_op`]: toggle play/pause.
+const MEDIA_BODY_PLAY_PAUSE: &str = "if(el.paused)el.play();else el.pause();";
+/// Body for [`media_op`]: toggle mute.
+const MEDIA_BODY_MUTE: &str = "el.muted=!el.muted;";
+/// Body for [`media_op`]: toggle loop.
+const MEDIA_BODY_LOOP: &str = "el.loop=!el.loop;";
+/// Body for [`media_op`]: toggle native controls.
+const MEDIA_BODY_CONTROLS: &str = "el.controls=!el.controls;";
+
+/// Build the `elementFromPoint` → nearest `HTMLMediaElement` walk and run
+/// `body` against the element it finds (bound as `el`).
+///
+/// Falls back to the first `<video>`/`<audio>` in the document when the hit
+/// point is an overlay sibling rather than the media element itself. `x`/`y`
+/// are JSON-encoded — they are our own CEF-local coordinates, but encoding
+/// them keeps the splice honest.
+fn media_op(x: i32, y: i32, body: &str) -> String {
+    let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+    let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+    format!(
+        "(function(x,y){{\
+           var el=document.elementFromPoint(x,y);\
+           while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
+           if(!el)el=document.querySelector('video, audio');\
+           if(!el)return;\
+           {body}\
+         }})({x},{y});"
+    )
+}
+
+/// Picture-in-Picture toggle for the `<video>` under `(x, y)`.
+///
+/// Not expressible via [`media_op`]: it walks `HTMLVideoElement` (PiP is
+/// video-only) and wraps everything in try/catch because some hosts disable
+/// the PiP API outright.
+fn media_pip_js(x: i32, y: i32) -> String {
+    let x = serde_json::to_string(&x).unwrap_or_else(|_| "0".to_string());
+    let y = serde_json::to_string(&y).unwrap_or_else(|_| "0".to_string());
+    format!(
+        "(function(x,y){{\
+           try{{\
+             var el=document.elementFromPoint(x,y);\
+             while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
+             if(!el)el=document.querySelector('video');\
+             if(!el)return;\
+             if(document.pictureInPictureElement===el){{\
+               document.exitPictureInPicture();\
+             }}else{{\
+               el.requestPictureInPicture();\
+             }}\
+           }}catch(e){{}}\
+         }})({x},{y});"
+    )
+}
 
 /// Pixels per scroll-unit. `ScrollDown(3)` therefore moves 120px,
 /// matching a typical "tap j three times" feel without making each
@@ -3689,89 +3703,13 @@ mod tests {
 
     // ── JS-snippet builder tests (no CEF runtime required) ────────────────
     //
-    // These tests verify that the helpers produce JS strings containing the
-    // correct structural elements. They do NOT invoke CEF.
-
-    /// Build the play-pause snippet for the given coords and return it.
-    fn build_media_play_pause_js(x: i32, y: i32) -> String {
-        let x = serde_json::to_string(&x).unwrap();
-        let y = serde_json::to_string(&y).unwrap();
-        format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               if(el.paused)el.play();else el.pause();\
-             }})({x},{y});"
-        )
-    }
-
-    fn build_media_mute_js(x: i32, y: i32) -> String {
-        let x = serde_json::to_string(&x).unwrap();
-        let y = serde_json::to_string(&y).unwrap();
-        format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               el.muted=!el.muted;\
-             }})({x},{y});"
-        )
-    }
-
-    fn build_media_loop_js(x: i32, y: i32) -> String {
-        let x = serde_json::to_string(&x).unwrap();
-        let y = serde_json::to_string(&y).unwrap();
-        format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               el.loop=!el.loop;\
-             }})({x},{y});"
-        )
-    }
-
-    fn build_media_controls_js(x: i32, y: i32) -> String {
-        let x = serde_json::to_string(&x).unwrap();
-        let y = serde_json::to_string(&y).unwrap();
-        format!(
-            "(function(x,y){{\
-               var el=document.elementFromPoint(x,y);\
-               while(el&&!(el instanceof HTMLMediaElement))el=el.parentElement;\
-               if(!el)el=document.querySelector('video, audio');\
-               if(!el)return;\
-               el.controls=!el.controls;\
-             }})({x},{y});"
-        )
-    }
-
-    fn build_pip_js(x: i32, y: i32) -> String {
-        let x = serde_json::to_string(&x).unwrap();
-        let y = serde_json::to_string(&y).unwrap();
-        format!(
-            "(function(x,y){{\
-               try{{\
-                 var el=document.elementFromPoint(x,y);\
-                 while(el&&!(el instanceof HTMLVideoElement))el=el.parentElement;\
-                 if(!el)el=document.querySelector('video');\
-                 if(!el)return;\
-                 if(document.pictureInPictureElement===el){{\
-                   document.exitPictureInPicture();\
-                 }}else{{\
-                   el.requestPictureInPicture();\
-                 }}\
-               }}catch(e){{}}\
-             }})({x},{y});"
-        )
-    }
+    // These exercise the PRODUCTION builders. They used to re-implement all
+    // five media snippets verbatim inside this module (L2), so the tests
+    // would still have passed if the real builders had been deleted.
 
     #[test]
     fn media_play_pause_js_contains_coords_and_toggle() {
-        let js = build_media_play_pause_js(100, 200);
+        let js = super::media_op(100, 200, super::MEDIA_BODY_PLAY_PAUSE);
         assert!(js.contains("100"), "x coord missing");
         assert!(js.contains("200"), "y coord missing");
         assert!(js.contains("el.paused"), "paused check missing");
@@ -3786,7 +3724,7 @@ mod tests {
 
     #[test]
     fn media_mute_js_contains_coords_and_toggle() {
-        let js = build_media_mute_js(10, 20);
+        let js = super::media_op(10, 20, super::MEDIA_BODY_MUTE);
         assert!(js.contains("10"), "x coord missing");
         assert!(js.contains("20"), "y coord missing");
         assert!(js.contains("el.muted=!el.muted"), "mute toggle missing");
@@ -3799,7 +3737,7 @@ mod tests {
 
     #[test]
     fn media_loop_js_contains_toggle() {
-        let js = build_media_loop_js(0, 0);
+        let js = super::media_op(0, 0, super::MEDIA_BODY_LOOP);
         assert!(js.contains("el.loop=!el.loop"), "loop toggle missing");
         assert!(js.contains("HTMLMediaElement"), "media type guard missing");
         assert!(
@@ -3810,7 +3748,7 @@ mod tests {
 
     #[test]
     fn media_controls_js_contains_toggle() {
-        let js = build_media_controls_js(0, 0);
+        let js = super::media_op(0, 0, super::MEDIA_BODY_CONTROLS);
         assert!(
             js.contains("el.controls=!el.controls"),
             "controls toggle missing"
@@ -3824,7 +3762,9 @@ mod tests {
 
     #[test]
     fn pip_js_contains_pip_api_and_try_catch() {
-        let js = build_pip_js(50, 60);
+        let js = super::media_pip_js(50, 60);
+        assert!(js.contains("50"), "x coord missing");
+        assert!(js.contains("60"), "y coord missing");
         assert!(js.contains("pictureInPictureElement"), "PiP check missing");
         assert!(js.contains("requestPictureInPicture"), "requestPiP missing");
         assert!(js.contains("exitPictureInPicture"), "exitPiP missing");
@@ -3834,5 +3774,105 @@ mod tests {
             js.contains("querySelector('video')"),
             "overlay-sibling fallback missing"
         );
+        // PiP must NOT use the shared HTMLMediaElement walk — PiP is
+        // video-only, so a bare <audio> hit must not be promoted.
+        assert!(!js.contains("HTMLMediaElement"));
+    }
+
+    #[test]
+    fn media_op_shares_one_walk_across_bodies() {
+        // The whole point of L2: every body reuses the identical prologue.
+        let prologue = "var el=document.elementFromPoint(x,y);";
+        for body in [
+            super::MEDIA_BODY_PLAY_PAUSE,
+            super::MEDIA_BODY_MUTE,
+            super::MEDIA_BODY_LOOP,
+            super::MEDIA_BODY_CONTROLS,
+        ] {
+            let js = super::media_op(1, 2, body);
+            assert!(js.contains(prologue), "prologue missing for {body}");
+            assert!(js.ends_with("})(1,2);"), "call tail wrong for {body}");
+            assert!(js.contains(body));
+        }
+    }
+
+    #[test]
+    fn media_op_negative_coords_are_encoded_not_spliced() {
+        let js = super::media_op(-5, -7, super::MEDIA_BODY_MUTE);
+        assert!(js.ends_with("})(-5,-7);"), "{js}");
+    }
+
+    // ── L3: one edit-JS call builder ──────────────────────────────────────
+
+    #[test]
+    fn js_arg_quotes_and_escapes() {
+        assert_eq!(super::js_arg("abc"), "\"abc\"");
+        assert_eq!(super::js_arg("a\"b"), "\"a\\\"b\"");
+        // A field id that tries to close the call and inject a statement
+        // stays inside the string literal.
+        let arg = super::js_arg("x\"); alert(1); (\"");
+        assert!(!arg.contains("alert(1);\""), "{arg}");
+        assert!(arg.starts_with('"') && arg.ends_with('"'));
+    }
+
+    #[test]
+    fn js_arg_handles_newlines_and_unicode() {
+        assert_eq!(super::js_arg("a\nb"), "\"a\\nb\"");
+        assert_eq!(super::js_arg("こんに"), "\"こんに\"");
+    }
+
+    // ── M20: IME selection range is UTF-16, not bytes ─────────────────────
+
+    #[test]
+    fn ime_range_defaults_to_utf16_length_not_byte_length() {
+        // "こんに" is 9 UTF-8 bytes but 3 UTF-16 code units. Passing the
+        // byte length handed CEF an out-of-range selection on exactly the
+        // input class IME exists for.
+        let text = "こんに";
+        assert_eq!(text.len(), 9);
+        assert_eq!(super::utf16_selection_range(text, None), (3, 3));
+    }
+
+    #[test]
+    fn ime_range_ascii_is_unchanged() {
+        assert_eq!(super::utf16_selection_range("hello", None), (5, 5));
+        assert_eq!(super::utf16_selection_range("hello", Some((1, 3))), (1, 3));
+        assert_eq!(super::utf16_selection_range("", None), (0, 0));
+    }
+
+    #[test]
+    fn ime_range_converts_byte_offsets() {
+        let text = "こんに"; // 3 chars, 3 bytes each, 3 UTF-16 units
+        assert_eq!(super::utf16_selection_range(text, Some((0, 9))), (0, 3));
+        assert_eq!(super::utf16_selection_range(text, Some((3, 6))), (1, 2));
+        assert_eq!(super::utf16_selection_range(text, Some((0, 3))), (0, 1));
+    }
+
+    #[test]
+    fn ime_range_counts_surrogate_pairs_as_two_units() {
+        // U+1F600 is one char, 4 UTF-8 bytes, TWO UTF-16 code units.
+        let text = "a😀b";
+        assert_eq!(text.len(), 6);
+        assert_eq!(text.chars().count(), 3);
+        assert_eq!(super::utf16_selection_range(text, None), (4, 4));
+        assert_eq!(super::utf16_selection_range(text, Some((0, 5))), (0, 3));
+    }
+
+    #[test]
+    fn ime_range_clamps_out_of_bounds_and_non_boundaries() {
+        let text = "こんに";
+        // Past the end clamps to the UTF-16 length.
+        assert_eq!(super::utf16_selection_range(text, Some((0, 999))), (0, 3));
+        // Byte 1 and 2 are inside the first codepoint — round down to 0.
+        assert_eq!(super::utf16_selection_range(text, Some((1, 2))), (0, 0));
+        assert_eq!(super::utf16_selection_range(text, Some((4, 9))), (1, 3));
+    }
+
+    #[test]
+    fn ime_range_normalises_reversed_selection() {
+        // A backwards selection must not produce from > to.
+        let (from, to) = super::utf16_selection_range("hello", Some((4, 1)));
+        assert!(from <= to);
+        assert_eq!((from, to), (1, 4));
     }
 }
