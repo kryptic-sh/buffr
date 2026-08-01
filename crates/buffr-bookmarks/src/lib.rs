@@ -585,9 +585,7 @@ fn normalise_tags(tags: &[&str]) -> Vec<String> {
 /// HTML parser — just drop the angle-bracketed bits.
 fn strip_html(s: &str) -> String {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"<[^>]+>").expect("strip_html regex is a constant")
-    });
+    let re = RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("strip_html regex is a constant"));
     re.replace_all(s, "").trim().to_string()
 }
 

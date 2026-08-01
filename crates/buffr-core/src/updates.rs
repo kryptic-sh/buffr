@@ -173,15 +173,14 @@ impl UpdateChecker {
     pub fn new(config: UpdateConfig, cache_path: PathBuf) -> Self {
         // `env!("CARGO_PKG_VERSION")` for the `buffr-core` crate. The
         // workspace version is shared so this matches `buffr` itself.
-        let current =
-            Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    pkg_version = env!("CARGO_PKG_VERSION"),
-                    "updates: failed to parse CARGO_PKG_VERSION, falling back to 0.0.0"
-                );
-                Version::new(0, 0, 0)
-            });
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                pkg_version = env!("CARGO_PKG_VERSION"),
+                "updates: failed to parse CARGO_PKG_VERSION, falling back to 0.0.0"
+            );
+            Version::new(0, 0, 0)
+        });
         Self::with_client_and_current(config, cache_path, Box::new(UreqClient), current)
     }
 
