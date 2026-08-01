@@ -8,6 +8,179 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-08-01
+
+A full-codebase review (see `docs/code-review.md`) and the fixes for everything
+it turned up that needed no product decision. What is still open is listed in
+`docs/backlog.md`.
+
+### Security
+
+- **The renderer → browser console-log IPC is now authenticated.**
+  `on_console_message` matched three fixed, publicly-documented sentinel
+  prefixes anywhere in any console line from any frame — including third-party
+  iframes — so any page could overwrite the live `HintSession` and redirect the
+  next hint keystroke to an element it chose, pin the platform idle inhibitor on
+  so the screen never locked, or push text into the yank-to-clipboard path.
+  Lines now carry a 128-bit nonce (`<sentinel><nonce>:<json>`) minted from the
+  OS CSPRNG, rotated per main-frame load and per hint session, and the match is
+  anchored at the start of the line. See `docs/hint-mode.md` for what this does
+  and does not close.
+- **`buffr-src:` no longer performs arbitrary fetches for web content.** It was
+  registered `CORS_ENABLED | FETCH_ENABLED`, so any page could
+  `fetch('buffr-src:http://127.0.0.1:8080/admin')` and have the browser process
+  retrieve it outside Chromium's network stack — bypassing same-origin policy,
+  CSP and private-network checks — then render the body. Those flags are gone,
+  non-`http(s)` schemes are rejected, and loopback / link-local / RFC1918
+  targets are refused unless the initiating frame is already on that host.
+- **Windows "open on finish" no longer routes through `cmd.exe`.** Rust quotes
+  arguments per `CommandLineToArgvW`, which `cmd.exe` does not follow — it
+  re-parses `&`, `|`, `^`, `<`, `>` after unquoting — so a download named
+  `report"&calc.exe&".pdf` executed a second command. Uses `explorer.exe`.
+- **The single-instance socket and supervisor clean-shutdown flag moved to a
+  `0700` per-uid directory**, verified for owner and mode after creation. They
+  previously fell back to predictable paths in a shared temp dir, where another
+  local user could bind the socket and silently swallow forwarded URLs (the
+  victim exits 0 without opening), or pre-create the clean flag — checked with a
+  symlink-following `exists()` — to disable the crash watchdog entirely.
+  Forwarded payloads are now accepted only after an `SO_PEERCRED` uid check.
+- **The internal server no longer reads unbounded headers.** A single
+  newline-less header drove the browser to OOM; the 16 KiB guard only ran once a
+  whole line had been buffered. Concurrent connections are capped (503 over the
+  cap) — previously an unbounded thread per connection, each pinned for the full
+  2 s read timeout. Responses gained `Referrer-Policy: no-referrer` (the auth
+  token is in the URL path) and non-loopback `Host` headers are rejected.
+- **The vendored CEF distribution is now verified.** The ~200 MB archive that
+  becomes `libcef.so` in every shipped package was downloaded with no integrity
+  check at all — the `sha1` from the remote index was parsed and then discarded.
+  It is now checked, index entries whose name would escape `vendor/cef/` are
+  rejected, and tar entries with a parent-dir component are refused on extract.
+- Reopening a closed `buffr://` tab no longer exposes the internal server's auth
+  token in the address bar and the session file.
+- Page console messages are no longer logged verbatim by default; the blanket
+  log is behind an opt-in env var and non-sentinel text is truncated. It
+  previously wrote page-controlled text to disk even in private mode.
+- CI hardening: `cargo-machete` pinned to a commit SHA instead of `@main`, a
+  workflow-level `permissions: contents: read`, and pinned `known_hosts` for the
+  publish steps (`accept-new` against an empty `known_hosts` on an ephemeral
+  runner is equivalent to disabling host-key checking).
+- New fuzz targets for the console-sentinel parsers and the Netscape bookmark
+  importer — the most attacker-reachable parsers in the tree, previously
+  unfuzzed while the three existing targets all took input the user typed into
+  their own config.
+
+### Fixed
+
+- **The update checker always reported an update was available.** `buffr-core`
+  pinned its own `0.7.0` instead of the workspace version, and `UpdateChecker`
+  seeds the current version from `CARGO_PKG_VERSION`, so `0.14.6 <= 0.7.0` was
+  false forever. The same string was also the `buffr_version` on every crash
+  report and the update / image-copy `User-Agent`.
+- **Three reachable panics.** `truncate_to_width` in the permissions prompt
+  sliced before checking the char boundary, so a non-ASCII permission origin
+  panicked the chrome; `parse_hex_rgb` guarded on byte length then sliced at
+  fixed byte offsets, so a 7-byte `[theme]` value containing a multi-byte
+  codepoint hard-panicked startup; and view-source highlighted the raw bytes
+  while slicing the lossy-decoded string, so any non-UTF-8 source panicked
+  mid-replacement-character.
+- **A hung UI never restarted.** The heartbeat thread dropped its socket, the
+  supervisor read that as a clean disconnect rather than a hang, and then
+  blocked in `child.wait()` forever on a frozen browser.
+- **Windows: a UI hang spawned a second browser.** `GetExitCodeProcess` was
+  called without first checking the process had exited, so `STILL_ACTIVE` (259)
+  was recorded as a crash exit. Windows also restarted on any non-zero exit
+  (`buffr --bogus-flag` looped three times) and had no clean-flag support, so a
+  segfault during teardown after a normal window close respawned the browser.
+  Child arguments are now quoted per the MSVCRT rule instead of appended raw,
+  and an explicit environment block replaces mutating the supervisor's own env
+  while worker threads are live.
+- **Chrome updates were silently dropped.** `Renderer::frame` returned `Ok` on
+  six paths that never uploaded a pixel, and the caller retired the dirty
+  generation anyway — so a keystroke typed while the wgpu worker was still
+  presenting was lost until an unrelated event marked chrome dirty. Skipped
+  frames also re-fed the previous frame's stats into the occlusion heuristic.
+- **HiDPI hit-testing missed.** The context menu and the pinned-close confirm
+  buttons were painted in logical space but hit-tested against physical
+  coordinates, so at any scale > 1 clicks on the visible menu fell through to
+  "clicked outside" and "Yes" did nothing.
+- **A wedged renderer on a permission prompt.** `resolve` persisted the decision
+  before firing the C++ callback, so a sqlite error returned via `?` and dropped
+  the `MediaAccessCallback` un-invoked.
+- A lock-order inversion between `tabs` and `active` in `BrowserHost` that could
+  deadlock the UI once a second thread called any engine method.
+- Two `window.open()` calls in one task overwrote a single-slot pending-popup
+  allocation, so one popup got the other's frame and the second leaked a live
+  CEF browser past `close_all_browsers`.
+- Bookmark omnibar search issued a full table scan plus one query per row on
+  every keystroke (~2001 SQL round-trips at 2000 bookmarks, for 8 displayed
+  results). The match, rank and limit are now done in SQL.
+- `import_netscape` stored HTML-escaped URLs verbatim, so a real Chrome/Firefox
+  export of `?a=1&b=2` was saved as `?a=1&amp;b=2` and navigated elsewhere. It
+  also committed one transaction per entry with no rollback on partial failure.
+- Non-base64 binary `data:` images were unrecoverable — `percent_decode` pushed
+  each byte as a `char` into a `String` that was then UTF-8 encoded, so every
+  byte ≥ 0x80 became two.
+- Full-width CJK text drew each glyph on top of the previous one, and every
+  truncation and centring computation under-measured it by ~2×.
+- IME composition passed UTF-8 byte offsets where CEF expects UTF-16 code units.
+- Ctrl+A and friends reached the page as Alt+A on the WebKit backend.
+- An abandoned multi-chord prefix never flushed, so `g`, wait, `j` was rejected
+  instead of scrolling.
+- Unmodelled keys (`Menu`, media keys, F13+) were injected into form fields as
+  `SpecialKey::Insert`, toggling insert/replace mode.
+- `InternalServer::drop` could hang the process forever; the accept loop now
+  polls a shutdown flag as its comments already claimed.
+- The idle inhibitor issued blocking sends from the winit event loop, so a
+  wedged worker parked the browser UI thread and could hang shutdown.
+- Crash reports were named with millisecond precision and written with
+  `fs::write`, so two panics in the same millisecond lost one.
+- The config watcher reloaded on any churn in the config directory, surfacing a
+  spurious IO error when the file was momentarily absent.
+- `--audit-keymap` printed `<leader>` chords against a hard-coded backslash
+  while the actual default leader is a space.
+- Several integer overflows guarded only after the fact: the favicon cache's
+  `pixel_count * 4`, the tab-strip favicon bounds check, and the omnibar popup
+  width, which underflowed for windows narrower than its clamp floor.
+- `buffr-webkit` (excluded from the workspace, so nothing caught any of this):
+  the internal server was never passed through, so the first tab could not load;
+  download destinations were built from an unsanitized server-supplied filename,
+  which `Path::join` lets escape the download directory entirely; `--private`
+  still wrote a persistent cookie database; the OSR ingest loop read past the
+  end of its buffer; and the downloads sink downcast could never match, so every
+  download was silently invisible to the store.
+
+### Changed
+
+- Truncated chrome text now actually renders the `..` ellipsis its layout had
+  always reserved space for.
+- `validate()` rejects unparseable `[theme]` colours and a zero
+  `crash_reporter.purge_after_days`. Both were silently accepted, so
+  `--check-config` passed while the colour reverted to the built-in default and
+  `--purge-crashes` deleted every report including the one just written.
+- A store whose schema version is ahead of the running binary is now refused
+  rather than silently ignored.
+- Crash reports are named `<stamp>_<seq>.json` and written with `create_new`.
+- The Linux smoke test fails (exit 4) when the wgpu renderer cannot initialise,
+  instead of exiting the event loop and reporting success without painting.
+- Member manifests inherit workspace dependency versions; the literals had
+  already diverged (`buffr-webkit` pinned an incompatible `hjkl-clipboard`).
+
+### Added
+
+- `crates/buffr-store` — the sqlite open/tune boilerplate, migration runner and
+  timestamp helpers that were duplicated verbatim across five stores.
+- `docs/code-review.md` and `docs/backlog.md`.
+
+### Removed
+
+- The legacy CEF permissions queue, dead since Phase 8a: nothing pushed into it,
+  yet it was threaded through `BrowserHost`, `BuffrClient`, `CefEngineSinks` and
+  an `AppState` field, and drained at shutdown.
+- Assorted dead constants, unused handler factories, the windowing parity shims
+  for a backend that no longer exists, and three unused workspace dependencies.
+
+[0.14.7]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.7
+
 ## [0.14.6] - 2026-05-25
 
 ### Fixed
@@ -1801,7 +1974,7 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.7...HEAD
 [0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
