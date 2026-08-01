@@ -14,6 +14,49 @@ first.
 
 ---
 
+## Status
+
+Every `ACTIONABLE: yes` finding below has been fixed and pushed (commits
+`dff5a11`..`ea1108c`). The workspace is clean on `cargo fmt --check`,
+`clippy --workspace --all-targets -D warnings`, `test --workspace`, `build`,
+`cargo deny check` and `cargo machete`; `buffr-webkit` and the fuzz targets
+build too, and `apps/buffr` cross-checks for `x86_64-pc-windows-gnu`.
+
+**Still open — these need your call, and nothing was changed for them:**
+
+| ID  | Decision needed                                                                                                |
+| --- | -------------------------------------------------------------------------------------------------------------- |
+| H6  | Chromium sandbox is disabled process-wide. Ship `chrome-sandbox` or gate it per-target?                        |
+| M39 | `<C-c>` is bound twice; `StopLoading` is unreachable. Which chord wins?                                        |
+| M48 | `:open` bypasses the scheme allow-list. Is it meant to be a privileged escape hatch?                           |
+| M49 | Four dead config knobs (`new_tab_url`, `restore_session`, `theme.mode`, `updates.channel`). Wire up or delete? |
+| L18 | Delete `buffr-engine`'s unused neutral event types, or keep them for a planned migration?                      |
+| L19 | Same for the native-compositing trait trio (`supports_native` et al).                                          |
+| L23 | Occlude-sleep debounce is dead. Wire `Occluded(true)` to arm it, or delete it?                                 |
+| L36 | Hint status renders a meaningless `(n/n)`. Drop it or add a real `current` index?                              |
+| L37 | `PageMode::Pending` is never produced. Produce it, or delete it and its dead arms?                             |
+| L38 | Register prefix (`"a`) eats keystrokes and is discarded. Plumb it through or remove it?                        |
+| L40 | Eight `History` constructors. Collapse to a builder — an API change.                                           |
+| L41 | `classify_input` is dead public API that must be hand-synced with `resolve_input`.                             |
+| W2  | Any page can read the system clipboard via `fetch('buffr-clipboard:read')` (webkit only).                      |
+| W8  | Renderer-controlled URIs go to `xdg-open` with no prompt (webkit only).                                        |
+
+**Two things that could not be verified here** and want a manual pass:
+
+- No display server was available, so nothing was smoke-tested in a running
+  browser. The paint/occlusion rework (H8, M33, M34) and the `buffr-src:`
+  allowlist (M13) are the changes most worth exercising by hand.
+- The Windows supervisor fixes (M2, M3, M8, M9) cross-compile but were never
+  executed; `restart_on_crash_windows.rs` was rewritten and needs a Windows CI
+  run.
+
+Two review claims turned out to be **wrong** and were deliberately not "fixed":
+`TYPEFLAG_FRAME` (L39) does have a caller, and `ActivationError` (L21) is live
+via `request_activation`. The "cef-147 vs 148" half of L46 was also wrong — the
+`cef` crate at 148.x wraps libcef 147.0.14, so the docs were already right.
+
+---
+
 ## Summary
 
 | Severity | Count                              |
