@@ -32,6 +32,18 @@ jobs:
         with:
           submodules: recursive
 
+      # `buffr-core` is in the fuzz graph (the console-sentinel target
+      # drives its parsers), and on Linux it pulls the Wayland
+      # idle-inhibit backend, whose `wayland-sys` build script shells out
+      # to `pkg-config --libs --cflags wayland-client` and panics if it is
+      # missing. `libsqlite3-sys` comes in via `buffr-bookmarks` but uses
+      # the `bundled` feature, so it needs only a C compiler.
+      - name: install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev
+
       - name: install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
 
