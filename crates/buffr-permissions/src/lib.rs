@@ -36,7 +36,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 #[cfg(feature = "store")]
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use buffr_store::current_unix_time;
+#[cfg(feature = "store")]
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 #[cfg(feature = "store")]
@@ -65,6 +67,12 @@ pub enum PermError {
         source: rusqlite::Error,
         version: i64,
     },
+    #[cfg(feature = "store")]
+    /// The on-disk schema is newer than this binary understands —
+    /// the profile was written by a newer buffr. Refusing beats
+    /// silently running old code against a newer schema.
+    #[error("database schema v{found} is newer than supported v{supported}")]
+    SchemaTooNew { found: i64, supported: i64 },
     #[cfg(feature = "store")]
     #[error("query failed")]
     Query {
@@ -210,12 +218,8 @@ impl Permissions {
     /// Open or create the SQLite database at `path` and run any
     /// pending schema migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PermError> {
-        let mut conn = Connection::open_with_flags(
-            path.as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .map_err(|source| PermError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn =
+            buffr_store::open_tuned(path.as_ref()).map_err(|source| PermError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -225,22 +229,12 @@ impl Permissions {
     /// In-memory database — for tests and short-lived ephemeral
     /// profiles (private windows).
     pub fn open_in_memory() -> Result<Self, PermError> {
-        let mut conn = Connection::open_in_memory().map_err(|source| PermError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn =
+            buffr_store::open_tuned_in_memory().map_err(|source| PermError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
-    }
-
-    fn tune(conn: &Connection) -> Result<(), PermError> {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|source| PermError::Open { source })?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|source| PermError::Open { source })?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|source| PermError::Open { source })?;
-        Ok(())
     }
 
     /// Look up the stored decision for `(origin, capability)`. `None`
@@ -343,17 +337,24 @@ impl Permissions {
     }
 }
 
-#[cfg(feature = "store")]
-fn current_unix_time() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(all(test, feature = "store"))]
 mod tests {
     use super::*;
+
+    /// M54: a profile written by a newer buffr must be refused, not
+    /// silently opened with an older binary's expectations.
+    #[test]
+    fn schema_newer_than_binary_is_refused() {
+        let store = Permissions::open_in_memory().unwrap();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schema_version(version) VALUES (?1)",
+            params![schema::latest_version() + 1],
+        )
+        .unwrap();
+        let err = schema::apply(&mut conn).unwrap_err();
+        assert!(matches!(err, PermError::SchemaTooNew { .. }), "got {err:?}");
+    }
 
     #[test]
     fn open_in_memory_runs_migrations() {

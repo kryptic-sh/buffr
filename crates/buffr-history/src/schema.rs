@@ -11,7 +11,7 @@
 //! v1 is the only migration; future migrations append to the array
 //! without renumbering. **Never** rewrite history (heh) — append only.
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::HistoryError;
 
@@ -70,43 +70,21 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
-/// Run all pending migrations, leaving `schema_version` reflecting the
-/// new high-water mark.
+/// Run all pending migrations. Thin wrapper over the shared runner in
+/// [`buffr_store`] — the only crate-specific part is mapping the
+/// failure into [`HistoryError`].
 pub(crate) fn apply(conn: &mut Connection) -> Result<(), HistoryError> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-        .map_err(|source| HistoryError::Migrate { source, version: 0 })?;
-
-    let current: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|source| HistoryError::Migrate { source, version: 0 })?;
-
-    for (idx, sql) in MIGRATIONS.iter().enumerate() {
-        let version = (idx + 1) as i64;
-        if version <= current {
-            continue;
+    buffr_store::apply(conn, MIGRATIONS).map_err(|e| match e {
+        buffr_store::MigrationError::Sql { source, version } => {
+            HistoryError::Migrate { source, version }
         }
-        let tx = conn
-            .transaction()
-            .map_err(|source| HistoryError::Migrate { source, version })?;
-        tx.execute_batch(sql)
-            .map_err(|source| HistoryError::Migrate { source, version })?;
-        tx.execute(
-            "INSERT INTO schema_version(version) VALUES (?1)",
-            params![version],
-        )
-        .map_err(|source| HistoryError::Migrate { source, version })?;
-        tx.commit()
-            .map_err(|source| HistoryError::Migrate { source, version })?;
-    }
-
-    Ok(())
+        buffr_store::MigrationError::TooNew { found, supported } => {
+            HistoryError::SchemaTooNew { found, supported }
+        }
+    })
 }
 
 /// Highest version the binary knows about. Public for diagnostics.
 pub fn latest_version() -> i64 {
-    MIGRATIONS.len() as i64
+    buffr_store::latest_version(MIGRATIONS)
 }

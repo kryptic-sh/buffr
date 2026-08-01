@@ -37,8 +37,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use buffr_store::ts_to_dt;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::trace;
@@ -124,6 +125,11 @@ pub enum DownloadError {
         source: rusqlite::Error,
         version: i64,
     },
+    /// The on-disk schema is newer than this binary understands —
+    /// the profile was written by a newer buffr. Refusing beats
+    /// silently running old code against a newer schema.
+    #[error("database schema v{found} is newer than supported v{supported}")]
+    SchemaTooNew { found: i64, supported: i64 },
     #[error("query failed")]
     Query {
         #[from]
@@ -142,12 +148,8 @@ impl Downloads {
     /// Open or create the SQLite database at `path` and run any
     /// pending schema migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DownloadError> {
-        let mut conn = Connection::open_with_flags(
-            path.as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .map_err(|source| DownloadError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn = buffr_store::open_tuned(path.as_ref())
+            .map_err(|source| DownloadError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -158,23 +160,11 @@ impl Downloads {
     /// profiles (private windows, Phase 5 follow-up).
     pub fn open_in_memory() -> Result<Self, DownloadError> {
         let mut conn =
-            Connection::open_in_memory().map_err(|source| DownloadError::Open { source })?;
-        Self::tune(&conn)?;
+            buffr_store::open_tuned_in_memory().map_err(|source| DownloadError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
-    }
-
-    /// Apply per-connection pragmas. Same shape as the other stores.
-    fn tune(conn: &Connection) -> Result<(), DownloadError> {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|source| DownloadError::Open { source })?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|source| DownloadError::Open { source })?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|source| DownloadError::Open { source })?;
-        Ok(())
     }
 
     /// Record a new in-flight download or return the existing
@@ -407,15 +397,28 @@ fn row_to_download(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
     })
 }
 
-fn ts_to_dt(secs: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// M54: a profile written by a newer buffr must be refused, not
+    /// silently opened with an older binary's expectations.
+    #[test]
+    fn schema_newer_than_binary_is_refused() {
+        let store = Downloads::open_in_memory().unwrap();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schema_version(version) VALUES (?1)",
+            params![schema::latest_version() + 1],
+        )
+        .unwrap();
+        let err = schema::apply(&mut conn).unwrap_err();
+        assert!(
+            matches!(err, DownloadError::SchemaTooNew { .. }),
+            "got {err:?}"
+        );
+    }
 
     #[test]
     fn open_in_memory_runs_migrations() {

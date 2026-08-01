@@ -11,10 +11,14 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-rusqlite = { version = "0.39", features = ["bundled"] }
+# `functions` registers the `buffr_lower` scalar used by `search` —
+# SQLite's built-in `lower()` is ASCII-only, and search has always been
+# Unicode-case-insensitive via Rust's `str::to_lowercase`.
+rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 url = "2"
 regex = "1"
+buffr-store = { workspace = true, features = ["chrono"] }

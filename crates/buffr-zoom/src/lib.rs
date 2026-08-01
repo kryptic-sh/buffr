@@ -32,7 +32,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use buffr_store::current_unix_time;
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tracing::trace;
 
@@ -57,6 +58,11 @@ pub enum ZoomError {
         source: rusqlite::Error,
         version: i64,
     },
+    /// The on-disk schema is newer than this binary understands —
+    /// the profile was written by a newer buffr. Refusing beats
+    /// silently running old code against a newer schema.
+    #[error("database schema v{found} is newer than supported v{supported}")]
+    SchemaTooNew { found: i64, supported: i64 },
     #[error("query failed")]
     Query {
         #[from]
@@ -75,12 +81,8 @@ impl ZoomStore {
     /// Open or create the SQLite database at `path` and run any
     /// pending schema migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ZoomError> {
-        let mut conn = Connection::open_with_flags(
-            path.as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .map_err(|source| ZoomError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn =
+            buffr_store::open_tuned(path.as_ref()).map_err(|source| ZoomError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -90,23 +92,12 @@ impl ZoomStore {
     /// In-memory database — for tests and short-lived ephemeral
     /// profiles (private windows).
     pub fn open_in_memory() -> Result<Self, ZoomError> {
-        let mut conn = Connection::open_in_memory().map_err(|source| ZoomError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn =
+            buffr_store::open_tuned_in_memory().map_err(|source| ZoomError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
-    }
-
-    /// Apply per-connection pragmas. Same shape as the other stores.
-    fn tune(conn: &Connection) -> Result<(), ZoomError> {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|source| ZoomError::Open { source })?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|source| ZoomError::Open { source })?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|source| ZoomError::Open { source })?;
-        Ok(())
     }
 
     /// Look up the zoom level for `domain`. Returns `0.0` for any
@@ -196,18 +187,24 @@ pub fn domain_for_url(url: &str) -> String {
     }
 }
 
-/// Wall-clock unix-epoch seconds. Same shape as the other stores'
-/// `Utc::now().timestamp()` — we don't pull `chrono` in for one call.
-fn current_unix_time() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M54: a profile written by a newer buffr must be refused, not
+    /// silently opened with an older binary's expectations.
+    #[test]
+    fn schema_newer_than_binary_is_refused() {
+        let store = ZoomStore::open_in_memory().unwrap();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schema_version(version) VALUES (?1)",
+            params![schema::latest_version() + 1],
+        )
+        .unwrap();
+        let err = schema::apply(&mut conn).unwrap_err();
+        assert!(matches!(err, ZoomError::SchemaTooNew { .. }), "got {err:?}");
+    }
 
     #[test]
     fn open_in_memory_runs_migrations() {

@@ -7,6 +7,7 @@ members = [
     "crates/buffr-modal",
     "crates/buffr-ui",
     "crates/buffr-config",
+    "crates/buffr-store",
     "crates/buffr-history",
     "crates/buffr-bookmarks",
     "crates/buffr-downloads",
@@ -103,6 +104,8 @@ buffr-core = { path = "crates/buffr-core" }
 buffr-modal = { path = "crates/buffr-modal" }
 buffr-ui = { path = "crates/buffr-ui" }
 buffr-config = { path = "crates/buffr-config" }
+# Shared SQLite open/tune + migration runner behind the five stores.
+buffr-store = { path = "crates/buffr-store" }
 buffr-history = { path = "crates/buffr-history" }
 buffr-bookmarks = { path = "crates/buffr-bookmarks" }
 buffr-downloads = { path = "crates/buffr-downloads" }

@@ -20,18 +20,26 @@
 //!   equality lookup.
 //! - [`Bookmarks::search`] does case-insensitive substring match over
 //!   url, title, and any tag, with ordering
-//!   `title-match > url-match > tag-match`, then `modified DESC`.
+//!   `title-match > url-match > tag-match`, then `modified DESC`, then
+//!   `id DESC`. The match, the rank and any cap run in SQL, and tags
+//!   for the result set come back in one further query — two
+//!   round-trips per call regardless of profile size. Interactive
+//!   callers should use [`Bookmarks::search_limited`].
 //! - [`Bookmarks::import_netscape`] parses the Netscape Bookmark File
 //!   Format (Chrome/Firefox/Edge export shape) via a regex walker —
 //!   the format is loose enough that a real HTML parser is overkill.
+//!   HREFs and titles are HTML-entity-decoded, and the whole import is
+//!   one transaction: all-or-nothing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
+use buffr_store::ts_to_dt;
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::functions::FunctionFlags;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -71,6 +79,11 @@ pub enum BookmarkError {
         source: rusqlite::Error,
         version: i64,
     },
+    /// The on-disk schema is newer than this binary understands —
+    /// the profile was written by a newer buffr. Refusing beats
+    /// silently running old code against a newer schema.
+    #[error("database schema v{found} is newer than supported v{supported}")]
+    SchemaTooNew { found: i64, supported: i64 },
     #[error("query failed")]
     Query {
         #[from]
@@ -94,12 +107,9 @@ impl Bookmarks {
     /// Open or create the SQLite database at `path` and run any
     /// pending schema migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BookmarkError> {
-        let mut conn = Connection::open_with_flags(
-            path.as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .map_err(|source| BookmarkError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn = buffr_store::open_tuned(path.as_ref())
+            .map_err(|source| BookmarkError::Open { source })?;
+        register_lower(&conn)?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -110,23 +120,12 @@ impl Bookmarks {
     /// profiles (private windows, Phase 5 follow-up).
     pub fn open_in_memory() -> Result<Self, BookmarkError> {
         let mut conn =
-            Connection::open_in_memory().map_err(|source| BookmarkError::Open { source })?;
-        Self::tune(&conn)?;
+            buffr_store::open_tuned_in_memory().map_err(|source| BookmarkError::Open { source })?;
+        register_lower(&conn)?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
-    }
-
-    /// Apply per-connection pragmas. Same shape as `buffr-history`.
-    fn tune(conn: &Connection) -> Result<(), BookmarkError> {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|source| BookmarkError::Open { source })?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|source| BookmarkError::Open { source })?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|source| BookmarkError::Open { source })?;
-        Ok(())
     }
 
     /// Add or update a bookmark by URL.
@@ -141,52 +140,11 @@ impl Bookmarks {
         title: Option<&str>,
         tags: &[&str],
     ) -> Result<BookmarkId, BookmarkError> {
-        let canon = canonicalise(url)?;
-        let normalised_tags = normalise_tags(tags);
-        let title_owned = title
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        let now = Utc::now().timestamp();
-
         let mut conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
         let tx = conn.transaction()?;
-
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM bookmarks WHERE url = ?1",
-                params![canon],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let id = if let Some(id) = existing {
-            tx.execute(
-                "UPDATE bookmarks SET title = ?1, modified = ?2 WHERE id = ?3",
-                params![title_owned, now, id],
-            )?;
-            tx.execute(
-                "DELETE FROM bookmark_tags WHERE bookmark_id = ?1",
-                params![id],
-            )?;
-            id
-        } else {
-            tx.execute(
-                "INSERT INTO bookmarks (url, title, added, modified) VALUES (?1, ?2, ?3, ?3)",
-                params![canon, title_owned, now],
-            )?;
-            tx.last_insert_rowid()
-        };
-
-        for tag in &normalised_tags {
-            tx.execute(
-                "INSERT OR IGNORE INTO bookmark_tags (bookmark_id, tag) VALUES (?1, ?2)",
-                params![id, tag],
-            )?;
-        }
-
+        let id = add_in_tx(&tx, url, title, tags)?;
         tx.commit()?;
-        Ok(BookmarkId(id))
+        Ok(id)
     }
 
     /// Remove a bookmark by id. Returns `true` iff a row was deleted.
@@ -290,35 +248,22 @@ impl Bookmarks {
 
     /// All bookmarks, most recently modified first.
     pub fn all(&self) -> Result<Vec<Bookmark>, BookmarkError> {
+        self.all_limited(NO_LIMIT)
+    }
+
+    /// `all()` with a SQL-side `LIMIT`. `-1` means unlimited (SQLite's
+    /// own convention).
+    fn all_limited(&self, limit: i64) -> Result<Vec<Bookmark>, BookmarkError> {
         let conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
         let mut stmt = conn.prepare(
             "SELECT id, url, title, added, modified FROM bookmarks \
-             ORDER BY modified DESC, id DESC",
+             ORDER BY modified DESC, id DESC LIMIT ?1",
         )?;
-        let rows: Vec<(i64, String, Option<String>, i64, i64)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
+        let rows: Vec<BookmarkRow> = stmt
+            .query_map(params![limit], read_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, url, title, added, modified) in rows {
-            let tags = load_tags(&conn, id)?;
-            out.push(Bookmark {
-                id: BookmarkId(id),
-                url,
-                title,
-                tags,
-                added: ts_to_dt(added),
-                modified: ts_to_dt(modified),
-            });
-        }
-        Ok(out)
+        drop(stmt);
+        rows_to_bookmarks(&conn, rows)
     }
 
     /// Bookmarks tagged with `tag` (case-insensitive — input is
@@ -335,66 +280,50 @@ impl Bookmarks {
              WHERE t.tag = ?1 \
              ORDER BY b.modified DESC, b.id DESC",
         )?;
-        let rows: Vec<(i64, String, Option<String>, i64, i64)> = stmt
-            .query_map(params![needle], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
+        let rows: Vec<BookmarkRow> = stmt
+            .query_map(params![needle], read_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, url, title, added, modified) in rows {
-            let tags = load_tags(&conn, id)?;
-            out.push(Bookmark {
-                id: BookmarkId(id),
-                url,
-                title,
-                tags,
-                added: ts_to_dt(added),
-                modified: ts_to_dt(modified),
-            });
-        }
-        Ok(out)
+        drop(stmt);
+        rows_to_bookmarks(&conn, rows)
     }
 
     /// Case-insensitive substring search across url, title, and tags.
     ///
     /// Ordering: title-match (rank 0) > url-match (rank 1) >
-    /// tag-match (rank 2), then `modified DESC`. A bookmark is
-    /// returned at most once even if it matches in several fields —
-    /// the best (lowest-rank) match wins.
+    /// tag-match (rank 2), then `modified DESC`, then `id DESC`. A
+    /// bookmark is returned at most once even if it matches in several
+    /// fields — the best (lowest-rank) match wins.
+    ///
+    /// Unbounded. Interactive callers (the omnibar) should prefer
+    /// [`Bookmarks::search_limited`], which pushes the cap into SQL.
     pub fn search(&self, query: &str) -> Result<Vec<Bookmark>, BookmarkError> {
+        self.search_limited(query, None)
+    }
+
+    /// [`Bookmarks::search`] with a SQL-side `LIMIT`.
+    ///
+    /// The match, the rank and the cap all run inside SQLite, and tags
+    /// for the surviving rows are fetched in one extra round-trip — so
+    /// an omnibar keystroke costs two queries regardless of how many
+    /// bookmarks exist, instead of one-per-bookmark (M40).
+    pub fn search_limited(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Bookmark>, BookmarkError> {
+        let limit = limit.map_or(NO_LIMIT, |n| i64::try_from(n).unwrap_or(i64::MAX));
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
-            return self.all();
+            return self.all_limited(limit);
         }
-        let all = self.all()?;
-        let mut scored: Vec<(u8, i64, Bookmark)> = Vec::new();
-        for bm in all {
-            let title_l = bm.title.as_deref().unwrap_or("").to_lowercase();
-            let url_l = bm.url.to_lowercase();
-            let rank = if title_l.contains(&needle) {
-                Some(0u8)
-            } else if url_l.contains(&needle) {
-                Some(1u8)
-            } else if bm.tags.iter().any(|t| t.contains(&needle)) {
-                Some(2u8)
-            } else {
-                None
-            };
-            if let Some(r) = rank {
-                scored.push((r, bm.modified.timestamp(), bm));
-            }
-        }
-        // Sort by (rank ASC, modified DESC). Stable sort, so equal-rank
-        // entries already sorted by modified DESC from `all()` keep
-        // that ordering — explicit sort just makes the contract loud.
-        scored.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        Ok(scored.into_iter().map(|(_, _, b)| b).collect())
+        let pattern = format!("%{}%", escape_like(&needle));
+        let conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
+        let mut stmt = conn.prepare(SEARCH_SQL)?;
+        let rows: Vec<BookmarkRow> = stmt
+            .query_map(params![pattern, limit], read_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        rows_to_bookmarks(&conn, rows)
     }
 
     /// All distinct tags, sorted alphabetically.
@@ -442,7 +371,19 @@ impl Bookmarks {
     /// loose HTML — unbalanced tags, no DTD, no closing `</DT>` — so a
     /// strict parser is overkill. We scan top-to-bottom, push folder
     /// names from `<H3>` onto a stack (popping on `</DL>`), and emit
-    /// one `add()` per `<A>`.
+    /// one upsert per `<A>`.
+    ///
+    /// **Atomic.** The whole walk runs in a single transaction (M42):
+    /// a 5 000-entry export is one commit, and a SQL failure part-way
+    /// through rolls the entire import back and returns `Err` rather
+    /// than leaving a half-imported store behind an `Ok(partial)`.
+    /// Entries whose `HREF` doesn't parse are still skipped
+    /// individually — that's malformed input, not a store failure, and
+    /// no SQL has been issued for them.
+    ///
+    /// HREFs and titles are HTML-entity-decoded (M41), so a real
+    /// browser export of `https://example.com/?a=1&amp;b=2` is stored
+    /// with a literal `&`.
     pub fn import_netscape(&self, html: &str) -> Result<usize, BookmarkError> {
         // Tokens we walk in document order. We can't reuse a single
         // regex because `regex` doesn't support overlapping captures,
@@ -484,6 +425,8 @@ impl Bookmarks {
         // the folder for tag-purposes).
         let mut folder_stack: Vec<String> = Vec::new();
         let mut count = 0usize;
+        let mut conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
+        let tx = conn.transaction()?;
         for (_, tok) in toks {
             match tok {
                 Tok::FolderOpen(label) => {
@@ -502,9 +445,9 @@ impl Bookmarks {
                             .map(|x| x.as_str())
                             .unwrap_or("")
                             .to_ascii_uppercase();
-                        let val = m.get(2).map(|x| x.as_str()).unwrap_or("");
+                        let val = decode_entities(m.get(2).map(|x| x.as_str()).unwrap_or(""));
                         match key.as_str() {
-                            "HREF" => href = Some(val.to_string()),
+                            "HREF" => href = Some(val.clone()),
                             "TAGS" => {
                                 for t in val.split(',') {
                                     let trimmed = t.trim();
@@ -534,17 +477,216 @@ impl Bookmarks {
                         Some(title)
                     };
                     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-                    match self.add(&href, title_opt.as_deref(), &tag_refs) {
+                    match add_in_tx(&tx, &href, title_opt.as_deref(), &tag_refs) {
                         Ok(_) => count += 1,
-                        Err(e) => {
+                        // Unparseable HREF — malformed input, not a
+                        // store failure, and no SQL was issued. Skip
+                        // the entry and keep the transaction alive.
+                        Err(e @ BookmarkError::Url { .. }) => {
                             debug!(error = %e, href = %href, "netscape import: skipping malformed entry");
                         }
+                        // Anything else is a real SQLite failure:
+                        // bail out and let the `tx` drop roll the
+                        // whole import back.
+                        Err(e) => return Err(e),
                     }
                 }
             }
         }
+        tx.commit()?;
         Ok(count)
     }
+}
+
+/// Row shape shared by every `SELECT` that hydrates a [`Bookmark`]:
+/// `(id, url, title, added, modified)`.
+type BookmarkRow = (i64, String, Option<String>, i64, i64);
+
+/// SQLite's `LIMIT` sentinel for "no limit".
+const NO_LIMIT: i64 = -1;
+
+/// Match + rank + cap, all inside SQLite.
+///
+/// `?1` is the `LIKE` pattern (already lowercased and `%`/`_`-escaped),
+/// `?2` the row cap (`-1` = unlimited).
+///
+/// The rank `CASE` reproduces the old Rust-side `if / else if / else if`
+/// exactly — title beats url beats tag, first hit wins — and the
+/// `ORDER BY rank, modified DESC, id DESC` reproduces the old stable
+/// sort over an `all()` that was already ordered `modified DESC,
+/// id DESC`. The `ELSE 2` arm is only ever reached for rows that got
+/// into the result set via the tag `EXISTS`, so it can't mislabel a
+/// non-matching row.
+const SEARCH_SQL: &str = r#"
+    SELECT b.id, b.url, b.title, b.added, b.modified,
+           CASE
+             WHEN buffr_lower(COALESCE(b.title, '')) LIKE ?1 ESCAPE '\' THEN 0
+             WHEN buffr_lower(b.url) LIKE ?1 ESCAPE '\' THEN 1
+             ELSE 2
+           END AS match_rank
+      FROM bookmarks b
+     WHERE buffr_lower(COALESCE(b.title, '')) LIKE ?1 ESCAPE '\'
+        OR buffr_lower(b.url) LIKE ?1 ESCAPE '\'
+        OR EXISTS (SELECT 1 FROM bookmark_tags t
+                    WHERE t.bookmark_id = b.id AND t.tag LIKE ?1 ESCAPE '\')
+     ORDER BY match_rank ASC, b.modified DESC, b.id DESC
+     LIMIT ?2
+"#;
+
+fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BookmarkRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+/// Register `buffr_lower(x)` — a Unicode-aware `lower()`.
+///
+/// SQLite's built-in `lower()` folds ASCII only, but `search` has
+/// always compared `str::to_lowercase()` output on both sides. Pushing
+/// the filter into SQL (M40) with the built-in would have silently
+/// dropped non-ASCII case-insensitivity, so we register the same
+/// folding SQLite-side. `LIKE '%needle%'` can't use an index either
+/// way, so this costs nothing the Rust-side scan didn't already cost.
+///
+/// Tags are exempt: they're stored already-lowercased by
+/// [`normalise_tags`], and the needle is lowercased too, so a plain
+/// `LIKE` is an exact substring test for them.
+fn register_lower(conn: &Connection) -> Result<(), BookmarkError> {
+    conn.create_scalar_function(
+        "buffr_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+    )
+    .map_err(|source| BookmarkError::Open { source })?;
+    Ok(())
+}
+
+/// Escape the `LIKE` metacharacters so a query of `50%` or `a_b`
+/// matches literally. Pairs with `ESCAPE '\'` in [`SEARCH_SQL`].
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Upsert one bookmark inside an existing transaction.
+///
+/// Split out of [`Bookmarks::add`] so `import_netscape` can push
+/// thousands of rows through a single transaction (M42) instead of
+/// paying one mutex acquisition and one WAL commit per bookmark.
+fn add_in_tx(
+    tx: &Transaction<'_>,
+    url: &str,
+    title: Option<&str>,
+    tags: &[&str],
+) -> Result<BookmarkId, BookmarkError> {
+    let canon = canonicalise(url)?;
+    let normalised_tags = normalise_tags(tags);
+    let title_owned = title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let now = Utc::now().timestamp();
+
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM bookmarks WHERE url = ?1",
+            params![canon],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let id = if let Some(id) = existing {
+        tx.execute(
+            "UPDATE bookmarks SET title = ?1, modified = ?2 WHERE id = ?3",
+            params![title_owned, now, id],
+        )?;
+        tx.execute(
+            "DELETE FROM bookmark_tags WHERE bookmark_id = ?1",
+            params![id],
+        )?;
+        id
+    } else {
+        tx.execute(
+            "INSERT INTO bookmarks (url, title, added, modified) VALUES (?1, ?2, ?3, ?3)",
+            params![canon, title_owned, now],
+        )?;
+        tx.last_insert_rowid()
+    };
+
+    for tag in &normalised_tags {
+        tx.execute(
+            "INSERT OR IGNORE INTO bookmark_tags (bookmark_id, tag) VALUES (?1, ?2)",
+            params![id, tag],
+        )?;
+    }
+
+    Ok(BookmarkId(id))
+}
+
+/// Hydrate `rows` into [`Bookmark`]s, fetching every row's tags in a
+/// single extra query instead of one per row (M40).
+fn rows_to_bookmarks(
+    conn: &Connection,
+    rows: Vec<BookmarkRow>,
+) -> Result<Vec<Bookmark>, BookmarkError> {
+    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let mut tags = load_tags_bulk(conn, &ids)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, url, title, added, modified)| Bookmark {
+            id: BookmarkId(id),
+            url,
+            title,
+            tags: tags.remove(&id).unwrap_or_default(),
+            added: ts_to_dt(added),
+            modified: ts_to_dt(modified),
+        })
+        .collect())
+}
+
+/// Tags for many bookmarks at once, keyed by bookmark id and sorted
+/// alpha within each id (same contract as [`load_tags`]).
+///
+/// Chunked so the bound-parameter count stays well under
+/// `SQLITE_MAX_VARIABLE_NUMBER` no matter how large the profile is.
+fn load_tags_bulk(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<String>>, BookmarkError> {
+    const CHUNK: usize = 500;
+    let mut out: HashMap<i64, Vec<String>> = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT bookmark_id, tag FROM bookmark_tags \
+             WHERE bookmark_id IN ({placeholders}) \
+             ORDER BY bookmark_id ASC, tag ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, tag) = row?;
+            out.entry(id).or_default().push(tag);
+        }
+    }
+    Ok(out)
 }
 
 fn load_tags(conn: &Connection, bookmark_id: i64) -> Result<Vec<String>, BookmarkError> {
@@ -554,11 +696,6 @@ fn load_tags(conn: &Connection, bookmark_id: i64) -> Result<Vec<String>, Bookmar
         .query_map(params![bookmark_id], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
-}
-
-fn ts_to_dt(secs: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 
 /// Parse + canonicalise a URL string.
@@ -580,13 +717,86 @@ fn normalise_tags(tags: &[&str]) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Strip a small set of HTML tags from a string. Netscape titles
-/// occasionally contain `<B>`, `<I>`, `<BR>`. We don't need a real
-/// HTML parser — just drop the angle-bracketed bits.
+/// Strip a small set of HTML tags from a string, then decode entities.
+/// Netscape titles occasionally contain `<B>`, `<I>`, `<BR>`. We don't
+/// need a real HTML parser — just drop the angle-bracketed bits.
+///
+/// Order matters: tags first, entities second. Decoding first would
+/// turn a literal `&lt;b&gt;` into `<b>` and the tag-stripper would
+/// then eat it.
 fn strip_html(s: &str) -> String {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("strip_html regex is a constant"));
-    re.replace_all(s, "").trim().to_string()
+    decode_entities(re.replace_all(s, "").trim())
+        .trim()
+        .to_string()
+}
+
+/// Decode the five standard XML entities plus numeric character
+/// references (`&#NN;`, `&#xHH;`).
+///
+/// Chrome / Firefox / Edge all escape `&` as `&amp;` in exported
+/// HREFs, so without this a real export of
+/// `https://example.com/?a=1&b=2` is stored — and later navigated
+/// to — as `…?a=1&amp;b=2`. `url::Url::parse` happily accepts the
+/// mangled form, which is what made the corruption silent (M41).
+///
+/// Single pass, left to right: the output is never re-scanned, so
+/// `&amp;#38;` correctly yields the literal text `&#38;` rather than
+/// double-decoding to `&`. Anything we don't recognise (`&nbsp;`, a
+/// bare `&` in a query string) is emitted verbatim.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        // Entity bodies are short. Cap the scan so a stray `&` in a
+        // query string can't swallow a `;` hundreds of bytes later.
+        const MAX_ENTITY_BODY: usize = 12;
+        let Some((end, _)) = after
+            .char_indices()
+            .take(MAX_ENTITY_BODY)
+            .find(|(_, c)| *c == ';')
+        else {
+            out.push('&');
+            rest = after;
+            continue;
+        };
+        let body = &after[..end];
+        match decode_entity_body(body) {
+            Some(ch) => out.push(ch),
+            None => {
+                out.push('&');
+                out.push_str(body);
+                out.push(';');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text between `&` and `;`. `None` for anything unrecognised.
+fn decode_entity_body(body: &str) -> Option<char> {
+    match body {
+        "amp" => return Some('&'),
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        _ => {}
+    }
+    let digits = body.strip_prefix('#')?;
+    let code = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    char::from_u32(code)
 }
 
 #[cfg(test)]
@@ -786,5 +996,309 @@ mod tests {
         let imported = b.import_netscape(html).unwrap();
         assert_eq!(imported, 1);
         assert_eq!(b.count().unwrap(), 1);
+    }
+
+    // ----- M40: search / by_tag pushed into SQL -----
+
+    #[test]
+    fn search_empty_query_returns_all() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://a.example/", Some("A"), &["t"]).unwrap();
+        b.add("https://b.example/", Some("B"), &[]).unwrap();
+        assert_eq!(b.search("   ").unwrap().len(), 2);
+        assert_eq!(b.search("").unwrap(), b.all().unwrap());
+    }
+
+    #[test]
+    fn search_is_case_insensitive_on_both_sides() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://x.test/", Some("MiXeD CaSe"), &[]).unwrap();
+        assert_eq!(b.search("mixed case").unwrap().len(), 1);
+        assert_eq!(b.search("MIXED CASE").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_folds_non_ascii_case_like_the_old_rust_filter() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://x.test/", Some("ÉCOLE Normale"), &[])
+            .unwrap();
+        // SQLite's built-in `lower()` is ASCII-only — this only passes
+        // because of the registered `buffr_lower`.
+        assert_eq!(b.search("école").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_best_rank_wins_when_several_fields_match() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        // Matches in title AND url AND tag — must appear exactly once,
+        // ranked as a title match.
+        b.add("https://foobar.test/", Some("Foobar"), &["foobar"])
+            .unwrap();
+        b.add("https://other.test/", Some("Other"), &["foobar"])
+            .unwrap();
+        let hits = b.search("foobar").unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://foobar.test/");
+        assert_eq!(hits[1].url, "https://other.test/");
+    }
+
+    #[test]
+    fn search_ties_break_by_modified_then_id_desc() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        // Same second, same rank (all title matches) → id DESC.
+        let ids: Vec<BookmarkId> = (0..4)
+            .map(|i| {
+                b.add(
+                    &format!("https://t{i}.example/"),
+                    Some(&format!("Tie {i}")),
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect();
+        let hits = b.search("tie").unwrap();
+        let got: Vec<BookmarkId> = hits.iter().map(|h| h.id).collect();
+        let mut want = ids.clone();
+        want.reverse();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn search_limited_caps_rows_but_keeps_ranking() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://zz.example/", Some("Unrelated"), &["needle"])
+            .unwrap();
+        b.add("https://needle.example/", Some("Unrelated"), &[])
+            .unwrap();
+        b.add("https://y.example/", Some("Needle Title"), &[])
+            .unwrap();
+
+        // Unlimited keeps the full ranked list.
+        let all_hits = b.search("needle").unwrap();
+        assert_eq!(all_hits.len(), 3);
+
+        // Limited returns the same prefix, not an arbitrary subset.
+        let two = b.search_limited("needle", Some(2)).unwrap();
+        assert_eq!(two, all_hits[..2].to_vec());
+        assert_eq!(b.search_limited("needle", Some(0)).unwrap().len(), 0);
+        assert_eq!(b.search_limited("needle", None).unwrap(), all_hits);
+        // Empty-query path honours the limit too.
+        assert_eq!(b.search_limited("", Some(1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_treats_like_metacharacters_literally() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://a.example/", Some("50% off"), &[]).unwrap();
+        b.add("https://b.example/", Some("50 percent off"), &[])
+            .unwrap();
+        b.add("https://c.example/", Some("a_b"), &[]).unwrap();
+        b.add("https://d.example/", Some("axb"), &[]).unwrap();
+
+        let pct = b.search("50%").unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].title.as_deref(), Some("50% off"));
+
+        let underscore = b.search("a_b").unwrap();
+        assert_eq!(underscore.len(), 1);
+        assert_eq!(underscore[0].title.as_deref(), Some("a_b"));
+
+        // A backslash in the query is literal too, not an escape.
+        b.add("https://e.example/", Some(r"back\slash"), &[])
+            .unwrap();
+        assert_eq!(b.search(r"back\slash").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_matches_tag_substrings_not_just_whole_tags() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://a.example/", Some("A"), &["programming"])
+            .unwrap();
+        let hits = b.search("gram").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tags, vec!["programming"]);
+    }
+
+    #[test]
+    fn search_and_by_tag_hydrate_tags_in_bulk() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://a.example/", Some("Alpha"), &["z", "a", "m"])
+            .unwrap();
+        b.add("https://b.example/", Some("Alpha two"), &[]).unwrap();
+
+        // Bulk load must still sort alpha within a bookmark, and must
+        // leave tagless rows with an empty vec (not drop the row).
+        let hits = b.search("alpha").unwrap();
+        assert_eq!(hits.len(), 2);
+        let a = hits.iter().find(|h| h.url == "https://a.example/").unwrap();
+        let b_hit = hits.iter().find(|h| h.url == "https://b.example/").unwrap();
+        assert_eq!(a.tags, vec!["a", "m", "z"]);
+        assert!(b_hit.tags.is_empty());
+
+        assert_eq!(b.by_tag("m").unwrap()[0].tags, vec!["a", "m", "z"]);
+        assert_eq!(b.all().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn bulk_tag_load_spans_chunk_boundary() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        // 600 rows > the 500-id chunk used by `load_tags_bulk`.
+        for i in 0..600 {
+            b.add(&format!("https://n{i}.example/"), Some("Chunky"), &["c"])
+                .unwrap();
+        }
+        let all = b.all().unwrap();
+        assert_eq!(all.len(), 600);
+        assert!(all.iter().all(|bm| bm.tags == vec!["c"]));
+        assert_eq!(b.search("chunky").unwrap().len(), 600);
+    }
+
+    // ----- M41: HTML entity decoding on import -----
+
+    #[test]
+    fn decode_entities_handles_named_and_numeric() {
+        assert_eq!(decode_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
+        assert_eq!(decode_entities("&quot;q&quot; &apos;a&apos;"), "\"q\" 'a'");
+        assert_eq!(decode_entities("&#38;"), "&");
+        assert_eq!(decode_entities("&#x26;"), "&");
+        assert_eq!(decode_entities("Caf&#xE9;"), "Café");
+        // Single pass — no double decoding.
+        assert_eq!(decode_entities("&amp;#38;"), "&#38;");
+        // Unknown / malformed left verbatim.
+        assert_eq!(decode_entities("&nbsp;"), "&nbsp;");
+        assert_eq!(decode_entities("a & b"), "a & b");
+        assert_eq!(decode_entities("trailing&"), "trailing&");
+        assert_eq!(decode_entities("&#x110000;"), "&#x110000;");
+        assert_eq!(decode_entities("no entities here"), "no entities here");
+    }
+
+    /// Trimmed-down but byte-accurate shape of a Chrome export.
+    const NETSCAPE_ESCAPED_FIXTURE: &str = r#"<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<TITLE>Bookmarks</TITLE>
+<H1>Bookmarks</H1>
+<DL><p>
+    <DT><H3 ADD_DATE="1700000000" LAST_MODIFIED="1700000009">R&amp;D</H3>
+    <DL><p>
+        <DT><A HREF="https://example.com/?a=1&amp;b=2" ADD_DATE="1700000001">Tom &amp; Jerry</A>
+        <DT><A HREF="https://example.com/q?s=%22x%22&amp;t=1" ADD_DATE="1700000002">Quote &quot;x&quot; &#38; more</A>
+        <DT><A HREF="https://example.com/e?v=a&#38;w=b" ADD_DATE="1700000003">Caf&#xe9; &lt;b&gt;bold&lt;/b&gt;</A>
+    </DL><p>
+</DL><p>
+"#;
+
+    #[test]
+    fn import_netscape_decodes_entities_in_href_and_title() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        assert_eq!(b.import_netscape(NETSCAPE_ESCAPED_FIXTURE).unwrap(), 3);
+
+        // Folder name entity-decoded before it becomes a tag.
+        let folder = b.by_tag("r&d").unwrap();
+        assert_eq!(folder.len(), 3);
+
+        let urls: Vec<String> = b.all().unwrap().into_iter().map(|x| x.url).collect();
+        assert!(urls.contains(&"https://example.com/?a=1&b=2".to_string()));
+        assert!(urls.contains(&"https://example.com/q?s=%22x%22&t=1".to_string()));
+        assert!(urls.contains(&"https://example.com/e?v=a&w=b".to_string()));
+        // The corrupted forms must not be present.
+        assert!(!urls.iter().any(|u| u.contains("&amp;")));
+
+        let titles: Vec<String> = b
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter_map(|x| x.title)
+            .collect();
+        assert!(titles.contains(&"Tom & Jerry".to_string()));
+        assert!(titles.contains(&"Quote \"x\" & more".to_string()));
+        // Real `<b>` tags stripped; the escaped ones survive as text.
+        assert!(titles.contains(&"Café <b>bold</b>".to_string()));
+    }
+
+    #[test]
+    fn import_netscape_strips_real_tags_but_keeps_escaped_ones() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html = r#"<DL>
+            <DT><A HREF="https://a.example/"><B>Bold</B> title</A>
+        </DL>"#;
+        b.import_netscape(html).unwrap();
+        let bm = &b.all().unwrap()[0];
+        assert_eq!(bm.title.as_deref(), Some("Bold title"));
+    }
+
+    // ----- M42: import is one transaction -----
+
+    #[test]
+    fn import_netscape_rolls_back_on_sql_failure() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        b.add("https://pre.example/", Some("Pre-existing"), &[])
+            .unwrap();
+        {
+            let conn = b.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON bookmarks \
+                 WHEN new.url LIKE '%boom%' \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        }
+        let html = r#"<DL>
+            <DT><A HREF="https://one.example/">One</A>
+            <DT><A HREF="https://boom.example/">Boom</A>
+            <DT><A HREF="https://three.example/">Three</A>
+        </DL>"#;
+        let err = b.import_netscape(html);
+        assert!(
+            matches!(err, Err(BookmarkError::Query { .. })),
+            "expected a store error, got {err:?}"
+        );
+        // Nothing from the import survived, but the pre-existing row did.
+        assert_eq!(b.count().unwrap(), 1);
+        assert_eq!(b.all().unwrap()[0].url, "https://pre.example/");
+    }
+
+    #[test]
+    fn import_netscape_still_skips_bad_urls_without_aborting() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html = r#"<DL>
+            <DT><A HREF="https://one.example/">One</A>
+            <DT><A HREF="not a url">Bad</A>
+            <DT><A HREF="https://three.example/">Three</A>
+        </DL>"#;
+        assert_eq!(b.import_netscape(html).unwrap(), 2);
+        assert_eq!(b.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn import_netscape_commits_everything_in_one_go() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let mut html = String::from("<DL>");
+        for i in 0..200 {
+            html.push_str(&format!(
+                "<DT><A HREF=\"https://bulk{i}.example/\">Bulk {i}</A>"
+            ));
+        }
+        html.push_str("</DL>");
+        assert_eq!(b.import_netscape(&html).unwrap(), 200);
+        assert_eq!(b.count().unwrap(), 200);
+    }
+
+    // ----- M54: refuse a schema from the future -----
+
+    #[test]
+    fn schema_newer_than_binary_is_refused() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let mut conn = b.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schema_version(version) VALUES (?1)",
+            params![schema::latest_version() + 1],
+        )
+        .unwrap();
+        let err = schema::apply(&mut conn).unwrap_err();
+        assert!(
+            matches!(err, BookmarkError::SchemaTooNew { .. }),
+            "got {err:?}"
+        );
     }
 }

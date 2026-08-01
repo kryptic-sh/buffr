@@ -17,3 +17,4 @@ thiserror = "2"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 url = "2"
+buffr-store = { workspace = true, features = ["chrono"] }

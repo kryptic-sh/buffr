@@ -16,10 +16,11 @@ publish.workspace = true
 # / Decision types (e.g. buffr-engine pulled into a Servo build that
 # can't tolerate the rusqlite transitive deps).
 default = ["store"]
-store = ["dep:rusqlite"]
+store = ["dep:rusqlite", "dep:buffr-store"]
 
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+buffr-store = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

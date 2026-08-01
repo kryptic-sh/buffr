@@ -33,8 +33,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use buffr_store::ts_to_dt;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -124,6 +125,11 @@ pub enum HistoryError {
         source: rusqlite::Error,
         version: i64,
     },
+    /// The on-disk schema is newer than this binary understands —
+    /// the profile was written by a newer buffr. Refusing beats
+    /// silently running old code against a newer schema.
+    #[error("database schema v{found} is newer than supported v{supported}")]
+    SchemaTooNew { found: i64, supported: i64 },
     #[error("query failed")]
     Query {
         #[from]
@@ -229,12 +235,8 @@ impl History {
         clock: Box<dyn Clock>,
         skip_schemes: Vec<String>,
     ) -> Result<Self, HistoryError> {
-        let mut conn = Connection::open_with_flags(
-            path.as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .map_err(|source| HistoryError::Open { source })?;
-        Self::tune(&conn)?;
+        let mut conn = buffr_store::open_tuned(path.as_ref())
+            .map_err(|source| HistoryError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -271,29 +273,13 @@ impl History {
         skip_schemes: Vec<String>,
     ) -> Result<Self, HistoryError> {
         let mut conn =
-            Connection::open_in_memory().map_err(|source| HistoryError::Open { source })?;
-        Self::tune(&conn)?;
+            buffr_store::open_tuned_in_memory().map_err(|source| HistoryError::Open { source })?;
         schema::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
             skip_schemes,
         })
-    }
-
-    /// Apply per-connection pragmas. WAL gives us non-blocking reads
-    /// while a writer is active; `synchronous=NORMAL` is safe under
-    /// WAL and avoids fsync-per-commit thrash. `foreign_keys=ON` is
-    /// belt-and-braces: we don't have FKs in v1 but every future
-    /// migration that adds them will Just Work.
-    fn tune(conn: &Connection) -> Result<(), HistoryError> {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|source| HistoryError::Open { source })?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|source| HistoryError::Open { source })?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|source| HistoryError::Open { source })?;
-        Ok(())
     }
 
     /// Record a single visit. Performs URL canonicalisation, scheme
@@ -509,11 +495,6 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     })
 }
 
-fn ts_to_dt(secs: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
-}
-
 /// Parse + canonicalise a URL string. Returns `None` when parsing
 /// fails. We round-trip via `url::Url` so trailing whitespace, mixed
 /// case in the scheme/host, and default ports get normalised.
@@ -539,6 +520,24 @@ mod tests {
 
     fn fixed_clock(secs: i64) -> MockClock {
         MockClock::new(DateTime::<Utc>::from_timestamp(secs, 0).expect("ts"))
+    }
+
+    /// M54: a profile written by a newer buffr must be refused, not
+    /// silently opened with an older binary's expectations.
+    #[test]
+    fn schema_newer_than_binary_is_refused() {
+        let store = History::open_in_memory().unwrap();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schema_version(version) VALUES (?1)",
+            params![schema::latest_version() + 1],
+        )
+        .unwrap();
+        let err = schema::apply(&mut conn).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::SchemaTooNew { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

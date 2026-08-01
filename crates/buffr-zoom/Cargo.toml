@@ -18,3 +18,4 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
 url = "2"
+buffr-store = { workspace = true }

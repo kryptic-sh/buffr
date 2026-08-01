@@ -434,7 +434,6 @@ name = "buffr-app"
 version = "0.14.6"
 dependencies = [
  "anyhow",
- "bitflags 2.11.1",
  "buffr-bookmarks",
  "buffr-cef",
  "buffr-config",
@@ -474,6 +473,7 @@ dependencies = [
 name = "buffr-bookmarks"
 version = "0.1.2"
 dependencies = [
+ "buffr-store",
  "chrono",
  "regex",
  "rusqlite",
@@ -561,6 +561,7 @@ dependencies = [
 name = "buffr-downloads"
 version = "0.1.3"
 dependencies = [
+ "buffr-store",
  "chrono",
  "rusqlite",
  "serde",
@@ -593,6 +594,7 @@ dependencies = [
 name = "buffr-history"
 version = "0.1.2"
 dependencies = [
+ "buffr-store",
  "chrono",
  "rusqlite",
  "serde",
@@ -620,11 +622,21 @@ dependencies = [
 name = "buffr-permissions"
 version = "0.1.3"
 dependencies = [
+ "buffr-store",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "buffr-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -648,6 +660,7 @@ dependencies = [
 name = "buffr-zoom"
 version = "0.1.2"
 dependencies = [
+ "buffr-store",
  "rusqlite",
  "thiserror 2.0.18",
  "tracing",

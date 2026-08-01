@@ -1,0 +1,25 @@
+[package]
+name = "buffr-store"
+description = "Shared SQLite plumbing (open/tune + forward-only migrations) for the buffr stores."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# `ts_to_dt` is the only chrono-flavoured helper. Off by default so
+# `buffr-zoom` / `buffr-permissions` — which only want `open_tuned`,
+# `apply` and `current_unix_time` — don't pull chrono in.
+chrono = ["dep:chrono"]
+
+[dependencies]
+rusqlite = { version = "0.39", features = ["bundled"] }
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+], optional = true }
