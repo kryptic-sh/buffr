@@ -7,6 +7,9 @@
 //! - `find(forward = true|false)` for the boolean-tagged find action.
 //! - `enter_mode("normal" | "visual" | "command" | "hint")` for mode
 //!   transitions.
+//! - `tab_reorder(from = N, to = N)` and `engine(<id>)` — not intended to
+//!   be written by hand, but emitted by `--print-config` and therefore
+//!   accepted so the printed config round-trips.
 //!
 //! Anything else returns a clear error that mentions the offending token.
 
@@ -163,8 +166,52 @@ fn parse_with_args(name: &str, args: &str) -> Result<PageAction, KeyBindingError
             };
             Ok(EnterMode(mode))
         }
+        // `tab_reorder` and `engine` are not bindable by hand today, but
+        // `action_to_string` emits them for `--print-config`, so they must
+        // parse back or the printed config would be un-loadable.
+        "tab_reorder" => {
+            let (from_arg, to_arg) =
+                args.split_once(',')
+                    .ok_or_else(|| KeyBindingError::BadArg {
+                        action: "tab_reorder".into(),
+                        msg: format!("expected `from = N, to = N`, got {args:?}"),
+                    })?;
+            let from = parse_kv_u32(from_arg, "from").map_err(|msg| KeyBindingError::BadArg {
+                action: "tab_reorder".into(),
+                msg,
+            })?;
+            let to = parse_kv_u32(to_arg, "to").map_err(|msg| KeyBindingError::BadArg {
+                action: "tab_reorder".into(),
+                msg,
+            })?;
+            Ok(TabReorder { from, to })
+        }
+        "engine" => {
+            // `action_to_string` emits the id bare; accept a quoted form too.
+            let id = strip_string_lit(args).unwrap_or(args).trim();
+            if id.is_empty() {
+                return Err(KeyBindingError::BadArg {
+                    action: "engine".into(),
+                    msg: "expected a non-empty engine id".into(),
+                });
+            }
+            Ok(Engine(id.to_string()))
+        }
         other => Err(KeyBindingError::UnknownAction(other.into())),
     }
+}
+
+fn parse_kv_u32(s: &str, key: &str) -> Result<u32, String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected `{key} = N`, got {s:?}"))?;
+    let k = k.trim();
+    if k != key {
+        return Err(format!("expected key {key:?}, got {k:?}"));
+    }
+    let v = v.trim();
+    v.parse()
+        .map_err(|_| format!("expected non-negative integer for {key}, got {v:?}"))
 }
 
 fn parse_kv_bool(s: &str, key: &str) -> Result<bool, String> {
@@ -321,10 +368,54 @@ mod tests {
             PageAction::Reload,
             PageAction::Find { forward: false },
             PageAction::EnterMode(PageMode::Visual),
+            PageAction::TabReorder { from: 0, to: 4 },
+            PageAction::Engine("cef".into()),
+            PageAction::Engine("servo-nightly".into()),
         ] {
             let s = action_to_string(&action);
-            let back = parse_action(&s).unwrap();
+            let back =
+                parse_action(&s).unwrap_or_else(|e| panic!("{s:?} failed to parse back: {e}"));
             assert_eq!(back, action, "round trip failed for {s}");
         }
+    }
+
+    #[test]
+    fn tab_reorder_parses() {
+        assert_eq!(
+            parse_action("tab_reorder(from = 2, to = 7)").unwrap(),
+            PageAction::TabReorder { from: 2, to: 7 }
+        );
+        assert_eq!(
+            parse_action("tab_reorder(from=2,to=7)").unwrap(),
+            PageAction::TabReorder { from: 2, to: 7 }
+        );
+        assert!(matches!(
+            parse_action("tab_reorder(from = 2)"),
+            Err(KeyBindingError::BadArg { .. })
+        ));
+        assert!(matches!(
+            parse_action("tab_reorder(to = 2, from = 7)"),
+            Err(KeyBindingError::BadArg { .. })
+        ));
+        assert!(matches!(
+            parse_action("tab_reorder(from = x, to = 7)"),
+            Err(KeyBindingError::BadArg { .. })
+        ));
+    }
+
+    #[test]
+    fn engine_parses_bare_and_quoted() {
+        assert_eq!(
+            parse_action("engine(cef)").unwrap(),
+            PageAction::Engine("cef".into())
+        );
+        assert_eq!(
+            parse_action("engine(\"cef\")").unwrap(),
+            PageAction::Engine("cef".into())
+        );
+        assert!(matches!(
+            parse_action("engine()"),
+            Err(KeyBindingError::BadArg { .. })
+        ));
     }
 }

@@ -146,16 +146,17 @@ fn looks_like_url(s: &str) -> bool {
         return false;
     }
     // Strip optional `:port`.
-    let (host, port) = match head.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
-        _ => (head, None),
+    let host = match head.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => head,
     };
     if host.is_empty() {
         return false;
     }
-    // Special-case `localhost`.
+    // Special-case `localhost`: it has no dot, so the generic hostname
+    // rule below would reject it. Always URL-like, with or without a port.
     if host.eq_ignore_ascii_case("localhost") {
-        return port.is_some() || port.is_none();
+        return true;
     }
     // IPv4 dotted quad.
     if is_ipv4(host) {

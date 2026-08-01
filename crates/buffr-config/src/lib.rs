@@ -214,12 +214,17 @@ impl Default for Theme {
 /// emits 6-digit hex.
 pub fn parse_hex_rgb(s: &str) -> Option<u32> {
     let s = s.trim();
-    if s.len() != 7 || !s.starts_with('#') {
+    // `s.len()` is a *byte* count, so a 7-byte string containing a
+    // multi-byte codepoint (`"#a€aa"`) would pass a length-only guard and
+    // then panic when sliced at fixed byte offsets. Require ASCII first so
+    // byte offsets and char offsets are guaranteed to agree, and use
+    // `get()` so any residual mismatch yields `None` instead of a panic.
+    if !s.is_ascii() || s.len() != 7 || !s.starts_with('#') {
         return None;
     }
-    let r = u32::from_str_radix(&s[1..3], 16).ok()?;
-    let g = u32::from_str_radix(&s[3..5], 16).ok()?;
-    let b = u32::from_str_radix(&s[5..7], 16).ok()?;
+    let r = u32::from_str_radix(s.get(1..3)?, 16).ok()?;
+    let g = u32::from_str_radix(s.get(3..5)?, 16).ok()?;
+    let b = u32::from_str_radix(s.get(5..7)?, 16).ok()?;
     Some(0xFF_00_00_00 | (r << 16) | (g << 8) | b)
 }
 
@@ -672,6 +677,8 @@ where
 /// Checks:
 ///
 /// - `general.leader` is exactly one character.
+/// - Every `[theme]` colour is a parseable `#RRGGBB` string.
+/// - `crash_reporter.purge_after_days` is greater than zero.
 /// - `search.default_engine` references a defined engine.
 /// - Every keymap binding string parses via `buffr_modal::parse_keys`.
 pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
@@ -753,6 +760,40 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 location: Some("updates.check_interval_hours".into()),
             });
         }
+    }
+
+    // -- theme ----------------------------------------------------------
+    // `build_palette` falls back to the built-in default for any colour
+    // it can't parse, so without this check `accent = "not-a-color"`
+    // silently reverts to the built-in blue while `--check-config`
+    // reports success.
+    {
+        let colours: [(&str, &str); 6] = [
+            ("theme.accent", cfg.theme.accent.as_str()),
+            ("theme.cert_secure", cfg.theme.cert_secure.as_str()),
+            ("theme.cert_insecure", cfg.theme.cert_insecure.as_str()),
+            ("theme.private", cfg.theme.private.as_str()),
+            ("theme.progress", cfg.theme.progress.as_str()),
+            ("theme.update", cfg.theme.update.as_str()),
+        ];
+        for (field, value) in colours {
+            if parse_hex_rgb(value).is_none() {
+                return Err(ConfigError::Validate {
+                    message: format!("{field} must be a `#RRGGBB` hex colour (got {value:?})"),
+                    location: Some(field.into()),
+                });
+            }
+        }
+    }
+
+    // -- crash_reporter ---------------------------------------------------
+    // `0` would make `--purge-crashes` delete every report, including the
+    // one just written for the crash the user is trying to inspect.
+    if cfg.crash_reporter.purge_after_days == 0 {
+        return Err(ConfigError::Validate {
+            message: "crash_reporter.purge_after_days must be > 0".into(),
+            location: Some("crash_reporter.purge_after_days".into()),
+        });
     }
 
     if !cfg.search.engines.contains_key(&cfg.search.default_engine) {
@@ -1018,6 +1059,104 @@ mod tests {
         cfg.general.leader = "abc".into();
         let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, ConfigError::Validate { .. }));
+    }
+
+    #[test]
+    fn parse_hex_rgb_accepts_valid() {
+        assert_eq!(parse_hex_rgb("#000000"), Some(0xFF_00_00_00));
+        assert_eq!(parse_hex_rgb("#ffffff"), Some(0xFF_FF_FF_FF));
+        assert_eq!(parse_hex_rgb("  #7aa2f7  "), Some(0xFF_7A_A2_F7));
+    }
+
+    #[test]
+    fn parse_hex_rgb_rejects_non_ascii_without_panicking() {
+        // 7 *bytes* but only 5 chars — the old fixed byte-offset slicing
+        // split the `€` codepoint and panicked (H2).
+        // Each of these is exactly 7 bytes with a multi-byte codepoint
+        // straddling one of the `[1..3]` / `[3..5]` / `[5..7]` boundaries.
+        for s in [
+            "#a\u{20ac}aa",
+            "#\u{20ac}aaa",
+            "#aa\u{20ac}a",
+            "#aaa\u{20ac}",
+        ] {
+            assert_eq!(s.len(), 7, "{s:?} should be 7 bytes");
+            assert_eq!(parse_hex_rgb(s), None, "{s:?} should not parse");
+        }
+        // Assorted other non-ASCII shapes must not panic either.
+        assert_eq!(parse_hex_rgb("\u{20ac}aaaaa"), None);
+        assert_eq!(parse_hex_rgb("#\u{1F600}aa"), None);
+        assert_eq!(parse_hex_rgb("\u{1F600}\u{1F600}"), None);
+        assert_eq!(parse_hex_rgb("#\u{e9}\u{e9}\u{e9}"), None);
+    }
+
+    #[test]
+    fn parse_hex_rgb_rejects_malformed_ascii() {
+        assert_eq!(parse_hex_rgb(""), None);
+        assert_eq!(parse_hex_rgb("#fff"), None);
+        assert_eq!(parse_hex_rgb("7aa2f7"), None);
+        assert_eq!(parse_hex_rgb("#zzzzzz"), None);
+        assert_eq!(parse_hex_rgb("not-a-color"), None);
+    }
+
+    #[test]
+    fn validate_rejects_bad_theme_colour() {
+        for field in [
+            "accent",
+            "cert_secure",
+            "cert_insecure",
+            "private",
+            "progress",
+            "update",
+        ] {
+            let mut cfg = Config::default();
+            match field {
+                "accent" => cfg.theme.accent = "not-a-color".into(),
+                "cert_secure" => cfg.theme.cert_secure = "not-a-color".into(),
+                "cert_insecure" => cfg.theme.cert_insecure = "not-a-color".into(),
+                "private" => cfg.theme.private = "not-a-color".into(),
+                "progress" => cfg.theme.progress = "not-a-color".into(),
+                "update" => cfg.theme.update = "not-a-color".into(),
+                _ => unreachable!(),
+            }
+            let err = validate(&cfg).unwrap_err();
+            match err {
+                ConfigError::Validate { message, location } => {
+                    assert!(message.contains("not-a-color"), "unexpected msg: {message}");
+                    assert_eq!(location.as_deref(), Some(format!("theme.{field}").as_str()));
+                }
+                other => panic!("expected Validate error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_ascii_theme_colour() {
+        let mut cfg = Config::default();
+        cfg.theme.accent = "#a\u{20ac}aa".into();
+        assert!(matches!(validate(&cfg), Err(ConfigError::Validate { .. })));
+    }
+
+    #[test]
+    fn validate_accepts_default_theme() {
+        validate(&Config::default()).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_zero_purge_after_days() {
+        let mut cfg = Config::default();
+        cfg.crash_reporter.purge_after_days = 0;
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, location } => {
+                assert!(
+                    message.contains("purge_after_days"),
+                    "unexpected: {message}"
+                );
+                assert_eq!(location.as_deref(), Some("crash_reporter.purge_after_days"));
+            }
+            other => panic!("expected Validate error, got {other:?}"),
+        }
     }
 
     #[test]

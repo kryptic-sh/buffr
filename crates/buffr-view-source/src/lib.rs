@@ -46,10 +46,15 @@ pub fn render(url: &str, source: &[u8]) -> String {
         return build_page(url, &format!("<pre>{notice}</pre>"));
     }
 
+    // Decode lossily exactly once, up front, and highlight the *decoded*
+    // bytes. Highlighter span offsets index whatever slice they were
+    // produced from; if we highlighted the raw bytes but sliced the decoded
+    // string, every invalid byte (which becomes a 3-byte U+FFFD) would shift
+    // the two out of sync and the slices would land mid-codepoint.
     let text = String::from_utf8_lossy(source);
 
     // Try syntax-highlighted path.
-    match try_highlight(url, source) {
+    match try_highlight(url, &text) {
         Some(highlighted) => build_page(url, &highlighted),
         None => {
             let escaped = html_escape(&text);
@@ -58,11 +63,15 @@ pub fn render(url: &str, source: &[u8]) -> String {
     }
 }
 
-/// Attempts to syntax-highlight `source` for the language detected from `url`.
+/// Attempts to syntax-highlight `text` for the language detected from `url`.
+///
+/// `text` must already be valid UTF-8 (the caller lossy-decodes once); span
+/// offsets are taken against `text.as_bytes()` so they always agree with the
+/// string we slice.
 ///
 /// Returns `Some(html_fragment)` on success, `None` when no grammar matches or
 /// any step fails (caller falls back to plain `<pre>`).
-fn try_highlight(url: &str, source: &[u8]) -> Option<String> {
+fn try_highlight(url: &str, text: &str) -> Option<String> {
     let registry = match GrammarRegistry::embedded() {
         Ok(r) => r,
         Err(e) => {
@@ -104,12 +113,11 @@ fn try_highlight(url: &str, source: &[u8]) -> Option<String> {
         }
     };
 
-    let spans = highlighter.highlight(source);
-    let text = String::from_utf8_lossy(source);
+    let spans = highlighter.highlight(text.as_bytes());
 
     // Build highlighted HTML: walk spans in order, emitting spans and
     // unstyled text between them.
-    let mut html = String::with_capacity(source.len() * 2);
+    let mut html = String::with_capacity(text.len() * 2);
     html.push_str("<pre><code>");
 
     let mut cursor = 0usize;
@@ -117,24 +125,36 @@ fn try_highlight(url: &str, source: &[u8]) -> Option<String> {
     for span in &spans {
         let range = &span.byte_range;
 
-        // Emit any plain text before this span.
-        if cursor < range.start {
-            let plain = html_escape(&text[cursor..range.start]);
-            html.push_str(&plain);
+        // Defensive: the grammar's spans are *supposed* to be ordered,
+        // non-overlapping and byte-boundary aligned, but nothing here
+        // enforces that. Skip any span that goes backwards, is inverted, or
+        // whose slices don't land on char boundaries — indexing on any of
+        // those would panic on user-supplied page source.
+        if range.start < cursor || range.end < range.start {
+            continue;
         }
+        let (Some(plain), Some(content)) = (
+            text.get(cursor..range.start),
+            text.get(range.start..range.end),
+        ) else {
+            continue;
+        };
+
+        // Emit any plain text before this span.
+        html.push_str(&html_escape(plain));
 
         // Emit this highlighted span.
         let class = capture_to_class(span.capture());
-        let content = html_escape(&text[range.start..range.end]);
-        html.push_str(&format!("<span class=\"{class}\">{content}</span>"));
+        let escaped = html_escape(content);
+        html.push_str(&format!("<span class=\"{class}\">{escaped}</span>"));
 
         cursor = range.end;
     }
 
-    // Emit any trailing plain text.
-    if cursor < text.len() {
-        let tail = html_escape(&text[cursor..]);
-        html.push_str(&tail);
+    // Emit any trailing plain text. `cursor` is always a char boundary
+    // (it only ever advances to the end of a successfully sliced range).
+    if let Some(tail) = text.get(cursor..) {
+        html.push_str(&html_escape(tail));
     }
 
     html.push_str("</code></pre>");
@@ -271,5 +291,63 @@ mod tests {
     fn capture_to_class_dots_become_dashes() {
         assert_eq!(capture_to_class("function.macro"), "hl-function-macro");
         assert_eq!(capture_to_class("keyword"), "hl-keyword");
+    }
+
+    #[test]
+    fn render_invalid_utf8_does_not_panic() {
+        // Stray 0xFF bytes each decode to a 3-byte U+FFFD, so the lossy
+        // string is longer than the raw source. Highlighting the raw bytes
+        // and slicing the decoded string used to land mid-replacement-char
+        // and panic with "byte index is not a char boundary" (H3).
+        let source = b"fn main() {\n    let s = \"\xff\xfe caf\xe9\";\n}\n";
+        let html = render("https://example.com/main.rs", source);
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        // The highlighter path really did run (tokens are wrapped in spans,
+        // so `fn main` is not contiguous in the output).
+        assert!(html.contains("<span class=\"hl-"), "expected highlighting");
+        // Every invalid byte survives as exactly one U+FFFD — nothing was
+        // dropped by the boundary guard and nothing was duplicated.
+        assert_eq!(
+            html.matches('\u{FFFD}').count(),
+            3,
+            "expected the three invalid bytes to survive as U+FFFD"
+        );
+        assert!(html.contains("main"));
+        // `let s` is emitted verbatim; nothing before the bad bytes is lost.
+        assert!(html.contains("let"));
+    }
+
+    #[test]
+    fn render_invalid_utf8_unknown_extension_does_not_panic() {
+        let html = render("https://example.com/blob.unknownext", b"\xff\xfe\xff\xfe");
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn render_lone_invalid_byte_is_lossless_in_length() {
+        // A single 0xFF at every offset of an otherwise-ASCII buffer.
+        for i in 0..12usize {
+            let mut source = b"fn a(){b();}".to_vec();
+            source[i] = 0xFF;
+            let html = render("https://example.com/x.rs", &source);
+            assert!(html.starts_with("<!DOCTYPE html>"), "failed at offset {i}");
+        }
+    }
+
+    #[test]
+    fn render_multibyte_utf8_is_preserved() {
+        let html = render(
+            "https://example.com/main.rs",
+            "fn main() { \"café €\"; }".as_bytes(),
+        );
+        assert!(html.contains("caf\u{e9}"));
+        assert!(html.contains('\u{20ac}'));
+    }
+
+    #[test]
+    fn render_empty_source() {
+        let html = render("https://example.com/main.rs", b"");
+        assert!(html.starts_with("<!DOCTYPE html>"));
     }
 }
