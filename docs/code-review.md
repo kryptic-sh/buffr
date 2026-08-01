@@ -41,19 +41,21 @@ build too, and `apps/buffr` cross-checks for `x86_64-pc-windows-gnu`.
 | W2  | Any page can read the system clipboard via `fetch('buffr-clipboard:read')` (webkit only).                      |
 | W8  | Renderer-controlled URIs go to `xdg-open` with no prompt (webkit only).                                        |
 
-**Two things that could not be verified here** and want a manual pass:
+Everything still outstanding — the decisions above, the verification gaps, the
+accepted limitations, and the corrections to this document — is consolidated in
+[`backlog.md`](./backlog.md). The short version:
 
-- No display server was available, so nothing was smoke-tested in a running
-  browser. The paint/occlusion rework (H8, M33, M34) and the `buffr-src:`
-  allowlist (M13) are the changes most worth exercising by hand.
-- The Windows supervisor fixes (M2, M3, M8, M9) cross-compile but were never
-  executed; `restart_on_crash_windows.rs` was rewritten and needs a Windows CI
-  run.
+- The browser **has** since been exercised end to end under headless sway,
+  locally and on CI, so the paint path (H8, M33, M34) is no longer unverified.
+  The `buffr-src:` allow-list (M13) still is.
+- CI runs `cargo test` on **Linux only**, so the Windows supervisor fixes (M2,
+  M3, M8, M9) are cross-compiled and linted but never executed. That is the
+  largest remaining gap.
 
-Two review claims turned out to be **wrong** and were deliberately not "fixed":
-`TYPEFLAG_FRAME` (L39) does have a caller, and `ActivationError` (L21) is live
-via `request_activation`. The "cef-147 vs 148" half of L46 was also wrong — the
-`cef` crate at 148.x wraps libcef 147.0.14, so the docs were already right.
+Three claims in this document turned out to be **wrong** and were deliberately
+not "fixed": `TYPEFLAG_FRAME` (L39) does have a caller, `ActivationError` (L21)
+is live via `request_activation`, and the "cef-147 vs 148" half of L46 was a
+misreading — the `cef` crate at 148.x wraps libcef 147.0.14.
 
 ---
 
