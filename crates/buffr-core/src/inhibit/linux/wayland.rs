@@ -16,17 +16,14 @@
 //!
 //! A worker thread owns the `Connection`, `EventQueue`, the bound
 //! `ZwpIdleInhibitManagerV1`, and the current `ZwpIdleInhibitorV1` (if any).
-//! Commands arrive from the UI thread via an `mpsc` channel. `is_active()` is
-//! backed by an `AtomicBool` updated by the worker.
+//! Commands arrive from the UI thread over the bounded, never-blocking channel
+//! owned by the shared `WorkerInhibitor` in `inhibit/mod.rs`, which also carries
+//! the `AtomicBool` backing `is_active()`.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
-    },
-    thread,
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 
 use wayland_client::{
@@ -39,14 +36,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 };
 
 use super::{IdleInhibitor, InhibitError};
-
-// ── Command channel ───────────────────────────────────────────────────────────
-
-enum InhibitCmd {
-    Acquire,
-    Release,
-    Shutdown,
-}
+use crate::inhibit::worker::{InhibitCmd, WorkerInhibitor};
 
 // ── Worker state (Dispatch implementations) ───────────────────────────────────
 
@@ -91,73 +81,9 @@ impl Dispatch<ZwpIdleInhibitorV1, ()> for WorkerState {
     }
 }
 
-// ── Public inhibitor struct ───────────────────────────────────────────────────
-
-/// Wayland idle inhibitor using `zwp_idle_inhibit_manager_v1`.
-pub(super) struct WaylandInhibitor {
-    tx: SyncSender<InhibitCmd>,
-    active: Arc<AtomicBool>,
-    /// Join handle so Drop can wait briefly for the worker.
-    worker: Option<thread::JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for WaylandInhibitor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WaylandInhibitor")
-            .field("active", &self.active.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-impl IdleInhibitor for WaylandInhibitor {
-    fn acquire(&self) -> Result<(), InhibitError> {
-        if self.active.load(Ordering::Relaxed) {
-            return Ok(()); // idempotent
-        }
-        self.tx
-            .send(InhibitCmd::Acquire)
-            .map_err(|_| InhibitError::PlatformError("wayland worker thread disconnected".into()))
-    }
-
-    fn release(&self) -> Result<(), InhibitError> {
-        if !self.active.load(Ordering::Relaxed) {
-            return Ok(()); // idempotent
-        }
-        self.tx
-            .send(InhibitCmd::Release)
-            .map_err(|_| InhibitError::PlatformError("wayland worker thread disconnected".into()))
-    }
-
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for WaylandInhibitor {
-    fn drop(&mut self) {
-        // Best-effort: ask the worker to release and exit. Ignore send errors
-        // (the worker may have already exited on its own).
-        let _ = self.tx.send(InhibitCmd::Release);
-        let _ = self.tx.send(InhibitCmd::Shutdown);
-
-        // Wait for the worker to exit, but give it at most 100 ms so we
-        // don't stall application shutdown. Returns as soon as the
-        // worker finishes — only sleeps the full window if it's stuck.
-        if let Some(handle) = self.worker.take() {
-            let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
-            thread::spawn(move || {
-                let _ = handle.join();
-                let _ = done_tx.send(());
-            });
-            let _ = done_rx.recv_timeout(Duration::from_millis(100));
-            // On timeout the watcher detaches naturally; process exit reaps it.
-        }
-    }
-}
-
 // ── Constructor ───────────────────────────────────────────────────────────────
 
-/// Construct a [`WaylandInhibitor`] from raw `wl_display` + `wl_surface`
+/// Construct a Wayland [`WorkerInhibitor`] from raw `wl_display` + `wl_surface`
 /// pointers handed in by the host. The caller is responsible for keeping
 /// both objects alive for the inhibitor's lifetime — typically the host's
 /// `wayr::Toplevel` owns the `wl_surface` and `wayr::EventLoop` owns the
@@ -228,22 +154,11 @@ pub(super) unsafe fn new(
 
     // ── Spin up the worker thread ─────────────────────────────────────────
 
-    let (tx, rx) = mpsc::sync_channel::<InhibitCmd>(4);
-    let active = Arc::new(AtomicBool::new(false));
-    let active_worker = active.clone();
-
-    let worker_handle = thread::Builder::new()
-        .name("buffr-wayland-inhibit".into())
-        .spawn(move || {
-            run_worker(conn, event_queue, manager, wl_surface, rx, active_worker);
-        })
-        .map_err(|e| InhibitError::PlatformError(format!("spawn worker: {e}")))?;
-
-    Ok(Box::new(WaylandInhibitor {
-        tx,
-        active,
-        worker: Some(worker_handle),
-    }))
+    let inhibitor =
+        WorkerInhibitor::spawn("wayland", "buffr-wayland-inhibit", move |rx, active| {
+            run_worker(conn, event_queue, manager, wl_surface, rx, active);
+        })?;
+    Ok(Box::new(inhibitor))
 }
 
 // ── Worker thread ─────────────────────────────────────────────────────────────

@@ -30,18 +30,6 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Default GitHub repo polled for releases. Users may point at a fork
-/// via `[updates] github_repo = "..."`.
-pub const DEFAULT_GITHUB_REPO: &str = "kryptic-sh/buffr";
-
-/// Default check interval in hours. Once-a-day is plenty; the cache
-/// soaks shorter restarts so a noisy `buffr` quitter doesn't spam.
-pub const DEFAULT_CHECK_INTERVAL_HOURS: u32 = 24;
-
-/// Default release channel. `nightly` reserved for the post-1.0
-/// pre-release tag stream; today only `stable` resolves cleanly.
-pub const DEFAULT_CHANNEL: &str = "stable";
-
 /// User-Agent set on every GitHub API request. GitHub rejects requests
 /// without one, so this is mandatory.
 const USER_AGENT: &str = concat!("buffr/", env!("CARGO_PKG_VERSION"));
@@ -171,8 +159,11 @@ impl UpdateChecker {
     /// Construct with the production [`UreqClient`] and the buffr
     /// crate's compile-time version.
     pub fn new(config: UpdateConfig, cache_path: PathBuf) -> Self {
-        // `env!("CARGO_PKG_VERSION")` for the `buffr-core` crate. The
-        // workspace version is shared so this matches `buffr` itself.
+        // `buffr-core` inherits `version.workspace = true`, so
+        // `CARGO_PKG_VERSION` here is the same string the `buffr`
+        // binary reports. Keep it that way — if this crate ever gets
+        // its own version, `resolve_status` starts comparing the
+        // wrong number and every user sees a permanent `* upd` nag.
         let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|e| {
             tracing::warn!(
                 error = %e,
@@ -346,6 +337,32 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
+
+    /// Regression (H4): `UpdateChecker::new` seeds `current` from this
+    /// crate's `CARGO_PKG_VERSION`, so `buffr-core` must inherit the
+    /// workspace version. When it declared its own (`0.7.0` vs a
+    /// workspace `0.14.6`) every up-to-date user saw a permanent
+    /// `* upd` nag, and crash reports carried the wrong version.
+    #[test]
+    fn crate_version_matches_workspace_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+        let workspace_version = manifest
+            .lines()
+            .skip_while(|l| l.trim() != "[workspace.package]")
+            .find_map(|l| l.trim().strip_prefix("version = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("[workspace.package] version");
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            workspace_version,
+            "buffr-core must use `version.workspace = true`"
+        );
+    }
 
     /// Mock client: returns either a canned body or a canned error.
     /// Records every URL it was called with so tests can assert the

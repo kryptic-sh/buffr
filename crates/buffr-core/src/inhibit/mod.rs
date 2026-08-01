@@ -127,6 +127,176 @@ impl IdleInhibitor for NoopInhibitor {
     }
 }
 
+// ── Shared worker-thread inhibitor ────────────────────────────────────────────
+
+/// Backends that drive a dedicated worker thread. The Wayland and
+/// Windows implementations were byte-for-byte identical apart from the
+/// log strings and the worker body, so the plumbing lives here once.
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "windows",
+    test
+))]
+pub(crate) mod worker {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc::{self, SyncSender, TrySendError},
+        },
+        thread,
+        time::Duration,
+    };
+
+    use super::{IdleInhibitor, InhibitError};
+
+    /// Commands the UI thread posts to a backend worker.
+    pub(crate) enum InhibitCmd {
+        Acquire,
+        Release,
+        Shutdown,
+    }
+
+    /// Depth of the command channel. Transitions are rare (a video
+    /// starting or stopping), so anything queued beyond this means the
+    /// worker is wedged and the extra commands are worthless anyway.
+    const CMD_CAP: usize = 4;
+
+    /// How long [`WorkerInhibitor::drop`] waits for the worker to exit
+    /// before detaching it and letting process exit reap it.
+    const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
+    /// Channel + state + shutdown plumbing shared by every worker-thread
+    /// idle-inhibit backend. Each backend supplies only its `run_worker`
+    /// body via [`WorkerInhibitor::spawn`].
+    pub(crate) struct WorkerInhibitor {
+        /// Backend name, used verbatim in log lines and error strings
+        /// (e.g. `"wayland"`, `"windows"`).
+        backend: &'static str,
+        tx: SyncSender<InhibitCmd>,
+        active: Arc<AtomicBool>,
+        /// Join handle so Drop can wait briefly for the worker.
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl WorkerInhibitor {
+        /// Spawn `run` on a named thread and return the handle wrapping
+        /// its command channel.
+        ///
+        /// `run` receives the command receiver and the shared `active`
+        /// flag; it owns every platform object and is the only code
+        /// permitted to touch them, which is what gives the backends
+        /// their thread affinity.
+        pub(crate) fn spawn<F>(
+            backend: &'static str,
+            thread_name: &str,
+            run: F,
+        ) -> Result<Self, InhibitError>
+        where
+            F: FnOnce(mpsc::Receiver<InhibitCmd>, Arc<AtomicBool>) + Send + 'static,
+        {
+            let (tx, rx) = mpsc::sync_channel::<InhibitCmd>(CMD_CAP);
+            let active = Arc::new(AtomicBool::new(false));
+            let active_worker = Arc::clone(&active);
+            let worker = thread::Builder::new()
+                .name(thread_name.to_string())
+                .spawn(move || run(rx, active_worker))
+                .map_err(|e| InhibitError::PlatformError(format!("spawn worker: {e}")))?;
+            Ok(Self {
+                backend,
+                tx,
+                active,
+                worker: Some(worker),
+            })
+        }
+
+        /// Post `cmd` **without ever blocking the caller**.
+        ///
+        /// `acquire` / `release` run on the winit event loop. A blocking
+        /// `SyncSender::send` would park the entire browser UI thread
+        /// whenever the worker wedges (a compositor socket that won't
+        /// drain, say). A full buffer instead means several transitions
+        /// are already queued and this one is stale, so we drop it: the
+        /// apps layer re-evaluates inhibit policy every frame against
+        /// [`IdleInhibitor::is_active`], so the next frame re-issues
+        /// whatever is still needed and the state self-heals.
+        fn post(&self, cmd: InhibitCmd, what: &'static str) -> Result<(), InhibitError> {
+            match self.tx.try_send(cmd) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => {
+                    tracing::debug!(
+                        backend = self.backend,
+                        command = what,
+                        "idle inhibitor: worker busy, dropping transition"
+                    );
+                    Ok(())
+                }
+                Err(TrySendError::Disconnected(_)) => Err(InhibitError::PlatformError(format!(
+                    "{} worker thread disconnected",
+                    self.backend
+                ))),
+            }
+        }
+    }
+
+    impl std::fmt::Debug for WorkerInhibitor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("WorkerInhibitor")
+                .field("backend", &self.backend)
+                .field("active", &self.active.load(Ordering::Relaxed))
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl IdleInhibitor for WorkerInhibitor {
+        fn acquire(&self) -> Result<(), InhibitError> {
+            if self.active.load(Ordering::Relaxed) {
+                return Ok(()); // idempotent
+            }
+            self.post(InhibitCmd::Acquire, "acquire")
+        }
+
+        fn release(&self) -> Result<(), InhibitError> {
+            if !self.active.load(Ordering::Relaxed) {
+                return Ok(()); // idempotent
+            }
+            self.post(InhibitCmd::Release, "release")
+        }
+
+        fn is_active(&self) -> bool {
+            self.active.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for WorkerInhibitor {
+        fn drop(&mut self) {
+            // Best-effort: ask the worker to release and exit. These are
+            // `try_send` for the same reason `post` is — a wedged worker
+            // must not hang application shutdown. If either is dropped,
+            // closing `tx` below still ends the worker's `for cmd in rx`
+            // loop, and both backends clean up on that path.
+            let _ = self.tx.try_send(InhibitCmd::Release);
+            let _ = self.tx.try_send(InhibitCmd::Shutdown);
+
+            // Wait for the worker to exit, but give it at most
+            // `SHUTDOWN_GRACE` so we don't stall application shutdown.
+            // Returns as soon as the worker finishes — only sleeps the
+            // full window if it's stuck.
+            if let Some(handle) = self.worker.take() {
+                let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+                let spawned = thread::spawn(move || {
+                    let _ = handle.join();
+                    let _ = done_tx.send(());
+                });
+                let _ = done_rx.recv_timeout(SHUTDOWN_GRACE);
+                // On timeout the watcher detaches naturally; process
+                // exit reaps it.
+                drop(spawned);
+            }
+        }
+    }
+}
+
 // ── Platform stubs ────────────────────────────────────────────────────────────
 
 /// Linux idle-inhibit dispatcher.
@@ -283,6 +453,157 @@ mod tests {
     #[test]
     fn policy_no_signal_no_inhibit() {
         assert!(!want_inhibit(true, false, false, false, false, true));
+    }
+
+    // ── Shared worker-thread inhibitor ───────────────────────────────────
+
+    mod worker_inhibitor {
+        use super::super::worker::{InhibitCmd, WorkerInhibitor};
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        /// Worker that blocks on `gate` before touching the channel, so
+        /// tests can wedge it and fill the command buffer on purpose.
+        fn wedged_worker(
+            gate: mpsc::Receiver<()>,
+            seen: Arc<AtomicUsize>,
+        ) -> impl FnOnce(mpsc::Receiver<InhibitCmd>, Arc<std::sync::atomic::AtomicBool>) + Send + 'static
+        {
+            move |rx, _active| {
+                // Block until the test releases us.
+                let _ = gate.recv();
+                for _cmd in rx {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        #[test]
+        fn acquire_never_blocks_when_the_worker_is_wedged() {
+            // Regression (M36): `SyncSender::send` from the winit event
+            // loop parked the whole browser UI thread once the 4-slot
+            // buffer filled behind a stuck worker.
+            let (gate_tx, gate_rx) = mpsc::channel::<()>();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let inhibitor = WorkerInhibitor::spawn(
+                "test",
+                "buffr-test-inhibit",
+                wedged_worker(gate_rx, Arc::clone(&seen)),
+            )
+            .unwrap();
+
+            // Far more transitions than the channel can hold. Every one
+            // must return promptly rather than parking.
+            let start = Instant::now();
+            for _ in 0..1000 {
+                inhibitor.acquire().unwrap();
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "acquire blocked on a full channel"
+            );
+
+            // Overflow is dropped, not queued: the worker cannot have
+            // received more than the buffer depth.
+            drop(gate_tx);
+            drop(inhibitor);
+            assert!(
+                seen.load(Ordering::SeqCst) <= 8,
+                "commands were not dropped"
+            );
+        }
+
+        #[test]
+        fn drop_does_not_hang_on_a_wedged_worker() {
+            let (gate_tx, gate_rx) = mpsc::channel::<()>();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let inhibitor = WorkerInhibitor::spawn(
+                "test",
+                "buffr-test-inhibit-drop",
+                wedged_worker(gate_rx, seen),
+            )
+            .unwrap();
+            for _ in 0..64 {
+                inhibitor.acquire().unwrap();
+            }
+            let start = Instant::now();
+            drop(inhibitor);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "Drop blocked on a wedged worker"
+            );
+            drop(gate_tx);
+        }
+
+        #[test]
+        fn commands_reach_a_healthy_worker_and_flip_active() {
+            let flipped = Arc::new(AtomicUsize::new(0));
+            let flipped_w = Arc::clone(&flipped);
+            let inhibitor =
+                WorkerInhibitor::spawn("test", "buffr-test-inhibit-ok", move |rx, active| {
+                    for cmd in rx {
+                        match cmd {
+                            InhibitCmd::Acquire => {
+                                active.store(true, Ordering::Relaxed);
+                                flipped_w.fetch_add(1, Ordering::SeqCst);
+                            }
+                            InhibitCmd::Release => {
+                                active.store(false, Ordering::Relaxed);
+                                flipped_w.fetch_add(1, Ordering::SeqCst);
+                            }
+                            InhibitCmd::Shutdown => return,
+                        }
+                    }
+                })
+                .unwrap();
+
+            assert!(!inhibitor.is_active());
+            inhibitor.acquire().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !inhibitor.is_active() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(inhibitor.is_active(), "worker never applied Acquire");
+
+            // Idempotent: a second acquire is a pure no-op.
+            let before = flipped.load(Ordering::SeqCst);
+            inhibitor.acquire().unwrap();
+            assert_eq!(flipped.load(Ordering::SeqCst), before);
+
+            inhibitor.release().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while inhibitor.is_active() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(!inhibitor.is_active(), "worker never applied Release");
+        }
+
+        #[test]
+        fn disconnected_worker_reports_a_platform_error() {
+            let inhibitor =
+                WorkerInhibitor::spawn("test", "buffr-test-inhibit-dead", |rx, active| {
+                    // Exit immediately, dropping the receiver.
+                    drop(rx);
+                    active.store(true, std::sync::atomic::Ordering::Relaxed);
+                })
+                .unwrap();
+            // Wait for the receiver to actually be gone.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut err = None;
+            while Instant::now() < deadline {
+                match inhibitor.release() {
+                    Ok(()) => std::thread::yield_now(),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            let err = err.expect("expected a disconnect error");
+            assert!(matches!(err, InhibitError::PlatformError(ref m) if m.contains("test")));
+        }
     }
 
     #[test]

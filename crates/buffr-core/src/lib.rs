@@ -10,6 +10,7 @@
 use thiserror::Error;
 
 pub mod cmdline;
+mod console_sentinel;
 pub mod context_menu;
 pub mod crash;
 pub mod cursor;
@@ -54,10 +55,9 @@ pub use find::{
     FindResult, FindResultSink, new_sink as new_find_sink, take_latest as take_find_result,
 };
 pub use hint::{
-    DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HINT_CONSOLE_SENTINEL, HINT_OVERLAY_CLASS,
-    HINT_OVERLAY_Z_INDEX, Hint, HintAction, HintAlphabet, HintConsoleEvent, HintError,
-    HintEventSink, HintKind, HintLabel, HintRect, HintSession, build_inject_script,
-    new_hint_event_sink, parse_console_event, take_hint_event,
+    DEFAULT_HINT_ALPHABET, DEFAULT_HINT_SELECTORS, HINT_CONSOLE_SENTINEL, Hint, HintAction,
+    HintAlphabet, HintConsoleEvent, HintError, HintEventSink, HintKind, HintRect, HintSession,
+    build_inject_script, new_hint_event_sink, parse_console_event, take_hint_event,
 };
 pub use inhibit::{IdleInhibitor, InhibitError, new_inhibitor};
 pub use telemetry::{
@@ -65,8 +65,7 @@ pub use telemetry::{
     KEY_SEARCHES_RUN, KEY_TABS_OPENED, TelemetryError, UsageCounters,
 };
 pub use updates::{
-    DEFAULT_CHANNEL, DEFAULT_CHECK_INTERVAL_HOURS, DEFAULT_GITHUB_REPO, HttpClient, ReleaseInfo,
-    UpdateChecker, UpdateConfig, UpdateError, UpdateStatus, UreqClient,
+    HttpClient, ReleaseInfo, UpdateChecker, UpdateConfig, UpdateError, UpdateStatus, UreqClient,
 };
 
 #[derive(Debug, Error)]

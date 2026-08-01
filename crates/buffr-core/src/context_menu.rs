@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 // ── CEF bit-flag constants (from cef::sys / cef-dll-sys) ─────────────────────
 
 // cef_context_menu_type_flags_t inner values (transparent u32 wrapper)
-pub const TYPEFLAG_NONE: u32 = 0;
 pub const TYPEFLAG_PAGE: u32 = 1;
 pub const TYPEFLAG_FRAME: u32 = 2;
 pub const TYPEFLAG_LINK: u32 = 4;
@@ -36,9 +35,7 @@ pub const MEDIAFLAG_MUTED: u32 = 4;
 pub const MEDIAFLAG_LOOP: u32 = 8;
 pub const MEDIAFLAG_CAN_SAVE: u32 = 16;
 pub const MEDIAFLAG_CAN_TOGGLE_CONTROLS: u32 = 64;
-pub const MEDIAFLAG_CONTROLS: u32 = 128;
 pub const MEDIAFLAG_CAN_PICTURE_IN_PICTURE: u32 = 1024;
-pub const MEDIAFLAG_PICTURE_IN_PICTURE: u32 = 2048;
 
 // ── Queue capacity ────────────────────────────────────────────────────────────
 

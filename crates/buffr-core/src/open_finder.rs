@@ -10,7 +10,7 @@
 //!
 //! - **Linux**: `xdg-open <path>`
 //! - **macOS**: `open <path>`
-//! - **Windows**: `cmd /c start "" <path>`
+//! - **Windows**: `explorer.exe <path>`
 //!
 //! Failures are logged at `warn!` and otherwise swallowed — the
 //! browser thread never blocks waiting for the user's launcher to
@@ -78,18 +78,21 @@ pub fn command_for(path: &OsStr) -> (OsString, Vec<OsString>) {
     }
     #[cfg(target_os = "windows")]
     {
-        // `start ""` consumes the empty title argument so the actual
-        // path-arg isn't misread as a window title. `cmd /c` runs
-        // `start` and exits; nothing to forward stdout to.
-        (
-            OsString::from("cmd"),
-            vec![
-                OsString::from("/c"),
-                OsString::from("start"),
-                OsString::from(""),
-                path.to_os_string(),
-            ],
-        )
+        // NEVER route this through `cmd.exe /c start`. `path` derives
+        // from the download's suggested filename, which is
+        // server-controlled (URL / `Content-Disposition`). Rust quotes
+        // arguments per `CommandLineToArgvW`, but `cmd.exe` does not
+        // follow those rules — it re-parses `&`, `|`, `^`, `<`, `>`
+        // and `"` after unquoting, so a file saved as
+        // `report"&calc.exe&".pdf` would execute a second command.
+        //
+        // `explorer.exe <path>` performs the same shell-verb "open"
+        // dispatch without a command interpreter in the middle: the
+        // argument reaches it through `CommandLineToArgvW` intact and
+        // is never re-parsed. (`ShellExecuteW` would be marginally
+        // better but needs a `windows-sys` dependency this
+        // cross-compiled crate does not carry.)
+        (OsString::from("explorer.exe"), vec![path.to_os_string()])
     }
 }
 
@@ -146,11 +149,27 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(prog, &OsString::from("cmd"));
-            assert_eq!(args.len(), 4);
-            assert_eq!(args[0], OsString::from("/c"));
-            assert_eq!(args[1], OsString::from("start"));
+            assert_eq!(prog, &OsString::from("explorer.exe"));
+            assert_eq!(args, &vec![OsString::from("/tmp/foo")]);
         }
+    }
+
+    /// The launcher must never be a command interpreter — `cmd.exe`
+    /// re-parses metacharacters out of the (server-controlled)
+    /// filename. See H7.
+    #[test]
+    fn command_for_never_uses_a_shell() {
+        let hostile = OsStr::new(r#"C:\dl\report"&calc.exe&".pdf"#);
+        let (prog, args) = command_for(hostile);
+        let prog = prog.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            !prog.contains("cmd") && !prog.contains("powershell") && !prog.contains("sh"),
+            "launcher must not be a shell, got {prog}"
+        );
+        // The path is passed as one intact argv entry, never spliced
+        // into a command string.
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0], hostile.to_os_string());
     }
 
     #[test]

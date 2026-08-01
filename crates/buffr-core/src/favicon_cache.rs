@@ -23,6 +23,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 use tracing::{debug, trace};
 
+/// Largest favicon edge we are willing to reconstruct from the cache
+/// DB. Real favicons top out around 256px; anything larger is a
+/// corrupted or externally-written row, and materialising it would
+/// allocate megabytes on the UI path. Rows above this are discarded.
+const MAX_FAVICON_EDGE: u32 = 1024;
+
 /// Forward-only migrations. Index `i` → schema version `i + 1`.
 const MIGRATIONS: &[&str] = &[
     // v1 — initial schema.
@@ -160,11 +166,23 @@ impl FaviconCache {
             .ok()
             .flatten();
         let (width, height, bgra) = result?;
-        let pixel_count = (width as usize).saturating_mul(height as usize);
-        if bgra.len() != pixel_count * 4 {
+        // Reject implausible dimensions before doing any arithmetic or
+        // allocation — a corrupted row can carry `u32::MAX` here.
+        if width > MAX_FAVICON_EDGE || height > MAX_FAVICON_EDGE {
             debug!(
                 origin,
-                expected = pixel_count * 4,
+                width, height, "favicon cache: implausible dimensions — discarding"
+            );
+            return None;
+        }
+        let pixel_count = (width as usize).saturating_mul(height as usize);
+        // `saturating_mul` throughout: a plain `* 4` would panic in
+        // debug / wrap in release and defeat this very length check.
+        let expected = pixel_count.saturating_mul(4);
+        if bgra.len() != expected {
+            debug!(
+                origin,
+                expected,
                 actual = bgra.len(),
                 "favicon cache: BLOB length mismatch — discarding"
             );
@@ -282,6 +300,65 @@ mod tests {
         assert_eq!(got.width, 2);
         assert_eq!(got.height, 1);
         assert_eq!(got.pixels, pixels);
+    }
+
+    /// Insert a row straight into the table, bypassing `put`, so tests
+    /// can simulate a corrupted / externally-written `favicon-cache.db`.
+    fn insert_raw(cache: &FaviconCache, origin: &str, width: u32, height: u32, bgra: &[u8]) {
+        let conn = cache.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO favicons(origin, width, height, bgra, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![origin, width, height, bgra, 0i64],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn get_rejects_overflowing_dimensions_without_panicking() {
+        // Regression (M23): `pixel_count * 4` on a saturated
+        // `pixel_count` panicked in debug / wrapped in release,
+        // defeating the BLOB-length check it was guarding.
+        let cache = FaviconCache::open_in_memory().unwrap();
+        insert_raw(
+            &cache,
+            "https://evil.example",
+            u32::MAX,
+            u32::MAX,
+            &[0u8; 4],
+        );
+        assert!(cache.get("https://evil.example").is_none());
+    }
+
+    #[test]
+    fn get_rejects_implausible_dimensions() {
+        let cache = FaviconCache::open_in_memory().unwrap();
+        let w = MAX_FAVICON_EDGE + 1;
+        // Length-consistent, so only the dimension guard can reject it.
+        insert_raw(
+            &cache,
+            "https://huge.example",
+            w,
+            1,
+            &vec![0u8; (w as usize) * 4],
+        );
+        assert!(cache.get("https://huge.example").is_none());
+        // The boundary itself is still accepted.
+        insert_raw(
+            &cache,
+            "https://ok.example",
+            MAX_FAVICON_EDGE,
+            1,
+            &vec![0u8; (MAX_FAVICON_EDGE as usize) * 4],
+        );
+        assert!(cache.get("https://ok.example").is_some());
+    }
+
+    #[test]
+    fn get_rejects_blob_length_mismatch() {
+        let cache = FaviconCache::open_in_memory().unwrap();
+        insert_raw(&cache, "https://short.example", 4, 4, &[0u8; 8]);
+        assert!(cache.get("https://short.example").is_none());
     }
 
     #[test]

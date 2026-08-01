@@ -36,12 +36,7 @@ pub struct MediaProbeEvent {
 /// - `Some(Ok(event))` — prefix present, JSON decoded.
 /// - `Some(Err(err))` — prefix present but JSON decode failed.
 pub fn parse(line: &str) -> Option<Result<MediaProbeEvent, serde_json::Error>> {
-    // Some pages wrap `console.log` to prepend a styling format string
-    // (e.g. `%cINFO ...`); locate the sentinel anywhere in the line, not
-    // just at the start. Mirrors the edit.rs / hint.rs handling.
-    let idx = line.find(MEDIA_PROBE_SENTINEL)?;
-    let suffix = &line[idx + MEDIA_PROBE_SENTINEL.len()..];
-    Some(serde_json::from_str::<MediaProbeEvent>(suffix))
+    crate::console_sentinel::parse_sentinel(line, MEDIA_PROBE_SENTINEL)
 }
 
 #[cfg(test)]

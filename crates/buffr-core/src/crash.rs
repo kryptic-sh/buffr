@@ -36,7 +36,7 @@
 
 use std::backtrace::Backtrace;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -80,9 +80,21 @@ pub struct CrashReporter;
 /// the second call becomes a no-op instead.
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide uniquifier for crash-report filenames. The timestamp
+/// only has millisecond precision, so two threads unwinding together
+/// would otherwise collide and the second `write` would truncate the
+/// first report.
+static REPORT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How many suffixes [`write_report`] tries before giving up. Each
+/// attempt uses `create_new(true)`, so an existing file is never
+/// truncated; the bound just stops an unbounded spin if the directory
+/// is somehow unwritable in a way that reports as `AlreadyExists`.
+const WRITE_REPORT_MAX_ATTEMPTS: u64 = 64;
+
 impl CrashReporter {
     /// Install a `std::panic::set_hook` that writes a [`CrashReport`]
-    /// to `<dir>/<timestamp>.json` whenever a panic fires.
+    /// to `<dir>/<timestamp>_<seq>.json` whenever a panic fires.
     ///
     /// Idempotent: subsequent calls log a debug breadcrumb and return
     /// without re-installing.
@@ -130,28 +142,11 @@ impl CrashReporter {
     /// most-recent-first. Malformed files are logged at WARN and
     /// skipped — one bad file shouldn't hide the rest.
     pub fn list_crashes(dir: &Path) -> Vec<CrashReport> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
-        };
-        let mut out = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            match std::fs::read(&path) {
-                Ok(raw) => match serde_json::from_slice::<CrashReport>(&raw) {
-                    Ok(r) => out.push(r),
-                    Err(err) => {
-                        tracing::warn!(error = %err, path = %path.display(), "crash: skip malformed report");
-                    }
-                },
-                Err(err) => {
-                    tracing::warn!(error = %err, path = %path.display(), "crash: read failed");
-                }
-            }
-        }
+        let mut out: Vec<CrashReport> = read_reports(dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
         out.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
         out
     }
@@ -166,29 +161,7 @@ impl CrashReporter {
         }
         let cutoff = Utc::now() - chrono::Duration::days(i64::from(days));
         let mut removed = 0usize;
-        let entries = std::fs::read_dir(dir).map_err(|source| CrashError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let raw = match std::fs::read(&path) {
-                Ok(r) => r,
-                Err(err) => {
-                    tracing::warn!(error = %err, path = %path.display(), "crash: read failed; skipping");
-                    continue;
-                }
-            };
-            let parsed: CrashReport = match serde_json::from_slice(&raw) {
-                Ok(r) => r,
-                Err(err) => {
-                    tracing::warn!(error = %err, path = %path.display(), "crash: malformed; skipping purge");
-                    continue;
-                }
-            };
+        for (path, parsed) in read_reports(dir)? {
             if parsed.timestamp < cutoff {
                 if let Err(err) = std::fs::remove_file(&path) {
                     tracing::warn!(error = %err, path = %path.display(), "crash: remove failed");
@@ -199,6 +172,40 @@ impl CrashReporter {
         }
         Ok(removed)
     }
+}
+
+/// Read and parse every `*.json` file directly under `dir`.
+///
+/// Unreadable or malformed files are logged at WARN and skipped — one
+/// bad file must never hide the rest, and `purge_older_than` must never
+/// delete something it could not parse. Only a failure to enumerate the
+/// directory itself is surfaced as an error.
+fn read_reports(dir: &Path) -> Result<Vec<(PathBuf, CrashReport)>, CrashError> {
+    let entries = std::fs::read_dir(dir).map_err(|source| CrashError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match std::fs::read(&path) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(error = %err, path = %path.display(), "crash: read failed");
+                continue;
+            }
+        };
+        match serde_json::from_slice::<CrashReport>(&raw) {
+            Ok(r) => out.push((path, r)),
+            Err(err) => {
+                tracing::warn!(error = %err, path = %path.display(), "crash: skip malformed report");
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn build_report(info: &std::panic::PanicHookInfo<'_>) -> CrashReport {
@@ -260,25 +267,55 @@ fn write_report(dir: &Path, report: &CrashReport) -> Result<(), CrashError> {
         path: dir.to_path_buf(),
         source,
     })?;
-    // Filename pattern: <RFC3339>_<u32>.json with `:` swapped for `-`
-    // so the path is portable to FAT/Windows.
+    // Filename pattern: `<RFC3339>_<u64>.json` with `:` swapped for `-`
+    // so the path is portable to FAT/Windows. The timestamp alone is
+    // only millisecond-precise, so the counter disambiguates threads
+    // that unwind together; `create_new` then guarantees we never
+    // truncate a report that already exists (e.g. a second buffr
+    // process sharing the directory).
     let stamp = report
         .timestamp
         .format("%Y-%m-%dT%H-%M-%S%.3fZ")
         .to_string();
-    let path = dir.join(format!("{stamp}.json"));
     let json = serde_json::to_string_pretty(report).map_err(|source| CrashError::Json {
-        path: path.clone(),
+        path: dir.join(format!("{stamp}.json")),
         source,
     })?;
-    std::fs::write(&path, json).map_err(|source| CrashError::Io { path, source })?;
-    Ok(())
+    let mut last_err = None;
+    for _ in 0..WRITE_REPORT_MAX_ATTEMPTS {
+        let seq = REPORT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stamp}_{seq}.json"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                return f
+                    .write_all(json.as_bytes())
+                    .map_err(|source| CrashError::Io { path, source });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some((path, err));
+                continue;
+            }
+            Err(source) => return Err(CrashError::Io { path, source }),
+        }
+    }
+    let (path, source) = last_err.expect("loop runs at least once");
+    Err(CrashError::Io { path, source })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Serialises the tests that reason about [`REPORT_SEQ`], which is
+    /// process-global. Without it a sibling test could consume the
+    /// sequence number this one predicted.
+    static SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn write_fixture(dir: &Path, age_days: i64, label: &str) -> PathBuf {
         let report = CrashReport {
@@ -385,6 +422,63 @@ mod tests {
     }
 
     #[test]
+    fn write_report_does_not_clobber_same_millisecond_reports() {
+        // Regression (M22): the filename used to be `<stamp>.json` with
+        // millisecond precision and `fs::write` truncation, so two
+        // reports carrying the same timestamp lost one.
+        let _guard = SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let ts = Utc::now();
+        for i in 0..5 {
+            let report = CrashReport {
+                timestamp: ts,
+                buffr_version: "0.0.1".into(),
+                os: "linux x86_64".into(),
+                display_server: "x11".into(),
+                message: format!("boom {i}"),
+                location: None,
+                backtrace: vec![],
+            };
+            write_report(dir.path(), &report).unwrap();
+        }
+        let out = CrashReporter::list_crashes(dir.path());
+        assert_eq!(out.len(), 5, "every report must survive");
+        let mut msgs: Vec<&str> = out.iter().map(|r| r.message.as_str()).collect();
+        msgs.sort_unstable();
+        assert_eq!(msgs, vec!["boom 0", "boom 1", "boom 2", "boom 3", "boom 4"]);
+    }
+
+    #[test]
+    fn write_report_never_truncates_an_existing_file() {
+        // `create_new(true)`: if the chosen name is already taken the
+        // writer must move on rather than overwrite.
+        let _guard = SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let report = CrashReport {
+            timestamp: Utc::now(),
+            buffr_version: "0.0.1".into(),
+            os: "linux x86_64".into(),
+            display_server: "x11".into(),
+            message: "fresh".into(),
+            location: None,
+            backtrace: vec![],
+        };
+        let stamp = report
+            .timestamp
+            .format("%Y-%m-%dT%H-%M-%S%.3fZ")
+            .to_string();
+        // Pre-create the exact name the next sequence number will pick.
+        let seq = REPORT_SEQ.load(Ordering::Relaxed);
+        let squatted = dir.path().join(format!("{stamp}_{seq}.json"));
+        std::fs::write(&squatted, "PRE-EXISTING").unwrap();
+        write_report(dir.path(), &report).unwrap();
+        assert_eq!(std::fs::read_to_string(&squatted).unwrap(), "PRE-EXISTING");
+        let out = CrashReporter::list_crashes(dir.path());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message, "fresh");
+    }
+
+    #[test]
     fn install_disabled_is_noop() {
         // Disabled install must not flip the global state.
         let dir = tempdir().unwrap();
@@ -405,6 +499,7 @@ mod tests {
         if INSTALLED.load(Ordering::SeqCst) {
             return;
         }
+        let _guard = SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let dir_path = dir.path().to_path_buf();
         CrashReporter::install(dir_path.clone(), true);

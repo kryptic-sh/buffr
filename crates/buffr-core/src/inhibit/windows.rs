@@ -16,16 +16,13 @@
 //! one thread and releasing from another would not actually clear the flag. To
 //! guarantee that both calls happen on the same OS thread, all
 //! `SetThreadExecutionState` invocations are made from a dedicated worker
-//! thread. Commands arrive via `mpsc::sync_channel(4)`.
+//! thread. Commands arrive over the bounded, never-blocking channel owned by
+//! the shared `WorkerInhibitor` in `inhibit/mod.rs`.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
-    },
-    thread,
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 
 use windows_sys::Win32::System::Power::{
@@ -33,82 +30,15 @@ use windows_sys::Win32::System::Power::{
 };
 
 use super::{IdleInhibitor, InhibitError};
-
-// ── Command channel ───────────────────────────────────────────────────────────
-
-enum InhibitCmd {
-    Acquire,
-    Release,
-    Shutdown,
-}
-
-// ── Public inhibitor struct ───────────────────────────────────────────────────
-
-/// Windows idle inhibitor using `SetThreadExecutionState`.
-pub(super) struct WindowsInhibitor {
-    tx: SyncSender<InhibitCmd>,
-    active: Arc<AtomicBool>,
-    /// Join handle so Drop can wait briefly for the worker.
-    worker: Option<thread::JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for WindowsInhibitor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WindowsInhibitor")
-            .field("active", &self.active.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-impl IdleInhibitor for WindowsInhibitor {
-    fn acquire(&self) -> Result<(), InhibitError> {
-        if self.active.load(Ordering::Relaxed) {
-            return Ok(()); // idempotent
-        }
-        self.tx
-            .send(InhibitCmd::Acquire)
-            .map_err(|_| InhibitError::PlatformError("windows worker thread disconnected".into()))
-    }
-
-    fn release(&self) -> Result<(), InhibitError> {
-        if !self.active.load(Ordering::Relaxed) {
-            return Ok(()); // idempotent
-        }
-        self.tx
-            .send(InhibitCmd::Release)
-            .map_err(|_| InhibitError::PlatformError("windows worker thread disconnected".into()))
-    }
-
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for WindowsInhibitor {
-    fn drop(&mut self) {
-        // Best-effort: ask the worker to release and exit. Ignore send errors
-        // (the worker may have already exited on its own).
-        let _ = self.tx.send(InhibitCmd::Release);
-        let _ = self.tx.send(InhibitCmd::Shutdown);
-
-        // Wait for the worker to exit, but give it at most 100 ms so we
-        // don't stall application shutdown. Returns as soon as the
-        // worker finishes — only sleeps the full window if it's stuck.
-        if let Some(handle) = self.worker.take() {
-            let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
-            thread::spawn(move || {
-                let _ = handle.join();
-                let _ = done_tx.send(());
-            });
-            let _ = done_rx.recv_timeout(Duration::from_millis(100));
-            // On timeout the watcher detaches naturally; process exit reaps it.
-        }
-    }
-}
+use crate::inhibit::worker::{InhibitCmd, WorkerInhibitor};
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
-/// Construct a [`WindowsInhibitor`].
+/// Construct a Windows [`WorkerInhibitor`].
+///
+/// The channel, `active` flag, idempotence checks and shutdown handshake
+/// all live in [`WorkerInhibitor`], shared with the Wayland backend; this
+/// module only supplies [`run_worker`].
 ///
 /// The pointer arguments are accepted for API symmetry with the Linux
 /// backend but are ignored — `SetThreadExecutionState` is per-thread,
@@ -117,22 +47,8 @@ pub(super) fn new(
     _display_ptr: *mut std::ffi::c_void,
     _surface_ptr: *mut std::ffi::c_void,
 ) -> Result<Box<dyn IdleInhibitor>, InhibitError> {
-    let (tx, rx) = mpsc::sync_channel::<InhibitCmd>(4);
-    let active = Arc::new(AtomicBool::new(false));
-    let active_worker = active.clone();
-
-    let worker_handle = thread::Builder::new()
-        .name("buffr-windows-inhibit".into())
-        .spawn(move || {
-            run_worker(rx, active_worker);
-        })
-        .map_err(|e| InhibitError::PlatformError(format!("spawn worker: {e}")))?;
-
-    Ok(Box::new(WindowsInhibitor {
-        tx,
-        active,
-        worker: Some(worker_handle),
-    }))
+    let inhibitor = WorkerInhibitor::spawn("windows", "buffr-windows-inhibit", run_worker)?;
+    Ok(Box::new(inhibitor))
 }
 
 // ── Worker thread ─────────────────────────────────────────────────────────────

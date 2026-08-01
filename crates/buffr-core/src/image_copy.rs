@@ -104,13 +104,20 @@ fn decode_data_url(rest: &str) -> Result<Vec<u8>, String> {
         B64.decode(payload.as_bytes())
             .map_err(|e| format!("base64 decode: {e}"))
     } else {
-        // Percent-decoded text payload — rare for images, but spec-legal.
-        Ok(percent_decode(payload).into_bytes())
+        // Percent-decoded payload — rare for images, but spec-legal.
+        Ok(percent_decode(payload))
     }
 }
 
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// Percent-decode `s` into **raw bytes**.
+///
+/// Must not go via `String`: a `data:` image payload is binary, and
+/// mapping each decoded byte to a `char` would UTF-8-encode everything
+/// ≥ 0x80 into two bytes (`%89` → `0xC2 0x89`), corrupting the PNG
+/// magic and every other high byte. Undecodable `%` sequences are
+/// passed through verbatim, matching browser behaviour.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -118,11 +125,11 @@ fn percent_decode(s: &str) -> String {
             && i + 2 < bytes.len()
             && let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
         {
-            out.push(((hi << 4) | lo) as char);
+            out.push((hi << 4) | lo);
             i += 3;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
@@ -165,7 +172,27 @@ mod tests {
 
     #[test]
     fn percent_decode_hex_pairs() {
-        assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        assert_eq!(percent_decode("a%20b%2Fc"), b"a b/c".to_vec());
+    }
+
+    #[test]
+    fn percent_decode_preserves_high_bytes() {
+        // Regression: decoding used to go via `String`, so every byte
+        // ≥ 0x80 was re-encoded as two UTF-8 bytes.
+        assert_eq!(percent_decode("%89%FF%00"), vec![0x89u8, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn data_url_percent_encoded_keeps_png_magic() {
+        // Non-base64 `data:` payload — the PNG signature must survive
+        // byte-for-byte.
+        let bytes = decode_data_url("image/png,%89PNG%0D%0A%1A%0A").unwrap();
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n".to_vec());
+    }
+
+    #[test]
+    fn percent_decode_passes_through_bad_escapes() {
+        assert_eq!(percent_decode("a%zzb%2"), b"a%zzb%2".to_vec());
     }
 
     #[test]

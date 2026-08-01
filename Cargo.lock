@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-core"
-version = "0.7.0"
+version = "0.14.6"
 dependencies = [
  "base64",
  "buffr-config",

@@ -53,14 +53,11 @@ use thiserror::Error;
 /// handler scrapes these and routes the JSON tail to a [`HintEventSink`].
 pub const HINT_CONSOLE_SENTINEL: &str = "__buffr_hint__:";
 
-/// CSS class applied to every injected hint overlay div. Documented here
-/// (not just in the JS asset) so a future user-CSS-block can avoid
-/// colliding with it.
-pub const HINT_OVERLAY_CLASS: &str = "buffr-hint-overlay";
-
-/// `z-index` used by the injected style for [`HINT_OVERLAY_CLASS`].
-/// Maxed out so user-page overlays can't shadow the hints.
-pub const HINT_OVERLAY_Z_INDEX: i64 = 2_147_483_647;
+/// Hard ceiling on the BFS label queue in
+/// [`HintAlphabet::labels_for`]. Purely an OOM backstop: 2^20 labels is
+/// four orders of magnitude past any plausible page's interactive-element
+/// count, and callers today ask for at most `LABEL_BUDGET`.
+const MAX_LABEL_QUEUE: usize = 1 << 20;
 
 /// Default selector list used when the host doesn't pass one. Matches
 /// links, buttons, form fields, and anything tagged with an interactive
@@ -188,11 +185,12 @@ impl HintAlphabet {
         // the slice is large enough.
         let mut queue: Vec<String> = vec![String::new()];
         let mut offset: usize = 0;
-        // Safety cap so a pathological `count` can't OOM us.
-        // alpha_len^16 dwarfs any plausible page; if we ever hit this
-        // we still return whatever fit.
-        let cap = alpha_len.saturating_pow(16);
-        while queue.len() - offset < count && queue.len() < cap {
+        // Safety cap so a pathological `count` can't OOM us. Must be an
+        // absolute number: the old `alpha_len.saturating_pow(16)`
+        // saturated to `usize::MAX` for the 16-char default alphabet,
+        // so the guard never fired. If we ever hit the cap we still
+        // return whatever fit.
+        while queue.len() - offset < count && queue.len() < MAX_LABEL_QUEUE {
             // Pop one prefix (BFS head). `mem::take` leaves an empty
             // string at the slot — fine, we'll never read it again.
             let head = std::mem::take(&mut queue[offset]);
@@ -365,11 +363,6 @@ impl HintSession {
         HintAction::Filter
     }
 
-    /// Esc always cancels the session.
-    pub fn esc(&mut self) -> HintAction {
-        HintAction::Cancel
-    }
-
     /// Backspace pops the last typed char and re-widens the candidate
     /// set. Returns:
     ///
@@ -395,10 +388,6 @@ impl HintSession {
         HintAction::Filter
     }
 }
-
-/// Alias for [`Hint`] — the `HintLabel` name is used in some external
-/// docs / specs. They're the same type.
-pub type HintLabel = Hint;
 
 /// Renderer-emitted JSON payload variants. The Rust side constructs
 /// these from the suffix of a `__buffr_hint__:`-prefixed console line.
@@ -437,11 +426,7 @@ pub fn take_hint_event(sink: &HintEventSink) -> Option<HintConsoleEvent> {
 /// parse — useful so callers can log malformed renderer output without
 /// silently dropping it.
 pub fn parse_console_event(message: &str) -> Option<Result<HintConsoleEvent, serde_json::Error>> {
-    // Find the sentinel anywhere in the line — some sites wrap
-    // `console.log` to prepend styling format strings.
-    let idx = message.find(HINT_CONSOLE_SENTINEL)?;
-    let suffix = &message[idx + HINT_CONSOLE_SENTINEL.len()..];
-    Some(serde_json::from_str::<HintConsoleEvent>(suffix))
+    crate::console_sentinel::parse_sentinel(message, HINT_CONSOLE_SENTINEL)
 }
 
 /// Build the JS payload to send via `frame.execute_java_script`.
@@ -671,6 +656,22 @@ mod tests {
         }
     }
 
+    /// Regression (L31): the cap used to be `alpha_len.saturating_pow(16)`,
+    /// which is `usize::MAX` for the 16-char default alphabet, so the
+    /// OOM guard never fired and an absurd `count` allocated until the
+    /// process died. The cap must bound the result instead.
+    #[test]
+    fn labels_for_absurd_count_is_bounded_by_the_cap() {
+        let a = alpha(DEFAULT_HINT_ALPHABET);
+        let labels = a.labels_for(usize::MAX);
+        assert!(!labels.is_empty());
+        assert!(
+            labels.len() <= MAX_LABEL_QUEUE,
+            "cap not enforced: got {}",
+            labels.len()
+        );
+    }
+
     #[test]
     fn labels_use_alphabet_chars_only() {
         let a = alpha("xyz");
@@ -824,15 +825,6 @@ mod tests {
         );
         assert_eq!(s.feed('a'), HintAction::Filter);
         assert_eq!(s.feed('b'), HintAction::Click(0));
-    }
-
-    #[test]
-    fn session_esc_cancels_anytime() {
-        let mut s = HintSession::new(alpha("asdf"), mk_hints(&["a", "b"]), false);
-        assert_eq!(s.esc(), HintAction::Cancel);
-        // Re-issuing esc after a feed still returns Cancel.
-        s.feed('a');
-        assert_eq!(s.esc(), HintAction::Cancel);
     }
 
     #[test]
