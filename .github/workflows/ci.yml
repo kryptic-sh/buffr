@@ -124,19 +124,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux was informational-only because of a CEF ICU crash
-          # that turned out to be this job's own LD_LIBRARY_PATH
-          # shadowing the staged libcef.so (see the smoke step below).
-          # Fixing that exposed a second problem: the runner has no
-          # Vulkan ICD, wgpu init failed, and buffr-app exited 0 without
-          # painting — a green but entirely vacuous pass. That now exits
-          # 4, and mesa-vulkan-drivers is installed so the real path
-          # runs. Kept non-blocking for one more cycle to confirm the
-          # software-Vulkan path is stable; flip to `false` after that.
+          # Linux is blocking, like macOS and Windows. It was
+          # informational-only for a long time because of a CEF ICU
+          # crash blamed on headless sway; the real cause was this
+          # job's own LD_LIBRARY_PATH shadowing the staged libcef.so
+          # (see the smoke step below). Fixing that exposed a second
+          # problem: the runner has no Vulkan ICD, so wgpu init failed
+          # and buffr-app exited 0 without painting — a green but
+          # entirely vacuous pass. That now exits 4, and
+          # mesa-vulkan-drivers supplies a software ICD, so the job
+          # runs the real path: CEF init → browser → llvmpipe →
+          # first paint → exit 0.
           - os: ubuntu-latest
             cef_platform: linux64
             bin_suffix: ""
-            allow_failure: true
+            allow_failure: false
           - os: macos-latest
             cef_platform: macosarm64
             bin_suffix: ""
