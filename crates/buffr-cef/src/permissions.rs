@@ -35,11 +35,11 @@
 //!   The type alias below keeps existing `buffr_cef::PromptOutcome` imports
 //!   working.
 //! - [`CefPermissionsQueue`] is the CEF-internal queue (C++ callbacks).
-//! - The neutral `buffr_engine::PermissionsQueue` is populated in parallel.
+//! - The neutral `buffr_engine::PermissionsQueue` is the queue the apps
+//!   layer drains to drive the prompt strip.
 //! - [`CefCallbackRegistry`] maps `resolve_id → PendingPermission` for
 //!   async resolution from the UI thread.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -356,71 +356,6 @@ pub fn enqueue_to_both(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy `PermissionsQueue` — DEAD, kept only as a compile shim (L16)
-// ---------------------------------------------------------------------------
-//
-// Nothing has pushed into this queue since Phase 8a (#88):
-// `BuffrPermissionHandler` writes exclusively to `cef_callback_registry` +
-// the neutral `buffr_engine::PermissionsQueue`. Every CEF-internal user of
-// the type has been removed (`BrowserHost`, `BuffrClient`,
-// `BuffrPermissionHandler`, `make_client`).
-//
-// The type and the four helpers below survive ONLY because
-// `apps/buffr-app/src/main.rs` still holds a `buffr_cef::PermissionsQueue`
-// field and calls `drain_permissions_with_defer` on it at shutdown. That
-// call site is outside this crate; once it is removed, delete everything in
-// this section along with `CefEngineSinks::permissions_queue`.
-//
-// Not marked `#[deprecated]` on purpose — the apps crate builds with
-// `-D warnings`, so the attribute would break the workspace build before
-// the call site is gone.
-
-/// Shared queue between the CEF IO/UI callbacks and the UI thread.
-///
-/// **Dead since Phase 8a (#88)** — always empty. See the module note above.
-pub type PermissionsQueue = Arc<Mutex<VecDeque<PendingPermission>>>;
-
-/// Build a fresh empty permissions queue. **Dead** — see [`PermissionsQueue`].
-pub fn new_queue() -> PermissionsQueue {
-    Arc::new(Mutex::new(VecDeque::new()))
-}
-
-/// Number of pending requests currently in `queue`.
-/// **Dead** (always 0) — see [`PermissionsQueue`].
-pub fn queue_len(queue: &PermissionsQueue) -> usize {
-    queue.lock().map(|g| g.len()).unwrap_or(0)
-}
-
-/// Pop the front of the queue, if any.
-/// **Dead** (always `None`) — see [`PermissionsQueue`].
-pub fn pop_front(queue: &PermissionsQueue) -> Option<PendingPermission> {
-    queue.lock().ok().and_then(|mut g| g.pop_front())
-}
-
-/// Inspect (without removing) the front of the queue.
-/// **Dead** (always `None`) — see [`PermissionsQueue`].
-pub fn peek_front(queue: &PermissionsQueue) -> Option<(String, Vec<Capability>)> {
-    let g = queue.lock().ok()?;
-    let front = g.front()?;
-    Some((front.origin().to_string(), front.capabilities().to_vec()))
-}
-
-/// Drop every entry in `queue`, dispatching a [`PromptOutcome::Defer`]
-/// for each so the renderer doesn't wedge.
-/// **Dead** (queue is always empty) — see [`PermissionsQueue`].
-pub fn drain_with_defer(queue: &PermissionsQueue, store: &Permissions) {
-    let drained: Vec<PendingPermission> = match queue.lock() {
-        Ok(mut g) => g.drain(..).collect(),
-        Err(_) => return,
-    };
-    for p in drained {
-        if let Err(err) = p.resolve(PromptOutcome::Defer, store) {
-            warn!(error = %err, "permissions: defer dispatch on drain failed");
-        }
-    }
-}
-
 /// Drain the [`CefCallbackRegistry`], firing `Defer` for each pending
 /// callback so the renderer doesn't wedge.
 ///
@@ -661,14 +596,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, None);
-    }
-
-    #[test]
-    fn queue_starts_empty() {
-        let q = new_queue();
-        assert_eq!(queue_len(&q), 0);
-        assert!(pop_front(&q).is_none());
-        assert!(peek_front(&q).is_none());
     }
 
     // ── H9 regression coverage ────────────────────────────────────────────

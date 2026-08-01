@@ -138,9 +138,7 @@ fn build_palette(theme: &buffr_config::Theme) -> Palette {
 }
 
 use anyhow::{Context, Result};
-use buffr_cef::{
-    CefBackend, CefEngineSinks, drain_permissions_with_defer, new_permissions_queue, profile_paths,
-};
+use buffr_cef::{CefBackend, CefEngineSinks, profile_paths};
 // Neutral permission types — Phase 8a (#88). Apps layer now uses the
 // engine-agnostic queue so both CEF and blink-cdp share the same prompt path.
 use buffr_config::{ClearableData, Config, ConfigSource};
@@ -677,7 +675,7 @@ fn main() -> Result<()> {
         return run_update_status(cli.config.as_deref());
     }
     if cli.audit_keymap {
-        return run_audit_keymap();
+        return run_audit_keymap(cli.config.as_deref());
     }
     if cli.search_history.is_some() || cli.list_history {
         let limit = cli.history_limit.unwrap_or(100);
@@ -825,7 +823,6 @@ fn main() -> Result<()> {
         Permissions::open(paths.data.join("permissions.sqlite"))
             .context("opening permissions database")?
     });
-    let permissions_queue = new_permissions_queue();
 
     // -------- downloads store + resolved config -----------------------
     //
@@ -1259,7 +1256,6 @@ fn main() -> Result<()> {
         downloads_config,
         zoom.clone(),
         permissions.clone(),
-        permissions_queue.clone(),
         download_notice_queue,
         search_config,
         engines_config,
@@ -1321,10 +1317,6 @@ fn main() -> Result<()> {
             engine.resolve_permission(p.resolve_id.as_deref(), PromptOutcome::Defer);
         }
     }
-    // Also drain any residual entries in the legacy CEF queue (for
-    // callbacks that arrived before Phase 8a wiring was active).
-    drain_permissions_with_defer(&permissions_queue, &permissions);
-
     // Drop engine hosts first. This releases every Browser ref while
     // CEF's threads are still running, so CEF can finish the close
     // callbacks instead of segfaulting on dangling refs during its
@@ -1838,8 +1830,27 @@ fn run_update_status(config_path: Option<&std::path::Path>) -> Result<()> {
 /// chord(s) that bind it. Format: `<mode>\t<keys>\t<action>`. Sorted by
 /// mode then keys for stable output. Used to verify keyboard-only
 /// reachability (Phase 6 a11y).
-fn run_audit_keymap() -> Result<()> {
-    let rows = buffr_modal::Keymap::audit_default_bindings('\\');
+///
+/// Resolves the leader from the user's config rather than assuming one:
+/// `<leader>`-prefixed chords print with the character the user will
+/// actually press, so the audit matches their keyboard and not a
+/// hard-coded guess.
+fn run_audit_keymap(path: Option<&std::path::Path>) -> Result<()> {
+    let leader = match buffr_config::load_and_validate(path) {
+        Ok((cfg, _)) => cfg.general.leader.chars().next().unwrap_or(' '),
+        Err(e) => {
+            // Audit is a diagnostic — degrade to the built-in default
+            // rather than failing outright on an unrelated config error.
+            eprintln!("warning: using the default leader ({e})");
+            buffr_config::Config::default()
+                .general
+                .leader
+                .chars()
+                .next()
+                .unwrap_or(' ')
+        }
+    };
+    let rows = buffr_modal::Keymap::audit_default_bindings(leader);
     for (mode, keys, action) in &rows {
         println!("{mode}\t{keys}\t{action:?}");
     }
@@ -2050,10 +2061,6 @@ struct AppState {
     downloads_config: Arc<buffr_config::DownloadsConfig>,
     zoom: Arc<buffr_zoom::ZoomStore>,
     permissions: Arc<Permissions>,
-    /// Legacy CEF permissions queue kept for the shutdown drain path.
-    /// Phase 8a (#88): the UI thread now reads per-engine neutral queues
-    /// via `BrowserEngine::permissions_queue()` instead of this field.
-    permissions_queue: buffr_cef::PermissionsQueue,
     /// Active permission prompt (if any). `Some` while the front of
     /// the active engine's permissions queue is being shown. Keystrokes
     /// route to the prompt resolution path while this is set.
@@ -2659,7 +2666,6 @@ impl AppState {
         downloads_config: Arc<buffr_config::DownloadsConfig>,
         zoom: Arc<buffr_zoom::ZoomStore>,
         permissions: Arc<Permissions>,
-        permissions_queue: buffr_cef::PermissionsQueue,
         download_notice_queue: DownloadNoticeQueue,
         search_config: Arc<buffr_config::Search>,
         engines_config: Arc<buffr_config::Engines>,
@@ -2714,7 +2720,6 @@ impl AppState {
             downloads_config,
             zoom,
             permissions,
-            permissions_queue,
             permissions_prompt: None,
             confirm_close_pinned: None,
             download_notice_queue,
@@ -7646,7 +7651,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             downloads_config: self.downloads_config.clone(),
                             zoom: self.zoom.clone(),
                             permissions: self.permissions.clone(),
-                            permissions_queue: self.permissions_queue.clone(),
                             notice_queue: self.download_notice_queue.clone(),
                             find_sink: self.find_sink.clone(),
                             hint_sink: self.hint_sink.clone(),

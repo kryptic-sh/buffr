@@ -98,17 +98,6 @@ pub use permissions::{
     drain_registry_with_defer as drain_permissions_registry_with_defer, enqueue_to_both,
     next_resolve_id, precheck as precheck_permission,
 };
-// L16: the legacy `PermissionsQueue` is dead — nothing in this crate pushes
-// into it any more. These re-exports survive only for
-// `apps/buffr-app/src/main.rs`, which still declares a
-// `buffr_cef::PermissionsQueue` field and drains it at shutdown. Delete this
-// block (and `permissions.rs`'s shim section, plus
-// `CefEngineSinks::permissions_queue`) once that call site is gone.
-pub use permissions::{
-    PermissionsQueue, drain_with_defer as drain_permissions_with_defer,
-    new_queue as new_permissions_queue, peek_front as peek_permission_front,
-    pop_front as pop_permission_front, queue_len as permissions_queue_len,
-};
 pub use view_source_scheme::{register_buffr_src_handler_factory, register_buffr_src_scheme};
 
 /// Pin the CEF runtime API version before any CEF entry point.
