@@ -127,6 +127,35 @@ slices.
 
 ---
 
+## 5. Release follow-ups
+
+- **`buffr-bin` on the AUR is still at the pre-0.14.7 version.** The `aur-bin`
+  job failed on the `v0.14.7` tag run with
+  `No ED25519 host key is known for aur.archlinux.org`: the pinned `known_hosts`
+  was written correctly, but `GIT_SSH_COMMAND` was supplied through an `env:`
+  block containing a literal `~`, and neither git's `sh -c` (tilde expansion
+  does not apply to the result of a parameter expansion) nor ssh itself expands
+  it in a `-o` value. Fixed in `ci.yml` by assigning `GIT_SSH_COMMAND` inside
+  the step so `$HOME` expands first; reproduced and re-verified in an
+  `archlinux:latest` container against `HOME=/github/home`. Everything else in
+  the release published — GitHub release, homebrew-tap, scoop-bucket, all 20
+  build/package jobs.
+
+  The fix cannot be applied retroactively: re-running the job checks out the
+  workflow file as of the `v0.14.7` tag, which still has the bug, and the tag
+  must not be moved. So AUR catches up on the **next** tagged release. Nothing
+  to do here beyond cutting one.
+
+- **The `known_hosts` pin was inert in all three publish jobs**, not just AUR.
+  `brew-tap` and `scoop-bucket` passed only because the runner image appends
+  github.com's keys to `/etc/ssh/ssh_known_hosts`
+  (`images/ubuntu/scripts/build/install-git.sh` in `actions/runner-images`), so
+  ssh verified against the global file while the per-job pin was never read. Now
+  fixed alongside AUR, but it means the pin has never actually been exercised
+  for github.com — a wrong pin there would still pass today.
+
+---
+
 ## Corrections to the review itself
 
 Three findings in `code-review.md` were **wrong** and were deliberately not

@@ -1396,13 +1396,18 @@ jobs:
         # `StrictHostKeyChecking=yes` against the pinned `known_hosts`
         # written in the step above: on an ephemeral runner `accept-new`
         # always hits an empty known_hosts, which is `no` by another name.
-        env:
-          GIT_SSH_COMMAND:
-            'ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o
-            StrictHostKeyChecking=yes -o
-            UserKnownHostsFile=~/.ssh/known_hosts'
+        #
+        # Paths are absolute and built HERE rather than in an `env:` block.
+        # An `env:` value reaches git with a literal `~`: git runs the
+        # command via `sh -c`, but tilde expansion never applies to the
+        # result of a parameter expansion, and ssh does not expand `~` in
+        # a `-o` value either. So `UserKnownHostsFile=~/.ssh/known_hosts`
+        # looks for a directory literally named `~`, finds no pin, and
+        # fails with "No ED25519 host key is known" (v0.14.7's release).
+        # Assigning in the step expands `$HOME` before git ever sees it.
         run: |
           set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           git config --global user.name  "buffr-ci"
           git config --global user.email "ci@kryptic.sh"
           git clone ssh://aur@aur.archlinux.org/buffr-bin.git aur-repo
@@ -1481,13 +1486,13 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Push cask to homebrew-tap
-        env:
-          GIT_SSH_COMMAND:
-            'ssh -i ~/.ssh/brew -o IdentitiesOnly=yes -o
-            StrictHostKeyChecking=yes -o
-            UserKnownHostsFile=~/.ssh/known_hosts'
+        # Absolute paths, built here not in `env:` — see the AUR push step
+        # for why a `~` inside an `env:` value never gets expanded. This
+        # job only ever passed because the runner image also pins
+        # github.com in the global known_hosts, masking the same bug.
         run: |
           set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/brew -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           git config --global user.name  "buffr-ci"
           git config --global user.email "ci@kryptic.sh"
           git clone git@github.com:kryptic-sh/homebrew-tap.git tap
@@ -1568,13 +1573,13 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Push manifest to scoop-bucket
-        env:
-          GIT_SSH_COMMAND:
-            'ssh -i ~/.ssh/scoop -o IdentitiesOnly=yes -o
-            StrictHostKeyChecking=yes -o
-            UserKnownHostsFile=~/.ssh/known_hosts'
+        # Absolute paths, built here not in `env:` — see the AUR push step
+        # for why a `~` inside an `env:` value never gets expanded. This
+        # job only ever passed because the runner image also pins
+        # github.com in the global known_hosts, masking the same bug.
         run: |
           set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/scoop -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           git config --global user.name  "buffr-ci"
           git config --global user.email "ci@kryptic.sh"
           git clone git@github.com:kryptic-sh/scoop-bucket.git bucket
