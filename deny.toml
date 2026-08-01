@@ -16,13 +16,13 @@ targets = [
 version = 2
 yanked = "deny"
 ignore = [
-  # `paste` is unmaintained but has no known vulnerabilities. Transitive
-  # via ratatui → hjkl-buffer → buffr-modal.
-  "RUSTSEC-2024-0436",
-  # quick-xml < 0.41 — pulled only by wayland-scanner (^0.39), a
-  # build-time codegen proc-macro parsing the trusted Wayland protocol
-  # XML shipped in the crate; no attacker-controlled input reaches it.
-  # Drop when wayland-scanner moves to quick-xml >= 0.41.
+  # quick-xml 0.39 — two consumers in the graph:
+  #   * `wayland-scanner 0.31` — build-time codegen proc-macro parsing
+  #     the trusted Wayland protocol XML shipped inside the crate.
+  #   * `plist 1.9` (via `cef 148`) — used by cef's build script to read
+  #     the CEF framework's own Info.plist.
+  # Neither sees attacker-controlled input. Drop when *both*
+  # wayland-scanner and plist move to quick-xml >= 0.41.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
   # ttf-parser — unmaintained, transitive via the text/font stack.

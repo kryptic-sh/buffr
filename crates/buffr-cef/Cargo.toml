@@ -19,7 +19,7 @@ osr = []
 ignored = []
 
 [dependencies]
-cef = "148"
+cef.workspace = true
 tracing = "0.1"
 hjkl-config.workspace = true
 serde_json = "1"
@@ -50,4 +50,4 @@ windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 
 [dev-dependencies]
 tempfile = "3"
-toml = "1.1"
+toml.workspace = true

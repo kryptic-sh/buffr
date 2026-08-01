@@ -22,9 +22,9 @@ thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+chrono = { workspace = true, features = ["serde", "clock"] }
 ureq = { version = "3", features = ["json"] }
-semver = { version = "1", features = ["serde"] }
+semver.workspace = true
 buffr-engine.workspace = true
 buffr-config.workspace = true
 hjkl-clipboard.workspace = true
@@ -37,7 +37,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 base64 = "0.22"
 url = "2"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 wayland-client = { version = "0.31", features = ["system"] }
@@ -54,4 +54,4 @@ windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 
 [dev-dependencies]
 tempfile = "3"
-toml = "1.1"
+toml.workspace = true

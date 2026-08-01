@@ -59,13 +59,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 bitflags = "2"
 toml = "1.1"
-directories = "6"
 raw-window-handle = "0.6"
 ureq = { version = "3", features = ["json"] }
 serde_json = "1"
-flate2 = "1"
 tar = "0.4"
 bzip2 = "0.6"
+# Integrity check for the CEF tarball in `cargo xtask fetch-cef`. The
+# Spotify CDN index publishes SHA-1 digests only, so that's what we
+# verify against.
+sha1 = "0.10"
 clap = { version = "4", features = ["derive"] }
 notify = "8"
 # History store deps. `rusqlite`'s `bundled` feature is opted-in by
@@ -80,11 +82,7 @@ regex = "1"
 # Ephemeral profile dir for `--private` mode. The TempDir's Drop
 # tears the tree down at process exit so no state persists.
 tempfile = "3"
-# Phase 3 chrome — software-blit bitmap surface for the statusline strip
-# below the CEF child window. No GPU dependency; drawing is a per-pixel
-# `&mut [u32]` blit driven by the bitmap font in `buffr-ui::font`.
-softbuffer = "0.4"
-# wgpu present layer — replaces softbuffer in apps/buffr. CPU-composite
+# wgpu present layer — replaces the old softbuffer blit. CPU-composite
 # buffer is uploaded to a single GPU texture and drawn as a fullscreen
 # triangle. No platform branching: Vulkan on Linux, Metal on macOS, DX12.
 wgpu = "29"

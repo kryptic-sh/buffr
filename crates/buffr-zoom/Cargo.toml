@@ -14,7 +14,7 @@ publish.workspace = true
 ignored = []
 
 [dependencies]
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
 url = "2"

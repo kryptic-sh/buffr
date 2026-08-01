@@ -36,6 +36,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use sha1::{Digest, Sha1};
 
 const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
 /// CEF major version we pin against the `cef` crate (147.x).
@@ -108,7 +109,8 @@ struct CefFile {
     #[serde(rename = "type")]
     file_type: String,
     name: String,
-    #[allow(dead_code)]
+    /// Hex SHA-1 of the archive, as published in the CDN index. Verified
+    /// against the bytes we actually downloaded — see [`verify_sha1`].
     sha1: String,
 }
 
@@ -258,17 +260,29 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
     fs::create_dir_all(&vendor_dir)
         .with_context(|| format!("creating {}", vendor_dir.display()))?;
 
-    let archive_url = format!("{DEFAULT_CDN}/{}", file.name);
-    let archive_path = vendor_dir.join(&file.name);
+    // `file.name` is remote-controlled: it comes straight out of
+    // `index.json`, which we fetch over the network. Treat it as hostile
+    // before it becomes a path component — an entry named
+    // `../../.cargo/config.toml` would otherwise write outside
+    // `vendor/cef/<platform>/`.
+    let archive_name = validate_archive_name(&file.name)?;
+
+    let archive_url = format!("{DEFAULT_CDN}/{archive_name}");
+    let archive_path = vendor_dir.join(archive_name);
     download(&archive_url, &archive_path)?;
+
+    // The ~200 MB blob we just fetched becomes `libcef.so` in every
+    // shipped package, so it does not get unpacked until its digest
+    // matches the one the index advertised.
+    verify_sha1(&archive_path, &file.sha1)?;
 
     eprintln!(
         "xtask: extracting {} -> {}",
-        file.name,
+        archive_name,
         vendor_dir.display()
     );
     extract_tar_bz2(&archive_path, &vendor_dir)
-        .with_context(|| format!("extracting {}", file.name))?;
+        .with_context(|| format!("extracting {archive_name}"))?;
 
     flatten_top_level(&vendor_dir)
         .with_context(|| format!("flattening {}", vendor_dir.display()))?;
@@ -393,11 +407,151 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate a filename taken from the remote CEF `index.json`.
+///
+/// The value is used both as a URL suffix and as a path component under
+/// `vendor/cef/<platform>/`, so it has to be a single, plain file name.
+/// Anything with a directory separator, a `..` component, a drive letter
+/// or a leading `-` (which could be read as a flag by tools further down
+/// the pipeline) is rejected outright rather than sanitised — a
+/// well-behaved index never produces one, so a hit means the index is
+/// either broken or hostile and we should stop.
+fn validate_archive_name(name: &str) -> Result<&str> {
+    if name.is_empty() {
+        bail!("CEF index entry has an empty file name");
+    }
+    if name.len() > 255 {
+        bail!(
+            "CEF index file name is implausibly long ({} bytes)",
+            name.len()
+        );
+    }
+    if name.contains('/') || name.contains('\\') {
+        bail!("CEF index file name `{name}` contains a path separator");
+    }
+    if name.contains("..") {
+        bail!("CEF index file name `{name}` contains `..`");
+    }
+    if name.contains(':') {
+        bail!("CEF index file name `{name}` contains `:`");
+    }
+    if name.starts_with('-') {
+        bail!("CEF index file name `{name}` starts with `-`");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        bail!("CEF index file name contains a control character");
+    }
+    // Belt and braces: after all of the above, `file_name()` must be the
+    // whole string. If it isn't, the OS disagrees with us about what a
+    // path component is and we bail instead of guessing.
+    if Path::new(name).file_name().and_then(|n| n.to_str()) != Some(name) {
+        bail!("CEF index file name `{name}` is not a plain file name");
+    }
+    Ok(name)
+}
+
+/// Hash `path` with SHA-1 and compare against `expected` (hex).
+///
+/// SHA-1 is not a defence against a determined forger, but it is the
+/// only digest the Spotify CDN index publishes, and it does catch a
+/// truncated / corrupted / swapped download — which is the difference
+/// between shipping the CEF we asked for and shipping whatever the CDN
+/// (or something between us and it) handed back.
+fn verify_sha1(path: &Path, expected: &str) -> Result<()> {
+    let expected = expected.trim();
+    if expected.len() != 40 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "CEF index published a malformed sha1 `{expected}` for {}",
+            path.display()
+        );
+    }
+
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha1::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex_lower(&hasher.finalize());
+
+    if !actual.eq_ignore_ascii_case(expected) {
+        // Don't leave a mismatched blob lying around for the next run to
+        // find and happily extract.
+        let _ = fs::remove_file(path);
+        bail!(
+            "sha1 mismatch for {}: index said {expected}, downloaded bytes hash to {actual} \
+             (archive deleted)",
+            path.display()
+        );
+    }
+    eprintln!("xtask: sha1 ok ({actual})");
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Reject a tar entry whose path would escape the extraction root.
+///
+/// `tar::Archive::unpack` already refuses absolute paths and `..`, but
+/// it does so silently in some versions and the guarantee isn't part of
+/// the crate's stable contract. We check every entry ourselves so a
+/// zip-slip archive fails loudly instead of being trusted to the tar
+/// crate's discretion.
+fn tar_path_is_safe(path: &Path) -> bool {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    path.components().all(|c| match c {
+        Component::Normal(part) => !part.to_string_lossy().contains('\0'),
+        Component::CurDir => true,
+        // Absolute paths, `..`, and Windows prefixes (`C:`, `\\?\…`) all
+        // let the entry land outside `dest`.
+        Component::ParentDir | Component::RootDir | Component::Prefix(_) => false,
+    })
+}
+
 fn extract_tar_bz2(archive: &Path, dest: &Path) -> Result<()> {
     let file = File::open(archive)?;
     let bz2 = bzip2::read::BzDecoder::new(file);
     let mut tar = tar::Archive::new(bz2);
-    tar.unpack(dest)?;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if !tar_path_is_safe(&path) {
+            bail!(
+                "refusing to extract `{}` from {}: entry path escapes the destination",
+                path.display(),
+                archive.display()
+            );
+        }
+        // `unpack_in` returns Ok(false) when *it* decided the entry was
+        // unsafe to write (its own traversal / link-target checks). Our
+        // check above should have caught those already, so a `false`
+        // here means the two disagree — bail rather than silently ship a
+        // partial tree.
+        let unpacked = entry
+            .unpack_in(dest)
+            .with_context(|| format!("unpacking {}", path.display()))?;
+        if !unpacked {
+            bail!(
+                "tar refused to unpack `{}` from {}",
+                path.display(),
+                archive.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1146,9 +1300,7 @@ fn build_deb(
     // Invoke dpkg-deb if available. Otherwise leave the staging tree
     // and let CI pick it up.
     let out = dist_dir.join(format!("buffr-{version}-{arch}.deb"));
-    let dpkg = Command::new("which").arg("dpkg-deb").output().ok();
-    let dpkg_ok = dpkg.as_ref().map(|o| o.status.success()).unwrap_or(false);
-    if !dpkg_ok {
+    if !which("dpkg-deb") {
         eprintln!(
             "xtask: dpkg-deb not on PATH; leaving deb staging tree at {}",
             debroot.display()
@@ -1543,12 +1695,89 @@ fn macos_arch_suffix() -> &'static str {
     }
 }
 
+/// Locate `tool` on `PATH`, returning the full path to the executable.
+///
+/// Implemented in Rust rather than by shelling out to `which(1)`: that
+/// binary does not exist on a stock Windows host (`where` is a `cmd`
+/// builtin, not an executable on `PATH`), so the old version reported
+/// *every* tool as missing on any Windows runner without
+/// Git-for-Windows' `usr/bin` on `PATH` — which silently degraded
+/// `package-windows-msi` into a payload-staging no-op.
+///
+/// Windows semantics: a bare name is tried against every extension in
+/// `PATHEXT` (defaulting to the usual `.COM;.EXE;.BAT;.CMD`) as well as
+/// verbatim, so `which_path("candle")` finds `candle.exe`.
+fn which_path(tool: &str) -> Option<PathBuf> {
+    // An explicit path (`./foo`, `C:\wix\candle.exe`) bypasses the PATH
+    // walk entirely, matching what `Command::new` would do with it.
+    if tool.contains('/') || (cfg!(windows) && tool.contains('\\')) {
+        let p = PathBuf::from(tool);
+        return is_executable_file(&p).then_some(p);
+    }
+
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for candidate in exe_candidates(tool) {
+            let full = dir.join(&candidate);
+            if is_executable_file(&full) {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+/// File-name spellings to try for `tool`, in priority order.
+fn exe_candidates(tool: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return vec![tool.to_string()];
+    }
+    let mut out = Vec::new();
+    // A name that already carries a known extension is used verbatim
+    // first; otherwise PATHEXT spellings win over the bare name so we
+    // don't match an extensionless sibling on Windows.
+    let pathext =
+        env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".into());
+    let has_ext = pathext
+        .split(';')
+        .filter(|e| !e.is_empty())
+        .any(|e| tool.to_ascii_lowercase().ends_with(&e.to_ascii_lowercase()));
+    if has_ext {
+        out.push(tool.to_string());
+    }
+    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+        out.push(format!("{tool}{ext}"));
+    }
+    out.push(tool.to_string());
+    out.dedup();
+    out
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// `which_path(tool).is_some()` — the presence-only form used by the
+/// "is this optional packaging tool available?" checks.
 fn which(tool: &str) -> bool {
-    Command::new("which")
-        .arg(tool)
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+    which_path(tool).is_some()
 }
 
 // ----------------------------- package-windows-msi -----------------------
@@ -1621,24 +1850,31 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
     }
     stage_windows_payload(&bin_payload_dir, &cef_payload_dir, &payload)?;
 
-    // 3. Resolve candle + light + heat. All three must exist; partial
-    //    WiX 3 install is treated as missing.
-    let have_candle = which("candle") || which("candle.exe");
-    let have_light = which("light") || which("light.exe");
-    let have_heat = which("heat") || which("heat.exe");
-    if !have_candle || !have_light || !have_heat {
-        eprintln!(
-            "xtask: candle/light/heat from the WiX 3 toolset not on PATH; \
-             leaving payload + .wxs at {}",
+    // 3. Resolve candle + light + heat. All three must exist; a partial
+    //    WiX 3 install is treated as missing. `which_path` already tries
+    //    the PATHEXT spellings on Windows, so a bare name finds
+    //    `candle.exe`.
+    //
+    //    This is a hard failure, not a warning: the caller asked for an
+    //    .msi, and returning Ok() here left CI's "validate msi exists"
+    //    step to report the absence as an unrelated error several steps
+    //    later.
+    let missing: Vec<&str> = ["candle", "light", "heat"]
+        .into_iter()
+        .filter(|t| !which(t))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "WiX 3 toolset incomplete: {} not found on PATH. The payload and \
+             .wxs have been staged at {}; install WiX 3 (or the v3 build of \
+             WiX 4) and re-run, or use the CI windows-package job.",
+            missing.join(", "),
             dist_dir.display()
         );
-        eprintln!(
-            "       To produce the .msi: install WiX 3 (or the v3 build of WiX 4) \
-             and re-run this command on a host with the toolset, or rely on the \
-             CI windows-package job."
-        );
-        return Ok(());
     }
+    let heat_exe = which_path("heat").expect("heat resolved above");
+    let candle_exe = which_path("candle").expect("candle resolved above");
+    let light_exe = which_path("light").expect("light resolved above");
 
     // 4. heat.exe — harvest the CEF runtime tree into a ComponentGroup.
     //    `-srd` suppresses the root-dir element so files install
@@ -1647,7 +1883,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
     //    don't bake an absolute path into the wxs.
     let cef_wxs_path = dist_dir.join("cef-payload.wxs");
     eprintln!("xtask: heat -> {}", cef_wxs_path.display());
-    let status = Command::new(if which("heat") { "heat" } else { "heat.exe" })
+    let status = Command::new(&heat_exe)
         .arg("dir")
         .arg(&cef_payload_dir)
         .arg("-nologo")
@@ -1675,21 +1911,17 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
     let wixobj = dist_dir.join("buffr.wixobj");
     let cef_wixobj = dist_dir.join("cef-payload.wixobj");
     eprintln!("xtask: candle -> {}", wixobj.display());
-    let status = Command::new(if which("candle") {
-        "candle"
-    } else {
-        "candle.exe"
-    })
-    .arg("-arch")
-    .arg(arch)
-    .arg(format!("-dCefPayloadDir={}", cef_payload_dir.display()))
-    .arg("-o")
-    .arg(format!("{}\\", dist_dir.display()))
-    .arg(&wxs_path)
-    .arg(&cef_wxs_path)
-    .current_dir(&dist_dir)
-    .status()
-    .context("spawning candle")?;
+    let status = Command::new(&candle_exe)
+        .arg("-arch")
+        .arg(arch)
+        .arg(format!("-dCefPayloadDir={}", cef_payload_dir.display()))
+        .arg("-o")
+        .arg(format!("{}\\", dist_dir.display()))
+        .arg(&wxs_path)
+        .arg(&cef_wxs_path)
+        .current_dir(&dist_dir)
+        .status()
+        .context("spawning candle")?;
     if !status.success() {
         bail!("candle exited {status:?}");
     }
@@ -1703,7 +1935,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
     // fragment (50+ files, nested locales/ tree). Suppress: install
     // scope is already perUser via the Package element and the
     // INSTALLFOLDER component carries a `RemoveFolder` for the root.
-    let status = Command::new(if which("light") { "light" } else { "light.exe" })
+    let status = Command::new(&light_exe)
         .arg("-o")
         .arg(&msi_path)
         .arg("-sice:ICE38")
@@ -2373,6 +2605,157 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M1: remote-controlled `index.json` file names + tar path traversal
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn archive_name_accepts_a_real_spotify_filename() {
+        let n = "cef_binary_147.0.10+gabcdef0+chromium-147.0.0.0_linux64_minimal.tar.bz2";
+        assert_eq!(validate_archive_name(n).unwrap(), n);
+    }
+
+    #[test]
+    fn archive_name_rejects_traversal_and_separators() {
+        for bad in [
+            "../../.cargo/config.toml",
+            "..",
+            "../evil.tar.bz2",
+            "sub/dir/evil.tar.bz2",
+            "sub\\dir\\evil.tar.bz2",
+            "/etc/passwd",
+            "C:\\windows\\system32\\evil.dll",
+            "",
+            "-rf",
+            "evil\u{0}.tar.bz2",
+            "ev\nil.tar.bz2",
+        ] {
+            assert!(
+                validate_archive_name(bad).is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_name_rejects_implausibly_long_names() {
+        let long = "a".repeat(256);
+        assert!(validate_archive_name(&long).is_err());
+    }
+
+    #[test]
+    fn tar_path_safety() {
+        for good in [
+            "cef_binary_147/Release/libcef.so",
+            "./cef_binary_147/README.txt",
+            "libcef.so",
+        ] {
+            assert!(tar_path_is_safe(Path::new(good)), "`{good}` should be safe");
+        }
+        for bad in [
+            "../escape",
+            "cef_binary_147/../../escape",
+            "/etc/passwd",
+            "cef/../../../../tmp/pwned",
+            "",
+        ] {
+            assert!(
+                !tar_path_is_safe(Path::new(bad)),
+                "`{bad}` should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn sha1_verification_round_trips_and_catches_tampering() {
+        let dir = tempdir();
+        let f = dir.path().join("blob.bin");
+        fs::write(&f, b"abc").unwrap();
+        // Known vector: SHA-1("abc").
+        let expected = "a9993e364706816aba3e25717850c26c9cd0d89d";
+        verify_sha1(&f, expected).unwrap();
+        // Uppercase hex from the index must still match.
+        fs::write(&f, b"abc").unwrap();
+        verify_sha1(&f, &expected.to_ascii_uppercase()).unwrap();
+
+        // Mismatch fails *and* removes the blob so a re-run can't pick
+        // the bad archive back up and extract it.
+        fs::write(&f, b"abd").unwrap();
+        assert!(verify_sha1(&f, expected).is_err());
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn sha1_verification_rejects_a_malformed_digest() {
+        let dir = tempdir();
+        let f = dir.path().join("blob.bin");
+        fs::write(&f, b"abc").unwrap();
+        for bad in ["", "deadbeef", &"z".repeat(40)] {
+            assert!(verify_sha1(&f, bad).is_err(), "`{bad}` should be rejected");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M43: PATH resolution without shelling out to `which(1)`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn which_finds_nothing_for_a_bogus_tool() {
+        assert!(which_path("definitely-not-a-real-tool-xyzzy").is_none());
+        assert!(!which("definitely-not-a-real-tool-xyzzy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_finds_an_executable_on_path_and_skips_non_executables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let exe = dir.path().join("buffr-fake-tool");
+        fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Same dir, not executable — must not be resolved.
+        let data = dir.path().join("buffr-fake-data");
+        fs::write(&data, b"not a program").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A directory that merely shares the name must not match either.
+        let as_dir = dir.path().join("buffr-fake-dir");
+        fs::create_dir_all(&as_dir).unwrap();
+
+        let orig = env::var_os("PATH");
+        // SAFETY: single-threaded test process; PATH is restored below.
+        unsafe { env::set_var("PATH", dir.path()) };
+        let found = which_path("buffr-fake-tool");
+        let skipped = which_path("buffr-fake-data");
+        let dir_hit = which_path("buffr-fake-dir");
+        match orig {
+            Some(p) => unsafe { env::set_var("PATH", p) },
+            None => unsafe { env::remove_var("PATH") },
+        }
+
+        assert_eq!(found.as_deref(), Some(exe.as_path()));
+        assert!(skipped.is_none(), "non-executable file must not resolve");
+        assert!(dir_hit.is_none(), "directory must not resolve");
+    }
+
+    #[test]
+    fn exe_candidates_shape_matches_the_host() {
+        let got = exe_candidates("candle");
+        assert!(got.contains(&"candle".to_string()));
+        if cfg!(windows) {
+            assert!(
+                got.iter().any(|c| c.eq_ignore_ascii_case("candle.EXE")),
+                "PATHEXT spellings missing: {got:?}"
+            );
+            // The bare name must be last so a PATHEXT hit wins.
+            assert_eq!(got.last().unwrap(), "candle");
+        } else {
+            assert_eq!(got, vec!["candle".to_string()]);
         }
     }
 }

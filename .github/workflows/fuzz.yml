@@ -24,6 +24,8 @@ jobs:
           - fuzz_target_keybind
           - fuzz_target_keys
           - fuzz_target_config_toml
+          - fuzz_target_console_sentinel
+          - fuzz_target_netscape_import
 
     steps:
       - uses: actions/checkout@v6

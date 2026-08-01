@@ -23,3 +23,8 @@ ureq.workspace = true
 serde.workspace = true
 tar.workspace = true
 bzip2.workspace = true
+# SHA-1 is the only digest the Spotify CEF `index.json` publishes, so the
+# integrity check on the ~200 MB tarball has to match it. Not used for
+# anything security-critical beyond "did the CDN hand us the bytes the
+# index says it would".
+sha1.workspace = true

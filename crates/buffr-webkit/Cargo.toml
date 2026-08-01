@@ -20,7 +20,7 @@ buffr-permissions = { path = "../buffr-permissions", default-features = false }
 serde_json = "1"
 buffr-modal = { path = "../buffr-modal" }
 buffr-downloads = { path = "../buffr-downloads" }
-hjkl-clipboard = "0.5"
+hjkl-clipboard = "0.25"
 tracing = "0.1"
 thiserror = "2"
 ureq = { version = "3" }

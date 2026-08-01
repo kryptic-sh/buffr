@@ -19,7 +19,7 @@ default = ["store"]
 store = ["dep:rusqlite", "dep:buffr-store"]
 
 [dependencies]
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+rusqlite = { workspace = true, features = ["bundled"], optional = true }
 buffr-store = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

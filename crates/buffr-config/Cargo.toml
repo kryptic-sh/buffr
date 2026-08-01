@@ -16,10 +16,10 @@ ignored = []
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-toml = "1.1"
+toml.workspace = true
 dirs = "6"
 hjkl-config.workspace = true
-notify = "8"
+notify.workspace = true
 url = "2"
 buffr-modal.workspace = true
 

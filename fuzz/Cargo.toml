@@ -11,21 +11,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 buffr-config = { path = "../crates/buffr-config" }
 buffr-modal = { path = "../crates/buffr-modal" }
-toml = "1.1"
-
-# Cargo-fuzz requires a nightly-only build; the patch table from the
-# workspace root does NOT apply here (this is an excluded crate), so we
-# re-declare path overrides for every buffr-* transitive dep.
-[patch.crates-io]
-buffr-bookmarks = { path = "../crates/buffr-bookmarks" }
-buffr-config = { path = "../crates/buffr-config" }
 buffr-core = { path = "../crates/buffr-core" }
-buffr-downloads = { path = "../crates/buffr-downloads" }
-buffr-history = { path = "../crates/buffr-history" }
-buffr-modal = { path = "../crates/buffr-modal" }
-buffr-permissions = { path = "../crates/buffr-permissions" }
-buffr-ui = { path = "../crates/buffr-ui" }
-buffr-zoom = { path = "../crates/buffr-zoom" }
+buffr-bookmarks = { path = "../crates/buffr-bookmarks" }
+toml = "1.1"
 
 [[bin]]
 name = "fuzz_target_keybind"
@@ -44,6 +32,20 @@ bench = false
 [[bin]]
 name = "fuzz_target_config_toml"
 path = "fuzz_targets/fuzz_target_config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_target_console_sentinel"
+path = "fuzz_targets/fuzz_target_console_sentinel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_target_netscape_import"
+path = "fuzz_targets/fuzz_target_netscape_import.rs"
 test = false
 doc = false
 bench = false
