@@ -25,7 +25,7 @@ and keeping them there costs no extra compositor work.
 CEF -> Rust uses the **console-log fallback** path, not `cef_process_message_t`.
 The injected JS calls
 
-    console.log("__buffr_hint__:" + JSON.stringify(payload))
+    console.log("__buffr_hint__" + nonce + ":" + JSON.stringify(payload))
 
 and `BuffrDisplayHandler::on_console_message` (in
 `crates/buffr-cef/src/handlers.rs`) pattern-matches the sentinel via the shared
@@ -33,6 +33,37 @@ and `BuffrDisplayHandler::on_console_message` (in
 and writes into a one-slot `HintEventSink`
 (`Arc<Mutex<Option<HintConsoleEvent>>>`). The host drains the sink each tick
 from `BrowserHost::pump_hint_events`.
+
+### The nonce
+
+`on_console_message` has no frame argument, so without authentication _any_
+frame — including a third-party ad iframe — could emit a sentinel line and have
+it accepted. A page doing that could point the next hint keystroke at an element
+it chose, pin the idle inhibitor on so the screen never locks, or push text into
+the yank-to-clipboard path.
+
+So every sentinel line carries a 128-bit nonce (`buffr_core::console_nonce`),
+minted from the OS CSPRNG and spliced into the injected script:
+
+    <sentinel><nonce>:<json>
+
+The page nonce rotates on every main-frame load and the hint nonce on every
+`enter_hint_mode`. Nonces only ever reach main frames, so a subframe can never
+learn one. The match is also **anchored** at the start of the console line
+rather than located with `find` anywhere in it.
+
+Two consequences worth knowing:
+
+- **This is not a boundary against the top frame.** The injected script runs in
+  the page, and injection happens at `on_load_end` — after page script has run —
+  so a page that hooks `console.log` first reads the nonce and can forge for
+  itself. What the nonce closes is cross-frame forgery and cross-load replay.
+  The complete fix is a real `cef_process_message_t` channel; this is defence in
+  depth on a transport that is structurally observable.
+- **Anchoring is an availability trade.** A page that wraps `console.log` to
+  prepend its own format string (`%cINFO …`) now hides our payload too, so hint
+  and edit mode stop working on it. Accepted deliberately: on such a page the
+  nonce is readable anyway, so the alternative is a channel the page controls.
 
 The cleaner `cef_process_message_t` IPC channel was rejected for v1 because it
 requires a renderer-side `RenderProcessHandler` registered via

@@ -12,6 +12,13 @@
 // This is the same console-log scraping pattern as hint.js — see
 // `crates/buffr-core/src/hint.rs` for the rationale.
 //
+// `%%SENTINEL%%` is substituted by `edit::build_inject_script` with
+// `__buffr_edit__:` + the per-page-load nonce + `:`. Rust rejects any line
+// whose nonce isn't the one it minted for this browser, which is what stops
+// a third-party iframe from forging edit events (notably
+// `{"type":"selection"}`, which feeds the yank-to-clipboard path). Keep it
+// in this IIFE's scope — never assign it to `window`.
+//
 // IPC (browser → renderer) — Stage 2 additions:
 //   `window.__buffrEditApply(field_id, value)` — push a new value from
 //       Rust back into the focused field, firing a synthetic `input`
@@ -24,10 +31,29 @@
 //
 // Guard: `window.__buffrEditWired` prevents double-installation on
 // SPA soft navigations that re-run injected scripts.
+//
+// The guard alone is not enough now that the sentinel carries a per-load
+// nonce: a re-injection that bailed on the guard would leave the *already
+// wired* closure emitting the previous nonce, and Rust would drop every
+// event from then on. So a re-injection tears the previous copy down via
+// `window.__buffrEditTeardown()` and wires itself fresh.
+//
+// Teardown deliberately takes no arguments and returns nothing. A page can
+// squat the name to make its own edit mode stop working — which it could
+// already do by setting `__buffrEditWired` — but there is no path here that
+// hands page-controlled code the nonce.
 
 (function () {
     'use strict';
 
+    // A previous copy of this script is live in this same document (the
+    // guard survived because `window` did). Unwire it so this copy, with
+    // the current nonce, fully replaces it.
+    if (typeof window.__buffrEditTeardown === 'function') {
+        try { window.__buffrEditTeardown(); } catch (_) {}
+    }
+    // Still wired means something else owns the flag (a page squatting the
+    // name). Bail rather than stack a second listener set on top.
     if (window.__buffrEditWired) { return; }
     window.__buffrEditWired = true;
 
@@ -42,7 +68,11 @@
     // (or post-load via setTimeout / rAF / observers) would otherwise
     // keep the caret blinking, which forces continuous on_paint frames
     // from CEF and pegs buffr's render pipeline at idle.
-    window.__buffrUserGesture = false;
+    //
+    // Preserved across a re-wire: the user's gesture on this document
+    // already happened, and re-arming the gate would silently blur the
+    // field they are typing in.
+    if (window.__buffrUserGesture !== true) { window.__buffrUserGesture = false; }
     function markGesture() { window.__buffrUserGesture = true; }
     document.addEventListener('mousedown', markGesture, true);
     document.addEventListener('pointerdown', markGesture, true);
@@ -142,7 +172,7 @@
     // Capture phase (third arg = true) ensures we see it before any
     // page-level handlers that call stopPropagation.
 
-    document.addEventListener('focusin', function (ev) {
+    function onFocusIn(ev) {
         var el = ev.target;
         var kind = kindOf(el);
         if (!kind) { return; }
@@ -171,14 +201,15 @@
             selection_start: start,
             selection_end: end
         });
-    }, true);
+    }
+    document.addEventListener('focusin', onFocusIn, true);
 
     // ---- focusout (capture) ---------------------------------------------
     //
     // Fires when any element loses focus. We remove the overlay class and
     // emit a blur event so Stage 2 can drop the EditSession.
 
-    document.addEventListener('focusout', function (ev) {
+    function onFocusOut(ev) {
         var el = ev.target;
         var kind = kindOf(el);
         if (!kind) { return; }
@@ -187,7 +218,8 @@
         el.classList.remove(OVERLAY_CLASS);
 
         emit({ type: 'blur', field_id: id });
-    }, true);
+    }
+    document.addEventListener('focusout', onFocusOut, true);
 
     // ---- input (capture) ------------------------------------------------
     //
@@ -201,7 +233,7 @@
     // our own `__buffrEditApply` call — skip re-emitting to break the
     // Rust-writes → JS-emits → Rust-processes loop.
 
-    document.addEventListener('input', function (ev) {
+    function onInput(ev) {
         var el = ev.target;
         var kind = kindOf(el);
         if (!kind) { return; }
@@ -215,7 +247,26 @@
 
         var id = idMap.get(el);
         emit({ type: 'mutate', field_id: id, value: valueOf(el, kind) });
-    }, true);
+    }
+    document.addEventListener('input', onInput, true);
+
+    // ---- teardown -------------------------------------------------------
+    //
+    // Called by a *later* injection of this same script into this same
+    // document (see the guard at the top). Removes every listener this
+    // copy installed and clears the wired flag so the new copy — carrying
+    // the current console nonce — can install cleanly. Takes no arguments
+    // and returns nothing, so a page that squats the name learns nothing.
+
+    window.__buffrEditTeardown = function () {
+        document.removeEventListener('focusin', onFocusIn, true);
+        document.removeEventListener('focusout', onFocusOut, true);
+        document.removeEventListener('input', onInput, true);
+        document.removeEventListener('mousedown', markGesture, true);
+        document.removeEventListener('pointerdown', markGesture, true);
+        document.removeEventListener('touchstart', markGesture, true);
+        window.__buffrEditWired = false;
+    };
 
     // ---- browser → renderer IPC (Stage 2) ------------------------------
 

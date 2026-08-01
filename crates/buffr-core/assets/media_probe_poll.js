@@ -7,6 +7,10 @@
 // constructors; if it hasn't, the three patched-constructor signals simply
 // read as false.
 //
+// This file is a TEMPLATE: `media_probe::build_poll_script` substitutes
+// `%%SENTINEL%%` with the sentinel + the per-page-load nonce before the
+// script is evaluated. Evaluating it verbatim emits lines Rust rejects.
+//
 // Signal sources and how they map to each flag:
 //
 //   Signal                                       | media_active | video_active
@@ -120,11 +124,18 @@
     // updates BrowserHost's video_active atomic. Same console-log shape as
     // edit.js / hint.js. Cache the last emitted payload so we only fire a
     // line on transitions — silent pages would otherwise spam every ~2 s.
+    //
+    // `%%SENTINEL%%` is substituted by `media_probe::build_poll_script` with
+    // `__buffr_media__:` + the per-page-load nonce + `:`. The Rust side only
+    // accepts lines carrying the nonce it currently holds for this browser,
+    // which is what stops an ad iframe from pinning the idle inhibitor on.
+    // Keep it a local `var`: never publish it on `window`.
     try {
+        var SENTINEL = '%%SENTINEL%%';
         var prev = window.__buffr_media_last_emit;
         if (!prev || prev.media !== active || prev.video !== videoActive) {
             window.__buffr_media_last_emit = { media: active, video: videoActive };
-            console.log('__buffr_media__:' + JSON.stringify({
+            console.log(SENTINEL + JSON.stringify({
                 media: active,
                 video: videoActive
             }));

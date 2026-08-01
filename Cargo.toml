@@ -93,6 +93,13 @@ bytemuck = { version = "1", features = ["derive"] }
 # Phase 6 update channel: `UpdateChecker` compares the running version
 # against GitHub releases. SemVer parsing handles rc/beta suffixes.
 semver = { version = "1", features = ["serde"] }
+# OS entropy for the per-page-load console-IPC nonce (`buffr_core::
+# console_nonce`). Deliberately *not* `rand`: we need exactly one thing —
+# 16 unpredictable bytes from the kernel (`getrandom(2)` / `BCryptGenRandom`
+# / `getentropy`) — and `getrandom` is the no-dependency leaf crate that
+# `rand` itself sits on. It is already in `Cargo.lock` as a transitive dep,
+# so this adds no new code to the build.
+getrandom = "0.3"
 
 # Buffr-* crates are now plain monorepo members under crates/<name>/.
 # All deps resolve directly via path — no registry pins or [patch.crates-io] needed.

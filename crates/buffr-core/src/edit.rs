@@ -7,11 +7,18 @@
 //! 1. `edit.js` is injected into every main frame on `on_load_end` (once
 //!    per page load, not per hint-mode invocation).
 //! 2. The JS installs capture-phase `focusin`, `focusout`, and `input`
-//!    listeners that emit `%%SENTINEL%%:{…}` lines via `console.log`.
+//!    listeners that emit `__buffr_edit__:<nonce>:{…}` lines via
+//!    `console.log`.
 //! 3. [`crate::handlers::BuffrDisplayHandler::on_console_message`]
-//!    strips the sentinel, parses the JSON tail via
+//!    strips the sentinel, checks the nonce, parses the JSON tail via
 //!    [`parse_console_event`], and pushes the result into an
 //!    [`EditEventSink`] queue.
+//!
+//! The `<nonce>` is minted per main-frame load (see
+//! [`crate::console_nonce`]) and spliced into the asset by
+//! [`build_inject_script`]. Without it, any frame on the page could emit
+//! `__buffr_edit__:{"type":"selection","value":"…"}` and push text of its
+//! choosing into the yank-to-clipboard path.
 //! 4. Stage 2 will drain the queue from the UI render loop and wire events
 //!    into [`EditSession`] construction / keystroke routing / Esc handling.
 //!
@@ -163,29 +170,37 @@ struct TypeTag {
 
 /// Try to parse a console message line as an edit-mode event.
 ///
+/// `nonce` is the page nonce currently minted for the emitting browser
+/// (`ConsoleNonces::page`).
+///
 /// Returns:
-/// - `None` — line does not carry the [`EDIT_CONSOLE_SENTINEL`] prefix;
-///   the caller should treat it as a regular console message.
-/// - `Some(Ok(event))` — prefix present; JSON decoded successfully.
-/// - `Some(Err(err))` — prefix present but decoding failed; callers
-///   should log the error rather than silently dropping it.
-pub fn parse_console_event(line: &str) -> Option<Result<EditConsoleEvent, ParseError>> {
-    let suffix = crate::console_sentinel::sentinel_payload(line, EDIT_CONSOLE_SENTINEL)?;
+/// - `None` — the line is not an authentic edit line for `nonce`: no
+///   [`EDIT_CONSOLE_SENTINEL`] at the *start*, or the nonce doesn't match.
+///   The caller should treat it as a regular console message.
+/// - `Some(Ok(event))` — authentic; JSON decoded successfully.
+/// - `Some(Err(err))` — authentic but decoding failed; callers should log
+///   the error rather than silently dropping it.
+pub fn parse_console_event(
+    line: &str,
+    nonce: &str,
+) -> Option<Result<EditConsoleEvent, ParseError>> {
+    let suffix = crate::console_sentinel::sentinel_payload(line, EDIT_CONSOLE_SENTINEL, nonce)?;
+    Some(parse_payload(suffix))
+}
 
+/// Decode a bare edit-event JSON payload (no sentinel, no nonce).
+///
+/// For backends that receive the payload over a trusted channel instead of
+/// scraping `console.log`, so they don't have to synthesise a wire line.
+pub fn parse_payload(json: &str) -> Result<EditConsoleEvent, ParseError> {
     // Two-pass approach: first extract the "type" discriminant, then
     // deserialise the full payload into the appropriate variant. Avoids
     // a custom Visitor while keeping good error messages.
-    let tag: TypeTag = match serde_json::from_str(suffix) {
-        Ok(t) => t,
-        Err(e) => return Some(Err(ParseError::Json(e))),
-    };
+    let tag: TypeTag = serde_json::from_str(json)?;
 
     let event = match tag.kind.as_str() {
         "focus" => {
-            let r: RawFocus = match serde_json::from_str(suffix) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(ParseError::Json(e))),
-            };
+            let r: RawFocus = serde_json::from_str(json)?;
             EditConsoleEvent::Focus {
                 field_id: r.field_id,
                 kind: r.kind,
@@ -195,37 +210,28 @@ pub fn parse_console_event(line: &str) -> Option<Result<EditConsoleEvent, ParseE
             }
         }
         "blur" => {
-            let r: RawBlur = match serde_json::from_str(suffix) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(ParseError::Json(e))),
-            };
+            let r: RawBlur = serde_json::from_str(json)?;
             EditConsoleEvent::Blur {
                 field_id: r.field_id,
             }
         }
         "mutate" => {
-            let r: RawMutate = match serde_json::from_str(suffix) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(ParseError::Json(e))),
-            };
+            let r: RawMutate = serde_json::from_str(json)?;
             EditConsoleEvent::Mutate {
                 field_id: r.field_id,
                 value: r.value,
             }
         }
         "selection" => {
-            let r: RawSelection = match serde_json::from_str(suffix) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(ParseError::Json(e))),
-            };
+            let r: RawSelection = serde_json::from_str(json)?;
             EditConsoleEvent::Selection { value: r.value }
         }
         other => {
-            return Some(Err(ParseError::UnknownType(other.to_owned())));
+            return Err(ParseError::UnknownType(other.to_owned()));
         }
     };
 
-    Some(Ok(event))
+    Ok(event)
 }
 
 /// Queue shared between [`crate::handlers::BuffrDisplayHandler`] (writer)
@@ -254,14 +260,31 @@ pub fn drain_edit_events(sink: &EditEventSink) -> Vec<EditConsoleEvent> {
 ///
 /// Substitutes the two placeholders the asset uses:
 ///
-/// - `%%SENTINEL%%`     → [`EDIT_CONSOLE_SENTINEL`]
+/// - `%%SENTINEL%%`     → [`EDIT_CONSOLE_SENTINEL`] + `nonce` + `:`, the
+///   exact prefix [`parse_console_event`] will accept for this page load.
 /// - `%%OVERLAY_CLASS%%` → [`EDIT_DOM_OVERLAY_CLASS`]
 ///
 /// The asset already wraps the substitution sites in string literals so
-/// no additional quoting is needed here (both values are ASCII-safe).
-pub fn build_inject_script() -> String {
+/// no additional quoting is needed here (all values are ASCII-safe;
+/// `nonce` is plain hex).
+///
+/// `nonce` comes from [`crate::console_nonce::ConsoleNonces::rotate_page`].
+/// Inject the result into a **main frame only** — handing a subframe the
+/// nonce would give away the very thing it is there to withhold.
+///
+/// Re-injection into a document that already has `edit.js` wired is
+/// handled by the asset's `window.__buffrEditTeardown` hook: the new copy
+/// unwires the old listeners and installs its own, so a soft-navigation
+/// `on_load_end` that rotates the nonce does not leave the document
+/// emitting the stale one (which Rust would then drop, silently killing
+/// edit mode). Teardown takes no arguments, so nothing on that path can
+/// hand the nonce to page-controlled code.
+pub fn build_inject_script(nonce: &str) -> String {
     include_str!("../assets/edit.js")
-        .replace("%%SENTINEL%%", EDIT_CONSOLE_SENTINEL)
+        .replace(
+            "%%SENTINEL%%",
+            &crate::console_sentinel::sentinel_prefix(EDIT_CONSOLE_SENTINEL, nonce),
+        )
         .replace("%%OVERLAY_CLASS%%", EDIT_DOM_OVERLAY_CLASS)
 }
 
@@ -271,18 +294,26 @@ mod tests {
 
     // ---- parse_console_event --------------------------------------------
 
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn wire(body: &str) -> String {
+        format!("{EDIT_CONSOLE_SENTINEL}{NONCE}:{body}")
+    }
+
     #[test]
     fn parse_non_sentinel() {
         // Lines that don't start with the sentinel return None.
-        assert!(parse_console_event("hello world").is_none());
-        assert!(parse_console_event("__buffr_hint__:{\"kind\":\"ready\"}").is_none());
-        assert!(parse_console_event("").is_none());
+        assert!(parse_console_event("hello world", NONCE).is_none());
+        assert!(parse_console_event(&format!("__buffr_hint__:{NONCE}:{{}}"), NONCE).is_none());
+        assert!(parse_console_event("", NONCE).is_none());
     }
 
     #[test]
     fn parse_focus_event() {
-        let line = r#"__buffr_edit__:{"type":"focus","field_id":"f1","kind":"input","value":"hello","selection_start":5,"selection_end":5}"#;
-        let ev = parse_console_event(line)
+        let line = wire(
+            r#"{"type":"focus","field_id":"f1","kind":"input","value":"hello","selection_start":5,"selection_end":5}"#,
+        );
+        let ev = parse_console_event(&line, NONCE)
             .expect("should return Some")
             .expect("should parse ok");
         match ev {
@@ -306,8 +337,12 @@ mod tests {
     #[test]
     fn parse_focus_event_null_selection() {
         // contentEditable fields emit null for selection positions.
-        let line = r#"__buffr_edit__:{"type":"focus","field_id":"f2","kind":"contentEditable","value":"world","selection_start":null,"selection_end":null}"#;
-        let ev = parse_console_event(line).expect("Some").expect("ok");
+        let line = wire(
+            r#"{"type":"focus","field_id":"f2","kind":"contentEditable","value":"world","selection_start":null,"selection_end":null}"#,
+        );
+        let ev = parse_console_event(&line, NONCE)
+            .expect("Some")
+            .expect("ok");
         match ev {
             EditConsoleEvent::Focus {
                 selection_start,
@@ -323,8 +358,10 @@ mod tests {
 
     #[test]
     fn parse_blur_event() {
-        let line = r#"__buffr_edit__:{"type":"blur","field_id":"f3"}"#;
-        let ev = parse_console_event(line).expect("Some").expect("ok");
+        let line = wire(r#"{"type":"blur","field_id":"f3"}"#);
+        let ev = parse_console_event(&line, NONCE)
+            .expect("Some")
+            .expect("ok");
         match ev {
             EditConsoleEvent::Blur { field_id } => assert_eq!(field_id, "f3"),
             other => panic!("expected Blur, got {other:?}"),
@@ -333,8 +370,10 @@ mod tests {
 
     #[test]
     fn parse_mutate_event() {
-        let line = r#"__buffr_edit__:{"type":"mutate","field_id":"f4","value":"new text"}"#;
-        let ev = parse_console_event(line).expect("Some").expect("ok");
+        let line = wire(r#"{"type":"mutate","field_id":"f4","value":"new text"}"#);
+        let ev = parse_console_event(&line, NONCE)
+            .expect("Some")
+            .expect("ok");
         match ev {
             EditConsoleEvent::Mutate { field_id, value } => {
                 assert_eq!(field_id, "f4");
@@ -348,8 +387,8 @@ mod tests {
     fn parse_unknown_type() {
         // A payload with a valid sentinel but unrecognised `type` must
         // return `Some(Err(_))`, not `None` or `Some(Ok(_))`.
-        let line = r#"__buffr_edit__:{"type":"weird","field_id":"f5"}"#;
-        let result = parse_console_event(line).expect("Some");
+        let line = wire(r#"{"type":"weird","field_id":"f5"}"#);
+        let result = parse_console_event(&line, NONCE).expect("Some");
         assert!(result.is_err(), "expected Err for unknown type, got Ok");
         match result.unwrap_err() {
             ParseError::UnknownType(t) => assert_eq!(t, "weird"),
@@ -359,16 +398,67 @@ mod tests {
 
     #[test]
     fn parse_malformed_json() {
-        let line = "__buffr_edit__:not json at all";
-        let result = parse_console_event(line).expect("Some");
+        let line = wire("not json at all");
+        let result = parse_console_event(&line, NONCE).expect("Some");
         assert!(result.is_err(), "expected Err for malformed JSON");
+    }
+
+    // ---- H5: forged edit events ------------------------------------------
+
+    #[test]
+    fn parse_rejects_line_without_nonce() {
+        // The pre-nonce wire format: any frame could emit this to push
+        // attacker-chosen text into the yank-to-clipboard path.
+        let forged = r#"__buffr_edit__:{"type":"selection","value":"attacker text"}"#;
+        assert!(parse_console_event(forged, NONCE).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_wrong_nonce() {
+        let forged = format!(
+            "{EDIT_CONSOLE_SENTINEL}{}:{}",
+            "f".repeat(32),
+            r#"{"type":"selection","value":"attacker text"}"#
+        );
+        assert!(parse_console_event(&forged, NONCE).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unanchored_sentinel() {
+        let forged = format!("%cINFO {}", wire(r#"{"type":"blur","field_id":"f3"}"#));
+        assert!(parse_console_event(&forged, NONCE).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_nonce_from_a_previous_page_load() {
+        use crate::console_nonce::ConsoleNonces;
+        let nonces = ConsoleNonces::new();
+        let old = nonces.rotate_page(1);
+        let line = format!(
+            "{EDIT_CONSOLE_SENTINEL}{old}:{}",
+            r#"{"type":"blur","field_id":"f3"}"#
+        );
+        assert!(parse_console_event(&line, &old).is_some(), "sanity");
+        let new = nonces.rotate_page(1);
+        assert!(
+            parse_console_event(&line, &new).is_none(),
+            "a nonce leaked on a prior load must not work after navigation"
+        );
+    }
+
+    // ---- parse_payload ----------------------------------------------------
+
+    #[test]
+    fn parse_payload_skips_the_wire_framing() {
+        let ev = parse_payload(r#"{"type":"blur","field_id":"f9"}"#).expect("ok");
+        assert!(matches!(ev, EditConsoleEvent::Blur { field_id } if field_id == "f9"));
     }
 
     // ---- build_inject_script --------------------------------------------
 
     #[test]
     fn build_inject_script_substitutes_placeholders() {
-        let script = build_inject_script();
+        let script = build_inject_script(NONCE);
         // No raw placeholder markers should remain.
         assert!(
             !script.contains("%%SENTINEL%%"),
@@ -389,6 +479,53 @@ mod tests {
         );
         // No `%%` sequences should remain at all.
         assert!(!script.contains("%%"), "stray %% in script:\n{script}");
+    }
+
+    #[test]
+    fn build_inject_script_emits_the_prefix_parse_accepts() {
+        let script = build_inject_script(NONCE);
+        let prefix = format!("{EDIT_CONSOLE_SENTINEL}{NONCE}:");
+        assert!(script.contains(&prefix), "nonce not spliced into edit.js");
+        let emitted = format!("{prefix}{}", r#"{"type":"blur","field_id":"f1"}"#);
+        assert!(parse_console_event(&emitted, NONCE).unwrap().is_ok());
+    }
+
+    #[test]
+    fn build_inject_script_differs_across_loads() {
+        use crate::console_nonce::new_console_nonce;
+        let a = build_inject_script(&new_console_nonce());
+        let b = build_inject_script(&new_console_nonce());
+        assert_ne!(a, b, "nonce must change across page loads");
+    }
+
+    #[test]
+    fn build_inject_script_rewires_an_already_wired_document() {
+        // The `__buffrEditWired` guard must not leave a soft-navigated
+        // document emitting the stale nonce.
+        let script = build_inject_script(NONCE);
+        assert!(
+            script.contains("__buffrEditTeardown"),
+            "edit.js lost its teardown hook — a soft-nav re-injection would \
+             silently kill edit mode for that document"
+        );
+    }
+
+    #[test]
+    fn edit_js_never_publishes_the_nonce_on_window() {
+        // The nonce must stay in the IIFE's scope. Any `window.` /
+        // `self.` assignment carrying SENTINEL would hand it to the page
+        // outright.
+        let script = build_inject_script(NONCE);
+        for line in script.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(code.contains("window.") && code.contains("SENTINEL =")),
+                "edit.js assigns the sentinel onto window: {line}"
+            );
+        }
     }
 
     // ---- sink helpers ---------------------------------------------------

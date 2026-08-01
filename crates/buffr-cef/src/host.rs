@@ -315,6 +315,18 @@ pub struct BrowserHost {
     /// [`Self::any_video_active`] which the apps-layer idle-inhibit policy
     /// consults each tick.
     video_active: Arc<AtomicBool>,
+    /// Per-browser nonces authenticating the renderer → browser
+    /// console-log IPC (hint / edit / media probe).
+    ///
+    /// `BuffrLoadHandler::on_load_end` rotates the page nonce on every
+    /// main-frame load and splices it into `edit.js`;
+    /// [`Self::enter_hint_mode`] rotates the hint nonce per session and
+    /// splices it into `hint.js`; [`Self::run_media_probe`] splices the
+    /// current page nonce into the poll script. The display handler drops
+    /// any sentinel line that does not carry the matching value, which is
+    /// what stops an arbitrary frame from driving buffr's internals. See
+    /// [`buffr_core::console_nonce`] for the threat model.
+    console_nonces: buffr_core::console_nonce::ConsoleNonces,
     /// Queue of right-click events translated into [`ContextMenuRequest`]s
     /// by `BuffrContextMenuHandler::run_context_menu`. The apps layer
     /// drains these each tick via [`Self::drain_context_menu_requests`].
@@ -546,6 +558,7 @@ impl BrowserHost {
             audio_sink: new_audio_state_sink(),
             audio_queue: new_audio_event_queue(),
             video_active: Arc::new(AtomicBool::new(false)),
+            console_nonces: buffr_core::console_nonce::ConsoleNonces::new(),
             context_menu_sink: new_context_menu_sink(),
             request_context: Mutex::new(request_context),
             neutral_permissions_queue: buffr_engine::permissions::new_queue(),
@@ -1308,6 +1321,7 @@ impl BrowserHost {
             self.audio_queue.clone(),
             self.video_active.clone(),
             self.context_menu_sink.clone(),
+            self.console_nonces.clone(),
         );
         let mut rc_guard = self
             .request_context
@@ -1674,6 +1688,9 @@ impl BrowserHost {
             // are gone for good, so their overrides go too (M19).
             for t in evicted {
                 self.forget_display_url(t.id);
+                // Browser is gone for good — drop its console nonces so
+                // the table doesn't grow with tab churn.
+                self.console_nonces.forget(t.browser.identifier());
                 if let Some(host) = t.browser.host() {
                     host.close_browser(1);
                 }
@@ -1681,6 +1698,7 @@ impl BrowserHost {
         } else {
             // Not stashable — close immediately and drop the override.
             self.forget_display_url(removed.id);
+            self.console_nonces.forget(removed.browser.identifier());
             if let Some(host) = removed.browser.host() {
                 host.close_browser(1);
             }
@@ -2207,7 +2225,6 @@ impl BrowserHost {
         const LABEL_BUDGET: usize = 256;
         let labels = self.hint_alphabet.labels_for(LABEL_BUDGET);
         let alphabet_str = self.hint_alphabet.as_string();
-        let script = build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS);
 
         let alphabet = self.hint_alphabet.clone();
         let mut bail = false;
@@ -2218,6 +2235,15 @@ impl BrowserHost {
                 bail = true;
                 return;
             };
+            // Fresh nonce per hint session (H5): a forged `kind:"ready"`
+            // event picks the element the user's next hint keystroke
+            // activates, so a nonce that leaked during an earlier session
+            // must not still work here. Built inside `with_active` so the
+            // nonce is keyed to the browser we actually inject into, and
+            // only ever handed to the *main* frame.
+            let nonce = self.console_nonces.rotate_hint(t.browser.identifier());
+            let script =
+                build_inject_script(&alphabet_str, &labels, DEFAULT_HINT_SELECTORS, &nonce);
             let url = CefStringUtf16::from(&frame.url()).to_string();
             let cef_script = CefString::from(script.as_str());
             let cef_url = CefString::from(url.as_str());
@@ -2694,7 +2720,20 @@ impl BrowserHost {
     /// which is out of scope for phase-1.  The two-call window-property
     /// approach is cheap and correct: probe writes, reader reads one tick later.
     pub fn run_media_probe(&self) {
-        self.run_js(buffr_core::scripts::MEDIA_PROBE_POLL_JS);
+        // The poll script's console sentinel carries the active tab's page
+        // nonce (H5) — without it the display handler drops the line, and
+        // conversely a page that emits `__buffr_media__:{"video":true}` on
+        // its own can no longer pin the idle inhibitor on.
+        self.with_active(|t| {
+            let Some(frame) = t.browser.main_frame() else {
+                warn!("run_media_probe: main frame unavailable");
+                return;
+            };
+            let nonce = self.console_nonces.page(t.browser.identifier());
+            let code = CefString::from(buffr_core::media_probe::build_poll_script(&nonce).as_str());
+            let script_url = CefString::from("buffr://media-probe-poll");
+            frame.execute_java_script(Some(&code), Some(&script_url), 0);
+        });
     }
 
     // L17: `read_media_probe_result` was a documented no-op with no

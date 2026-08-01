@@ -35,7 +35,17 @@ pub const EXIT_INSERT: &str = include_str!("../assets/exit_insert.js");
 /// does not affect the others.
 pub const MEDIA_PROBE_INIT_JS: &str = include_str!("../assets/media_probe_init.js");
 
-/// Media-activity probe — poll script (v1.6).
+/// Media-activity probe — poll script (v1.7).
+///
+/// **Not a ready-to-run script.** `assets/media_probe_poll.js` is a template
+/// carrying a `%%SENTINEL%%` placeholder that must be filled with the
+/// browser's current console nonce; call
+/// [`crate::media_probe::build_poll_script`] instead of evaluating this
+/// constant. Exposed only so callers can inspect the template — the
+/// `_TEMPLATE` suffix (renamed from `MEDIA_PROBE_POLL_JS` when the nonce
+/// landed) is there so any out-of-workspace consumer that used to eval it
+/// verbatim fails to compile rather than silently emitting lines Rust
+/// rejects.
 ///
 /// Executed every ~2 s by [`crate::host::BrowserHost::run_media_probe`].
 /// Recomputes `window.__buffr_media_active` and `window.__buffr_video_active`
@@ -60,4 +70,4 @@ pub const MEDIA_PROBE_INIT_JS: &str = include_str!("../assets/media_probe_init.j
 /// A return-value path (e.g. V8 context eval) is not exposed by
 /// cef-rs's `Frame::execute_java_script`; using the `window` property
 /// sidesteps that limitation without requiring a custom scheme bridge.
-pub const MEDIA_PROBE_POLL_JS: &str = include_str!("../assets/media_probe_poll.js");
+pub const MEDIA_PROBE_POLL_JS_TEMPLATE: &str = include_str!("../assets/media_probe_poll.js");

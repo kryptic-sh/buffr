@@ -1,17 +1,24 @@
 // buffr hint mode -- DOM-injected overlay.
 //
 // This script is injected via `cef::Frame::execute_java_script`. The Rust
-// caller substitutes three placeholders before calling `execute_java_script`:
+// caller substitutes four placeholders before calling `execute_java_script`:
 //
 //   __ALPHABET__   -- JS string literal, the configured label alphabet.
 //   __LABELS__     -- JS array literal, [["a"], ["s"], ...] (one entry per
 //                    enumerated element, in document order).
 //   __SELECTORS__  -- JS string literal, CSS selector list.
+//   %%SENTINEL%%   -- JS string literal, `__buffr_hint__:` + the per-hint-
+//                    session nonce + `:`.
 //
 // IPC (renderer -> browser) uses `console.log` with a sentinel prefix:
-// `__buffr_hint__:` + JSON. The buffr `DisplayHandler::on_console_message`
+// `__buffr_hint__:<nonce>:` + JSON. The buffr `DisplayHandler::on_console_message`
 // scrapes those lines. This avoids `cef_process_message_t` which would
 // require a renderer-side `RenderProcessHandler` + V8 extension.
+//
+// The nonce is what stops the page (or a third-party iframe on it) from
+// forging a `kind:"ready"` event: forging one lets an attacker choose which
+// element the user's next hint keystroke activates. It lives in this IIFE's
+// scope only -- never assign it to `window`.
 //
 // The script is wrapped in an IIFE so each `enter_hint_mode` invocation
 // gets a fresh closure. All host-callable entries are stashed on
@@ -23,7 +30,7 @@
     var ALPHABET = '__ALPHABET__';
     var LABELS = __LABELS__;
     var SELECTORS = '__SELECTORS__';
-    var SENTINEL = '__buffr_hint__:';
+    var SENTINEL = '%%SENTINEL%%';
     var STYLE_ID = 'buffr-hint-style';
     var CLASS = 'buffr-hint-overlay';
 

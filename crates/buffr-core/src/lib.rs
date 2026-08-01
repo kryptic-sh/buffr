@@ -10,6 +10,7 @@
 use thiserror::Error;
 
 pub mod cmdline;
+pub mod console_nonce;
 mod console_sentinel;
 pub mod context_menu;
 pub mod crash;
@@ -28,6 +29,7 @@ pub mod scripts;
 pub mod telemetry;
 pub mod updates;
 
+pub use console_nonce::{CONSOLE_NONCE_LEN, ConsoleNonces, new_console_nonce};
 pub use context_menu::{
     CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuItem, ContextMenuRequest, ContextMenuSink,
     ContextMenuTarget, build_model as build_context_menu_model,

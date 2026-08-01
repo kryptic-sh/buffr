@@ -25,6 +25,7 @@ serde_json = "1"
 chrono = { workspace = true, features = ["serde", "clock"] }
 ureq = { version = "3", features = ["json"] }
 semver.workspace = true
+getrandom.workspace = true
 buffr-engine.workspace = true
 buffr-config.workspace = true
 hjkl-clipboard.workspace = true

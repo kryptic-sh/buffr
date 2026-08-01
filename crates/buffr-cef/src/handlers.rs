@@ -38,6 +38,7 @@ use crate::audio::{AudioEventQueue, AudioStateSink, BuffrAudioHandler};
 use crate::permissions::{
     PendingPermission, capabilities_for_media_mask, capabilities_for_request_mask, precheck,
 };
+use buffr_core::console_nonce::ConsoleNonces;
 use buffr_core::context_menu::{
     CONTEXT_MENU_REQUEST_QUEUE_CAP, ContextMenuRequest, ContextMenuSink, ContextMenuTarget,
     build_model,
@@ -92,8 +93,15 @@ const CONSOLE_LOG_MAX_LEN: usize = 120;
 
 /// Sentinel prefixes emitted by buffr's own injected scripts. These are
 /// protocol, not user content, so they are logged in full.
-const CONSOLE_SENTINEL_PREFIXES: &[&str] =
-    &["__buffr_hint__:", "__buffr_edit__:", "__buffr_media__:"];
+///
+/// Note this is a *logging* policy only — a page can trivially prefix a
+/// line with one of these and get it logged verbatim. Authenticity is
+/// decided by the nonce check in the parsers, not here.
+const CONSOLE_SENTINEL_PREFIXES: &[&str] = &[
+    buffr_core::hint::HINT_CONSOLE_SENTINEL,
+    buffr_core::edit::EDIT_CONSOLE_SENTINEL,
+    buffr_core::media_probe::MEDIA_PROBE_SENTINEL,
+];
 
 /// `true` when [`CONSOLE_LOG_ENV`] is set to anything other than
 /// `""` / `0` / `false` / `off` / `no`.
@@ -171,6 +179,7 @@ pub fn make_client(
     audio_queue: AudioEventQueue,
     video_active: Arc<AtomicBool>,
     context_menu_sink: ContextMenuSink,
+    console_nonces: ConsoleNonces,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -202,6 +211,7 @@ pub fn make_client(
         audio_queue,
         video_active,
         context_menu_sink,
+        console_nonces,
     )
 }
 
@@ -456,6 +466,12 @@ wrap_client! {
         // `media_probe_poll.js` and stores the latest video flag here.
         video_active: Arc<AtomicBool>,
         context_menu_sink: ContextMenuSink,
+        // console_nonces: per-browser tokens that authenticate the
+        // renderer → browser console-log IPC (H5). The load handler mints
+        // one per main-frame load and splices it into every injected
+        // script; the display handler rejects any sentinel line that
+        // doesn't carry the current value.
+        console_nonces: ConsoleNonces,
     }
 
     impl Client {
@@ -478,6 +494,7 @@ wrap_client! {
                 Arc::new(Mutex::new(HashMap::new())),
                 self.edit_sink.clone(),
                 self.loading_busy.clone(),
+                self.console_nonces.clone(),
             ))
         }
 
@@ -492,6 +509,7 @@ wrap_client! {
                 self.favicon_sink.clone(),
                 self.favicon_enabled.clone(),
                 self.video_active.clone(),
+                self.console_nonces.clone(),
             ))
         }
 
@@ -586,6 +604,10 @@ wrap_load_handler! {
         // this via `BrowserHost::is_loading` to play the buffr ASCII
         // anim across the navigation gap.
         loading_busy: Arc<AtomicBool>,
+        // console_nonces: rotated on every main-frame `on_load_end` and
+        // spliced into the scripts injected below, so the display
+        // handler can tell our own console lines from a page's forgery.
+        console_nonces: ConsoleNonces,
     }
 
     impl LoadHandler {
@@ -645,6 +667,10 @@ wrap_load_handler! {
                 return;
             }
             let url = CefStringUtf16::from(&frame.url()).to_string();
+            // Browser id is needed twice below (transition lookup, console
+            // nonce) and `browser` is moved by the zoom block, so snapshot
+            // it up front.
+            let browser_id = browser.as_ref().map(|b| cef::ImplBrowser::identifier(*b));
             // Phase 6 telemetry: count one main-frame load. Gated on
             // the same `is_main` check as the history recorder so
             // counts and history rows stay in sync.
@@ -654,12 +680,8 @@ wrap_load_handler! {
             // Retrieve the transition stashed by `on_load_start`. If
             // none is present (e.g. the load started before this
             // handler was wired), fall back to `Link`.
-            let transition = browser
-                .as_ref()
-                .and_then(|b| {
-                    let id = cef::ImplBrowser::identifier(*b);
-                    self.pending_transitions.lock().ok()?.remove(&id)
-                })
+            let transition = browser_id
+                .and_then(|id| self.pending_transitions.lock().ok()?.remove(&id))
                 .unwrap_or(Transition::Link);
             if let Err(err) =
                 self.history.record_visit(&url, None, transition)
@@ -697,12 +719,29 @@ wrap_load_handler! {
             // focus action (DOM .focus() from a click or `i` keypress
             // promotes widget focus implicitly via Chromium).
 
+            // H5: mint the page's console-IPC nonce *before* any script is
+            // injected. Rotating here — once per main-frame load — is what
+            // confines a leaked nonce to a single page load, and because
+            // the nonce only ever reaches main frames, a third-party iframe
+            // has no way to learn one and forge events for the top frame.
+            //
+            // If CEF handed us no browser we cannot key the table, so skip
+            // injection entirely rather than inject a script whose lines
+            // the display handler would drop anyway.
+            let Some(browser_id) = browser_id else {
+                tracing::warn!(%url, "console nonce: on_load_end without a browser — skipping script injection");
+                return;
+            };
+            let nonce = self.console_nonces.rotate_page(browser_id);
+
             // Edit-mode Stage 1: inject edit.js once per main-frame load.
             // The script is idempotent (`window.__buffrEditWired` guard)
-            // so SPA soft-navigations that re-trigger on_load_end are safe.
+            // so SPA soft-navigations that re-trigger on_load_end are safe;
+            // when the guard trips, the re-injected copy still hands the
+            // live closure the fresh nonce via `window.__buffrEditRearm`.
             // We gate on `frame.is_main()` (already checked above) so
-            // iframes and subframes never get the listener installed.
-            let script = build_edit_inject_script();
+            // iframes and subframes never get the listener — or the nonce.
+            let script = build_edit_inject_script(&nonce);
             let cef_script = CefString::from(script.as_str());
             let cef_url = CefString::from("buffr://edit-inject");
             frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
@@ -792,6 +831,10 @@ wrap_display_handler! {
         // and writes the latest video flag here for the apps-layer
         // idle-inhibit policy to consult.
         video_active: Arc<AtomicBool>,
+        // console_nonces: the per-browser tokens the three console-IPC
+        // parsers below check. Written by `BuffrLoadHandler::on_load_end`
+        // (page nonce) and `BrowserHost::enter_hint_mode` (hint nonce).
+        console_nonces: ConsoleNonces,
     }
 
     impl DisplayHandler {
@@ -949,7 +992,7 @@ wrap_display_handler! {
 
         fn on_console_message(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _level: LogSeverity,
             message: Option<&CefString>,
             _source: Option<&CefString>,
@@ -961,6 +1004,18 @@ wrap_display_handler! {
             // returning 1 would suppress the message from devtools.
             let Some(message) = message else { return 0; };
             let text = message.to_string();
+
+            // H5: CEF's `on_console_message` carries no frame argument, so
+            // this callback cannot tell the top document from a
+            // third-party ad iframe on it — cef-rs exposes nothing here
+            // that would narrow it down. Authenticity therefore rides on
+            // the per-page-load nonce spliced into every injected script:
+            // frames we never injected into (i.e. every subframe) cannot
+            // produce a line the parsers below will accept.
+            //
+            // Without a browser we cannot look up which nonce applies, so
+            // the line is page chatter as far as the IPC is concerned.
+            let browser_id = browser.map(|b| cef::ImplBrowser::identifier(b));
 
             // Diagnostic console mirroring (L34).
             //
@@ -975,9 +1030,21 @@ wrap_display_handler! {
                 tracing::debug!(target: "buffr_core::console", text = %redacted, "on_console_message");
             }
 
+            // Fast path: almost all console traffic is page chatter. Bail
+            // before touching the nonce table so a chatty page doesn't pay
+            // two mutex locks and two String clones per `console.log`.
+            // Starting with a sentinel is necessary but nowhere near
+            // sufficient — the parsers still check the nonce.
+            if !CONSOLE_SENTINEL_PREFIXES.iter().any(|p| text.starts_with(p)) {
+                return 0;
+            }
+            let Some(browser_id) = browser_id else { return 0; };
+
             // ---- hint mode IPC ------------------------------------------
-            // hint.js emits `__buffr_hint__:{...}` lines.
-            if let Some(parsed) = parse_console_event(&text) {
+            // hint.js emits `__buffr_hint__:<nonce>:{...}` lines. The hint
+            // nonce rotates per session, so a nonce leaked during one
+            // session is dead by the next `enter_hint_mode`.
+            if let Some(parsed) = parse_console_event(&text, &self.console_nonces.hint(browser_id)) {
                 match parsed {
                     Ok(event) => {
                         if let Ok(mut guard) = self.hint_sink.lock() {
@@ -991,8 +1058,11 @@ wrap_display_handler! {
             }
 
             // ---- edit mode IPC ------------------------------------------
-            // edit.js emits `__buffr_edit__:{...}` lines on focus/blur/mutate.
-            if let Some(parsed) = buffr_core::edit::parse_console_event(&text) {
+            // edit.js emits `__buffr_edit__:<nonce>:{...}` lines on
+            // focus/blur/mutate. The page nonce is minted per main-frame
+            // load by `BuffrLoadHandler::on_load_end`.
+            let page_nonce = self.console_nonces.page(browser_id);
+            if let Some(parsed) = buffr_core::edit::parse_console_event(&text, &page_nonce) {
                 match parsed {
                     Ok(event) => {
                         if let Ok(mut guard) = self.edit_sink.lock() {
@@ -1006,10 +1076,13 @@ wrap_display_handler! {
             }
 
             // ---- media probe IPC ----------------------------------------
-            // media_probe_poll.js emits `__buffr_media__:{...}` lines on
-            // every transition. Flip the shared video_active atomic so the
-            // apps-layer idle-inhibit policy picks it up next tick.
-            if let Some(parsed) = buffr_core::media_probe::parse(&text) {
+            // media_probe_poll.js emits `__buffr_media__:<nonce>:{...}`
+            // lines on every transition. Flip the shared video_active
+            // atomic so the apps-layer idle-inhibit policy picks it up next
+            // tick — which is exactly why the nonce matters here: an
+            // unauthenticated `{"video":true}` loop pins the platform idle
+            // inhibitor on and the user's screen never locks.
+            if let Some(parsed) = buffr_core::media_probe::parse(&text, &page_nonce) {
                 match parsed {
                     Ok(event) => {
                         self.video_active

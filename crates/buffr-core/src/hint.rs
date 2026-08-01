@@ -11,8 +11,18 @@
 //!
 //! Communication CEF → Rust uses the **fallback path** documented in the
 //! Phase 3 brief: the injected JS calls `console.log("__buffr_hint__:" +
-//! JSON.stringify(payload))` and our [`crate::handlers::BuffrDisplayHandler`]
-//! intercepts those messages via `DisplayHandler::on_console_message`.
+//! nonce + ":" + JSON.stringify(payload))` and our
+//! [`crate::handlers::BuffrDisplayHandler`] intercepts those messages via
+//! `DisplayHandler::on_console_message`.
+//!
+//! That callback has no frame argument, so the `nonce` is what tells an
+//! authentic event from one forged by the page (or by a third-party iframe
+//! on it) — a forged `Ready` event replaces the live [`HintSession`] and
+//! turns the user's next hint keystroke into a click on an attacker-chosen
+//! element. It is minted per hint session by
+//! [`crate::console_nonce::ConsoleNonces::rotate_hint`] and spliced into the
+//! asset by [`build_inject_script`]. See [`crate::console_nonce`] for what
+//! that does and does not buy.
 //!
 //! We picked this over `cef_process_message_t` IPC because the message-pipe
 //! path requires a renderer-side `RenderProcessHandler` (registered through
@@ -420,29 +430,57 @@ pub fn take_hint_event(sink: &HintEventSink) -> Option<HintConsoleEvent> {
     sink.lock().ok().and_then(|mut guard| guard.take())
 }
 
-/// Try to parse a console message line as a hint event. Returns `None`
-/// when the line doesn't carry the sentinel prefix. Returns
-/// `Some(Err(…))` when the prefix is present but the JSON tail won't
-/// parse — useful so callers can log malformed renderer output without
-/// silently dropping it.
-pub fn parse_console_event(message: &str) -> Option<Result<HintConsoleEvent, serde_json::Error>> {
-    crate::console_sentinel::parse_sentinel(message, HINT_CONSOLE_SENTINEL)
+/// Try to parse a console message line as a hint event.
+///
+/// `nonce` is the hint nonce currently minted for the emitting browser
+/// (`ConsoleNonces::hint`).
+///
+/// Returns `None` when the line is not an authentic hint line for `nonce` —
+/// the sentinel is absent, the line is not anchored at the start, or the
+/// nonce does not match. Returns `Some(Err(…))` when sentinel *and* nonce
+/// matched but the JSON tail won't parse, so callers can log malformed
+/// output from our own script without silently dropping it.
+pub fn parse_console_event(
+    message: &str,
+    nonce: &str,
+) -> Option<Result<HintConsoleEvent, serde_json::Error>> {
+    crate::console_sentinel::parse_sentinel(message, HINT_CONSOLE_SENTINEL, nonce)
+}
+
+/// Decode a bare hint JSON payload (no sentinel, no nonce).
+///
+/// For backends that receive the payload over a trusted channel instead of
+/// scraping `console.log`, so they don't have to synthesise a wire line.
+pub fn parse_payload(json: &str) -> Result<HintConsoleEvent, serde_json::Error> {
+    serde_json::from_str(json)
 }
 
 /// Build the JS payload to send via `frame.execute_java_script`.
 ///
-/// Substitutes the three placeholders the asset uses:
+/// Substitutes the four placeholders the asset uses:
 ///
 /// - `__ALPHABET__`  → the alphabet string, JSON-escaped (so an alphabet
 ///   containing quotes / non-ASCII doesn't break the JS).
 /// - `__LABELS__`    → JSON array of labels (a JS array literal).
 /// - `__SELECTORS__` → CSS selectors, JSON-escaped string body.
+/// - `%%SENTINEL%%`  → [`HINT_CONSOLE_SENTINEL`] + `nonce` + `:`, the exact
+///   prefix [`parse_console_event`] will accept for this session.
 ///
 /// Note the *contents* are JSON-escaped; the placeholders themselves
 /// are wrapped in matching quotes inside `hint.js`. We strip the
 /// outer quotes that `serde_json::to_string` would produce so the
 /// substitution lands inside the existing `'…'` quotes.
-pub fn build_inject_script(alphabet: &str, labels: &[String], selectors: &str) -> String {
+///
+/// `nonce` comes from [`crate::console_nonce::ConsoleNonces::rotate_hint`]
+/// and is plain hex, so it needs no escaping. Inject the result into a
+/// **main frame only** — handing a subframe the nonce would give away the
+/// very thing it is there to withhold.
+pub fn build_inject_script(
+    alphabet: &str,
+    labels: &[String],
+    selectors: &str,
+    nonce: &str,
+) -> String {
     let alphabet_lit = json_string_inner(alphabet);
     let selectors_lit = json_string_inner(selectors);
     // Labels become an actual JS array literal (with double-quoted
@@ -480,6 +518,10 @@ pub fn build_inject_script(alphabet: &str, labels: &[String], selectors: &str) -
         .replace("__ALPHABET__", &alphabet_lit)
         .replace("__LABELS__", &labels_lit)
         .replace("__SELECTORS__", &selectors_lit)
+        .replace(
+            "%%SENTINEL%%",
+            &crate::console_sentinel::sentinel_prefix(HINT_CONSOLE_SENTINEL, nonce),
+        )
 }
 
 /// JSON-escape `s`, force every non-ASCII codepoint to `\uXXXX`, and
@@ -861,15 +903,21 @@ mod tests {
 
     // ---- console-event parsing ---------------------------------------
 
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn wire(body: &str) -> String {
+        format!("{HINT_CONSOLE_SENTINEL}{NONCE}:{body}")
+    }
+
     #[test]
     fn parse_console_event_ignores_non_sentinel() {
-        assert!(parse_console_event("hello world").is_none());
+        assert!(parse_console_event("hello world", NONCE).is_none());
     }
 
     #[test]
     fn parse_console_event_ready() {
-        let line = r#"__buffr_hint__:{"kind":"ready","hints":[],"alphabet":"asdf"}"#;
-        let ev = parse_console_event(line).unwrap().unwrap();
+        let line = wire(r#"{"kind":"ready","hints":[],"alphabet":"asdf"}"#);
+        let ev = parse_console_event(&line, NONCE).unwrap().unwrap();
         match ev {
             HintConsoleEvent::Ready { alphabet, hints } => {
                 assert_eq!(alphabet, "asdf");
@@ -881,8 +929,8 @@ mod tests {
 
     #[test]
     fn parse_console_event_error() {
-        let line = r#"__buffr_hint__:{"kind":"error","message":"boom"}"#;
-        let ev = parse_console_event(line).unwrap().unwrap();
+        let line = wire(r#"{"kind":"error","message":"boom"}"#);
+        let ev = parse_console_event(&line, NONCE).unwrap().unwrap();
         match ev {
             HintConsoleEvent::Error { message } => assert_eq!(message, "boom"),
             _ => panic!("wrong variant"),
@@ -891,9 +939,52 @@ mod tests {
 
     #[test]
     fn parse_console_event_malformed_returns_inner_err() {
-        let line = "__buffr_hint__:not json";
-        let parsed = parse_console_event(line).unwrap();
+        let line = wire("not json");
+        let parsed = parse_console_event(&line, NONCE).unwrap();
         assert!(parsed.is_err());
+    }
+
+    // ---- H5: forged hint events ---------------------------------------
+
+    #[test]
+    fn parse_console_event_rejects_line_without_nonce() {
+        // The pre-nonce wire format: any frame could emit this and take
+        // over the live HintSession.
+        let forged = r#"__buffr_hint__:{"kind":"ready","hints":[],"alphabet":"asdf"}"#;
+        assert!(parse_console_event(forged, NONCE).is_none());
+    }
+
+    #[test]
+    fn parse_console_event_rejects_wrong_nonce() {
+        let forged = format!(
+            "{HINT_CONSOLE_SENTINEL}{}:{}",
+            "f".repeat(32),
+            r#"{"kind":"ready","hints":[],"alphabet":"asdf"}"#
+        );
+        assert!(parse_console_event(&forged, NONCE).is_none());
+    }
+
+    #[test]
+    fn parse_console_event_rejects_unanchored_sentinel() {
+        let forged = format!("%cINFO {}", wire(r#"{"kind":"error","message":"x"}"#));
+        assert!(parse_console_event(&forged, NONCE).is_none());
+    }
+
+    #[test]
+    fn parse_console_event_rejects_nonce_from_another_session() {
+        use crate::console_nonce::ConsoleNonces;
+        let nonces = ConsoleNonces::new();
+        let old = nonces.rotate_hint(1);
+        let line = format!(
+            "{HINT_CONSOLE_SENTINEL}{old}:{}",
+            r#"{"kind":"ready","hints":[],"alphabet":"asdf"}"#
+        );
+        assert!(parse_console_event(&line, &old).is_some(), "sanity");
+        let new = nonces.rotate_hint(1);
+        assert!(
+            parse_console_event(&line, &new).is_none(),
+            "a nonce leaked in a prior session must not work in the next one"
+        );
     }
 
     // ---- build_inject_script ----------------------------------------
@@ -901,13 +992,33 @@ mod tests {
     #[test]
     fn inject_script_substitutes_placeholders() {
         let labels = vec!["a".to_string(), "s".to_string()];
-        let s = build_inject_script("asdf", &labels, "a, button");
+        let s = build_inject_script("asdf", &labels, "a, button", NONCE);
         // Sanity: placeholders are gone.
         assert!(!s.contains("__ALPHABET__"));
         assert!(!s.contains("__LABELS__"));
         assert!(!s.contains("__SELECTORS__"));
+        assert!(!s.contains("%%SENTINEL%%"));
         // The labels array literal lands inline.
         assert!(s.contains("[\"a\",\"s\"]"));
+    }
+
+    #[test]
+    fn inject_script_emits_the_prefix_parse_accepts() {
+        let labels = vec!["a".to_string()];
+        let s = build_inject_script("asdf", &labels, "div", NONCE);
+        let prefix = format!("{HINT_CONSOLE_SENTINEL}{NONCE}:");
+        assert!(s.contains(&prefix), "nonce not spliced into hint.js");
+        let emitted = format!("{prefix}{}", r#"{"kind":"error","message":"boom"}"#);
+        assert!(parse_console_event(&emitted, NONCE).unwrap().is_ok());
+    }
+
+    #[test]
+    fn inject_script_differs_across_sessions() {
+        use crate::console_nonce::new_console_nonce;
+        let labels = vec!["a".to_string()];
+        let a = build_inject_script("asdf", &labels, "div", &new_console_nonce());
+        let b = build_inject_script("asdf", &labels, "div", &new_console_nonce());
+        assert_ne!(a, b, "nonce must change across injections");
     }
 
     #[test]
@@ -917,7 +1028,7 @@ mod tests {
         // `'-inside-single-quoted-string` path; backslash tests JSON's
         // own escape pass-through.
         let labels = vec!["a".to_string()];
-        let s = build_inject_script("a'b\\c", &labels, "div");
+        let s = build_inject_script("a'b\\c", &labels, "div", NONCE);
         // No raw single-quote inside the alphabet placement: must be
         // escaped to `\'`.
         // Find the literal alphabet tail: search for `'a` then check
@@ -929,7 +1040,7 @@ mod tests {
     #[test]
     fn inject_script_handles_unicode_alphabet() {
         let labels = vec!["α".to_string()];
-        let s = build_inject_script("αβγδ", &labels, "div");
+        let s = build_inject_script("αβγδ", &labels, "div", NONCE);
         // serde_json escapes non-ASCII into \uXXXX by default; verify
         // the output is valid ASCII so it can't break the surrounding
         // JS string literal regardless of its quote style.
