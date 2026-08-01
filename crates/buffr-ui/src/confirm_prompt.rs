@@ -10,7 +10,7 @@
 //! `y` / `n` (or `<Esc>` for No) is the keyboard equivalent and is
 //! handled at the apps layer too.
 
-use crate::{fill_rect, font};
+use crate::{fill_rect, font, truncate_to_width};
 
 /// Content height in pixels. The caller wraps this in a popup frame.
 pub const CONFIRM_PROMPT_HEIGHT: u32 = 60;
@@ -77,17 +77,14 @@ impl ConfirmPrompt {
 
         let text_x = content_x as i32 + 8;
         let text_y = top + (CONFIRM_PROMPT_HEIGHT as i32 - font::glyph_h() as i32) / 2;
-        font::draw_text(
-            buffer,
-            width,
-            height,
-            text_x,
-            text_y,
-            &self.message,
-            COLOUR_FG,
-        );
 
         let (yes, no) = self.button_rects_at(content_x, content_y, content_w);
+        // Clamp the message to the space left of the Yes button —
+        // otherwise a long one runs underneath both buttons.
+        let message_max_px = (yes.0 - text_x - MESSAGE_BUTTON_GAP).max(0) as usize;
+        let message = truncate_to_width(&self.message, message_max_px);
+        font::draw_text(buffer, width, height, text_x, text_y, &message, COLOUR_FG);
+
         paint_button(buffer, width, height, yes, &self.yes_label, COLOUR_BTN_YES);
         paint_button(buffer, width, height, no, &self.no_label, COLOUR_BTN_NO);
 
@@ -122,6 +119,9 @@ pub fn rect_contains(rect: ConfirmRect, px: i32, py: i32) -> bool {
 
 const BUTTON_H: i32 = 28;
 const BUTTON_PAD_X: i32 = 14;
+/// Minimum gap in pixels between the end of the message and the Yes
+/// button. The message is truncated to keep it.
+const MESSAGE_BUTTON_GAP: i32 = 8;
 
 const COLOUR_FG: u32 = 0xFF_F0_E8_D8;
 const COLOUR_BTN_YES: u32 = 0xFF_40_28_28;
@@ -145,6 +145,46 @@ mod tests {
         assert!(
             no.0 + no.2 <= (content_x + content_w) as i32,
             "No must fit inside content width"
+        );
+    }
+
+    #[test]
+    fn long_message_is_truncated_before_the_buttons() {
+        // M29: an over-long message used to run underneath Yes/No.
+        let w = 600usize;
+        let h = CONFIRM_PROMPT_HEIGHT as usize;
+        let mut buf = vec![0u32; w * h];
+        let p = ConfirmPrompt {
+            message: "W".repeat(500),
+            yes_label: "Yes".into(),
+            no_label: "No".into(),
+        };
+        p.paint_at(&mut buf, w, h, 0, 0, w as u32);
+        let (yes, _no) = p.button_rects_at(0, 0, w as u32);
+        // The columns immediately left of the Yes button are part of
+        // the reserved gap; nothing may be drawn into them.
+        let gap_start = (yes.0 - MESSAGE_BUTTON_GAP / 2).max(0) as usize;
+        for y in 0..h {
+            for x in gap_start..yes.0 as usize {
+                assert_eq!(buf[y * w + x], 0, "message text bled to ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn short_message_is_left_untouched() {
+        let w = 600usize;
+        let h = CONFIRM_PROMPT_HEIGHT as usize;
+        let mut buf = vec![0u32; w * h];
+        let p = ConfirmPrompt {
+            message: "Close pinned tab?".into(),
+            yes_label: "Yes".into(),
+            no_label: "No".into(),
+        };
+        p.paint_at(&mut buf, w, h, 0, 0, w as u32);
+        assert!(
+            buf.contains(&COLOUR_FG),
+            "message should still be painted in full"
         );
     }
 

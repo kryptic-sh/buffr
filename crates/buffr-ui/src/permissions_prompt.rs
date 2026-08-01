@@ -17,7 +17,7 @@
 //! +---------------------------------------------------------------+
 //! ```
 
-use crate::font;
+use crate::{font, truncate_to_width};
 
 /// Content height in pixels. Two text rows with padding.
 pub const PERMISSIONS_PROMPT_HEIGHT: u32 = 60;
@@ -100,7 +100,7 @@ impl PermissionsPrompt {
             height,
             text_x,
             text_y0,
-            line1_truncated,
+            &line1_truncated,
             COLOUR_PROMPT_FG,
         );
 
@@ -134,31 +134,6 @@ impl PermissionsPrompt {
 /// Action hint string. `[a]` = allow once, `[d]` = deny once,
 /// `[A]` = allow always, `[D]` = deny always, `[Esc]` = defer.
 pub const ACTION_HINT: &str = "[a]llow [d]eny [A]llow always [D]eny always [Esc]defer";
-
-/// Truncate `s` to at most `max_px` pixels of rendered width. Adds a
-/// trailing `..` ellipsis when the original didn't fit. Mirrors the
-/// helper in `lib.rs` — duplicated here to avoid a `pub(crate)` leak.
-fn truncate_to_width(s: &str, max_px: usize) -> &str {
-    if font::text_width(s) <= max_px {
-        return s;
-    }
-    if max_px < font::text_width("..") {
-        return "";
-    }
-    let mut end = s.len();
-    while end > 0 {
-        let prefix = &s[..end];
-        if !s.is_char_boundary(end) {
-            end -= 1;
-            continue;
-        }
-        if font::text_width(prefix) + font::text_width("..") <= max_px {
-            return prefix;
-        }
-        end -= 1;
-    }
-    ""
-}
 
 const COLOUR_PROMPT_FG: u32 = 0xFF_F0_E8_D8;
 const COLOUR_PROMPT_HINT: u32 = 0xFF_C8_C8_C0;
@@ -245,5 +220,32 @@ mod tests {
     #[test]
     fn truncate_to_width_zero_budget_returns_empty() {
         assert_eq!(truncate_to_width("anything", 1), "");
+    }
+
+    #[test]
+    fn truncate_to_width_non_ascii_origin_does_not_panic() {
+        // H1: the copy that used to live in this module sliced the
+        // string before checking the char boundary and panicked with
+        // "byte index 10 is not a char boundary" on any multi-byte
+        // origin. `origin` is page-controlled.
+        let out = truncate_to_width("https://héllo.example wants: camera", 30);
+        assert!(out.is_empty() || out.ends_with(".."));
+    }
+
+    #[test]
+    fn paint_with_non_ascii_origin_does_not_panic() {
+        let w = 400;
+        let h = PERMISSIONS_PROMPT_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let p = PermissionsPrompt {
+            origin: "https://héllo.example".into(),
+            capabilities: vec!["camera".into(), "マイク".into()],
+            queue_len: 2,
+        };
+        // Sweep narrow widths so the truncation lands mid-codepoint.
+        for content_w in [20u32, 30, 64, 200, 400] {
+            let ret = p.paint_at(&mut buf, w, h, 0, 0, content_w);
+            assert_eq!(ret, PERMISSIONS_PROMPT_HEIGHT);
+        }
     }
 }

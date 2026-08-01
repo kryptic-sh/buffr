@@ -10,6 +10,8 @@
 //! trivial (build a `Vec<u32>`, paint, assert pixels) and avoids
 //! coupling chrome rendering to any one window backend.
 
+use std::borrow::Cow;
+
 use buffr_modal::PageMode;
 
 pub mod confirm_prompt;
@@ -282,7 +284,7 @@ impl Statusline {
             font::glyph_h(),
             cert_colour,
         );
-        font::draw_text(buffer, width, height, url_x + 6, text_y, url_text, p.fg);
+        font::draw_text(buffer, width, height, url_x + 6, text_y, &url_text, p.fg);
 
         // Progress bar — top 2 px of the strip. 0.0 = invisible,
         // 1.0 = full width. Phase 3 will animate this off CEF's
@@ -326,29 +328,46 @@ fn format_find(f: &FindStatus) -> String {
     }
 }
 
-/// Truncate `s` to at most `max_px` pixels of rendered width. Adds a
-/// trailing `..` ellipsis when the original didn't fit.
-pub(crate) fn truncate_to_width(s: &str, max_px: usize) -> &str {
-    if font::text_width(s) <= max_px {
-        return s;
-    }
-    if max_px < font::text_width("..") {
-        return "";
-    }
-    // Walk backwards by char until the prefix + ".." fits.
-    let mut end = s.len();
-    while end > 0 {
-        if !s.is_char_boundary(end) {
-            end -= 1;
-            continue;
+/// Truncate `s` to at most `max_px` pixels of rendered width, appending
+/// a trailing `..` ellipsis when the original didn't fit. Returns a
+/// borrow of `s` in the common case where nothing had to be dropped.
+///
+/// Returns `""` when not even `..` fits, or when no leading character
+/// fits alongside it.
+///
+/// The single copy for the whole crate — every widget calls this one
+/// (M55). Walks `char_indices()` forward once, accumulating width, so
+/// it is O(n) and bails out as soon as the budget is blown; measuring
+/// backwards from the end was O(n²) and stalled repaints on long URLs
+/// (M25).
+pub(crate) fn truncate_to_width(s: &str, max_px: usize) -> Cow<'_, str> {
+    let dots_px = font::text_width("..");
+    // `used` is the rendered width of the prefix walked so far;
+    // `fit_end` is the byte end of the longest prefix that still
+    // leaves room for the ellipsis.
+    let ellipsis_budget = max_px.checked_sub(dots_px);
+    let mut used = 0usize;
+    let mut fit_end = 0usize;
+    for (i, c) in s.char_indices() {
+        // Glyphs after the first are preceded by a 1-px gap, matching
+        // font::text_width / font::draw_text.
+        let next = if i == 0 {
+            font::char_width(c)
+        } else {
+            used + 1 + font::char_width(c)
+        };
+        if next > max_px {
+            if fit_end == 0 {
+                return Cow::Borrowed("");
+            }
+            return Cow::Owned(format!("{}..", &s[..fit_end]));
         }
-        let prefix = &s[..end];
-        if font::text_width(prefix) + font::text_width("..") <= max_px {
-            return prefix;
+        used = next;
+        if ellipsis_budget.is_some_and(|budget| used <= budget) {
+            fit_end = i + c.len_utf8();
         }
-        end -= 1;
     }
-    ""
+    Cow::Borrowed(s)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,13 +743,66 @@ mod tests {
 
     #[test]
     fn truncate_to_width_drops_chars_until_fit() {
-        // Width budget for "a" + ".." = 6 + 1 + (6+1+6) = 20 px.
+        // Budget fits exactly one "a" plus the reserved ".." ellipsis,
+        // which the helper now actually appends (M26).
         let dotdot = font::text_width("..");
         let one_a = font::text_width("a");
         let budget = one_a + dotdot;
         let s = "abcd";
         let out = truncate_to_width(s, budget);
-        assert_eq!(out, "a");
+        assert_eq!(out, "a..");
+    }
+
+    #[test]
+    fn truncate_to_width_appends_ellipsis_when_cut() {
+        let s = "abcdefghij";
+        let budget = font::text_width("abc") + font::text_width("..");
+        let out = truncate_to_width(s, budget);
+        assert!(out.ends_with(".."), "expected ellipsis, got {out:?}");
+        assert!(s.starts_with(out.trim_end_matches("..")));
+        assert!(font::text_width(&out) <= budget + 1);
+    }
+
+    #[test]
+    fn truncate_to_width_exact_fit_is_untouched() {
+        let s = "abcd";
+        let out = truncate_to_width(s, font::text_width(s));
+        assert_eq!(out, "abcd");
+        assert!(matches!(out, Cow::Borrowed(_)), "should not allocate");
+    }
+
+    #[test]
+    fn truncate_to_width_never_splits_a_codepoint() {
+        // Regression for H1: the permissions-prompt copy sliced before
+        // checking the char boundary and panicked on any multi-byte
+        // origin. All widgets share this implementation now.
+        let s = "https://héllo.example wants: camera";
+        for budget in 0..font::text_width(s) + 4 {
+            let out = truncate_to_width(s, budget);
+            let body = out.strip_suffix("..").unwrap_or(&out);
+            assert!(s.starts_with(body), "not a prefix of the input: {out:?}");
+        }
+    }
+
+    #[test]
+    fn truncate_to_width_handles_non_ascii_permission_origin() {
+        // The exact case from H1 — must not panic.
+        let out = truncate_to_width("https://héllo.example wants: camera", 30);
+        assert!(out.is_empty() || out.ends_with(".."));
+    }
+
+    #[test]
+    fn truncate_to_width_long_input_is_linear() {
+        // M25: a 200k-char URL must not take quadratic time. The old
+        // implementation would not finish this in any sane duration.
+        let s = "h".repeat(200_000);
+        let start = std::time::Instant::now();
+        let out = truncate_to_width(&s, 400);
+        assert!(out.ends_with(".."));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "truncate_to_width is still super-linear"
+        );
     }
 
     #[test]

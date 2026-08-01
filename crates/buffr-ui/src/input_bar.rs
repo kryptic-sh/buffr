@@ -437,7 +437,7 @@ impl InputBar {
                 buf_h,
                 text_left as i32,
                 row_text_y,
-                display,
+                &display,
                 p.fg,
             );
         }

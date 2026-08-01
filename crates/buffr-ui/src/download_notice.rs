@@ -26,7 +26,7 @@
 //! - `Completed` → `OK `
 //! - `Failed`    → `X `
 
-use crate::{fill_rect, font};
+use crate::{fill_rect, font, truncate_to_width};
 
 /// Strip height in pixels. 2 px accent + 6 px top pad + 14 px glyph
 /// row + 6 px bottom pad = 28.  Chosen as half of
@@ -93,7 +93,15 @@ impl DownloadNoticeStrip {
         let max_px = (width as i32 - text_x - right_pad).max(0) as usize;
         let line_trunc = truncate_to_width(&line, max_px);
 
-        font::draw_text(buffer, width, height, text_x, text_y, line_trunc, COLOUR_FG);
+        font::draw_text(
+            buffer,
+            width,
+            height,
+            text_x,
+            text_y,
+            &line_trunc,
+            COLOUR_FG,
+        );
     }
 }
 
@@ -128,30 +136,6 @@ fn palette(kind: DownloadNoticeKind) -> (u32, u32) {
         // Red tint — failure.
         DownloadNoticeKind::Failed => (COLOUR_BG_FAILED, COLOUR_ACCENT_FAILED),
     }
-}
-
-/// Truncate `s` to at most `max_px` pixels of rendered width. Mirrors
-/// the helper in `lib.rs` and `permissions_prompt.rs`.
-fn truncate_to_width(s: &str, max_px: usize) -> &str {
-    if font::text_width(s) <= max_px {
-        return s;
-    }
-    if max_px < font::text_width("..") {
-        return "";
-    }
-    let mut end = s.len();
-    while end > 0 {
-        if !s.is_char_boundary(end) {
-            end -= 1;
-            continue;
-        }
-        let prefix = &s[..end];
-        if font::text_width(prefix) + font::text_width("..") <= max_px {
-            return prefix;
-        }
-        end -= 1;
-    }
-    ""
 }
 
 // Palette (opaque BGRA: 0xFF_RR_GG_BB) ---------------------------------

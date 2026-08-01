@@ -13,6 +13,17 @@ struct TtfFace {
     /// `TARGET_PX`-tall cell instead of bottom-aligned.
     cap_height: usize,
     cache: std::sync::Mutex<HashMap<char, (Metrics, Vec<u8>)>>,
+    /// Per-codepoint advance width in whole pixels. Memoised because
+    /// measuring is on the repaint hot path (every truncation walks a
+    /// string char by char) and `fontdue::Font::metrics` rebuilds the
+    /// glyph geometry on each call.
+    advances: std::sync::Mutex<HashMap<char, usize>>,
+}
+
+/// Take a mutex without ever propagating poison. A panic inside one
+/// rasterize must not permanently kill every future repaint (M28).
+fn lock_ignore_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 enum FontFace {
@@ -62,6 +73,7 @@ fn load_face() -> FontFace {
                     advance: advance.max(1),
                     cap_height: metrics.height.max(1),
                     cache: std::sync::Mutex::new(HashMap::new()),
+                    advances: std::sync::Mutex::new(HashMap::new()),
                 });
             }
         });
@@ -77,9 +89,34 @@ fn face() -> &'static FontFace {
     FACE.get_or_init(load_face)
 }
 
+/// Nominal cell width — the advance of `'M'`. Callers that need a
+/// fixed column size (rect sizing, cursor cells) use this; anything
+/// measuring real text must use [`text_width`] / [`char_width`], which
+/// honour per-glyph advances.
 pub fn glyph_w() -> usize {
     match face() {
         FontFace::Ttf(f) => f.advance,
+        FontFace::Bitmap => BITMAP_GLYPH_W,
+    }
+}
+
+/// Advance width of a single glyph in whole pixels, excluding the 1-px
+/// inter-glyph gap [`text_width`] and [`draw_text`] insert. Full-width
+/// CJK glyphs report ~2× [`glyph_w`]; zero-width combining marks report
+/// 0 so they stack on the preceding glyph instead of claiming a cell.
+pub fn char_width(c: char) -> usize {
+    match face() {
+        FontFace::Ttf(f) => {
+            if let Some(&w) = lock_ignore_poison(&f.advances).get(&c) {
+                return w;
+            }
+            // Measured outside the lock; a duplicate measure under a
+            // race is harmless and cheaper than holding it across the
+            // fontdue call.
+            let w = f.font.metrics(c, TARGET_PX).advance_width.round().max(0.0) as usize;
+            lock_ignore_poison(&f.advances).insert(c, w);
+            w
+        }
         FontFace::Bitmap => BITMAP_GLYPH_W,
     }
 }
@@ -91,20 +128,28 @@ pub fn glyph_h() -> usize {
     }
 }
 
+/// Rendered pixel width of `s`: the sum of each glyph's advance plus a
+/// 1-px gap between adjacent glyphs (no trailing gap). Matches the pen
+/// walk in [`draw_text`] exactly, so truncation and centring stay
+/// correct for non-ASCII text.
 pub fn text_width(s: &str) -> usize {
-    let n = s.chars().count();
+    let mut w = 0usize;
+    let mut n = 0usize;
+    for c in s.chars() {
+        w += char_width(c);
+        n += 1;
+    }
     if n == 0 {
         return 0;
     }
-    n * (glyph_w() + 1) - 1
+    w + n - 1
 }
 
 pub fn draw_text(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, s: &str, fg: u32) {
-    let advance = (glyph_w() as i32) + 1;
     let mut pen_x = x;
     for c in s.chars() {
         draw_char(buf, width, height, pen_x, y, c, fg);
-        pen_x += advance;
+        pen_x += char_width(c) as i32 + 1;
     }
 }
 
@@ -126,12 +171,18 @@ fn draw_ttf_char(
     c: char,
     fg: u32,
 ) {
-    let (metrics, bitmap) = {
-        let mut cache = f.cache.lock().unwrap();
-        cache
-            .entry(c)
-            .or_insert_with(|| f.font.rasterize(c, TARGET_PX))
-            .clone()
+    // Rasterize outside the lock: fontdue must never run while the
+    // cache mutex is held, or one panicking glyph would poison it for
+    // the life of the process. Poison is ignored on top of that, so a
+    // panic elsewhere can't stop the chrome repainting either.
+    let cached = lock_ignore_poison(&f.cache).get(&c).cloned();
+    let (metrics, bitmap) = match cached {
+        Some(entry) => entry,
+        None => {
+            let entry = f.font.rasterize(c, TARGET_PX);
+            lock_ignore_poison(&f.cache).insert(c, entry.clone());
+            entry
+        }
     };
 
     let fg_r = (fg >> 16) & 0xFF;
@@ -359,6 +410,44 @@ mod tests {
     fn text_width_n_glyphs_includes_gaps() {
         assert_eq!(text_width("AB"), 2 * glyph_w() + 1);
         assert_eq!(text_width("ABC"), 3 * glyph_w() + 2);
+    }
+
+    #[test]
+    fn text_width_ascii_unchanged_by_per_glyph_advances() {
+        // ASCII in a monospace face has a uniform advance, so the
+        // per-glyph sum must still equal the old fixed-cell formula.
+        for s in ["A", "hi", "Hello, World!", "https://example.com/a?b=c"] {
+            let n = s.chars().count();
+            assert_eq!(
+                text_width(s),
+                n * (glyph_w() + 1) - 1,
+                "ASCII measurement changed for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_width_is_sum_of_char_advances_plus_gaps() {
+        // Holds for any script, including full-width CJK where
+        // char_width() is ~2 * glyph_w().
+        for s in ["aB1", "héllo", "漢字テスト", "mixed 漢 ascii"] {
+            let n = s.chars().count();
+            let expected: usize = s.chars().map(char_width).sum::<usize>() + n - 1;
+            assert_eq!(text_width(s), expected, "mismatch for {s:?}");
+        }
+    }
+
+    #[test]
+    fn char_width_matches_single_char_text_width() {
+        for c in ['A', ' ', 'é', '漢'] {
+            assert_eq!(text_width(&c.to_string()), char_width(c));
+        }
+    }
+
+    #[test]
+    fn char_width_cached_value_is_stable() {
+        let first = char_width('漢');
+        assert_eq!(first, char_width('漢'));
     }
 
     #[test]

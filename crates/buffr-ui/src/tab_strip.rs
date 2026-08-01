@@ -32,6 +32,7 @@ use std::sync::Arc;
 use crate::Palette;
 use crate::fill_rect;
 use crate::font;
+use crate::truncate_to_width;
 
 /// Tab strip strip height in pixels. 34 px gives a 14-px glyph row
 /// with comfortable padding above + below plus a 2-px progress bar
@@ -285,16 +286,26 @@ impl TabStrip {
                         opaque,
                     );
                     // 2-char white label centred in the badge rectangle.
-                    let label = tab.engine_label.as_deref().unwrap_or("??");
-                    let label_px = font::text_width(label) as i32;
-                    let label_x = x + (badge_w - label_px) / 2;
+                    // `engine_label` is only documented as 2 chars, not
+                    // enforced, so clip it to 2 and clamp the centring
+                    // offset — otherwise a longer label centres to the
+                    // left of the pill and draws over the previous tab.
+                    let label: String = tab
+                        .engine_label
+                        .as_deref()
+                        .unwrap_or("??")
+                        .chars()
+                        .take(2)
+                        .collect();
+                    let label_px = font::text_width(&label) as i32;
+                    let label_x = (x + (badge_w - label_px) / 2).max(x);
                     font::draw_text(
                         buffer,
                         width,
                         height,
                         label_x,
                         text_y,
-                        label,
+                        &label,
                         BADGE_TEXT_COLOR,
                     );
                     // Hover outline: 1-px border around the badge rect in the
@@ -355,7 +366,7 @@ impl TabStrip {
                     .saturating_sub((text_x - x) as usize)
                     .saturating_sub(6);
                 let label = truncate_to_width(&tab.title, max_text_px);
-                font::draw_text(buffer, width, height, text_x, text_y, label, fg);
+                font::draw_text(buffer, width, height, text_x, text_y, &label, fg);
             }
 
             // Progress bar across the bottom edge of the pill — hidden
@@ -397,30 +408,6 @@ fn pinned_glyph(title: &str) -> String {
         }
     }
     "*".to_string()
-}
-
-/// Truncate `s` to fit in `max_px` pixels, appending `..` when it
-/// didn't fit. Mirrors the logic in `Statusline::paint`'s URL cell.
-fn truncate_to_width(s: &str, max_px: usize) -> &str {
-    if font::text_width(s) <= max_px {
-        return s;
-    }
-    if max_px < font::text_width("..") {
-        return "";
-    }
-    let mut end = s.len();
-    while end > 0 {
-        if !s.is_char_boundary(end) {
-            end -= 1;
-            continue;
-        }
-        let prefix = &s[..end];
-        if font::text_width(prefix) + font::text_width("..") <= max_px {
-            return prefix;
-        }
-        end -= 1;
-    }
-    ""
 }
 
 const GUTTER: u32 = 4;
@@ -465,7 +452,14 @@ fn blit_favicon(
     let dst_w_us = dst_w as usize;
     let dst_h_us = dst_h as usize;
     let src_pixels: &[u32] = fav.pixels.as_slice();
-    if src_pixels.len() < src_w * src_h {
+    // checked_mul: `width`/`height` are public fields with no invariant
+    // tying them to `pixels.len()`, so a bogus pair would wrap the
+    // product in release and let the guard pass before the sampling
+    // loop indexes out of bounds.
+    let Some(needed) = src_w.checked_mul(src_h) else {
+        return;
+    };
+    if src_pixels.len() < needed {
         return;
     }
     // Pre-extract the bg channels; reused for every alpha composite.
@@ -767,6 +761,70 @@ mod tests {
     #[test]
     fn truncate_returns_full_when_fits() {
         assert_eq!(truncate_to_width("hi", 1000), "hi");
+    }
+
+    #[test]
+    fn blit_favicon_rejects_overflowing_dimensions() {
+        // M24: the guard must reject implausible dimensions rather
+        // than let the sampling loop index past `pixels`. On a 32-bit
+        // target this pair also wraps the `src_w * src_h` product.
+        let w = 200;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let fav = TabFavicon {
+            width: u32::MAX,
+            height: u32::MAX,
+            pixels: Arc::new(vec![0xFF_FF_FF_FF; 4]),
+        };
+        blit_favicon(&mut buf, w, h, 0, 0, 16, 16, &fav, 0);
+        assert!(buf.iter().all(|&px| px == 0), "no pixels should be written");
+    }
+
+    #[test]
+    fn blit_favicon_rejects_short_pixel_buffer() {
+        let w = 200;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let fav = TabFavicon {
+            width: 16,
+            height: 16,
+            pixels: Arc::new(vec![0xFF_FF_FF_FF; 8]),
+        };
+        blit_favicon(&mut buf, w, h, 0, 0, 16, 16, &fav, 0);
+        assert!(buf.iter().all(|&px| px == 0));
+    }
+
+    #[test]
+    fn over_long_engine_label_stays_inside_its_pill() {
+        // L32: a label longer than the 2 glyphs the badge is sized for
+        // made the centring offset negative, drawing over the previous
+        // tab. It must be clipped and clamped to the pill's left edge.
+        let w = 400;
+        let h = TAB_STRIP_HEIGHT as usize;
+        let mut buf = make_buf(w, h);
+        let s = TabStrip {
+            tabs: vec![TabView {
+                title: "only".into(),
+                engine_badge: Some(0x00_FF_00_00),
+                engine_label: Some("LADYBIRD".into()),
+                ..Default::default()
+            }],
+            active: Some(0),
+            ..TabStrip::default()
+        };
+        s.paint(&mut buf, w, h, 0);
+        // The pill starts at x = GUTTER; the strip background is all
+        // that may occupy the columns to its left.
+        let bg = s.palette.bg;
+        for y in 0..h {
+            for x in 0..GUTTER as usize {
+                assert_eq!(
+                    buf[y * w + x],
+                    bg,
+                    "badge label painted at ({x}, {y}), left of its pill"
+                );
+            }
+        }
     }
 
     #[test]
