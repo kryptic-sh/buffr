@@ -22,8 +22,23 @@ and buffr does **not** depend on the `directories` crate. Debug builds use
 `buffr-debug` instead of `buffr` as the directory name so a dev tree never
 shares state with an installed release.
 
-Sibling profile trees resolve the same way: data in `~/.local/share/buffr/`
-(`XDG_DATA_HOME`), CEF cache in `~/.cache/buffr/` (`XDG_CACHE_HOME`).
+Everything else the browser persists lives under `XDG_DATA_HOME` —
+`~/.local/share/buffr/` by default, `~/.local/share/buffr-debug/` in debug
+builds. That includes the six SQLite stores (`history.sqlite`,
+`bookmarks.sqlite`, `downloads.sqlite`, `zoom.sqlite`, `permissions.sqlite`,
+`favicons.sqlite`), `session.json`, `update-cache.json`, `usage-counters.json`,
+`crashes/`, **and CEF's own profile tree** — cookies, `Local Storage`,
+IndexedDB, and the HTTP `Cache` directory all sit in there together, because
+`apps/buffr-app/src/main.rs` passes the data dir as CEF's `root_cache_path`.
+
+That is deliberate: the XDG spec says `~/.cache` contents may be deleted at any
+time without warning, and losing cookies and local storage to a `tmpfiles` sweep
+is not acceptable. `~/.cache/buffr/` (`XDG_CACHE_HOME`) is still created at
+startup and is used to derive the single-instance profile id, but CEF does not
+store anything there.
+
+Per-engine subtrees are namespaced as `~/.local/share/buffr/engines/<id>/`. See
+[`[engines]`](#engines) for what that currently does — and does not — isolate.
 
 Override the config file per-run with `--config <PATH>`.
 
@@ -128,6 +143,18 @@ silently replaced by the built-in default.
 | `clear_on_exit`    | string[] | `[]`                                         | Any of `cookies`, `cache`, `history`, `bookmarks`, `downloads`, `local_storage`. |
 | `skip_schemes`     | string[] | `["about", "cef", "chrome", "data", "file"]` | URL schemes never recorded in history (case-insensitive).                        |
 
+Telemetry is opt-in, local-only, and has **no network endpoint** — there is no
+collector to send counters to. The only network request buffr makes by default
+is the update check; see [privacy.md](./privacy.md) and
+[updates.md](./updates.md).
+
+> **Known bug in `clear_on_exit`.** `cookies`, `history`, `bookmarks`, and
+> `downloads` work. `cache` and `local_storage` do not: `run_clear_on_exit`
+> (`apps/buffr-app/src/main.rs`) deletes `<XDG_CACHE_HOME>/buffr/Cache` and
+> `<XDG_CACHE_HOME>/buffr/Local Storage`, but CEF writes both under its
+> `root_cache_path`, which is the **data** dir. The deletes therefore hit a
+> directory CEF never populated and log `dir absent — skipping`.
+
 ### `[downloads]`
 
 | Key                  | Type  | Default | Notes                                                                                    |
@@ -184,15 +211,34 @@ default = "cef"
 [[engines.instances]]
 id      = "cef"
 backend = "cef"
-# data_dir = "/tmp/cef-b-cache"   # parsed, but advisory only
+# data_dir = "/tmp/cef-b-cache"   # accepted, but has no effect today
 
 [[engines.rules]]
 match  = "*.figma.com"
 engine = "cef"
 ```
 
-`backend` accepts only `"cef"` today. `--engine <NAME>` overrides the whole
-section for one run.
+`backend` accepts only `"cef"`. It is the sole backend the browser can
+construct: the WPE WebKit backend (`crates/buffr-webkit`) is excluded from the
+workspace, Linux-only, and not built by CI. `--engine <NAME>` overrides the
+whole section for one run and likewise only accepts `cef`.
+
+#### `data_dir` and per-engine isolation
+
+`data_dir` on an instance is parsed and plumbed all the way through —
+`buffr-app` resolves it (explicit value, else `<data>/engines/<id>/`) and hands
+it to the backend as `BackendOpenOptions::data_dir`. The CEF backend then
+**discards it**: `BrowserHost::new_with_options`
+(`crates/buffr-cef/src/host.rs`) does `let _ = data_dir;` and creates no
+per-engine `RequestContext`, because CEF's Alloy runtime collapses a child
+context's `cache_path` back onto the global `Default/` profile anyway
+(kryptic-sh/buffr#158).
+
+Net effect today: **every engine instance shares one on-disk profile** — the
+`root_cache_path`, which is the data dir described under
+[File location](#file-location). Setting `data_dir` changes nothing you can
+observe. The key is kept so configs do not break when per-engine isolation lands
+(it needs the Chrome runtime, not Alloy).
 
 ### `[keymap.<mode>]`
 

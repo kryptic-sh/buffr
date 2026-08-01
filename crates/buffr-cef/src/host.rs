@@ -2300,7 +2300,8 @@ impl BrowserHost {
                     if matches!(action, HintAction::OpenInBackground(_)) {
                         tracing::warn!(
                             element_id = *id,
-                            "hint background commit: routes through `open_tab_background`",
+                            "hint background commit: NOT routed through \
+                             `open_tab_background` — committing as a same-tab click",
                         );
                     }
                     commit_id = Some(*id);

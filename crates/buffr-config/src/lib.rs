@@ -328,25 +328,28 @@ fn default_engine_id() -> String {
 /// [[engines.instances]]
 /// id       = "cef-b"
 /// backend  = "cef"
-/// data_dir = "/tmp/cef-b-cache"  # advisory only in Phase 3
+/// data_dir = "/tmp/cef-b-cache"  # accepted; no effect today
 /// ```
 ///
 /// `id` is referenced by `engines.default` and `[[engines.rules]]`.
-/// `backend` selects the runtime crate: only `"cef"` is supported in Phase 3.
-/// `data_dir` is accepted but advisory — CEF's cache path is process-global.
-/// Real per-engine on-disk isolation requires `RequestContext` (Phase 5+).
+/// `backend` selects the runtime crate: only `"cef"` is supported.
+/// `data_dir` is parsed and passed to the backend, but the CEF backend
+/// discards it — no per-engine `RequestContext` is created, so every
+/// instance shares CEF's process-global `root_cache_path`. See
+/// `docs/config.md` and kryptic-sh/buffr#158.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineInstance {
     /// Unique id referenced by `engines.default` and routing rules.
     /// Lower-case ASCII recommended.
     pub id: String,
-    /// Which backend crate hosts this instance.
-    /// Phase 3 supports only `"cef"`.
+    /// Which backend crate hosts this instance. Only `"cef"` is
+    /// supported.
     pub backend: String,
-    /// Optional per-instance data directory.
-    /// **Phase 3 advisory only** — CEF cache path is process-global.
-    /// Real isolation tracked as follow-up (Phase 5+).
+    /// Optional per-instance data directory. Parsed and plumbed to the
+    /// backend, but the CEF backend discards it — every instance shares
+    /// the process-global `root_cache_path`. Kept so configs survive the
+    /// eventual per-engine isolation work (kryptic-sh/buffr#158).
     #[serde(default)]
     pub data_dir: Option<String>,
 }

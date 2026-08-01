@@ -462,7 +462,7 @@ pub struct Palette {
 
 impl Palette {
     /// Derive a palette from a single base accent. `bg` is the accent
-    /// mixed 92% with black; `bg_lifted` is the accent mixed 80%;
+    /// mixed 92% with black; `bg_lifted` is the accent mixed 85%;
     /// `fg_dim` is `fg` mixed 35% with black. Semantic colours fall
     /// back to fixed signal values — callers override via
     /// [`Palette::with_signals`].

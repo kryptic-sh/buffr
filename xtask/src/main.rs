@@ -163,7 +163,7 @@ fn print_help() {
     println!();
     println!("    package-linux [--release] [--variant VARIANT]");
     println!("        Produce Linux distribution artifacts under target/dist/linux/.");
-    println!("        VARIANT: appimage | deb | aur | all (default: all).");
+    println!("        VARIANT: deb | rpm | tarball | aur | all (default: all).");
     println!();
     println!("    package-macos-dmg [--release]");
     println!(

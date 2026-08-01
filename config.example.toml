@@ -91,14 +91,19 @@ enable_telemetry = false
 # Valid entries:
 #   "cookies"        — flush every cookie via CEF's global cookie
 #                      manager.
-#   "cache"          — delete <root_cache_path>/Cache (recreated on
-#                      next startup).
+#   "cache"          — delete <XDG_CACHE_HOME>/buffr/Cache.
 #   "history"        — wipe every row in history.sqlite.
 #   "bookmarks"      — wipe every row in bookmarks.sqlite. Destructive;
 #                      only honored when listed.
 #   "downloads"      — wipe every row in downloads.sqlite (regardless
 #                      of status).
-#   "local_storage"  — delete <root_cache_path>/Local Storage.
+#   "local_storage"  — delete <XDG_CACHE_HOME>/buffr/Local Storage.
+#
+# KNOWN BUG: the "cache" and "local_storage" entries resolve against
+# the XDG *cache* dir, but CEF's root_cache_path is the XDG *data* dir
+# (~/.local/share/buffr) — see docs/config.md. So those two deletes hit
+# a directory CEF never writes to and log "dir absent — skipping".
+# "cookies", "history", "bookmarks", and "downloads" work as described.
 #
 # Example: paranoid web-browsing — wipe cookies, cache, and local
 # storage on exit; keep history + bookmarks.
@@ -216,9 +221,19 @@ require_focus = true
 #
 # Validation: `default` must be non-empty and must name a declared (or
 # synthesised) instance, instance ids must be unique, and every rule's
-# `engine` must resolve to an instance. `backend` accepts only "cef"
-# today. `data_dir` is parsed but advisory — CEF's cache path is
-# process-global.
+# `engine` must resolve to an instance.
+#
+# `backend` accepts only "cef" — that is the only backend the browser
+# can construct. (crates/buffr-webkit exists but is excluded from the
+# workspace, Linux-only, and not built by CI.)
+#
+# `data_dir` is parsed and passed to the backend, but the CEF backend
+# discards it: no per-engine RequestContext is created, because CEF's
+# Alloy runtime collapses a child cache_path onto the global Default
+# profile anyway (kryptic-sh/buffr#158). Every instance therefore shares
+# one on-disk profile — CEF's root_cache_path, which is the XDG data dir
+# (~/.local/share/buffr). Setting `data_dir` has no observable effect
+# today; the key stays so configs survive the eventual isolation work.
 
 [engines]
 default = "cef"
@@ -228,7 +243,7 @@ default = "cef"
 # [[engines.instances]]
 # id      = "cef"
 # backend = "cef"
-# data_dir = "/tmp/cef-b-cache"  # advisory only
+# data_dir = "/tmp/cef-b-cache"  # accepted; no effect today
 
 # [[engines.rules]]
 # match  = "*.figma.com"

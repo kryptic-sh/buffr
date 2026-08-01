@@ -47,7 +47,7 @@ fn main() {
     // Informational only — cargo has no `cargo:info=` directive, so we
     // emit to stderr where it shows under `cargo build -vv` without
     // polluting normal builds with a warning.
-    eprintln!("buffr-core: using CEF_PATH = {}", cef_path.display());
+    eprintln!("buffr-cef: using CEF_PATH = {}", cef_path.display());
 
     // Spotify minimal distributions ship the shared library under
     // `Release/` on Linux/Windows and under

@@ -49,13 +49,16 @@ buffr is XDG-everywhere, so the dev run writes profile state to the same
 directories it uses on Linux (a debug build adds the `-debug` suffix):
 
 ```text
-~/.cache/buffr-debug/
 ~/.local/share/buffr-debug/
 ```
 
-That includes CEF cache data plus SQLite stores for history, bookmarks,
-downloads, permissions, and zoom. Use `--private` for an in-memory/private data
-session:
+Everything lives there: the SQLite stores (history, bookmarks, downloads,
+permissions, zoom, favicons) **and** CEF's own profile tree — cookies,
+`Local Storage`, and the HTTP cache — because `buffr-app` passes the data dir as
+CEF's `root_cache_path`. `~/.cache/buffr-debug/` is created too, but CEF writes
+nothing there. See [`config.md`](./config.md).
+
+Use `--private` for an in-memory/private data session:
 
 ```sh
 cargo run --bin buffr-app -- --private

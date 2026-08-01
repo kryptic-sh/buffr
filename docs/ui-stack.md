@@ -1,8 +1,7 @@
 # UI stack — chrome rendering decision
 
-Phase 3 of `PLAN.md` introduces native chrome (statusline, tab strip, command
-line, hint overlay). This ADR records the rendering stack chosen for the first
-batch of chrome — statusline today, tab strip + command line later in Phase 3.
+This ADR records the rendering stack chosen for buffr's native chrome —
+statusline, tab strip, command line, hint overlay.
 
 ## Options
 
@@ -51,16 +50,22 @@ like everything else.
 
 ## Layout
 
-- `STATUSLINE_HEIGHT = 24` pixels, docked to the bottom of the buffr window.
-- `TAB_STRIP_HEIGHT = 30` pixels, sits above the CEF page area and below the
+Constants below are the live values; `crates/buffr-ui` is the source of truth
+(`STATUSLINE_HEIGHT` in `src/lib.rs`, `TAB_STRIP_HEIGHT` in `src/tab_strip.rs`,
+`INPUT_HEIGHT` / `SUGGESTION_ROW_HEIGHT` / `MAX_SUGGESTIONS` in
+`src/input_bar.rs`).
+
+- `STATUSLINE_HEIGHT = 30` pixels, docked to the bottom of the buffr window.
+- `TAB_STRIP_HEIGHT = 34` pixels, sits above the CEF page area and below the
   optional input bar. Always painted (zero tabs renders an empty bar in the
   strip's bg colour).
 - `INPUT_HEIGHT = 28` pixels, docked to the **top** when the command line or
   omnibar is open. The input strip is hidden when the overlay is closed and the
   page region reclaims those rows.
-- Suggestion dropdown: each row is `STATUSLINE_HEIGHT` (24 px) tall, max 8 rows.
-  Stacks below the input strip when populated; the dropdown rectangle also
-  shrinks the CEF child rect so suggestions never overlap the page.
+- Suggestion dropdown: each row is `SUGGESTION_ROW_HEIGHT`, which is defined as
+  `STATUSLINE_HEIGHT` (30 px); `MAX_SUGGESTIONS = 8` rows. Stacks below the
+  input strip when populated; the dropdown rectangle also shrinks the CEF child
+  rect so suggestions never overlap the page.
 - CEF page rect:
   `(0, overlay_h + TAB_STRIP_HEIGHT, w, h - overlay_h - TAB_STRIP_HEIGHT - STATUSLINE_HEIGHT)`,
   where `overlay_h` is `INPUT_HEIGHT + dropdown_rows * STATUSLINE_HEIGHT` when

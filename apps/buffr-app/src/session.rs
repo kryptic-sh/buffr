@@ -1,7 +1,7 @@
 //! Session restore — persist the open tab list across runs.
 //!
 //! Layout: a tiny JSON blob at `~/.local/share/buffr/session.json`
-//! (resolved via `directories::ProjectDirs`):
+//! (resolved via `hjkl_config::data_dir`, XDG on every platform):
 //!
 //! ```json
 //! {

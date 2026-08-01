@@ -14,13 +14,15 @@ the [`cef`](https://crates.io/crates/cef) Rust crate. Vim keybindings powered by
 
 ## Status
 
-`0.14.6` — pre-1.0, tagged releases on every version bump. Multi-tab browsing;
-popup windows (`window.open`, OAuth) render in dedicated buffr windows with
-read-only address bars and preserve `window.opener`; `target="_blank"` and
-Ctrl+click open in tabs; two-finger horizontal swipe navigates browser history;
-vim modal engine (`hjkl-engine 0.5`) wired for page-mode dispatch and
-insert-mode text editing; history / downloads / bookmarks / permissions / zoom
-data layers wired and persisted to SQLite. See [CHANGELOG.md](CHANGELOG.md).
+Pre-1.0, tagged releases on every version bump — the current version is whatever
+the [latest release](https://github.com/kryptic-sh/buffr/releases/latest) says.
+Multi-tab browsing; popup windows (`window.open`, OAuth) render in dedicated
+buffr windows with read-only address bars and preserve `window.opener`;
+`target="_blank"` and Ctrl+click open in tabs; two-finger horizontal swipe
+navigates browser history; vim modal engine (`hjkl-engine`) wired for page-mode
+dispatch and insert-mode text editing; history / downloads / bookmarks /
+permissions / zoom data layers wired and persisted to SQLite. See
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Supported platforms
 
@@ -41,8 +43,9 @@ Each release publishes binary artifacts for:
 We dropped Intel Mac builds in `0.1.14`. Apple stopped selling Intel Macs in
 2023, and the GitHub Actions `macos-13` runner pool is heavily contended —
 release tags routinely queued for 1–2 hours waiting on a slot, blocking the
-entire publish pipeline (the crates.io stub publish gates on every binary leg).
-The cost wasn't paying for the user count, so we cut it.
+entire publish pipeline (`publish-github-release` in `.github/workflows/ci.yml`
+gates on every binary leg). The cost wasn't paying for the user count, so we cut
+it.
 
 If you're on an Intel Mac and want to run buffr, build from source on your own
 machine — the workspace builds clean against `x86_64-apple-darwin`, the support
@@ -74,7 +77,20 @@ is just absent from the release pipeline, not from the code.
 | `buffr-zoom`        | SQLite-backed per-domain zoom-level persistence.                    |
 | `buffr-view-source` | Syntax highlighting + HTML rendering for `buffr-src:` pages.        |
 
-Not yet published to crates.io — consume via path or git dep.
+All members set `publish = false` — nothing here goes to crates.io, and the
+`buffr` name on the registry is yanked. Consume via path dep inside the
+workspace, or a git dep from outside it.
+
+**Experimental, outside the workspace.** `crates/buffr-webkit` (a WPE WebKit
+backend) and `apps/buffr-poc` (a Wayland subsurface-embedding proof of concept
+on top of it) are in the `exclude` list in the root `Cargo.toml`. They are
+Linux-only, need `wpewebkit-2.0` system packages, and are **not built by CI**.
+Build them standalone:
+
+```bash
+cargo build --manifest-path crates/buffr-webkit/Cargo.toml
+cargo build --manifest-path apps/buffr-poc/Cargo.toml
+```
 
 ## Install
 
@@ -125,10 +141,12 @@ cargo run --bin buffr
 cargo run --bin buffr-app
 ```
 
-> **Heads-up:** `cargo install buffr` is **not** a supported install path. The
-> `buffr` crate on crates.io is a stub that prints download instructions — CEF
-> apps need a ~150 MB runtime payload (libcef, paks, locales, sandbox) that
-> `cargo install` can't bundle. Grab a prebuilt release from
+> **Heads-up:** `cargo install buffr` is **not** a supported install path. Every
+> workspace member sets `publish = false` and the `buffr` name on crates.io is
+> yanked, so there is nothing for `cargo install` to fetch. A CEF app also needs
+> a large runtime payload next to the binary (libcef, `.pak` resources, locales,
+> the sandbox helper) that `cargo install` has no way to place. Grab a prebuilt
+> release from
 > [github.com/kryptic-sh/buffr/releases](https://github.com/kryptic-sh/buffr/releases),
 > or build from source as shown above.
 
@@ -145,7 +163,9 @@ CEF path overrides.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) (if exists) or open an issue / PR.
+There is no CONTRIBUTING.md yet — open an issue or a PR. Local gates before you
+push: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test`. See [`docs/dev.md`](docs/dev.md).
 
 ## License
 

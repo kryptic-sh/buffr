@@ -7,8 +7,10 @@ Reference for the default page-mode bindings shipped by
 `Config`), so the one `<leader>` binding below (`<leader>p` → `PinTab`) is typed
 as `<Space>p` out of the box. Set `[general] leader = "\\"` for the vim
 convention; `build_keymap` feeds that character to `Keymap::default_bindings`,
-so every `<leader>` chord follows the config. (`buffr --audit-keymap` currently
-renders the audit table with `\` regardless of your config — cosmetic only.)
+so every `<leader>` chord follows the config. (`buffr --audit-keymap` prints the
+raw table strings, so a leader chord shows as the literal token `<leader>p`
+rather than the key you actually press — `Keymap::audit_default_bindings`
+ignores the leader it is handed. Cosmetic only.)
 
 > **Defaults mirror Vieb** (stock `app/renderer/input.js`). Intentional
 > divergences are flagged inline with **[buffr]**.
@@ -26,16 +28,16 @@ Shift, `<M-...>` / `<A-...>` = Alt, `<D-...>` = Super (Cmd on macOS), `<leader>`
 | `Command` | `:` or `e`        | Command line / omnibar focused. `<Esc>` returns.        |
 | `Hint`    | `f` / `F`         | DOM hint overlay active. `<Esc>` returns.               |
 | `Pending` | (transient)       | Multi-key prefix in flight. Not user-bindable.          |
-| `Insert`  | text-field focus  | Forwarded to `hjkl_editor::Editor` once Phase 2 ships.  |
+| `Insert`  | text-field focus  | Forwarded to `Engine::feed_edit_mode_key`.              |
 
 ## Count and register prefixes
 
 - **Count** — leading digits accumulate: `5j` scrolls down 5 lines, `12G` jumps
   to line 12 (when implemented). `0` alone is bindable (vim convention: column
   0); digits 1-9 always start a count.
-- **Register** — `"<char>` selects a register before a yank. Phase 2 captures
-  register state on the engine but does not yet thread it through to actions.
-  Yank-to-register lands with Phase 5.
+- **Register** — `"<char>` selects a register before a yank. The engine captures
+  register state but does **not** thread it through to actions; yank-to-register
+  is not implemented.
 
 ## Ambiguity timeout
 
@@ -93,8 +95,10 @@ the shorter action fires.
 
 `TabClose` (and `:q`) close the active tab. The application only exits when the
 last tab is gone. `PinTab` toggles the pinned bit (pinned tabs sort to the front
-— pin does not prevent close). There is **no** `DuplicateTab` action. See
-[`multi-tab.md`](./multi-tab.md).
+— pin does not prevent close). There is **no** `PageAction` for duplicating a
+tab — the capability exists only as the "Duplicate Tab" entry in the tab-strip
+right-click menu (`ContextMenuItem::TabDuplicate`). See
+[`multi-tab.md`](./multi-tab.md) and [`context-menu.md`](./context-menu.md).
 
 ### History
 
@@ -234,12 +238,14 @@ readline / vim's command-line conventions.
 | -------------------- | -------------------------------------------------------- |
 | `<Esc>` / `<C-c>`    | Cancel — close overlay, return to Normal mode.           |
 | `<CR>`               | Confirm — dispatch the command or navigate to the URL.   |
-| `<Tab>` / `<Down>`   | Move suggestion selection one row down (cycles to last). |
+| `<Tab>` / `<Down>`   | Move suggestion selection one row down (clamps at last). |
 | `<S-Tab>` / `<Up>`   | Move suggestion selection one row up (clears at top).    |
 | `<Left>` / `<Right>` | Move cursor through the buffer.                          |
 | `<BS>`               | Delete the codepoint before the cursor.                  |
 | `<C-u>`              | Clear the entire buffer.                                 |
 | `<C-w>`              | Delete the word before the cursor.                       |
+| `<C-v>`              | Paste clipboard text, with CR/LF stripped.               |
+| `<Space>`            | Literal space (the toolkit reports it as a named key).   |
 
 ## In-prompt shortcuts (permissions)
 

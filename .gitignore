@@ -1,8 +1,4 @@
 target/
-# apps/buffr-stub is excluded from the workspace (it owns the `buffr`
-# crates.io name; the bin output collides with the real binary), so
-# it has its own target/ that the root `/target` rule misses.
-/apps/buffr-stub/target
 **/*.rs.bk
 *.pdb
 
@@ -33,8 +29,9 @@ target/
 /flatpak/sh.kryptic.buffr.desktop
 /flatpak/.flatpak-builder
 
-# Snap build state.
-/snap/payload
+# Snap build state. snapcraft resolves `source: payload` relative to the
+# project root, so the staged tree lands at /payload, not /snap/payload.
+/payload
 /snap/buffr-*.tar.gz
 /buffr-*.snap
 /buffr-*.snap.sha256

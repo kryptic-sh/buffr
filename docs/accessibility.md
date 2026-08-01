@@ -87,7 +87,9 @@ they override every `[theme]` colour from the config.
 - MSAA + UI Automation bridge on Windows.
 - Larger-text option for the chrome font (`crates/buffr-ui/src/font.rs`
   rasterizes at a fixed `TARGET_PX = 15.0` with no user scale).
-- Reduced-motion preference (currently no animations besides cursor blink).
+- Reduced-motion preference. There is no way to turn chrome animation off: the
+  ASCII splash loading animation (`apps/buffr-app/src/loading_anim.rs`, a ~2 s
+  cycle at 12 fps) and the page-load progress bar both animate unconditionally.
 
 If any of these block your daily use, file an issue at
 <https://github.com/kryptic-sh/buffr/issues>.

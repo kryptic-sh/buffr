@@ -2,8 +2,10 @@
 
 ## Prerequisites
 
-- Rust **1.95** (pinned via `rust-toolchain.toml`; `rustup` will install
-  automatically on first build).
+- Rust **1.95** — the MSRV (`rust-version` in the root `Cargo.toml`), pinned for
+  local builds by `rust-toolchain.toml` (`channel = "1.95.0"`); `rustup`
+  installs it automatically on first build. CI does not use the pin: every job
+  in `.github/workflows/ci.yml` sets up `stable`.
 - A C/C++ toolchain (CEF links against system libraries).
 - Linux: `libgtk-3`, `libnss3`, `libnspr4`, `libatk1.0`, `libatk-bridge2.0`,
   `libxcomposite1`, `libxdamage1`, `libxrandr2`, `libxkbcommon0`,
@@ -21,7 +23,7 @@ plain `cargo run` CEF layout, see [`docs/macos-running.md`](./macos-running.md).
 git clone git@github.com:kryptic-sh/buffr.git
 cd buffr
 
-# Vendor the CEF binary distribution (~500 MB extracted).
+# Vendor the CEF binary distribution (several hundred MB extracted).
 # Drops files under `vendor/cef/<platform>/`.
 cargo xtask fetch-cef
 
@@ -35,25 +37,18 @@ cargo run --bin buffr
 
 `cargo xtask fetch-cef` accepts:
 
-- `--platform <linux64 | macosarm64 | macosx64 | windows64>` — override the host
-  detection (useful when cross-prepping).
-- `--version <X.Y>` — version prefix to match in the Spotify CDN (`index.json`).
-  Defaults to `CEF_VERSION_PREFIX` in `xtask/src/main.rs`, which must match the
-  libcef version the `cef` crate binds (crate `148.x` wraps libcef `147.0.14`,
-  so the prefix is `147.`).
+- `--platform <PLATFORM>` (alias `--target`) — override host detection, useful
+  when cross-prepping. Accepted values, from `fetch_cef` in `xtask/src/main.rs`:
+  `linux64` (default on Linux), `linuxarm64`, `macosarm64`, `macosx64`,
+  `windows64`, `windowsarm64`.
+- `--version <PREFIX>` — version prefix to match in the Spotify CDN
+  (`index.json`). Defaults to `CEF_VERSION_PREFIX` in `xtask/src/main.rs`, which
+  must match the libcef version the `cef` crate binds. That pairing is
+  load-bearing: `cef 148.x` wraps libcef `147.0.14`, so the prefix is `147.`.
 
 Override the CEF tree location with `CEF_PATH=...` (mirrors
-`tauri-apps/cef-rs`). When unset, `buffr-core/build.rs` falls back to
+`tauri-apps/cef-rs`). When unset, `crates/buffr-cef/build.rs` falls back to
 `vendor/cef/<platform>/`.
-
-## CEF binary distribution — size + platform matrix
-
-| Platform     | Archive (compressed) | Extracted | Notes                                |
-| ------------ | -------------------- | --------- | ------------------------------------ |
-| `linux64`    | ~140 MB              | ~480 MB   | Tier 1 (primary dev target).         |
-| `macosarm64` | ~150 MB              | ~520 MB   | Tier 1 (`cargo xtask bundle-macos`). |
-| `macosx64`   | ~150 MB              | ~520 MB   | Tier 1.                              |
-| `windows64`  | ~165 MB              | ~530 MB   | Tier 2.                              |
 
 `vendor/cef/` is in `.gitignore`. Re-run `cargo xtask fetch-cef` after bumping
 the `cef` crate version.
@@ -63,18 +58,41 @@ the `cef` crate version.
 ```
 buffr/
 ├── apps/
-│   ├── buffr/         # supervisor binary (Linux default entrypoint)
-│   ├── buffr-app/     # browser binary (spawned by supervisor on Linux)
-│   └── buffr-helper/  # CEF subprocess helper (macOS Helper.app)
+│   ├── buffr/              # supervisor binary (spawns + restarts buffr-app)
+│   ├── buffr-app/          # browser binary (window, CEF lifecycle, chrome)
+│   ├── buffr-helper/       # CEF subprocess helper (macOS Helper.app)
+│   └── buffr-poc/          # EXCLUDED from the workspace — see below
 ├── crates/
-│   ├── buffr-core/    # CEF lifecycle + browser host + build.rs
-│   ├── buffr-modal/   # vim-style mode + keybind engine
-│   ├── buffr-ui/      # chrome, command palette, hint overlay
-│   └── buffr-config/  # config loading (TOML)
-├── xtask/             # cargo xtask: fetch-cef, etc.
-├── vendor/cef/        # downloaded CEF binaries (gitignored)
-├── docs/              # this file
-└── PLAN.md            # phase roadmap
+│   ├── buffr-engine/       # BrowserEngine trait, routing, buffr:// server
+│   ├── buffr-cef/          # CEF integration: host, handlers, build.rs
+│   ├── buffr-core/         # engine-agnostic core: hints, edit, updates, …
+│   ├── buffr-modal/        # vim page-mode FSM + keymap trie
+│   ├── buffr-ui/           # chrome: statusline, tab strip, input bar
+│   ├── buffr-config/       # config loading (TOML) + hot reload
+│   ├── buffr-store/        # shared SQLite open/tune + migration runner
+│   ├── buffr-history/      # history store
+│   ├── buffr-bookmarks/    # bookmark store + Netscape import
+│   ├── buffr-downloads/    # download tracking
+│   ├── buffr-zoom/         # per-domain zoom persistence
+│   ├── buffr-permissions/  # per-origin permission store
+│   ├── buffr-view-source/  # buffr-src: rendering
+│   └── buffr-webkit/       # EXCLUDED from the workspace — see below
+├── xtask/                  # cargo xtask: fetch-cef, packaging
+├── fuzz/                   # EXCLUDED from the workspace (cargo-fuzz)
+├── vendor/cef/             # downloaded CEF binaries (gitignored)
+├── docs/                   # this file
+└── TODO.md                 # near-term task list
+```
+
+`crates/buffr-webkit` (an experimental WPE WebKit backend) and `apps/buffr-poc`
+(a Wayland subsurface-embedding proof of concept built on it) are in the
+`exclude` list in the root `Cargo.toml`. They are Linux-only, need
+`wpewebkit-2.0` system packages that CI does not install, and are **not built by
+CI**. Build them by hand:
+
+```sh
+cargo build --manifest-path crates/buffr-webkit/Cargo.toml
+cargo build --manifest-path apps/buffr-poc/Cargo.toml
 ```
 
 ## Running
@@ -131,10 +149,11 @@ Notes:
 - The compiled helper binary is `buffr-helper` (with hyphen) but the bundle
   convention renames it to `Buffr Helper` (space-separated) during the copy. No
   Cargo changes needed.
-- This round ships a single `Buffr Helper.app` used for all subprocess types.
-  macOS's full sandbox model wants `Helper`, `Helper (GPU)`,
-  `Helper (Renderer)`, and `Helper (Plugin)` — that split is deferred to Phase 6
-  when proper signing + sandbox entitlements land.
+- The bundle ships the full four-helper layout macOS's sandbox model expects:
+  `Buffr Helper.app`, `Buffr Helper (GPU).app`, `Buffr Helper (Renderer).app`,
+  and `Buffr Helper (Plugin).app`, each with its own plist from
+  `xtask/templates/`. The bundle test in `xtask/src/main.rs` asserts all four
+  exist.
 - No `buffr.icns` is bundled yet; the plist references the file so Finder picks
   it up once we ship one. Until then macOS uses a generic app icon.
 - The bundle script runs on Linux too — useful for catching script regressions
@@ -147,17 +166,22 @@ Notes:
 
 ## Linux packaging
 
-Three Linux distribution paths, all producible from a single Linux dev box:
+Four Linux distribution paths — `deb`, `rpm`, `tarball`, `aur` — all producible
+from a single Linux dev box:
 
 ```sh
 cargo xtask package-linux --release --variant all
 ls target/dist/linux/
-# buffr-0.0.1-x86_64.AppImage
-# buffr-0.0.1-amd64.deb
+# buffr-<version>-amd64.deb
+# buffr-<version>-x86_64.rpm
+# buffr-<version>-x86_64.tar.gz
 ```
 
-`appimagetool` and `dpkg-deb` are auto-detected; if either is missing the xtask
-leaves the staging directory in place and prints a warning rather than failing.
+`<version>` is the workspace version from the root `Cargo.toml`; the xtask
+stamps it into every filename, so there is nothing to keep in sync by hand.
+
+`dpkg-deb` is auto-detected; when it is missing the xtask leaves the staging
+tree at `target/<profile>/buffr-deb/` and prints a warning rather than failing.
 The AUR PKGBUILD is regenerated at `pkg/aur/PKGBUILD` with the current workspace
 version on every run.
 
@@ -226,11 +250,11 @@ cargo test --workspace
 Chrome (statusline, tab strip, input bar, prompts) lives in `crates/buffr-ui`.
 Rendering decisions are in [`docs/ui-stack.md`](./ui-stack.md): CEF renders the
 page off-screen and the app composites page + chrome into one `winit` window
-with `wgpu` on every platform. The 24-pixel statusline rasterizes glyphs with
-`fontdue` at a fixed 15 px, with per-glyph advance widths
-(`crates/buffr-ui/src/font.rs`). Find-in-page is wired through
-`BrowserHost::start_find` / `stop_find`; the `--find <query>` flag on
-`buffr-app` exercises the round trip headlessly.
+with `wgpu` on every platform. The 30-pixel statusline
+(`buffr_ui::STATUSLINE_HEIGHT`) rasterizes glyphs with `fontdue` at a fixed 15
+px, with per-glyph advance widths (`crates/buffr-ui/src/font.rs`). Find-in-page
+is wired through `BrowserHost::start_find` / `stop_find`; the `--find <query>`
+flag on `buffr-app` exercises the round trip headlessly.
 
 ## Storage
 
@@ -239,27 +263,37 @@ Per-user state resolves through `hjkl-config`'s XDG helpers — `$XDG_DATA_HOME`
 `buffr` as the directory name (`buffr-debug` in debug builds). The `directories`
 crate is not used:
 
-| Path                                       | Owner                                                           |
-| ------------------------------------------ | --------------------------------------------------------------- |
-| `~/.cache/buffr/`                          | CEF cache (cookies, GPU shader cache).                          |
-| `~/.local/share/buffr/history.sqlite`      | History DB (Phase 5, `buffr-history`).                          |
-| `~/.local/share/buffr/bookmarks.sqlite`    | Bookmarks DB (Phase 5, `buffr-bookmarks`).                      |
-| `~/.local/share/buffr/downloads.sqlite`    | Downloads DB (Phase 5, `buffr-downloads`).                      |
-| `~/.local/share/buffr/zoom.sqlite`         | Per-site zoom levels (Phase 5, `buffr-zoom`).                   |
-| `~/.local/share/buffr/permissions.sqlite`  | Per-origin permission decisions (Phase 5, `buffr-permissions`). |
-| `~/.local/share/buffr/usage-counters.json` | Opt-in local telemetry counters (Phase 6; off by default).      |
-| `~/.local/share/buffr/crashes/`            | Opt-in panic reports, `<stamp>_<seq>.json` (off by default).    |
-| `~/.local/share/buffr/update-cache.json`   | Cached GitHub release check (see `docs/updates.md`).            |
+| Path                                            | Owner                                                                                           |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `~/.local/share/buffr/` (CEF `root_cache_path`) | Cookies, `Local Storage`, IndexedDB, HTTP `Cache`, GPU shader cache.                            |
+| `~/.local/share/buffr/engines/<id>/`            | Per-engine namespace. Computed and passed, but CEF ignores it — see [`config.md`](./config.md). |
+| `~/.local/share/buffr/history.sqlite`           | History DB (`buffr-history`).                                                                   |
+| `~/.local/share/buffr/bookmarks.sqlite`         | Bookmarks DB (`buffr-bookmarks`).                                                               |
+| `~/.local/share/buffr/downloads.sqlite`         | Downloads DB (`buffr-downloads`).                                                               |
+| `~/.local/share/buffr/zoom.sqlite`              | Per-site zoom levels (`buffr-zoom`).                                                            |
+| `~/.local/share/buffr/permissions.sqlite`       | Per-origin permission decisions (`buffr-permissions`).                                          |
+| `~/.local/share/buffr/favicons.sqlite`          | Favicon cache (`buffr_core::FaviconCache`).                                                     |
+| `~/.local/share/buffr/session.json`             | Saved tab session (see [`multi-tab.md`](./multi-tab.md)).                                       |
+| `~/.local/share/buffr/launch.json`              | Crash-loop tracker (`apps/buffr-app/src/crash_guard.rs`).                                       |
+| `~/.local/share/buffr/usage-counters.json`      | Opt-in local telemetry counters (off by default).                                               |
+| `~/.local/share/buffr/crashes/`                 | Opt-in panic reports, `<stamp>_<seq>.json` (off by default).                                    |
+| `~/.local/share/buffr/update-cache.json`        | Cached GitHub release check (see [`updates.md`](./updates.md)).                                 |
+| `~/.cache/buffr/`                               | Created at startup; used to derive the single-instance profile id. CEF stores nothing here.     |
+
+**CEF state is under `XDG_DATA_HOME`, not `XDG_CACHE_HOME`.** `buffr-app` passes
+the data dir as CEF's `root_cache_path`, so cookies and local storage sit
+alongside the SQLite stores. The XDG spec allows `~/.cache` contents to be
+deleted without warning, which is not survivable for a browser profile.
 
 `history.sqlite` runs in WAL mode, so you'll also see `history.sqlite-wal` /
 `history.sqlite-shm` next to it during a live session — that's normal. Schema
-migrations are forward-only and recorded in a `schema_version` table; see
-[`crates/buffr-history/README.md`](../crates/buffr-history/README.md) for the
-schema and frecency formula.
+migrations are forward-only and recorded in a `schema_version` table; the
+migration runner is `crates/buffr-store/src/lib.rs` and the frecency query lives
+in `crates/buffr-history/src/lib.rs`.
 
-macOS and Windows use the **same** XDG layout (`~/.local/share/buffr/`,
-`~/.cache/buffr/`) — there is no `~/Library/Application Support` or `%APPDATA%`
-special case, and `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` are honored everywhere.
+macOS and Windows use the **same** XDG layout — there is no
+`~/Library/Application Support` or `%APPDATA%` special case, and
+`$XDG_DATA_HOME` / `$XDG_CACHE_HOME` are honored everywhere.
 
 ## Config
 
@@ -280,10 +314,9 @@ buffr --homepage about:blank    # override general.homepage for one run
 ## Bookmarks
 
 `buffr-bookmarks` ships an SQLite-backed bookmark store with tag support and a
-Netscape HTML importer. Schema and Netscape parsing notes live in
-[`crates/buffr-bookmarks/README.md`](../crates/buffr-bookmarks/README.md).
-There's no UI yet (Phase 5b alongside the omnibar); the CLI flags exist for
-import + debugging:
+Netscape HTML importer. Schema and Netscape parsing notes are in the module docs
+at `crates/buffr-bookmarks/src/lib.rs`. There's no bookmarks UI yet; the CLI
+flags exist for import + debugging:
 
 ```sh
 # Import a Netscape HTML export (Chrome / Firefox / Edge "Export bookmarks…").
@@ -305,8 +338,7 @@ server.
 `buffr-zoom` ships an SQLite-backed per-site zoom-level store. The CEF
 `LoadHandler::on_load_end` callback restores the persisted level for the domain
 on every load; the `ZoomIn` / `ZoomOut` / `ZoomReset` page actions write
-through. Schema lives in
-[`crates/buffr-zoom/README.md`](../crates/buffr-zoom/README.md).
+through. Schema lives in the module docs at `crates/buffr-zoom/src/lib.rs`.
 
 ```sh
 # Print every override (`<domain>\t<level>`).
@@ -338,14 +370,21 @@ Caveats:
 - The clear-on-exit hook is a no-op in private mode — the tempdir's `Drop`
   already removes everything.
 - Multi-profile / per-window incognito (one persistent window plus one private
-  window in the same process) is Phase 5 tabs work.
+  window in the same process) is **not implemented** — `--private` is a
+  whole-process switch.
 
 ## Clear-on-exit
 
 `[privacy] clear_on_exit` (in `config.toml`) lists data categories that buffr
 wipes after the event loop returns and before `cef::shutdown()`. Cookies route
-through CEF's global `CookieManager::delete_cookies`; cache and local-storage
-are directory-tree wipes under `Settings::root_cache_path`; history / bookmarks
-/ downloads call `clear_all` on their respective stores. See
+through CEF's global cookie manager; history / bookmarks / downloads call
+`clear_all` on their respective stores. See
 [`config.example.toml`](../config.example.toml) for the full list of valid
 entries.
+
+The `cache` and `local_storage` entries are **currently broken**:
+`run_clear_on_exit` in `apps/buffr-app/src/main.rs` deletes
+`<XDG_CACHE_HOME>/buffr/Cache` and `<XDG_CACHE_HOME>/buffr/Local Storage`, but
+CEF writes both under its `root_cache_path`, which is the data dir. Both deletes
+therefore hit a directory that was never populated and log
+`clear_on_exit: dir absent — skipping`.

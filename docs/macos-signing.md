@@ -1,9 +1,12 @@
 # macOS code signing + notarization (stub)
 
-> **Status:** Phase 6 work. This document is a placeholder describing what real
-> macOS distribution will need. The current `cargo xtask bundle-macos` skips
-> signing entirely; assembled bundles only run after ad-hoc local signing
-> (`codesign --force --deep --sign -`).
+> **Status: aspirational.** None of the signing or notarization described here
+> is implemented — no workflow in `.github/workflows/` signs anything.
+> `cargo xtask bundle-macos` skips signing entirely; assembled bundles only run
+> after ad-hoc local signing (`codesign --force --deep --sign -`). The one
+> section that describes shipped behaviour is
+> [Helper-flavor split](#helper-flavor-split-current-layout) and
+> [DMG production](#dmg-production).
 
 ## Why signing matters
 
@@ -28,8 +31,9 @@ CEF bundles must be signed inside-out:
 
 1. `Contents/Frameworks/Chromium Embedded Framework.framework/Versions/A/Libraries/*.dylib`
 2. `Contents/Frameworks/Chromium Embedded Framework.framework`
-3. `Contents/Frameworks/Buffr Helper.app` (and any
-   `Helper (GPU/Renderer/Plugin).app` once the multi-helper split lands)
+3. `Contents/Frameworks/Buffr Helper.app` plus the three flavored bundles —
+   `Buffr Helper (GPU).app`, `(Renderer).app`, `(Plugin).app` — which the
+   bundler already produces (see below)
 4. `Contents/MacOS/buffr` (the main bundle binary, signed last with the bundle
    plist)
 
@@ -51,7 +55,8 @@ files. At minimum:
   required for Chromium's V8.
 
 The Chromium upstream `cef/tests/cefclient/resources/mac/*.entitlements` files
-are the reference; we'll vendor adapted copies once Phase 6 lands.
+are the reference; adapted copies would be vendored when signing lands. None are
+in the tree today.
 
 ## Helper-flavor split (current layout)
 
@@ -72,10 +77,11 @@ bundle's `Contents/MacOS/Buffr Helper (Flavor)` is a `fs::copy` of the same
 
 cef-rs 147 only resolves a single `browser_subprocess_path`, so today every
 subprocess type is launched out of the unbranded `Buffr Helper.app`. The other
-three bundles are still shipped (~80 MiB extra) so future signing only needs
-per-flavor entitlements + a path-resolver hook — when cef-rs grows
-`on_browser_process_handler_path` (or equivalent) we point each subprocess at
-its branded helper, no bundle layout migration required.
+three bundles are still shipped (each a full copy of the helper binary, so the
+bundle grows accordingly) so future signing only needs per-flavor entitlements
+plus a path-resolver hook — when cef-rs grows `on_browser_process_handler_path`
+(or equivalent) we point each subprocess at its branded helper, no bundle layout
+migration required.
 
 ## DMG production
 
@@ -96,8 +102,8 @@ its branded helper, no bundle layout migration required.
 5. If neither tool is on `PATH` the staging tree is left in place and a clear
    warning is printed; nothing fails.
 
-The DMG is **unsigned** in this round. After download, first-run users must
-clear the quarantine xattr that Gatekeeper attaches to web-downloaded files:
+The DMG is **unsigned**. After download, first-run users must clear the
+quarantine xattr that Gatekeeper attaches to web-downloaded files:
 
 ```sh
 xattr -d com.apple.quarantine /Applications/Buffr.app
@@ -122,5 +128,6 @@ xcrun stapler staple target/release/Buffr.app
 ```
 
 CI integration (GitHub Actions secrets, ephemeral keychain via
-`security create-keychain`, etc.) will live in `.github/workflows/release.yml`
-once we cut the first signed nightly.
+`security create-keychain`, etc.) would go in `.github/workflows/ci.yml`, next
+to the existing `macos-package` and `publish-github-release` jobs — there is no
+separate `release.yml` in this repo.

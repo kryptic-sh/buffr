@@ -65,13 +65,17 @@ A single GET to a public REST endpoint. The request carries no PII:
 GitHub logs the request like any other API request (IP + timestamp). buffr does
 **not** receive that log; we do not run our own collector.
 
-## Dismissing a release
+## Dismissing a release — API only, not reachable yet
 
 `UpdateChecker::dismiss(version)` records a release in the cache as "ignored".
 Subsequent `check_cached`/`check_now` for the same version resolve to `UpToDate`
 instead of `Available`. Filtering happens at **read time**, not write time: the
-cache stays the source of truth for "what GitHub last reported". A future
-`--reset-update-dismissals` flag (TODO) will clear the dismiss list.
+cache stays the source of truth for "what GitHub last reported".
+
+> **Not user-facing.** Nothing outside `updates.rs` and its unit tests calls
+> `dismiss()` — there is no CLI flag and no chrome affordance for it, so a user
+> cannot currently dismiss a release. Both the dismiss entry point and a
+> `--reset-update-dismissals` flag to clear the list are outstanding work.
 
 ## Implementation
 

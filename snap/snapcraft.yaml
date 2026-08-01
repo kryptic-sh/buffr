@@ -44,9 +44,10 @@ platforms:
     build-on: [arm64]
     build-for: [arm64]
 
-# CI overrides nothing here — `parts.buffr.source` points at the staged
-# tarball (`snap/payload/`). Local snapcraft runs need the same staging:
-# `tar xzf buffr-*.tar.gz -C snap/payload --strip-components=1`.
+# CI overrides nothing here — `parts.buffr.source` is `payload`, which
+# snapcraft resolves relative to the PROJECT ROOT, not this directory.
+# Local snapcraft runs need the same staging, from the repo root:
+# `mkdir -p payload && tar xzf buffr-*.tar.gz -C payload --strip-components=1`.
 parts:
   buffr:
     plugin: dump

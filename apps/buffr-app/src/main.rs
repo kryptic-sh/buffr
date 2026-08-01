@@ -7619,11 +7619,17 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         None
                     };
                     // Default: ~/.local/share/buffr/engines/<id>/ (XDG_DATA_HOME).
-                    // CEF stores persistent profile state (cookies, localStorage,
-                    // IndexedDB, history) and ephemeral cache together under this
-                    // path — XDG spec says ~/.cache is "lost without warning"
-                    // (systemd-tmpfiles, tmpfs, cleanup tools), so persistent
-                    // profile state belongs in data_root.
+                    // Rooted in data_root, not cache_dir, because CEF stores
+                    // persistent profile state (cookies, localStorage, IndexedDB)
+                    // and ephemeral cache together — and the XDG spec says
+                    // ~/.cache may be "lost without warning" (systemd-tmpfiles,
+                    // tmpfs, cleanup tools).
+                    //
+                    // NOTE: the CEF backend currently DISCARDS this value — see
+                    // `BrowserHost::new_with_options` and kryptic-sh/buffr#158.
+                    // Every instance shares the process-global root_cache_path
+                    // (which is `paths.data`). Kept wired so per-engine
+                    // isolation is a one-line change once Alloy is replaced.
                     let data_dir_buf: Option<std::path::PathBuf> =
                         Some(match inst.data_dir.as_deref() {
                             Some(explicit) => std::path::PathBuf::from(explicit),

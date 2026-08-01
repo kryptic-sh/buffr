@@ -1,14 +1,13 @@
 # Multi-tab architecture
 
-Phase 3 (tab strip) and Phase 5 (tabs / session restore) share one design: the
-[`BrowserHost`](../crates/buffr-core/src/host.rs) is a manager owning a
-`Vec<Tab>` of CEF browsers. All tabs are parented to the **same** X11 window
-(the winit window the embedder constructed); only the active browser is visible.
-Switching tabs flips visibility and focus.
+[`BrowserHost`](../crates/buffr-cef/src/host.rs) is a manager owning a
+`Vec<Tab>` of CEF browsers. All tabs belong to the **same** window (the winit
+window the embedder constructed); only the active browser is visible. Switching
+tabs flips visibility and focus.
 
 ## Single `Client`, many `Browser`s
 
-`buffr-core::handlers::make_client` is called once per `open_tab`. Every client
+`buffr_cef::handlers::make_client` is called once per `open_tab`. Every client
 returned from that factory shares the same `Arc<History>`, `Arc<Downloads>`,
 `Arc<ZoomStore>`, plus the find / hint mailboxes. This means new visits,
 downloads, and zoom rows all funnel into one set of sinks — the chrome doesn't
@@ -33,14 +32,10 @@ The `was_resized` call exists because hidden browsers don't repaint, and when
 they come back the cached size may not match the current chrome geometry.
 Calling `was_resized` forces CEF's renderer to re-layout.
 
-### X11 stacking caveat
-
-`was_hidden(true)` is sufficient on XWayland and most X11 compositors — the
-embedded X window stops drawing and the now-active sibling becomes the visible
-top child. On window managers that aggressively cache sub-window stacking, an
-`XRaiseWindow` / `XConfigureWindow` follow-up might be needed; cef-rs 147
-doesn't expose that, so we lean on `was_hidden` + `was_resized` and document the
-gap rather than vendor xlib bindings.
+There is no native child-window stacking to manage: every tab renders off-screen
+(`windowless_rendering_enabled = 1`) and the app composites the active tab's
+buffer itself, so visibility is entirely a matter of which buffer gets drawn.
+See [`ui-stack.md`](./ui-stack.md).
 
 `set_focus(true)` is enough for keyboard input to route to the new tab — CEF
 dispatches synthesized focus events internally when the host's focus bit flips.
@@ -51,23 +46,29 @@ On startup `buffr` reads `~/.local/share/buffr/session.json` (resolved via
 `hjkl_config::data_dir` — XDG on every platform, `buffr-debug` in debug builds).
 When the file exists, the first entry navigates the initial tab; the rest open
 in the background. CLI `--new-tab <url>` URLs append after the session list.
-Each entry is `{ url, pinned }`; the schema is versioned so a future format bump
-can ignore stale files.
+Crash-loop detection quarantines the session file and skips restore entirely.
+
+Pinned and unpinned URLs live in **two flat string arrays**, not one array of
+objects. The runtime tab order is `pinned ++ tabs`, and `active` indexes into
+that combined list (`apps/buffr-app/src/session.rs`). The struct is
+`#[serde(deny_unknown_fields)]`, so a hand-written file with extra keys is
+rejected. The schema is versioned so a future format bump can ignore stale
+files.
 
 ```jsonc
 {
   "version": 1,
-  "tabs": [
-    { "url": "https://kryptic.sh", "pinned": false },
-    { "url": "https://example.com", "pinned": true },
-  ],
+  "pinned": ["https://example.com"],
+  "tabs": ["https://kryptic.sh"],
+  "active": 0,
 }
 ```
 
 `--no-restore` skips the read (homepage opens in a single tab) and still writes
 a fresh session on exit. `--list-session` prints the saved file's entries to
-stdout (`*\t<url>` for pinned, `\t<url>` otherwise) and exits without launching
-CEF. Schema version is printed on stderr for diagnostic clarity.
+stdout, one per line, as `<flag>\t<url>` where `<flag>` is `*` for pinned and a
+single space otherwise, then exits without launching CEF. Schema version is
+printed on stderr for diagnostic clarity.
 
 ### Fresh installs
 

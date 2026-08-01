@@ -1,15 +1,14 @@
 # buffr — Windows packaging (MSI)
 
-Phase 6 ships an MSI installer for Windows 10+. Like the Linux `.deb` / AppImage
-and the macOS `.dmg`, it is **unsigned** in this round; Authenticode signing
-lives in the post-Phase-6 release pipeline.
+An MSI installer for Windows 10+. Like the Linux packages and the macOS `.dmg`,
+it is **unsigned** — Authenticode signing is not implemented anywhere in CI.
 
 ## Driver
 
 ```sh
 cargo xtask package-windows-msi --release
 ls target/dist/windows/
-# buffr-<version>-x64.msi
+# buffr-<version>-<x64|arm64>.msi
 # buffr.wxs
 # payload/  (binaries + libcef.dll + paks + locales/)
 ```
@@ -86,8 +85,9 @@ the Microsoft C runtime; the `cef` crate's `libcef.lib` import library is
 MSVC-format. Cross-linking from MinGW (`x86_64-pc-windows-gnu`) against an MSVC
 `libcef.lib` is not officially supported and may fail at link time. The reliable
 path is a native Windows host with the Visual Studio Build Tools installed. The
-CI `windows-package` job uses the `windows-latest` GitHub-hosted runner (which
-has VS Build Tools preinstalled) for the same reason.
+CI `windows-package` job uses GitHub-hosted `windows-latest` and
+`windows-11-arm` runners (which have VS Build Tools preinstalled) for the same
+reason.
 
 ## Tooling fall-back
 
@@ -101,7 +101,9 @@ without a cross-build), `cargo xtask package-windows-msi` still writes the
 `buffr.wxs` source to `target/dist/windows/` for inspection — the MSI step is
 skipped with a clear message.
 
-## Authenticode signing (Phase 6 follow-up)
+## Authenticode signing — planned, not implemented
+
+No workflow signs the MSI today. The intended local command is:
 
 ```sh
 signtool sign /fd sha256 \
@@ -111,6 +113,7 @@ signtool sign /fd sha256 \
 
 Requires an EV or OV code-signing certificate provisioned on the build host.
 Without signing, SmartScreen will warn the user on first run; with EV signing
-reputation accrues immediately, OV reputation accrues over time. Detailed CI
-integration (Azure Key Vault, ephemeral keychain, etc.) lives alongside the
-macOS notarization steps in the eventual `.github/workflows/release.yml`.
+reputation accrues immediately, OV reputation accrues over time. CI integration
+(Azure Key Vault, ephemeral keychain, etc.) would land alongside the macOS
+notarization steps in `.github/workflows/ci.yml`, which is where release
+publishing already lives — there is no separate `release.yml`.

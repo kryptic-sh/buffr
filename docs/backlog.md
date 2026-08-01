@@ -121,6 +121,14 @@ slices.
 - `docs/ui-stack.md` still describes option A's softbuffer history in prose.
   Accurate as history, but worth a "superseded" marker now that the wgpu path is
   the only one.
+- **`[privacy] clear_on_exit` — `cache` and `local_storage` are no-ops.**
+  `run_clear_on_exit` in `apps/buffr-app/src/main.rs` resolves both against
+  `paths.cache` (`~/.cache/buffr`), but CEF's `root_cache_path` is `paths.data`
+  (`~/.local/share/buffr`), so the deletes hit a directory CEF never populated
+  and log `clear_on_exit: dir absent — skipping`. The other four categories
+  (`cookies`, `history`, `bookmarks`, `downloads`) work. One-line fix
+  (`paths.cache` → `paths.data`); documented as broken in `docs/config.md` and
+  `config.example.toml` until it lands.
 - The review's own `Summary` counts in `code-review.md` are frozen at the time
   of writing and no longer reflect what has been fixed; the `Status` section
   above them is the live view.

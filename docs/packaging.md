@@ -1,7 +1,7 @@
 # buffr — Packaging
 
-Phase 6 lands distribution artifacts for all three tier-1 targets, all unsigned
-in this round (signing infrastructure is the next step):
+Distribution artifacts for all three tier-1 targets. Everything below is
+**unsigned** — no signing step exists in any workflow yet:
 
 | Platform | Driver                            | Output                                             |
 | -------- | --------------------------------- | -------------------------------------------------- |
@@ -18,20 +18,24 @@ covers Linux end-to-end.
 
 ## Linux
 
-Phase 6 ships three Linux distribution paths, all producible from a single Linux
-dev box:
+`cargo xtask package-linux` ships four Linux distribution paths, all producible
+from a single Linux dev box:
 
-| Format   | Tooling               | Audience                          |
-| -------- | --------------------- | --------------------------------- |
-| AppImage | `appimagetool`        | Distro-agnostic single-file blob. |
-| `.deb`   | `dpkg-deb`            | Debian / Ubuntu / Mint.           |
-| PKGBUILD | `makepkg` (user-side) | Arch / Manjaro / EndeavourOS.     |
+| Format    | Tooling               | Audience                       |
+| --------- | --------------------- | ------------------------------ |
+| `.deb`    | `dpkg-deb`            | Debian / Ubuntu / Mint.        |
+| `.rpm`    | `rpmbuild`            | Fedora / RHEL / openSUSE.      |
+| `.tar.gz` | `tar`                 | Distro-agnostic portable tree. |
+| PKGBUILD  | `makepkg` (user-side) | Arch / Manjaro / EndeavourOS.  |
 
-None of these are **signed** in this round. Signing lives in the release
-pipeline (Phase 6, separate trust-store work). The artifacts here are
-installable but Gatekeeper-equivalent prompts will warn the user.
+Flatpak and Snap bundles are produced by CI, not by the xtask — see
+[Flatpak](#flatpak) and [Snap](#snap) below.
 
-## Building all three
+None of these are **signed**. Signing is separate trust-store work that has not
+landed; the artifacts here are installable but Gatekeeper-equivalent prompts
+will warn the user.
+
+## Building all four
 
 ```sh
 cd buffr
@@ -44,22 +48,28 @@ You'll get:
 
 ```
 target/dist/linux/
-├── buffr-0.0.1-x86_64.AppImage      # ~350 MiB squashfs
-└── buffr-0.0.1-amd64.deb            # ~330 MiB
+├── buffr-<version>-amd64.deb
+├── buffr-<version>-x86_64.rpm
+└── buffr-<version>-x86_64.tar.gz
 ```
 
+`<version>` is `[workspace.package] version` from the root `Cargo.toml`, stamped
+in by the xtask.
+
 The PKGBUILD is written to `pkg/aur/PKGBUILD` (in-tree, not under `target/`) —
-its version field is rewritten to match `[workspace.package] version` on every
-run.
+its `pkgver` field is rewritten to match the workspace version on every run.
 
 ### Variant flags
 
 ```sh
-cargo xtask package-linux --variant appimage
 cargo xtask package-linux --variant deb
+cargo xtask package-linux --variant rpm
+cargo xtask package-linux --variant tarball   # `tar` is accepted too
 cargo xtask package-linux --variant aur
-cargo xtask package-linux --variant all      # default
+cargo xtask package-linux --variant all       # default
 ```
+
+Anything else is rejected by `LinuxVariant::parse` in `xtask/src/main.rs`.
 
 Add `--release` to use the release-profile binaries; without it the debug
 binaries land in the package (slow, large, useful for smoke testing the bundle
@@ -67,52 +77,11 @@ scripts).
 
 ### Tooling fall-back
 
-`appimagetool` and `dpkg-deb` are auto-detected:
-
-1. **`appimagetool`** — checked on `$PATH` first; falls back to
-   `vendor/appimagetool/appimagetool-x86_64.AppImage`; if neither exists,
-   downloaded from the upstream `continuous` release. The download is cached in
-   `vendor/appimagetool/` and CI keys an `actions/cache@v4` entry off it. If the
-   tool can't be obtained at all (no internet), the `buffr.AppDir` staging
-   directory is left in place under `target/<profile>/` and a warning is
-   printed.
-2. **`dpkg-deb`** — checked on `$PATH`. If absent (Arch / Fedora hosts without
-   the `dpkg` package), the staging tree at `target/<profile>/buffr-deb/` is
-   left in place and a warning is printed. The `.deb` itself is not produced.
-
-## AppImage
-
-```sh
-chmod +x target/dist/linux/buffr-*-x86_64.AppImage
-./target/dist/linux/buffr-*-x86_64.AppImage
-```
-
-The AppImage embeds:
-
-- `usr/bin/buffr` (supervisor) + `usr/bin/buffr-app` (browser) +
-  `usr/bin/buffr-helper`
-- `usr/lib/libcef.so` + `*.pak` + `icudtl.dat` + `v8_context_snapshot.bin`
-- `usr/lib/locales/<lang>.pak`
-- `AppRun` launcher (sets `LD_LIBRARY_PATH` and execs `usr/bin/buffr`)
-- `buffr.desktop` + `buffr.png` (placeholder icon)
-
-### Glibc requirement
-
-The bundled CEF expects **glibc >= 2.28**. Distros older than the following will
-fail at load time with `version 'GLIBC_2.28' not found`:
-
-- Ubuntu 18.04 (glibc 2.27) — **not supported**
-- Ubuntu 20.04+ — supported
-- Debian 10 (Buster, glibc 2.28) — supported
-- Debian 11+ — supported
-- RHEL 8+ — supported
-
-### Fuse / `--appimage-extract`
-
-If the host doesn't have `libfuse2` installed, AppImages fail with
-`/dev/fuse: Permission denied`. Workaround:
-`./buffr-*.AppImage --appimage-extract` produces a `squashfs-root/` directory
-you can run `./squashfs-root/AppRun` out of.
+`dpkg-deb` is checked on `$PATH`. If absent (Arch / Fedora hosts without the
+`dpkg` package), the staging tree at `target/<profile>/buffr-deb/` is left in
+place and a warning is printed; the `.deb` itself is not produced. `rpmbuild` is
+checked the same way — `xtask: rpmbuild not on PATH; skipping rpm build` — and
+the tarball leg shells out to `tar`. A missing tool never fails the run.
 
 ## `.deb`
 
@@ -202,7 +171,7 @@ rust cargo cmake
 Plus the runtime depends:
 
 ```
-gtk3 nss libxss alsa-lib libgbm libxshmfence libxkbcommon
+gtk3 nss libxss alsa-lib mesa libxshmfence libxkbcommon
 libxkbcommon-x11 libglvnd
 ```
 
@@ -210,35 +179,41 @@ libxkbcommon-x11 libglvnd
 
 ## Sandbox caveat
 
-CEF on Linux uses a SUID sandbox helper by default. Both the AppImage and the
-`.deb` ship the unprivileged binary; CEF will fall back to the **namespace
-sandbox** if the kernel supports `unprivileged_userns_clone` (default on every
-distro since 2018). On hosts where that's been turned off (some hardened-kernel
-distros, or `sysctl kernel.unprivileged_userns_clone=0`), buffr will warn and
-continue without sandboxing. To re-enable, the sysadmin needs to flip the sysctl
-or the package needs to ship a SUID helper at `/opt/buffr/chrome-sandbox` —
-Phase 6+ work.
+CEF on Linux uses a SUID sandbox helper by default. Every Linux package here
+ships the unprivileged binary and **no** `chrome-sandbox` helper; CEF falls back
+to the **namespace sandbox** when the kernel allows unprivileged user
+namespaces. On hosts where that has been turned off (some hardened-kernel
+distros), buffr will warn and continue without sandboxing. Re-enabling means
+either flipping the sysctl or shipping a SUID helper at
+`/opt/buffr/chrome-sandbox` — the latter is not implemented.
 
 ## Icon — placeholder
 
 `pkg/buffr.png` is a 512×512 placeholder generated with ImageMagick (`#7aa2f7`
 lowercase "b" on `#1a1a1a`). The real icon will live at the same path; the
-AppImage / `.deb` / PKGBUILD all point at it. Replacing the file and re-running
-`cargo xtask package-linux` is enough to ship a new icon.
+`.deb`, `.rpm`, tarball, PKGBUILD, and the flatpak job all point at it.
+Replacing the file and re-running `cargo xtask package-linux` is enough to ship
+a new icon.
 
 ## CI
 
 The `linux-package` job in `.github/workflows/ci.yml` runs the full
-`cargo xtask package-linux --release --variant all` pipeline on every PR. It:
+`cargo xtask package-linux --release --variant all` pipeline. It is **skipped on
+pull requests** (`if: github.event_name != 'pull_request'`) and runs on pushes
+to `main`, on `v*` tags, and on `workflow_dispatch`. The same gate applies to
+`macos-package`, `windows-package`, `flatpak`, and `snap`. It:
 
-- caches the CEF binary distribution (~480 MiB extracted),
-- caches the downloaded `appimagetool` binary,
-- runs `dpkg-deb -I` against the produced `.deb` to assert valid metadata,
-- asserts the AppImage is an executable ELF (it's an `AppImage` magic squashfs
-  ELF, so `file` recognises ELF).
+- caches the CEF binary distribution,
+- runs `dpkg-deb -I` against the produced `.deb` and `rpm -qpi` against the
+  `.rpm` to assert valid metadata,
+- validates the tarball and smoke-tests the extracted binaries,
+- uploads the `.deb` / `.rpm` / `.tar.gz` plus `.sha256` sidecars as workflow
+  artifacts (`if-no-files-found: error`).
 
-No artifacts are uploaded — the Phase 6 release pipeline replaces this with
-proper artifact retention.
+Release publishing lives in the same workflow, not a separate one: on a `v*`
+tag, `publish-github-release` gathers every packaging job's artifacts and
+attaches them to the GitHub release, then `aur-bin`, `brew-tap`, and
+`scoop-bucket` push the downstream manifests.
 
 ## macOS
 
@@ -261,29 +236,33 @@ xattr -d com.apple.quarantine /Applications/Buffr.app
 ```
 
 The CI `macos-package` job runs the full pipeline on a `macos-latest` runner and
-uploads the DMG as a build artifact. Signing + notarization land in the eventual
-`release.yml` workflow.
+uploads the DMG as a build artifact. Signing + notarization are **not
+implemented** anywhere in CI yet; see [`macos-signing.md`](./macos-signing.md)
+for the plan.
 
 ## Windows
 
 `cargo xtask package-windows-msi --release` produces
-`target/dist/windows/buffr-<ver>-x64.msi` from a hand-rolled WiX 3 source
-(`xtask/templates/buffr.wxs`). Full layout, registry directives, uninstall
-behaviour, and cross-build prerequisites are documented in
+`target/dist/windows/buffr-<ver>-<x64|arm64>.msi` from a hand-rolled WiX 3
+source (`xtask/templates/buffr.wxs`). Full layout, registry directives,
+uninstall behaviour, and cross-build prerequisites are documented in
 [`windows-packaging.md`](./windows-packaging.md).
 
-Unsigned in this round. SmartScreen will warn the user on first run until
-Authenticode signing lands.
+Unsigned. SmartScreen will warn the user on first run until Authenticode signing
+lands.
 
-The CI `windows-package` job runs the full pipeline on a `windows-latest` runner
-with the WiX 3 toolset installed and uploads the MSI as a build artifact.
+The CI `windows-package` job runs the full pipeline over a two-entry matrix —
+`windows-latest` / `x86_64-pc-windows-msvc` and `windows-11-arm` /
+`aarch64-pc-windows-msvc` — with the WiX 3 toolset installed, and uploads a
+`.msi` plus a `.zip` per arch as build artifacts.
 
 ## Flatpak
 
 `flatpak/sh.kryptic.buffr.yml` builds a single-file `.flatpak` bundle from the
 runtime tarball emitted by `cargo xtask package-linux --variant tarball`. CI
-extracts the tarball into `flatpak/payload/`, invokes `flatpak-builder`, and
-uploads `buffr-<ver>-<arch>.flatpak` to the GitHub release. Users install with:
+extracts the tarball into `flatpak/payload/` (the manifest's module is
+`type: dir, path: payload`), invokes `flatpak-builder`, and attaches
+`buffr-<ver>-<arch>.flatpak` to the GitHub release. Users install with:
 
 ```sh
 flatpak install --user ./buffr-<ver>-amd64.flatpak
@@ -315,19 +294,22 @@ Flathub submission. Phase 2 work, deferred:
 
 Long-term, we'd like to swap to `org.freedesktop.Platform//24.08` and route all
 native dialogs through `xdg-desktop-portal` so the flatpak base doesn't identify
-us as a GNOME app. CEF supports portal-based file pickers via the
-`--enable-features=DesktopPortalFileChooser` switch (set in
-`crates/buffr-core/src/app.rs`'s command-line setup); the printing and color
-picker paths still need investigation. Tracked separately because it affects the
-.deb and .rpm runtime deps too — if we patch CEF / disable GTK fallbacks, the
-deb's `libgtk-3-0` Depends and the rpm's `gtk3` Requires can drop.
+us as a GNOME app. CEF supports portal-based file pickers via an
+`--enable-features=DesktopPortalFileChooser` switch, which buffr does **not**
+currently pass — the command-line hook is
+`crates/buffr-cef/src/app.rs::on_before_command_line_processing` and the switch
+is absent from it. The printing and colour-picker paths still need
+investigation. Tracked separately because it affects the .deb and .rpm runtime
+deps too — if we patch CEF / disable GTK fallbacks, the deb's `libgtk-3-0`
+Depends and the rpm's `gtk3` Requires can drop.
 
 ## Snap
 
 `snap/snapcraft.yaml` builds a `.snap` bundle from the same runtime tarball the
-flatpak job uses. CI extracts the tarball into `snap/payload/` and runs
-`snapcore/action-build@v1`, which boots an LXD VM, runs snapcraft, and emits
-`buffr-<ver>-<arch>.snap`. Users install with:
+flatpak job uses. CI extracts the tarball into `payload/` at the **repo root**
+(snapcraft resolves `source: payload` relative to the project root, not the
+`snap/` directory) and runs `snapcore/action-build@v1`, which boots an LXD VM,
+runs snapcraft, and emits `buffr-<ver>-<arch>.snap`. Users install with:
 
 ```sh
 snap install --dangerous --classic ./buffr-<ver>-amd64.snap

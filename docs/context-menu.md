@@ -20,14 +20,17 @@ dispatcher.
 
 When multiple flags apply to a click target, the highest-priority bucket wins:
 
-| Priority | Bucket    | Trigger condition                              |
-| -------- | --------- | ---------------------------------------------- |
-| 1        | Editable  | `TYPEFLAG_EDITABLE` or `is_editable`           |
-| 2        | Link      | `TYPEFLAG_LINK` or a non-empty `link_url`      |
-| 3        | Image     | `TYPEFLAG_MEDIA` + `MEDIATYPE_IMAGE`           |
-| 4        | Media     | `TYPEFLAG_MEDIA` + `MEDIATYPE_VIDEO/AUDIO`     |
-| 5        | Selection | `TYPEFLAG_SELECTION` (and not Editable)        |
-| 6        | Page      | Fallback — always shown when no bucket matches |
+| Priority | Bucket    | Trigger condition                                               |
+| -------- | --------- | --------------------------------------------------------------- |
+| 1        | Editable  | `TYPEFLAG_EDITABLE` or `is_editable`                            |
+| 2        | Link      | `TYPEFLAG_LINK` or a non-empty `link_url`                       |
+| 3        | Image     | `TYPEFLAG_MEDIA` + `MEDIATYPE_IMAGE`                            |
+| 4        | Media     | `TYPEFLAG_MEDIA` + `MEDIATYPE_VIDEO/AUDIO`                      |
+| 5        | Selection | `TYPEFLAG_SELECTION` or a non-empty selection, and not Editable |
+| 6        | Page      | Fallback — always shown when no bucket matches                  |
+
+Right-clicks on the tab strip do not go through this table at all; they build a
+separate model — see [Tab strip](#tab-strip) below.
 
 ## Per-bucket items
 
@@ -119,6 +122,28 @@ ops are dispatched as CEF frame edit commands to the focused frame.
 | `SelectAll`        | Select All          | `cef_frame_t` edit command.           |
 | `Undo`             | Undo                | `cef_frame_t` edit command.           |
 | `Redo`             | Redo                | `cef_frame_t` edit command.           |
+
+### Tab strip
+
+Right-clicking an entry in the tab strip builds its own model via
+`build_tab_model(tab_count, tab_index, pinned)` in
+`crates/buffr-core/src/context_menu.rs` — it does not consult the page hit-test
+buckets above.
+
+| Variant           | Label                   |
+| ----------------- | ----------------------- |
+| `TabReload`       | Reload Tab              |
+| `TabDuplicate`    | Duplicate Tab           |
+| `TabPin`          | Pin Tab / Unpin Tab     |
+| `TabCopyUrl`      | Copy Tab URL            |
+| `TabClose`        | Close Tab               |
+| `TabCloseOthers`  | Close Other Tabs        |
+| `TabCloseToRight` | Close Tabs to the Right |
+
+`TabPin`'s label flips on the tab's current pinned bit. `TabCloseOthers` is
+enabled only when `tab_count > 1` and `TabCloseToRight` only when
+`tab_index + 1 < tab_count`; otherwise they render dimmed and cannot be
+activated.
 
 ## `buffr-src:` URL prefix
 
