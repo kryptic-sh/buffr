@@ -89,7 +89,7 @@ pub use osr::{OsrFrame, OsrViewState, PopupFrameMap, SharedOsrFrame, SharedOsrVi
 // imports keep resolving without modification.
 pub use buffr_engine::{
     PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue,
-    drain_popup_closes, drain_popup_creates, drain_popup_urls, new_pending_popup_alloc,
+    drain_popup_closes, drain_popup_creates, drain_popup_targets, new_pending_popup_alloc,
     new_popup_close_sink, new_popup_create_sink, new_popup_queue,
 };
 pub use permissions::{

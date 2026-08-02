@@ -157,7 +157,7 @@ use buffr_engine::{
 };
 use buffr_engine::{
     PopupCloseSink, PopupCreateSink, SharedOsrFrame, SharedOsrViewState, drain_popup_closes,
-    drain_popup_creates, drain_popup_urls,
+    drain_popup_creates, drain_popup_targets,
 };
 use buffr_engine::{
     PromptOutcome, peek_permission_front, permissions_queue_len, pop_permission_front,
@@ -3538,6 +3538,11 @@ impl AppState {
             // asked for was never the one they landed on.
             let cli_tabs = std::mem::take(&mut self.pending_new_tabs);
             let mut claim_initial_tab = has_initial_tab && !session_claimed_initial_tab;
+            // `buffr <url>` is an explicit "show me this". The first CLI URL
+            // ends up active either way: it takes over the unused homepage
+            // tab when there is one, and is selected after opening when a
+            // restored session already owns tab 0.
+            let mut focus_first_cli_tab = !claim_initial_tab;
             for url in cli_tabs {
                 if claim_initial_tab {
                     claim_initial_tab = false;
@@ -3551,9 +3556,14 @@ impl AppState {
                     continue;
                 }
                 match self.routed_open_tab_background(&url) {
-                    Ok(_) => {
+                    Ok(id) => {
                         if let Some(last) = host.tabs_summary().last() {
                             prefill_queue.push((last.browser_id, url.clone()));
+                        }
+                        if focus_first_cli_tab {
+                            focus_first_cli_tab = false;
+                            host.select_tab(id);
+                            self.on_tab_switch();
                         }
                     }
                     Err(err) => warn!(error = %err, %url, "new-tab: open_tab failed"),
@@ -8993,9 +9003,24 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // each as a tab. Popup-window dispositions (OAuth, etc) are not
         // queued — CEF handles those natively.
         if let Some(engine) = self.active_engine_dyn() {
-            for url in drain_popup_urls(&engine.popup_queue()) {
-                if let Err(err) = engine.open_tab(&url) {
-                    warn!(error = %err, %url, "popup -> open_tab failed");
+            for target in drain_popup_targets(&engine.popup_queue()) {
+                let url = target.url;
+                // Ctrl/Cmd+click and middle-click queue reading for later and
+                // must not move the user; `target="_blank"` and `window.open`
+                // are "take me there". Both used to call open_tab, so every
+                // Ctrl+click yanked the user off the page they were reading.
+                let result = if target.focus.is_foreground() {
+                    engine.open_tab(&url)
+                } else {
+                    engine.open_tab_background(&url)
+                };
+                if let Err(err) = result {
+                    warn!(
+                        error = %err,
+                        %url,
+                        foreground = target.focus.is_foreground(),
+                        "popup -> open_tab failed"
+                    );
                 }
             }
         }

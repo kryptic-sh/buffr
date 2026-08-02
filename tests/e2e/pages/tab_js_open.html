@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>window.open</title>
+<script src="e2e.js"></script>
+<style>body{font:16px sans-serif;padding:20px}
+ button{display:block;width:320px;height:50px;font-size:16px;margin:12px 0}</style>
+<h1>window.open from a button</h1>
+<!-- A JS-opened tab is a deliberate navigation the user triggered, so it
+     focuses like target=_blank. Called straight from the click handler so
+     it keeps the user gesture and is not treated as a blocked popup. -->
+<button id="opener">open a tab via JS (should focus)</button>
+<script>
+document.getElementById('opener').addEventListener('click', function () {
+  window.open('plain.html', '_blank');
+});
+</script>

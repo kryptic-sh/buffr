@@ -78,6 +78,7 @@ use crate::osr::{
 };
 use crate::{PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
 use buffr_core::open_finder::{OsSpawn, open_path};
+use buffr_engine::popup::{PopupFocus, PopupTarget};
 
 // ── Console-message logging policy (L34) ────────────────────────────────────
 
@@ -253,15 +254,27 @@ wrap_life_span_handler! {
             // postMessage parent ref) — let CEF handle them via OSR
             // in a new buffr window.
             let raw = target_disposition.get_raw();
-            let is_tab = raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw()
-                || raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw();
-            if is_tab {
+            // Carry the disposition through the queue. It is the only thing
+            // distinguishing a Ctrl+click (background — the user is queueing
+            // reading and expects to stay put) from a `target="_blank"` click
+            // or `window.open` (foreground — the user asked to go there).
+            let focus = if raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw() {
+                Some(PopupFocus::Foreground)
+            } else if raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw() {
+                Some(PopupFocus::Background)
+            } else {
+                None
+            };
+            if let Some(focus) = focus {
                 if let Some(url) = target_url {
                     let url_str = url.to_string();
                     if !url_str.is_empty()
                         && let Ok(mut guard) = self.popup_queue.lock()
                     {
-                        guard.push_back(url_str);
+                        guard.push_back(PopupTarget {
+                            url: url_str,
+                            focus,
+                        });
                     }
                 }
                 // Cancel — main loop will open the URL as a tab.
@@ -411,18 +424,29 @@ wrap_request_handler! {
             // Ctrl+click / middle-click come through here (Chromium does
             // not route them through on_before_popup). Re-route the
             // new-tab dispositions to our tab queue and cancel.
+            //
+            // This is the path that made Ctrl+click steal focus: the
+            // disposition Chromium worked out — BACKGROUND for Ctrl/Cmd and
+            // middle-click, FOREGROUND for Ctrl+Shift — was read only to
+            // decide whether to re-route, then dropped, so every tab opened
+            // in the foreground.
             let raw = target_disposition.get_raw();
-            let is_tab = raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw()
-                || raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw();
-            if !is_tab {
+            let focus = if raw == WindowOpenDisposition::NEW_FOREGROUND_TAB.get_raw() {
+                PopupFocus::Foreground
+            } else if raw == WindowOpenDisposition::NEW_BACKGROUND_TAB.get_raw() {
+                PopupFocus::Background
+            } else {
                 return 0;
-            }
+            };
             if let Some(url) = target_url {
                 let url_str = url.to_string();
                 if !url_str.is_empty()
                     && let Ok(mut guard) = self.popup_queue.lock()
                 {
-                    guard.push_back(url_str);
+                    guard.push_back(PopupTarget {
+                        url: url_str,
+                        focus,
+                    });
                 }
             }
             1
