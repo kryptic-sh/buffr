@@ -17,6 +17,43 @@ Each of these has a real defect behind it, but two or more defensible
 resolutions. None was touched, so the current behaviour is whatever the table
 describes.
 
+### E1 — edit mode does not work inside iframes
+
+**Where:** `crates/buffr-cef/src/handlers.rs`, `on_load_end`;
+`crates/buffr-core/assets/edit.js`.
+
+Clicking a text field inside any `iframe` never enters Insert mode. Not a
+regression — `on_load_end` returns early for subframes and the comment there
+states the intent plainly: iframes and subframes never get the listener, or the
+nonce. That is what stops a third-party frame forging edit events for the top
+frame (notably `{"type":"selection"}`, which feeds yank-to-clipboard).
+
+The cost is real: embedded comment boxes, checkout and payment frames, search
+widgets and any cross-origin login form are unusable in Insert mode. The user
+sees "clicking this input does nothing".
+
+Reproduced by `tests/e2e/pages/iframe_same_origin.html` and
+`iframe_srcdoc.html`, both deliberately excluded from the e2e expectations until
+this is decided.
+
+The options, cheapest first:
+
+1. **Leave it.** Document the limitation. Iframe text entry stays broken.
+2. **Per-frame nonce.** Inject into every frame, each with its own nonce, and
+   have Rust track which frame a nonce belongs to. A frame can then forge only
+   events attributed to itself — so a hostile iframe can drive Insert mode for
+   its own fields (which it already controls) but cannot impersonate the top
+   frame or reach `selection`. Most work; closest to correct.
+3. **Same-origin subframes only.** Inject where the frame's origin matches the
+   top frame's. Cheap, and covers same-site embeds, but misses exactly the
+   cross-origin cases that matter most (payments, third-party login).
+4. **Main frame plus a `selection`-free nonce for subframes.** Subframes get a
+   nonce that Rust accepts for `focus`/`blur`/`mutate` but never for
+   `selection`. Narrower blast radius than 2, less bookkeeping.
+
+Whichever way this goes, the two iframe pages should move into the e2e
+expectations so the behaviour is pinned rather than assumed.
+
 | ID  | Where                                                    | The problem                                                                                                                                                                                           | The choice                                                                                                         |
 | --- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | H6  | `crates/buffr-cef/src/lib.rs`, `app.rs`                  | `no_sandbox: 1` plus a `--no-sandbox` switch disable the Chromium sandbox process-wide, so any renderer RCE is immediate code execution as the user.                                                  | Ship the setuid `chrome-sandbox` helper / rely on user namespaces, or gate it per-target.                          |
