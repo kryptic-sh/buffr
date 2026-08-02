@@ -5137,7 +5137,10 @@ impl AppState {
         let scale = popup.window.scale_factor() as f32;
         let (lwidth, lheight) = logical_chrome_dims(width, height, scale);
         let bar_h = STATUSLINE_HEIGHT;
-        let phys_bar_h = popup_bar_h_physical(scale);
+        // Single source of truth for the popup's CEF rect: the same helper
+        // feeds `popup_resize`, so the viewport CEF lays the page out for is
+        // the rect the quad is painted into (M35).
+        let osr_dst_rect = popup_cef_rect_pure(width, height, scale);
 
         // Same freshness gate as the main window's paint_chrome_with —
         // including stale-dim rejection via popup.view atomics.
@@ -5177,12 +5180,7 @@ impl AppState {
                 width: osr_w,
                 height: osr_h,
                 generation: osr_gen,
-                dst_rect: (
-                    0,
-                    phys_bar_h,
-                    width,
-                    height.saturating_sub(phys_bar_h).max(1),
-                ),
+                dst_rect: osr_dst_rect,
             };
             popup.renderer.frame(
                 chrome_dirty,
@@ -5205,12 +5203,7 @@ impl AppState {
                 width: cached_w,
                 height: cached_h,
                 generation: popup.last_osr_generation,
-                dst_rect: (
-                    0,
-                    phys_bar_h,
-                    width,
-                    height.saturating_sub(phys_bar_h).max(1),
-                ),
+                dst_rect: osr_dst_rect,
             };
             popup.renderer.frame(
                 chrome_dirty,

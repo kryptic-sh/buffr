@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use buffr_ui::{DOWNLOAD_NOTICE_HEIGHT, STATUSLINE_HEIGHT, TAB_STRIP_HEIGHT};
 
+use crate::chrome_paint::popup_bar_h_physical;
 use crate::{PRESENT_HISTORY_SIZE, PaintPolicy};
 
 // ---------------------------------------------------------------------------
@@ -387,6 +388,35 @@ pub(crate) fn cef_child_rect_pure(
     (0, cef_y, cef_w, cef_h)
 }
 
+/// Pure CEF page-rect computation for a **popup** window, in physical
+/// pixels.
+///
+/// A popup's chrome is one address-bar strip at the top and nothing else,
+/// so the page area is the window minus that strip. This is the popup's
+/// counterpart to [`cef_child_rect_pure`], and — like it — is the single
+/// source of truth for two things that must agree: the `dst_rect` the OSR
+/// quad is drawn into, and the viewport handed to `popup_resize` (which
+/// becomes CEF's `view_rect`).
+///
+/// They disagreed until M35: the resize call passed the FULL window height
+/// while the quad was painted one bar shorter, so CEF laid the page out for
+/// more rows than were displayed and the image was squashed — a vertical
+/// error that grows toward the bottom of the window, sending clicks near
+/// the bottom edge to the wrong element.
+///
+/// `full_w` / `full_h` are physical pixels; the returned rect is physical
+/// too. The bar height comes from [`popup_bar_h_physical`], the same helper
+/// the pointer offset uses, so there is only one rounding of it.
+///
+/// A window shorter than the bar yields a height of 1 rather than
+/// underflowing, matching the paint site's `saturating_sub(..).max(1)`.
+pub(crate) fn popup_cef_rect_pure(full_w: u32, full_h: u32, scale: f32) -> (u32, u32, u32, u32) {
+    let bar_h = popup_bar_h_physical(scale);
+    let cef_w = full_w.max(1);
+    let cef_h = full_h.saturating_sub(bar_h).max(1);
+    (0, bar_h, cef_w, cef_h)
+}
+
 /// Whether the SharedOsrFrame currently holds a freshly-painted CEF
 /// frame that the embedder has not yet consumed.
 ///
@@ -543,4 +573,68 @@ pub(crate) fn should_show_loading_anim(
         return true;
     };
     lw.abs_diff(browser_w) > OSR_DIM_TOLERANCE || lh.abs_diff(browser_h) > OSR_DIM_TOLERANCE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The OSR `dst_rect` the popup paint site draws its quad into,
+    /// spelled out independently of [`popup_cef_rect_pure`] so the two
+    /// can be compared. Mirrors `AppState::paint_popup_window`.
+    fn painted_quad_rect(full_w: u32, full_h: u32, scale: f32) -> (u32, u32, u32, u32) {
+        let phys_bar_h = popup_bar_h_physical(scale);
+        (
+            0,
+            phys_bar_h,
+            full_w,
+            full_h.saturating_sub(phys_bar_h).max(1),
+        )
+    }
+
+    /// Regression (M35): the viewport handed to `popup_resize` must be the
+    /// rect the quad is actually painted into. Before the fix the resize
+    /// path passed the full window height while the quad lost an address
+    /// bar, so CEF laid the page out taller than it was displayed.
+    #[test]
+    fn popup_viewport_matches_painted_quad_at_1x() {
+        let (w, h, scale) = (800u32, 600u32, 1.0f32);
+        assert_eq!(
+            popup_cef_rect_pure(w, h, scale),
+            painted_quad_rect(w, h, scale)
+        );
+    }
+
+    #[test]
+    fn popup_viewport_matches_painted_quad_at_2x() {
+        let (w, h) = (1600u32, 1200u32);
+        assert_eq!(popup_cef_rect_pure(w, h, 2.0), painted_quad_rect(w, h, 2.0));
+
+        // The strip is a logical constant, so its physical height doubles
+        // with the scale — and the viewport loses exactly that much.
+        let bar_1x = popup_cef_rect_pure(w, h, 1.0).1;
+        let bar_2x = popup_cef_rect_pure(w, h, 2.0).1;
+        assert_eq!(bar_2x, bar_1x * 2, "bar height must scale with the DPI");
+        assert_eq!(popup_cef_rect_pure(w, h, 2.0).3, h - bar_2x);
+    }
+
+    #[test]
+    fn popup_viewport_does_not_underflow_on_tiny_window() {
+        let bar = popup_bar_h_physical(1.0);
+        for h in [0, 1, bar / 2, bar, bar + 1] {
+            let (_, _, cef_w, cef_h) = popup_cef_rect_pure(0, h, 1.0);
+            assert!(cef_h >= 1, "height underflowed at full_h={h}: {cef_h}");
+            assert!(cef_w >= 1, "width underflowed at full_h={h}: {cef_w}");
+        }
+    }
+
+    #[test]
+    fn popup_viewport_origin_y_is_the_bar_height() {
+        for scale in [1.0f32, 1.5, 2.0] {
+            let (x, y, _, _) = popup_cef_rect_pure(1024, 768, scale);
+            assert_eq!(x, 0);
+            assert_eq!(y, popup_bar_h_physical(scale));
+            assert_eq!(y, painted_quad_rect(1024, 768, scale).1);
+        }
+    }
 }

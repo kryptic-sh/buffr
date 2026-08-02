@@ -10,6 +10,14 @@ and this project adheres to
 
 ### Fixed
 
+- Clicks in a popup window (OAuth flows, `window.open`) now land on the element
+  under the cursor. The popup told CEF a viewport as tall as the whole window
+  while the page image was painted into a rect one address-bar strip shorter, so
+  the page was squashed vertically and the error grew toward the bottom edge —
+  an "Authorize" button at the foot of the window received the click meant for a
+  different element. Both `popup_resize` call sites and the paint rect now go
+  through one helper, `popup_cef_rect_pure`, so the reported viewport and the
+  painted quad cannot drift apart again.
 - Answering a permission prompt can no longer grant camera, microphone,
   geolocation or any other capability to a site the prompt was not asking about.
   The prompt strip rendered the front of the permissions queue but remembered

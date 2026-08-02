@@ -1578,10 +1578,16 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     continue;
                 }
             };
-            // Initial OSR resize to match the window's actual physical size.
+            // Initial OSR resize to the popup's CEF page rect — the window
+            // minus its address-bar strip, not the full window (M35). The
+            // rect must be the one the quad is painted into, or CEF lays the
+            // page out for rows that are never displayed.
             let inner = popup_win.physical_size();
-            let pw = inner.width.max(1);
-            let ph = inner.height.max(1);
+            let (_, _, pw, ph) = popup_cef_rect_pure(
+                inner.width.max(1),
+                inner.height.max(1),
+                popup_win.scale_factor() as f32,
+            );
             if let Some(engine) = self.active_engine_dyn() {
                 engine.popup_resize(created.browser_id, pw, ph);
             }
@@ -1872,15 +1878,21 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             if let Some((w, h, at)) = pending
                 && Instant::now() >= at
             {
-                let browser_id = self.popups.get(&wid).map(|p| p.browser_id).unwrap_or(-1);
+                let (browser_id, pop_scale) = self
+                    .popups
+                    .get(&wid)
+                    .map(|p| (p.browser_id, p.window.scale_factor() as f32))
+                    .unwrap_or((-1, 1.0));
+                // Same rect the quad is painted into — see popup_cef_rect_pure.
+                let (_, _, cef_w, cef_h) = popup_cef_rect_pure(w, h, pop_scale);
                 if browser_id >= 0
                     && let Some(engine) = self.active_engine_dyn()
                 {
-                    engine.popup_resize(browser_id, w, h);
+                    engine.popup_resize(browser_id, cef_w, cef_h);
                     tracing::debug!(
                         browser_id,
-                        w,
-                        h,
+                        w = cef_w,
+                        h = cef_h,
                         "popup: pending Resized debounce elapsed -> popup_resize"
                     );
                 }
