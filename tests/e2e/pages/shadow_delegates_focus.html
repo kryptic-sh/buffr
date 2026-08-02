@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>delegatesFocus</title>
+<style>body{font:16px sans-serif;padding:20px}
+ deleg-field{display:block;width:300px;height:60px;border:1px solid #888}</style>
+<h1>delegatesFocus</h1>
+<!-- With delegatesFocus the HOST becomes document.activeElement while the
+     inner input holds the caret -- so activeElement alone is not enough. -->
+<deleg-field id="host"></deleg-field>
+<script>
+customElements.define('deleg-field', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: 'open', delegatesFocus: true });
+    r.innerHTML = '<style>input{display:block;width:280px;height:40px;'
+      + 'font-size:16px;margin:8px}</style>'
+      + '<input id="inner" type="text" placeholder="delegated">';
+  }
+});
+</script>

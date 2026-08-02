@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>label click</title>
+<style>body{font:16px sans-serif;padding:20px}
+ label{display:block;width:300px;height:50px;line-height:50px;border:1px solid #888;text-align:center}
+ input{display:block;width:300px;height:40px;font-size:16px;margin-top:12px}</style>
+<h1>click the label, not the input</h1>
+<!-- Label activation focuses the control, but the click target is the
+     label. Anything keying off the click target rather than the focus
+     target misses this. -->
+<label for="named">click this label</label>
+<input id="named" type="text" placeholder="focused via label">

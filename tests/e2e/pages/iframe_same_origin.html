@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>iframe same origin</title>
+<style>body{font:16px sans-serif;padding:20px}
+ iframe{width:340px;height:120px;border:1px solid #888}</style>
+<h1>same-origin iframe</h1>
+<!-- edit.js is injected on main frames only (nonce confinement), so the
+     child document has no listener at all. -->
+<iframe id="frame" src="iframe_child.html"></iframe>

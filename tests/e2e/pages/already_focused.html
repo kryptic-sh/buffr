@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>already focused</title>
+<style>body{font:16px sans-serif;padding:20px}
+ input{display:block;width:300px;height:40px;font-size:16px;margin:12px 0}</style>
+<h1>click a field that already has focus</h1>
+<!-- No focusin fires the second time. If Insert was left for any reason
+     other than a blur, the re-click cannot recover it. -->
+<input id="text" type="text" placeholder="click me twice">

@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dynamic input</title>
+<style>body{font:16px sans-serif;padding:20px}
+ #spawn{width:300px;height:50px;font-size:16px}
+ input{display:block;width:300px;height:40px;font-size:16px;margin-top:12px}</style>
+<h1>input created by the click handler</h1>
+<button id="spawn">add field</button>
+<div id="slot"></div>
+<script>
+document.getElementById('spawn').addEventListener('click', function () {
+  var i = document.createElement('input');
+  i.id = 'made'; i.type = 'text'; i.placeholder = 'created just now';
+  document.getElementById('slot').appendChild(i);
+  i.focus();
+});
+</script>

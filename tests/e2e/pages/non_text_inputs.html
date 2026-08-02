@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>non-text inputs</title>
+<style>body{font:16px sans-serif;padding:20px}
+ label{display:block;margin:10px 0;font-size:16px}
+ input{height:30px;font-size:16px}
+ input[type=range]{width:250px}</style>
+<h1>inputs that are not text fields</h1>
+<!-- INPUT covers far more than text. Entering Insert on any of these traps
+     the user: the keymap stops reaching Normal-mode bindings. -->
+<label><input id="check" type="checkbox"> checkbox</label>
+<label><input id="radio" type="radio" name="r"> radio</label>
+<label><input id="button" type="button" value="button"></label>
+<label><input id="range" type="range"></label>
+<label><input id="color" type="color"></label>
+<label><input id="file" type="file"></label>
+<label><input id="submit" type="submit" value="submit"></label>

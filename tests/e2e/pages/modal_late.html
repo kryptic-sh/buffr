@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>modal late focus</title>
+<style>body{font:16px sans-serif;padding:20px}
+ #open{width:300px;height:50px;font-size:16px}
+ dialog{border:1px solid #888;padding:16px}
+ dialog input{width:280px;height:40px;font-size:16px}</style>
+<h1>dialog focuses its input in rAF</h1>
+<button id="open">open search</button>
+<dialog id="dlg"><input id="q" type="text" placeholder="search"></dialog>
+<script>
+document.getElementById('open').addEventListener('click', function () {
+  var d = document.getElementById('dlg');
+  d.showModal();
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () { document.getElementById('q').focus(); });
+  });
+});
+</script>

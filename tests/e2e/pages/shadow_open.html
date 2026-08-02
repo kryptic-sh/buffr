@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shadow open</title>
+<style>body{font:16px sans-serif;padding:20px}</style>
+<h1>open shadow root</h1>
+<!-- focusin retargets to the HOST when it crosses a shadow boundary, so a
+     listener that reads ev.target sees <my-field>, not the inner input. -->
+<my-field id="host"></my-field>
+<script>
+customElements.define('my-field', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: 'open' });
+    r.innerHTML = '<style>input{display:block;width:300px;height:40px;'
+      + 'font-size:16px;margin:12px 0}</style>'
+      + '<input id="inner" type="text" placeholder="inside open shadow">';
+  }
+});
+</script>

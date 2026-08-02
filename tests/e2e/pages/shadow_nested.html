@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shadow nested</title>
+<style>body{font:16px sans-serif;padding:20px}</style>
+<h1>nested shadow roots</h1>
+<outer-box id="host"></outer-box>
+<script>
+customElements.define('inner-box', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: 'open' });
+    r.innerHTML = '<style>input{display:block;width:300px;height:40px;'
+      + 'font-size:16px;margin:12px 0}</style>'
+      + '<input id="inner" type="text" placeholder="two levels deep">';
+  }
+});
+customElements.define('outer-box', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: 'open' });
+    r.innerHTML = '<inner-box></inner-box>';
+  }
+});
+</script>

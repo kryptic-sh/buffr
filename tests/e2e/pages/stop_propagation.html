@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>swallowed focusin</title>
+<style>body{font:16px sans-serif;padding:20px}
+ input{display:block;width:300px;height:40px;font-size:16px;margin:12px 0}</style>
+<h1>page swallows focusin at window capture</h1>
+<!-- A document-level capture listener runs AFTER a window-level one, so a
+     page that stops propagation on window capture hides the event from a
+     document listener entirely. -->
+<input id="text" type="text" placeholder="focusin is swallowed">
+<script>
+window.addEventListener('focusin', function (e) { e.stopPropagation(); }, true);
+</script>

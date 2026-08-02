@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rich contenteditable</title>
+<style>body{font:16px sans-serif;padding:20px}
+ #editor{width:400px;min-height:120px;border:1px solid #888;padding:8px}
+ #editor p{margin:6px 0}</style>
+<h1>click a child of the editable root</h1>
+<!-- The click lands on the <b>, focus lands on #editor. isContentEditable
+     is true for both, but the field identity must be the editing host. -->
+<div id="editor" contenteditable="true">
+  <p>plain paragraph</p>
+  <p><b id="bold">bold run inside the editor</b></p>
+</div>

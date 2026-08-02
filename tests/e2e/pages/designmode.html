@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>designMode</title>
+<style>body{font:16px sans-serif;padding:20px}
+ #para{width:400px;min-height:80px;border:1px solid #888;padding:8px}</style>
+<h1>document.designMode</h1>
+<!-- The whole document is editable; no element carries contenteditable,
+     and document.activeElement stays <body>. -->
+<div id="para">the entire document is editable here</div>
+<script>document.designMode = 'on';</script>

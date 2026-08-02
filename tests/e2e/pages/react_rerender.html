@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>node replaced on click</title>
+<style>body{font:16px sans-serif;padding:20px}
+ input{display:block;width:300px;height:40px;font-size:16px;margin:12px 0}</style>
+<h1>input node replaced during the click</h1>
+<!-- What a keyed re-render does: the clicked node is detached and an
+     identical one is inserted, then focused. The buffr field id minted for
+     the old node now points at a detached element. -->
+<div id="host"><input id="text" type="text" placeholder="v1"></div>
+<script>
+document.getElementById('host').addEventListener('mousedown', function () {
+  setTimeout(function () {
+    var host = document.getElementById('host');
+    var fresh = document.createElement('input');
+    fresh.id = 'text'; fresh.type = 'text'; fresh.placeholder = 'v2';
+    host.replaceChildren(fresh);
+    fresh.focus();
+  }, 30);
+}, true);
+</script>

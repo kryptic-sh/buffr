@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shadow closed</title>
+<style>body{font:16px sans-serif;padding:20px}</style>
+<h1>closed shadow root</h1>
+<!-- mode:'closed' means element.shadowRoot is null, so a walker that
+     recurses through .shadowRoot cannot find the input at all. -->
+<my-closed id="host"></my-closed>
+<script>
+customElements.define('my-closed', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: 'closed' });
+    r.innerHTML = '<style>input{display:block;width:300px;height:40px;'
+      + 'font-size:16px;margin:12px 0}</style>'
+      + '<input id="inner" type="text" placeholder="inside closed shadow">';
+    window.__closedRoot = r;   // test hook only
+  }
+});
+</script>
