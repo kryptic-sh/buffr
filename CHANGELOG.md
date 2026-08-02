@@ -8,6 +8,11 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-08-03
+
+Five correctness fixes from the 2026-08-02 review pass, two of them
+high-severity. Every one is reproducible on 0.14.8.
+
 ### Fixed
 
 - Clicks in a popup window (OAuth flows, `window.open`) now land on the element
@@ -53,6 +58,8 @@ and this project adheres to
   fired while browsing and never in Insert mode. Insert mode forwards every key
   to the page by design, so it has no bindings; move the entry to
   `[keymap.normal]` and use `<Esc>` to leave Insert.
+
+[0.14.9]: https://github.com/kryptic-sh/buffr/releases/tag/v0.14.9
 
 ## [0.14.8] - 2026-08-02
 
@@ -2052,7 +2059,7 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.8...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.9...HEAD
 [0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
