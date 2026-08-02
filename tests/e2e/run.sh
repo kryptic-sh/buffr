@@ -27,7 +27,8 @@ VERDICT="$WORK/verdict"
 
 export XDG_RUNTIME_DIR="$WORK/xdg"; mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
 export WLR_BACKENDS=headless
-export WLR_LIBINPUT_NO_DEVICES=1
+# no WLR_LIBINPUT_NO_DEVICES: it suppresses the seat pointer capability,
+# and a client that never sees wl_pointer cannot receive synthetic clicks
 export WLR_RENDERER=pixman          # software rendering: no GPU on CI
 export LIBGL_ALWAYS_SOFTWARE=1
 
@@ -36,22 +37,12 @@ cat > "$WORK/inner.sh" <<INNER
 # Runs inside the sway session, so WAYLAND_DISPLAY is set for buffr.
 export XDG_SESSION_TYPE=wayland
 export BUFFR_DISABLE_ZYGOTE=1
-export RUST_LOG=info,buffr_core=debug
+export RUST_LOG=info,buffr_core=debug,buffr_app=debug,buffr=debug
 export BUFFR_LOG_CONSOLE=1
 cd "$REPO"
 
 "$BIN" --private "file://$PAGE_PATH" > "$LOG" 2>&1 &
 APP=\$!
-
-# The page opens as a background tab (positional URLs always do), so
-# switch to it with a real keypress before doing anything else.
-for i in \$(seq 1 120); do
-  grep -q 'tab opened' "$LOG" && break
-  sleep 0.25
-done
-sleep 2
-(/usr/bin/wtype gt && echo "WTYPE-OK" >> "$LOG") || echo "WTYPE-FAIL $?" >> "$LOG"
-sleep 1
 
 # Wait for the page to load and report its geometry.
 for i in \$(seq 1 200); do

@@ -3464,6 +3464,10 @@ impl AppState {
             // blink-cdp starts with zero tabs, so the first restored URL must
             // be opened, not navigated. Detect by querying tab_count().
             let has_initial_tab = host.tab_count() > 0;
+            // When the session restored nothing, the auto-created homepage
+            // tab is still sitting there unused, and the first CLI URL
+            // should take it over (see the `cli_tabs` loop below).
+            let session_claimed_initial_tab = !session.is_empty();
             for (i, (url, pinned)) in session.iter().enumerate() {
                 if i == 0 && has_initial_tab {
                     // CEF path: navigate the auto-created tab in place so we
@@ -3524,9 +3528,28 @@ impl AppState {
                     self.on_tab_switch();
                 }
             }
-            // CLI `--new-tab` URLs append after the session.
+            // CLI URLs append after the session.
+            //
+            // The first one navigates the auto-created homepage tab when the
+            // session restored nothing, exactly as the session's own first
+            // entry does above. Opening it in the background instead left
+            // `buffr https://example.com` sitting on a blank `buffr://new`
+            // with the requested page hidden behind it — the URL the user
+            // asked for was never the one they landed on.
             let cli_tabs = std::mem::take(&mut self.pending_new_tabs);
+            let mut claim_initial_tab = has_initial_tab && !session_claimed_initial_tab;
             for url in cli_tabs {
+                if claim_initial_tab {
+                    claim_initial_tab = false;
+                    if let Err(err) = host.navigate(&url) {
+                        warn!(error = %err, %url, "cli-url: navigate first tab failed");
+                        continue;
+                    }
+                    if let Some(active) = host.active_tab() {
+                        prefill_queue.push((active.browser_id, url.clone()));
+                    }
+                    continue;
+                }
                 match self.routed_open_tab_background(&url) {
                     Ok(_) => {
                         if let Some(last) = host.tabs_summary().last() {
