@@ -9,10 +9,10 @@
 <button id="spawn">add field</button>
 <div id="slot"></div>
 <script>
-document.getElementById('spawn').addEventListener('click', function () {
+window.__e2eTrigger = function () {
   var i = document.createElement('input');
   i.id = 'made'; i.type = 'text'; i.placeholder = 'created just now';
   document.getElementById('slot').appendChild(i);
   i.focus();
-});
+};
 </script>

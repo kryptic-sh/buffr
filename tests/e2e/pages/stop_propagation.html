@@ -8,7 +8,7 @@
 <!-- A document-level capture listener runs AFTER a window-level one, so a
      page that stops propagation on window capture hides the event from a
      document listener entirely. -->
-<input id="text" type="text" placeholder="focusin is swallowed">
+<input id="text" type="text" placeholder="focusin is swallowed" data-e2e-target>
 <script>
 window.addEventListener('focusin', function (e) { e.stopPropagation(); }, true);
 </script>

@@ -17,6 +17,38 @@ Each of these has a real defect behind it, but two or more defensible
 resolutions. None was touched, so the current behaviour is whatever the table
 describes.
 
+### E2 — closed shadow roots are invisible to edit mode
+
+**Where:** `crates/buffr-core/assets/edit.js` (`deepTarget`);
+`crates/buffr-cef/src/handlers.rs`, `on_load_end`.
+
+Focusing a text field inside `attachShadow({mode: 'closed'})` does not enter
+Insert mode. Open, nested and `delegatesFocus` roots all work — `focusin`
+retargets to the host and `composedPath()[0]` recovers the real node — but a
+closed root is opaque by design: `composedPath()` stops at the host and
+`element.shadowRoot` is `null` from outside. Chromium's own autofill has the
+same blind spot.
+
+Covered by `tests/e2e/pages/shadow_closed.html`, which currently asserts
+`normal` so the gap is pinned rather than silently tolerated. Flip the
+expectation to `insert` when this is fixed.
+
+The only real fix is to record roots as they are created, which needs a
+script running at **document start**, before the page's own scripts:
+
+1. **Renderer-process handler.** Implement `CefRenderProcessHandler` in
+   `buffr-helper` and hook `OnContextCreated` to patch
+   `Element.prototype.attachShadow`, keeping a side table of closed roots.
+   Correct and complete, but it is a new process-boundary component: the
+   helper currently has no CEF handler at all, and the side table has to
+   reach the browser process.
+2. **Leave it.** Closed roots are rare outside deliberately encapsulated
+   widgets, and a component that closes its root has opted out of exactly
+   this kind of introspection.
+
+Doing nothing is defensible; what is not defensible is claiming shadow DOM
+support without saying which kind.
+
 ### E1 — edit mode does not work inside iframes
 
 **Where:** `crates/buffr-cef/src/handlers.rs`, `on_load_end`;

@@ -78,21 +78,45 @@
     document.addEventListener('pointerdown', markGesture, true);
     document.addEventListener('touchstart', markGesture, true);
 
-    // Strip any auto-focus the page applied on load. buffr starts every
-    // page in Normal mode; the user explicitly enters Insert via `i`
-    // or by clicking an input. Without this, sites like google.com
-    // autofocus their search box and create the click-on-already-focused
-    // race where DOM doesn't fire focusin.
-    function clearInitialFocus() {
+    // A field that is already focused when this script installs — the
+    // classic case being `autofocus`, which fires before injection — never
+    // produces a `focusin` we can see. Report it once at install time so it
+    // is not silently unreachable.
+    //
+    // This used to blur it instead, on the reasoning that buffr starts in
+    // Normal mode. But the page had put the caret in a text field and the
+    // user could see it there, while every keystroke went to the keymap
+    // instead: focused to look at, dead to type in.
+    function reportExistingFocus() {
         var el = document.activeElement;
-        if (el && el !== document.body && el !== document.documentElement
-            && typeof el.blur === 'function') {
-            el.blur();
+        if (!el) { return; }
+        // delegatesFocus puts the HOST in activeElement while the caret sits
+        // on an inner node; walk in to find who really has it.
+        while (el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
         }
+        var kind = kindOf(el);
+        if (!kind) { return; }
+        var id = idFor(el);
+        if (id === lastFocusId) { return; }
+        lastFocusId = id;
+        el.classList.add(OVERLAY_CLASS);
+        emit({
+            type: 'focus',
+            field_id: id,
+            kind: kind,
+            value: valueOf(el, kind),
+            selection_start: (kind !== 'contentEditable') ? el.selectionStart : null,
+            selection_end: (kind !== 'contentEditable') ? el.selectionEnd : null
+        });
     }
-    clearInitialFocus();
+    // Invoked at the very bottom of this IIFE, not here: it calls idFor(),
+    // and `var idMap` below is hoisted as undefined until its assignment
+    // runs. Calling it at this point threw, which aborted the whole IIFE
+    // and left the listeners uninstalled — edit mode dead on any page that
+    // already had a focused field.
     if (document.readyState !== 'complete') {
-        window.addEventListener('load', clearInitialFocus, { once: true });
+        window.addEventListener('load', reportExistingFocus, { once: true });
     }
 
     // ---- stable per-element ID ------------------------------------------
@@ -130,13 +154,53 @@
     // Returns one of "input" | "textarea" | "contentEditable" | null.
     // null means "not a text-editable field; ignore".
 
+    // `<input>` covers far more than text entry. Entering Insert on a
+    // checkbox or a range slider traps the user: Normal-mode keys stop
+    // reaching the keymap while the field cannot accept text anyway.
+    // Allow-list by exclusion — unknown/new types default to editable,
+    // which fails toward "the user can type", the safer direction.
+    var NON_EDITABLE_INPUT_TYPES = {
+        button: 1, checkbox: 1, color: 1, file: 1, hidden: 1, image: 1,
+        radio: 1, range: 1, reset: 1, submit: 1
+    };
+
     function kindOf(el) {
         if (!el || !el.tagName) { return null; }
         var tag = el.tagName.toUpperCase();
         if (tag === 'TEXTAREA') { return 'textarea'; }
-        if (tag === 'INPUT') { return 'input'; }
+        if (tag === 'INPUT') {
+            // `.type` normalises to lowercase and falls back to "text" for
+            // an absent or unrecognised attribute, matching the platform.
+            var t = (el.type || 'text').toLowerCase();
+            if (NON_EDITABLE_INPUT_TYPES[t] === 1) { return null; }
+            return 'input';
+        }
         if (el.isContentEditable) { return 'contentEditable'; }
+        // designMode: the whole document is editable and no element carries
+        // contenteditable, so focus lands on <body> with isContentEditable
+        // false. `designMode` is the only signal.
+        try {
+            var doc = el.ownerDocument;
+            if (doc && doc.designMode === 'on'
+                && (tag === 'BODY' || tag === 'HTML')) {
+                return 'contentEditable';
+            }
+        } catch (_) {}
         return null;
+    }
+
+    // The element that actually holds the caret.
+    //
+    // `focusin` is retargeted to the shadow HOST when focus crosses a shadow
+    // boundary, so `ev.target` on a custom element is <my-field>, not the
+    // <input> inside it — and kindOf() on the host returns null, so the
+    // event was dropped and Insert never engaged. composedPath()[0] is the
+    // real focused node, and it works for open, closed, nested and
+    // delegatesFocus roots alike because the path is built by the platform.
+    function deepTarget(ev) {
+        var path = (ev && ev.composedPath) ? ev.composedPath() : null;
+        if (path && path.length) { return path[0]; }
+        return ev ? ev.target : null;
     }
 
     // ---- current text value --------------------------------------------
@@ -172,19 +236,25 @@
     // Capture phase (third arg = true) ensures we see it before any
     // page-level handlers that call stopPropagation.
 
+    // Last element reported as focused. `focusin` and `focus` both fire for
+    // the same change, and reportExistingFocus can race either, so without
+    // this the browser would see two or three Focus events per real focus.
+    var lastFocusId = null;
+
     function onFocusIn(ev) {
-        var el = ev.target;
+        var el = deepTarget(ev);
         var kind = kindOf(el);
         if (!kind) { return; }
+        var seen = idFor(el);
+        if (seen === lastFocusId) { return; }
+        lastFocusId = seen;
 
-        // No real user gesture yet → page-driven autofocus. Re-blur
-        // immediately so the caret doesn't blink and don't emit a
-        // focus event up to Rust (avoids pointless engine work).
-        if (!window.__buffrUserGesture) {
-            if (typeof el.blur === 'function') { el.blur(); }
-            return;
-        }
-
+        // Every focus of an editable field is reported, including ones the
+        // page drove itself (autofocus, .focus() after a fetch, a dialog
+        // grabbing its search box). Focus is focus: if the caret is in a
+        // text field, typing must reach it. This used to re-blur anything
+        // without a preceding user gesture, which is why autofocused
+        // fields looked focused but silently swallowed every keystroke.
         var id = idFor(el);
         el.classList.add(OVERLAY_CLASS);
 
@@ -203,6 +273,17 @@
         });
     }
     document.addEventListener('focusin', onFocusIn, true);
+    // Fallback for pages that swallow `focusin`. A capture listener on
+    // `window` runs before one on `document`, so a page that calls
+    // stopPropagation there hides the event from us entirely — and ours
+    // cannot be registered first, because this script is injected after the
+    // page's own scripts have run.
+    //
+    // `focus` is a separate event: it does not bubble, but capture still
+    // walks down to the target, and stopping `focusin` does nothing to it.
+    // onFocusIn is idempotent per element (see lastFocusId), so a page that
+    // stops neither simply reports once.
+    document.addEventListener('focus', onFocusIn, true);
 
     // ---- focusout (capture) ---------------------------------------------
     //
@@ -210,12 +291,14 @@
     // emit a blur event so Stage 2 can drop the EditSession.
 
     function onFocusOut(ev) {
-        var el = ev.target;
+        var el = deepTarget(ev);
         var kind = kindOf(el);
         if (!kind) { return; }
 
         var id = idFor(el);
         el.classList.remove(OVERLAY_CLASS);
+        // Clear the latch so re-focusing this same field reports again.
+        if (lastFocusId === id) { lastFocusId = null; }
 
         emit({ type: 'blur', field_id: id });
     }
@@ -234,7 +317,7 @@
     // Rust-writes → JS-emits → Rust-processes loop.
 
     function onInput(ev) {
-        var el = ev.target;
+        var el = deepTarget(ev);
         var kind = kindOf(el);
         if (!kind) { return; }
 
@@ -368,5 +451,11 @@
         try { s = window.getSelection ? String(window.getSelection() || '') : ''; } catch (_) {}
         emit({ type: 'selection', value: s });
     };
+
+    // Everything above is declared; safe to inspect the existing focus now.
+    // `autofocus` fires before this script is injected and produces no
+    // focusin we could observe, so without this the field the page focused
+    // on load would be typed into by nobody.
+    reportExistingFocus();
 
 })();

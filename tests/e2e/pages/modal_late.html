@@ -10,11 +10,11 @@
 <button id="open">open search</button>
 <dialog id="dlg"><input id="q" type="text" placeholder="search"></dialog>
 <script>
-document.getElementById('open').addEventListener('click', function () {
+window.__e2eTrigger = function () {
   var d = document.getElementById('dlg');
   d.showModal();
   requestAnimationFrame(function () {
     requestAnimationFrame(function () { document.getElementById('q').focus(); });
   });
-});
+};
 </script>

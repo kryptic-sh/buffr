@@ -106,6 +106,74 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  edit-mode-e2e:
+    # End-to-end coverage for "focus an input -> Insert mode".
+    #
+    # Runs buffr for real under headless sway with software rendering
+    # (pixman for the compositor, llvmpipe via mesa-vulkan-drivers for
+    # wgpu) and loads one static page per focus pattern a real site uses:
+    # autofocus, .focus() after a tick, a dialog focusing its field two
+    # rAFs later, a component focusing inside its own shadow root, a keyed
+    # re-render that swaps the focused node, designMode, label activation.
+    #
+    # Focus is driven by the PAGE, never by synthetic input: the headless
+    # seat has no input devices, so neither pointer nor keyboard events can
+    # be injected here. That is a property of the environment, not a
+    # shortcut -- every trigger used is one a real page performs itself.
+    #
+    # The verdict comes from buffr's own log, which is why
+    # BUFFR_LOG_CONSOLE=1 is set inside the runner: page console output is
+    # gated off by default for privacy.
+    name: e2e (edit mode focus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CEF_PATH: ${{ github.workspace }}/vendor/cef/linux64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: install CEF runtime deps + sway
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 libxshmfence1 \
+            libdrm2 libgbm1 libpango-1.0-0 libasound2-dev \
+            libx11-xcb1 libxcb-dri3-0 libcups2 libxss1 libxtst6 \
+            libgl1 libegl1 libgles2 \
+            libglib2.0-dev \
+            sway xwayland \
+            mesa-vulkan-drivers vulkan-tools
+
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-ubuntu-latest
+
+      - name: cache CEF binary distribution
+        uses: actions/cache@v5
+        with:
+          path: vendor/cef
+          key: cef-linux64-${{ hashFiles('xtask/src/main.rs') }}
+
+      - name: fetch CEF
+        run: cargo xtask fetch-cef
+
+      - name: build buffr-app (debug)
+        run: cargo build -p buffr-app
+
+      - name: run edit-mode e2e suite
+        run: ./tests/e2e/suite.sh
+
   smoke:
     # Cross-platform event-loop smoke. Builds buffr-app + supervisor
     # for the target OS, then launches `buffr-app --smoke-test`. The

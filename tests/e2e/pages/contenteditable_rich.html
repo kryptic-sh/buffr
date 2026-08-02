@@ -8,7 +8,7 @@
 <h1>click a child of the editable root</h1>
 <!-- The click lands on the <b>, focus lands on #editor. isContentEditable
      is true for both, but the field identity must be the editing host. -->
-<div id="editor" contenteditable="true">
+<div id="editor" contenteditable="true" data-e2e-target>
   <p>plain paragraph</p>
   <p><b id="bold">bold run inside the editor</b></p>
 </div>

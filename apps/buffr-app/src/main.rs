@@ -5770,26 +5770,23 @@ impl AppState {
                         already_editing,
                         "drain_edit_focus_events: Focus received"
                     );
-                    // Only enter Insert mode if a recent user gesture
-                    // (left-click or `i`) preceded this focusin. Pages
-                    // that autofocus on load or call `.focus()`
-                    // programmatically (e.g. monkeytype's Esc-to-reload
-                    // refocuses the test input) get ignored.
-                    const INTENT_WINDOW: std::time::Duration =
-                        std::time::Duration::from_millis(500);
-                    let user_intent = self
-                        .insert_intent_at
-                        .map(|t| t.elapsed() <= INTENT_WINDOW)
-                        .unwrap_or(false);
-                    // Tab/Shift+Tab transfer: a Blur from the previously
-                    // focused field landed within BLUR_TRANSFER_WINDOW.
-                    // Treat the Focus as a continuation of Insert mode.
-                    let transfer_window = std::time::Duration::from_millis(BLUR_TRANSFER_WINDOW_MS);
-                    let is_transfer = self
-                        .pending_blur_at
-                        .map(|t| t.elapsed() <= transfer_window)
-                        .unwrap_or(false);
-                    if !already_editing && (user_intent || is_transfer) {
+                    // Any focus of an editable field enters Insert mode.
+                    //
+                    // This used to require a left-click or `i` within a
+                    // 500 ms window, which silently dropped every focus the
+                    // page drove itself: autofocus, a dialog focusing its
+                    // search box a frame later, anything waiting on a fetch
+                    // or a hydration tick. The field looked focused and the
+                    // caret sat in it, but keystrokes went to the keymap —
+                    // and the slower the site, the more often it happened.
+                    //
+                    // The gate cannot distinguish "the page stole focus" from
+                    // "the user asked for this" anyway: both arrive as a
+                    // focusin on a text field. What the user sees is a caret,
+                    // and a caret has to accept typing. Non-text controls
+                    // never reach here — edit.js classifies checkboxes,
+                    // radios, ranges and friends as not editable.
+                    if !already_editing {
                         self.insert_intent_at = None;
                         self.pending_blur_at = None;
                         if let Some(engine) = self.active_engine_dyn() {
@@ -5800,17 +5797,14 @@ impl AppState {
                         }
                         tracing::info!(
                             %field_id,
-                            is_transfer,
-                            user_intent,
+                            ?kind,
                             "edit-mode entered (engine=Insert, edit_focus=Editing)"
                         );
-                        // Remember the last field that received user-driven
-                        // focus so `i` can re-focus it on the next press.
+                        // Remember the last field that received focus so `i`
+                        // can re-focus it on the next press.
                         self.last_focused_field = Some(field_id.clone());
                         self.edit_focus = EditFocus::Editing { field_id };
                         mode_changed = true;
-                    } else if !already_editing {
-                        tracing::debug!(%field_id, "focus ignored — no recent user gesture");
                     }
                 }
                 EditConsoleEvent::Blur { field_id } => {

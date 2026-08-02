@@ -2,6 +2,14 @@
 <meta charset="utf-8">
 <title>shadow closed</title>
 <script src="e2e.js"></script>
+<script>
+window.__e2eTrigger = function () {
+  // mode:'closed' means element.shadowRoot is null from outside; the
+  // component focuses its own field, which is what a real one does.
+  var r = window.__closedRoot;
+  if (r) { r.querySelector('input').focus(); }
+};
+</script>
 <style>body{font:16px sans-serif;padding:20px}</style>
 <h1>closed shadow root</h1>
 <!-- mode:'closed' means element.shadowRoot is null, so a walker that

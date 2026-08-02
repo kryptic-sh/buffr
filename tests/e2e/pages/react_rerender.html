@@ -10,13 +10,15 @@
      the old node now points at a detached element. -->
 <div id="host"><input id="text" type="text" placeholder="v1"></div>
 <script>
-document.getElementById('host').addEventListener('mousedown', function () {
+window.__e2eTrigger = function () {
+  document.getElementById('text').focus();
+  // Keyed re-render: the focused node is thrown away and replaced.
   setTimeout(function () {
     var host = document.getElementById('host');
     var fresh = document.createElement('input');
     fresh.id = 'text'; fresh.type = 'text'; fresh.placeholder = 'v2';
     host.replaceChildren(fresh);
     fresh.focus();
-  }, 30);
-}, true);
+  }, 120);
+};
 </script>

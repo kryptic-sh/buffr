@@ -2,6 +2,19 @@
 <meta charset="utf-8">
 <title>shadow open</title>
 <script src="e2e.js"></script>
+<script>
+window.__e2eTrigger = function () {
+  var host = document.getElementById('host');
+  // Walk down through however many open roots there are.
+  var node = host;
+  while (node && node.shadowRoot) {
+    var inner = node.shadowRoot.querySelector('input, inner-box, [contenteditable]');
+    if (!inner) { break; }
+    node = inner;
+  }
+  (node || host).focus();
+};
+</script>
 <style>body{font:16px sans-serif;padding:20px}</style>
 <h1>open shadow root</h1>
 <!-- focusin retargets to the HOST when it crosses a shadow boundary, so a

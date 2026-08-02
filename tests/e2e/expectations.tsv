@@ -1,0 +1,21 @@
+# page	expected	what it proves
+plain.html	insert	baseline: input/textarea/contenteditable
+autofocus.html	insert	page autofocus must reach Insert, not just look focused
+shadow_open.html	insert	focusin retargets to the shadow host
+# KNOWN GAP, not a desired behaviour. composedPath() stops at a closed
+# shadow root by design and element.shadowRoot is null from outside, so an
+# injected content script cannot see the focused input. Fixing it needs a
+# document-start hook to record roots as they are created -- backlog E2.
+shadow_closed.html	normal	closed shadow root is opaque to injection (backlog E2)
+shadow_nested.html	insert	two shadow boundaries deep
+shadow_delegates_focus.html	insert	delegatesFocus puts the host in activeElement
+async_focus.html	insert	focus 600ms later, past the old intent window
+modal_late.html	insert	dialog focuses its input two rAFs later
+dynamic_input.html	insert	field created then focused
+react_rerender.html	insert	focused node replaced by a keyed re-render
+label_click.html	insert	label activation focuses the control
+contenteditable_rich.html	insert	editing host with child elements
+designmode.html	insert	document.designMode, focus lands on body
+stop_propagation.html	insert	page swallows focusin on window capture
+already_focused.html	insert	re-focus of the already-focused field
+non_text_inputs.html	normal	checkbox must NOT trap the user in Insert

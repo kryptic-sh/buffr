@@ -39,6 +39,25 @@
             ' type=' + ((deep && deep.type) || '-'));
     }, true);
 
+    // Focus trigger. A page either defines window.__e2eTrigger for a
+    // sequence of its own (open a dialog, spawn a field, swap a node) or
+    // marks one element [data-e2e-target] to be focused directly. This is
+    // how the suite exercises focus without synthetic input: every path
+    // below is one a real site actually uses to focus a field.
+    function trigger() {
+        try {
+            if (typeof window.__e2eTrigger === 'function') {
+                window.__e2eTrigger();
+                return;
+            }
+            var t = document.querySelector('[data-e2e-target]');
+            if (t && typeof t.focus === 'function') { t.focus(); }
+        } catch (e) {
+            console.log('E2E-TRIGGER-ERROR ' + e);
+        }
+    }
+    window.addEventListener('load', function () { setTimeout(trigger, 400); });
+
     if (document.readyState === 'complete') { report(); }
     else { window.addEventListener('load', report); }
     // Re-report after late DOM work (dialogs, spawned fields).

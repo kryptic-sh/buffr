@@ -8,4 +8,11 @@
 <!-- The whole document is editable; no element carries contenteditable,
      and document.activeElement stays <body>. -->
 <div id="para">the entire document is editable here</div>
-<script>document.designMode = 'on';</script>
+<script>
+document.designMode = 'on';
+window.__e2eTrigger = function () {
+  // No element carries contenteditable; the document itself is editable
+  // and focus lands on <body>.
+  document.body.focus();
+};
+</script>
