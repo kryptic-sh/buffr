@@ -36,11 +36,22 @@ cat > "$WORK/inner.sh" <<INNER
 # Runs inside the sway session, so WAYLAND_DISPLAY is set for buffr.
 export XDG_SESSION_TYPE=wayland
 export BUFFR_DISABLE_ZYGOTE=1
-export RUST_LOG=info,buffr_core::console=debug
+export RUST_LOG=info,buffr_core=debug
+export BUFFR_LOG_CONSOLE=1
 cd "$REPO"
 
-"$BIN" "file://$PAGE_PATH" > "$LOG" 2>&1 &
+"$BIN" --private "file://$PAGE_PATH" > "$LOG" 2>&1 &
 APP=\$!
+
+# The page opens as a background tab (positional URLs always do), so
+# switch to it with a real keypress before doing anything else.
+for i in \$(seq 1 120); do
+  grep -q 'tab opened' "$LOG" && break
+  sleep 0.25
+done
+sleep 2
+(/usr/bin/wtype gt && echo "WTYPE-OK" >> "$LOG") || echo "WTYPE-FAIL $?" >> "$LOG"
+sleep 1
 
 # Wait for the page to load and report its geometry.
 for i in \$(seq 1 200); do
