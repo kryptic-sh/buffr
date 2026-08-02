@@ -181,7 +181,7 @@ use buffr_ui::{
 
 mod cef_translate;
 mod chrome_paint;
-mod cli_commands;
+mod cli;
 mod crash_guard;
 mod engine_router;
 mod heartbeat;
@@ -198,7 +198,7 @@ mod single_instance;
 mod windowing;
 use crate::cef_translate::*;
 use crate::chrome_paint::*;
-use crate::cli_commands::*;
+use crate::cli::Cli;
 use crate::paint_policy::*;
 use crate::windowing::{
     ApplicationHandler, EventLoop, EventLoopProxy, Modifiers, Surface, SurfaceId,
@@ -346,168 +346,6 @@ struct PopupWindow {
     repaint_retry_at: Option<Instant>,
 }
 
-/// ASCII-art banner. Regenerate with:
-///
-/// ```sh
-/// figlet -f "ANSI Regular" buffr > apps/buffr/src/art.txt
-/// ```
-const LONG_ABOUT: &str = concat!(
-    "\n",
-    include_str!("art.txt"),
-    "\nGPU-accelerated CEF web browser · v",
-    env!("CARGO_PKG_VERSION"),
-);
-
-#[derive(Parser, Debug)]
-#[command(name = "buffr-app", version, about = "GPU-accelerated CEF web browser", long_about = LONG_ABOUT)]
-struct Cli {
-    /// Print resolved config (TOML) to stdout and exit.
-    #[arg(long)]
-    print_config: bool,
-    /// Validate the config file and exit non-zero on failure.
-    #[arg(long)]
-    check_config: bool,
-    /// Override config file path (default: XDG location).
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
-    /// Override `general.homepage` for this run.
-    #[arg(long, value_name = "URL")]
-    homepage: Option<String>,
-    /// Import bookmarks from a Netscape Bookmark File (HTML). Runs
-    /// without launching CEF; prints the import count to stdout.
-    #[arg(long, value_name = "PATH")]
-    import_bookmarks: Option<PathBuf>,
-    /// Print every bookmark to stdout and exit. Debug aid until UI lands.
-    #[arg(long)]
-    list_bookmarks: bool,
-    /// Print every bookmark tag (sorted) to stdout and exit.
-    #[arg(long)]
-    list_bookmarks_tags: bool,
-    /// Print every download (most-recent first) to stdout and exit.
-    /// Debug aid until the downloads pane lands (Phase 5b chrome).
-    #[arg(long)]
-    list_downloads: bool,
-    /// Delete every `Completed` download row (keeps Failed/Canceled).
-    /// Prints the count removed.
-    #[arg(long)]
-    clear_completed_downloads: bool,
-    /// Print every persisted zoom override (`<domain>\t<level>`) and
-    /// exit. Debug aid until UI lands.
-    #[arg(long)]
-    list_zoom: bool,
-    /// Wipe the per-site zoom store. Prints the count of rows removed.
-    #[arg(long)]
-    clear_zoom: bool,
-    /// Run in private mode: every store is in-memory, the CEF cache
-    /// lives in a tempdir under `$TMPDIR/buffr-private-<pid>` that is
-    /// deleted on shutdown. Nothing persists across restarts.
-    ///
-    /// This is single-window incognito — there is no IPC isolation
-    /// from other buffr processes; full-process compartmentalisation
-    /// (Tor-Browser-grade) is out of scope for Phase 5.
-    #[arg(long)]
-    private: bool,
-    /// Smoke-test flag for Phase 3 find-in-page wiring. After the
-    /// browser is created and the homepage starts loading, kicks off
-    /// a single find for `<query>` (forward search). Match counts
-    /// are routed through the statusline; tracing also logs each
-    /// `OnFindResult` tick so the smoke job can scrape them.
-    #[arg(long, value_name = "QUERY")]
-    find: Option<String>,
-    /// Open this URL in an extra tab on launch. Repeatable; tabs are
-    /// added in order after any restored session and the homepage.
-    #[arg(long = "new-tab", value_name = "URL", action = clap::ArgAction::Append)]
-    new_tab: Vec<String>,
-    /// Skip session restore for this run. The homepage opens in a
-    /// single tab and a fresh session file is written on exit.
-    #[arg(long)]
-    no_restore: bool,
-    /// Print the saved session (one URL per line, `*` prefix for
-    /// pinned tabs) to stdout and exit. Does not launch CEF.
-    #[arg(long)]
-    list_session: bool,
-    /// Print every persisted permission decision and exit.
-    /// Output: `<origin>\t<capability>\t<decision>\t<set_at>`.
-    #[arg(long)]
-    list_permissions: bool,
-    /// Wipe the permissions table. Prints the count of rows removed.
-    #[arg(long)]
-    clear_permissions: bool,
-    /// Drop every stored permission decision for `<ORIGIN>`. Prints
-    /// the count of rows removed.
-    #[arg(long, value_name = "ORIGIN")]
-    forget_origin: Option<String>,
-    /// Print every history entry (most-recent first) and exit.
-    /// Debug aid until the history UI lands. See also `--history-limit`.
-    #[arg(long)]
-    list_history: bool,
-    /// Frecency-search history for `<QUERY>` and print matches, best
-    /// first. Mutually exclusive with `--list-history` (search wins).
-    #[arg(long, value_name = "QUERY")]
-    search_history: Option<String>,
-    /// Maximum rows returned by `--list-history` / `--search-history`.
-    /// Defaults to 100.
-    #[arg(long, value_name = "N")]
-    history_limit: Option<usize>,
-    /// Print the telemetry on/off state, the on-disk counter file
-    /// path, and the current counter table; exit 0. No CEF init.
-    #[arg(long)]
-    telemetry_status: bool,
-    /// Reset every counter to zero (truncates the on-disk JSON to
-    /// `{}`). No-op when telemetry is disabled. Prints "telemetry
-    /// counters reset" and exits 0.
-    #[arg(long)]
-    reset_telemetry: bool,
-    /// Print every captured panic report (most recent first) and
-    /// exit 0. No CEF init.
-    #[arg(long)]
-    list_crashes: bool,
-    /// Delete crash reports older than `crash_reporter.purge_after_days`.
-    /// Prints "purged N reports" and exits 0.
-    #[arg(long)]
-    purge_crashes: bool,
-    /// Phase 6 update channel: hit GitHub releases now, print the
-    /// resolved status, exit 0. No CEF init. Honors
-    /// `[updates] enabled = false` (prints `disabled` without any
-    /// network call).
-    #[arg(long)]
-    check_for_updates: bool,
-    /// Read the on-disk update cache and print the cached status. No
-    /// network. No CEF init. The statusline reads the same cache.
-    #[arg(long)]
-    update_status: bool,
-    /// Print every default-bound `PageAction` and the keys that bind
-    /// it. Exits 0 — used to verify keyboard-only paths for the a11y
-    /// audit. No CEF init.
-    #[arg(long)]
-    audit_keymap: bool,
-    /// Override the default engine backend for this run. Synthesises a single
-    /// instance with the chosen backend and routes every tab through it,
-    /// ignoring `[engines]` config. Valid values: cef.
-    #[arg(long, value_name = "NAME")]
-    engine: Option<String>,
-    /// URLs to open. Each becomes a new tab. When another buffr instance is
-    /// already running on the same profile, these are forwarded to it and
-    /// this process exits 0. Combined with `--new-tab` URLs for forwarding.
-    #[arg(value_name = "URL")]
-    urls: Vec<String>,
-    /// Hidden smoke-test flag: launch the event loop, wait for the
-    /// first `WindowEvent::RedrawRequested` (proves the windowing
-    /// backend reached steady state and the compositor / window
-    /// manager accepted the surface), then exit 0. Bounded by
-    /// `--smoke-test-timeout-ms` (default 30 000) so CI never hangs.
-    /// Used by the cross-platform CI smoke harness to catch
-    /// regressions in the wayr / winit backends that don't surface
-    /// at compile time.
-    #[arg(long, hide = true)]
-    smoke_test: bool,
-    /// Smoke-test timeout in milliseconds. Process exits non-zero if
-    /// no `RedrawRequested` event arrives within this budget. Only
-    /// honoured when `--smoke-test` is set.
-    #[arg(long, default_value = "30000", hide = true)]
-    smoke_test_timeout_ms: u64,
-}
-
 // ── smoke-test plumbing ──────────────────────────────────────────────────────
 //
 // Two static atomics drive the `--smoke-test` flag in main and the
@@ -624,69 +462,8 @@ fn main() -> Result<()> {
     }
 
     // -------- short-circuit modes (no CEF init) ----------------------
-    if cli.check_config {
-        return run_check_config(cli.config.as_deref());
-    }
-    if cli.print_config {
-        return run_print_config(cli.config.as_deref());
-    }
-    if let Some(path) = cli.import_bookmarks.as_deref() {
-        return run_import_bookmarks(path);
-    }
-    if cli.list_bookmarks {
-        return run_list_bookmarks();
-    }
-    if cli.list_bookmarks_tags {
-        return run_list_bookmarks_tags();
-    }
-    if cli.list_downloads {
-        return run_list_downloads();
-    }
-    if cli.clear_completed_downloads {
-        return run_clear_completed_downloads();
-    }
-    if cli.list_zoom {
-        return run_list_zoom();
-    }
-    if cli.clear_zoom {
-        return run_clear_zoom();
-    }
-    if cli.list_session {
-        return run_list_session();
-    }
-    if cli.list_permissions {
-        return run_list_permissions();
-    }
-    if cli.clear_permissions {
-        return run_clear_permissions();
-    }
-    if let Some(origin) = cli.forget_origin.as_deref() {
-        return run_forget_origin(origin);
-    }
-    if cli.telemetry_status {
-        return run_telemetry_status(cli.config.as_deref());
-    }
-    if cli.reset_telemetry {
-        return run_reset_telemetry(cli.config.as_deref());
-    }
-    if cli.list_crashes {
-        return run_list_crashes();
-    }
-    if cli.purge_crashes {
-        return run_purge_crashes(cli.config.as_deref());
-    }
-    if cli.check_for_updates {
-        return run_check_for_updates(cli.config.as_deref());
-    }
-    if cli.update_status {
-        return run_update_status(cli.config.as_deref());
-    }
-    if cli.audit_keymap {
-        return run_audit_keymap(cli.config.as_deref());
-    }
-    if cli.search_history.is_some() || cli.list_history {
-        let limit = cli.history_limit.unwrap_or(100);
-        return run_query_history(cli.search_history.as_deref(), limit);
+    if let Some(result) = cli::dispatch(&cli) {
+        return result;
     }
 
     // Debug builds default to DEBUG, release builds to INFO. Both
