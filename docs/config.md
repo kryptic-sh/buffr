@@ -255,6 +255,13 @@ vim-notation key sequence to a `PageAction`:
 
 The full default keymap lives in [`keymap.md`](./keymap.md).
 
+There is deliberately no `[keymap.insert]`. Insert mode forwards every key
+straight to the page so the focused field handles typing natively — a binding
+there would shadow whatever the user is typing, and the engine never consults
+the keymap while in Insert anyway. The section is a hard validation error rather
+than a silent no-op. Press `<Esc>` to leave Insert mode, then use a
+`[keymap.normal]` binding.
+
 #### Action notation
 
 - **Unit variants** — bare snake_case name. `"scroll_down"`, `"reload"`,
@@ -322,5 +329,6 @@ config stays live.
   instance; instance ids must be unique; every rule's `engine` must resolve.
 - Every keymap binding's key sequence must parse via the engine's `parse_keys`,
   and its action notation must match the table above.
+- `[keymap.insert]` is rejected outright — Insert mode has no bindable keymap.
 - Unknown top-level keys, unknown nested keys, and unknown enum variants all
   error out (`#[serde(deny_unknown_fields)]`).

@@ -22,9 +22,16 @@
 //! # Mode scoping
 //!
 //! A [`Keymap`] holds one trie per [`PageMode`] (Normal, Visual,
-//! Command, Hint). Pending and Edit are not bindable directly:
-//! Pending is a transient internal state of the engine, and Edit-mode
-//! routes through `feed_edit_mode_key` instead of the trie.
+//! Command, Hint). Pending and Insert are not bindable directly:
+//! Pending is a transient internal state of a Normal-mode chord
+//! sequence and shares the Normal trie, while Insert has no trie at
+//! all. [`Engine::feed`] answers every chord with `Step::EditModeActive`
+//! while the mode is Insert — the page owns the keyboard — so a binding
+//! stored for Insert could never fire. [`Keymap::bind`] rejects it with
+//! [`BindError::InsertNotBindable`] rather than filing it somewhere it
+//! would fire under the wrong mode.
+//!
+//! [`Engine::feed`]: crate::engine::Engine::feed
 
 use crate::actions::{PageAction, PageMode};
 use crate::key::{Key, KeyChord, Modifiers, NamedKey, ParseError, parse_keys};
@@ -67,6 +74,14 @@ pub enum BindError {
     Parse(#[from] ParseError),
     #[error("binding contains <leader> but no leader configured")]
     NoLeader,
+    /// Insert mode has no trie — see the module docs. Kept as its own
+    /// variant so the config layer can surface the `[keymap.insert]`
+    /// wording without string-matching.
+    #[error(
+        "insert mode is not bindable: Insert mode forwards every key to the page, \
+         so a binding there would shadow typing — press <Esc> to leave Insert mode"
+    )]
+    InsertNotBindable,
 }
 
 impl Keymap {
@@ -87,6 +102,9 @@ impl Keymap {
     /// Bind a chord sequence to an action in the given mode. Parses
     /// `keys` via [`parse_keys`] and resolves `<leader>` to the
     /// configured leader.
+    ///
+    /// `PageMode::Insert` is rejected with
+    /// [`BindError::InsertNotBindable`] — see the module docs.
     pub fn bind(
         &mut self,
         mode: PageMode,
@@ -94,25 +112,36 @@ impl Keymap {
         action: PageAction,
     ) -> Result<(), BindError> {
         let chords = self.resolve_keys(keys)?;
-        self.mode_map_mut(mode).bind_chords(&chords, action);
-        Ok(())
+        self.bind_chords(mode, &chords, action)
     }
 
     /// Bind already-parsed chords. Used by the engine when feeding
-    /// programmatic bindings.
-    pub fn bind_chords(&mut self, mode: PageMode, chords: &[KeyChord], action: PageAction) {
-        self.mode_map_mut(mode).bind_chords(chords, action);
+    /// programmatic bindings. Same mode restriction as [`Self::bind`].
+    pub fn bind_chords(
+        &mut self,
+        mode: PageMode,
+        chords: &[KeyChord],
+        action: PageAction,
+    ) -> Result<(), BindError> {
+        self.mode_map_mut(mode)
+            .ok_or(BindError::InsertNotBindable)?
+            .bind_chords(chords, action);
+        Ok(())
     }
 
-    /// Look up the chord sequence under `mode`.
+    /// Look up the chord sequence under `mode`. Modes with no trie
+    /// (Insert) always report [`Lookup::NoMatch`].
     pub fn lookup(&self, mode: PageMode, chords: &[KeyChord]) -> Lookup<'_> {
-        self.mode_map(mode).lookup(chords)
+        match self.mode_map(mode) {
+            Some(map) => map.lookup(chords),
+            None => Lookup::NoMatch,
+        }
     }
 
     /// Resolve the longest-prefix action along `chords` — the engine
     /// uses this when the ambiguity timeout fires.
     pub fn resolve_timeout(&self, mode: PageMode, chords: &[KeyChord]) -> Option<&PageAction> {
-        self.mode_map(mode).resolve_timeout(chords)
+        self.mode_map(mode)?.resolve_timeout(chords)
     }
 
     /// Flatten every binding under `mode` to `(chord_sequence, action)`
@@ -122,8 +151,11 @@ impl Keymap {
     /// overrides.
     pub fn entries(&self, mode: PageMode) -> Vec<(Vec<KeyChord>, PageAction)> {
         let mut out = Vec::new();
+        let Some(map) = self.mode_map(mode) else {
+            return out;
+        };
         let mut prefix = Vec::new();
-        self.mode_map(mode).root.collect(&mut prefix, &mut out);
+        map.root.collect(&mut prefix, &mut out);
         out
     }
 
@@ -143,21 +175,35 @@ impl Keymap {
         Ok(chords)
     }
 
-    fn mode_map(&self, mode: PageMode) -> &ModeMap {
+    /// Trie backing `mode`, or `None` when the mode has none.
+    ///
+    /// `Pending` deliberately shares the Normal trie — it is the
+    /// transient mid-chord state of a Normal-mode sequence, and the
+    /// engine looks the partial sequence up under it.
+    ///
+    /// `Insert` maps to nothing at all. It used to fall into the
+    /// Normal arm, which meant a `[keymap.insert]` entry was installed
+    /// in the Normal trie: it fired while browsing (wrong mode) and
+    /// could never fire in Insert (the engine short-circuits before
+    /// the trie). Returning `None` makes that misfiling impossible.
+    fn mode_map(&self, mode: PageMode) -> Option<&ModeMap> {
         match mode {
-            PageMode::Normal | PageMode::Pending | PageMode::Insert => &self.normal,
-            PageMode::Visual => &self.visual,
-            PageMode::Command => &self.command,
-            PageMode::Hint => &self.hint,
+            PageMode::Normal | PageMode::Pending => Some(&self.normal),
+            PageMode::Visual => Some(&self.visual),
+            PageMode::Command => Some(&self.command),
+            PageMode::Hint => Some(&self.hint),
+            PageMode::Insert => None,
         }
     }
 
-    fn mode_map_mut(&mut self, mode: PageMode) -> &mut ModeMap {
+    /// Mutable counterpart of [`Self::mode_map`]; same `None` for Insert.
+    fn mode_map_mut(&mut self, mode: PageMode) -> Option<&mut ModeMap> {
         match mode {
-            PageMode::Normal | PageMode::Pending | PageMode::Insert => &mut self.normal,
-            PageMode::Visual => &mut self.visual,
-            PageMode::Command => &mut self.command,
-            PageMode::Hint => &mut self.hint,
+            PageMode::Normal | PageMode::Pending => Some(&mut self.normal),
+            PageMode::Visual => Some(&mut self.visual),
+            PageMode::Command => Some(&mut self.command),
+            PageMode::Hint => Some(&mut self.hint),
+            PageMode::Insert => None,
         }
     }
 
@@ -680,6 +726,58 @@ mod tests {
         let mut km = Keymap::new();
         let err = km.bind(PageMode::Normal, "<leader>n", PageAction::TabNew);
         assert!(matches!(err, Err(BindError::NoLeader)));
+    }
+
+    #[test]
+    fn insert_mode_binding_is_rejected() {
+        let mut km = Keymap::new();
+        let err = km
+            .bind(PageMode::Insert, "<F2>", PageAction::TabNew)
+            .expect_err("insert mode must not be bindable");
+        assert_eq!(err, BindError::InsertNotBindable);
+        // The message has to tell the user *why* and how to get out,
+        // because it is what buffr-config surfaces for
+        // `[keymap.insert]`.
+        let msg = err.to_string();
+        assert!(msg.contains("forwards every key to the page"), "{msg}");
+        assert!(msg.contains("<Esc>"), "{msg}");
+        // Rejected, not misfiled: nothing landed in the Normal trie.
+        assert!(matches!(
+            km.lookup(PageMode::Normal, &chords("<F2>")),
+            Lookup::NoMatch
+        ));
+        // Same for the pre-parsed entry point.
+        let mut km = Keymap::new();
+        assert_eq!(
+            km.bind_chords(PageMode::Insert, &chords("<F2>"), PageAction::TabNew),
+            Err(BindError::InsertNotBindable)
+        );
+    }
+
+    #[test]
+    fn insert_does_not_share_the_normal_map() {
+        // Guards the `mode_map` / `mode_map_mut` Insert arm. Every
+        // assertion below flips if `PageMode::Insert` is folded back
+        // into the Normal arm.
+        let mut km = Keymap::new();
+        km.bind(PageMode::Normal, "j", PageAction::ScrollDown(1))
+            .unwrap();
+        // A Normal binding must not be visible under Insert…
+        assert!(matches!(
+            km.lookup(PageMode::Insert, &chords("j")),
+            Lookup::NoMatch
+        ));
+        assert!(km.resolve_timeout(PageMode::Insert, &chords("j")).is_none());
+        assert!(km.entries(PageMode::Insert).is_empty());
+        // …while Pending, which legitimately shares it, still sees it.
+        assert!(matches!(
+            km.lookup(PageMode::Pending, &chords("j")),
+            Lookup::Match(PageAction::ScrollDown(1))
+        ));
+        assert_eq!(km.entries(PageMode::Pending).len(), 1);
+        // Sanity: the binding really is in the Normal trie, so the
+        // assertions above are about routing and not an empty keymap.
+        assert_eq!(km.entries(PageMode::Normal).len(), 1);
     }
 
     #[test]

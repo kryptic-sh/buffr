@@ -1106,7 +1106,21 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // Edit-mode takes precedence over the page-mode FSM
                 // once a field is focused (Editing state). Esc is
                 // intercepted; all other keys forward directly to CEF.
-                if matches!(&self.edit_focus, EditFocus::Editing { .. })
+                //
+                // The engine can also sit in `PageMode::Insert` with
+                // NO field focused — `enter_insert_mode` is bindable
+                // user config, and a focused field can go away under
+                // us. There, `Engine::feed` answers every chord with
+                // `Step::EditModeActive` before consulting the trie,
+                // so no binding (Esc included) can fire and the
+                // keyboard is stranded until the user clicks an input
+                // or kills the window. Run the same handler in that
+                // state so its Esc branch still gets a look; it
+                // returns `false` for every other key, which falls
+                // through to the dispatch below exactly as before.
+                let insert_no_focus = !matches!(&self.edit_focus, EditFocus::Editing { .. })
+                    && matches!(self.engine.lock().map(|e| e.mode()), Ok(PageMode::Insert));
+                if (matches!(&self.edit_focus, EditFocus::Editing { .. }) || insert_no_focus)
                     && self.edit_mode_handle_key(&event)
                 {
                     return;

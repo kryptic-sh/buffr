@@ -19,6 +19,18 @@ and this project adheres to
   thread keeps marking liveness through a stall so the heartbeat thread's
   existing recovery path can fire; the heartbeat is now dropped only on a
   terminal socket write error.
+- `<Esc>` always leaves Insert mode, even when no text field is focused. The
+  engine can sit in Insert with nothing focused (a user-bound
+  `enter_insert_mode`, or a field that went away), and in that state it answers
+  every key with "edit mode active" before consulting the keymap — so no
+  binding, `<Esc>` included, could fire and the keyboard was dead until the user
+  clicked an input or closed the window. `<Esc>` now returns to the mode Insert
+  was entered from; every other key behaves as before.
+- A `[keymap.insert]` section is now a startup error naming the section instead
+  of being silently installed into the **normal** keymap, where the binding
+  fired while browsing and never in Insert mode. Insert mode forwards every key
+  to the page by design, so it has no bindings; move the entry to
+  `[keymap.normal]` and use `<Esc>` to leave Insert.
 
 ## [0.14.8] - 2026-08-02
 

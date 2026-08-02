@@ -597,6 +597,46 @@ mod tests {
     }
 
     #[test]
+    fn esc_exits_insert_entered_by_enter_insert_mode() {
+        // Reachability: `enter_insert_mode` is a real PageAction kept
+        // for advanced user config, so the engine can sit in Insert
+        // with no field focused. In that state `feed` short-circuits
+        // to EditModeActive for EVERY chord — Esc included — so the
+        // only way back out is `feed_edit_mode_key`. If that stopped
+        // restoring `return_mode` the keyboard would be stranded.
+        let mut e = engine_with(&[
+            (
+                PageMode::Normal,
+                "v",
+                PageAction::EnterMode(PageMode::Visual),
+            ),
+            (PageMode::Visual, "i", PageAction::EnterInsertMode),
+        ]);
+        let _ = e.feed(parse_key("v").unwrap(), t(0));
+        assert_eq!(e.mode(), PageMode::Visual);
+        let _ = e.feed(parse_key("i").unwrap(), t(1));
+        assert_eq!(e.mode(), PageMode::Insert);
+        // Esc through the trie is dead here — that is the whole point.
+        assert_eq!(
+            e.feed(parse_key("<Esc>").unwrap(), t(2)),
+            Step::EditModeActive
+        );
+        assert_eq!(e.mode(), PageMode::Insert);
+        // The engine's exit path works regardless, and restores the
+        // mode we came from rather than hardcoding Normal.
+        assert_eq!(
+            e.feed_edit_mode_key(parse_key("<Esc>").unwrap()),
+            EditModeStep::Exited
+        );
+        assert_eq!(e.mode(), PageMode::Visual);
+        // Keyboard is live again.
+        assert_eq!(
+            e.feed(parse_key("i").unwrap(), t(3)),
+            Step::Resolved(PageAction::EnterInsertMode)
+        );
+    }
+
+    #[test]
     fn count_does_not_apply_to_non_count_actions() {
         let mut e = engine_with(&[(PageMode::Normal, "r", PageAction::Reload)]);
         let _ = e.feed(parse_key("5").unwrap(), t(0));

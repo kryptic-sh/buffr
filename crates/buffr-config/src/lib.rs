@@ -8,7 +8,9 @@
 //! - `[theme]` — accent + dark/light mode.
 //! - `[privacy]` — telemetry / clear-on-exit.
 //! - `[keymap.<mode>]` — `"j" = "scroll_down"` style entries that
-//!   parse into [`buffr_modal::PageAction`].
+//!   parse into [`buffr_modal::PageAction`]. `<mode>` is one of
+//!   `normal`, `visual`, `command`, `hint`; `insert` is rejected by
+//!   [`validate`] because Insert mode forwards every key to the page.
 //! - `[engines]` — default browser backend + per-domain routing rules.
 //!
 //! XDG path resolution via `directories::ProjectDirs::from("sh",
@@ -675,6 +677,13 @@ where
     HashMap::<PageMode, HashMap<String, KeyBinding>>::deserialize(deserializer)
 }
 
+/// Message for a `[keymap.insert]` section. Shared by [`validate`] and
+/// the tests that pin the wording, since it is the only thing telling a
+/// user why their binding was refused and how to get out of Insert.
+const INSERT_KEYMAP_REJECTED: &str = "[keymap.insert] is not supported: Insert mode forwards every key to the page, \
+     so a binding there would shadow typing. Press <Esc> to leave Insert mode; \
+     put the binding under [keymap.normal] instead.";
+
 /// Validate a parsed `Config`. Called after `toml::from_str` succeeds.
 ///
 /// Checks:
@@ -683,6 +692,7 @@ where
 /// - Every `[theme]` colour is a parseable `#RRGGBB` string.
 /// - `crash_reporter.purge_after_days` is greater than zero.
 /// - `search.default_engine` references a defined engine.
+/// - No `[keymap.insert]` section is present (see [`INSERT_KEYMAP_REJECTED`]).
 /// - Every keymap binding string parses via `buffr_modal::parse_keys`.
 pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     let leader_chars: Vec<char> = cfg.general.leader.chars().collect();
@@ -831,6 +841,20 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 });
             }
         }
+    }
+
+    // `[keymap.insert]` parses (PageMode has an `insert` variant, used
+    // by `enter_mode("insert")` action values) but is not bindable:
+    // Insert mode forwards every key to the page, so the engine
+    // short-circuits before the trie and a binding stored there can
+    // only ever misfire in another mode. Reject the whole section in
+    // its own pass so the error is deterministic no matter which order
+    // the keymap HashMap iterates.
+    if cfg.keymap.contains_key(&PageMode::Insert) {
+        return Err(ConfigError::Validate {
+            message: INSERT_KEYMAP_REJECTED.into(),
+            location: Some("keymap.insert".into()),
+        });
     }
 
     for (mode, bindings) in &cfg.keymap {
@@ -1238,6 +1262,80 @@ mod tests {
         let err = toml::from_str::<Config>(toml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("fly") || msg.contains("unknown"));
+    }
+
+    #[test]
+    fn validate_rejects_keymap_insert_section() {
+        let toml = r#"
+[keymap.insert]
+"<F2>" = "tab_new"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // The section parses — PageMode has an `insert` variant — so
+        // validation is the only thing standing between the user and a
+        // binding filed under the wrong mode.
+        assert!(cfg.keymap.contains_key(&PageMode::Insert));
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, location } => {
+                assert_eq!(message, INSERT_KEYMAP_REJECTED);
+                assert_eq!(location.as_deref(), Some("keymap.insert"));
+                // Actionable: names the section, says why, says the way out.
+                assert!(message.contains("[keymap.insert]"), "{message}");
+                assert!(
+                    message.contains("forwards every key to the page"),
+                    "{message}"
+                );
+                assert!(message.contains("<Esc>"), "{message}");
+            }
+            other => panic!("expected Validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_the_other_keymap_modes() {
+        // Companion to `validate_rejects_keymap_insert_section`: the
+        // insert check must not be a blanket keymap rejection.
+        let toml = r#"
+[keymap.normal]
+"j" = "scroll_down"
+
+[keymap.visual]
+"y" = "yank_selection"
+
+[keymap.command]
+"<Esc>" = "enter_mode(\"normal\")"
+
+[keymap.hint]
+"<Esc>" = "enter_mode(\"normal\")"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.keymap.len(), 4);
+        validate(&cfg).expect("non-insert keymap sections must validate");
+        // …and they actually build into a keymap.
+        let km = build_keymap(&cfg).expect("build_keymap");
+        assert!(matches!(
+            km.lookup(PageMode::Visual, &buffr_modal::parse_keys("y").unwrap()),
+            buffr_modal::Lookup::Match(PageAction::YankSelection)
+        ));
+    }
+
+    #[test]
+    fn build_keymap_refuses_insert_bindings() {
+        // Defence in depth for the hot-reload path, which builds a
+        // keymap from a config it just parsed.
+        let toml = r#"
+[keymap.insert]
+"<F2>" = "tab_new"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        match build_keymap(&cfg).unwrap_err() {
+            ConfigError::Validate { message, .. } => {
+                assert!(message.contains("keymap.insert"), "{message}");
+                assert!(message.contains("not bindable"), "{message}");
+            }
+            other => panic!("expected Validate error, got {other:?}"),
+        }
     }
 
     #[test]

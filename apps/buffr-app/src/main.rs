@@ -4674,6 +4674,12 @@ impl AppState {
     /// arrow keys, selection, copy/paste, IME, etc.). The only key
     /// intercepted is `Esc`, which exits Insert mode and returns to
     /// Normal page mode.
+    ///
+    /// Also called with no focused field when the engine is in
+    /// [`PageMode::Insert`] anyway — see the caller in `event_loop`.
+    /// In that state only `Esc` is handled (it must always be able to
+    /// leave Insert); every other key returns `false` and falls
+    /// through to the chord engine as before.
     fn edit_mode_handle_key(&mut self, event: &crate::windowing::KeyEvent) -> bool {
         let planned = Self::wayr_key_to_planned(event, &self.modifiers);
         let is_esc_pressed = matches!(planned, Some(PlannedInput::Key(SpecialKey::Esc, _)));
@@ -4692,6 +4698,27 @@ impl AppState {
         );
 
         let EditFocus::Editing { field_id, .. } = &self.edit_focus else {
+            // No focused field. If the engine is nonetheless in
+            // PageMode::Insert (user-bound `enter_insert_mode`, or a
+            // field that vanished), Esc is the ONLY way out: the trie
+            // is short-circuited by `Step::EditModeActive`, so an
+            // `<Esc>` binding can never fire. Drive the engine's own
+            // exit path, which restores the mode Insert was entered
+            // from.
+            if is_esc_pressed && mode == Some(PageMode::Insert) {
+                let exited = self.engine.lock().ok().map(|mut e| {
+                    e.feed_edit_mode_key(buffr_modal::KeyChord::plain(Key::Named(NamedKey::Esc)))
+                });
+                if matches!(exited, Some(buffr_modal::EditModeStep::Exited)) {
+                    self.refresh_title();
+                    self.request_redraw();
+                    tracing::info!(
+                        "edit_mode: exited via Esc with no focused field — \
+                         engine left PageMode::Insert"
+                    );
+                    return true;
+                }
+            }
             tracing::warn!(
                 state = ?event.state,
                 key_code = ?event.key_code,
