@@ -3,9 +3,15 @@
 Everything left over from the full-codebase review in
 [`code-review.md`](./code-review.md), plus what surfaced while fixing it.
 
-Nothing here is a known-broken build: `main` is green on CI (all three OSes),
-`cargo deny`, `cargo machete`, and the fuzz workflow. These are the items that
-were deliberately **not** actioned, and why.
+Nothing here is a known-broken **build**: `main` is green on CI (all three
+OSes), `cargo deny`, `cargo machete`, and the fuzz workflow. These are the items
+that were deliberately **not** actioned, and why.
+
+That is not the same as "no known bugs". Sections 8 and 9 are a review pass from
+2026-08-02 with nothing fixed — including two high-severity correctness bugs
+(**C1**, vertical touchpad scrolling navigating history; **C2**, a transient
+stall permanently disarming the heartbeat) that are reproducible today on green
+CI. Read those before assuming the tree is clean.
 
 Grouped by what is actually blocking them.
 
@@ -33,18 +39,18 @@ Covered by `tests/e2e/pages/shadow_closed.html`, which currently asserts
 `normal` so the gap is pinned rather than silently tolerated. Flip the
 expectation to `insert` when this is fixed.
 
-The only real fix is to record roots as they are created, which needs a
-script running at **document start**, before the page's own scripts:
+The only real fix is to record roots as they are created, which needs a script
+running at **document start**, before the page's own scripts:
 
 1. **Renderer-process handler.** Implement `CefRenderProcessHandler` in
    `buffr-helper` and hook `OnContextCreated` to patch
    `Element.prototype.attachShadow`, keeping a side table of closed roots.
-   Correct and complete, but it is a new process-boundary component: the
-   helper currently has no CEF handler at all, and the side table has to
-   reach the browser process.
+   Correct and complete, but it is a new process-boundary component: the helper
+   currently has no CEF handler at all, and the side table has to reach the
+   browser process.
 2. **Leave it.** Closed roots are rare outside deliberately encapsulated
-   widgets, and a component that closes its root has opted out of exactly
-   this kind of introspection.
+   widgets, and a component that closes its root has opted out of exactly this
+   kind of introspection.
 
 Doing nothing is defensible; what is not defensible is claiming shadow DOM
 support without saying which kind.
@@ -86,20 +92,20 @@ The options, cheapest first:
 Whichever way this goes, the two iframe pages should move into the e2e
 expectations so the behaviour is pinned rather than assumed.
 
-| ID  | Where                                                    | The problem                                                                                                                                                                                           | The choice                                                                                                         |
-| --- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| H6  | `crates/buffr-cef/src/lib.rs`, `app.rs`                  | `no_sandbox: 1` plus a `--no-sandbox` switch disable the Chromium sandbox process-wide, so any renderer RCE is immediate code execution as the user.                                                  | Ship the setuid `chrome-sandbox` helper / rely on user namespaces, or gate it per-target.                          |
-| M48 | `apps/buffr-app/src/main.rs`                             | `:open` passes its argument straight to `navigate`, bypassing the allow-list every other path enforces. `:open javascript:…` runs in the page origin.                                                 | Is `:open` meant to be a privileged escape hatch, or should it go through `resolve_input`?                         |
-| M39 | `crates/buffr-modal/src/keymap.rs`                       | `<C-c>` is bound twice; last-write-wins gives `YankUrl`, so `StopLoading` has no working binding — and `missing_default_bindings` scans the table, not the trie, so the a11y test reports it covered. | Pick an owner for `<C-c>`; separately, make the audit walk the built keymap so a shadowed row can't fake coverage. |
-| M49 | `buffr-config` + `apps/buffr-app`                        | Four knobs are parsed, validated and documented but never read: `startup.new_tab_url`, `startup.restore_session`, `theme.mode`, `updates.channel`.                                                    | Wire each up or delete it. Docs currently describe them honestly as inert.                                         |
-| L23 | `apps/buffr-app/src/main.rs`                             | The occlude-sleep debounce is dead — `sleep_deadline` is only ever set to `None`, so the expiry check and deadline clamp can never fire.                                                              | Wire `Occluded(true)` to arm it as designed, or delete the field, const and both blocks.                           |
-| L36 | `crates/buffr-ui/src/lib.rs`                             | Hint status renders `(n/n)` — numerator and denominator are the same field, so it always reads e.g. `3/3`.                                                                                            | Drop the pair, or add a real `current` index to `HintStatus`.                                                      |
-| L37 | `crates/buffr-modal/src/actions.rs`                      | `PageMode::Pending` is documented as live but never produced; `buffr-ui` and `buffr-app` carry unreachable arms for it.                                                                               | Produce it while a prefix is pending, or delete it and the dead arms.                                              |
-| L38 | `crates/buffr-modal/src/engine.rs`                       | The register prefix (`"a`) consumes two keystrokes, stores the register, then discards it — indistinguishable from a broken keymap.                                                                   | Plumb `register` into the emitted action, or remove the prefix handling.                                           |
-| L18 | `crates/buffr-engine/src/event.rs`, `types.rs`, `tab.rs` | `EngineEvent`, `NavigationEvent`, `LoadState`, `CursorChanged`, `CursorKind`, `TabOptions` have zero users; `CursorKind` is actively contradicted by the trait.                                       | Delete, or keep for a planned migration.                                                                           |
-| L19 | `crates/buffr-engine/src/engine.rs`                      | `supports_native` / `set_native_parent` / `set_native_visible` document a four-step protocol with no callers and no implementors.                                                                     | Delete until the subsurface work lands, or wire the apps layer to honour it.                                       |
-| L40 | `crates/buffr-history/src/lib.rs`                        | Eight constructors for the cross-product of two optional params; a third would mean sixteen.                                                                                                          | Collapse to an options struct/builder — a public API change.                                                       |
-| L41 | `crates/buffr-config/src/search.rs`                      | `classify_input` / `InputKind` are dead public API whose doc admits it "mirrors the branch order in `resolve_input` exactly" — i.e. hand-synced.                                                      | Delete, or implement `resolve_input` in terms of it so they cannot drift.                                          |
+| ID  | Where                                                    | The problem                                                                                                                                                                                            | The choice                                                                                                         |
+| --- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| H6  | `crates/buffr-cef/src/lib.rs`, `app.rs`                  | `no_sandbox: 1` plus a `--no-sandbox` switch disable the Chromium sandbox process-wide, so any renderer RCE is immediate code execution as the user.                                                   | Ship the setuid `chrome-sandbox` helper / rely on user namespaces, or gate it per-target.                          |
+| M48 | `apps/buffr-app/src/main.rs`                             | `:open` passes its argument straight to `navigate`, bypassing the allow-list every other path enforces. `:open javascript:…` runs in the page origin.                                                  | Is `:open` meant to be a privileged escape hatch, or should it go through `resolve_input`?                         |
+| M39 | `crates/buffr-modal/src/keymap.rs`                       | `<C-c>` is bound twice; last-write-wins gives `YankUrl`, so `StopLoading` has no working binding — and `missing_default_bindings` scans the table, not the trie, so the a11y test reports it covered.  | Pick an owner for `<C-c>`; separately, make the audit walk the built keymap so a shadowed row can't fake coverage. |
+| M49 | `buffr-config` + `apps/buffr-app`                        | Four knobs are parsed, validated and documented but never read: `startup.new_tab_url`, `startup.restore_session`, `theme.mode`, `updates.channel`.                                                     | Wire each up or delete it. Docs currently describe them honestly as inert.                                         |
+| L23 | `apps/buffr-app/src/main.rs` + `event_loop.rs`           | The occlude-sleep debounce is dead — `sleep_deadline` is only ever set to `None`, so the expiry check and deadline clamp can never fire. The field is on `AppState`; the checks moved to `event_loop`. | Wire `Occluded(true)` to arm it as designed, or delete the field, const and both blocks.                           |
+| L36 | `crates/buffr-ui/src/lib.rs`                             | Hint status renders `(n/n)` — numerator and denominator are the same field, so it always reads e.g. `3/3`.                                                                                             | Drop the pair, or add a real `current` index to `HintStatus`.                                                      |
+| L37 | `crates/buffr-modal/src/actions.rs`                      | `PageMode::Pending` is documented as live but never produced; `buffr-ui` and `buffr-app` carry unreachable arms for it.                                                                                | Produce it while a prefix is pending, or delete it and the dead arms.                                              |
+| L38 | `crates/buffr-modal/src/engine.rs`                       | The register prefix (`"a`) consumes two keystrokes, stores the register, then discards it — indistinguishable from a broken keymap.                                                                    | Plumb `register` into the emitted action, or remove the prefix handling.                                           |
+| L18 | `crates/buffr-engine/src/event.rs`, `types.rs`, `tab.rs` | `EngineEvent`, `NavigationEvent`, `LoadState`, `CursorChanged`, `CursorKind`, `TabOptions` have zero users; `CursorKind` is actively contradicted by the trait.                                        | Delete, or keep for a planned migration.                                                                           |
+| L19 | `crates/buffr-engine/src/engine.rs`                      | `supports_native` / `set_native_parent` / `set_native_visible` document a four-step protocol with no callers and no implementors.                                                                      | Delete until the subsurface work lands, or wire the apps layer to honour it.                                       |
+| L40 | `crates/buffr-history/src/lib.rs`                        | Eight constructors for the cross-product of two optional params; a third would mean sixteen.                                                                                                           | Collapse to an options struct/builder — a public API change.                                                       |
+| L41 | `crates/buffr-config/src/search.rs`                      | `classify_input` / `InputKind` are dead public API whose doc admits it "mirrors the branch order in `resolve_input` exactly" — i.e. hand-synced.                                                       | Delete, or implement `resolve_input` in terms of it so they cannot drift.                                          |
 
 ### `buffr-webkit` only (excluded crate, not shipped)
 
@@ -206,13 +212,35 @@ slices.
 
 ## 5. Release follow-ups
 
-- **`buffr-bin` on the AUR is still at the pre-0.14.7 version.** The `aur-bin`
-  job failed on the `v0.14.7` tag run with
-  `No ED25519 host key is known for aur.archlinux.org`: the pinned `known_hosts`
-  was written correctly, but `GIT_SSH_COMMAND` was supplied through an `env:`
-  block containing a literal `~`, and neither git's `sh -c` (tilde expansion
-  does not apply to the result of a parameter expansion) nor ssh itself expands
-  it in a `-o` value.
+- **`buffr-bin` on the AUR is stuck at `0.14.6-1`** while the workspace is at
+  `0.14.8` — two releases behind, for two _different_ reasons.
+
+  `v0.14.7` failed on the ssh regression described below. That is fixed. But
+  `v0.14.8`, cut specifically to prove the fix, failed before reaching it: the
+  AUR was in maintenance and the git remote refused the push
+  (`The AUR is down due to maintenance` →
+  `fatal: Could not read from remote repository`, exit 128). A re-run of the
+  failed job on 2026-08-02 hit the same banner.
+
+  **So the ssh fix is still unproven.** It has never been exercised against a
+  live AUR — both attempts died earlier in the job than the host-key check.
+  Whoever cuts the next release should confirm the `aur-bin` job actually
+  reaches and passes the push, not just that the tag went green.
+
+  **Do not use an HTTP check as the readiness signal.**
+  `https://aur.archlinux.org/` returns `200` and the RPC serves package JSON
+  while the **git/ssh** endpoint is still refusing pushes. A watcher polling the
+  web front end reports "back up" during a maintenance window that still blocks
+  publishing; that is exactly how the re-run above was triggered too early. Test
+  the actual remote (an `ssh aur@aur.archlinux.org` handshake or a dry-run
+  push), not the website.
+
+- **The `v0.14.7` ssh regression itself.** The `aur-bin` job failed on the
+  `v0.14.7` tag run with `No ED25519 host key is known for aur.archlinux.org`:
+  the pinned `known_hosts` was written correctly, but `GIT_SSH_COMMAND` was
+  supplied through an `env:` block containing a literal `~`, and neither git's
+  `sh -c` (tilde expansion does not apply to the result of a parameter
+  expansion) nor ssh itself expands it in a `-o` value.
 
   The tilde is **not** the regression — it has been there since the job was
   written, is present in the AUR jobs of every sibling repo (`gpur`, `hjkl`,
@@ -230,10 +258,10 @@ slices.
   accepts any key presented. Everything else in the release published — GitHub
   release, homebrew-tap, scoop-bucket, all 20 build/package jobs.
 
-  The fix cannot be applied retroactively: re-running the job checks out the
-  workflow file as of the `v0.14.7` tag, which still has the bug, and the tag
-  must not be moved. So AUR catches up on the **next** tagged release. Nothing
-  to do here beyond cutting one.
+  The fix cannot be applied retroactively to `v0.14.7`: re-running that job
+  checks out the workflow file as of the tag, which still has the bug, and the
+  tag must not be moved. `v0.14.8` and later do carry the fix — re-running
+  _those_ is worthwhile once the AUR is genuinely reachable.
 
 - **The `known_hosts` pin was inert in all three publish jobs**, not just AUR.
   `brew-tap` and `scoop-bucket` survived the same flip only because the runner
@@ -252,13 +280,295 @@ slices.
 
 ---
 
+## 6. `main.rs` decomposition — partly done
+
+`apps/buffr-app/src/main.rs` was 11,628 lines. Seven slices took it to 6,994,
+each a separate commit verified with `cargo fmt --all`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` (1072
+passed, 0 failed throughout) and a diff against the previous commit proving the
+move was pure. CI is green on the result (`e374b37`).
+
+Extracted so far: `cli` (the clap `Cli`, dispatch, and every `run_*`
+subcommand), `cef_translate`, `chrome_paint`, `paint_policy`, `event_loop`,
+`context_menu`.
+
+**Still in `main.rs`:** `AppState` and its main `impl` (~4,000 lines), plus
+`mod tests` (1,556). The remaining method groups are _interleaved_ in source
+order rather than contiguous, so each needs a commit that gathers scattered
+methods instead of cutting a range. The natural groups:
+
+| Group                 | Representative methods                                                         |
+| --------------------- | ------------------------------------------------------------------------------ |
+| Overlay / omnibar     | `open_omnibar`, `refresh_overlay_suggestions`, `dispatch_command`, `apply_set` |
+| Hint mode             | `hint_mode_handle_key`, `handle_hint_action`, `exit_hint_mode`                 |
+| Edit mode             | `drain_edit_focus_events`, `expire_pending_blur`, `edit_mode_handle_key`       |
+| Permissions / confirm | `sync_permissions_prompt`, `resolve_permission`, `confirm_handle_key`          |
+| Popup windows         | `paint_popup_window`, `handle_popup_window_event`                              |
+| Chrome painting       | `paint_chrome_with`, `paint_chrome_inner`, `resync_cef_rect`                   |
+
+- **Two modules use a `crate::*` glob** rather than explicit imports:
+  `event_loop` and `context_menu`. Deliberate and noted in both module docs —
+  they reach most of the crate root while `AppState` still lives there. **Narrow
+  both once `AppState` moves out**; leaving the globs is how a module boundary
+  quietly stops meaning anything.
+- **`mod tests` should follow its subjects.** It still tests functions that now
+  live in `paint_policy`, `cef_translate` and `chrome_paint`, reaching them
+  through `use super::*`. Splitting each module's tests into that module is
+  mechanical but was deliberately deferred so the moves stayed reviewable.
+- **`wayr_key_to_planned` keeps a stale prefix.** The `wayr_`/`_to_winit`
+  prefixes were dropped from the `cef_translate` functions (both backends now
+  sit behind `windowing`), but this one is a method on `AppState` and was out of
+  that slice's scope. Rename when the edit-mode group moves.
+
+---
+
+## 7. Found while cleaning up, not actioned
+
+- **`--private` profile directories are never reaped.** Each
+  `buffr-app --private` launch creates `$TMPDIR/buffr-private-<pid>-<rand>/` and
+  leaves it behind on exit; 49 had accumulated from three e2e suite runs alone.
+  The `TempDir` returned by `resolve_paths` is supposed to own that lifetime, so
+  either it is being leaked (`std::mem::forget`, or an early `_exit` that skips
+  destructors — note `main` calls `libc::_exit(0)` on unix) or the drop happens
+  on a path the shutdown never takes. **User-visible:** someone who browses
+  private daily silently fills `/tmp`. Not a test artefact — worth confirming
+  against a normal `--private` run before deciding the fix.
+- **Bare `cargo test` under-reports this workspace: 244 tests vs 1072 for
+  `cargo test --workspace`.** A green bare run covers less than a quarter of the
+  suite. Everything in this repo should use `--workspace`, matching the rule
+  already in `AGENTS.md`.
+- **`cargo clippy` without `--all-targets` misses the test target.** Removing an
+  import used only by `mod tests` leaves the bin target compiling clean while CI
+  fails. Hit once during the refactor; `--all-targets` catches it.
+- **Three abandoned branches were archived as tags, not deleted.** All local and
+  remote branches except `main` were removed; the three carrying unmerged work
+  are preserved as `archive/gpu-compositor-poc`, `archive/wl-subsurface-poc` and
+  `archive/wxs-codepage-fix` (pushed; `archive/*` does not match the `v*`
+  release trigger). All three predate the `apps/buffr` → `apps/buffr-app` rename
+  (`bec1f30`) and need a real rebase, not a cherry-pick.
+  `archive/wl-subsurface-poc` is the subsurface work **L19** refers to.
+
+---
+
+## 8. Correctness review, 2026-08-02 (none fixed)
+
+A read-only review pass. **Nothing here has been fixed** — no code changed.
+Findings marked ✅ were re-verified by opening the cited location; the rest are
+reported as found and still need confirming before anyone acts on them.
+
+### C1 ✅ HIGH — vertical touchpad scrolling navigates history
+
+**Where:** `apps/buffr-app/src/event_loop.rs`, the `is_pixel` branch of the
+scroll handler (`detect_swipe(scroll_ev.delta as f32, 0.0)`); twin at
+`AppState::handle_popup_window_event`.
+
+A `ScrollEvent` carries **one axis per event** — `scroll_to_cef_delta` in
+`cef_translate.rs` correctly branches on `ev.axis`. The swipe detector does not:
+it passes `delta` as `dx` and hard-codes `dy = 0.0`, so a _vertical_ delta
+accumulates into `swipe_accum_x`. `detect_swipe`'s dominance guard
+(`ax >= HORIZ_THRESHOLD && ax > HORIZ_DOMINANCE * ay`) is then vacuous, because
+`ay` is always 0.
+
+Two-finger scrolling down a page on a touchpad accumulates ~150 px and fires
+`HistoryBack`, navigating away mid-scroll. Fix: branch on `ev.axis` the way
+`scroll_to_cef_delta` already does.
+
+### C2 ✅ HIGH — one transient UI stall permanently disarms the heartbeat
+
+**Where:** `AppState::tick_heartbeat` in `apps/buffr-app/src/main.rs`;
+`run_heartbeat_loop` in `apps/buffr-app/src/heartbeat.rs`.
+
+`thread_alive` is cleared in two cases: a fatal write error (terminal) and the
+**recoverable** "UI thread silent past `UI_LIVENESS_TIMEOUT`" state. The loop
+has an explicit recovery path for the second — but it only runs if
+`last_alive_us` keeps advancing, and `tick_heartbeat` reacts to `!is_alive()` by
+setting `self.heartbeat = None`, so `mark_alive` is never called again.
+
+A >5 s block in `write_texture`/`submit` — which this codebase documents as
+observed — therefore converts a recoverable stall into a guaranteed supervisor
+kill of a healthy browser. Fix: distinguish the fatal flag from the stall flag,
+and don't drop the handle for the recoverable one.
+
+### C3 ✅ MEDIUM — Insert-mode keybindings are installed into the Normal trie
+
+**Where:** `Keymap::mode_map_mut` in `crates/buffr-modal/src/keymap.rs`
+(`PageMode::Normal | PageMode::Pending | PageMode::Insert => &mut self.normal`);
+`Engine::feed` in `crates/buffr-modal/src/engine.rs`.
+
+`build_keymap` faithfully forwards `[keymap.insert]` entries, and `mode_name`
+accepts `"insert"` — but they all land in the **Normal** trie, so they fire
+while browsing and never in Insert mode. They could not fire in Insert anyway:
+`feed` returns `Step::EditModeActive` before consulting the trie.
+
+Related: every other non-Normal mode has an `<Esc>` route through the trie;
+Insert does not, and `edit_mode_handle_key` is gated on `EditFocus::Editing`. So
+reaching `PageMode::Insert` with no focused field leaves the keyboard dead until
+the user clicks an input. Decide whether `[keymap.insert]` is supported — if
+not, reject it in config validation rather than silently misfiling it.
+
+### C4 MEDIUM — a permission answer can be applied to a different origin
+
+**Where:** `AppState::sync_permissions_prompt` (peeks the queue front) and
+`AppState::resolve_permission` (pops it) in `apps/buffr-app/src/main.rs`;
+`on_dismiss_permission_prompt` in `crates/buffr-cef/src/handlers.rs`.
+
+The displayed prompt is the peeked front; the outcome is applied to whatever is
+popped later, with no re-validation that they match.
+`on_dismiss_permission_prompt` meanwhile removes an arbitrary entry by
+`resolve_id` without clearing `permissions_prompt`. If the displayed request is
+dismissed while a second is queued, answering the visible prompt can grant a
+**persistent** capability to an origin the user never saw. Fix: carry the
+`resolve_id` in `permissions_prompt` and match it on pop.
+
+### C5 MEDIUM — popups tell CEF a viewport one address-bar taller than they paint
+
+**Where:** popup creation and resize call `popup_resize(browser_id, pw, ph)`
+with the full window height, but the OSR quad is drawn into
+`(0, phys_bar_h, w, h - phys_bar_h)` and pointer events forward `y - bar_h`. The
+main window gets this right — `cef_child_rect` subtracts the chrome strips
+before `osr_resize`. Result: popup content is squashed and clicks land offset by
+roughly `STATUSLINE_HEIGHT`, worst at the bottom of the window (OAuth
+"Authorize" buttons). Fix: subtract the bar height before `popup_resize`.
+
+### C6 MEDIUM — `on_tab_switch` resets `last_osr_generation` to 0
+
+**Where:** `AppState::on_tab_switch` in `apps/buffr-app/src/main.rs`;
+`is_osr_frame_fresh` in `apps/buffr-app/src/paint_policy.rs`.
+
+The doc comment argues this is safe because the new tab's first paint always has
+a non-zero generation. True, but it also makes the _already-consumed_ generation
+compare as fresh, defeating the double-swap guard. On `gt` the user can see a
+stale frame of the tab they just left instead of the loading animation.
+
+### C7 LOW — `reopen_closed_tab` can break the pinned-first ordering
+
+**Where:** `reopen_closed_tab` in `crates/buffr-cef/src/host.rs` restores at
+`entry.index.min(tabs.len())` without calling `enforce_pinned_ordering()`,
+unlike `toggle_pin_active` and `set_pinned`. `hit_test_tab_strip_pure` derives
+pill widths from `i < pinned_count` while `TabStrip::paint` uses each tab's own
+`pinned` flag, so once the invariant breaks, clicks select the wrong tab.
+
+---
+
+## 9. Performance review, 2026-08-02 (none fixed)
+
+Same pass, same caveat: **nothing here has been changed**. ✅ = re-verified at
+the cited location.
+
+Frequency baseline the findings rest on: `about_to_wait` clamps its wakeup to
+the fastest output's refresh period, so its whole body runs at display refresh
+rate even when idle. A 1080p logical chrome buffer is ~8.3 MB.
+
+### P1 ✅ HIGH — unbounded bookmark query on the UI thread per omnibar keystroke
+
+**Where:** `AppState::omnibar_suggestions` in `apps/buffr-app/src/main.rs` calls
+`self.bookmarks.search(needle)` then `.take(8)`.
+
+`search` delegates to `search_limited(query, None)` → `NO_LIMIT`, so a
+`LIKE '%…%'` full scan returns **every** match, plus a second query fetching
+tags for all of them — after which Rust discards all but 8. `search_limited`
+already exists in `crates/buffr-bookmarks/src/lib.rs` and takes the limit.
+
+Runs synchronously on the event loop for every printable char, backspace,
+`<C-u>` and `<C-w>` in the omnibar, and is **not debounced** — while live-find
+next to it _is_ (`FIND_LIVE_DEBOUNCE_MS`). Fix: pass `Some(8)`, and debounce the
+suggestion refresh like find. Cheapest high-value fix in this list.
+
+### P2 ✅ HIGH — the full OSR buffer is copied every frame, then often discarded
+
+**Where:** `Renderer::frame` in `apps/buffr-app/src/render.rs` does
+`osr.as_ref().map(OsrUploadOwned::from)`, whose `From` impl is
+`pixels: u.pixels.to_vec()` — an ~8 MB alloc + memcpy on the UI thread. The
+worker then skips `write_texture` entirely when `upload.generation` is
+unchanged, making the copy pure waste.
+
+The `SyntheticScratch` path deliberately reuses the generation the GPU already
+holds, so this fires on cursor blink, statusline and progress updates, tab hover
+and mode changes. Fix: track the last-sent generation and send an empty `pixels`
+when it matches; recycle buffers rather than copying on the fresh path.
+
+### P3 ✅ HIGH — 8.3 MB allocated and zeroed per chrome-dirty frame
+
+**Where:** `apps/buffr-app/src/render.rs`, `vec![0u32; lw * lh]` immediately
+before `paint_chrome`.
+
+Allocated on the UI thread, freed on the worker thread — a pattern that defeats
+allocator thread caches — and only the top (~52) and bottom (~28) logical rows
+are ever written; the browser region must stay transparent, which it already is
+in a reused buffer. Forced true every tick during the loading animation. Fix:
+recycle a `chrome_scratch` via a return channel and clear only the strip bands
+plus the previous overlay rect.
+
+### P4 ✅ HIGH — the tab strip is cloned and diffed at refresh rate
+
+**Where:** `apps/buffr-app/src/event_loop.rs`,
+`let prev_tabs = self.tab_strip.tabs.clone();` before `refresh_tab_strip`.
+
+Per tick this clones N tab-title `String`s purely to diff — work
+`refresh_tab_strip` already does internally as `tabs_changed`. It also runs
+`host.tabs_summary()`, which takes one `tabs` lock plus a `display_urls` lock
+and two `String` allocations **per tab**, and allocates a `HashSet` to drive one
+`retain`. At 20 tabs / 144 Hz that is roughly 100 allocations and 21 mutex
+acquisitions per frame to conclude "nothing changed".
+
+The comment above it is also stale: it claims "the cost is a small alloc" and
+that redraws are gated "via softbuffer's damage rect" — softbuffer was replaced
+by the wgpu path. Fix: return `tabs_changed` from `refresh_tab_strip` and add a
+`tabs_revision` counter on `BrowserHost` to early-return.
+
+### P5 ✅ MEDIUM — every glyph blit clones its bitmap and takes two mutexes
+
+**Where:** `crates/buffr-ui/src/font.rs`,
+`lock_ignore_poison(&f.cache).get(&c).cloned()`.
+
+`.cloned()` copies the rasterized coverage bitmap on a cache **hit**, per
+character. `draw_text` separately calls `char_width` per char, taking a second
+mutex, and `truncate_to_width` walks the string doing the same. A chrome repaint
+draws several hundred glyphs. Fix: store `Arc<(Metrics, Vec<u8>)>`, fold the
+advance into the same entry, and hold one guard across the string.
+
+### P6 MEDIUM — the whole chrome texture is re-uploaded when one strip changed
+
+**Where:** `Renderer::write_chrome` in `apps/buffr-app/src/render.rs` always
+issues a full-size `write_texture` with no sub-rect. This is the largest
+per-frame PCIe transfer in the app, and the same file documents observed
+multi-second blocks on `write_texture`. Fix: pass a dirty rect (top band +
+bottom band) and use `origin`/`Extent3d` with an offset into the source. Typical
+saving ~8.3 MB → ~0.4 MB per frame.
+
+### P7 MEDIUM — SQL is recompiled from source text on every omnibar keystroke
+
+**Where:** `crates/buffr-history/src/lib.rs` and
+`crates/buffr-bookmarks/src/lib.rs` use `conn.prepare(...)`; there is no
+`prepare_cached` anywhere in the workspace. The history query is a
+`visits ⋈ visits_fts` join with `GROUP BY` and two correlated subqueries, so
+SQLite re-parses and re-plans it per keystroke. Both stores hold a long-lived
+`Connection`, so a per-connection statement cache would persist. No new
+dependency needed.
+
+### P8 LOW — avoidable per-event allocations
+
+- `tabs_summary()` is materialised in full just to read the ids (throttled to 4
+  Hz); a `tab_ids()` accessor would cost one lock and no allocations.
+- `tick_splash_js_push` calls `active_tab_live_url()` — two locks and a `String`
+  — from every `about_to_wait` tick merely to compare against `NEW_TAB_URL`.
+  Gate it on the next-push deadline it already maintains.
+- While a context menu is open, `to_overlay` rebuilds a `Vec<ContextMenuEntry>`
+  per `PointerMoved` (100–1000 Hz) purely to hit-test, then again during paint.
+- `loading_anim.rs` does `cell.ch.to_string()` per cell per frame; exposing a
+  `font::draw_char` removes it.
+
+---
+
 ## Corrections to the review itself
 
 Three findings in `code-review.md` were **wrong** and were deliberately not
 "fixed". Recorded here so nobody re-files them:
 
-- **L39** — `TYPEFLAG_FRAME` does have a caller (`context_menu.rs`), so it was
-  kept while the genuinely-dead constants around it were removed.
+- **L39** — `TYPEFLAG_FRAME` does have a caller
+  (`crates/buffr-core/src/context_menu.rs` — there are now three files by that
+  name), so it was kept while the genuinely-dead constants around it were
+  removed.
 - **L21** — `ActivationError` is live via `request_activation`; only the rest of
   the windowing parity surface was dead.
 - **L46 (the cef half)** — the `cef` crate at 148.x wraps **libcef 147.0.14**,
