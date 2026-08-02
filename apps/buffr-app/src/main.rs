@@ -180,6 +180,7 @@ use buffr_ui::{
     TabStrip, TabView,
 };
 
+mod cef_translate;
 mod cli_commands;
 mod crash_guard;
 mod engine_router;
@@ -194,9 +195,10 @@ mod single_instance;
 // them; allow the dead-code lints crate-wide here.
 #[allow(dead_code)]
 mod windowing;
+use crate::cef_translate::*;
 use crate::cli_commands::*;
 use crate::windowing::{
-    ApplicationHandler, CursorIcon, EventLoop, EventLoopProxy, Modifiers, Surface, SurfaceId,
+    ApplicationHandler, EventLoop, EventLoopProxy, Modifiers, Surface, SurfaceId,
     Window as Toplevel, WindowEvent,
 };
 use buffr_engine::MouseButton as NeutralMouseButton;
@@ -3437,7 +3439,7 @@ impl AppState {
         let Some((browser_id, raw)) = engine.take_cursor_change() else {
             return;
         };
-        let icon = cef_cursor_type_to_winit(raw);
+        let icon = cef_cursor_to_icon(raw);
         // winit's set_cursor is per-window (not per-seat the way wayr /
         // raw Wayland are), so apply to every live window: the main
         // toplevel + every popup. winit silently ignores the request
@@ -3599,7 +3601,7 @@ impl AppState {
             return;
         }
         if let Some(engine) = self.active_engine_dyn() {
-            let mods = wayr_mods_to_cef(&self.modifiers);
+            let mods = mods_to_cef(&self.modifiers);
             // osr_cursor is physical (browser-region-relative); OSR takes DIPs.
             let (phys_bx, phys_by) = self.osr_cursor;
             let mom_scale = self.current_scale();
@@ -5678,10 +5680,10 @@ impl AppState {
         // Forward every other key directly to CEF. The page handles it
         // natively — no Rust-side editor model.
         if let Some(host) = self.active_engine_dyn() {
-            let mods = wayr_mods_to_cef(&self.modifiers);
+            let mods = mods_to_cef(&self.modifiers);
             // edit_mode_handle_key only runs when EditFocus::Editing is
             // active, so a text input is always focused here.
-            let cef_events = wayr_key_to_neutral_events(event, mods, true);
+            let cef_events = key_to_neutral_events(event, mods, true);
             for ev in &cef_events {
                 tracing::debug!(
                     kind = ?ev.kind,
@@ -6111,7 +6113,7 @@ impl AppState {
                 let mods = self
                     .popups
                     .get(&window_id)
-                    .map(|p| wayr_mods_to_cef(&p.modifiers))
+                    .map(|p| mods_to_cef(&p.modifiers))
                     .unwrap_or(0);
                 if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
@@ -6136,7 +6138,7 @@ impl AppState {
                 popup.cursor = (phys_bx, phys_by);
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_scale);
-                let mods = wayr_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
+                let mods = mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
@@ -6153,7 +6155,7 @@ impl AppState {
                     return;
                 };
                 popup.modifiers = modifiers;
-                let Some(cef_button) = wayr_button_to_neutral(&button) else {
+                let Some(cef_button) = button_to_neutral(&button) else {
                     return;
                 };
                 let mouse_up = state != Pressed;
@@ -6184,7 +6186,7 @@ impl AppState {
                     popup.last_click_button = Some(cef_button);
                 }
                 let (phys_bx, phys_by) = popup.cursor;
-                let mods = wayr_mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
+                let mods = mods_to_cef(&popup.modifiers) | popup.mouse_buttons;
                 let click_count = popup.click_count;
                 let in_content = phys_by >= 0;
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
@@ -6245,8 +6247,8 @@ impl AppState {
                     return;
                 };
                 let (phys_bx, phys_by) = popup.cursor;
-                let mods = wayr_mods_to_cef(&popup.modifiers);
-                let (dx, dy, _is_pixel) = wayr_scroll_to_cef_delta(&scroll_ev);
+                let mods = mods_to_cef(&popup.modifiers);
+                let (dx, dy, _is_pixel) = scroll_to_cef_delta(&scroll_ev);
                 // CEF OSR consumes DIPs — route through helper (already region-relative).
                 let pop_wheel_scale = popup.window.scale_factor() as f32;
                 let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, pop_wheel_scale);
@@ -6260,12 +6262,12 @@ impl AppState {
                 let Some(popup) = self.popups.get(&window_id) else {
                     return;
                 };
-                let mods = wayr_mods_to_cef(&popup.modifiers);
+                let mods = mods_to_cef(&popup.modifiers);
                 // Popup windows (DevTools, target=_blank for OAuth flows etc.)
                 // don't track focus state in buffr — assume editable so
                 // typing into popup forms gets the same dispatch as the
                 // main window's edit-mode path.
-                let events = wayr_key_to_neutral_events(&key_ev, mods, true);
+                let events = key_to_neutral_events(&key_ev, mods, true);
                 if let Some(engine) = self.active_engine_dyn()
                     && browser_id >= 0
                 {
@@ -6275,430 +6277,6 @@ impl AppState {
                 }
             }
             _ => {}
-        }
-    }
-}
-
-// ---- OSR input helpers ---------------------------------------------------
-
-/// Convert a wayr `ScrollEvent` to a CEF wheel delta (dx, dy, is_pixel).
-///
-/// CEF's `send_mouse_wheel_event` takes integer deltas in wheel-tick units
-/// (~120 = 1 line). Touchpad / high-res sources produce sub-pixel deltas;
-/// we scale those by `PIXEL_DELTA_SCALE` (10× — empirical sweet spot for
-/// touchpad feel after testing). Discrete wheel ticks use the `discrete_steps`
-/// field (×120 per step).
-///
-/// wayr `ScrollEvent` carries a single axis per event; the orthogonal axis
-/// delta is always 0.
-///
-/// Sign convention: wayr matches winit — positive vertical = scroll up,
-/// positive horizontal = scroll right. CEF `send_mouse_wheel_event` uses
-/// the same convention, so no sign flip is needed here.
-fn wayr_scroll_to_cef_delta(ev: &crate::windowing::ScrollEvent) -> (i32, i32, bool) {
-    use crate::windowing::{AxisDirection, AxisSource};
-    const PIXEL_DELTA_SCALE: f32 = 10.0;
-    let is_pixel = matches!(ev.source, AxisSource::Finger | AxisSource::Continuous);
-    let scaled = if is_pixel {
-        (ev.delta as f32 * PIXEL_DELTA_SCALE) as i32
-    } else {
-        // Discrete: prefer discrete_steps if available, else use delta.
-        if ev.discrete_steps != 0 {
-            ev.discrete_steps * 120
-        } else {
-            (ev.delta as f32 * 120.0) as i32
-        }
-    };
-    match ev.axis {
-        AxisDirection::Horizontal => (scaled, 0, is_pixel),
-        AxisDirection::Vertical => (0, scaled, is_pixel),
-    }
-}
-
-/// Map a CEF `CursorType` raw discriminant to a winit [`CursorIcon`].
-///
-/// CEF emits the type via `DisplayHandler::on_cursor_change` whenever the
-/// page wants the system cursor to update (link hover → hand, input hover
-/// → ibeam, resize edge → corresponding resize arrow, …). The raw value is
-/// `CursorType::get_raw()` — kept opaque here so buffr-core stays free of
-/// winit deps.
-///
-/// Constants come from `cef_dll_sys::cef_cursor_type_t` (stable across
-/// CEF versions; no import needed here — we compare raw integers).
-///
-/// Unknown / unimplemented variants fall back to [`CursorIcon::Default`].
-fn cef_cursor_type_to_winit(raw: u32) -> CursorIcon {
-    // Raw values from cef_dll_sys::cef_cursor_type_t (CEF 147, stable).
-    const CT_POINTER: u32 = 0;
-    const CT_CROSS: u32 = 1;
-    const CT_HAND: u32 = 2;
-    const CT_IBEAM: u32 = 3;
-    const CT_WAIT: u32 = 4;
-    const CT_HELP: u32 = 5;
-    const CT_EASTRESIZE: u32 = 6;
-    const CT_NORTHRESIZE: u32 = 7;
-    const CT_NORTHEASTRESIZE: u32 = 8;
-    const CT_NORTHWESTRESIZE: u32 = 9;
-    const CT_SOUTHRESIZE: u32 = 10;
-    const CT_SOUTHEASTRESIZE: u32 = 11;
-    const CT_SOUTHWESTRESIZE: u32 = 12;
-    const CT_WESTRESIZE: u32 = 13;
-    const CT_NORTHSOUTHRESIZE: u32 = 14;
-    const CT_EASTWESTRESIZE: u32 = 15;
-    const CT_NORTHEASTSOUTHWESTRESIZE: u32 = 16;
-    const CT_NORTHWESTSOUTHEASTRESIZE: u32 = 17;
-    const CT_COLUMNRESIZE: u32 = 18;
-    const CT_ROWRESIZE: u32 = 19;
-    const CT_MOVE: u32 = 20;
-    const CT_VERTICALTEXT: u32 = 21;
-    const CT_CELL: u32 = 22;
-    const CT_CONTEXTMENU: u32 = 23;
-    const CT_ALIAS: u32 = 24;
-    const CT_PROGRESS: u32 = 25;
-    const CT_NODROP: u32 = 26;
-    const CT_COPY: u32 = 27;
-    const CT_NONE: u32 = 28;
-    const CT_NOTALLOWED: u32 = 29;
-    const CT_ZOOMIN: u32 = 30;
-    const CT_ZOOMOUT: u32 = 31;
-    const CT_GRAB: u32 = 32;
-    const CT_GRABBING: u32 = 33;
-    const CT_DND_NONE: u32 = 34;
-    const CT_DND_MOVE: u32 = 35;
-    const CT_DND_COPY: u32 = 36;
-    const CT_DND_LINK: u32 = 37;
-
-    if raw == CT_POINTER {
-        CursorIcon::Default
-    } else if raw == CT_CROSS {
-        CursorIcon::Crosshair
-    } else if raw == CT_HAND {
-        CursorIcon::Pointer
-    } else if raw == CT_IBEAM {
-        CursorIcon::Text
-    } else if raw == CT_WAIT {
-        CursorIcon::Wait
-    } else if raw == CT_HELP {
-        CursorIcon::Help
-    } else if raw == CT_EASTRESIZE {
-        CursorIcon::EResize
-    } else if raw == CT_NORTHRESIZE {
-        CursorIcon::NResize
-    } else if raw == CT_NORTHEASTRESIZE {
-        CursorIcon::NeResize
-    } else if raw == CT_NORTHWESTRESIZE {
-        CursorIcon::NwResize
-    } else if raw == CT_SOUTHRESIZE {
-        CursorIcon::SResize
-    } else if raw == CT_SOUTHEASTRESIZE {
-        CursorIcon::SeResize
-    } else if raw == CT_SOUTHWESTRESIZE {
-        CursorIcon::SwResize
-    } else if raw == CT_WESTRESIZE {
-        CursorIcon::WResize
-    } else if raw == CT_NORTHSOUTHRESIZE {
-        CursorIcon::NsResize
-    } else if raw == CT_EASTWESTRESIZE {
-        CursorIcon::EwResize
-    } else if raw == CT_NORTHEASTSOUTHWESTRESIZE {
-        CursorIcon::NeswResize
-    } else if raw == CT_NORTHWESTSOUTHEASTRESIZE {
-        CursorIcon::NwseResize
-    } else if raw == CT_COLUMNRESIZE {
-        CursorIcon::ColResize
-    } else if raw == CT_ROWRESIZE {
-        CursorIcon::RowResize
-    } else if raw == CT_MOVE {
-        CursorIcon::Move
-    } else if raw == CT_VERTICALTEXT {
-        CursorIcon::VerticalText
-    } else if raw == CT_CELL {
-        CursorIcon::Cell
-    } else if raw == CT_CONTEXTMENU {
-        CursorIcon::ContextMenu
-    } else if raw == CT_ALIAS {
-        CursorIcon::Alias
-    } else if raw == CT_PROGRESS {
-        CursorIcon::Progress
-    } else if raw == CT_NODROP || raw == CT_NOTALLOWED {
-        CursorIcon::NotAllowed
-    } else if raw == CT_COPY || raw == CT_DND_COPY {
-        CursorIcon::Copy
-    } else if raw == CT_NONE {
-        // winit has no "hide cursor" CursorIcon variant; closest match.
-        CursorIcon::Default
-    } else if raw == CT_ZOOMIN {
-        CursorIcon::ZoomIn
-    } else if raw == CT_ZOOMOUT {
-        CursorIcon::ZoomOut
-    } else if raw == CT_GRAB {
-        CursorIcon::Grab
-    } else if raw == CT_GRABBING {
-        CursorIcon::Grabbing
-    } else if raw == CT_DND_NONE {
-        CursorIcon::NotAllowed
-    } else if raw == CT_DND_MOVE {
-        CursorIcon::Move
-    } else if raw == CT_DND_LINK {
-        CursorIcon::Alias
-    } else {
-        CursorIcon::Default
-    }
-}
-
-/// Convert wayr `Modifiers` to CEF event-flag bits.
-///
-/// CEF bit values (from cef_dll_sys `cef_event_flags_t`):
-///   SHIFT   = 2
-///   CONTROL = 4
-///   ALT     = 8
-///   COMMAND = 128
-fn wayr_mods_to_cef(m: &Modifiers) -> u32 {
-    let mut flags: u32 = 0;
-    if m.shift {
-        flags |= 2;
-    }
-    if m.ctrl {
-        flags |= 4;
-    }
-    if m.alt {
-        flags |= 8;
-    }
-    if m.logo {
-        flags |= 128;
-    }
-    flags
-}
-
-/// Map a wayr `ScanCode` to a Windows virtual-key code for CEF.
-///
-/// wayr `ScanCode` carries the raw Linux evdev scancode (matches
-/// `linux/input-event-codes.h` — `KEY_ESC = 1`, `KEY_BACKSPACE = 14`,
-/// `KEY_TAB = 15`, `KEY_ENTER = 28`, …); no offset adjustment needed.
-/// Coverage: A-Z, 0-9, F1-F12, common navigation and editing keys,
-/// plus OEM punctuation so virtual-keyboard tools (wtype, xdotool etc.)
-/// that route through `zwp_virtual_keyboard_v1` still deliver VK codes.
-/// Unknowns map to 0 (CEF ignores `windows_key_code == 0` for non-printable
-/// keys; printable keys use `character` instead).
-fn scan_code_to_vk(sc: crate::windowing::ScanCode) -> i32 {
-    // wayr surfaces the raw evdev scancode directly — no offset.
-    match sc.0 {
-        // Row 1 — number row (evdev 2-13).
-        2 => 0x31,  // 1
-        3 => 0x32,  // 2
-        4 => 0x33,  // 3
-        5 => 0x34,  // 4
-        6 => 0x35,  // 5
-        7 => 0x36,  // 6
-        8 => 0x37,  // 7
-        9 => 0x38,  // 8
-        10 => 0x39, // 9
-        11 => 0x30, // 0
-        12 => 0xBD, // minus (-) VK_OEM_MINUS
-        13 => 0xBB, // equal (=) VK_OEM_PLUS
-        // Editing (evdev 14, 15).
-        14 => 0x08, // Backspace VK_BACK
-        15 => 0x09, // Tab VK_TAB
-        // QWERTY row (evdev 16-27).
-        16 => 0x51, // q
-        17 => 0x57, // w
-        18 => 0x45, // e
-        19 => 0x52, // r
-        20 => 0x54, // t
-        21 => 0x59, // y
-        22 => 0x55, // u
-        23 => 0x49, // i
-        24 => 0x4F, // o
-        25 => 0x50, // p
-        26 => 0xDB, // [ VK_OEM_4
-        27 => 0xDD, // ] VK_OEM_6
-        28 => 0x0D, // Enter VK_RETURN
-        // ASDF row (evdev 30-41).
-        30 => 0x41, // a
-        31 => 0x53, // s
-        32 => 0x44, // d
-        33 => 0x46, // f
-        34 => 0x47, // g
-        35 => 0x48, // h
-        36 => 0x4A, // j
-        37 => 0x4B, // k
-        38 => 0x4C, // l
-        39 => 0xBA, // ; VK_OEM_1
-        40 => 0xDE, // ' VK_OEM_7
-        41 => 0xC0, // ` VK_OEM_3
-        43 => 0xDC, // \ VK_OEM_5
-        // ZXCV row (evdev 44-53).
-        44 => 0x5A, // z
-        45 => 0x58, // x
-        46 => 0x43, // c
-        47 => 0x56, // v
-        48 => 0x42, // b
-        49 => 0x4E, // n
-        50 => 0x4D, // m
-        51 => 0xBC, // , VK_OEM_COMMA
-        52 => 0xBE, // . VK_OEM_PERIOD
-        53 => 0xBF, // / VK_OEM_2
-        57 => 0x20, // Space VK_SPACE
-        // F-keys (evdev 59-68 = F1-F10, 87-88 = F11-F12).
-        59 => 0x70, // F1
-        60 => 0x71, // F2
-        61 => 0x72, // F3
-        62 => 0x73, // F4
-        63 => 0x74, // F5
-        64 => 0x75, // F6
-        65 => 0x76, // F7
-        66 => 0x77, // F8
-        67 => 0x78, // F9
-        68 => 0x79, // F10
-        87 => 0x7A, // F11
-        88 => 0x7B, // F12
-        // Navigation cluster.
-        102 => 0x24, // Home
-        103 => 0x26, // ArrowUp
-        104 => 0x21, // PageUp
-        105 => 0x25, // ArrowLeft
-        106 => 0x27, // ArrowRight
-        107 => 0x23, // End
-        108 => 0x28, // ArrowDown
-        109 => 0x22, // PageDown
-        110 => 0x2D, // Insert
-        111 => 0x2E, // Delete
-        // Escape (evdev 1).
-        1 => 0x1B, // Escape VK_ESCAPE
-        _ => 0,
-    }
-}
-
-/// Resolve the CHAR-event code unit for a wayr key event.
-///
-/// Uses `event.text` (the IME-translated / xkb-composed string).
-/// For keys without a printable character (arrows, F-keys, modifiers),
-/// wayr sets `text` to `None` and we return 0.
-///
-/// Returns 0 when no single-UTF-16-unit character is available (multi-unit
-/// chars, named keys, modifier-only events).
-fn resolve_char_unit(text: Option<&str>) -> u16 {
-    text.and_then(|t| t.chars().next())
-        .map(|c| {
-            let mut buf = [0u16; 2];
-            let encoded = c.encode_utf16(&mut buf);
-            if encoded.len() == 1 { encoded[0] } else { 0 }
-        })
-        .unwrap_or(0)
-}
-
-/// Map a printable ASCII character to its Windows VK code.
-///
-/// Used when the typed character disagrees with the physical scancode —
-/// the wtype / xdotool / accessibility-tool case. Those tools build a
-/// synthetic xkb keymap that assigns each character to whichever scancode
-/// is convenient (`Escape`, `Digit1`, `Tab`, …); blindly translating the
-/// scancode would make Chromium fire keydown with `code=Escape` /
-/// `code=Tab` / `code=Backspace` while the character is actually `s` /
-/// `o` / `c`. Effects: Escape blurs the input, Tab jumps focus, Backspace
-/// deletes the previous character. Match by character instead so virtual
-/// keyboards send the VK that lines up with the text.
-///
-/// Returns `None` for characters with no direct VK (shifted punctuation
-/// like `@` `#` `$`, non-ASCII), letting the caller keep the
-/// scancode-derived VK as a fallback.
-fn char_to_vk(ch: u16) -> Option<i32> {
-    let c = char::from_u32(ch as u32)?;
-    Some(match c {
-        'a'..='z' => (c as u32 - 'a' as u32 + 0x41) as i32, // VK_A..VK_Z
-        'A'..='Z' => c as i32,                              // VK_A..VK_Z
-        '0'..='9' => c as i32,                              // VK_0..VK_9
-        ' ' => 0x20,                                        // VK_SPACE
-        '\r' => 0x0D,                                       // VK_RETURN
-        '\n' => 0x0D,
-        '\t' => 0x09,     // VK_TAB
-        '\x08' => 0x08,   // VK_BACK
-        '\x1b' => 0x1B,   // VK_ESCAPE
-        '.' => 0xBE,      // VK_OEM_PERIOD
-        ',' => 0xBC,      // VK_OEM_COMMA
-        '-' => 0xBD,      // VK_OEM_MINUS
-        '=' => 0xBB,      // VK_OEM_PLUS
-        ';' => 0xBA,      // VK_OEM_1
-        '/' => 0xBF,      // VK_OEM_2
-        '`' => 0xC0,      // VK_OEM_3
-        '[' => 0xDB,      // VK_OEM_4
-        '\\' => 0xDC,     // VK_OEM_5
-        ']' => 0xDD,      // VK_OEM_6
-        '\'' => 0xDE,     // VK_OEM_7
-        _ => return None, // shifted symbols (@ # $ % …), non-ASCII
-    })
-}
-
-/// Build neutral [`NeutralKeyEvent`]s from a wayr key event.
-///
-/// `focus_on_editable_field` reports whether a text input is currently
-/// focused — Chromium routes editable-field shortcuts and composition
-/// state differently when this flag is set, and some virtual-keyboard
-/// pathways need it to dispatch keystrokes through the same DOM event
-/// flow as real-keyboard typing.
-///
-/// Returns an empty vec for modifier-only presses (no VK code, no character).
-fn wayr_key_to_neutral_events(
-    event: &crate::windowing::KeyEvent,
-    modifiers: u32,
-    focus_on_editable_field: bool,
-) -> Vec<buffr_engine::NeutralKeyEvent> {
-    use buffr_engine::{KeyEventKind, NeutralKeyEvent};
-
-    let vk_from_sc = scan_code_to_vk(event.scancode);
-    let ch = resolve_char_unit(event.text.as_deref());
-    // Prefer a VK derived from the resolved character when one is
-    // available — virtual_keyboard sources (wtype etc.) put characters
-    // on arbitrary scancodes, so the physical mapping would otherwise
-    // deliver e.g. `VK_BACK` with character `'c'`. Fall through to the
-    // scancode-derived VK for shifted symbols / non-ASCII / no-text
-    // events (real-keyboard typing matches both, so this is a no-op).
-    let vk = char_to_vk(ch).unwrap_or(vk_from_sc);
-
-    // Skip pure modifier keys (no VK, no character text).
-    if vk == 0 && ch == 0 {
-        return Vec::new();
-    }
-
-    match event.state {
-        crate::windowing::KeyState::Pressed => {
-            let raw = NeutralKeyEvent {
-                kind: KeyEventKind::RawDown,
-                windows_key_code: vk,
-                native_key_code: 0,
-                character: ch,
-                unmodified_character: ch,
-                modifiers,
-                is_system_key: false,
-                focus_on_editable_field,
-            };
-            if ch != 0 {
-                let char_ev = NeutralKeyEvent {
-                    kind: KeyEventKind::Char,
-                    windows_key_code: ch as i32,
-                    native_key_code: 0,
-                    character: ch,
-                    unmodified_character: ch,
-                    modifiers,
-                    is_system_key: false,
-                    focus_on_editable_field,
-                };
-                vec![raw, char_ev]
-            } else {
-                vec![raw]
-            }
-        }
-        crate::windowing::KeyState::Released => {
-            vec![NeutralKeyEvent {
-                kind: KeyEventKind::Up,
-                windows_key_code: vk,
-                native_key_code: 0,
-                character: ch,
-                unmodified_character: ch,
-                modifiers,
-                is_system_key: false,
-                focus_on_editable_field,
-            }]
         }
     }
 }
@@ -7012,21 +6590,6 @@ fn paint_chrome_strips(
 
 /// Double-click detection window.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
-
-/// Map a wayr `PointerButton` to a neutral [`buffr_engine::MouseButton`].
-/// Returns `None` for `Other(_)` buttons — callers that need a fallback
-/// use [`buffr_engine::MouseButton::Other`] directly.
-fn wayr_button_to_neutral(
-    button: &crate::windowing::PointerButton,
-) -> Option<buffr_engine::MouseButton> {
-    use crate::windowing::PointerButton;
-    match button {
-        PointerButton::Left => Some(buffr_engine::MouseButton::Left),
-        PointerButton::Right => Some(buffr_engine::MouseButton::Right),
-        PointerButton::Middle => Some(buffr_engine::MouseButton::Middle),
-        _ => None,
-    }
-}
 
 /// Map a [`PageMode`] to the status-line label rendered into the
 /// window title. `Pending` collapses to `NORMAL` because the engine
@@ -7642,7 +7205,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             }
             WindowEvent::PointerLeft => {
                 if let Some(host) = self.active_engine_dyn() {
-                    let mods = wayr_mods_to_cef(&self.modifiers);
+                    let mods = mods_to_cef(&self.modifiers);
                     host.osr_mouse_leave(mods);
                 }
             }
@@ -7724,7 +7287,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // Logical (DIP) coords for CEF — route through helper.
                     let scale = self.current_scale();
                     let (bx, by) = physical_cursor_to_dip(phys_bx, phys_by, 0, scale);
-                    let mods = wayr_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
+                    let mods = mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     host.osr_mouse_move(bx, by, mods);
 
                     // Promote to Visual the moment a left-button drag
@@ -7988,7 +7551,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 let mut enter_visual = false;
                 let mut exit_visual = false;
                 if let Some(host) = self.active_engine_dyn()
-                    && let Some(cef_button) = wayr_button_to_neutral(&button)
+                    && let Some(cef_button) = button_to_neutral(&button)
                 {
                     use crate::windowing::PointerButtonState::Released;
                     let mouse_up = state == Released;
@@ -8068,7 +7631,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             }
                         }
                     }
-                    let mods = wayr_mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
+                    let mods = mods_to_cef(&self.modifiers) | self.osr_mouse_buttons;
                     // osr_cursor is in physical pixels (browser-region-relative);
                     // CEF OSR takes DIPs — route through helper (cef_y_offset=0
                     // because osr_cursor is already region-relative).
@@ -8125,7 +7688,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     // No active engine yet (startup race) — silently discard the event.
                     return;
                 };
-                let (dx, dy, is_pixel_delta) = wayr_scroll_to_cef_delta(&scroll_ev);
+                let (dx, dy, is_pixel_delta) = scroll_to_cef_delta(&scroll_ev);
                 if is_pixel_delta {
                     // Track velocity only for high-res input; discrete
                     // wheel ticks have their own physical inertia.
@@ -8136,7 +7699,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     self.osr_wheel_velocity = (0.0, 0.0);
                     self.osr_wheel_last_at = None;
                 }
-                let mods = wayr_mods_to_cef(&self.modifiers);
+                let mods = mods_to_cef(&self.modifiers);
                 // osr_cursor is physical (browser-region-relative); CEF OSR takes DIPs.
                 let (phys_bx, phys_by) = self.osr_cursor;
                 let wheel_scale = self.current_scale();
@@ -8274,7 +7837,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                             matches!(post_mode, PageMode::Insert | PageMode::Command);
                         if pass_through {
                             if let Some(host) = self.active_engine_dyn() {
-                                let mods = wayr_mods_to_cef(&self.modifiers);
+                                let mods = mods_to_cef(&self.modifiers);
                                 // Reject path: in Insert/Command modes a
                                 // text input may or may not be focused.
                                 // Use `edit_focus` to set the flag.
@@ -8287,7 +7850,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                                     editable,
                                     "page-mode Reject pass-through (key bypassed edit_mode_handle_key)"
                                 );
-                                for ev in wayr_key_to_neutral_events(&event, mods, editable) {
+                                for ev in key_to_neutral_events(&event, mods, editable) {
                                     host.osr_key_event(ev);
                                 }
                             }
@@ -10217,7 +9780,7 @@ mod tests {
     // constructing crate::windowing::KeyEvent in unit tests.
     //
     // The production code paths (wayr_key_to_planned, scan_code_to_vk,
-    // resolve_char_unit, wayr_key_to_neutral_events) are covered at the
+    // resolve_char_unit, key_to_neutral_events) are covered at the
     // integration level.
 
     /// Test the `EditFocus` FSM state transitions (None ↔ Editing).

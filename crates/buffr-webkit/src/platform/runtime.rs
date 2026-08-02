@@ -1081,7 +1081,7 @@ pub(crate) struct CursorSignalCtx {
 /// Map a CSS cursor keyword to a CEF `cef_cursor_type_t` raw discriminant.
 ///
 /// Values mirror `cef_cursor_type_t` from CEF 147, which is also what
-/// `apps/buffr-app/src/main.rs::cef_cursor_type_to_winit` expects.
+/// `apps/buffr-app/src/cef_translate.rs::cef_cursor_to_icon` expects.
 pub(crate) fn css_cursor_to_cef_raw(css: &str) -> u32 {
     match css {
         "default" | "auto" => 0, // POINTER

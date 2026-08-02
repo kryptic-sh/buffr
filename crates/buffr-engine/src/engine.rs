@@ -622,7 +622,7 @@ pub trait BrowserEngine: Send + Sync {
     // Returns a pending cursor change as `(browser_id, raw_kind)` and clears
     // the dirty flag. The `raw_kind` is the platform-raw discriminant from
     // CEF's `CursorType` enum (a `u32`); the apps layer maps it to
-    // `winit::CursorIcon` via `cef_cursor_type_to_winit`.
+    // the windowing layer's `CursorIcon` via `cef_cursor_to_icon`.
     //
     // Returning the raw pair rather than a `SharedCursorState` handle keeps
     // `buffr-engine` free of any `buffr-core` dependency (which would be
