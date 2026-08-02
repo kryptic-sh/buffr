@@ -69,9 +69,12 @@ mod inner {
     pub struct Heartbeat {
         last_alive_us: Arc<AtomicU64>,
         epoch: Instant,
-        /// Cleared when the background thread observes a fatal write
-        /// error so the next `mark_alive` does not log spurious staleness.
-        thread_alive: Arc<AtomicBool>,
+        /// Set once, and only, on the terminal write-error path.  The
+        /// background thread's other "not pinging" state — the UI
+        /// thread having gone stale — is recoverable and deliberately
+        /// invisible here, so the UI keeps marking itself alive and the
+        /// loop's recovery path can fire.
+        thread_fatal: Arc<AtomicBool>,
     }
 
     impl Heartbeat {
@@ -106,9 +109,10 @@ mod inner {
             // one ping before the UI thread has a chance to mark itself.
             let last_alive_us = Arc::new(AtomicU64::new(0));
             let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
 
             let alive_clone = Arc::clone(&last_alive_us);
-            let thread_alive_clone = Arc::clone(&thread_alive);
+            let thread_fatal_clone = Arc::clone(&thread_fatal);
             thread::Builder::new()
                 .name("buffr-heartbeat".into())
                 .spawn(move || {
@@ -116,7 +120,8 @@ mod inner {
                         stream,
                         epoch,
                         alive_clone,
-                        thread_alive_clone,
+                        thread_alive,
+                        thread_fatal_clone,
                         HEARTBEAT_INTERVAL,
                         UI_LIVENESS_TIMEOUT,
                     );
@@ -126,7 +131,7 @@ mod inner {
             Some(Self {
                 last_alive_us,
                 epoch,
-                thread_alive,
+                thread_fatal,
             })
         }
 
@@ -140,11 +145,26 @@ mod inner {
             self.last_alive_us.store(us, Ordering::Relaxed);
         }
 
-        /// Whether the background heartbeat thread is still alive
-        /// (i.e. no fatal IO error has occurred).  The UI thread uses
-        /// this to skip per-event work when the connection is gone.
-        pub fn is_alive(&self) -> bool {
-            self.thread_alive.load(Ordering::Relaxed)
+        /// Whether the background thread died on an unrecoverable write
+        /// error.  Only then is dropping the handle correct: a merely
+        /// stale heartbeat must keep receiving `mark_alive` so the
+        /// loop's recovery path can resume pinging.
+        pub fn is_fatal(&self) -> bool {
+            self.thread_fatal.load(Ordering::Relaxed)
+        }
+
+        /// One UI-thread tick: stamp liveness, then report whether the
+        /// caller should keep the handle.
+        ///
+        /// Returns `false` only on a terminal failure.  A stall is
+        /// deliberately NOT terminal: the loop withholds pings but can
+        /// recover, and it can only see the recovery if the UI thread
+        /// keeps calling this — dropping the handle on a stall makes
+        /// that recovery unreachable and turns a transient GPU block
+        /// into a supervisor kill of a healthy browser.
+        pub fn tick(&self) -> bool {
+            self.mark_alive();
+            !self.is_fatal()
         }
     }
 
@@ -166,6 +186,7 @@ mod inner {
         epoch: Instant,
         last_alive_us: Arc<AtomicU64>,
         thread_alive: Arc<AtomicBool>,
+        thread_fatal: Arc<AtomicBool>,
         interval: Duration,
         liveness_timeout: Duration,
     ) {
@@ -225,6 +246,7 @@ mod inner {
                         continue;
                     }
                     tracing::warn!(error = %e, "heartbeat: fatal write error; thread exiting");
+                    thread_fatal.store(true, Ordering::Relaxed);
                     thread_alive.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -287,11 +309,13 @@ mod inner {
 
             let last_alive_us = Arc::new(AtomicU64::new(0));
             let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
             let epoch = Instant::now();
             let ta = Arc::clone(&thread_alive);
+            let tf = Arc::clone(&thread_fatal);
             let la = Arc::clone(&last_alive_us);
             let h = thread::spawn(move || {
-                run_heartbeat_loop(client, epoch, la, ta, TEST_INTERVAL, TEST_LIVENESS);
+                run_heartbeat_loop(client, epoch, la, ta, tf, TEST_INTERVAL, TEST_LIVENESS);
             });
 
             let mut buf = [0u8; 1];
@@ -299,6 +323,7 @@ mod inner {
             assert_eq!(n, 1);
             assert_eq!(buf[0], 0x01);
             assert!(thread_alive.load(Ordering::Relaxed));
+            assert!(!thread_fatal.load(Ordering::Relaxed));
 
             drop(server);
             let _ = h.join();
@@ -357,13 +382,18 @@ mod inner {
             // grows past TEST_LIVENESS within a couple of intervals.
             let last_alive_us = Arc::new(AtomicU64::new(1));
             let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
             let ta = Arc::clone(&thread_alive);
+            let tf = Arc::clone(&thread_fatal);
             let la = Arc::clone(&last_alive_us);
             let h = thread::spawn(move || {
-                run_heartbeat_loop(client, epoch, la, ta, TEST_INTERVAL, TEST_LIVENESS);
+                run_heartbeat_loop(client, epoch, la, ta, tf, TEST_INTERVAL, TEST_LIVENESS);
             });
 
             wait_until_stale(&thread_alive, Duration::from_secs(5));
+            // A stall is recoverable, so it must NOT look terminal to the
+            // UI thread — that is what keeps `mark_alive` coming.
+            assert!(!thread_fatal.load(Ordering::Relaxed));
             drain_pings(&mut server);
 
             // The decisive assertion: still no EOF and no further pings —
@@ -399,10 +429,12 @@ mod inner {
             let epoch = Instant::now();
             let last_alive_us = Arc::new(AtomicU64::new(1));
             let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
             let ta = Arc::clone(&thread_alive);
+            let tf = Arc::clone(&thread_fatal);
             let la = Arc::clone(&last_alive_us);
             let h = thread::spawn(move || {
-                run_heartbeat_loop(client, epoch, la, ta, TEST_INTERVAL, TEST_LIVENESS);
+                run_heartbeat_loop(client, epoch, la, ta, tf, TEST_INTERVAL, TEST_LIVENESS);
             });
 
             wait_until_stale(&thread_alive, Duration::from_secs(5));
@@ -432,6 +464,145 @@ mod inner {
             drop(server);
             let _ = h.join();
         }
+
+        /// End-to-end recovery through the **production** UI-side policy.
+        ///
+        /// `recovered_ui_resumes_pinging` above pokes `last_alive_us`
+        /// directly, so it passes even when the real UI thread would have
+        /// thrown its handle away. This one drives [`Heartbeat::tick`] —
+        /// exactly what `AppState::tick_heartbeat` calls — so a policy that
+        /// treats a stall as terminal stops the marks, the loop never sees
+        /// the recovery, and the socket read below times out.
+        #[test]
+        fn transient_ui_stall_recovers_through_tick_policy() {
+            let (mut server, client, _dir) = socket_pair();
+
+            let epoch = Instant::now();
+            // Marked alive 1 µs after the epoch and never again: the UI is
+            // "blocked in write_texture" and the loop will declare it stale.
+            let last_alive_us = Arc::new(AtomicU64::new(1));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
+
+            let hb = Heartbeat {
+                last_alive_us: Arc::clone(&last_alive_us),
+                epoch,
+                thread_fatal: Arc::clone(&thread_fatal),
+            };
+
+            let ta = Arc::clone(&thread_alive);
+            let tf = Arc::clone(&thread_fatal);
+            let la = Arc::clone(&last_alive_us);
+            let loop_thread = thread::spawn(move || {
+                run_heartbeat_loop(client, epoch, la, ta, tf, TEST_INTERVAL, TEST_LIVENESS);
+            });
+
+            wait_until_stale(&thread_alive, Duration::from_secs(5));
+            assert!(
+                !thread_fatal.load(Ordering::Relaxed),
+                "a stall is recoverable and must not be reported as terminal"
+            );
+            drain_pings(&mut server);
+
+            // The GPU call returned: the UI thread starts ticking again,
+            // running the same keep-or-drop decision as the event loop.
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_c = Arc::clone(&stop);
+            let ui = thread::spawn(move || {
+                let mut handle = Some(hb);
+                while !stop_c.load(Ordering::Relaxed) {
+                    if let Some(h) = handle.as_ref()
+                        && !h.tick()
+                    {
+                        handle = None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                handle.is_some()
+            });
+
+            // Pings must not merely restart, they must KEEP flowing. A UI
+            // thread that marks itself once and then lets its handle go
+            // still buys a short tail: the loop pings until staleness
+            // crosses TEST_LIVENESS again, i.e. TEST_LIVENESS/TEST_INTERVAL
+            // of them. Read several times that many, so only sustained
+            // marking can satisfy it.
+            let tail_pings = (TEST_LIVENESS.as_micros() / TEST_INTERVAL.as_micros()) as usize;
+            let required = 4 * tail_pings;
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set_read_timeout");
+            let mut buf = [0u8; 1];
+            for i in 0..required {
+                let n = server.read(&mut buf).unwrap_or_else(|e| {
+                    panic!("ping {i} of {required} never arrived after the UI recovered: {e}")
+                });
+                assert_eq!(n, 1);
+                assert_eq!(buf[0], 0x01);
+            }
+            assert!(
+                thread_alive.load(Ordering::Relaxed),
+                "the loop must clear the stall when the UI thread comes back"
+            );
+
+            stop.store(true, Ordering::Relaxed);
+            let kept = ui.join().expect("ui thread");
+            assert!(
+                kept,
+                "a recoverable stall must not make the UI thread drop its heartbeat handle"
+            );
+
+            drop(server);
+            let _ = loop_thread.join();
+        }
+
+        /// The other half of the fix: a genuinely dead heartbeat must still
+        /// be dropped, so keeping the handle through a stall cannot make a
+        /// broken socket look healthy forever.
+        #[test]
+        fn fatal_write_error_is_terminal_and_drops_the_handle() {
+            let (server, client, _dir) = socket_pair();
+
+            let epoch = Instant::now();
+            let last_alive_us = Arc::new(AtomicU64::new(0));
+            let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
+
+            let hb = Heartbeat {
+                last_alive_us: Arc::clone(&last_alive_us),
+                epoch,
+                thread_fatal: Arc::clone(&thread_fatal),
+            };
+
+            // Supervisor end gone: the loop's very first write gets EPIPE.
+            drop(server);
+
+            let ta = Arc::clone(&thread_alive);
+            let tf = Arc::clone(&thread_fatal);
+            let la = Arc::clone(&last_alive_us);
+            let loop_thread = thread::spawn(move || {
+                run_heartbeat_loop(client, epoch, la, ta, tf, TEST_INTERVAL, TEST_LIVENESS);
+            });
+
+            loop_thread.join().expect("loop must exit on a fatal write");
+            assert!(
+                thread_fatal.load(Ordering::Relaxed),
+                "a fatal write error must be recorded as terminal"
+            );
+            assert!(!thread_alive.load(Ordering::Relaxed));
+
+            // The UI-side policy must now throw the handle away.
+            let mut handle = Some(hb);
+            if let Some(h) = handle.as_ref()
+                && !h.tick()
+            {
+                handle = None;
+            }
+            assert!(
+                handle.is_none(),
+                "a dead heartbeat must be dropped so the supervisor restarts us"
+            );
+        }
     }
 }
 
@@ -452,7 +623,9 @@ mod inner {
     pub struct Heartbeat {
         last_alive_us: Arc<AtomicU64>,
         epoch: Instant,
-        thread_alive: Arc<AtomicBool>,
+        /// See the Unix twin: terminal write failures only.  A stall is
+        /// recoverable and deliberately invisible here.
+        thread_fatal: Arc<AtomicBool>,
     }
 
     impl Heartbeat {
@@ -500,9 +673,10 @@ mod inner {
             let epoch = Instant::now();
             let last_alive_us = Arc::new(AtomicU64::new(0));
             let thread_alive = Arc::new(AtomicBool::new(true));
+            let thread_fatal = Arc::new(AtomicBool::new(false));
 
             let alive_clone = Arc::clone(&last_alive_us);
-            let thread_alive_clone = Arc::clone(&thread_alive);
+            let thread_fatal_clone = Arc::clone(&thread_fatal);
             thread::Builder::new()
                 .name("buffr-heartbeat".into())
                 .spawn(move || {
@@ -510,7 +684,8 @@ mod inner {
                         file,
                         epoch,
                         alive_clone,
-                        thread_alive_clone,
+                        thread_alive,
+                        thread_fatal_clone,
                         HEARTBEAT_INTERVAL,
                         UI_LIVENESS_TIMEOUT,
                     );
@@ -520,7 +695,7 @@ mod inner {
             Some(Self {
                 last_alive_us,
                 epoch,
-                thread_alive,
+                thread_fatal,
             })
         }
 
@@ -529,8 +704,16 @@ mod inner {
             self.last_alive_us.store(us, Ordering::Relaxed);
         }
 
-        pub fn is_alive(&self) -> bool {
-            self.thread_alive.load(Ordering::Relaxed)
+        /// See the Unix twin.
+        pub fn is_fatal(&self) -> bool {
+            self.thread_fatal.load(Ordering::Relaxed)
+        }
+
+        /// See the Unix twin: `false` only on a terminal failure, never
+        /// on a recoverable stall.
+        pub fn tick(&self) -> bool {
+            self.mark_alive();
+            !self.is_fatal()
         }
     }
 
@@ -541,6 +724,7 @@ mod inner {
         epoch: Instant,
         last_alive_us: Arc<AtomicU64>,
         thread_alive: Arc<AtomicBool>,
+        thread_fatal: Arc<AtomicBool>,
         interval: Duration,
         liveness_timeout: Duration,
     ) {
@@ -590,6 +774,7 @@ mod inner {
                         continue;
                     }
                     tracing::warn!(error = %e, "heartbeat: fatal write error; thread exiting");
+                    thread_fatal.store(true, Ordering::Relaxed);
                     thread_alive.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -614,8 +799,14 @@ mod inner {
 
         pub fn mark_alive(&self) {}
 
-        pub fn is_alive(&self) -> bool {
+        pub fn is_fatal(&self) -> bool {
             false
+        }
+
+        /// No supervisor here, so nothing is ever terminal — and
+        /// `try_connect` never hands out a handle anyway.
+        pub fn tick(&self) -> bool {
+            true
         }
     }
 }

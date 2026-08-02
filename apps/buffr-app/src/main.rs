@@ -5440,14 +5440,18 @@ impl AppState {
     ///
     /// The background heartbeat thread owns the socket and does the actual
     /// 1 Hz ping; all the UI thread does is prove it is still turning over.
-    /// Drops the handle when the bg thread reported a fatal write error, so
-    /// the supervisor sees silence and restarts us.
+    ///
+    /// `tick` drops the handle only on a terminal write error. It must NOT
+    /// drop it while the bg thread is merely withholding pings after a
+    /// `UI_LIVENESS_TIMEOUT` stall: that state is recoverable, and the bg
+    /// thread can only see the recovery through the marks this makes — so
+    /// letting go there would turn a multi-second `queue.submit` block into
+    /// a supervisor kill of a perfectly healthy browser.
     fn tick_heartbeat(&mut self) {
-        if let Some(h) = self.heartbeat.as_ref() {
-            h.mark_alive();
-            if !h.is_alive() {
-                self.heartbeat = None;
-            }
+        if let Some(h) = self.heartbeat.as_ref()
+            && !h.tick()
+        {
+            self.heartbeat = None;
         }
     }
 

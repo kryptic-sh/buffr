@@ -8,6 +8,18 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Scrolling vertically with a touchpad no longer navigates back through history.
+  Both swipe call sites passed the scroll delta as the horizontal component, so
+  a downward scroll accumulated as a left-to-right swipe and fired `HistoryBack`
+  after about 150 pixels.
+- A transient multi-second GPU stall (`queue.write_texture` / `queue.submit`) no
+  longer causes the supervisor to kill and respawn a healthy browser. The UI
+  thread keeps marking liveness through a stall so the heartbeat thread's
+  existing recovery path can fire; the heartbeat is now dropped only on a
+  terminal socket write error.
+
 ## [0.14.8] - 2026-08-02
 
 A release-pipeline fix. v0.14.7 published everywhere except the AUR, so
