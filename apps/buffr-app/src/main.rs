@@ -149,6 +149,11 @@ use buffr_core::{
     drain_edit_events, expire_stale_notices, new_download_notice_queue, new_edit_event_sink,
     new_find_sink, new_hint_event_sink, new_inhibitor, peek_download_notice,
 };
+use buffr_engine::PromptOutcome;
+use buffr_engine::permissions::{
+    PromptIdentity, ResolveTarget, peek_front_entry as peek_permission_front_entry,
+    queue_len as permissions_queue_len, take_front_matching as take_permission_front_matching,
+};
 use buffr_engine::{
     Backend, BackendOpenOptions, NewTabHtmlProvider, ProfilePaths, TabId,
     newtab::{
@@ -158,9 +163,6 @@ use buffr_engine::{
 use buffr_engine::{
     PopupCloseSink, PopupCreateSink, SharedOsrFrame, SharedOsrViewState, drain_popup_closes,
     drain_popup_creates, drain_popup_targets,
-};
-use buffr_engine::{
-    PromptOutcome, peek_permission_front, permissions_queue_len, pop_permission_front,
 };
 use buffr_modal::{
     Engine, EngineModifiers, Key, NamedKey, PageMode, PlannedInput, SpecialKey, Step,
@@ -1479,6 +1481,17 @@ struct AppState {
     /// the active engine's permissions queue is being shown. Keystrokes
     /// route to the prompt resolution path while this is set.
     permissions_prompt: Option<PermissionsPrompt>,
+    /// Identity of the queue entry `permissions_prompt` is rendering.
+    ///
+    /// The widget carries only what it draws (origin, capability labels,
+    /// backlog count) — nothing that says *which* request that is. Backends
+    /// can withdraw a queued request at any time (CEF does this when the tab
+    /// navigates away), so the front of the queue when the user answers is
+    /// not necessarily the entry they read. This is the identity the answer
+    /// is matched against before anything is stored or resolved; see
+    /// [`buffr_engine::permissions::resolve_target`]. Always `Some` while
+    /// `permissions_prompt` is `Some`.
+    permissions_prompt_id: Option<PromptIdentity>,
     /// Pending close-pinned-tab confirmation. When `Some(id)`, a
     /// yes/no banner is shown and the close is gated on the user's
     /// answer (`y` / yes-button → close; `n` / no-button / `<Esc>`
@@ -2033,6 +2046,7 @@ impl AppState {
             zoom,
             permissions,
             permissions_prompt: None,
+            permissions_prompt_id: None,
             confirm_close_pinned: None,
             download_notice_queue,
             search_config,
@@ -4832,37 +4846,64 @@ impl AppState {
         true
     }
 
-    /// Pull the front of the permissions queue into a renderable
-    /// [`PermissionsPrompt`] if no prompt is currently shown. Returns
-    /// `true` when the prompt state changed (so the caller knows to
-    /// resync the CEF rect + redraw).
+    /// Bring the on-screen permission prompt in line with the front of the
+    /// permissions queue. Returns `true` when the prompt state changed (so
+    /// the caller knows to resync the CEF rect + redraw).
+    ///
+    /// A prompt already on screen is left alone **only** while the entry it
+    /// is rendering is still the queue front. If the backend withdrew that
+    /// entry, the prompt is taken down and replaced by the current front (or
+    /// nothing) — otherwise the chrome would keep asking about a request that
+    /// no longer exists, and the answer would land on an unrelated one.
+    ///
+    /// The identity of the displayed entry is stashed in
+    /// `permissions_prompt_id`; [`Self::resolve_permission`] matches the
+    /// user's answer against it.
     ///
     /// Phase 8a (#88): queue is fetched from the active engine via the
     /// neutral `BrowserEngine::permissions_queue()` trait method so both
     /// CEF and blink-cdp share the same prompt path.
     fn sync_permissions_prompt(&mut self) -> bool {
-        // Already showing a prompt — nothing to do until the user
-        // resolves it.
-        if self.permissions_prompt.is_some() {
-            return false;
-        }
         let queue = match self.active_engine_dyn() {
             Some(engine) => engine.permissions_queue(),
-            None => return false,
+            // No engine to answer to — drop any prompt still on screen so a
+            // keypress can't be aimed at a queue that no longer exists.
+            None => return self.clear_permissions_prompt(),
         };
         let queue_total = permissions_queue_len(&queue);
-        if queue_total == 0 {
-            return false;
+        let front = peek_permission_front_entry(&queue);
+
+        // A prompt is already up. It stays up only while the entry it is
+        // rendering is still the front of the queue: backends withdraw
+        // requests (CEF's `OnDismissPermissionPrompt` on navigation), and a
+        // prompt for a withdrawn request must not linger — the user would be
+        // answering a question nobody is asking any more.
+        let mut changed = false;
+        if self.permissions_prompt.is_some() {
+            let still_current = match (&front, &self.permissions_prompt_id) {
+                (Some(f), Some(id)) => id.matches(f),
+                _ => false,
+            };
+            if still_current {
+                return false;
+            }
+            debug!("permissions: displayed request withdrawn — replacing prompt");
+            changed = self.clear_permissions_prompt();
+            // Fall through: show whatever is at the front now, if anything.
         }
+
+        let Some(front) = front else {
+            // Nothing left to show. `changed` is true when the withdrawal
+            // branch above just took a stale prompt off screen.
+            return changed;
+        };
         // queue_total includes the front entry; "more pending after
         // this one" is queue_total - 1.
         let queue_after = queue_total.saturating_sub(1) as u32;
-        let Some((origin, caps)) = peek_permission_front(&queue) else {
-            return false;
-        };
-        let labels: Vec<String> = caps.iter().map(|c| c.human_label()).collect();
+        let labels: Vec<String> = front.capabilities.iter().map(|c| c.human_label()).collect();
+        self.permissions_prompt_id = Some(PromptIdentity::of(&front));
         self.permissions_prompt = Some(PermissionsPrompt {
-            origin,
+            origin: front.origin.clone(),
             capabilities: labels,
             queue_len: queue_after,
         });
@@ -4870,26 +4911,63 @@ impl AppState {
         true
     }
 
-    /// Resolve the front-of-queue permission with `outcome`. The
-    /// callback fires exactly once; the next prompt (if any) is
-    /// drawn on the following tick via [`Self::sync_permissions_prompt`].
+    /// Drop the on-screen permission prompt and its remembered identity.
+    /// Returns `true` when there was one to drop (i.e. the prompt state
+    /// changed and the chrome needs a redraw).
+    fn clear_permissions_prompt(&mut self) -> bool {
+        let had = self.permissions_prompt.is_some();
+        self.permissions_prompt = None;
+        self.permissions_prompt_id = None;
+        if had {
+            self.mark_chrome_dirty();
+        }
+        had
+    }
+
+    /// Resolve the permission request **that is on screen** with `outcome`.
+    /// The callback fires exactly once; the next prompt (if any) is drawn
+    /// immediately via [`Self::sync_permissions_prompt`].
+    ///
+    /// If the displayed request is no longer the front of the queue — the
+    /// backend withdrew it while the user was reading — the answer is
+    /// discarded rather than applied to whatever took its place. Nothing is
+    /// written to the permissions store and the queue is left untouched, so
+    /// the request the user never saw stays unanswered.
     ///
     /// Phase 8a (#88): delegates to `BrowserEngine::resolve_permission`
     /// so both CEF and blink-cdp can handle the outcome correctly.
     fn resolve_permission(&mut self, outcome: PromptOutcome) {
         let Some(engine) = self.active_engine_dyn() else {
             warn!("permissions: resolve called with no active engine");
-            self.permissions_prompt = None;
-            self.mark_chrome_dirty();
+            self.clear_permissions_prompt();
             return;
         };
         let queue = engine.permissions_queue();
-        let Some(pending) = pop_permission_front(&queue) else {
-            warn!("permissions: resolve called with empty queue");
-            self.permissions_prompt = None;
-            self.mark_chrome_dirty();
-            return;
-        };
+        // Apply the answer to the entry the user actually read, or to
+        // nothing at all. The front of the queue is not proof of identity:
+        // the backend can withdraw the displayed request (tab navigated
+        // away) and leave an unrelated one in its place, and answering that
+        // would store a decision — possibly a persistent one — for an origin
+        // and capability the user never saw.
+        let pending =
+            match take_permission_front_matching(&queue, self.permissions_prompt_id.as_ref()) {
+                ResolveTarget::Apply(pending) => pending,
+                ResolveTarget::Stale => {
+                    warn!(
+                        "permissions: displayed request is no longer at the front of \
+                     the queue — discarding the answer instead of applying it to \
+                     a request the user did not see"
+                    );
+                    // Drop the stale prompt, leave the queue untouched (the entry
+                    // now at the front stays unanswered), and re-sync so the next
+                    // request is presented fresh.
+                    self.clear_permissions_prompt();
+                    self.sync_permissions_prompt();
+                    self.mark_chrome_dirty();
+                    self.request_redraw();
+                    return;
+                }
+            };
         // Store persistent decisions before delegating to the backend.
         let store = self.permissions.clone();
         match outcome {
@@ -4915,6 +4993,7 @@ impl AppState {
         }
         engine.resolve_permission(pending.resolve_id.as_deref(), outcome);
         self.permissions_prompt = None;
+        self.permissions_prompt_id = None;
         // Pull the next prompt immediately so the chrome shows it
         // without waiting for the next tick.
         self.sync_permissions_prompt();

@@ -10,6 +10,20 @@ and this project adheres to
 
 ### Fixed
 
+- Answering a permission prompt can no longer grant camera, microphone,
+  geolocation or any other capability to a site the prompt was not asking about.
+  The prompt strip rendered the front of the permissions queue but remembered
+  nothing about which request it was; the answer was applied to whatever sat at
+  the front at keypress time. When the displayed request was withdrawn behind
+  the user's back (the engine cancels a prompt when its tab navigates away) the
+  next queued request silently took its place on screen — so allow-and-remember
+  (`A` / `Y`) could write a **persistent** allow row for a different origin and
+  a different capability than the one shown. The prompt now carries the identity
+  of the request it is displaying, an answer is applied only to that request,
+  and a withdrawn request's prompt is taken off screen and replaced instead of
+  lingering. Answers that arrive after a withdrawal are discarded with a warning
+  and leave the queue untouched, so the request the user never saw stays
+  unanswered.
 - Scrolling vertically with a touchpad no longer navigates back through history.
   Both swipe call sites passed the scroll delta as the horizontal component, so
   a downward scroll accumulated as a left-to-right swipe and fired `HistoryBack`

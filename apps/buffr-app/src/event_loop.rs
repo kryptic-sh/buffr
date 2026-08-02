@@ -1672,9 +1672,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         }
 
         // Permission prompt: pull the front of the queue into a
-        // visible widget. `sync_permissions_prompt` is a no-op when a
-        // prompt is already active, so the user always sees one
-        // request at a time.
+        // visible widget. `sync_permissions_prompt` leaves an active
+        // prompt alone while it is still the front of the queue, so the
+        // user always sees one request at a time — but it does take a
+        // prompt down when the backend has withdrawn the request behind
+        // it (tab navigated away), so no keystroke can be answered
+        // against a request that is no longer on offer.
         if self.sync_permissions_prompt() {
             self.mark_chrome_dirty();
             self.request_redraw();
