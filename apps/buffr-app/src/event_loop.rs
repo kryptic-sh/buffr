@@ -1019,11 +1019,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     crate::windowing::AxisSource::Finger | crate::windowing::AxisSource::Continuous
                 );
                 if is_pixel {
-                    if let Some(action) = self.detect_swipe(scroll_ev.delta as f32, 0.0) {
+                    let (swipe_dx, swipe_dy) = scroll_swipe_delta(&scroll_ev);
+                    if let Some(action) = self.detect_swipe(swipe_dx, swipe_dy) {
                         self.dispatch_action(&action);
                         return;
                     }
-                    if self.swipe_committed {
+                    if self.swipe.committed {
                         return;
                     }
                 }

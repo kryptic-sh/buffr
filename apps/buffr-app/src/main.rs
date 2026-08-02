@@ -1319,6 +1319,92 @@ fn clear_cookies(backend: &dyn Backend) {
     backend.delete_all_cookies();
 }
 
+/// Split a [`ScrollEvent`] into an `(dx, dy)` pair for the swipe
+/// detector.
+///
+/// A `ScrollEvent` carries exactly one axis per event with a single
+/// `delta`; the orthogonal component is zero. Mirrors
+/// [`scroll_to_cef_delta`]'s axis match — feeding `delta` in as `dx`
+/// unconditionally makes vertical scrolling look like a horizontal
+/// swipe and defeats the detector's dominance guard.
+fn scroll_swipe_delta(ev: &crate::windowing::ScrollEvent) -> (f32, f32) {
+    use crate::windowing::AxisDirection;
+    let d = ev.delta as f32;
+    match ev.axis {
+        AxisDirection::Horizontal => (d, 0.0),
+        AxisDirection::Vertical => (0.0, d),
+    }
+}
+
+/// Two-finger horizontal-swipe back/forward gesture accumulator.
+///
+/// Pure state machine so it can be exercised without an `AppState`:
+/// [`SwipeDetector::feed`] takes the current time rather than reading
+/// the clock itself. [`AppState::detect_swipe`] is the thin wrapper
+/// that supplies `Instant::now()`.
+#[derive(Debug, Default)]
+struct SwipeDetector {
+    accum_x: f32,
+    accum_y: f32,
+    last_at: Option<Instant>,
+    committed: bool,
+}
+
+impl SwipeDetector {
+    /// Feed one high-res scroll delta in screen pixels. Returns
+    /// `Some(HistoryBack | HistoryForward)` the first time a gesture
+    /// commits; subsequent events of the same gesture are bounded by
+    /// `committed` (caller swallows them). A gesture is bounded by
+    /// `GAP` of inactivity.
+    ///
+    /// Direction: positive `dx` = swipe RIGHT → back. Negative = swipe
+    /// LEFT → forward. Mirrors Chrome/Safari macOS convention (verified
+    /// on Linux Wayland touchpad with natural scrolling enabled — sign
+    /// matches the physical gesture there).
+    fn feed(&mut self, dx: f32, dy: f32, now: Instant) -> Option<buffr_modal::PageAction> {
+        const GAP: Duration = Duration::from_millis(200);
+        // Raw px thresholds — touchpad 2-finger swipes deliver ~5-15px
+        // per event at 60Hz, so 150px = ~10-30 events of intent.
+        const HORIZ_THRESHOLD: f32 = 150.0;
+        const HORIZ_DOMINANCE: f32 = 2.0;
+
+        let resumed = self
+            .last_at
+            .map(|t| now.duration_since(t) > GAP)
+            .unwrap_or(true);
+        if resumed {
+            self.accum_x = 0.0;
+            self.accum_y = 0.0;
+            self.committed = false;
+        }
+        self.last_at = Some(now);
+        self.accum_x += dx;
+        self.accum_y += dy;
+
+        if self.committed {
+            return None;
+        }
+        let ax = self.accum_x.abs();
+        let ay = self.accum_y.abs();
+        if ax >= HORIZ_THRESHOLD && ax > HORIZ_DOMINANCE * ay {
+            self.committed = true;
+            let action = if self.accum_x > 0.0 {
+                buffr_modal::PageAction::HistoryBack
+            } else {
+                buffr_modal::PageAction::HistoryForward
+            };
+            tracing::debug!(
+                accum_x = self.accum_x,
+                accum_y = self.accum_y,
+                ?action,
+                "swipe gesture committed",
+            );
+            return Some(action);
+        }
+        None
+    }
+}
+
 /// Minimal winit `ApplicationHandler` that owns one window + one
 /// CEF browser, pumping CEF's message loop on `about_to_wait`.
 ///
@@ -1623,15 +1709,11 @@ struct AppState {
     osr_wheel_velocity: (f32, f32),
     osr_wheel_last_at: Option<Instant>,
     /// Two-finger horizontal-swipe back/forward gesture state. Only
-    /// `PixelDelta` events accumulate (touchpad). A gesture is bounded
-    /// by `SWIPE_GAP_MS` of inactivity. Once the accumulated horizontal
-    /// distance crosses `SWIPE_THRESHOLD_PX` while staying horizontal-
-    /// dominant, we fire HistoryBack/Forward once and `swipe_committed`
-    /// suppresses further nav until the gesture restarts.
-    swipe_accum_x: f32,
-    swipe_accum_y: f32,
-    swipe_last_at: Option<Instant>,
-    swipe_committed: bool,
+    /// `PixelDelta` events accumulate (touchpad). See [`SwipeDetector`]
+    /// for the gap, threshold and dominance rules; once a gesture
+    /// commits, `swipe.committed` suppresses further nav until it
+    /// restarts.
+    swipe: SwipeDetector,
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
@@ -1998,10 +2080,7 @@ impl AppState {
             osr_mouse_buttons: 0,
             osr_wheel_velocity: (0.0, 0.0),
             osr_wheel_last_at: None,
-            swipe_accum_x: 0.0,
-            swipe_accum_y: 0.0,
-            swipe_last_at: None,
-            swipe_committed: false,
+            swipe: SwipeDetector::default(),
             shutdown_flag,
             internal_server: None,
             cef_next_pump_at: None,
@@ -3139,58 +3218,12 @@ impl AppState {
     }
 
     /// Two-finger horizontal-swipe back/forward gesture detector.
-    /// Call once per touchpad `PixelDelta` event with the raw winit
-    /// delta in screen pixels. Returns `Some(HistoryBack | HistoryForward)`
-    /// the first time a gesture commits; subsequent events of the same
-    /// gesture are bounded by `swipe_committed` (caller swallows them).
-    /// A gesture is bounded by `GAP` of inactivity.
-    ///
-    /// Direction: positive winit `PixelDelta.x` = swipe RIGHT → back.
-    /// Negative = swipe LEFT → forward. Mirrors Chrome/Safari macOS
-    /// convention (verified on Linux Wayland touchpad with natural
-    /// scrolling enabled — sign matches the physical gesture there).
+    /// Call once per touchpad `PixelDelta` event with the raw delta in
+    /// screen pixels — see [`scroll_swipe_delta`] for mapping a
+    /// single-axis `ScrollEvent` onto `(dx, dy)`. Thin clock wrapper
+    /// around [`SwipeDetector::feed`], which holds the actual rules.
     fn detect_swipe(&mut self, dx: f32, dy: f32) -> Option<buffr_modal::PageAction> {
-        const GAP: Duration = Duration::from_millis(200);
-        // Raw px thresholds — touchpad 2-finger swipes deliver ~5-15px
-        // per event at 60Hz, so 150px = ~10-30 events of intent.
-        const HORIZ_THRESHOLD: f32 = 150.0;
-        const HORIZ_DOMINANCE: f32 = 2.0;
-
-        let now = Instant::now();
-        let resumed = self
-            .swipe_last_at
-            .map(|t| now.duration_since(t) > GAP)
-            .unwrap_or(true);
-        if resumed {
-            self.swipe_accum_x = 0.0;
-            self.swipe_accum_y = 0.0;
-            self.swipe_committed = false;
-        }
-        self.swipe_last_at = Some(now);
-        self.swipe_accum_x += dx;
-        self.swipe_accum_y += dy;
-
-        if self.swipe_committed {
-            return None;
-        }
-        let ax = self.swipe_accum_x.abs();
-        let ay = self.swipe_accum_y.abs();
-        if ax >= HORIZ_THRESHOLD && ax > HORIZ_DOMINANCE * ay {
-            self.swipe_committed = true;
-            let action = if self.swipe_accum_x > 0.0 {
-                buffr_modal::PageAction::HistoryBack
-            } else {
-                buffr_modal::PageAction::HistoryForward
-            };
-            tracing::debug!(
-                accum_x = self.swipe_accum_x,
-                accum_y = self.swipe_accum_y,
-                ?action,
-                "swipe gesture committed",
-            );
-            return Some(action);
-        }
-        None
+        self.swipe.feed(dx, dy, Instant::now())
     }
 
     /// Synthesize wheel-momentum decay frames after high-res input
@@ -5292,7 +5325,8 @@ impl AppState {
                     crate::windowing::AxisSource::Finger | crate::windowing::AxisSource::Continuous
                 );
                 if is_pixel {
-                    if let Some(action) = self.detect_swipe(scroll_ev.delta as f32, 0.0) {
+                    let (swipe_dx, swipe_dy) = scroll_swipe_delta(&scroll_ev);
+                    if let Some(action) = self.detect_swipe(swipe_dx, swipe_dy) {
                         if let Some(engine) = self.active_engine_dyn()
                             && browser_id >= 0
                         {
@@ -5308,7 +5342,7 @@ impl AppState {
                         }
                         return;
                     }
-                    if self.swipe_committed {
+                    if self.swipe.committed {
                         return;
                     }
                 }
@@ -6990,5 +7024,175 @@ mod tests {
         // Never zero, even for a degenerate surface or scale.
         assert_eq!(logical_chrome_dims(0, 0, 2.0), (1, 1));
         assert_eq!(logical_chrome_dims(10, 10, 0.0), (10, 10));
+    }
+
+    // ---- swipe gesture detector --------------------------------------------
+
+    use crate::windowing::{AxisDirection, AxisSource, ScrollEvent};
+
+    /// A high-res (touchpad) scroll event on one axis, as the pointer
+    /// backend delivers it: a single `delta`, the orthogonal component
+    /// implied by `axis`.
+    fn touchpad_scroll(axis: AxisDirection, delta: f64) -> ScrollEvent {
+        ScrollEvent {
+            axis,
+            delta,
+            discrete_steps: 0,
+            high_res_120: 0,
+            source: AxisSource::Finger,
+        }
+    }
+
+    /// Drive the detector exactly as the `WindowEvent::Scroll` arms do:
+    /// map the event's single axis onto `(dx, dy)`, then feed it.
+    fn feed_scroll(
+        det: &mut SwipeDetector,
+        ev: &ScrollEvent,
+        now: Instant,
+    ) -> Option<buffr_modal::PageAction> {
+        let (dx, dy) = scroll_swipe_delta(ev);
+        det.feed(dx, dy, now)
+    }
+
+    #[test]
+    fn scroll_swipe_delta_keeps_the_event_on_its_own_axis() {
+        assert_eq!(
+            scroll_swipe_delta(&touchpad_scroll(AxisDirection::Horizontal, 7.0)),
+            (7.0, 0.0)
+        );
+        assert_eq!(
+            scroll_swipe_delta(&touchpad_scroll(AxisDirection::Vertical, 7.0)),
+            (0.0, 7.0)
+        );
+    }
+
+    #[test]
+    fn vertical_scroll_never_navigates_history() {
+        // Regression: both call sites used to pass `delta` as `dx` and
+        // hard-code `dy = 0.0`, so scrolling a page down accumulated
+        // into the horizontal channel and fired HistoryBack after
+        // ~150px. Every event on the vertical axis must return None, no
+        // matter how far the page scrolls.
+        let mut det = SwipeDetector::default();
+        let ev = touchpad_scroll(AxisDirection::Vertical, 10.0);
+        let start = Instant::now();
+        for i in 0..40 {
+            let now = start + Duration::from_millis(16 * i);
+            assert_eq!(
+                feed_scroll(&mut det, &ev, now),
+                None,
+                "vertical scroll event {i} navigated history"
+            );
+        }
+        // The whole run landed in the vertical channel, untouched.
+        assert_eq!(det.accum_x, 0.0);
+        assert_eq!(det.accum_y, 400.0);
+        assert!(!det.committed);
+    }
+
+    #[test]
+    fn vertical_feed_never_navigates_history() {
+        // Same invariant one layer down, independent of the axis mapping.
+        let mut det = SwipeDetector::default();
+        let start = Instant::now();
+        for i in 0..40 {
+            assert_eq!(
+                det.feed(0.0, 10.0, start + Duration::from_millis(16 * i)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_right_commits_history_back() {
+        let mut det = SwipeDetector::default();
+        let ev = touchpad_scroll(AxisDirection::Horizontal, 10.0);
+        let start = Instant::now();
+        let mut fired = Vec::new();
+        for i in 0..40 {
+            if let Some(a) = feed_scroll(&mut det, &ev, start + Duration::from_millis(16 * i)) {
+                fired.push((i, a));
+            }
+        }
+        // 150px threshold at 10px/event → commits once, on the 15th event.
+        assert_eq!(fired, vec![(14, buffr_modal::PageAction::HistoryBack)]);
+    }
+
+    #[test]
+    fn horizontal_scroll_left_commits_history_forward() {
+        let mut det = SwipeDetector::default();
+        let ev = touchpad_scroll(AxisDirection::Horizontal, -10.0);
+        let start = Instant::now();
+        let mut fired = Vec::new();
+        for i in 0..40 {
+            if let Some(a) = feed_scroll(&mut det, &ev, start + Duration::from_millis(16 * i)) {
+                fired.push((i, a));
+            }
+        }
+        assert_eq!(fired, vec![(14, buffr_modal::PageAction::HistoryForward)]);
+    }
+
+    #[test]
+    fn diagonal_drag_fails_the_dominance_rule() {
+        // ax clears the threshold but the drag is not horizontal-dominant
+        // (ax <= 2 * ay), so nothing commits.
+        let mut det = SwipeDetector::default();
+        let start = Instant::now();
+        for i in 0..40 {
+            let now = start + Duration::from_millis(16 * i);
+            assert_eq!(
+                det.feed(10.0, 6.0, now),
+                None,
+                "diagonal event {i} committed"
+            );
+        }
+        let (ax, ay) = (det.accum_x.abs(), det.accum_y.abs());
+        assert!(
+            ax >= 150.0,
+            "test is vacuous: ax {ax} never crossed threshold"
+        );
+        assert!(ax <= 2.0 * ay, "test is vacuous: ax {ax} dominates ay {ay}");
+    }
+
+    #[test]
+    fn a_gap_over_200ms_resets_the_accumulator() {
+        let mut det = SwipeDetector::default();
+        let start = Instant::now();
+        // 14 events of +10px = 140px, just under the 150px threshold.
+        for i in 0..14 {
+            assert_eq!(
+                det.feed(10.0, 0.0, start + Duration::from_millis(16 * i)),
+                None
+            );
+        }
+        assert_eq!(det.accum_x, 140.0);
+        // Idle past the gap, then one more event: the run restarts from
+        // zero instead of tipping the old total over the threshold.
+        let after_gap = start + Duration::from_millis(16 * 13) + Duration::from_millis(201);
+        assert_eq!(det.feed(10.0, 0.0, after_gap), None);
+        assert_eq!(det.accum_x, 10.0);
+    }
+
+    #[test]
+    fn a_committed_gesture_swallows_the_rest_of_its_events() {
+        let mut det = SwipeDetector::default();
+        let start = Instant::now();
+        let mut committed_at = None;
+        for i in 0..20 {
+            if det
+                .feed(10.0, 0.0, start + Duration::from_millis(16 * i))
+                .is_some()
+            {
+                assert!(committed_at.is_none(), "committed twice in one gesture");
+                committed_at = Some(i);
+            }
+        }
+        assert_eq!(committed_at, Some(14));
+        assert!(det.committed);
+        // Still latched: more of the same gesture keeps returning None.
+        assert_eq!(
+            det.feed(10.0, 0.0, start + Duration::from_millis(16 * 20)),
+            None
+        );
     }
 }
