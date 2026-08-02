@@ -238,27 +238,48 @@ slices.
   whenever `buffr-modal` is next versioned for its own sake.
 
 - **`buffr-bin` on the AUR is stuck at `0.14.6-1`** while the workspace is at
-  `0.14.8` — two releases behind, for two _different_ reasons.
+  `0.14.9` — three releases behind, for two _different_ reasons.
 
   `v0.14.7` failed on the ssh regression described below. That is fixed. But
   `v0.14.8`, cut specifically to prove the fix, failed before reaching it: the
   AUR was in maintenance and the git remote refused the push
   (`The AUR is down due to maintenance` →
   `fatal: Could not read from remote repository`, exit 128). A re-run of the
-  failed job on 2026-08-02 hit the same banner.
+  failed job on 2026-08-02 hit the same banner, and so did the `v0.14.9` tag run
+  on 2026-08-03 — the maintenance window has now spanned three attempts over two
+  days. Everything else in all three releases published normally.
 
   **So the ssh fix is still unproven.** It has never been exercised against a
-  live AUR — both attempts died earlier in the job than the host-key check.
+  live AUR — all three attempts died earlier in the job than the host-key check.
   Whoever cuts the next release should confirm the `aur-bin` job actually
   reaches and passes the push, not just that the tag went green.
 
-  **Do not use an HTTP check as the readiness signal.**
-  `https://aur.archlinux.org/` returns `200` and the RPC serves package JSON
-  while the **git/ssh** endpoint is still refusing pushes. A watcher polling the
-  web front end reports "back up" during a maintenance window that still blocks
-  publishing; that is exactly how the re-run above was triggered too early. Test
-  the actual remote (an `ssh aur@aur.archlinux.org` handshake or a dry-run
-  push), not the website.
+  **The only valid readiness signal is `git ls-remote`.** Two cheaper-looking
+  probes both report "up" during a maintenance window that still blocks
+  publishing, and each has now burned an attempt:
+
+  - **HTTP.** `https://aur.archlinux.org/` returns `200` and the RPC serves
+    package JSON throughout. That is how the 2026-08-02 re-run was triggered too
+    early.
+  - **The ssh handshake.** `ssh -T aur@aur.archlinux.org` **succeeds during
+    maintenance** — it authenticates the key and prints
+    `Welcome to AUR, <user>! Interactive shell is disabled.` The banner lives on
+    the git subcommand path, not on authentication, so the greeting says nothing
+    about whether `git-upload-pack` will run. That is how the `v0.14.9` tag was
+    cut into a closed window: the handshake was checked minutes before tagging
+    and passed, and the job failed anyway.
+
+  Both were confirmed side by side while the AUR was down: the same shell that
+  got the welcome message got
+  `The AUR is down due to maintenance. We will be back soon.` from
+  `git ls-remote ssh://aur@aur.archlinux.org/buffr-bin.git` seconds later. Probe
+  with `git ls-remote` — it exercises the identical code path the job uses.
+
+  **The pending action is a re-run, not a new release.** `v0.14.9` published
+  everywhere else, so the AUR is the only gap; re-run the failed
+  `Publish buffr-bin to AUR` job on the `v0.14.9` tag run once `git ls-remote`
+  answers. Unlike `v0.14.7`, that tag's workflow already carries the ssh fix, so
+  a re-run is a real test of it. Do not cut another version just to retry.
 
 - **The `v0.14.7` ssh regression itself.** The `aur-bin` job failed on the
   `v0.14.7` tag run with `No ED25519 host key is known for aur.archlinux.org`:
