@@ -7,11 +7,10 @@ Nothing here is a known-broken **build**: `main` is green on CI (all three
 OSes), `cargo deny`, `cargo machete`, and the fuzz workflow. These are the items
 that were deliberately **not** actioned, and why.
 
-That is not the same as "no known bugs". Sections 8 and 9 are a review pass from
-2026-08-02 with nothing fixed — including two high-severity correctness bugs
-(**C1**, vertical touchpad scrolling navigating history; **C2**, a transient
-stall permanently disarming the heartbeat) that are reproducible today on green
-CI. Read those before assuming the tree is clean.
+That is not the same as "no known bugs". Sections 8 and 9 hold a review pass
+from 2026-08-02. Five correctness findings have since been fixed and removed
+from section 8; what remains there — and the whole of section 9 — is
+reproducible today on green CI. Read those before assuming the tree is clean.
 
 Grouped by what is actually blocking them.
 
@@ -145,6 +144,23 @@ has observed.
 - **`edit.js` rewire on soft navigation.** The teardown hook added for the H5
   nonce assumes CEF re-fires main-frame `on_load_end` for the same document.
   Worth exercising a heavy SPA.
+- **The C1–C5 fixes are unit-tested, not exercised.** Each landed with a pure
+  test that was proven to go red, but three of them have branches no test
+  reaches, and the tests cannot reach them:
+  - **C3's `<Esc>`-leaves-Insert half.** The keymap half (rejecting
+    `[keymap.insert]`) is covered; the event-loop wiring that routes `<Esc>`
+    back to the mode Insert was entered from is not. Needs a running browser
+    parked in Insert with nothing focused.
+  - **C4's withdrawal paths.** `sync_permissions_prompt`'s
+    replace-a-withdrawn-prompt branch and `resolve_permission`'s
+    `ResolveTarget::Stale` branch are both driven by the engine cancelling a
+    prompt when its tab navigates away — a race no unit test stages.
+  - **C5's call sites.** The geometry helper `popup_cef_rect_pure` is tested at
+    1× and 2×, but a test of a pure function cannot observe a **call site**:
+    reverting any of the three back to the full window height leaves every test
+    green. What prevents that regression is structural — one helper feeding the
+    paint rect and both `popup_resize` calls — not any assertion. Verified by
+    mutating both: the helper goes red, a call site does not.
 
 ---
 
@@ -211,6 +227,15 @@ slices.
 ---
 
 ## 5. Release follow-ups
+
+- **`buffr-modal` owes itself a minor bump.** The C3 fix changed
+  `Keymap::bind_chords` from returning `()` to `Result<(), BindError>` and made
+  `mode_map`/`mode_map_mut` return `Option` — breaking, and the crate is at
+  `0.1.5`, so pre-1.0 rules make that a **minor** bump to `0.2.0`, not a patch.
+  Nothing forced the issue at the time: every dependant is a path dependency
+  with no version requirement, the workspace is `publish = false`, and the crate
+  version is independent of the workspace version a release tag carries. Bump it
+  whenever `buffr-modal` is next versioned for its own sake.
 
 - **`buffr-bin` on the AUR is stuck at `0.14.6-1`** while the workspace is at
   `0.14.8` — two releases behind, for two _different_ reasons.
@@ -286,7 +311,8 @@ slices.
 each a separate commit verified with `cargo fmt --all`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` (1072
 passed, 0 failed throughout) and a diff against the previous commit proving the
-move was pure. CI is green on the result (`e374b37`).
+move was pure. CI is green on the result (`e374b37`). The C1–C5 fixes have since
+grown it back to 7,301, which is the number to beat.
 
 Extracted so far: `cli` (the clap `Cli`, dispatch, and every `run_*`
 subcommand), `cef_translate`, `chrome_paint`, `paint_policy`, `event_loop`,
@@ -350,85 +376,12 @@ methods instead of cutting a range. The natural groups:
 
 ---
 
-## 8. Correctness review, 2026-08-02 (none fixed)
+## 8. Correctness review, 2026-08-02
 
-A read-only review pass. **Nothing here has been fixed** — no code changed.
+A read-only review pass, since partly actioned. **C1–C5 shipped** and have been
+removed from this list — `git log` has them. What is left below is unfixed.
 Findings marked ✅ were re-verified by opening the cited location; the rest are
 reported as found and still need confirming before anyone acts on them.
-
-### C1 ✅ HIGH — vertical touchpad scrolling navigates history
-
-**Where:** `apps/buffr-app/src/event_loop.rs`, the `is_pixel` branch of the
-scroll handler (`detect_swipe(scroll_ev.delta as f32, 0.0)`); twin at
-`AppState::handle_popup_window_event`.
-
-A `ScrollEvent` carries **one axis per event** — `scroll_to_cef_delta` in
-`cef_translate.rs` correctly branches on `ev.axis`. The swipe detector does not:
-it passes `delta` as `dx` and hard-codes `dy = 0.0`, so a _vertical_ delta
-accumulates into `swipe_accum_x`. `detect_swipe`'s dominance guard
-(`ax >= HORIZ_THRESHOLD && ax > HORIZ_DOMINANCE * ay`) is then vacuous, because
-`ay` is always 0.
-
-Two-finger scrolling down a page on a touchpad accumulates ~150 px and fires
-`HistoryBack`, navigating away mid-scroll. Fix: branch on `ev.axis` the way
-`scroll_to_cef_delta` already does.
-
-### C2 ✅ HIGH — one transient UI stall permanently disarms the heartbeat
-
-**Where:** `AppState::tick_heartbeat` in `apps/buffr-app/src/main.rs`;
-`run_heartbeat_loop` in `apps/buffr-app/src/heartbeat.rs`.
-
-`thread_alive` is cleared in two cases: a fatal write error (terminal) and the
-**recoverable** "UI thread silent past `UI_LIVENESS_TIMEOUT`" state. The loop
-has an explicit recovery path for the second — but it only runs if
-`last_alive_us` keeps advancing, and `tick_heartbeat` reacts to `!is_alive()` by
-setting `self.heartbeat = None`, so `mark_alive` is never called again.
-
-A >5 s block in `write_texture`/`submit` — which this codebase documents as
-observed — therefore converts a recoverable stall into a guaranteed supervisor
-kill of a healthy browser. Fix: distinguish the fatal flag from the stall flag,
-and don't drop the handle for the recoverable one.
-
-### C3 ✅ MEDIUM — Insert-mode keybindings are installed into the Normal trie
-
-**Where:** `Keymap::mode_map_mut` in `crates/buffr-modal/src/keymap.rs`
-(`PageMode::Normal | PageMode::Pending | PageMode::Insert => &mut self.normal`);
-`Engine::feed` in `crates/buffr-modal/src/engine.rs`.
-
-`build_keymap` faithfully forwards `[keymap.insert]` entries, and `mode_name`
-accepts `"insert"` — but they all land in the **Normal** trie, so they fire
-while browsing and never in Insert mode. They could not fire in Insert anyway:
-`feed` returns `Step::EditModeActive` before consulting the trie.
-
-Related: every other non-Normal mode has an `<Esc>` route through the trie;
-Insert does not, and `edit_mode_handle_key` is gated on `EditFocus::Editing`. So
-reaching `PageMode::Insert` with no focused field leaves the keyboard dead until
-the user clicks an input. Decide whether `[keymap.insert]` is supported — if
-not, reject it in config validation rather than silently misfiling it.
-
-### C4 MEDIUM — a permission answer can be applied to a different origin
-
-**Where:** `AppState::sync_permissions_prompt` (peeks the queue front) and
-`AppState::resolve_permission` (pops it) in `apps/buffr-app/src/main.rs`;
-`on_dismiss_permission_prompt` in `crates/buffr-cef/src/handlers.rs`.
-
-The displayed prompt is the peeked front; the outcome is applied to whatever is
-popped later, with no re-validation that they match.
-`on_dismiss_permission_prompt` meanwhile removes an arbitrary entry by
-`resolve_id` without clearing `permissions_prompt`. If the displayed request is
-dismissed while a second is queued, answering the visible prompt can grant a
-**persistent** capability to an origin the user never saw. Fix: carry the
-`resolve_id` in `permissions_prompt` and match it on pop.
-
-### C5 MEDIUM — popups tell CEF a viewport one address-bar taller than they paint
-
-**Where:** popup creation and resize call `popup_resize(browser_id, pw, ph)`
-with the full window height, but the OSR quad is drawn into
-`(0, phys_bar_h, w, h - phys_bar_h)` and pointer events forward `y - bar_h`. The
-main window gets this right — `cef_child_rect` subtracts the chrome strips
-before `osr_resize`. Result: popup content is squashed and clicks land offset by
-roughly `STATUSLINE_HEIGHT`, worst at the bottom of the window (OAuth
-"Authorize" buttons). Fix: subtract the bar height before `popup_resize`.
 
 ### C6 MEDIUM — `on_tab_switch` resets `last_osr_generation` to 0
 
@@ -447,6 +400,38 @@ stale frame of the tab they just left instead of the loading animation.
 unlike `toggle_pin_active` and `set_pinned`. `hit_test_tab_strip_pure` derives
 pill widths from `i < pinned_count` while `TabStrip::paint` uses each tab's own
 `pinned` flag, so once the invariant breaks, clicks select the wrong tab.
+
+### C8 ✅ MEDIUM — popup browsers never get a device scale, so they render at 1×
+
+**Where:** `on_before_popup` in `crates/buffr-cef/src/handlers.rs` builds the
+popup's `OsrViewState::new()` and stores only width and height into it;
+`BrowserHost::set_device_scale` in `crates/buffr-cef/src/host.rs` writes
+`self.osr_view` — the **main** view — and nothing else.
+`OsrPaintHandler::resolve_scale` in `crates/buffr-cef/src/osr.rs` returns the
+popup's own `scale()` for a popup browser id, and `default_view_dims_and_scale`
+in the same file asserts `new()` starts at 1.0.
+
+So on a 2× display CEF lays the popup's page out at scale 1.0 while the embedder
+divides pointer coordinates by 2: the page renders at half size in the quad and
+clicks land at roughly twice the intended offset. Found while fixing C5 and left
+alone — C5 was physical-to-physical geometry, this needs the popup view seeded
+from the main view's scale at creation, and then kept in step by
+`set_device_scale`, which today has no idea popups exist. Untested at a real
+HiDPI scale either way; see section 2.
+
+### C9 LOW — `[keymap.pending]` folds into the Normal trie without saying so
+
+**Where:** `Keymap::mode_map_mut` in `crates/buffr-modal/src/keymap.rs`
+(`PageMode::Normal | PageMode::Pending => Some(&mut self.normal)`); `validate`
+in `crates/buffr-config/src/lib.rs` rejects only `PageMode::Insert`.
+
+The same silent-fold shape C3 fixed, one severity down. Folding Pending into
+Normal is _correct_ — a pending chord continues in the normal trie, so there is
+no separate map to file into — but a user who writes `[keymap.pending]` gets a
+binding that also fires in Normal with no diagnostic. Either reject the section
+the way `[keymap.insert]` now is, or document that it is an alias. Note **L37**
+in section 1: `PageMode::Pending` is never actually produced, so resolving that
+one first may delete the question.
 
 ---
 
