@@ -311,12 +311,7 @@ fn format_hint(h: &HintStatus) -> String {
     if h.typed.is_empty() {
         format!("{prefix}: {} hints", h.match_count)
     } else {
-        format!(
-            "{prefix}: {} ({}/{})",
-            h.typed,
-            h.match_count,
-            h.match_count.max(1)
-        )
+        format!("{prefix}: {}", h.typed)
     }
 }
 
@@ -842,8 +837,7 @@ mod tests {
             match_count: 3,
             background: true,
         };
-        assert!(format_hint(&h).starts_with("F:"));
-        assert!(format_hint(&h).contains("as"));
+        assert_eq!(format_hint(&h), "F: as");
     }
 
     #[test]

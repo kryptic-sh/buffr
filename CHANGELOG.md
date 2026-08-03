@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- The hint-mode statusline no longer renders a meaningless `(n/n)` counter —
+  numerator and denominator were the same field, so it always read e.g.
+  `f: as (3/3)`. It now shows just the typed prefix (`f: as`).
+
 ## [0.14.9] - 2026-08-03
 
 Five correctness fixes from the 2026-08-02 review pass, two of them
