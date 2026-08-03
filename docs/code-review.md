@@ -1937,3 +1937,243 @@ today.
   the version divergence in L15.
 - **Fix:** Share one `Arc<Clipboard>` across all three.
 - **ACTIONABLE:** yes
+
+---
+
+# Review — 2026-08-04 (v0.14.9, commit `a38fa86`)
+
+Fresh full-codebase pass at low depth (correctness only; no style). The git tree
+was clean, so the whole workspace was in scope: all 14 workspace members, the
+excluded `buffr-webkit`, `buffr-poc`, `xtask`, and the fuzz targets. The
+verification gate (`fmt`, `clippy -D warnings`, `build`, `nextest`) is green at
+`a38fa86`, so nothing below is a lint the compiler already catches.
+
+**Verdict: not safe to ship as-is.** Findings 1–3 affect production usage and
+should be fixed before the next release. Findings 4–6 are lower priority.
+
+## Findings
+
+### 1. HIGH — closing a tab left of the active tab leaves the old active tab running as if foregrounded
+
+- **Location:** `crates/buffr-cef/src/host.rs:1716-1717` (guard at
+  `host.rs:1407-1414`)
+- **Problem:** `close_index` removes the tab, then calls
+  `set_active_index(new_idx)` with the _stale_ stored `active` index still
+  pointing at the removed tab's slot, so the "hide the previous tab" guard in
+  `set_active_index` never fires and the previously-active browser is never
+  hidden.
+
+```
+Repro: tabs [A, B, C], active = 2 (C is visible). close_tab(A) i.e. close_index(0).
+  tabs.remove(0)            → [B, C]; stored `active` is still Some(2)
+  len = 2; new_idx = 0; set_active_index(0) with prev = 2
+  guard: prev < tabs.len()  → 2 < 2 is false → C is never was_hidden(1)/set_focus(0)
+Expect: C's browser is hidden and unfocused the moment B becomes active.
+Actual: C stays was_hidden(0) with focus; its timers, animations and audio keep
+  running as if foregrounded until the next tab switch. (The per-tab OSR frame
+  is per-BrowserHost, so it is C's own render budget that keeps burning.)
+```
+
+- **Fix:** in `close_index`, when `idx < old_active`, decrement the stored
+  active index before calling `set_active_index`, or have `set_active_index`
+  hide by tab id rather than raw index.
+
+### 2. MEDIUM — `buffr-src:` private-network guard bypassed by uncompressed IPv6 literal spellings
+
+- **Location:** `crates/buffr-cef/src/view_source_scheme.rs:213-235`
+  (`is_non_public_host`)
+- **Problem:** the IPv6 classification is exact-string matching (`h == "::1"`,
+  `h == "::"`, `fe8*/fe9*/fea*/feb*/fc*/fd*` prefixes, and an IPv4-mapped check
+  that only fires when the tail after the last `:` is a dotted quad). Any other
+  canonical encoding of a loopback / link-local / RFC1918-mapped address is
+  treated as public, so `validate_target` (line 149) returns `Ok` without ever
+  consulting the initiator — and `fetch_and_render` then ureq-GETs the address
+  from the browser process, outside Chromium's network stack.
+
+```
+Repro: a page at https://evil.example/ navigates to
+       buffr-src:http://[0:0:0:0:0:0:0:1]/admin
+  http_host        → "0:0:0:0:0:0:0:1" (lowercased, brackets stripped)
+  is_non_public    → not ::1/::, no fe8*/fc*/fd* prefix, tail after ':' is "1"
+                     (no '.', so the mapped check is skipped) → false
+  validate_target  → Ok (foreign initiator not consulted)
+  fetch_and_render → browser-process GET to ::1 succeeds
+  Also exploitable: [::ffff:7f00:1] (127.0.0.1), [::ffff:a9fe:a9fe]
+                     (169.254.169.254), [::ffff:0a00:0001] (10.0.0.1)
+Expect: any spelling of a loopback/link-local/unique-local address is refused
+        from a foreign initiator.
+Actual: only the exact compressed spellings are caught.
+```
+
+- **Fix:** parse with `std::net::IpAddr` (after `url`-style parsing) and
+  classify the resolved address class instead of string-matching spellings.
+
+### 3. MEDIUM — context-menu "Close tab" exits the app on the active engine's count alone
+
+- **Location:** `apps/buffr-app/src/context_menu.rs:577-590`
+- **Problem:** every other tab-close path (keyboard `close_active_tab_or_exit`,
+  `main.rs:2636`; pinned-close resolution, `main.rs:2676`) sums `tab_count()`
+  across **all** engines before deciding to exit. The context-menu path counts
+  only the active engine, so closing the last tab of the active engine while
+  another engine still has tabs prematurely triggers `shutdown_flag`.
+
+```
+Repro: engines E1 (1 tab) and E2 (3 tabs); E1 active. Right-click the E1 tab
+       in the strip → Close Tab.
+  host = active_engine_dyn() = E1; close_tab(id) → E1 now 0 tabs
+  remaining = host.tab_count() = 0 → save_session + shutdown_flag.store(true)
+Expect: app keeps running (E2 still has 3 tabs).
+Actual: clean shutdown is requested and the browser exits.
+```
+
+- **Fix:** sum `self.engines.values().map(|e| e.tab_count())` like the other two
+  paths.
+
+### 4. LOW — webkit `move_tab` lands rightward moves one slot short; `MoveTabRight` is a no-op
+
+- **Location:** `crates/buffr-webkit/src/platform/runtime.rs:4500-4502`
+- **Problem:** `insert_at = if to > from { to - 1 } else { to }` treats `to` as
+  a pre-move index, but the trait contract (`buffr-engine/src/engine.rs:84`),
+  the CEF backend (`host.rs:1745-1746`), and every caller use `to` as the final
+  position. Experimental backend only.
+
+```
+Repro: tabs [A, B, C], MoveTabRight on B → move_tab(1, 2)
+  entry = tabs.remove(1)        → [A, C]
+  insert_at = 2 - 1 = 1         → [A, B, C] (unchanged)
+Expect: [A, C, B] — matching the CEF backend's move_tab(idx, idx+1).
+Actual: the strip is unchanged; every rightward reorder lands one slot short.
+```
+
+- **Fix:** `tabs.insert(to, entry)` unconditionally (and mirror in the
+  `engine_state` branch at runtime.rs:4510-4512).
+
+### 5. LOW — `<C-c>` is bound twice; `StopLoading` is unreachable
+
+- **Location:** `crates/buffr-modal/src/keymap.rs:532` and `:554`
+- **Problem:** `bind_chords` (keymap.rs:337-343) overwrites `node.action`
+  unconditionally in table order, so the later `<C-c>` → `YankUrl` row
+  (line 554) silently replaces `<C-c>` → `StopLoading` (line 532). Ctrl+C in
+  Normal mode yanks the URL instead of stopping the load. Already tracked as M39
+  in the v0.14.6 review above.
+
+```
+Repro: keymap = Keymap::default_bindings('\\'); lookup(Normal, [Ctrl+'c'])
+Expect: StopLoading (the documented default at keymap.rs:531)
+Actual: YankUrl — the second row overwrote the first.
+```
+
+- **Fix:** delete one of the two rows (M39 asks which chord should win).
+
+### 6. LOW — edit-mode console sink is an unbounded queue
+
+- **Location:** `crates/buffr-cef/src/handlers.rs:1092-1094` (sink type at
+  `crates/buffr-core/src/edit.rs:241`)
+- **Problem:** the hint and media sinks overwrite a single slot; the edit sink
+  `push_back`s into a `VecDeque` with no cap. A page that has learned the page
+  nonce (the documented same-document threat model — the injected script runs in
+  the page) can emit sentinel-prefixed `focus`/`mutate` events to grow the queue
+  without bound until the process is OOM-killed.
+
+```
+Repro: page replaces console.log before injection, reads the nonce from a
+       leaked line, then loops console.log("__buffr_edit__:<nonce>:{\"type\":\"blur\",\"field_id\":\"x\"}")
+Expect: the edit sink is bounded (drop or coalesce past a cap).
+Actual: the VecDeque grows without bound; the render loop drains it but the
+  page can emit faster than the loop drains.
+```
+
+- **Fix:** cap the sink length on push (drop oldest / coalesce) like the
+  popup-alloc queue does.
+
+### 7. LOW — context-menu tab target resolved by stale slot index
+
+- **Location:** `apps/buffr-app/src/context_menu.rs:659-670`
+- **Problem:** `resolve_tab_target` indexes the _current_ tab list by the slot
+  recorded when the menu opened. Any tab-list change while the menu is open (a
+  page's `window.open` landing a background tab, another tab closing) shifts
+  indices and the action fires against the wrong tab. Narrow: most interactions
+  dismiss the menu first, and the pinned-close confirmation covers the misaim it
+  cares about.
+
+```
+Repro: open context menu on tab at index 1; a background window.open adds a
+       tab at index 1 (shifting the target to 2); choose Close Tab.
+Expect: the tab the menu was opened on is closed.
+Actual: the tab now at slot 1 is closed.
+```
+
+- **Fix:** resolve by tab id at dispatch time, or re-locate by id.
+
+## Cleared
+
+- **Windows heartbeat thread leak / restart wedge** (`heartbeat.rs:609-783`) —
+  the connect timeout can leak a thread, but the supervisor kills and reaps a
+  hung child before restarting (`supervisor.rs` WatchOutcome::Hang), so the pipe
+  is freed before a new child connects; the claimed "wedge every restart" does
+  not trace. Resource note, not a defect.
+- **`internal_server.rs`** — bounded request line (32 KiB) and headers (16 KiB,
+  enforced while reading), connection cap (32) with 503, constant-time token
+  compare, Host-header DNS-rebinding defence. All tested; no defect.
+- **`console_nonce` / `console_sentinel`** — anchored prefix match, fail-closed
+  on empty nonce, per-load rotation, defensive tests; no defect.
+- **`updates.rs`** — semver ordering (incl. rc/beta), cache staleness, dismiss
+  filtering, no-network-when-disabled; no defect.
+- **`edit.rs` parsing / `build_inject_script`** — two-pass type-tag decode,
+  teardown hook, nonce never on `window`; no defect (the unbounded sink above is
+  the only edit-mode issue).
+- **`buffr-store` migrations** — per-migration transactions, TooNew refusal,
+  resume-from-partial; no defect.
+- **`buffr-permissions` / `buffr-downloads` / `buffr-zoom` / `buffr-bookmarks`
+  stores** — parameterized SQL throughout; no injection surface.
+- **`buffr-view-source`** — all content HTML-escaped, 10 MiB size cap, span walk
+  skips non-boundary/out-of-order/past-end offsets (H3 regression tests pin it);
+  no defect.
+- **`single_instance.rs`** — bounded line read, uid check (SO_PEERCRED), scheme
+  allow-list for forwarded URLs, accept timeouts; no defect.
+- **`cli.rs`** — one-shot subcommands are coherent; no defect.
+- **`key.rs` parser** — modifier/unicode/F-key handling well-tested; the `<C-c>`
+  duplicate is a keymap-table issue, not a parser one.
+- **`hint.rs` `labels_for` / `feed` / `backspace`** — greedy-balanced labels,
+  no-prefix guarantee, cancel-on-empty, re-derive on backspace; no defect.
+- **`tab_strip.rs` layout** — saturating/checked math, right-edge capping; no
+  overflow at any width.
+- **CEF `osr.rs` `on_paint` validation** — negative dims / null buffer / usize
+  overflow all rejected; no defect.
+- **`FetchPermit` accounting** (`view_source_scheme.rs`) — decrement on drop
+  covers the spawn-failure path; no defect.
+- **`PendingPermission::resolve` / registry drain** (`permissions.rs`) —
+  callback fired exactly once on every path; no defect.
+- **`close_tab`/`close_active` `recv_timeout().unwrap_or(false)`** — a >2 s
+  worker stall could mis-report the last-tab case, but no reachable >2 s stall
+  exists; not a finding.
+
+## Coverage
+
+Scope: full workspace, clean tree at `a38fa86` (per step 1 of the brief).
+
+Reviewed in depth (read end-to-end, findings verified against the code):
+`buffr-cef` (host, view_source_scheme, handlers console/OSR paths, osr),
+`buffr-webkit` (runtime `move_tab`), `buffr-engine` (internal_server, engine
+trait + move_tab dispatch), `buffr-core` (console_nonce, console_sentinel,
+updates, edit, hint, store), `buffr-config` (loader, keybinding), the five data
+stores, `buffr-view-source`, `buffr-ui` (tab_strip), and `apps/buffr-app`
+(event_loop, main close/exit paths, context_menu, heartbeat, single_instance,
+cli, paint_policy).
+
+**Not reviewed** (the sub-agent reports for these slices were lost to a delivery
+failure — three of four agents returned a status summary instead of the report,
+so their content is unrecoverable): `buffr-core` (find, image_copy, favicon\*,
+media_probe, telemetry, scripts, crash, cursor, download_notice, context_menu,
+cmdline, open_finder, inhibit/\*), `buffr-config` (lib.rs, search.rs,
+watcher.rs), `buffr-modal` (engine.rs, host.rs, adapters, edit_mode, actions,
+bridge_adapter), `buffr-engine` (tab.rs, input.rs, osr.rs, permissions.rs,
+popup.rs, profile.rs, favicon.rs, hint.rs, clipboard.rs, newtab.rs, media_js.rs,
+event.rs), `buffr-history`, `buffr-downloads` (beyond the store), `buffr-zoom`,
+`buffr-bookmarks` (beyond import), `buffr-ui` (beyond tab_strip),
+`xtask/main.rs`, the fuzz targets, `apps/buffr` (main.rs, supervisor process
+wiring, tests), `apps/buffr-app` (render.rs, session.rs, engine_router.rs,
+cef_translate.rs, chrome_paint.rs, crash_guard.rs, loading_anim.rs,
+windowing/\*), and most of `buffr-webkit` (worker.rs, engine.rs,
+wpe_subclass.rs). These areas are unverified; the consistent quality of what was
+reviewed (heavy tests, defensive bounds) is some indication, but not coverage.
