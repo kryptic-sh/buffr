@@ -47,6 +47,9 @@ and this project adheres to
   `BrowserEngine` — none had callers, and the excluded `buffr-webkit` backend
   dropped its matching overrides and the `SetNativeRect` worker command.
   `is_using_native_compositing` stays; it gates the live pixel-pipeline path.
+- Collapsed `buffr-history`'s eight `open*` constructors into a `HistoryBuilder`
+  (with `open`/`open_in_memory` kept as thin delegators); a third option would
+  otherwise have meant sixteen constructors.
 
 ## [0.14.9] - 2026-08-03
 

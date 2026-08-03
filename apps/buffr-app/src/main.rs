@@ -495,16 +495,17 @@ fn main() -> Result<()> {
     // `buffr_core::handlers`) pump every main-frame visit + title
     // into it. Private mode opens an in-memory DB instead.
     let history = Arc::new(if cli.private {
-        buffr_history::History::open_in_memory_with_skip_schemes(
-            config.privacy.skip_schemes.clone(),
-        )
-        .context("opening in-memory history")?
+        buffr_history::History::builder()
+            .in_memory()
+            .skip_schemes(config.privacy.skip_schemes.clone())
+            .build()
+            .context("opening in-memory history")?
     } else {
-        buffr_history::History::open_with_skip_schemes(
-            paths.data.join("history.sqlite"),
-            config.privacy.skip_schemes.clone(),
-        )
-        .context("opening history database")?
+        buffr_history::History::builder()
+            .path(paths.data.join("history.sqlite"))
+            .skip_schemes(config.privacy.skip_schemes.clone())
+            .build()
+            .context("opening history database")?
     });
     let initial_rows = history.count().unwrap_or(0);
     info!(rows = initial_rows, "history opened");

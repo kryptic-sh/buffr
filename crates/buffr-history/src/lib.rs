@@ -30,7 +30,7 @@
 //! omnibar ever needs to query mid-keystroke we'll switch to a
 //! connection pool (`r2d2_sqlite`) — not now.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use buffr_store::ts_to_dt;
@@ -205,81 +205,20 @@ impl History {
     /// pending schema migrations. Uses [`SystemClock`] for time and
     /// the canonical [`DEFAULT_SKIP_SCHEMES`] list.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HistoryError> {
-        Self::open_with_clock(path, Box::new(SystemClock))
-    }
-
-    /// Open with a caller-supplied skip-schemes list. Pass
-    /// `config.privacy.skip_schemes.clone()` here. Schemes are matched
-    /// case-insensitively on the URL scheme component.
-    pub fn open_with_skip_schemes(
-        path: impl AsRef<Path>,
-        skip_schemes: Vec<String>,
-    ) -> Result<Self, HistoryError> {
-        Self::open_with_clock_and_skip_schemes(path, Box::new(SystemClock), skip_schemes)
-    }
-
-    /// Open or create the database with a custom [`Clock`] impl. Used
-    /// by tests to drive the dedupe window deterministically.
-    /// Uses the canonical [`DEFAULT_SKIP_SCHEMES`] list.
-    pub fn open_with_clock(
-        path: impl AsRef<Path>,
-        clock: Box<dyn Clock>,
-    ) -> Result<Self, HistoryError> {
-        let schemes = DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect();
-        Self::open_with_clock_and_skip_schemes(path, clock, schemes)
-    }
-
-    /// Full constructor: custom clock + custom skip-schemes list.
-    pub fn open_with_clock_and_skip_schemes(
-        path: impl AsRef<Path>,
-        clock: Box<dyn Clock>,
-        skip_schemes: Vec<String>,
-    ) -> Result<Self, HistoryError> {
-        let mut conn = buffr_store::open_tuned(path.as_ref())
-            .map_err(|source| HistoryError::Open { source })?;
-        schema::apply(&mut conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            clock,
-            skip_schemes,
-        })
+        Self::builder().path(path).build()
     }
 
     /// In-memory database — for tests and short-lived ephemeral
     /// profiles (private windows, Phase 5 follow-up).
     /// Uses the canonical [`DEFAULT_SKIP_SCHEMES`] list.
     pub fn open_in_memory() -> Result<Self, HistoryError> {
-        Self::open_in_memory_with_clock(Box::new(SystemClock))
+        Self::builder().in_memory().build()
     }
 
-    /// In-memory database with a caller-supplied skip-schemes list.
-    /// Pass `config.privacy.skip_schemes.clone()` here.
-    pub fn open_in_memory_with_skip_schemes(
-        skip_schemes: Vec<String>,
-    ) -> Result<Self, HistoryError> {
-        Self::open_in_memory_with_clock_and_skip_schemes(Box::new(SystemClock), skip_schemes)
-    }
-
-    /// In-memory database with a custom clock.
-    /// Uses the canonical [`DEFAULT_SKIP_SCHEMES`] list.
-    pub fn open_in_memory_with_clock(clock: Box<dyn Clock>) -> Result<Self, HistoryError> {
-        let schemes = DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect();
-        Self::open_in_memory_with_clock_and_skip_schemes(clock, schemes)
-    }
-
-    /// Full in-memory constructor: custom clock + custom skip-schemes list.
-    pub fn open_in_memory_with_clock_and_skip_schemes(
-        clock: Box<dyn Clock>,
-        skip_schemes: Vec<String>,
-    ) -> Result<Self, HistoryError> {
-        let mut conn =
-            buffr_store::open_tuned_in_memory().map_err(|source| HistoryError::Open { source })?;
-        schema::apply(&mut conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            clock,
-            skip_schemes,
-        })
+    /// Configure a [`History`] with a custom [`Clock`] and/or
+    /// skip-schemes list via [`HistoryBuilder`].
+    pub fn builder() -> HistoryBuilder {
+        HistoryBuilder::default()
     }
 
     /// Record a single visit. Performs URL canonicalisation, scheme
@@ -485,6 +424,76 @@ impl History {
     }
 }
 
+/// Builder for [`History`]. Defaults to an in-memory database with
+/// [`SystemClock`] and the canonical [`DEFAULT_SKIP_SCHEMES`] list;
+/// override each option with the consuming builder methods.
+pub struct HistoryBuilder {
+    path: Option<PathBuf>, // None => in-memory
+    clock: Box<dyn Clock>,
+    skip_schemes: Vec<String>, // empty => DEFAULT_SKIP_SCHEMES
+}
+
+impl Default for HistoryBuilder {
+    fn default() -> Self {
+        Self {
+            path: None,
+            clock: Box::new(SystemClock),
+            skip_schemes: Vec::new(),
+        }
+    }
+}
+
+impl HistoryBuilder {
+    /// Back the history with the SQLite database at `path`.
+    pub fn path(mut self, path: impl AsRef<Path>) -> Self {
+        self.path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Use an ephemeral in-memory database (the default).
+    pub fn in_memory(mut self) -> Self {
+        self.path = None;
+        self
+    }
+
+    /// Use a custom [`Clock`] instead of [`SystemClock`]. Needed by
+    /// tests to drive the dedupe window deterministically.
+    pub fn clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Replace the canonical [`DEFAULT_SKIP_SCHEMES`] list. Pass
+    /// `config.privacy.skip_schemes.clone()` here.
+    pub fn skip_schemes(mut self, schemes: Vec<String>) -> Self {
+        self.skip_schemes = schemes;
+        self
+    }
+
+    /// Build the [`History`]. An empty skip-schemes list resolves to
+    /// the canonical [`DEFAULT_SKIP_SCHEMES`].
+    pub fn build(self) -> Result<History, HistoryError> {
+        let skip_schemes = if self.skip_schemes.is_empty() {
+            DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect()
+        } else {
+            self.skip_schemes
+        };
+        let mut conn = match self.path {
+            Some(path) => {
+                buffr_store::open_tuned(&path).map_err(|source| HistoryError::Open { source })?
+            }
+            None => buffr_store::open_tuned_in_memory()
+                .map_err(|source| HistoryError::Open { source })?,
+        };
+        schema::apply(&mut conn)?;
+        Ok(History {
+            conn: Mutex::new(conn),
+            clock: self.clock,
+            skip_schemes,
+        })
+    }
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     Ok(HistoryEntry {
         id: row.get(0)?,
@@ -550,7 +559,11 @@ mod tests {
     #[test]
     fn record_three_visits_recent_orders_newest_first() {
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
         h.record_visit("https://a.example/", Some("A"), Transition::Link)
             .unwrap();
         clock.advance(120);
@@ -571,7 +584,11 @@ mod tests {
     #[test]
     fn dedupe_within_window_updates_in_place() {
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
         h.record_visit("https://a.example/", Some("A"), Transition::Link)
             .unwrap();
         clock.advance(5);
@@ -583,7 +600,11 @@ mod tests {
     #[test]
     fn dedupe_boundary_inserts_after_window() {
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
         h.record_visit("https://a.example/", Some("A"), Transition::Link)
             .unwrap();
         clock.advance(61);
@@ -595,7 +616,11 @@ mod tests {
     #[test]
     fn dedupe_keeps_existing_title_when_new_is_empty() {
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
         h.record_visit("https://a.example/", Some("Original"), Transition::Link)
             .unwrap();
         clock.advance(10);
@@ -611,7 +636,11 @@ mod tests {
         // b.example: visited 1x within recency window → score 2 + 10 = 12
         // c.example: visited 5x but ages ago → score 10 + 0 = 10
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
 
         for _ in 0..5 {
             h.record_visit("https://c.example/old", Some("Old"), Transition::Link)
@@ -640,7 +669,11 @@ mod tests {
     #[test]
     fn clear_range_deletes_window() {
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
         h.record_visit("https://a.example/", None, Transition::Link)
             .unwrap();
         let mid = clock.now();
@@ -677,7 +710,11 @@ mod tests {
 
     #[test]
     fn custom_skip_schemes_honored() {
-        let h = History::open_in_memory_with_skip_schemes(vec!["javascript".to_string()]).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .skip_schemes(vec!["javascript".to_string()])
+            .build()
+            .unwrap();
         h.record_visit("javascript:alert(1)", None, Transition::Link)
             .unwrap();
         assert_eq!(h.count().unwrap(), 0);
@@ -715,7 +752,11 @@ mod tests {
     #[test]
     fn update_latest_title_only_touches_most_recent() {
         let clock = fixed_clock(1_000_000_000);
-        let h = History::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        let h = History::builder()
+            .in_memory()
+            .clock(Box::new(clock.clone()))
+            .build()
+            .unwrap();
         h.record_visit("https://a.example/", Some("first"), Transition::Link)
             .unwrap();
         clock.advance(61);
