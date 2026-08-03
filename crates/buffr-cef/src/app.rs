@@ -172,9 +172,6 @@ wrap_app! {
             // laptops with integrated GPUs. We accept the risk — modern Mesa
             // drivers handle this fine.
             append_switch(command_line, "ignore-gpu-blocklist");
-            // No-sandbox is set in `Settings`, but a redundant switch
-            // keeps CEF from re-enabling on certain code paths.
-            append_switch(command_line, "no-sandbox");
             // BUFFR_DISABLE_ZYGOTE=1 opts out of Chromium's zygote
             // pre-fork model. On headless Linux CI (pixman-sway, no
             // DBus, etc.) the zygote subprocess crashes at init with

@@ -50,6 +50,11 @@ and this project adheres to
 - Collapsed `buffr-history`'s eight `open*` constructors into a `HistoryBuilder`
   (with `open`/`open_in_memory` kept as thin delegators); a third option would
   otherwise have meant sixteen constructors.
+- The Chromium renderer sandbox is now enabled: `no_sandbox` and the redundant
+  `--no-sandbox` switch are gone, so renderer subprocesses run under the
+  namespace sandbox on Linux instead of unsandboxed as the user. On hosts with
+  unprivileged user namespaces disabled, CEF warns and continues without
+  sandboxing (documented in `docs/packaging.md`).
 
 ## [0.14.9] - 2026-08-03
 

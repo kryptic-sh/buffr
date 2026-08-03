@@ -149,7 +149,6 @@ pub fn cef_initialize(cache_path: &str, app: &mut cef::App) -> Result<(), String
     // unused_mut warning on Linux/Windows where the bindings are immutable.
     #[allow(unused_mut)]
     let mut settings = cef::Settings {
-        no_sandbox: 1,
         multi_threaded_message_loop: 0,
         root_cache_path: cef::CefString::from(cache_path),
         windowless_rendering_enabled: 1,
