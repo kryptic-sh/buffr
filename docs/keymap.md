@@ -30,14 +30,11 @@ Shift, `<M-...>` / `<A-...>` = Alt, `<D-...>` = Super (Cmd on macOS), `<leader>`
 | `Pending` | (transient)       | Multi-key prefix in flight. Not user-bindable.          |
 | `Insert`  | text-field focus  | Forwarded to `Engine::feed_edit_mode_key`.              |
 
-## Count and register prefixes
+## Count prefix
 
-- **Count** — leading digits accumulate: `5j` scrolls down 5 lines, `12G` jumps
-  to line 12 (when implemented). `0` alone is bindable (vim convention: column
-  0); digits 1-9 always start a count.
-- **Register** — `"<char>` selects a register before a yank. The engine captures
-  register state but does **not** thread it through to actions; yank-to-register
-  is not implemented.
+- Leading digits accumulate: `5j` scrolls down 5 lines, `12G` jumps to line 12
+  (when implemented). `0` alone is bindable (vim convention: column 0); digits
+  1-9 always start a count.
 
 ## Ambiguity timeout
 

@@ -9,9 +9,6 @@
 //! - **count prefix** — leading digits 1-9 (and 0 if it's not a
 //!   binding by itself) accumulate into a u32 count attached to the
 //!   next count-bearing action. `5j` → `ScrollDown(5)`.
-//! - **register prefix** — `"<char>` selects a register and stashes
-//!   it on the engine. Phase 2 only captures the state; yank-to-
-//!   register wiring lands in Phase 5.
 //! - **mode** — current [`PageMode`]. Mode transitions arrive two
 //!   ways: implicit (specific actions like `OpenOmnibar` /
 //!   `EnterHintMode` / `EnterInsertMode` move the engine into the
@@ -60,7 +57,7 @@ pub enum Step {
     /// called past `timeout_at` the shorter action fires.
     Ambiguous { timeout_at: Duration },
     /// An action resolved. Engine has reset its pending buffer and
-    /// any count/register state attached to it.
+    /// any count state attached to it.
     Resolved(PageAction),
     /// Chord didn't extend any binding. Engine reset; caller may
     /// forward the original chord(s) to the page if desired.
@@ -97,11 +94,6 @@ pub struct Engine {
     /// Leading-digit count buffer. `0` means no count specified
     /// (binding gets count 1 unless explicit).
     count: u32,
-    /// `"<char>` register selector, set when user typed `"a` etc.
-    /// Phase 2 captures only — yank-to-register isn't wired.
-    register: Option<char>,
-    /// Set true while consuming the char *after* a `"`.
-    awaiting_register_char: bool,
     timeout: Duration,
 }
 
@@ -118,8 +110,6 @@ impl Engine {
             pending: Vec::new(),
             pending_started: None,
             count: 0,
-            register: None,
-            awaiting_register_char: false,
             timeout,
         }
     }
@@ -140,8 +130,6 @@ impl Engine {
         self.pending.clear();
         self.pending_started = None;
         self.count = 0;
-        self.register = None;
-        self.awaiting_register_char = false;
     }
 
     pub fn mode(&self) -> PageMode {
@@ -157,11 +145,6 @@ impl Engine {
     /// Current pending chord buffer (for status-line rendering).
     pub fn pending(&self) -> &[KeyChord] {
         &self.pending
-    }
-
-    /// Currently captured register, if any.
-    pub fn register(&self) -> Option<char> {
-        self.register
     }
 
     /// Currently buffered count (0 = none).
@@ -199,26 +182,9 @@ impl Engine {
             return Step::EditModeActive;
         }
 
-        // Register prefix consumes one chord at a time.
-        if self.awaiting_register_char {
-            self.awaiting_register_char = false;
-            if let Key::Char(c) = chord.key {
-                self.register = Some(c);
-                return Step::Pending;
-            }
-            // Non-char after `"` — abort register selection.
-            self.register = None;
-            return Step::Reject;
-        }
-
-        // Count and register prefixes only apply in Normal mode and
-        // only when no chords are pending.
+        // Count prefixes only apply in Normal mode and only when no
+        // chords are pending.
         if matches!(self.mode, PageMode::Normal | PageMode::Visual) && self.pending.is_empty() {
-            // `"` starts register selection.
-            if chord.modifiers.is_empty() && chord.key == Key::Char('"') {
-                self.awaiting_register_char = true;
-                return Step::Pending;
-            }
             // Digits 1-9 always start a count. `0` only starts a
             // count if a count is already in progress (vim
             // convention: `0` alone is "go to col 0", which here
@@ -313,13 +279,11 @@ impl Engine {
         EditModeStep::PassThrough(chord)
     }
 
-    /// Reset pending buffer + count + register. Mode untouched.
+    /// Reset pending buffer + count. Mode untouched.
     fn reset_pending(&mut self) {
         self.pending.clear();
         self.pending_started = None;
         self.count = 0;
-        self.register = None;
-        self.awaiting_register_char = false;
     }
 
     /// Bake the pending count into a count-bearing action and apply
@@ -520,22 +484,18 @@ mod tests {
     }
 
     #[test]
-    fn register_quote_a_then_y_captures_state() {
-        // Bind `y` to YankUrl. Feed `"ay`: the engine captures
-        // register `a` and then resolves YankUrl. Phase 2 contract:
-        // register state observable on the engine after the action
-        // resolves — the action itself doesn't carry it yet.
-        let mut e = engine_with(&[(PageMode::Normal, "y", PageAction::YankUrl)]);
+    fn quote_falls_through_to_trie() {
+        // `"` is unbound in DEFAULT_BINDINGS, so it must NoMatch →
+        // Reject like any other key instead of starting register
+        // selection. Regression for L38: `"ay` used to swallow both
+        // keystrokes and emit a plain YankUrl.
+        let mut e = engine_with(&[(PageMode::Normal, "j", PageAction::ScrollDown(1))]);
         let r1 = e.feed(parse_key("\"").unwrap(), t(0));
-        assert_eq!(r1, Step::Pending);
-        let r2 = e.feed(parse_key("a").unwrap(), t(0));
-        assert_eq!(r2, Step::Pending);
-        // After `"a`, register captured.
-        assert_eq!(e.register(), Some('a'));
-        let r3 = e.feed(parse_key("y").unwrap(), t(0));
-        assert_eq!(r3, Step::Resolved(PageAction::YankUrl));
-        // Action resolved; register cleared with the rest of pending state.
-        assert_eq!(e.register(), None);
+        assert_eq!(r1, Step::Reject);
+        assert!(e.pending().is_empty());
+        // Engine recovers; next chord works.
+        let r2 = e.feed(parse_key("j").unwrap(), t(10));
+        assert_eq!(r2, Step::Resolved(PageAction::ScrollDown(1)));
     }
 
     #[test]

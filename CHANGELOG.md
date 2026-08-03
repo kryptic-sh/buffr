@@ -13,6 +13,10 @@ and this project adheres to
 - The hint-mode statusline no longer renders a meaningless `(n/n)` counter —
   numerator and denominator were the same field, so it always read e.g.
   `f: as (3/3)`. It now shows just the typed prefix (`f: as`).
+- The vim register prefix (`"<char>`) no longer swallows two keystrokes and
+  discards them. Register state was captured but never threaded into actions, so
+  `"ay` produced a plain `YankUrl`; `"` now falls through to the keymap like any
+  other unbound key.
 
 ## [0.14.9] - 2026-08-03
 
