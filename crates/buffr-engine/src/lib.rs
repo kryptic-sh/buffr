@@ -26,7 +26,6 @@
 //! |---|---|
 //! | [`BrowserEngine`] | Central trait — one impl per backend |
 //! | [`EngineId`] | Unique handle identifying a live engine instance |
-//! | [`EngineEvent`] | Event enum produced by a running engine |
 //! | [`OsrFrame`] / [`SharedOsrFrame`] | Off-screen render buffer + sharing wrapper |
 //! | [`TabId`] / [`TabSummary`] | Lightweight tab identity and metadata |
 //! | [`PermissionsQueue`] | Lock-free queue for pending browser permission prompts |
@@ -48,7 +47,6 @@ pub mod clipboard;
 pub mod engine;
 pub mod engine_id;
 pub mod error;
-pub mod event;
 pub mod favicon;
 pub mod hint;
 pub mod input;
@@ -67,7 +65,6 @@ pub use clipboard::{ClipboardRead, ClipboardReader};
 pub use engine::BrowserEngine;
 pub use engine_id::EngineId;
 pub use error::EngineError;
-pub use event::EngineEvent;
 pub use favicon::FaviconUpdate;
 pub use hint::{HintAction, HintStatus};
 pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
@@ -84,10 +81,7 @@ pub use popup::{
 };
 pub use profile::ProfilePaths;
 pub use tab::{TabId, TabOptions, TabSession, TabSummary};
-pub use types::{
-    AudioEvent, ContextMenuRequest, CursorChanged, LoadState, NativeRect, NavigationEvent,
-    WaylandNativeHandles,
-};
+pub use types::{AudioEvent, ContextMenuRequest, NativeRect, WaylandNativeHandles};
 
 /// Re-export of the raw-window-handle crate so backends + apps share the
 /// same RawWindowHandle / RawDisplayHandle types without independent

@@ -39,6 +39,9 @@ and this project adheres to
   `false`), and a fresh tab (`o`/`O`/`:tabnew`) opens `new_tab_url` instead of
   the homepage. The never-implemented `theme.mode` and `updates.channel` knobs
   were removed along with their validation and docs.
+- Removed `buffr-engine`'s unused neutral event/state types (`EngineEvent`,
+  `NavigationEvent`, `LoadState`, `CursorChanged`, `CursorKind`) — they had zero
+  callers and their tests only tested themselves.
 
 ## [0.14.9] - 2026-08-03
 
