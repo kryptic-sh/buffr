@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use crate::{
     AudioEvent, ClipboardReader, ContextMenuRequest, EngineError, FaviconUpdate, HintAction,
-    HintStatus, MouseButton, NativeRect, NeutralKeyEvent, PermissionsQueue, PromptOutcome,
-    SharedOsrFrame, SharedOsrViewState, TabId, TabSummary,
+    HintStatus, MouseButton, NeutralKeyEvent, PermissionsQueue, PromptOutcome, SharedOsrFrame,
+    SharedOsrViewState, TabId, TabSummary,
     popup::{PopupCloseSink, PopupCreateSink, PopupQueue},
 };
 
@@ -766,47 +766,13 @@ pub trait BrowserEngine: Send + Sync {
     }
 
     // ── Native compositing (Phase 3, #109) ───────────────────────────────────
-    //
-    // Three-method API surface for backends that can render directly into a
-    // host-provided native surface (Wayland wl_surface today; Cocoa later).
-    // Default is "OSR-only": all three are no-ops, so existing backends
-    // compile + behave unchanged.
-
-    // ── Internal server (InternalServer HTTP loopback) ───────────────────────
-
-    /// Attach a shared [`crate::internal_server::InternalServer`] so future
-    /// `buffr://*` navigations resolve to authenticated localhost HTTP URLs.
-    ///
-    /// Idempotent; later calls replace the previous server.
-    ///
-    /// Default: no-op. Backends override when they support the loopback path.
-    fn set_internal_server(&self, _server: std::sync::Arc<crate::internal_server::InternalServer>) {
-    }
-
-    /// `true` when the backend supports native compositing into a host-
-    /// provided surface. When true, the apps layer should:
-    ///   1. Call [`Self::set_native_parent`] with a `RawWindowHandle` to the
-    ///      host's surface (e.g. winit's `wl_surface`) and the browser rect
-    ///      within it.
-    ///   2. Skip the OSR drain in its render loop — engine pixels arrive
-    ///      directly via the platform-native compositor.
-    ///   3. Render its chrome with alpha (transparent over the browser
-    ///      region) so the engine's native surface shows through.
-    ///   4. Call [`Self::set_native_visible`] on tab activation / window
-    ///      occlusion.
-    ///
-    /// Default: `false` (CEF and other backends without native compositing).
-    fn supports_native(&self) -> bool {
-        false
-    }
-
     /// Whether the engine is **currently** rendering through a native
     /// platform-compositor surface (e.g. Wayland subsurface) rather than
     /// the OSR readback path.
     ///
-    /// Distinct from [`Self::supports_native`]: an engine can support
-    /// native compositing (the capability exists) but still run on the
-    /// OSR path (the user opted out, the session type isn't right,
+    /// An engine can support native compositing (the capability exists)
+    /// but still run on the OSR path (the user opted out, the session
+    /// type isn't right,
     /// initialisation failed, etc.).  The apps layer uses this when
     /// gating logic that needs to know which pixel pipeline is live —
     /// e.g. suppressing the loading animation overlay over a native
@@ -819,26 +785,6 @@ pub trait BrowserEngine: Send + Sync {
     fn is_using_native_compositing(&self) -> bool {
         false
     }
-
-    /// Bind the engine to a parent native surface + viewport rect within it.
-    ///
-    /// `parent` is a [`raw_window_handle::RawWindowHandle`] — Wayland's
-    /// `WaylandWindowHandle::surface` carries the host `wl_surface`. The
-    /// engine creates a child subsurface positioned at `rect` and renders
-    /// into it.
-    ///
-    /// Calling again with a new parent or rect repositions / re-parents.
-    ///
-    /// Default: no-op.
-    fn set_native_parent(&self, _parent: raw_window_handle::RawWindowHandle, _rect: NativeRect) {}
-
-    /// Show or hide the engine's native surface attachment without tearing
-    /// it down. Used by the apps layer for tab switching: only the active
-    /// tab's native surface should be visible; others stay attached but
-    /// hidden so reactivation is instant.
-    ///
-    /// Default: no-op.
-    fn set_native_visible(&self, _visible: bool) {}
 }
 
 #[cfg(test)]

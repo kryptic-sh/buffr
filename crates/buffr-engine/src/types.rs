@@ -42,20 +42,6 @@ pub struct WaylandNativeHandles {
 unsafe impl Send for WaylandNativeHandles {}
 unsafe impl Sync for WaylandNativeHandles {}
 
-/// Rectangle in physical pixels relative to a host native surface origin.
-///
-/// Used by [`BrowserEngine::set_native_parent`] to tell the engine where its
-/// rendered content should appear within the host's window. Phase 3 of the
-/// WPE WebKit umbrella (#109) uses this to place a Wayland subsurface; future
-/// Cocoa native backends will read the same shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-}
-
 /// Audio stream activity change for one browser.
 #[derive(Debug, Clone, Copy)]
 pub struct AudioEvent {

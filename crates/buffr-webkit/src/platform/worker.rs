@@ -224,17 +224,6 @@ pub(crate) enum Command {
     /// delivered asynchronously via the `buffrMediaProbe` UCM handler, which
     /// stores the `video` flag in the runtime-wide `video_active` atomic.
     RunMediaProbe,
-    /// Update the active tab's `BuffrViewWayland` subsurface position and
-    /// render size (#153). Dispatched from `WebKitEngine::set_native_parent`
-    /// via the worker command channel; executed on the GLib worker thread so
-    /// `wl_subsurface_set_position` + `wpe_view_resized` happen in the right
-    /// thread context.
-    SetNativeRect {
-        x: i32,
-        y: i32,
-        w: u32,
-        h: u32,
-    },
     /// Push a preedit update to the active tab's `BuffrInputMethodContext`.
     ///
     /// `text` is the preedit string; `cursor` is an optional `(start, end)`
@@ -828,9 +817,6 @@ fn handle_command(cmd: Command, rt: &mut WpeRuntime, ml: &glib::MainLoop) -> boo
         }
         Command::RunMediaProbe => {
             rt.run_media_probe();
-        }
-        Command::SetNativeRect { x, y, w, h } => {
-            rt.set_native_rect(x, y, w, h);
         }
         Command::ImeSetComposition { text, cursor } => {
             rt.ime_set_composition(&text, cursor);

@@ -42,6 +42,11 @@ and this project adheres to
 - Removed `buffr-engine`'s unused neutral event/state types (`EngineEvent`,
   `NavigationEvent`, `LoadState`, `CursorChanged`, `CursorKind`) — they had zero
   callers and their tests only tested themselves.
+- Removed the dead native-compositing trait trio (`supports_native`,
+  `set_native_parent`, `set_native_visible`) plus `set_internal_server` from
+  `BrowserEngine` — none had callers, and the excluded `buffr-webkit` backend
+  dropped its matching overrides and the `SetNativeRect` worker command.
+  `is_using_native_compositing` stays; it gates the live pixel-pipeline path.
 
 ## [0.14.9] - 2026-08-03
 

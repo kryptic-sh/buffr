@@ -600,17 +600,6 @@ impl BrowserEngine for WebKitEngine {
         self.send(Command::Shutdown);
     }
 
-    // ── Internal server ───────────────────────────────────────────────────────
-
-    /// W1: real override of the trait's default no-op. Without this, a call
-    /// through `Arc<dyn BrowserEngine>` silently hit the default and left
-    /// `buffr://` URLs untranslated. Delegates to the inherent method
-    /// (inherent methods win on a concrete `WebKitEngine`, so both spellings
-    /// end up here).
-    fn set_internal_server(&self, server: Arc<InternalServer>) {
-        WebKitEngine::set_internal_server(self, server);
-    }
-
     // ── Tabs ──────────────────────────────────────────────────────────────────
 
     fn open_tab(&self, url: &str) -> Result<TabId, EngineError> {
@@ -1571,20 +1560,9 @@ impl BrowserEngine for WebKitEngine {
 
     // ── Native compositing (#143) ────────────────────────────────────────────
     //
-    // Phase 3 of the WPE WebKit umbrella (#109). WPE 2.52 ships
-    // WPEDisplayWayland which renders WebKit directly into a wl_surface —
-    // avoiding the OSR readback path entirely. supports_native gates the
-    // apps-layer's decision to skip OSR drains; set_native_parent /
-    // set_native_visible are the actual wiring (deferred to #145 / #147).
-    //
-    // buffr is Wayland-only on Linux, so the session-type check is redundant.
-    // supports_native always returns true; the actual compositing path is
-    // determined by is_using_native_compositing (which reflects whether
-    // WPEDisplayWayland was actually constructed vs the OSR fallback).
-
-    fn supports_native(&self) -> bool {
-        true
-    }
+    // Whether the native compositing path is actually live is reported by
+    // is_using_native_compositing, which reflects whether WPEDisplayWayland
+    // was actually constructed vs the OSR fallback.
 
     fn is_using_native_compositing(&self) -> bool {
         // Published by the GLib worker after WpeRuntime::new chose its
@@ -1592,37 +1570,6 @@ impl BrowserEngine for WebKitEngine {
         // stock WPEDisplayWayland was actually constructed; false when
         // the runtime fell back to the OSR readback path.
         self.using_native.load(Ordering::Relaxed)
-    }
-
-    fn set_native_parent(
-        &self,
-        _parent: buffr_engine::raw_window_handle::RawWindowHandle,
-        rect: buffr_engine::NativeRect,
-    ) {
-        // Send the rect to the GLib worker thread so wl_subsurface_set_position
-        // and wpe_view_resized run in the right Wayland/GLib context (#153).
-        tracing::debug!(
-            x = rect.x,
-            y = rect.y,
-            w = rect.w,
-            h = rect.h,
-            "webkit: set_native_parent → Command::SetNativeRect"
-        );
-        self.send(Command::SetNativeRect {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: rect.h,
-        });
-    }
-
-    fn set_native_visible(&self, visible: bool) {
-        // Stub. Real impl in #145 toggles wl_subsurface attach via a
-        // null-buffer commit or place_above/below dance.
-        tracing::debug!(
-            visible,
-            "webkit: set_native_visible (stub — Phase 3 #145 pending)"
-        );
     }
 
     // ── IME composition (#IME) ────────────────────────────────────────────────

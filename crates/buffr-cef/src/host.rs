@@ -2997,12 +2997,6 @@ impl buffr_engine::BrowserEngine for BrowserHost {
         self.close_all_browsers()
     }
 
-    // ── Internal server ──────────────────────────────────────────────────────
-
-    fn set_internal_server(&self, server: Arc<InternalServer>) {
-        self.set_internal_server(server);
-    }
-
     // ── Tabs ─────────────────────────────────────────────────────────────────
 
     fn open_tab(&self, url: &str) -> Result<TabId, buffr_engine::EngineError> {
