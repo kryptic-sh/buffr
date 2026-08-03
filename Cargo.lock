@@ -610,7 +610,7 @@ version = "0.1.5"
 dependencies = [
  "bitflags 2.11.1",
  "crossterm",
- "hjkl-buffer",
+ "hjkl-buffer 0.6.0",
  "hjkl-engine",
  "serde",
  "thiserror 2.0.18",
@@ -653,7 +653,7 @@ dependencies = [
 name = "buffr-view-source"
 version = "0.1.0"
 dependencies = [
- "hjkl-bonsai",
+ "hjkl-bonsai 0.6.1",
  "tracing",
 ]
 
@@ -1145,7 +1145,6 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
- "futures-core",
  "mio",
  "parking_lot",
  "rustix 1.1.4",
@@ -1929,9 +1928,33 @@ checksum = "908041907d7f641e54b094e3c86febd9b485df253b92508dfe523ef60223605f"
 dependencies = [
  "anyhow",
  "dirs",
- "hjkl-xdg",
+ "hjkl-xdg 0.1.0",
  "libloading 0.9.0",
  "ratatui",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "hjkl-bonsai"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be381fffa990b92ccc70a768685d7f9517bbb26d3ed344d66eb2d4ebc4038ede"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "hjkl-fs",
+ "hjkl-theme",
+ "hjkl-xdg 0.39.1",
+ "libloading 0.9.0",
+ "libmimalloc-sys",
+ "memchr",
+ "regex",
+ "ropey",
  "serde",
  "thiserror 2.0.18",
  "toml",
@@ -1946,8 +1969,19 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22a56e4162c8cc2d4b040c7be2c21e4b09b0d3c09c731d750c873d88bfd0a3a0"
 dependencies = [
- "ratatui",
  "regex",
+ "unicode-width",
+]
+
+[[package]]
+name = "hjkl-buffer"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a3fe0e44af1f7a1b8890e253149e10a85a4f7b4641469e8ecd64ac39ab3829f"
+dependencies = [
+ "regex",
+ "ropey",
+ "serde",
  "unicode-width",
 ]
 
@@ -1977,17 +2011,40 @@ dependencies = [
 
 [[package]]
 name = "hjkl-engine"
-version = "0.5.15"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "868b451122b7ba8c6d30e504e9cfc9a2dd1e175ca36c781c1277701bf65e19e8"
+checksum = "55a4b3d52923c81ee007c9d066410d1502ea89882d2af690a0ba8c41a986ca16"
 dependencies = [
  "bitflags 2.11.1",
- "crossterm",
- "hjkl-buffer",
- "ratatui",
+ "hjkl-buffer 0.39.1",
+ "hjkl-lang",
+ "hjkl-vim-types",
  "regex",
- "serde",
+ "ropey",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "hjkl-fs"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2438d644fcd1dffe182758ebe6ff06ba7e071d32a9219336ec9ed441a90c5d8"
+dependencies = [
+ "hjkl-xdg 0.39.1",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hjkl-lang"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c996730f71bdc598eecf36611145267d5382deaff49f55972008a5a9f41231e"
+dependencies = [
+ "anyhow",
+ "hjkl-bonsai 0.39.1",
+ "tracing",
 ]
 
 [[package]]
@@ -1997,10 +2054,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e38f603523defba5c303f13b8c4d2a998f77c0d656296f1a79efd4a3ac73707a"
 
 [[package]]
+name = "hjkl-theme"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d565bcfd238e4136c35b464a118da40ede4c32d4f0e0ce326de8ef47d34d236e"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "hjkl-vim-types"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dacc0d96f7f68a17b89adbfc409944f91108cfe7933d6b3574c3042b392aa98"
+dependencies = [
+ "ropey",
+]
+
+[[package]]
 name = "hjkl-xdg"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a9818d4389b1cc9d8ea54f57f388f3a58d3f80315e0ceb66903813a26c3fa1f"
+dependencies = [
+ "dirs",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f20d213a26f69744195653813132398d355c69f9f8bca9f14bb519001529dd3f"
 dependencies = [
  "dirs",
  "thiserror 2.0.18",
@@ -2482,6 +2569,15 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "libredox"
@@ -3777,6 +3873,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ropey"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
+dependencies = [
+ "smallvec",
+ "str_indices",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4217,6 +4323,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "str_indices"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
 
 [[package]]
 name = "streaming-iterator"
