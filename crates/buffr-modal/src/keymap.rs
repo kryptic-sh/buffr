@@ -244,10 +244,22 @@ impl Keymap {
         // We DO this by name (not by `PageAction` value) so that count
         // variants compare with `count = 1`; the table maps the canonical
         // chord that fires the unit case.
-        let bound: std::collections::HashSet<&'static str> = DEFAULT_BINDINGS
-            .iter()
-            .map(|(_, _, a)| action_kind(a))
-            .collect();
+        //
+        // `bound` is collected from the *built trie* (via `entries`),
+        // not the static table: a row shadowed by a later duplicate
+        // binding is overwritten during construction, so it must be
+        // reported missing rather than counted as covered.
+        let km = Self::default_bindings('\\');
+        let bound: std::collections::HashSet<&'static str> = [
+            PageMode::Normal,
+            PageMode::Visual,
+            PageMode::Command,
+            PageMode::Hint,
+        ]
+        .into_iter()
+        .flat_map(|mode| km.entries(mode))
+        .map(|(_, a)| action_kind(&a))
+        .collect();
         let expected = [
             "ScrollUp",
             "ScrollDown",
@@ -546,7 +558,6 @@ const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     (PageMode::Normal, "N", PageAction::FindPrev),
     // -- yank -----------------------------------------------------
     (PageMode::Normal, "y", PageAction::YankUrl),
-    (PageMode::Normal, "<C-c>", PageAction::YankUrl),
     // -- zoom -----------------------------------------------------
     // `+` / `=` zoom in (matches Chromium's Ctrl++ and Ctrl+= aliases),
     // `-` / `_` zoom out, `0` / `)` reset. `<C-0>` kept as a Vieb-style
@@ -818,6 +829,23 @@ mod tests {
             let (b_mode, b_keys) = (w[1].0, w[1].1);
             let cmp = a_mode.cmp(b_mode).then(a_keys.cmp(b_keys));
             assert!(cmp.is_le(), "{a_mode}/{a_keys} vs {b_mode}/{b_keys}");
+        }
+    }
+
+    #[test]
+    fn default_bindings_has_no_duplicate_mode_keys() {
+        // Guards against shadowed rows in `DEFAULT_BINDINGS`:
+        // `ModeMap::bind_chords` overwrites the trie node's action, so
+        // a duplicate `(mode, keys)` pair silently hides the earlier
+        // row — a user loses a working binding and `missing_default_bindings`
+        // reports the shadowed action as covered.
+        let mut seen: std::collections::HashSet<(PageMode, &str)> =
+            std::collections::HashSet::new();
+        for &(mode, keys, _) in DEFAULT_BINDINGS {
+            assert!(
+                seen.insert((mode, keys)),
+                "duplicate default binding ({mode:?}, {keys})"
+            );
         }
     }
 

@@ -118,15 +118,7 @@ right-click menu (`ContextMenuItem::TabDuplicate`). See
 > `ExitInsertMode` — it blurs the focused DOM element and resets the engine to
 > Normal unconditionally.
 >
-> **`StopLoading` has no working default binding.** `DEFAULT_BINDINGS` lists
-> `<C-c>` twice in Normal mode — once as `StopLoading` and again, later, as
-> `YankUrl` — and the later row wins when the trie is built, so `<C-c>` yanks
-> the URL. Bind it yourself if you want it back:
->
-> ```toml
-> [keymap.normal]
-> "<C-s>" = "stop_loading"
-> ```
+> **`<C-c>` is `StopLoading`** (a buffr extension); `y` is `YankUrl`.
 
 ### Omnibar / command line
 
@@ -155,10 +147,9 @@ right-click menu (`ContextMenuItem::TabDuplicate`). See
 
 ### Yank
 
-| Keys    | Action    | Notes                                                        |
-| ------- | --------- | ------------------------------------------------------------ |
-| `y`     | `YankUrl` |                                                              |
-| `<C-c>` | `YankUrl` | Shadows the earlier `<C-c>` → `StopLoading` row (see above). |
+| Keys | Action    | Notes |
+| ---- | --------- | ----- |
+| `y`  | `YankUrl` |       |
 
 ### Zoom
 

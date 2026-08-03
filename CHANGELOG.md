@@ -19,6 +19,11 @@ and this project adheres to
   other unbound key.
 - Removed the never-produced `PageMode::Pending` state and its dead status-line
   and keymap arms; a `[keymap.pending]` config section is no longer accepted.
+- `<C-c>` is now reliably `StopLoading`. It was bound twice — the later
+  `YankUrl` row shadowed it, so stopping a load had no default key and the
+  keyboard-accessibility audit falsely reported it covered. The shadow row is
+  gone (`y` still yanks) and the audit now walks the built keymap instead of the
+  static table, so a shadowed binding can no longer fake coverage.
 
 ## [0.14.9] - 2026-08-03
 
