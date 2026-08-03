@@ -144,6 +144,16 @@ has observed.
 - **`edit.js` rewire on soft navigation.** The teardown hook added for the H5
   nonce assumes CEF re-fires main-frame `on_load_end` for the same document.
   Worth exercising a heavy SPA.
+- **"Every commit is CI-green" is not true, and the run list says so.** The CI
+  workflow uses a concurrency group that cancels superseded runs, so when
+  commits land in quick succession only the last one completes. Of the five
+  correctness fixes, **C1–C4 (`4b9e4cb`, `29e6a22`, `64c2327`, `08ab615`) all
+  show `cancelled`**; the first green run in that stretch is C5 (`f6c1360`). Six
+  of the seven decomposition slices were cancelled the same way, with `e374b37`
+  the green one. The tip being green is genuine and is what the release rests
+  on, but no individual fix was independently verified on CI — each rests on the
+  local `--workspace` run instead. If per-commit CI is wanted, pushes have to be
+  spaced or the group narrowed.
 - **The C1–C5 fixes are unit-tested, not exercised.** Each landed with a pure
   test that was proven to go red, but three of them have branches no test
   reaches, and the tests cannot reach them:
@@ -566,6 +576,55 @@ dependency needed.
   per `PointerMoved` (100–1000 Hz) purely to hit-test, then again during paint.
 - `loading_anim.rs` does `cell.ch.to_string()` per cell per frame; exposing a
   `font::draw_char` removes it.
+
+---
+
+## 10. Queued, agreed but not started
+
+The order settled on 2026-08-02: finish the correctness findings, then the
+performance ones, then the dependency bump. One item per commit — delegate,
+verify independently, commit, push — rather than a batch.
+
+- **Correctness: C6, C7, C8, C9** in section 8. C6 and C7 are from the original
+  pass; C8 and C9 surfaced while fixing C5 and C3 respectively.
+- **Performance: P1–P8** in section 9, none started. P1 (unbounded bookmark
+  query plus the missing omnibar debounce) is the cheapest high-value one and
+  was picked as the entry point.
+- **Bump the HJKL dependencies to latest.** Six of them are declared in
+  `[workspace.dependencies]` in the root `Cargo.toml`: `hjkl-engine`,
+  `hjkl-buffer`, `hjkl-clipboard`, `hjkl-splash`, `hjkl-config` and
+  `hjkl-bonsai`. They are caret requirements, not the `=` pins older changelog
+  entries describe, so a `cargo update` already moves them within a major and
+  only a major bump needs the manifest touched. Use `cargo add`/`cargo update`
+  rather than editing versions by hand. Historically these bumps needed no
+  source changes because buffr consumes only editor-level APIs — an assumption
+  worth re-checking each time, not a guarantee.
+
+---
+
+## 11. Working practice, learned the hard way
+
+Not repo defects. Recorded because each one cost real time or real work, and
+none of it is recoverable from `git log`.
+
+- **Never remove a canary edit with a git restore.** `git checkout-index -f --`
+  and `git checkout HEAD --` both restore from a source that does **not**
+  include a sub-agent's unstaged work, and doing that once destroyed a completed
+  `buffr-engine/src/permissions.rs` change — `PromptIdentity`, `ResolveTarget`,
+  `resolve_target`, `take_front_matching` and eleven tests — which only survived
+  because the agent had kept its own scratchpad copy. The flow that replaced it:
+  **stage the agent's output first**, then add the canary, then remove the
+  canary by targeted string replacement. An empty `git diff --stat` against the
+  index then proves the canary is gone without any restore being involved.
+- **rust-analyzer diagnostics went stale repeatedly** during the decomposition,
+  reporting freshly-wired functions as "never used" and inventing missing struct
+  fields. Every instance was contradicted by
+  `cargo clippy --all-targets -- -D warnings`. Trust the compiler, not the
+  editor, and re-check rather than acting on the squiggle.
+- **A regex that widens struct fields will also hit function parameters.**
+  Broadening visibility with `^(    )(\w+: )` during the `paint_policy` slice
+  produced roughly forty syntax errors by matching multi-line call signatures.
+  Regenerate from the committed copy and edit named blocks after reading them.
 
 ---
 
