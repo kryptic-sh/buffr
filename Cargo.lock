@@ -1929,7 +1929,7 @@ checksum = "908041907d7f641e54b094e3c86febd9b485df253b92508dfe523ef60223605f"
 dependencies = [
  "anyhow",
  "dirs",
- "hjkl-xdg",
+ "hjkl-xdg 0.1.0",
  "libloading 0.9.0",
  "ratatui",
  "serde",
@@ -1965,14 +1965,16 @@ dependencies = [
 
 [[package]]
 name = "hjkl-config"
-version = "0.25.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad3bc3d65ee3102fbf062a7376b9d5f1813fbfd05686e65b972f1cfd8a99e69d"
+checksum = "3740746d894b2a27ee3060d204c4a19fd9f4f0f2b1b8beb5e33445a69935e77f"
 dependencies = [
- "dirs",
+ "hjkl-fs",
+ "hjkl-xdg 0.39.1",
  "serde",
  "thiserror 2.0.18",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1991,6 +1993,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hjkl-fs"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2438d644fcd1dffe182758ebe6ff06ba7e071d32a9219336ec9ed441a90c5d8"
+dependencies = [
+ "hjkl-xdg 0.39.1",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hjkl-splash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2001,6 +2014,16 @@ name = "hjkl-xdg"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a9818d4389b1cc9d8ea54f57f388f3a58d3f80315e0ceb66903813a26c3fa1f"
+dependencies = [
+ "dirs",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f20d213a26f69744195653813132398d355c69f9f8bca9f14bb519001529dd3f"
 dependencies = [
  "dirs",
  "thiserror 2.0.18",
@@ -4526,6 +4549,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
