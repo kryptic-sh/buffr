@@ -177,10 +177,6 @@ impl Keymap {
 
     /// Trie backing `mode`, or `None` when the mode has none.
     ///
-    /// `Pending` deliberately shares the Normal trie — it is the
-    /// transient mid-chord state of a Normal-mode sequence, and the
-    /// engine looks the partial sequence up under it.
-    ///
     /// `Insert` maps to nothing at all. It used to fall into the
     /// Normal arm, which meant a `[keymap.insert]` entry was installed
     /// in the Normal trie: it fired while browsing (wrong mode) and
@@ -188,7 +184,7 @@ impl Keymap {
     /// the trie). Returning `None` makes that misfiling impossible.
     fn mode_map(&self, mode: PageMode) -> Option<&ModeMap> {
         match mode {
-            PageMode::Normal | PageMode::Pending => Some(&self.normal),
+            PageMode::Normal => Some(&self.normal),
             PageMode::Visual => Some(&self.visual),
             PageMode::Command => Some(&self.command),
             PageMode::Hint => Some(&self.hint),
@@ -199,7 +195,7 @@ impl Keymap {
     /// Mutable counterpart of [`Self::mode_map`]; same `None` for Insert.
     fn mode_map_mut(&mut self, mode: PageMode) -> Option<&mut ModeMap> {
         match mode {
-            PageMode::Normal | PageMode::Pending => Some(&mut self.normal),
+            PageMode::Normal => Some(&mut self.normal),
             PageMode::Visual => Some(&mut self.visual),
             PageMode::Command => Some(&mut self.command),
             PageMode::Hint => Some(&mut self.hint),
@@ -394,7 +390,6 @@ fn mode_label(mode: PageMode) -> &'static str {
         PageMode::Visual => "visual",
         PageMode::Command => "command",
         PageMode::Hint => "hint",
-        PageMode::Pending => "pending",
         PageMode::Insert => "insert",
     }
 }
@@ -769,12 +764,6 @@ mod tests {
         ));
         assert!(km.resolve_timeout(PageMode::Insert, &chords("j")).is_none());
         assert!(km.entries(PageMode::Insert).is_empty());
-        // …while Pending, which legitimately shares it, still sees it.
-        assert!(matches!(
-            km.lookup(PageMode::Pending, &chords("j")),
-            Lookup::Match(PageAction::ScrollDown(1))
-        ));
-        assert_eq!(km.entries(PageMode::Pending).len(), 1);
         // Sanity: the binding really is in the Normal trie, so the
         // assertions above are about routing and not an empty keymap.
         assert_eq!(km.entries(PageMode::Normal).len(), 1);

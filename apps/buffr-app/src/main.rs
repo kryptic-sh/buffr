@@ -5488,12 +5488,10 @@ impl AppState {
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 /// Map a [`PageMode`] to the status-line label rendered into the
-/// window title. `Pending` collapses to `NORMAL` because the engine
-/// only enters `Pending` mid-multi-chord and we don't want the title
-/// to flicker on every key.
+/// window title.
 fn mode_label(mode: PageMode) -> &'static str {
     match mode {
-        PageMode::Normal | PageMode::Pending => "NORMAL",
+        PageMode::Normal => "NORMAL",
         PageMode::Visual => "VISUAL",
         PageMode::Command => "COMMAND",
         PageMode::Hint => "HINT",

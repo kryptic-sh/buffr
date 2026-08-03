@@ -406,7 +406,6 @@ fn mode_label(mode: PageMode) -> &'static str {
         PageMode::Command => "COMMAND",
         PageMode::Hint => "HINT",
         PageMode::Insert => "INSERT",
-        PageMode::Pending => "PENDING",
     }
 }
 
@@ -548,7 +547,7 @@ const HUE_HINT: f32 = 240.0;
 
 fn mode_hue_offset(mode: PageMode) -> f32 {
     match mode {
-        PageMode::Normal | PageMode::Pending => HUE_NORMAL,
+        PageMode::Normal => HUE_NORMAL,
         PageMode::Insert => HUE_INSERT,
         PageMode::Visual => HUE_VISUAL,
         PageMode::Command => HUE_COMMAND,

@@ -17,6 +17,8 @@ and this project adheres to
   discards them. Register state was captured but never threaded into actions, so
   `"ay` produced a plain `YankUrl`; `"` now falls through to the keymap like any
   other unbound key.
+- Removed the never-produced `PageMode::Pending` state and its dead status-line
+  and keymap arms; a `[keymap.pending]` config section is no longer accepted.
 
 ## [0.14.9] - 2026-08-03
 

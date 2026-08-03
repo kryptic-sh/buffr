@@ -37,10 +37,6 @@ pub enum PageMode {
     Visual,
     Command,
     Hint,
-    /// A pending key sequence is being collected (e.g., `g…`,
-    /// `<C-w>…`). Internal — surfaces from `Engine::mode()` only while
-    /// a multi-chord prefix is mid-flight.
-    Pending,
     /// Insert-mode is active; keystrokes route through
     /// [`crate::engine::Engine::feed_edit_mode_key`] which (post-Phase
     /// 2) hands off to `hjkl_editor::Editor`.

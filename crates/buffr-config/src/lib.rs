@@ -1023,7 +1023,6 @@ fn mode_name(mode: PageMode) -> &'static str {
         PageMode::Visual => "visual",
         PageMode::Command => "command",
         PageMode::Hint => "hint",
-        PageMode::Pending => "pending",
         PageMode::Insert => "insert",
     }
 }
