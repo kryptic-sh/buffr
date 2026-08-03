@@ -82,14 +82,14 @@ The 13 sections below are the complete `Config` surface
 
 ### `[startup]`
 
-Both keys are parsed and validated but **not read yet**: session restore is
-gated on `--no-restore` / `--private` / crash-loop detection only, and a new tab
-opens `general.homepage`.
+`restore_session = true` reopens the previous session's tabs on launch (opt-in —
+default `false`). A fresh tab (`o`/`O`/`:tabnew`) opens `new_tab_url` (default
+`about:blank`); the cold-start tab 0 still opens `general.homepage`.
 
-| Key               | Type   | Default       | Notes                    |
-| ----------------- | ------ | ------------- | ------------------------ |
-| `restore_session` | bool   | `false`       | Not consumed at runtime. |
-| `new_tab_url`     | string | `about:blank` | Not consumed at runtime. |
+| Key               | Type   | Default       | Notes                                                           |
+| ----------------- | ------ | ------------- | --------------------------------------------------------------- |
+| `restore_session` | bool   | `false`       | `true` restores the previous session's tabs on launch (opt-in). |
+| `new_tab_url`     | string | `about:blank` | URL fresh tabs (`o`/`O`/`:tabnew`) open.                        |
 
 ### `[search]`
 
@@ -132,7 +132,6 @@ silently replaced by the built-in default.
 | `private`       | string | `#ffc8c8` | `PRIVATE` marker on the statusline.                                       |
 | `progress`      | string | `#66c2ff` | Page-load progress bar.                                                   |
 | `update`        | string | `#e0c85a` | Update-available indicator (`* upd`).                                     |
-| `mode`          | enum   | `auto`    | `auto` \| `dark` \| `light`. Validated but not read yet.                  |
 | `high_contrast` | bool   | `false`   | Overrides every colour above; see [accessibility.md](./accessibility.md). |
 
 ### `[privacy]`
@@ -181,12 +180,11 @@ See [hint-mode.md](./hint-mode.md).
 
 ### `[updates]`
 
-| Key                    | Type   | Default            | Notes                                              |
-| ---------------------- | ------ | ------------------ | -------------------------------------------------- |
-| `enabled`              | bool   | `true`             | The only network request buffr makes by default.   |
-| `channel`              | string | `stable`           | `stable` \| `nightly`. Validated but not read yet. |
-| `check_interval_hours` | u32    | `24`               | Must be `> 0`.                                     |
-| `github_repo`          | string | `kryptic-sh/buffr` | `owner/repo` slug; shape-validated.                |
+| Key                    | Type   | Default            | Notes                                            |
+| ---------------------- | ------ | ------------------ | ------------------------------------------------ |
+| `enabled`              | bool   | `true`             | The only network request buffr makes by default. |
+| `check_interval_hours` | u32    | `24`               | Must be `> 0`.                                   |
+| `github_repo`          | string | `kryptic-sh/buffr` | `owner/repo` slug; shape-validated.              |
 
 See [updates.md](./updates.md).
 
@@ -323,8 +321,8 @@ config stays live.
 - All six `[theme]` colours must parse as `#RRGGBB`. A typo is a hard error — it
   is no longer silently swapped for the built-in colour.
 - `crash_reporter.purge_after_days` must be `> 0`.
-- `updates.check_interval_hours` must be `> 0`; `updates.channel` must be
-  `stable` or `nightly`; `updates.github_repo` must be an `owner/repo` slug.
+- `updates.check_interval_hours` must be `> 0`; `updates.github_repo` must be an
+  `owner/repo` slug.
 - `engines.default` must be non-empty and name a declared (or synthesised)
   instance; instance ids must be unique; every rule's `engine` must resolve.
 - Every keymap binding's key sequence must parse via the engine's `parse_keys`,

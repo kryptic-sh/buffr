@@ -158,15 +158,6 @@ pub struct SearchEngine {
     pub prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThemeMode {
-    #[default]
-    Auto,
-    Dark,
-    Light,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Theme {
@@ -186,7 +177,6 @@ pub struct Theme {
     pub progress: String,
     /// Update-available indicator (`* upd`).
     pub update: String,
-    pub mode: ThemeMode,
     /// Phase 6 accessibility: when `true`, the chrome (statusline,
     /// tab strip, input bar, prompt) renders with a high-contrast
     /// palette instead of the accent-tinted default. See
@@ -203,7 +193,6 @@ impl Default for Theme {
             private: "#ffc8c8".into(),
             progress: "#66c2ff".into(),
             update: "#e0c85a".into(),
-            mode: ThemeMode::Auto,
             high_contrast: false,
         }
     }
@@ -242,8 +231,6 @@ pub fn parse_hex_rgb(s: &str) -> Option<u32> {
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
     pub enabled: bool,
-    /// Release channel. `"stable"` only today; `"nightly"` reserved.
-    pub channel: String,
     pub check_interval_hours: u32,
     /// `owner/repo` slug. Forks point this at their own repo.
     pub github_repo: String,
@@ -253,7 +240,6 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            channel: "stable".into(),
             check_interval_hours: 24,
             github_repo: "kryptic-sh/buffr".into(),
         }
@@ -742,18 +728,9 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
 
     // -- updates ------------------------------------------------------
-    // Validate channel + repo shape so a typo doesn't surface as a 404
-    // GET burned each launch. Keep accepted channels permissive so
-    // `nightly` parses now even though the actual nightly tag stream
-    // isn't published yet.
+    // Validate the repo shape so a typo doesn't surface as a 404 GET
+    // burned each launch.
     {
-        let ch = cfg.updates.channel.as_str();
-        if ch != "stable" && ch != "nightly" {
-            return Err(ConfigError::Validate {
-                message: format!("updates.channel must be \"stable\" or \"nightly\" (got {ch:?})"),
-                location: Some("updates.channel".into()),
-            });
-        }
         let repo = cfg.updates.github_repo.as_str();
         // GitHub repos are `owner/repo` — exactly one slash, no empty
         // segments. Anything else routes to a 404 we'd rather catch
@@ -1625,7 +1602,6 @@ cert_insecure = "#e05a5a"
 private = "#ffc8c8"
 progress = "#66c2ff"
 update = "#e0c85a"
-mode = "auto"
 
 [privacy]
 enable_telemetry = false

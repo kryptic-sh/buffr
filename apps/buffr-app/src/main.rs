@@ -603,6 +603,7 @@ fn main() -> Result<()> {
         .homepage
         .clone()
         .unwrap_or_else(|| config.general.homepage.clone());
+    let new_tab_url = config.startup.new_tab_url.clone();
 
     // -------- telemetry counters --------
     //
@@ -894,7 +895,7 @@ fn main() -> Result<()> {
     };
 
     let (pending_session_tabs, pending_session_active): (Vec<(String, bool)>, Option<usize>) =
-        if cli.private || cli.no_restore || crash_loop_detected {
+        if cli.private || cli.no_restore || crash_loop_detected || !config.startup.restore_session {
             (Vec::new(), None)
         } else if let Some(p) = session_path.as_ref() {
             match session::read(p) {
@@ -975,6 +976,7 @@ fn main() -> Result<()> {
     let mut app_state = AppState::new(
         backend,
         homepage,
+        new_tab_url,
         engine,
         history.clone(),
         bookmarks.clone(),
@@ -1428,11 +1430,15 @@ struct AppState {
     /// Constructed in `main()` as `Arc<CefBackend>` wrapped in
     /// `Arc<dyn Backend>`; all calls go through the trait.
     backend: Arc<dyn Backend>,
-    /// URL loaded into a fresh tab everywhere — cold-start tab 0,
-    /// `:tabnew`, the `gh` chord, and `o`/`O`. Defaults to
-    /// `buffr://new` and is overridable via `general.homepage` and
-    /// `--homepage`.
+    /// URL loaded into the cold-start tab 0. Defaults to `buffr://new`
+    /// and is overridable via `general.homepage` and `--homepage`.
+    /// Fresh tabs (`o`/`O`, `:tabnew`, the `gh` chord) use
+    /// `new_tab_url` instead.
     homepage: String,
+    /// URL a fresh tab opens (`o`/`O`, `:tabnew`, the TabNew action).
+    /// From `config.startup.new_tab_url`; default `about:blank`. The
+    /// cold-start tab 0 still uses `homepage`.
+    new_tab_url: String,
     // Drop order matters at shutdown: engine hosts MUST drop before `window`
     // and `renderer`. CEF browsers hold raw handles tied to the window
     // surface and to the GPU process; dropping the window or wgpu
@@ -1983,6 +1989,7 @@ impl AppState {
     fn new(
         backend: Arc<dyn Backend>,
         homepage: String,
+        new_tab_url: String,
         engine: Arc<Mutex<Engine>>,
         history: Arc<buffr_history::History>,
         bookmarks: Arc<buffr_bookmarks::Bookmarks>,
@@ -2033,6 +2040,7 @@ impl AppState {
         Self {
             backend,
             homepage,
+            new_tab_url,
             engines: std::collections::HashMap::new(),
             active_engine: buffr_engine::EngineId::new("cef"),
             engine_router: None,
@@ -2400,7 +2408,7 @@ impl AppState {
             // `O` from the first pinned tab would push the unpinned
             // entry into the pinned-only leading band.
             let insert_idx = raw_idx.max(engine.pinned_count());
-            let url = self.homepage.clone();
+            let url = self.new_tab_url.clone();
             // Open on the CURRENT engine, not via the router. The user
             // pressed `o`/`O` while looking at this engine — they expect
             // the tab to appear here, not on whichever engine the router's
@@ -2442,7 +2450,7 @@ impl AppState {
                 // open on the current engine, not via the router. The user
                 // expects the new tab on the engine they're already viewing;
                 // the router applies only on real-URL navigation.
-                let url = self.homepage.clone();
+                let url = self.new_tab_url.clone();
                 if let Err(err) = host.open_tab(&url) {
                     warn!(error = %err, %url, "tab_new: failed");
                 }
@@ -4341,7 +4349,7 @@ impl AppState {
                 }
             }
             Command::TabNew => {
-                let url = self.homepage.clone();
+                let url = self.new_tab_url.clone();
                 if let Some(host) = self.active_engine_dyn()
                     && let Err(err) = host.open_tab(&url)
                 {

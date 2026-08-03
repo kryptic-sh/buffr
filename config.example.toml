@@ -25,11 +25,10 @@ leader = " "
 show_favicons = true
 
 [startup]
-# NOTE: both keys below are parsed and validated but NOT yet read by
-# the browser. Session restore is currently gated on `--no-restore` /
-# `--private` / crash-loop detection only, and a new tab opens
-# `general.homepage`. Left in place so configs don't break when the
-# wiring lands.
+# `restore_session = true` reopens the previous session's tabs on
+# launch (default `false` — fresh launches start at `general.homepage`).
+# A fresh tab (`o`/`O`/`:tabnew`) opens `new_tab_url` (default
+# `about:blank`).
 #
 # Reopen the previous session's tabs on launch.
 restore_session = false
@@ -68,9 +67,6 @@ private = "#ffc8c8"
 progress = "#66c2ff"
 # Update-available indicator (`* upd`).
 update = "#e0c85a"
-# auto | dark | light. Parsed and validated, but NOT yet read — the
-# palette builder ignores it today.
-mode = "auto"
 # Phase 6 a11y: switch chrome to a high-contrast palette
 # (white-on-black with a saturated yellow accent). Overrides every
 # colour above. See `docs/accessibility.md` for the values.
@@ -171,10 +167,6 @@ purge_after_days = 30
 # entirely; that path makes ZERO network calls. See
 # `docs/privacy.md` and `docs/updates.md`.
 enabled = true
-# `stable` (today) or `nightly` (reserved for the post-1.0 nightly
-# tag stream). Validated against that allow-list, but not yet read —
-# the checker always queries `/releases/latest`.
-channel = "stable"
 # Minimum hours between live `--check-for-updates` queries. Reads
 # inside the window come from the on-disk cache.
 check_interval_hours = 24

@@ -34,6 +34,11 @@ and this project adheres to
   putting the paint pipeline to sleep immediately, so a workspace switch or
   overlay that flickers occluded-then-revealed no longer emits a spurious
   sleep/wake cycle. Reveal still wakes immediately.
+- `startup.restore_session` and `startup.new_tab_url` are now read:
+  `restore_session = true` reopens the previous session (opt-in, default
+  `false`), and a fresh tab (`o`/`O`/`:tabnew`) opens `new_tab_url` instead of
+  the homepage. The never-implemented `theme.mode` and `updates.channel` knobs
+  were removed along with their validation and docs.
 
 ## [0.14.9] - 2026-08-03
 

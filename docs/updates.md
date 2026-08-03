@@ -41,10 +41,6 @@ error          <message>
 # touching the network. The statusline indicator never appears.
 enabled = true
 
-# Reserved for the post-1.0 nightly tag stream. Today only `stable`
-# resolves cleanly.
-channel = "stable"
-
 # How often `--check-for-updates` is allowed to actually hit GitHub.
 # Reads inside the window are served from the disk cache. Minimum 1.
 check_interval_hours = 24
@@ -82,7 +78,7 @@ cache stays the source of truth for "what GitHub last reported".
 - `crates/buffr-core/src/updates.rs` — `UpdateChecker`, `UpdateStatus`,
   `HttpClient` trait, `UreqClient` impl.
 - `crates/buffr-config/src/lib.rs` — `[updates]` section schema + validation
-  (channel allow-list, repo shape, non-zero interval).
+  (repo shape, non-zero interval).
 - `apps/buffr-app/src/main.rs` — `--check-for-updates` / `--update-status` CLI
   short-circuits. Statusline `* upd` indicator wired to the cache read. (The
   `buffr` supervisor takes only `--heartbeat-timeout` / `--heartbeat-disable`
