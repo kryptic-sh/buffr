@@ -30,6 +30,10 @@ and this project adheres to
 - `:open` now resolves its argument through the same `resolve_input` the omnibar
   uses, so `javascript:` and `data:` URLs typed after `:open` are treated as
   search queries instead of executing in the current page's origin.
+- Occluding the window now arms the 200 ms occlude→sleep debounce instead of
+  putting the paint pipeline to sleep immediately, so a workspace switch or
+  overlay that flickers occluded-then-revealed no longer emits a spurious
+  sleep/wake cycle. Reveal still wakes immediately.
 
 ## [0.14.9] - 2026-08-03
 

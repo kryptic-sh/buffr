@@ -33,7 +33,6 @@ const CEF_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 /// pipeline is put to sleep.  Absorbs workspace-switch / overlay thrash
 /// (occluded then immediately revealed) without emitting spurious
 /// sleep/wake cycles that would produce a flickery on_paint burst.
-#[allow(dead_code)]
 const OCCLUDE_SLEEP_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// `present_us` threshold above which we suspect the compositor is

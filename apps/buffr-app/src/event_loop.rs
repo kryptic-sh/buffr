@@ -534,11 +534,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 // same `self.occluded` flag so paint policy doesn't
                 // need to know which source flipped it.
                 tracing::debug!(occluded, "WindowEvent::Occluded (wayr)");
-                self.occluded = occluded;
-                if !occluded {
-                    // Reveal: invalidate any stale CEF OSR buffer that
-                    // accumulated while we were sleeping, and clear the
-                    // probe deadline so paint resumes immediately.
+                if occluded {
+                    // Arm the occlude → sleep debounce: commit occluded=true
+                    // only when the grace window elapses without a reveal
+                    // (see OCCLUDE_SLEEP_DEBOUNCE), so workspace-switch /
+                    // overlay thrash doesn't emit spurious sleep/wake cycles.
+                    self.sleep_deadline = Some(Instant::now() + OCCLUDE_SLEEP_DEBOUNCE);
+                } else {
+                    // Reveal: wake immediately — drop any pending debounce,
+                    // invalidate any stale CEF OSR buffer that accumulated
+                    // while we were sleeping, and clear the probe deadline
+                    // so paint resumes immediately.
+                    self.sleep_deadline = None;
+                    self.occluded = false;
                     self.present_us_history.clear();
                     self.next_probe_at = None;
                 }
