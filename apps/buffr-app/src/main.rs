@@ -4329,9 +4329,13 @@ impl AppState {
                 self.dispatch_action(&buffr_modal::PageAction::HistoryForward);
             }
             Command::Open(url) => {
+                let resolved = buffr_config::resolve_input(&url, &self.search_config);
+                if resolved.is_empty() {
+                    return;
+                }
                 if let Some(host) = self.active_engine_dyn() {
-                    if let Err(err) = host.navigate(&url) {
-                        warn!(error = %err, %url, "open: navigate failed");
+                    if let Err(err) = host.navigate(&resolved) {
+                        warn!(error = %err, url = %resolved, "open: navigate failed");
                     }
                 } else {
                     warn!(%url, "open: no host yet");
