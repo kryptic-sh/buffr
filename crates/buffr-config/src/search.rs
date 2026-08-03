@@ -40,20 +40,31 @@ pub enum InputKind {
     Search,
 }
 
-/// Run `resolve_input`'s decision tree without producing the resolved
-/// string. Mirrors the branch order in `resolve_input` exactly.
+/// Classify which branch `resolve_input` would take for this input,
+/// without reproducing the resolved string. Implemented by delegating
+/// to [`resolve_input`] with a default search config, so the two can
+/// never drift.
 pub fn classify_input(input: &str) -> InputKind {
     let trimmed = input.trim();
-    if trimmed.is_empty() {
+    let resolved = resolve_input(input, &Search::default());
+    if resolved.is_empty() {
         return InputKind::Empty;
     }
+    // Branch 2 of `resolve_input` prepends `http://` or `https://` to
+    // the raw input, so a resolved string of exactly `{prefix}://{trimmed}`
+    // means the scheme came from the resolver, not from the input.
+    if let Some(prefix) = resolved.strip_suffix(trimmed)
+        && matches!(prefix, "http://" | "https://")
+    {
+        return InputKind::Host;
+    }
+    // Branch 1 of `resolve_input` requires the input to parse with a
+    // real scheme; everything else it returns is a search-engine URL
+    // (default-engine template or prefix shortcut).
     if let Ok(parsed) = url::Url::parse(trimmed)
         && is_real_scheme(parsed.scheme())
     {
         return InputKind::Url;
-    }
-    if looks_like_url(trimmed) {
-        return InputKind::Host;
     }
     InputKind::Search
 }
@@ -441,6 +452,55 @@ mod tests {
         assert_eq!(classify_input("localhost:3000"), InputKind::Host);
         assert_eq!(classify_input("foobar"), InputKind::Search);
         assert_eq!(classify_input("foo bar"), InputKind::Search);
+    }
+
+    #[test]
+    fn classify_input_agrees_with_resolve_input() {
+        // `classify_input` must never disagree with `resolve_input` about
+        // whether an input is a URL or a search: it is Search exactly when
+        // the resolution is the default-engine template, Empty exactly when
+        // the resolution is empty.
+        let s = search();
+        let template = "https://duckduckgo.com/?q={query}";
+        let inputs = [
+            "",
+            "   ",
+            "example.com",
+            "example.com/path",
+            "example.com:8080",
+            "localhost",
+            "localhost:3000",
+            "192.168.1.1",
+            "https://example.com",
+            "http://example.com/path",
+            "file:///etc/hosts",
+            "about:blank",
+            "foobar",
+            "foo bar",
+            "a&b=c",
+            "javascript:alert(1)",
+            "data:text/html,<h1>hi</h1>",
+            "  example.com  ",
+        ];
+        for input in inputs {
+            let resolved = resolve_input(input, &s);
+            let template_resolved = template.replace("{query}", &url_encode(input.trim()));
+            assert_eq!(
+                classify_input(input) == InputKind::Search,
+                resolved == template_resolved,
+                "Search agreement for {input:?} (resolved to {resolved:?})"
+            );
+            assert_eq!(
+                classify_input(input) == InputKind::Empty,
+                resolved.is_empty(),
+                "Empty agreement for {input:?} (resolved to {resolved:?})"
+            );
+        }
+        // Prefix-shortcut searches resolve to a different engine's template
+        // but are still branch-3 searches — classify must agree they're not
+        // URLs even though they don't match the default-engine template.
+        assert_eq!(classify_input("g rust closures"), InputKind::Search);
+        assert_eq!(classify_input("ddg vim folding"), InputKind::Search);
     }
 
     #[test]

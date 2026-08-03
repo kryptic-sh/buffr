@@ -24,6 +24,9 @@ and this project adheres to
   keyboard-accessibility audit falsely reported it covered. The shadow row is
   gone (`y` still yanks) and the audit now walks the built keymap instead of the
   static table, so a shadowed binding can no longer fake coverage.
+- `classify_input` now delegates to `resolve_input` instead of hand-mirroring
+  its branch order, so the omnibar's URL-vs-search telemetry can never drift
+  from what the resolver actually does.
 
 ## [0.14.9] - 2026-08-03
 
