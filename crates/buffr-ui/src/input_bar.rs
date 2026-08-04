@@ -124,6 +124,23 @@ impl Default for InputBar {
     }
 }
 
+/// Number of leading chars whose `widths` (real per-glyph advances + the
+/// 1-px gap) fit within `inner_w`. Pure so the CJK-wide-glyph case is
+/// testable without the global font face (A10).
+fn chars_visible_for(inner_w: usize, widths: impl Iterator<Item = usize>) -> usize {
+    let mut count = 0usize;
+    let mut used = 0usize;
+    for w in widths {
+        let adv = w + 1;
+        if used + adv > inner_w {
+            break;
+        }
+        used += adv;
+        count += 1;
+    }
+    count.max(1)
+}
+
 impl InputBar {
     /// Build an empty input bar with the given prefix string.
     pub fn with_prefix(prefix: impl Into<String>) -> Self {
@@ -351,9 +368,12 @@ impl InputBar {
 
         // Compute available pixel width for the buffer text and the
         // char-based scroll offset that keeps the cursor visible.
-        let glyph_advance = font::glyph_w() + 1;
         let inner_w = (x as i32 + w as i32 - 6 - buffer_x).max(0) as usize;
-        let chars_visible = (inner_w / glyph_advance).max(1);
+        // Count how many chars fit in inner_w by their REAL advances (A10):
+        // the old fixed `glyph_advance` over-counted when wide glyphs (CJK
+        // ~2x glyph_w) are present, overflowing the box and mis-placing the
+        // scroll window.
+        let chars_visible = chars_visible_for(inner_w, self.buffer.chars().map(font::char_width));
         let cursor_chars = self.buffer[..self.cursor].chars().count();
         let total_chars = self.buffer.chars().count();
         let mut scroll_chars: usize = if cursor_chars >= chars_visible {
@@ -380,7 +400,16 @@ impl InputBar {
         // (relative to the scrolled substring).
         if self.cursor_visible && self.selected.is_none() {
             let cursor_offset = cursor_chars.saturating_sub(scroll_chars);
-            let cursor_px = cursor_offset * glyph_advance;
+            // Position the cursor at the real pen position of the visible text
+            // before it (A10): `text_width` matches `draw_text`'s per-glyph
+            // walk, so a wide glyph no longer leaves the cursor short of the
+            // text end.
+            let byte_end = visible
+                .char_indices()
+                .nth(cursor_offset)
+                .map(|(i, _)| i)
+                .unwrap_or(visible.len());
+            let cursor_px = font::text_width(&visible[..byte_end]);
             let cursor_x = buffer_x + cursor_px as i32;
             fill_rect(
                 buffer,
@@ -656,5 +685,18 @@ mod tests {
         assert_eq!(b.cursor, 0);
         assert_eq!(b.selected, None);
         assert!(b.suggestions.is_empty());
+    }
+
+    #[test]
+    fn chars_visible_for_uses_real_advances() {
+        // [10, 20, 20, 10] in inner_w=50: advances 11, 21, 21, 11 →
+        // 11+21 = 32 fits, 32+21 = 53 doesn't, so 2. The old fixed
+        // formula inner_w / (glyph_w+1) = 50/11 = 4 would over-count.
+        assert_eq!(chars_visible_for(50, [10, 20, 20, 10].into_iter()), 2);
+        // All five fit: 11+11+21+21+11 = 75 ≤ 100 (fixed formula: 9).
+        assert_eq!(chars_visible_for(100, [10, 10, 20, 20, 10].into_iter()), 5);
+        // Floor: at least one char always counts as visible.
+        assert_eq!(chars_visible_for(5, [10].into_iter()), 1);
+        assert_eq!(chars_visible_for(100, std::iter::empty()), 1);
     }
 }
