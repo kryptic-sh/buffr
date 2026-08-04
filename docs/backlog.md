@@ -7,11 +7,6 @@ Nothing here is a known-broken **build**: `main` is green on CI (all three
 OSes), `cargo deny`, `cargo machete`, and the fuzz workflow. These are the items
 that were deliberately **not** actioned, and why.
 
-That is not the same as "no known bugs". Sections 8 and 9 hold a review pass
-from 2026-08-02. Five correctness findings have since been fixed and removed
-from section 8; what remains there — and the whole of section 9 — is
-reproducible today on green CI. Read those before assuming the tree is clean.
-
 Grouped by what is actually blocking them.
 
 ---
@@ -19,8 +14,8 @@ Grouped by what is actually blocking them.
 ## 1. Needs a product decision
 
 Each of these has a real defect behind it, but two or more defensible
-resolutions. None was touched, so the current behaviour is whatever the table
-describes.
+resolutions. None was touched, so the current behaviour is whatever is
+described.
 
 ### E2 — closed shadow roots are invisible to edit mode
 
@@ -91,27 +86,15 @@ The options, cheapest first:
 Whichever way this goes, the two iframe pages should move into the e2e
 expectations so the behaviour is pinned rather than assumed.
 
-| ID  | Where                                                    | The problem                                                                                                                                                                                            | The choice                                                                                                         |
-| --- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| H6  | `crates/buffr-cef/src/lib.rs`, `app.rs`                  | `no_sandbox: 1` plus a `--no-sandbox` switch disable the Chromium sandbox process-wide, so any renderer RCE is immediate code execution as the user.                                                   | Ship the setuid `chrome-sandbox` helper / rely on user namespaces, or gate it per-target.                          |
-| M48 | `apps/buffr-app/src/main.rs`                             | `:open` passes its argument straight to `navigate`, bypassing the allow-list every other path enforces. `:open javascript:…` runs in the page origin.                                                  | Is `:open` meant to be a privileged escape hatch, or should it go through `resolve_input`?                         |
-| M39 | `crates/buffr-modal/src/keymap.rs`                       | `<C-c>` is bound twice; last-write-wins gives `YankUrl`, so `StopLoading` has no working binding — and `missing_default_bindings` scans the table, not the trie, so the a11y test reports it covered.  | Pick an owner for `<C-c>`; separately, make the audit walk the built keymap so a shadowed row can't fake coverage. |
-| M49 | `buffr-config` + `apps/buffr-app`                        | Four knobs are parsed, validated and documented but never read: `startup.new_tab_url`, `startup.restore_session`, `theme.mode`, `updates.channel`.                                                     | Wire each up or delete it. Docs currently describe them honestly as inert.                                         |
-| L23 | `apps/buffr-app/src/main.rs` + `event_loop.rs`           | The occlude-sleep debounce is dead — `sleep_deadline` is only ever set to `None`, so the expiry check and deadline clamp can never fire. The field is on `AppState`; the checks moved to `event_loop`. | Wire `Occluded(true)` to arm it as designed, or delete the field, const and both blocks.                           |
-| L36 | `crates/buffr-ui/src/lib.rs`                             | Hint status renders `(n/n)` — numerator and denominator are the same field, so it always reads e.g. `3/3`.                                                                                             | Drop the pair, or add a real `current` index to `HintStatus`.                                                      |
-| L37 | `crates/buffr-modal/src/actions.rs`                      | `PageMode::Pending` is documented as live but never produced; `buffr-ui` and `buffr-app` carry unreachable arms for it.                                                                                | Produce it while a prefix is pending, or delete it and the dead arms.                                              |
-| L38 | `crates/buffr-modal/src/engine.rs`                       | The register prefix (`"a`) consumes two keystrokes, stores the register, then discards it — indistinguishable from a broken keymap.                                                                    | Plumb `register` into the emitted action, or remove the prefix handling.                                           |
-| L18 | `crates/buffr-engine/src/event.rs`, `types.rs`, `tab.rs` | `EngineEvent`, `NavigationEvent`, `LoadState`, `CursorChanged`, `CursorKind`, `TabOptions` have zero users; `CursorKind` is actively contradicted by the trait.                                        | Delete, or keep for a planned migration.                                                                           |
-| L19 | `crates/buffr-engine/src/engine.rs`                      | `supports_native` / `set_native_parent` / `set_native_visible` document a four-step protocol with no callers and no implementors.                                                                      | Delete until the subsurface work lands, or wire the apps layer to honour it.                                       |
-| L40 | `crates/buffr-history/src/lib.rs`                        | Eight constructors for the cross-product of two optional params; a third would mean sixteen.                                                                                                           | Collapse to an options struct/builder — a public API change.                                                       |
-| L41 | `crates/buffr-config/src/search.rs`                      | `classify_input` / `InputKind` are dead public API whose doc admits it "mirrors the branch order in `resolve_input` exactly" — i.e. hand-synced.                                                       | Delete, or implement `resolve_input` in terms of it so they cannot drift.                                          |
+### W8 (webkit, remainder) — external schemes still launch `xdg-open` without a confirmation prompt
 
-### `buffr-webkit` only (excluded crate, not shipped)
+**Where:** `crates/buffr-webkit/src/platform/runtime.rs`, `on_decide_policy`.
 
-| ID  | The problem                                                                                                                                                                                                           |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| W2  | The `buffr-clipboard` scheme is registered CORS-enabled and secure, and the handler returns the full system clipboard with no origin check, gesture or prompt — any page can read it via `fetch`.                     |
-| W8  | Any non-internal scheme is handed to `xdg-open` straight from the policy handler, with no user gesture and no confirmation (Chromium prompts here). The spawned child is never reaped, so each launch leaks a zombie. |
+The 2026-08-04 pass gesture-gated the launch (a scripted `location='foo://…'` no
+longer pops a handler) and reaps the child, but the confirmation prompt Chromium
+shows for external protocols is still absent. Doing it properly needs an
+apps-layer prompt channel the webkit backend does not have. `needs-decision` on
+whether to build that or accept the gesture-gate as sufficient.
 
 ---
 
@@ -131,6 +114,14 @@ has observed.
   and has no job, which is exactly how it bit-rotted into the W-series findings.
   It builds and passes clippy/tests locally now (needs `wpewebkit-2.0`), so a
   Linux job would keep it honest.
+- **The 2026-08-04 webkit edits are inspection-verified only.** The W2/W8 fixes
+  and the L19 removals in `buffr-webkit` were reviewed against the upstream
+  headers and by grep, but the crate cannot compile in this environment
+  (`wpewebkit-2.0` absent) and is not built by CI — the first real compile is
+  still owed.
+- **The 2026-08-04 render-path fixes (P2/P3/P6/N5) are unit-verified only.** The
+  banded chrome upload, scratch recycling and acquire-before-paint run under a
+  live compositor; no Wayland session was available to smoke them.
 - **`buffr-src:` allow-list (M13) is untested at runtime.** The scheme dropped
   `CORS_ENABLED | FETCH_ENABLED` and gained a scheme/host check. "View page
   source" needs a manual pass, including on a `buffr://` internal page.
@@ -144,16 +135,6 @@ has observed.
 - **`edit.js` rewire on soft navigation.** The teardown hook added for the H5
   nonce assumes CEF re-fires main-frame `on_load_end` for the same document.
   Worth exercising a heavy SPA.
-- **"Every commit is CI-green" is not true, and the run list says so.** The CI
-  workflow uses a concurrency group that cancels superseded runs, so when
-  commits land in quick succession only the last one completes. Of the five
-  correctness fixes, **C1–C4 (`4b9e4cb`, `29e6a22`, `64c2327`, `08ab615`) all
-  show `cancelled`**; the first green run in that stretch is C5 (`f6c1360`). Six
-  of the seven decomposition slices were cancelled the same way, with `e374b37`
-  the green one. The tip being green is genuine and is what the release rests
-  on, but no individual fix was independently verified on CI — each rests on the
-  local `--workspace` run instead. If per-commit CI is wanted, pushes have to be
-  spaced or the group narrowed.
 - **The C1–C5 fixes are unit-tested, not exercised.** Each landed with a pure
   test that was proven to go red, but three of them have branches no test
   reaches, and the tests cannot reach them:
@@ -212,8 +193,7 @@ rediscovered as findings.
 
 ## 4. Small cleanups
 
-Mechanical, low-risk, no decision needed — just not in scope for the review
-slices.
+Mechanical, low-risk, no decision needed.
 
 - `fuzz/corpus/` is gitignored, so every CI fuzz run starts from an empty corpus
   and re-derives the same shallow coverage. Committing seed inputs (or caching
@@ -230,6 +210,11 @@ slices.
   (`cookies`, `history`, `bookmarks`, `downloads`) work. One-line fix
   (`paths.cache` → `paths.data`); documented as broken in `docs/config.md` and
   `config.example.toml` until it lands.
+- **`buffr_view_wayland_set_rect` is now dead.** The L19 removal of the
+  `SetNativeRect` worker command left the helper defined
+  (`crates/buffr-webkit/src/platform/wpe_subclass.rs`) and imported
+  (`runtime.rs`) but unreferenced — warning-level residue in the excluded crate.
+  Delete it alongside the import.
 - The review's own `Summary` counts in `code-review.md` are frozen at the time
   of writing and no longer reflect what has been fixed; the `Status` section
   above them is the live view.
@@ -269,7 +254,6 @@ slices.
   them — and _not_ on authentication. So the split that matters is
   command-versus-no-command, and two probes that look like they test the remote
   report "up" throughout a window that still blocks publishing:
-
   - **HTTP.** `https://aur.archlinux.org/` returns `200` and the RPC serves
     package JSON throughout. That is how the 2026-08-02 re-run was triggered too
     early.
@@ -346,7 +330,9 @@ each a separate commit verified with `cargo fmt --all`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` (1072
 passed, 0 failed throughout) and a diff against the previous commit proving the
 move was pure. CI is green on the result (`e374b37`). The C1–C5 fixes have since
-grown it back to 7,301, which is the number to beat.
+grown it back to 7,301, which is the number to beat. The 2026-08-04 perf pass
+grew it further with the paint-path and tick changes; the extraction target
+still stands.
 
 Extracted so far: `cli` (the clap `Cli`, dispatch, and every `run_*`
 subcommand), `cef_translate`, `chrome_paint`, `paint_policy`, `event_loop`,
@@ -406,11 +392,12 @@ methods instead of cutting a range. The natural groups:
   `archive/wxs-codepage-fix` (pushed; `archive/*` does not match the `v*`
   release trigger). All three predate the `apps/buffr` → `apps/buffr-app` rename
   (`bec1f30`) and need a real rebase, not a cherry-pick.
-  `archive/wl-subsurface-poc` is the subsurface work **L19** refers to.
+  `archive/wl-subsurface-poc` is the subsurface work the removed native
+  compositing trio referred to.
 
 ---
 
-## 8. Correctness review, 2026-08-02
+## 8. Correctness review, 2026-08-02 — remaining
 
 A read-only review pass, since partly actioned. **C1–C5 shipped** and have been
 removed from this list — `git log` has them. What is left below is unfixed.
@@ -453,129 +440,33 @@ from the main view's scale at creation, and then kept in step by
 `set_device_scale`, which today has no idea popups exist. Untested at a real
 HiDPI scale either way; see section 2.
 
-### C9 LOW — `[keymap.pending]` folds into the Normal trie without saying so
-
-**Where:** `Keymap::mode_map_mut` in `crates/buffr-modal/src/keymap.rs`
-(`PageMode::Normal | PageMode::Pending => Some(&mut self.normal)`); `validate`
-in `crates/buffr-config/src/lib.rs` rejects only `PageMode::Insert`.
-
-The same silent-fold shape C3 fixed, one severity down. Folding Pending into
-Normal is _correct_ — a pending chord continues in the normal trie, so there is
-no separate map to file into — but a user who writes `[keymap.pending]` gets a
-binding that also fires in Normal with no diagnostic. Either reject the section
-the way `[keymap.insert]` now is, or document that it is an alias. Note **L37**
-in section 1: `PageMode::Pending` is never actually produced, so resolving that
-one first may delete the question.
-
 ---
 
-## 9. Performance review, 2026-08-02 (none fixed)
+## 9. Performance review, 2026-08-04 — shipped
 
-Same pass, same caveat: **nothing here has been changed**. ✅ = re-verified at
-the cited location.
+A read-only pass over the current tree (2026-08-04) re-verified the 2026-08-02
+findings (P1–P8, all still present then) and added N1–N5. **All of them are
+fixed and pushed** — commits `8621a90`..`2caa56f`, each verified by the full
+workspace gate. Summary of what shipped:
 
-Frequency baseline the findings rest on: `about_to_wait` clamps its wakeup to
-the fastest output's refresh period, so its whole body runs at display refresh
-rate even when idle. A 1080p logical chrome buffer is ~8.3 MB.
+| Item     | Fix                                                                                                                                           | Commit    |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| P1       | omnibar bookmark search capped at 8 in SQL (`search_limited`)                                                                                 | `8621a90` |
+| P4 + N1  | one `tabs_summary()` per tick; `refresh_tab_strip` returns `(tabs_changed, summaries)`; favicon pump shares them; `prev_tabs` clone-diff gone | `73dbb9e` |
+| P2       | synthetic OSR frames send an empty buffer (`skip_pixels`), no UI-thread 8.3 MB memcpy                                                         | `6a2b0f8` |
+| P6       | chrome texture uploaded as top+bottom strip bands (sub-rect `write_texture`), full buffer only when the animation/overlay paints the middle   | `a8ee2d8` |
+| N5       | swapchain acquired before chrome paint/OSR clone — skipped frames waste nothing                                                               | `ce33978` |
+| P3       | chrome paint buffer recycled via the stats channel (alloc + free on the UI thread)                                                            | `e924f92` |
+| P5       | `Arc<GlyphEntry>` glyph cache (hit = refcount bump, no bitmap copy); one lookup per char in `draw_text`                                       | `7846958` |
+| P7       | history FTS5 search + bookmark search use `prepare_cached`                                                                                    | `c976458` |
+| P8       | 4 per-event allocs killed (tab_ids reuse, splash-deadline gate, cached context-menu entries + hit-test, `draw_char`)                          | `fb39033` |
+| N2+N3+N4 | `outputs()` cached 1 s; paint-closure clones gated on dirty; `hint_status()` not polled outside hint mode                                     | `2caa56f` |
 
-### P1 ✅ HIGH — unbounded bookmark query on the UI thread per omnibar keystroke
-
-**Where:** `AppState::omnibar_suggestions` in `apps/buffr-app/src/main.rs` calls
-`self.bookmarks.search(needle)` then `.take(8)`.
-
-`search` delegates to `search_limited(query, None)` → `NO_LIMIT`, so a
-`LIKE '%…%'` full scan returns **every** match, plus a second query fetching
-tags for all of them — after which Rust discards all but 8. `search_limited`
-already exists in `crates/buffr-bookmarks/src/lib.rs` and takes the limit.
-
-Runs synchronously on the event loop for every printable char, backspace,
-`<C-u>` and `<C-w>` in the omnibar, and is **not debounced** — while live-find
-next to it _is_ (`FIND_LIVE_DEBOUNCE_MS`). Fix: pass `Some(8)`, and debounce the
-suggestion refresh like find. Cheapest high-value fix in this list.
-
-### P2 ✅ HIGH — the full OSR buffer is copied every frame, then often discarded
-
-**Where:** `Renderer::frame` in `apps/buffr-app/src/render.rs` does
-`osr.as_ref().map(OsrUploadOwned::from)`, whose `From` impl is
-`pixels: u.pixels.to_vec()` — an ~8 MB alloc + memcpy on the UI thread. The
-worker then skips `write_texture` entirely when `upload.generation` is
-unchanged, making the copy pure waste.
-
-The `SyntheticScratch` path deliberately reuses the generation the GPU already
-holds, so this fires on cursor blink, statusline and progress updates, tab hover
-and mode changes. Fix: track the last-sent generation and send an empty `pixels`
-when it matches; recycle buffers rather than copying on the fresh path.
-
-### P3 ✅ HIGH — 8.3 MB allocated and zeroed per chrome-dirty frame
-
-**Where:** `apps/buffr-app/src/render.rs`, `vec![0u32; lw * lh]` immediately
-before `paint_chrome`.
-
-Allocated on the UI thread, freed on the worker thread — a pattern that defeats
-allocator thread caches — and only the top (~52) and bottom (~28) logical rows
-are ever written; the browser region must stay transparent, which it already is
-in a reused buffer. Forced true every tick during the loading animation. Fix:
-recycle a `chrome_scratch` via a return channel and clear only the strip bands
-plus the previous overlay rect.
-
-### P4 ✅ HIGH — the tab strip is cloned and diffed at refresh rate
-
-**Where:** `apps/buffr-app/src/event_loop.rs`,
-`let prev_tabs = self.tab_strip.tabs.clone();` before `refresh_tab_strip`.
-
-Per tick this clones N tab-title `String`s purely to diff — work
-`refresh_tab_strip` already does internally as `tabs_changed`. It also runs
-`host.tabs_summary()`, which takes one `tabs` lock plus a `display_urls` lock
-and two `String` allocations **per tab**, and allocates a `HashSet` to drive one
-`retain`. At 20 tabs / 144 Hz that is roughly 100 allocations and 21 mutex
-acquisitions per frame to conclude "nothing changed".
-
-The comment above it is also stale: it claims "the cost is a small alloc" and
-that redraws are gated "via softbuffer's damage rect" — softbuffer was replaced
-by the wgpu path. Fix: return `tabs_changed` from `refresh_tab_strip` and add a
-`tabs_revision` counter on `BrowserHost` to early-return.
-
-### P5 ✅ MEDIUM — every glyph blit clones its bitmap and takes two mutexes
-
-**Where:** `crates/buffr-ui/src/font.rs`,
-`lock_ignore_poison(&f.cache).get(&c).cloned()`.
-
-`.cloned()` copies the rasterized coverage bitmap on a cache **hit**, per
-character. `draw_text` separately calls `char_width` per char, taking a second
-mutex, and `truncate_to_width` walks the string doing the same. A chrome repaint
-draws several hundred glyphs. Fix: store `Arc<(Metrics, Vec<u8>)>`, fold the
-advance into the same entry, and hold one guard across the string.
-
-### P6 MEDIUM — the whole chrome texture is re-uploaded when one strip changed
-
-**Where:** `Renderer::write_chrome` in `apps/buffr-app/src/render.rs` always
-issues a full-size `write_texture` with no sub-rect. This is the largest
-per-frame PCIe transfer in the app, and the same file documents observed
-multi-second blocks on `write_texture`. Fix: pass a dirty rect (top band +
-bottom band) and use `origin`/`Extent3d` with an offset into the source. Typical
-saving ~8.3 MB → ~0.4 MB per frame.
-
-### P7 MEDIUM — SQL is recompiled from source text on every omnibar keystroke
-
-**Where:** `crates/buffr-history/src/lib.rs` and
-`crates/buffr-bookmarks/src/lib.rs` use `conn.prepare(...)`; there is no
-`prepare_cached` anywhere in the workspace. The history query is a
-`visits ⋈ visits_fts` join with `GROUP BY` and two correlated subqueries, so
-SQLite re-parses and re-plans it per keystroke. Both stores hold a long-lived
-`Connection`, so a per-connection statement cache would persist. No new
-dependency needed.
-
-### P8 LOW — avoidable per-event allocations
-
-- `tabs_summary()` is materialised in full just to read the ids (throttled to 4
-  Hz); a `tab_ids()` accessor would cost one lock and no allocations.
-- `tick_splash_js_push` calls `active_tab_live_url()` — two locks and a `String`
-  — from every `about_to_wait` tick merely to compare against `NEW_TAB_URL`.
-  Gate it on the next-push deadline it already maintains.
-- While a context menu is open, `to_overlay` rebuilds a `Vec<ContextMenuEntry>`
-  per `PointerMoved` (100–1000 Hz) purely to hit-test, then again during paint.
-- `loading_anim.rs` does `cell.ch.to_string()` per cell per frame; exposing a
-  `font::draw_char` removes it.
+Verification: after each commit the full gate ran green — `cargo fmt --check`,
+`clippy --workspace --all-targets -D warnings`, `build --workspace`,
+`nextest --workspace` (1098 → 1107 tests as 9 new tests landed). The render-path
+items and event-loop timing are compile/test-verified; runtime behavior under a
+live compositor is not (no Wayland session) — see section 2.
 
 ---
 
@@ -585,11 +476,8 @@ The order settled on 2026-08-02: finish the correctness findings, then the
 performance ones, then the dependency bump. One item per commit — delegate,
 verify independently, commit, push — rather than a batch.
 
-- **Correctness: C6, C7, C8, C9** in section 8. C6 and C7 are from the original
-  pass; C8 and C9 surfaced while fixing C5 and C3 respectively.
-- **Performance: P1–P8** in section 9, none started. P1 (unbounded bookmark
-  query plus the missing omnibar debounce) is the cheapest high-value one and
-  was picked as the entry point.
+- **Correctness: C6, C7, C8** in section 8. (C9 was resolved by the L37
+  `PageMode::Pending` deletion — a `[keymap.pending]` section no longer parses.)
 - **Bump the HJKL dependencies to latest.** Six of them are declared in
   `[workspace.dependencies]` in the root `Cargo.toml`: `hjkl-engine`,
   `hjkl-buffer`, `hjkl-clipboard`, `hjkl-splash`, `hjkl-config` and
@@ -642,3 +530,20 @@ Three findings in `code-review.md` were **wrong** and were deliberately not
 - **L46 (the cef half)** — the `cef` crate at 148.x wraps **libcef 147.0.14**,
   and `xtask` pins `CEF_VERSION_PREFIX = "147."`, so the docs' "cef-147" was
   already correct. Only the wording was clarified.
+
+---
+
+## Shipped 2026-08-04
+
+Everything in this session was fixed and pushed, each item one commit verified
+by the full workspace gate:
+
+- **All 14 open code-review items** — the decision rows (H6, M39, M48, M49, L18,
+  L19, L23, L36, L37, L38, L40, L41, W2, W8): commits `0c7ee4a`..`6a0efdd`.
+  Sandbox enabled, `<C-c>` = StopLoading with a trie-walking audit, `:open`
+  through `resolve_input`, startup knobs wired / dead knobs deleted, dead types
+  and trait methods removed, history builder, gesture-gated clipboard and
+  `xdg-open`.
+- **All 12 perf findings** (P1–P8, N1–N5): commits `8621a90`..`2caa56f`, see
+  section 9.
+- **CHANGELOG**: every fix recorded under `[Unreleased]` in the same commit.
