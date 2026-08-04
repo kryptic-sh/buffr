@@ -85,7 +85,7 @@ tempfile = "3"
 # wgpu present layer — replaces the old softbuffer blit. CPU-composite
 # buffer is uploaded to a single GPU texture and drawn as a fullscreen
 # triangle. No platform branching: Vulkan on Linux, Metal on macOS, DX12.
-wgpu = "29"
+wgpu = "30"
 # block_on for async adapter / device request
 pollster = "0.4"
 # safe cast from &[u32] to &[u8] for texture upload
