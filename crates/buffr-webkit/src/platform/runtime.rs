@@ -1383,9 +1383,77 @@ unsafe extern "C" fn on_clipboard_paste_scheme_request(
     request: *mut super::ffi::WebKitURISchemeRequest,
     _user_data: *mut std::os::raw::c_void,
 ) {
-    use super::ffi::{GInputStream, WebKitURISchemeRequest, webkit_uri_scheme_request_finish};
+    use super::ffi::{
+        GInputStream, WebKitURISchemeRequest, webkit_uri_scheme_request_finish,
+        webkit_uri_scheme_request_get_scheme, webkit_uri_scheme_request_get_web_view,
+    };
 
     if request.is_null() {
+        return;
+    }
+
+    // ── Origin gate (W2): only buffr's own internal pages may read the ──────
+    // host clipboard via this scheme.
+    //
+    // `buffr://` pages share this handler and the scheme is registered
+    // CORS-enabled + secure, so without this gate ANY page (cross-origin or
+    // iframe) could `fetch('buffr-clipboard:read')` and read the system
+    // clipboard. Deny with an empty body — same pattern as the `None` branch
+    // below — so fetch() still resolves (resp.ok = true, text() = ''). We're
+    // on the GLib main thread and finish synchronously, so the deny path
+    // needs no g_object_ref/worker thread: WebKit still owns the request.
+    let finish_empty = |req: *mut WebKitURISchemeRequest| {
+        let empty: *mut GInputStream =
+            unsafe { g_memory_input_stream_new_from_data(std::ptr::null(), 0, None) };
+        let ct = std::ffi::CString::new("text/plain;charset=utf-8").unwrap();
+        unsafe { webkit_uri_scheme_request_finish(req, empty, 0, ct.as_ptr()) };
+        if !empty.is_null() {
+            unsafe { g_object_unref(empty as *mut _) };
+        }
+    };
+
+    // Only the `buffr-clipboard` scheme is served; a plain `buffr://` fetch
+    // must not read the clipboard.
+    let scheme_ptr = unsafe { webkit_uri_scheme_request_get_scheme(request) };
+    let is_clipboard_scheme = if scheme_ptr.is_null() {
+        false
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(scheme_ptr) }.to_bytes() == b"buffr-clipboard"
+    };
+    if !is_clipboard_scheme {
+        tracing::warn!(
+            "webkit: buffr-clipboard read denied — request scheme is not buffr-clipboard"
+        );
+        finish_empty(request);
+        return;
+    }
+
+    // Only buffr-internal pages (buffr://*) may read the clipboard. The
+    // requesting page URL comes from the request's WebView.
+    let page_uri = {
+        let web_view = unsafe { webkit_uri_scheme_request_get_web_view(request) };
+        if web_view.is_null() {
+            None
+        } else {
+            let uri_ptr = unsafe { webkit_web_view_get_uri(web_view) };
+            if uri_ptr.is_null() {
+                None
+            } else {
+                // SAFETY: WebKit guarantees a null-terminated UTF-8 URI string.
+                Some(
+                    unsafe { std::ffi::CStr::from_ptr(uri_ptr) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        }
+    };
+    if !page_uri.as_deref().is_some_and(|u| u.starts_with("buffr://")) {
+        tracing::warn!(
+            "webkit: buffr-clipboard read denied — requesting page {:?} is not a buffr:// internal page",
+            page_uri
+        );
+        finish_empty(request);
         return;
     }
 
@@ -3680,14 +3748,18 @@ impl WpeRuntime {
         // ── buffr-clipboard URI scheme (#128) ─────────────────────────────────
         //
         // Register `buffr-clipboard:read` once on the default WebContext so
-        // any WebView can call `fetch('buffr-clipboard:read')` to read the
-        // host clipboard. The callback (`on_clipboard_paste_scheme_request`)
-        // spawns a worker thread to avoid blocking the GLib main loop on the
-        // hjkl-clipboard Wayland roundtrip, then delivers the result via
-        // g_idle_add.
+        // buffr-internal pages can call `fetch('buffr-clipboard:read')` to
+        // read the host clipboard. The callback
+        // (`on_clipboard_paste_scheme_request`) spawns a worker thread to
+        // avoid blocking the GLib main loop on the hjkl-clipboard Wayland
+        // roundtrip, then delivers the result via g_idle_add.
         //
-        // Security: mark the scheme as CORS-enabled + secure so fetch() from
-        // any origin works without preflight and without mixed-content blocking.
+        // Security: the scheme must remain CORS-enabled + secure so buffr's
+        // own internal pages can fetch it without preflight or mixed-content
+        // blocking. The handler itself gates on the requesting page being a
+        // buffr:// internal page (W2): any other origin's fetch is denied
+        // with an empty body, so a cross-origin or iframe page cannot read
+        // the host clipboard.
         unsafe {
             use super::ffi::{
                 webkit_security_manager_register_uri_scheme_as_cors_enabled,

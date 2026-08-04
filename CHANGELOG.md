@@ -55,6 +55,10 @@ and this project adheres to
   namespace sandbox on Linux instead of unsandboxed as the user. On hosts with
   unprivileged user namespaces disabled, CEF warns and continues without
   sandboxing (documented in `docs/packaging.md`).
+- `buffr-clipboard:read` (webkit backend) now serves only buffr's own `buffr://`
+  internal pages: the scheme handler checks the requesting page's origin and the
+  requested scheme, so a cross-origin or iframe page's fetch gets an empty body
+  instead of the system clipboard.
 
 ## [0.14.9] - 2026-08-03
 
