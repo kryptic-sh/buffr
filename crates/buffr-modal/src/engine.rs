@@ -304,7 +304,16 @@ impl Engine {
                 self.return_mode = self.mode;
                 Some(PageMode::Insert)
             }
-            PageAction::EnterMode(m) => Some(*m),
+            PageAction::EnterMode(m) => {
+                // A11: the config action `enter_mode("insert")` must record
+                // the pre-insert mode too, or Esc in Insert
+                // (feed_edit_mode_key) restores the stale default
+                // return_mode instead of the mode the user came from.
+                if *m == PageMode::Insert {
+                    self.return_mode = self.mode;
+                }
+                Some(*m)
+            }
             _ => None,
         };
         if let Some(m) = new_mode {
@@ -593,6 +602,41 @@ mod tests {
         assert_eq!(
             e.feed(parse_key("i").unwrap(), t(3)),
             Step::Resolved(PageAction::EnterInsertMode)
+        );
+    }
+
+    #[test]
+    fn esc_exits_insert_entered_by_enter_mode() {
+        // A11: the config action `enter_mode("insert")` — a valid
+        // `parse_action` value — must record `return_mode` just like
+        // `EnterInsertMode`, or Esc in Insert restores the stale
+        // default Normal instead of the mode the user came from.
+        let mut e = engine_with(&[
+            (
+                PageMode::Normal,
+                "v",
+                PageAction::EnterMode(PageMode::Visual),
+            ),
+            (
+                PageMode::Visual,
+                "i",
+                PageAction::EnterMode(PageMode::Insert),
+            ),
+        ]);
+        let _ = e.feed(parse_key("v").unwrap(), t(0));
+        assert_eq!(e.mode(), PageMode::Visual);
+        let r = e.feed(parse_key("i").unwrap(), t(1));
+        assert_eq!(r, Step::Resolved(PageAction::EnterMode(PageMode::Insert)));
+        assert_eq!(e.mode(), PageMode::Insert);
+        assert_eq!(
+            e.feed_edit_mode_key(parse_key("<Esc>").unwrap()),
+            EditModeStep::Exited
+        );
+        assert_eq!(e.mode(), PageMode::Visual);
+        // Keyboard is live again.
+        assert_eq!(
+            e.feed(parse_key("i").unwrap(), t(3)),
+            Step::Resolved(PageAction::EnterMode(PageMode::Insert))
         );
     }
 
