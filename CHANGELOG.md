@@ -62,6 +62,20 @@ and this project adheres to
 - External schemes in the webkit backend now launch `xdg-open` only on a
   user-initiated navigation (a scripted `location = 'foo://…'` no longer pops a
   handler), and the spawned child is reaped instead of left as a zombie.
+- `[privacy] clear_on_exit` now actually wipes `cache` and `local_storage`: the
+  deletes resolved against `paths.cache`, but CEF's `root_cache_path` is
+  `paths.data`, so they hit a directory CEF never populated and logged
+  `dir absent — skipping`.
+- Reopening a closed pinned tab no longer breaks the pinned-first tab ordering,
+  so the tab strip's click hit-testing can no longer select the wrong tab.
+- Switching tabs no longer re-presents a stale frame of the previous visit: the
+  OSR freshness watermark is seeded from the new tab's current frame generation
+  instead of reset to 0, so the loading animation shows until the new tab
+  actually paints.
+- Popup windows now render at the device scale: the popup's `OsrViewState` is
+  seeded from the main view's scale at creation and kept in step by
+  `set_device_scale`, so a popup on a HiDPI display is no longer laid out at 1×
+  with doubled click offsets.
 
 ### Performance
 
