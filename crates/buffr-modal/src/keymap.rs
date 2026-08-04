@@ -82,6 +82,12 @@ pub enum BindError {
          so a binding there would shadow typing — press <Esc> to leave Insert mode"
     )]
     InsertNotBindable,
+    /// An empty chord sequence would install the action at the trie
+    /// root, corrupting ambiguity resolution (every abandoned prefix
+    /// would resolve to it on timeout). An empty binding is never
+    /// meaningful — reject it before the trie sees it.
+    #[error("binding key is empty")]
+    EmptyChord,
 }
 
 impl Keymap {
@@ -123,6 +129,13 @@ impl Keymap {
         chords: &[KeyChord],
         action: PageAction,
     ) -> Result<(), BindError> {
+        // A7: an empty chord sequence must never reach the trie — it
+        // would write the action onto the ROOT, so resolve_timeout
+        // would fire it for every abandoned prefix. Reject it before
+        // the mode_map lookup.
+        if chords.is_empty() {
+            return Err(BindError::EmptyChord);
+        }
         self.mode_map_mut(mode)
             .ok_or(BindError::InsertNotBindable)?
             .bind_chords(chords, action);
@@ -758,6 +771,32 @@ mod tests {
             km.bind_chords(PageMode::Insert, &chords("<F2>"), PageAction::TabNew),
             Err(BindError::InsertNotBindable)
         );
+    }
+
+    #[test]
+    fn empty_chord_binding_is_rejected() {
+        // A7: `"" = "action"` parses to an empty chord slice, and the
+        // old bind path installed the action at the trie ROOT. That
+        // corrupted ambiguity resolution: resolve_timeout seeds
+        // last_action from the root, so every abandoned prefix (a lone
+        // `g`, a partial `gT`, …) fired the root action after the
+        // timeout instead of being dropped.
+        let mut km = Keymap::new();
+        assert_eq!(
+            km.bind_chords(PageMode::Normal, &[], PageAction::TabNew),
+            Err(BindError::EmptyChord)
+        );
+        // The failed bind must not have polluted the root: a lone
+        // prefix chord resolves to nothing on timeout.
+        assert!(km.resolve_timeout(PageMode::Normal, &chords("g")).is_none());
+        // The `bind("", …)` entry point (config path) hits the same
+        // guard through parse_keys → bind_chords.
+        let mut km = Keymap::new();
+        assert_eq!(
+            km.bind(PageMode::Normal, "", PageAction::TabNew),
+            Err(BindError::EmptyChord)
+        );
+        assert!(km.resolve_timeout(PageMode::Normal, &chords("g")).is_none());
     }
 
     #[test]

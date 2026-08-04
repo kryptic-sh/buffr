@@ -836,6 +836,15 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
 
     for (mode, bindings) in &cfg.keymap {
         for keys in bindings.keys() {
+            // An empty key parses to an empty chord slice and would
+            // install the action at the trie root (A7), corrupting
+            // ambiguity resolution. Reject it before parse_keys.
+            if keys.is_empty() {
+                return Err(ConfigError::Validate {
+                    message: format!("keymap.{} has an empty binding key", mode_name(*mode)),
+                    location: Some(format!("keymap.{}", mode_name(*mode))),
+                });
+            }
             if let Err(e) = buffr_modal::parse_keys(keys) {
                 return Err(ConfigError::Validate {
                     message: format!(
@@ -1263,6 +1272,30 @@ mod tests {
                     "{message}"
                 );
                 assert!(message.contains("<Esc>"), "{message}");
+            }
+            other => panic!("expected Validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_keymap_binding_key() {
+        // A7: `"" = "action"` parses to an empty chord slice and
+        // installs the action at the trie ROOT, corrupting ambiguity
+        // resolution (abandoned prefixes fire the root action on
+        // timeout). Validation must reject it up front.
+        let toml = r#"
+[keymap.normal]
+"" = "tab_new"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ConfigError::Validate { message, location } => {
+                assert!(
+                    message.contains("empty binding key"),
+                    "unexpected msg: {message}"
+                );
+                assert_eq!(location.as_deref(), Some("keymap.normal"));
             }
             other => panic!("expected Validate error, got {other:?}"),
         }
