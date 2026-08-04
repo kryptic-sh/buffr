@@ -1892,7 +1892,8 @@ unsafe extern "C" fn on_context_menu(
 
 /// Internal URI schemes that WebKit should load directly.
 ///
-/// Any scheme not in this list is passed to `xdg-open` and ignored by WebKit.
+/// Any scheme not in this list is passed to `xdg-open` on a user-initiated
+/// navigation and ignored by WebKit.
 /// `ws` and `wss` are included because WebKit handles WebSocket connections
 /// internally via the same network session as HTTP.
 const INTERNAL_SCHEMES: &[&str] = &[
@@ -1917,8 +1918,10 @@ const INTERNAL_SCHEMES: &[&str] = &[
 /// request URI scheme:
 /// - Internal schemes (`http`, `https`, `file`, `buffr`, `about`, `data`,
 ///   `blob`, `ws`, `wss`): call `webkit_policy_decision_use`.
-/// - External schemes (`mailto:`, `magnet:`, etc.): spawn `xdg-open` and
-///   call `webkit_policy_decision_ignore`.
+/// - External schemes (`mailto:`, `magnet:`, etc.): on a user-initiated
+///   navigation (gesture check), spawn `xdg-open` and call
+///   `webkit_policy_decision_ignore`; the child is reaped on a detached
+///   thread. Without a user gesture the launch is skipped (still ignored).
 ///
 /// RESPONSE decisions are always passed to `webkit_policy_decision_use`
 /// (allow all MIME types; WebKit handles Content-Disposition downloads via
@@ -1973,13 +1976,30 @@ unsafe extern "C" fn on_decide_policy(
             tracing::debug!(uri, "webkit: decide-policy → use (internal scheme)");
             unsafe { webkit_policy_decision_use(decision) };
         } else {
-            tracing::debug!(
-                uri,
-                "webkit: decide-policy → xdg-open + ignore (external scheme)"
-            );
-            if !uri.is_empty() {
-                // Spawn xdg-open and discard result — failure is non-fatal.
-                let _ = std::process::Command::new("xdg-open").arg(&uri).spawn();
+            // Only launch external handlers on a user-initiated navigation;
+            // a scripted/redirected load must not pop a handler out of
+            // nowhere. A null nav_action counts as no gesture.
+            let user_gesture = !nav_action.is_null()
+                && unsafe { webkit_navigation_action_is_user_gesture(nav_action) } != 0;
+
+            if !uri.is_empty() && user_gesture {
+                tracing::debug!(
+                    uri,
+                    "webkit: decide-policy → xdg-open + ignore (external scheme, user gesture)"
+                );
+                if let Ok(mut child) = std::process::Command::new("xdg-open").arg(&uri).spawn() {
+                    // Reap the child so xdg-open's wrapper process doesn't linger as a
+                    // zombie (W8). xdg-open may itself daemonize; waiting on the child
+                    // we spawned is still required to reap it.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+            } else {
+                tracing::warn!(
+                    uri,
+                    "webkit: external scheme without user gesture — not launching"
+                );
             }
             unsafe { webkit_policy_decision_ignore(decision) };
         }

@@ -59,6 +59,9 @@ and this project adheres to
   internal pages: the scheme handler checks the requesting page's origin and the
   requested scheme, so a cross-origin or iframe page's fetch gets an empty body
   instead of the system clipboard.
+- External schemes in the webkit backend now launch `xdg-open` only on a
+  user-initiated navigation (a scripted `location = 'foo://…'` no longer pops a
+  handler), and the spawned child is reaped instead of left as a zombie.
 
 ## [0.14.9] - 2026-08-03
 
