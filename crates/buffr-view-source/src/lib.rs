@@ -86,7 +86,6 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
     let url_path = Path::new(url);
 
     let lang_name = registry.name_for_path(url_path)?;
-    let spec = registry.by_name(lang_name)?;
     let meta = registry.meta();
 
     let loader = match GrammarLoader::user_default(meta) {
@@ -97,7 +96,17 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
         }
     };
 
-    let grammar = match Grammar::load(lang_name, spec, &loader, meta) {
+    // A6: never clone/compile a grammar over the network from the render
+    // path — hjkl-bonsai's Grammar::load does exactly that on a cache miss
+    // (git clone + system C/C++ compiler + dlopen, in-process). Resolve only
+    // installed artifacts and fall back to plain <pre> when none exists.
+    let Some(so) = loader.lookup_only(lang_name) else {
+        tracing::debug!(
+            "buffr-view-source: no installed grammar artifact for '{lang_name}'; skipping highlight"
+        );
+        return None;
+    };
+    let grammar = match Grammar::load_from_path(lang_name, &so) {
         Ok(g) => Arc::new(g),
         Err(e) => {
             warn!("buffr-view-source: failed to load grammar '{lang_name}': {e:#}");
