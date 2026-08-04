@@ -1144,32 +1144,11 @@ impl Renderer {
             return Ok((self.last_present_stats, Submitted::No));
         }
 
-        // Chrome CPU paint — only when dirty. The closure runs on the UI
-        // thread because it captures AppState data that can't be sent to
-        // the worker. The resulting Vec<u32> is sent to the worker which
-        // uploads it to the GPU chrome texture.
-        let chrome_pixels = if chrome_dirty {
-            let lw = self.chrome_lw as usize;
-            let lh = self.chrome_lh as usize;
-            // Zero the buffer first so previous chrome state doesn't bleed
-            // into rows that are now transparent (e.g. after CEF rect shrinks).
-            let mut buf = vec![0u32; lw * lh];
-            paint_chrome(&mut buf, lw, lh);
-            Some(buf)
-        } else {
-            None
-        };
-
-        let t_chrome = t0.elapsed();
-
-        // Clone OSR pixels into an owned buffer. When the caller re-sends the
-        // previous generation (`skip_pixels`) the clone is skipped entirely —
-        // the worker dedupes on generation and never reads the pixels.
-        let osr_owned = osr.as_ref().map(OsrUploadOwned::from);
-
-        let t_osr_clone = t0.elapsed();
-
         // Acquire the swapchain texture.
+        //
+        // This happens before any CPU paint or clone so the early-return
+        // paths below (timeout, occluded, validation, stale size) bail out
+        // before allocating or painting anything.
         //
         // After a `surface.configure(new_size)` the swapchain still has
         // pre-allocated buffers at the previous size queued for present;
@@ -1269,6 +1248,31 @@ impl Renderer {
                 None => return Ok((FrameStats::default(), Submitted::No)),
             }
         };
+
+        // Chrome CPU paint — only when dirty. The closure runs on the UI
+        // thread because it captures AppState data that can't be sent to
+        // the worker. The resulting Vec<u32> is sent to the worker which
+        // uploads it to the GPU chrome texture.
+        let chrome_pixels = if chrome_dirty {
+            let lw = self.chrome_lw as usize;
+            let lh = self.chrome_lh as usize;
+            // Zero the buffer first so previous chrome state doesn't bleed
+            // into rows that are now transparent (e.g. after CEF rect shrinks).
+            let mut buf = vec![0u32; lw * lh];
+            paint_chrome(&mut buf, lw, lh);
+            Some(buf)
+        } else {
+            None
+        };
+
+        let t_chrome = t0.elapsed();
+
+        // Clone OSR pixels into an owned buffer. When the caller re-sends the
+        // previous generation (`skip_pixels`) the clone is skipped entirely —
+        // the worker dedupes on generation and never reads the pixels.
+        let osr_owned = osr.as_ref().map(OsrUploadOwned::from);
+
+        let t_osr_clone = t0.elapsed();
 
         let t_acquire = t0.elapsed();
 

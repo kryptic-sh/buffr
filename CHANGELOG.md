@@ -79,6 +79,9 @@ and this project adheres to
   statusline) instead of the whole ~8.3 MB texture every dirty frame; when the
   loading animation or a floating overlay paints into the browser region the
   full buffer is uploaded as before.
+- `Renderer::frame` now acquires the swapchain texture before painting chrome or
+  cloning OSR pixels, so a skipped frame (timeout, occluded, validation, stale
+  size) no longer wastes the CPU paint and the 8.3 MB alloc.
 
 ## [0.14.9] - 2026-08-03
 
