@@ -324,8 +324,16 @@ fn accept_loop(
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
-                tracing::warn!(error = %e, "internal_server: accept failed");
-                break;
+                // A8: EMFILE (transient fd exhaustion) and ECONNABORTED (reset
+                // before accept) are common under load and must not take the
+                // internal server down for the process lifetime — the old `break`
+                // silently killed every buffr://new / buffr://settings page. There
+                // is no portable errno distinction between those and a truly dead
+                // listener, so retry every unexpected error after the poll interval;
+                // a corrupted listener fd (the only fatal case) costs one warn per
+                // ACCEPT_POLL_INTERVAL until Drop sets the shutdown flag.
+                tracing::warn!(error = %e, "internal_server: accept failed; retrying");
+                thread::sleep(ACCEPT_POLL_INTERVAL);
             }
         }
     }
