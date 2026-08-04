@@ -389,8 +389,17 @@ impl Bookmarks {
         // regex because `regex` doesn't support overlapping captures,
         // and we genuinely need to know the relative ordering of
         // `<H3>`, `</DL>`, and `<A>` to maintain the folder stack.
-        let h3_re = Regex::new(r"(?is)<H3[^>]*>(.*?)</H3>").expect("h3 regex");
-        let a_re = Regex::new(r#"(?is)<A\s+([^>]*)>(.*?)</A>"#).expect("a regex");
+        //
+        // The open-tag body is `(?:[^>"]|"[^"]*")*`: either a
+        // non-`>`-non-`"` char or a complete double-quoted run. A `>`
+        // inside a quoted attribute value (a hand-authored file can
+        // contain `<A HREF="https://x/?a=1>2&b=3">`) is part of the
+        // value, and only an unquoted `>` closes the tag (A13). Side
+        // effect: a tag with an unclosed quote no longer matches at
+        // all, so that entry is skipped rather than corrupted —
+        // acceptable degradation for malformed input.
+        let h3_re = Regex::new(r#"(?is)<H3((?:[^>"]|"[^"]*")*)>(.*?)</H3>"#).expect("h3 regex");
+        let a_re = Regex::new(r#"(?is)<A\s+((?:[^>"]|"[^"]*")*)>(.*?)</A>"#).expect("a regex");
         let dl_close_re = Regex::new(r"(?i)</DL>").expect("dl regex");
         let attr_re = Regex::new(r#"(?i)(\w+)\s*=\s*"([^"]*)""#).expect("attr regex");
 
@@ -404,7 +413,8 @@ impl Bookmarks {
         let mut toks: Vec<(usize, Tok<'_>)> = Vec::new();
         for m in h3_re.captures_iter(html) {
             let pos = m.get(0).map(|m| m.start()).unwrap_or(0);
-            let label = m.get(1).map(|m| m.as_str()).unwrap_or("");
+            // Group 2: group 1 is now the open-tag attrs body.
+            let label = m.get(2).map(|m| m.as_str()).unwrap_or("");
             toks.push((pos, Tok::FolderOpen(label)));
         }
         for m in dl_close_re.find_iter(html) {
@@ -1225,6 +1235,44 @@ mod tests {
         b.import_netscape(html).unwrap();
         let bm = &b.all().unwrap()[0];
         assert_eq!(bm.title.as_deref(), Some("Bold title"));
+    }
+
+    // ----- A13: quoted attribute values may contain `>` -----
+
+    #[test]
+    fn import_netscape_keeps_gt_inside_quoted_href() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html = r#"<DL><DT><A HREF="https://x/?a=1>2&b=3">label</A></DL>"#;
+        assert_eq!(b.import_netscape(html).unwrap(), 1);
+        assert_eq!(b.count().unwrap(), 1);
+        let bm = &b.all().unwrap()[0];
+        // `url::Url` percent-encodes `>` in the query, so the stored URL
+        // is the full canonical form — the old regex truncated it at the
+        // first `>` inside the quoted HREF.
+        assert_eq!(bm.url, "https://x/?a=1%3E2&b=3");
+        assert_eq!(bm.title.as_deref(), Some("label"));
+    }
+
+    #[test]
+    fn import_netscape_keeps_gt_inside_quoted_h3_title() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html =
+            r#"<DL><DT><H3 TITLE="a>b">Folder</H3><DL><DT><A HREF="https://y/">Y</A></DL></DL>"#;
+        assert_eq!(b.import_netscape(html).unwrap(), 1);
+        let folder = b.by_tag("folder").unwrap();
+        assert_eq!(folder.len(), 1);
+        assert_eq!(folder[0].url, "https://y/");
+        assert_eq!(folder[0].title.as_deref(), Some("Y"));
+    }
+
+    #[test]
+    fn import_netscape_normal_anchor_unchanged() {
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html = r#"<DL><DT><A HREF="https://example.com/">Example</A></DL>"#;
+        assert_eq!(b.import_netscape(html).unwrap(), 1);
+        let bm = &b.all().unwrap()[0];
+        assert_eq!(bm.url, "https://example.com/");
+        assert_eq!(bm.title.as_deref(), Some("Example"));
     }
 
     // ----- M42: import is one transaction -----
