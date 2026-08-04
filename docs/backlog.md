@@ -195,26 +195,6 @@ rediscovered as findings.
 
 Mechanical, low-risk, no decision needed.
 
-- `fuzz/corpus/` is gitignored, so every CI fuzz run starts from an empty corpus
-  and re-derives the same shallow coverage. Committing seed inputs (or caching
-  the corpus between runs) would let the two new targets — `console_sentinel`
-  and `netscape_import` — actually get somewhere.
-- `docs/ui-stack.md` still describes option A's softbuffer history in prose.
-  Accurate as history, but worth a "superseded" marker now that the wgpu path is
-  the only one.
-- **`[privacy] clear_on_exit` — `cache` and `local_storage` are no-ops.**
-  `run_clear_on_exit` in `apps/buffr-app/src/main.rs` resolves both against
-  `paths.cache` (`~/.cache/buffr`), but CEF's `root_cache_path` is `paths.data`
-  (`~/.local/share/buffr`), so the deletes hit a directory CEF never populated
-  and log `clear_on_exit: dir absent — skipping`. The other four categories
-  (`cookies`, `history`, `bookmarks`, `downloads`) work. One-line fix
-  (`paths.cache` → `paths.data`); documented as broken in `docs/config.md` and
-  `config.example.toml` until it lands.
-- **`buffr_view_wayland_set_rect` is now dead.** The L19 removal of the
-  `SetNativeRect` worker command left the helper defined
-  (`crates/buffr-webkit/src/platform/wpe_subclass.rs`) and imported
-  (`runtime.rs`) but unreferenced — warning-level residue in the excluded crate.
-  Delete it alongside the import.
 - The review's own `Summary` counts in `code-review.md` are frozen at the time
   of writing and no longer reflect what has been fixed; the `Status` section
   above them is the live view.
@@ -397,52 +377,7 @@ methods instead of cutting a range. The natural groups:
 
 ---
 
-## 8. Correctness review, 2026-08-02 — remaining
-
-A read-only review pass, since partly actioned. **C1–C5 shipped** and have been
-removed from this list — `git log` has them. What is left below is unfixed.
-Findings marked ✅ were re-verified by opening the cited location; the rest are
-reported as found and still need confirming before anyone acts on them.
-
-### C6 MEDIUM — `on_tab_switch` resets `last_osr_generation` to 0
-
-**Where:** `AppState::on_tab_switch` in `apps/buffr-app/src/main.rs`;
-`is_osr_frame_fresh` in `apps/buffr-app/src/paint_policy.rs`.
-
-The doc comment argues this is safe because the new tab's first paint always has
-a non-zero generation. True, but it also makes the _already-consumed_ generation
-compare as fresh, defeating the double-swap guard. On `gt` the user can see a
-stale frame of the tab they just left instead of the loading animation.
-
-### C7 LOW — `reopen_closed_tab` can break the pinned-first ordering
-
-**Where:** `reopen_closed_tab` in `crates/buffr-cef/src/host.rs` restores at
-`entry.index.min(tabs.len())` without calling `enforce_pinned_ordering()`,
-unlike `toggle_pin_active` and `set_pinned`. `hit_test_tab_strip_pure` derives
-pill widths from `i < pinned_count` while `TabStrip::paint` uses each tab's own
-`pinned` flag, so once the invariant breaks, clicks select the wrong tab.
-
-### C8 ✅ MEDIUM — popup browsers never get a device scale, so they render at 1×
-
-**Where:** `on_before_popup` in `crates/buffr-cef/src/handlers.rs` builds the
-popup's `OsrViewState::new()` and stores only width and height into it;
-`BrowserHost::set_device_scale` in `crates/buffr-cef/src/host.rs` writes
-`self.osr_view` — the **main** view — and nothing else.
-`OsrPaintHandler::resolve_scale` in `crates/buffr-cef/src/osr.rs` returns the
-popup's own `scale()` for a popup browser id, and `default_view_dims_and_scale`
-in the same file asserts `new()` starts at 1.0.
-
-So on a 2× display CEF lays the popup's page out at scale 1.0 while the embedder
-divides pointer coordinates by 2: the page renders at half size in the quad and
-clicks land at roughly twice the intended offset. Found while fixing C5 and left
-alone — C5 was physical-to-physical geometry, this needs the popup view seeded
-from the main view's scale at creation, and then kept in step by
-`set_device_scale`, which today has no idea popups exist. Untested at a real
-HiDPI scale either way; see section 2.
-
----
-
-## 9. Performance review, 2026-08-04 — shipped
+## 8. Performance review, 2026-08-04 — shipped
 
 A read-only pass over the current tree (2026-08-04) re-verified the 2026-08-02
 findings (P1–P8, all still present then) and added N1–N5. **All of them are
@@ -470,27 +405,7 @@ live compositor is not (no Wayland session) — see section 2.
 
 ---
 
-## 10. Queued, agreed but not started
-
-The order settled on 2026-08-02: finish the correctness findings, then the
-performance ones, then the dependency bump. One item per commit — delegate,
-verify independently, commit, push — rather than a batch.
-
-- **Correctness: C6, C7, C8** in section 8. (C9 was resolved by the L37
-  `PageMode::Pending` deletion — a `[keymap.pending]` section no longer parses.)
-- **Bump the HJKL dependencies to latest.** Six of them are declared in
-  `[workspace.dependencies]` in the root `Cargo.toml`: `hjkl-engine`,
-  `hjkl-buffer`, `hjkl-clipboard`, `hjkl-splash`, `hjkl-config` and
-  `hjkl-bonsai`. They are caret requirements, not the `=` pins older changelog
-  entries describe, so a `cargo update` already moves them within a major and
-  only a major bump needs the manifest touched. Use `cargo add`/`cargo update`
-  rather than editing versions by hand. Historically these bumps needed no
-  source changes because buffr consumes only editor-level APIs — an assumption
-  worth re-checking each time, not a guarantee.
-
----
-
-## 11. Working practice, learned the hard way
+## 9. Working practice, learned the hard way
 
 Not repo defects. Recorded because each one cost real time or real work, and
 none of it is recoverable from `git log`.
@@ -545,5 +460,5 @@ by the full workspace gate:
   and trait methods removed, history builder, gesture-gated clipboard and
   `xdg-open`.
 - **All 12 perf findings** (P1–P8, N1–N5): commits `8621a90`..`2caa56f`, see
-  section 9.
+  section 8.
 - **CHANGELOG**: every fix recorded under `[Unreleased]` in the same commit.
