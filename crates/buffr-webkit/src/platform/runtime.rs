@@ -59,7 +59,6 @@ use super::wpe_subclass::{
     attach_view_ctx, buffr_display_take_last_view, buffr_display_wayland_new,
     buffr_input_method_context_cancel, buffr_input_method_context_commit,
     buffr_input_method_context_new, buffr_input_method_context_set_preedit,
-    buffr_view_wayland_set_rect,
 };
 
 // ── TabInfo (thread-safe snapshot) ───────────────────────────────────────────

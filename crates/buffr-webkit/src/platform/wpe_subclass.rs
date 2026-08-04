@@ -69,21 +69,6 @@ unsafe extern "C" {
         refresh_hz: std::os::raw::c_int,
     ) -> *mut WPEDisplay;
 
-    // ── BuffrViewWayland (#153) ───────────────────────────────────────────
-
-    /// Update the subsurface position and WebKit view render size.
-    ///
-    /// Must be called on the GLib worker thread (same thread that commits
-    /// Wayland protocol messages). No-op when `view` is NULL or is not a
-    /// `BuffrViewWayland` instance.
-    pub fn buffr_view_wayland_set_rect(
-        view: *mut WPEView,
-        x: std::os::raw::c_int,
-        y: std::os::raw::c_int,
-        w: std::os::raw::c_int,
-        h: std::os::raw::c_int,
-    );
-
     // ── BuffrInputMethodContext (#IME) ────────────────────────────────────
     //
     // Declared here (not in the bindgen allowlist) because they live in our
