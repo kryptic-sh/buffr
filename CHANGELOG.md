@@ -90,6 +90,9 @@ and this project adheres to
   behind an `Arc`, so a cache hit is a refcount bump instead of a bitmap copy,
   measuring and drawing share one lookup, and `draw_text` advances the pen from
   the same entry it drew from.
+- The two per-keystroke SQLite queries — history's FTS5 search and the bookmark
+  search — now use `prepare_cached`, so SQLite re-parses and re-plans them once
+  instead of on every omnibar keystroke.
 
 ## [0.14.9] - 2026-08-03
 

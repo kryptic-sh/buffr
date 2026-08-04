@@ -354,7 +354,7 @@ impl History {
         let conn = self.conn.lock().map_err(|_| HistoryError::Poisoned)?;
         let now = self.clock.now().timestamp();
         let recent_cutoff = now - RECENCY_WINDOW_SECS;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, url, title, visit_time, transition, score FROM ( \
                SELECT MAX(v.id) AS id, v.url, \
                       (SELECT title FROM visits v2 WHERE v2.url = v.url \

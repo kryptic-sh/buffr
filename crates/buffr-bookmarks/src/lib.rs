@@ -318,7 +318,7 @@ impl Bookmarks {
         }
         let pattern = format!("%{}%", escape_like(&needle));
         let conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
-        let mut stmt = conn.prepare(SEARCH_SQL)?;
+        let mut stmt = conn.prepare_cached(SEARCH_SQL)?;
         let rows: Vec<BookmarkRow> = stmt
             .query_map(params![pattern, limit], read_row)?
             .collect::<Result<Vec<_>, _>>()?;
