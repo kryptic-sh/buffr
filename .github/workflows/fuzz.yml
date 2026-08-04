@@ -60,6 +60,16 @@ jobs:
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      - name: seed corpus
+        run: |
+          if [ -d "fuzz/seeds/${{ matrix.target }}" ]; then
+            mkdir -p "fuzz/corpus/${{ matrix.target }}"
+            cp "fuzz/seeds/${{ matrix.target }}"/* "fuzz/corpus/${{ matrix.target }}"/
+            echo "seeded corpus with $(ls "fuzz/seeds/${{ matrix.target }}" | wc -l) inputs"
+          else
+            echo "no committed seeds for ${{ matrix.target }}"
+          fi
+
       - name: run fuzzer
         run: |
           cargo +nightly fuzz run ${{ matrix.target }} \
