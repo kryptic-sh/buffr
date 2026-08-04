@@ -75,6 +75,7 @@ type CefCursorArg = cef::sys::cef_cursor_handle_t;
 type CefCursorArg = *mut u8;
 use crate::osr::{
     OsrFrame, OsrViewState, PENDING_POPUP_ALLOC_CAP, PendingPopupAllocQueue, PopupFrameMap,
+    SharedOsrViewState,
 };
 use crate::{PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
 use buffr_core::open_finder::{OsSpawn, open_path};
@@ -181,6 +182,7 @@ pub fn make_client(
     video_active: Arc<AtomicBool>,
     context_menu_sink: ContextMenuSink,
     console_nonces: ConsoleNonces,
+    main_osr_view: SharedOsrViewState,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -213,6 +215,7 @@ pub fn make_client(
         video_active,
         context_menu_sink,
         console_nonces,
+        main_osr_view,
     )
 }
 
@@ -229,6 +232,8 @@ wrap_life_span_handler! {
         popup_create_sink: PopupCreateSink,
         popup_close_sink: PopupCloseSink,
         popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
+        // C8: main view's scale seeds each popup view at creation.
+        main_osr_view: SharedOsrViewState,
     }
 
     impl LifeSpanHandler {
@@ -296,6 +301,11 @@ wrap_life_span_handler! {
             // immediately call view_rect and resize from there.
             let frame = Arc::new(Mutex::new(OsrFrame::new(800, 600)));
             let view = Arc::new(OsrViewState::new());
+            // C8: a popup starts at scale 1.0 (OsrViewState::new), but CEF lays
+            // the popup page out from screen_info's device_scale_factor, which
+            // resolve_scale reads from this view. Seed from the main view so a
+            // popup on a HiDPI display doesn't render at half size.
+            view.set_scale(self.main_osr_view.scale());
             view.width.store(800, std::sync::atomic::Ordering::Relaxed);
             view.height.store(600, std::sync::atomic::Ordering::Relaxed);
 
@@ -496,6 +506,9 @@ wrap_client! {
         // script; the display handler rejects any sentinel line that
         // doesn't carry the current value.
         console_nonces: ConsoleNonces,
+        // C8: main view's scale seeds each popup view at creation and
+        // keeps popups in step when the device scale changes.
+        main_osr_view: SharedOsrViewState,
     }
 
     impl Client {
@@ -566,6 +579,7 @@ wrap_client! {
                 self.popup_create_sink.clone(),
                 self.popup_close_sink.clone(),
                 self.popup_browsers.clone(),
+                self.main_osr_view.clone(),
             ))
         }
 

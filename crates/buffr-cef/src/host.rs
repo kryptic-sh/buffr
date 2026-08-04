@@ -964,6 +964,23 @@ impl BrowserHost {
         let old = self.osr_view.scale();
         tracing::debug!(old_scale = old, new_scale = scale, "set_device_scale");
         self.osr_view.set_scale(scale);
+        // C8: popups keep their own OsrViewState, which resolve_scale
+        // reads when CEF asks for a popup's screen_info. Keep them in
+        // step with the main view so a live scale change (monitor
+        // switch, DPI change) doesn't leave popups rendering at the old
+        // factor.
+        if let Ok(map) = self.popup_frames.lock() {
+            for (_id, (_frame, view)) in map.iter() {
+                view.set_scale(scale);
+            }
+        }
+        if let Ok(browsers) = self.popup_browsers.lock() {
+            for (_id, browser) in browsers.iter() {
+                if let Some(host) = browser.host() {
+                    host.notify_screen_info_changed();
+                }
+            }
+        }
         self.notify_screen_info_changed();
     }
 
@@ -1327,6 +1344,7 @@ impl BrowserHost {
             self.video_active.clone(),
             self.context_menu_sink.clone(),
             self.console_nonces.clone(),
+            self.osr_view.clone(),
         );
         let mut rc_guard = self
             .request_context
