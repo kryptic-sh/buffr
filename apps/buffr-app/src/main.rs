@@ -256,6 +256,11 @@ struct PopupWindow {
     url: String,
     /// Generation of the last OSR frame we composited.
     last_osr_generation: u64,
+    /// True when the GPU may not hold the pixels currently in `osr_scratch`
+    /// — the last OSR-bearing frame returned `Submitted::No` (or errored).
+    /// A skipped upload never reached the GPU, so the synthetic retry must
+    /// re-upload the real pixels instead of skipping the memcpy.
+    osr_gpu_stale: bool,
     /// Reusable scratch buffer for the same mem::swap trick as the main window.
     osr_scratch: Vec<u8>,
     /// Chrome generation counter — bumped when URL or size changes.
@@ -1704,6 +1709,11 @@ struct AppState {
     /// we know there is new content to show; when they match we can skip
     /// the BGRA→RGB copy and re-present the existing buffer.
     last_osr_generation: u64,
+    /// True when the GPU may not hold the pixels currently in `osr_scratch`
+    /// — the last OSR-bearing frame returned `Submitted::No` (or errored).
+    /// A skipped upload never reached the GPU, so the synthetic retry must
+    /// re-upload the real pixels instead of skipping the memcpy.
+    osr_gpu_stale: bool,
     /// Dimensions of the most recently received OSR paint. `None` until
     /// CEF emits the first on_paint. Used to gate the loading animation:
     /// once we've seen a paint we don't fall back to animation just because
@@ -2119,6 +2129,7 @@ impl AppState {
             counters_flush_at: Instant::now(),
             update_checker,
             last_osr_generation: 0,
+            osr_gpu_stale: false,
             last_osr_dims: None,
             pending_cef_resize: ResizeDebounce::default(),
             osr_cursor: (0, 0),
@@ -3776,9 +3787,12 @@ impl AppState {
                     height: cached_h,
                     generation: self.last_osr_generation,
                     dst_rect: (0, browser_y, browser_w, browser_h),
-                    // Same generation as the GPU already holds: the worker
-                    // dedupes the upload, so skip the UI-thread memcpy.
-                    skip_pixels: true,
+                    // Skipping the memcpy is only safe when the GPU already
+                    // holds this generation (the last OSR frame submitted).
+                    // If `osr_gpu_stale` the worker never saw the pixels in
+                    // `osr_scratch`, so the retry carries them for real and
+                    // `maybe_upload` writes the new generation.
+                    skip_pixels: !self.osr_gpu_stale,
                 };
                 renderer.frame(
                     chrome_dirty_effective,
@@ -3808,9 +3822,10 @@ impl AppState {
         // it behind would let the freshness gate swap the same generation a
         // second time on the next paint and push the previous (already
         // consumed) buffer back into `osr_scratch` — see `is_osr_frame_fresh`
-        // condition 4.  The skipped pixels are not lost: they live in
-        // `osr_scratch` and the retry below re-uploads them through the
-        // SyntheticScratch path, which the worker dedupes by generation.
+        // condition 4.  A skipped frame's pixels are NOT on the GPU: they
+        // live in `osr_scratch`, which `osr_gpu_stale` records.  The retry
+        // below re-uploads them through the SyntheticScratch path with real
+        // pixels (no longer skipped) so `maybe_upload` can write them.
         self.last_osr_generation = new_osr_generation;
 
         // Schedule the next wake while the loading-anim path is active.
@@ -3891,6 +3906,16 @@ impl AppState {
                 None
             }
         };
+        // A2: the GPU only holds the pixels in osr_scratch if the last
+        // OSR-bearing frame actually submitted. A frame skipped because the
+        // worker was busy never reached the GPU, so the retry must re-upload
+        // real pixels, not a synthetic skip.
+        if matches!(
+            paint_path,
+            PaintPath::FreshOsr | PaintPath::SyntheticScratch
+        ) {
+            self.osr_gpu_stale = !matches!(&res, Ok((_, crate::render::Submitted::Yes)));
+        }
         let commit = decide_frame_commit(outcome, chrome_dirty_effective);
         if commit.advance_chrome_gen {
             self.last_painted_chrome_gen = self.chrome_generation;
@@ -5311,6 +5336,10 @@ impl AppState {
         popup.renderer.set_logical_size(lwidth, lheight);
         let url = popup.url.clone();
         let new_gen;
+        // A2: whether this frame carries an OSR upload (fresh or synthetic).
+        // Only those arms can leave the GPU behind `osr_scratch`, so only
+        // they update the staleness flag.
+        let carried_osr_upload = osr_meta.is_some() || popup.last_osr_dims.is_some();
         let res = if let Some((osr_w, osr_h, osr_gen)) = osr_meta {
             new_gen = osr_gen;
             let osr_upload = crate::render::OsrUpload {
@@ -5345,9 +5374,12 @@ impl AppState {
                 height: cached_h,
                 generation: popup.last_osr_generation,
                 dst_rect: osr_dst_rect,
-                // Same generation as the GPU already holds: the worker
-                // dedupes the upload, so skip the UI-thread memcpy.
-                skip_pixels: true,
+                // Skipping the memcpy is only safe when the GPU already
+                // holds this generation (the last OSR frame submitted). If
+                // `osr_gpu_stale` the worker never saw the pixels in
+                // `osr_scratch`, so the retry carries them for real and
+                // `maybe_upload` writes the new generation.
+                skip_pixels: !popup.osr_gpu_stale,
             };
             popup.renderer.frame(
                 chrome_dirty,
@@ -5382,6 +5414,13 @@ impl AppState {
                 None
             }
         };
+        // A2: same as the main window — the GPU only holds osr_scratch if the
+        // last OSR-bearing frame actually submitted. A frame skipped because
+        // the worker was busy never reached the GPU, so the retry must
+        // re-upload real pixels, not a synthetic skip.
+        if carried_osr_upload {
+            popup.osr_gpu_stale = !matches!(&res, Ok((_, crate::render::Submitted::Yes)));
+        }
         let commit = decide_frame_commit(outcome, chrome_dirty);
         if commit.advance_chrome_gen {
             popup.last_painted_chrome_gen = popup.chrome_generation;

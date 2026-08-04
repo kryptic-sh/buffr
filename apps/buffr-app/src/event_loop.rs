@@ -1627,6 +1627,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     view: created.view,
                     url: created.url,
                     last_osr_generation: 0,
+                    osr_gpu_stale: false,
                     last_osr_dims: None,
                     pending_cef_resize: None,
                     repaint_retry_at: None,
