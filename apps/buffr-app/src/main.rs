@@ -154,7 +154,7 @@ use buffr_engine::permissions::{
     queue_len as permissions_queue_len, take_front_matching as take_permission_front_matching,
 };
 use buffr_engine::{
-    Backend, BackendOpenOptions, NewTabHtmlProvider, ProfilePaths, TabId,
+    Backend, BackendOpenOptions, NewTabHtmlProvider, ProfilePaths, TabId, TabSummary,
     newtab::{
         NEW_TAB_HTML_TEMPLATE, NEW_TAB_KEYBINDS_MARKER, NEW_TAB_SPLASH_ART_MARKER, NEW_TAB_URL,
     },
@@ -2922,9 +2922,9 @@ impl AppState {
 
     /// Refresh the tab-strip render input from the host's current
     /// tab list. Cheap; runs every `about_to_wait` tick.
-    fn refresh_tab_strip(&mut self) {
+    fn refresh_tab_strip(&mut self) -> (bool, Vec<TabSummary>) {
         let Some(host) = self.active_engine_dyn() else {
-            return;
+            return (false, Vec::new());
         };
         let summaries = host.tabs_summary();
         let active = host.active_index();
@@ -2950,13 +2950,13 @@ impl AppState {
         let hovered_tab_idx = self.hit_test_tab_strip();
         let mut ids = Vec::with_capacity(summaries.len());
         let tabs = summaries
-            .into_iter()
+            .iter()
             .enumerate()
             .map(|(idx, t)| {
                 ids.push(t.id);
                 let favicon = self.favicons.get(&t.browser_id).cloned();
                 TabView {
-                    title: t.title,
+                    title: t.title.clone(),
                     progress: t.progress,
                     pinned: t.pinned,
                     private: t.private,
@@ -2974,6 +2974,7 @@ impl AppState {
         if tabs_changed {
             self.mark_chrome_dirty();
         }
+        (tabs_changed, summaries)
     }
 
     fn refresh_title(&mut self) {
@@ -3037,7 +3038,7 @@ impl AppState {
     ///   `register_favicon_prefill` (one lookup per pending entry; hits
     ///   populate `self.favicons` before the CEF callback fires).
     /// - Persists every fresh CEF-delivered bitmap back to the disk cache.
-    fn pump_favicon_updates(&mut self) -> bool {
+    fn pump_favicon_updates(&mut self, summaries: &[TabSummary]) -> bool {
         let Some(engine) = self.active_engine_dyn() else {
             return false;
         };
@@ -3063,11 +3064,10 @@ impl AppState {
         // mismatch → enqueue a prefill. Closed browsers are dropped from the
         // memoization map to bound memory.
         if self.favicon_cache.is_some() {
-            let summaries = engine.tabs_summary();
             let live_ids: std::collections::HashSet<i32> =
                 summaries.iter().map(|t| t.browser_id).collect();
             self.favicon_check_url.retain(|id, _| live_ids.contains(id));
-            for tab in &summaries {
+            for tab in summaries.iter() {
                 let same = self
                     .favicon_check_url
                     .get(&tab.browser_id)
@@ -3123,10 +3123,9 @@ impl AppState {
         }
         // Build a browser_id → url map from the current tab list so we can
         // resolve the origin for each incoming favicon.
-        let id_to_url: HashMap<i32, String> = engine
-            .tabs_summary()
-            .into_iter()
-            .map(|t| (t.browser_id, t.url))
+        let id_to_url: HashMap<i32, &str> = summaries
+            .iter()
+            .map(|t| (t.browser_id, t.url.as_str()))
             .collect();
         for u in updates {
             // Persist to disk cache keyed by the tab's current origin.

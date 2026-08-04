@@ -1452,13 +1452,6 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // — CEF can fire many times per frame as the cursor moves).
         self.pump_cursor_changes(event_loop);
 
-        // Drain any decoded favicons from CEF and stash by browser id.
-        // refresh_tab_strip below picks them up on the next tab refresh.
-        if self.pump_favicon_updates() {
-            self.mark_chrome_dirty();
-            self.request_redraw();
-        }
-
         // Drain any find result the CEF browser thread posted since
         // the last tick, then check whether the `--find` smoke
         // dispatch is due.
@@ -1782,12 +1775,19 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // Refresh tab-strip render input. The host's tab list can
         // change underneath us (LoadHandler updates URL/title;
         // dispatched tab actions add/remove rows) so we resync every
-        // tick. The cost is a small alloc; the redraw is gated on
-        // diff via softbuffer's damage rect.
-        let prev_tabs = self.tab_strip.tabs.clone();
-        let prev_active = self.tab_strip.active;
-        self.refresh_tab_strip();
-        if prev_tabs != self.tab_strip.tabs || prev_active != self.tab_strip.active {
+        // tick. The redraw is gated on the returned diff; the tab
+        // summaries are handed to the favicon pump below so it
+        // doesn't re-query the engine a second time this tick.
+        let (tabs_changed, summaries) = self.refresh_tab_strip();
+        if tabs_changed {
+            self.request_redraw();
+        }
+
+        // Drain any decoded favicons from CEF and stash by browser id,
+        // applying cache hits and prefills. refresh_tab_strip picks
+        // them up on the next tab refresh.
+        if self.pump_favicon_updates(&summaries) {
+            self.mark_chrome_dirty();
             self.request_redraw();
         }
 

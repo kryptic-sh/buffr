@@ -67,6 +67,11 @@ and this project adheres to
 
 - The omnibar's bookmark search is now capped at 8 rows inside SQL instead of
   scanning the whole bookmarks table per keystroke (`search_limited`).
+- The per-tick (144 Hz) refresh no longer computes the tab list twice:
+  `refresh_tab_strip` returns its `tabs_changed` diff plus the summaries, and
+  the favicon pump consumes the same data instead of re-querying the engine —
+  one `tabs_summary()` + one HashSet per tick instead of two of each, and the
+  `prev_tabs` clone-diff is gone.
 
 ## [0.14.9] - 2026-08-03
 
