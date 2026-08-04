@@ -177,7 +177,7 @@ use buffr_permissions::Permissions;
 use buffr_ui::{
     CertState, ContextMenuEntry, ContextMenuOverlay, DOWNLOAD_NOTICE_HEIGHT, FindStatus,
     HintStatus as UiHintStatus, InputBar, Palette, PermissionsPrompt, STATUSLINE_HEIGHT,
-    Statusline, Suggestion, SuggestionKind, TabStrip, TabView,
+    Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
 mod cef_translate;
@@ -3598,6 +3598,28 @@ impl AppState {
         let chrome_dirty_effective =
             should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated);
         let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
+        // Which chrome rows actually reached the GPU: by default only the
+        // painted strip bands — the top band (tab strip + download notice,
+        // a fixed upper bound: when no notice is queued it re-uploads a few
+        // transparent rows, which is harmless) and the bottom band
+        // (statusline). The browser region between them is transparent and
+        // skipped, turning the full-texture upload into two thin strips.
+        // But when anything paints into the browser region this frame — the
+        // loading animation, a floating omnibar/prompt/context menu, or the
+        // animation→OSR transition that must clear the animation pixels —
+        // the whole buffer has to reach the GPU, so the top band covers the
+        // full logical height.
+        let chrome_middle_painted = want_anim
+            || anim_just_deactivated
+            || confirm_close_pinned.is_some()
+            || permissions_prompt.is_some()
+            || overlay_data.is_some()
+            || context_menu_overlay.is_some();
+        let (chrome_top_band_h, chrome_bottom_band_h) = if chrome_middle_painted {
+            (lheight, 0)
+        } else {
+            (TAB_STRIP_HEIGHT + DOWNLOAD_NOTICE_HEIGHT, STATUSLINE_HEIGHT)
+        };
         // Single chrome-strip painter shared by every `PaintPath` arm — the
         // arms differ only in what they hand the renderer as the OSR layer
         // (and, for `Animation`, in the splash blit layered on top).
@@ -3625,6 +3647,8 @@ impl AppState {
                 new_osr_generation = self.last_osr_generation;
                 renderer.frame(
                     chrome_dirty_effective,
+                    chrome_top_band_h,
+                    chrome_bottom_band_h,
                     |buf, w, h| {
                         paint_strips(buf, w);
                         // Paint the animation into the browser region so it is
@@ -3657,6 +3681,8 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
+                    chrome_top_band_h,
+                    chrome_bottom_band_h,
                     |buf, w, _h| paint_strips(buf, w),
                     Some(osr_upload),
                 )
@@ -3689,6 +3715,8 @@ impl AppState {
                 };
                 renderer.frame(
                     chrome_dirty_effective,
+                    chrome_top_band_h,
+                    chrome_bottom_band_h,
                     |buf, w, _h| paint_strips(buf, w),
                     Some(osr_upload),
                 )
@@ -3699,6 +3727,8 @@ impl AppState {
                 new_osr_generation = self.last_osr_generation;
                 renderer.frame(
                     chrome_dirty_effective,
+                    chrome_top_band_h,
+                    chrome_bottom_band_h,
                     |buf, w, _h| paint_strips(buf, w),
                     None,
                 )
@@ -5200,6 +5230,8 @@ impl AppState {
             };
             popup.renderer.frame(
                 chrome_dirty,
+                bar_h,
+                0,
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 Some(osr_upload),
             )
@@ -5226,6 +5258,8 @@ impl AppState {
             };
             popup.renderer.frame(
                 chrome_dirty,
+                bar_h,
+                0,
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 Some(osr_upload),
             )
@@ -5234,6 +5268,8 @@ impl AppState {
             new_gen = popup.last_osr_generation;
             popup.renderer.frame(
                 chrome_dirty,
+                bar_h,
+                0,
                 |buf, w, h| paint_popup_chrome(buf, w, h, &url, bar_h),
                 None,
             )

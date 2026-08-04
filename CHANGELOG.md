@@ -75,6 +75,10 @@ and this project adheres to
 - Synthetic (between-paints) OSR frames no longer memcpy the full pixel buffer
   on the UI thread: when the generation is unchanged the renderer uploads an
   empty buffer and the GPU worker's generation dedupe skips the texture write.
+- The chrome texture is now uploaded as two thin strip bands (top strips +
+  statusline) instead of the whole ~8.3 MB texture every dirty frame; when the
+  loading animation or a floating overlay paints into the browser region the
+  full buffer is uploaded as before.
 
 ## [0.14.9] - 2026-08-03
 

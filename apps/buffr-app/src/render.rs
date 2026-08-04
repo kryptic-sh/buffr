@@ -161,6 +161,12 @@ struct RenderCommand {
     /// Logical chrome dims at acquire time.
     chrome_lw: u32,
     chrome_lh: u32,
+    /// Rows of the chrome buffer that are actually painted and need a GPU
+    /// upload: the top band `0..chrome_top_band_h` and the bottom band
+    /// `chrome_lh - chrome_bottom_band_h..chrome_lh`. Rows between them
+    /// (the transparent browser region) are skipped by `write_chrome`.
+    chrome_top_band_h: u32,
+    chrome_bottom_band_h: u32,
     /// Owned chrome pixels. `Some` only when `chrome_dirty` was true;
     /// `None` means the worker reuses its existing chrome texture.
     chrome_pixels: Option<Vec<u32>>,
@@ -300,6 +306,42 @@ struct RenderState {
     surface_format: wgpu::TextureFormat,
 }
 
+/// One strip of the chrome texture to upload: its texture-space `origin_y`,
+/// its height in rows, and the byte offset into the tightly-packed pixel
+/// buffer (row-major `chrome_lw` u32s) where the band starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChromeBand {
+    origin_y: u32,
+    height: u32,
+    byte_offset: u64,
+}
+
+/// Split a chrome upload into the painted strip bands: the top band
+/// (`0..top_band_h`) and the bottom band (`chrome_lh - bottom_band_h..chrome_lh`).
+/// The bottom band is clamped so it never overlaps the top band, and each
+/// band is clamped to the texture height; a band of 0 rows (or an empty
+/// texture) yields `None`. The byte offsets assume 4 bytes per logical pixel.
+fn chrome_upload_bands(
+    chrome_lw: u32,
+    chrome_lh: u32,
+    top_band_h: u32,
+    bottom_band_h: u32,
+) -> (Option<ChromeBand>, Option<ChromeBand>) {
+    let top_h = top_band_h.min(chrome_lh);
+    let bottom_h = bottom_band_h.min(chrome_lh.saturating_sub(top_h));
+    let top = (top_h > 0).then_some(ChromeBand {
+        origin_y: 0,
+        height: top_h,
+        byte_offset: 0,
+    });
+    let bottom = (bottom_h > 0).then_some(ChromeBand {
+        origin_y: chrome_lh - bottom_h,
+        height: bottom_h,
+        byte_offset: 4 * u64::from(chrome_lw) * u64::from(chrome_lh - bottom_h),
+    });
+    (top, bottom)
+}
+
 impl RenderState {
     /// Reallocate chrome texture + bind group for new logical dims.
     /// Called when the worker sees dims that differ from its cached state.
@@ -318,28 +360,56 @@ impl RenderState {
         self.chrome_lh = chrome_lh;
     }
 
-    /// Write chrome pixels to the GPU texture.
-    fn write_chrome(&self, pixels: &[u32]) {
+    /// Write chrome pixels to the GPU texture, uploading only the painted
+    /// strip bands: rows `0..top_band_h` and rows
+    /// `chrome_lh - bottom_band_h..chrome_lh`. The rows between them (the
+    /// transparent browser region, where the OSR quad shows through) are
+    /// skipped, turning the largest per-frame PCIe transfer — a full
+    /// `chrome_lw × chrome_lh` texture — into two thin strip copies.
+    fn write_chrome(
+        &self,
+        pixels: &[u32],
+        chrome_lw: u32,
+        chrome_lh: u32,
+        top_band_h: u32,
+        bottom_band_h: u32,
+    ) {
         let bytes: &[u8] = bytemuck::cast_slice(pixels);
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.chrome_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * self.chrome_lw),
-                rows_per_image: Some(self.chrome_lh),
-            },
-            wgpu::Extent3d {
-                width: self.chrome_lw,
-                height: self.chrome_lh,
-                depth_or_array_layers: 1,
-            },
-        );
+        let (top, bottom) = chrome_upload_bands(chrome_lw, chrome_lh, top_band_h, bottom_band_h);
+
+        let write_band = |band: ChromeBand| {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.chrome_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: band.origin_y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: band.byte_offset,
+                    bytes_per_row: Some(4 * chrome_lw),
+                    rows_per_image: Some(band.height),
+                },
+                wgpu::Extent3d {
+                    width: chrome_lw,
+                    height: band.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+
+        if let Some(band) = top {
+            write_band(band);
+        }
+
+        if let Some(band) = bottom {
+            write_band(band);
+        }
     }
 
     /// Upload OSR pixels and update the OSR uniform (dst_rect → NDC).
@@ -415,7 +485,13 @@ fn render_worker(
 
         // Write chrome texture if the UI thread sent new pixels.
         if let Some(ref pixels) = cmd.chrome_pixels {
-            state.write_chrome(pixels);
+            state.write_chrome(
+                pixels,
+                cmd.chrome_lw,
+                cmd.chrome_lh,
+                cmd.chrome_top_band_h,
+                cmd.chrome_bottom_band_h,
+            );
         }
 
         // Write OSR texture if provided.
@@ -1008,6 +1084,14 @@ impl Renderer {
     /// - `chrome_dirty`: when true, `paint_chrome` is called and chrome
     ///   pixels are sent to the worker for GPU upload. When false, the
     ///   worker reuses its existing chrome texture.
+    /// - `chrome_top_band_h` / `chrome_bottom_band_h`: rows of the chrome
+    ///   buffer that `paint_chrome` painted and that must reach the GPU —
+    ///   the top band `0..chrome_top_band_h` and the bottom band
+    ///   `chrome_lh - chrome_bottom_band_h..chrome_lh`. Rows between them
+    ///   (the transparent browser region) are skipped, so the worker uploads
+    ///   two thin strips instead of the whole texture. Pass a top band of
+    ///   the full logical height (and 0 bottom) when anything painted into
+    ///   the browser region this frame.
     /// - `paint_chrome`: closure that paints the chrome strips into the
     ///   provided buffer (logical chrome size, row-major BGRA u32). Only
     ///   the chrome rows should write opaque pixels (`0xFF_RR_GG_BB`); the
@@ -1022,6 +1106,8 @@ impl Renderer {
     pub fn frame<F>(
         &mut self,
         chrome_dirty: bool,
+        chrome_top_band_h: u32,
+        chrome_bottom_band_h: u32,
         paint_chrome: F,
         osr: Option<OsrUpload<'_>>,
     ) -> Result<(FrameStats, Submitted)>
@@ -1192,6 +1278,8 @@ impl Renderer {
             height: self.height,
             chrome_lw: self.chrome_lw,
             chrome_lh: self.chrome_lh,
+            chrome_top_band_h,
+            chrome_bottom_band_h,
             chrome_pixels,
             osr: osr_owned,
         };
@@ -1558,5 +1646,92 @@ mod composite_alpha_tests {
             pick_composite_alpha(&[], true),
             wgpu::CompositeAlphaMode::Opaque
         );
+    }
+}
+
+#[cfg(test)]
+mod chrome_band_tests {
+    use super::{ChromeBand, chrome_upload_bands};
+
+    fn band(origin_y: u32, height: u32, byte_offset: u64) -> ChromeBand {
+        ChromeBand {
+            origin_y,
+            height,
+            byte_offset,
+        }
+    }
+
+    /// The default main-window bands: top = tab strip + download notice,
+    /// bottom = statusline. The middle (transparent browser region) is
+    /// not uploaded.
+    #[test]
+    fn strips_only_upload_skips_browser_region() {
+        let (top, bottom) = chrome_upload_bands(1280, 800, 62, 30);
+        assert_eq!(top, Some(band(0, 62, 0)));
+        assert_eq!(bottom, Some(band(770, 30, 4 * 1280 * 770)));
+        // The two bands cover 92 of 800 rows — the browser region rows
+        // between them never reach the GPU.
+        assert!(top.unwrap().height + bottom.unwrap().height < 800);
+    }
+
+    /// The caller passes a top band of the full height when anything painted
+    /// into the browser region; that degenerates into the old full upload.
+    #[test]
+    fn full_height_top_band_uploads_whole_texture() {
+        let (top, bottom) = chrome_upload_bands(1280, 800, 800, 0);
+        assert_eq!(top, Some(band(0, 800, 0)));
+        assert_eq!(bottom, None);
+    }
+
+    /// Overlapping bands: the bottom band is clamped down so it starts at
+    /// the end of the top band instead of double-writing shared rows. It
+    /// stays anchored to the texture bottom (`origin = lh - bottom_h`), so
+    /// with lh=50, top=40, bottom=30 the union is rows 0..40 ∪ 40..50 —
+    /// every row exactly once.
+    #[test]
+    fn overlapping_bands_clamp_bottom() {
+        let (top, bottom) = chrome_upload_bands(4, 50, 40, 30);
+        assert_eq!(top, Some(band(0, 40, 0)));
+        assert_eq!(bottom, Some(band(40, 10, 4 * 4 * 40)));
+        // Union covers every row exactly once.
+        assert_eq!(top.unwrap().height + bottom.unwrap().height, 50);
+    }
+
+    /// The bottom-band byte offset lands exactly at the end of the buffer:
+    /// the upload reads rows `chrome_lh - bottom_h..chrome_lh` and nothing
+    /// past them (wgpu validates this against the pixel slice length).
+    #[test]
+    fn bottom_band_offset_is_row_aligned_within_buffer() {
+        let (lw, lh, top_h, bottom_h) = (4u32, 10u32, 2u32, 3u32);
+        let (top, bottom) = chrome_upload_bands(lw, lh, top_h, bottom_h);
+        assert_eq!(top, Some(band(0, 2, 0)));
+        assert_eq!(bottom, Some(band(7, 3, 4 * 4 * 7)));
+        let end = bottom.unwrap().byte_offset + 4 * u64::from(lw) * u64::from(bottom_h);
+        assert_eq!(
+            end,
+            4 * u64::from(lw) * u64::from(lh),
+            "band must end at buffer end"
+        );
+    }
+
+    /// No painted rows at all → nothing uploaded.
+    #[test]
+    fn zero_bands_skip_upload() {
+        assert_eq!(chrome_upload_bands(1280, 800, 0, 0), (None, None));
+    }
+
+    /// A degenerate (zero-height) texture uploads nothing rather than
+    /// issuing a 0-extent write.
+    #[test]
+    fn empty_texture_skips_upload() {
+        assert_eq!(chrome_upload_bands(1280, 0, 62, 30), (None, None));
+    }
+
+    /// A top band taller than the texture is clamped to the texture height.
+    #[test]
+    fn oversized_top_band_clamps_to_texture() {
+        let (top, bottom) = chrome_upload_bands(1280, 800, 5000, 30);
+        assert_eq!(top, Some(band(0, 800, 0)));
+        assert_eq!(bottom, None);
     }
 }
