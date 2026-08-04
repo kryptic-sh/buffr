@@ -76,6 +76,38 @@ and this project adheres to
   seeded from the main view's scale at creation and kept in step by
   `set_device_scale`, so a popup on a HiDPI display is no longer laid out at 1×
   with doubled click offsets.
+- `buffr-src:` no longer fetches loopback / RFC1918 / cloud-metadata through
+  non-canonical host spellings (`2852039166`, `0177.0.0.1`, `::ffff:7f00:1`, …):
+  the private-network guard parses hosts strictly and fails closed on
+  numeric-shaped forms that glibc resolves to local addresses.
+- Copy Image (`<img>` context menu) now refuses loopback / private / link-local
+  hosts (a page can't fetch those itself, so buffr would be the proxy) and caps
+  response and `data:` payload sizes at 16 MiB.
+- Multi-word history search now ANDs its tokens instead of matching them as one
+  adjacent phrase — `"rust learn"` finds a row whose url and title contain both
+  words in any order or column, as documented.
+- A page can no longer grow the edit-mode event queue without bound: the sink
+  drops the oldest entry at a 1024 cap, and oversized payloads are rejected at
+  parse time.
+- A first OSR frame skipped because the render worker was busy is now
+  re-uploaded on the retry instead of leaving the previous tab's frame on
+  screen; a background tab's popup can no longer steal the tab's OSR paint
+  routing.
+- Popup windows opened from a background tab no longer report the previous,
+  aborted popup's URL in their address bar.
+- `view-source:` uses only already-installed syntax-grammar artifacts — a cold
+  cache no longer triggers a network clone + native compile from the render
+  path.
+- The Netscape bookmark importer no longer truncates URLs or mangles titles when
+  an attribute value contains a literal `>`.
+- The input bar's cursor and scroll position now follow real glyph advances, so
+  CJK text no longer leaves the cursor inside the glyph.
+- An empty keymap binding (`"" = "action"`) is now rejected instead of firing
+  its action for every abandoned key prefix.
+- `enter_mode("insert")` restores the mode you came from on Esc, like the
+  built-in Insert entry; swipe gestures no longer bleed between the main window
+  and popups; and the internal server survives transient `accept()` failures (fd
+  exhaustion) instead of taking `buffr://` pages down for the session.
 
 ### Performance
 
