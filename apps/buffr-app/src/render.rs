@@ -115,11 +115,18 @@ pub struct OsrUpload<'a> {
     pub generation: u64,
     /// Destination rect in window pixels: (x, y, w, h).
     pub dst_rect: (u32, u32, u32, u32),
+    /// Set by callers that re-send the previous generation (a synthetic
+    /// between-paints upload): the worker's generation dedupe means the
+    /// pixels are never read, so `frame()` skips the UI-thread memcpy and
+    /// uploads an empty buffer instead.
+    pub skip_pixels: bool,
 }
 
 /// Owned variant of `OsrUpload` — created inside `frame()` by cloning the
 /// pixel slice. The clone cost (~220 µs at 30 GB/s for a 6.6 MB buffer)
-/// is the price for moving the GPU work off the UI thread.
+/// is the price for moving the GPU work off the UI thread; when
+/// `skip_pixels` is set the clone is skipped entirely (empty buffer, since
+/// the worker dedupes on generation and never reads it).
 struct OsrUploadOwned {
     pixels: Vec<u8>,
     width: u32,
@@ -131,7 +138,11 @@ struct OsrUploadOwned {
 impl<'a> From<&OsrUpload<'a>> for OsrUploadOwned {
     fn from(u: &OsrUpload<'a>) -> Self {
         Self {
-            pixels: u.pixels.to_vec(),
+            pixels: if u.skip_pixels {
+                Vec::new()
+            } else {
+                u.pixels.to_vec()
+            },
             width: u.width,
             height: u.height,
             generation: u.generation,
@@ -227,7 +238,14 @@ impl OsrTexture {
             self.height = upload.height;
             self.last_generation = u64::MAX;
         }
-        if upload.generation != self.last_generation {
+        // Skip the write when the generation matches the GPU state, or when a
+        // `skip_pixels` frame (synthetic, unchanged generation) left the buffer
+        // empty. An empty buffer with a differing generation would be a wgpu
+        // validation error (0-length write against a non-zero extent); it is
+        // also unreachable by construction, but if it ever arrives the old
+        // texture is kept and the next real frame uploads (last_generation is
+        // only advanced on an actual upload).
+        if upload.generation != self.last_generation && !upload.pixels.is_empty() {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
@@ -1058,7 +1076,9 @@ impl Renderer {
 
         let t_chrome = t0.elapsed();
 
-        // Clone OSR pixels into an owned buffer.
+        // Clone OSR pixels into an owned buffer. When the caller re-sends the
+        // previous generation (`skip_pixels`) the clone is skipped entirely —
+        // the worker dedupes on generation and never reads the pixels.
         let osr_owned = osr.as_ref().map(OsrUploadOwned::from);
 
         let t_osr_clone = t0.elapsed();

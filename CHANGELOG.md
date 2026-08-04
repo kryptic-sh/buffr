@@ -72,6 +72,9 @@ and this project adheres to
   the favicon pump consumes the same data instead of re-querying the engine —
   one `tabs_summary()` + one HashSet per tick instead of two of each, and the
   `prev_tabs` clone-diff is gone.
+- Synthetic (between-paints) OSR frames no longer memcpy the full pixel buffer
+  on the UI thread: when the generation is unchanged the renderer uploads an
+  empty buffer and the GPU worker's generation dedupe skips the texture write.
 
 ## [0.14.9] - 2026-08-03
 

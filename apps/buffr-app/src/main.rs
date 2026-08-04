@@ -3653,6 +3653,7 @@ impl AppState {
                     height: osr_h,
                     generation: osr_gen,
                     dst_rect: (0, browser_y, browser_w, browser_h),
+                    skip_pixels: false,
                 };
                 renderer.frame(
                     chrome_dirty_effective,
@@ -3682,6 +3683,9 @@ impl AppState {
                     height: cached_h,
                     generation: self.last_osr_generation,
                     dst_rect: (0, browser_y, browser_w, browser_h),
+                    // Same generation as the GPU already holds: the worker
+                    // dedupes the upload, so skip the UI-thread memcpy.
+                    skip_pixels: true,
                 };
                 renderer.frame(
                     chrome_dirty_effective,
@@ -5192,6 +5196,7 @@ impl AppState {
                 height: osr_h,
                 generation: osr_gen,
                 dst_rect: osr_dst_rect,
+                skip_pixels: false,
             };
             popup.renderer.frame(
                 chrome_dirty,
@@ -5215,6 +5220,9 @@ impl AppState {
                 height: cached_h,
                 generation: popup.last_osr_generation,
                 dst_rect: osr_dst_rect,
+                // Same generation as the GPU already holds: the worker
+                // dedupes the upload, so skip the UI-thread memcpy.
+                skip_pixels: true,
             };
             popup.renderer.frame(
                 chrome_dirty,
