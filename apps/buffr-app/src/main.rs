@@ -4052,14 +4052,27 @@ impl AppState {
     /// `true`, which overlays the loading animation until the incoming
     /// tab's first `render_buffer` lands and passes `is_osr_frame_fresh`.
     ///
-    /// `last_osr_generation = 0` resets the freshness gate: after a tab
-    /// switch the new tab's first paint will always have a generation ≠ 0
-    /// (guaranteed by the generation counter monotonically incrementing),
-    /// so `is_osr_frame_fresh` accepts it even if the dimensions happen to
-    /// match whatever the previous tab last painted.
+    /// `last_osr_generation` is seeded from the newly-active tab's current
+    /// frame generation rather than reset to 0: a previously-visited tab's
+    /// already-consumed generation would otherwise compare as fresh and
+    /// re-present a stale frame. Seeding means everything already painted
+    /// reads as consumed, so only a strictly-new `on_paint` passes the
+    /// gate — keeping the double-swap guard intact and showing the loading
+    /// animation until the new tab actually paints.
     fn on_tab_switch(&mut self) {
         self.last_osr_dims = None;
-        self.last_osr_generation = 0;
+        // C6: don't reset the watermark to 0 — a previously-visited tab's
+        // already-consumed frame generation would then compare as fresh and
+        // re-present a stale frame. Seed it with the new tab's current frame
+        // generation so only a genuinely new on_paint (generation strictly
+        // greater) passes the gate.
+        self.last_osr_generation = self
+            .active_engine_dyn()
+            .and_then(|host| {
+                let frame = host.osr_frame();
+                frame.lock().ok().map(|frame| frame.generation)
+            })
+            .unwrap_or(0);
     }
 
     fn open_command_line(&mut self) {
