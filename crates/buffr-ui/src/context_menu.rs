@@ -68,8 +68,34 @@ pub struct ContextMenuOverlay {
 impl ContextMenuOverlay {
     /// Compute the pixel width required to display all entry labels.
     pub fn preferred_width(&self) -> u32 {
-        let label_w = self
-            .entries
+        Self::preferred_width_for(&self.entries)
+    }
+
+    /// Compute the pixel height of the entire panel.
+    pub fn preferred_height(&self) -> u32 {
+        Self::preferred_height_for(&self.entries)
+    }
+
+    /// Panel geometry for a menu built from `entries` at requested origin
+    /// `(x0, y0)` inside a `(buf_w, buf_h)` buffer. Shared by the owned
+    /// overlay's paint/hit-test and the cheap per-event hit-test below,
+    /// so the clamped rect can never drift between the two paths.
+    fn panel_rect_for(
+        entries: &[ContextMenuEntry],
+        x0: i32,
+        y0: i32,
+        buf_w: usize,
+        buf_h: usize,
+    ) -> (i32, i32, i32, i32) {
+        let panel_w = Self::preferred_width_for(entries) as i32;
+        let panel_h = Self::preferred_height_for(entries) as i32;
+        let px = x0.clamp(0, (buf_w as i32 - panel_w).max(0));
+        let py = y0.clamp(0, (buf_h as i32 - panel_h).max(0));
+        (px, py, panel_w, panel_h)
+    }
+
+    fn preferred_width_for(entries: &[ContextMenuEntry]) -> u32 {
+        let label_w = entries
             .iter()
             .filter(|e| !e.is_separator)
             .map(|e| font::text_width(&e.label))
@@ -78,10 +104,9 @@ impl ContextMenuOverlay {
         (label_w + 2 * CONTEXT_MENU_PADDING_X + 2).max(CONTEXT_MENU_MIN_WIDTH)
     }
 
-    /// Compute the pixel height of the entire panel.
-    pub fn preferred_height(&self) -> u32 {
+    fn preferred_height_for(entries: &[ContextMenuEntry]) -> u32 {
         let mut h: u32 = 2; // top + bottom border px
-        for e in &self.entries {
+        for e in entries {
             h += if e.is_separator {
                 CONTEXT_MENU_SEP_HEIGHT
             } else {
@@ -195,17 +220,29 @@ impl ContextMenuOverlay {
     /// `(buf_w, buf_h)`. Mirrors the clamp logic in [`Self::paint`] so
     /// callers can hit-test the same pixels that render.
     pub fn panel_rect(&self, buf_w: usize, buf_h: usize) -> (i32, i32, i32, i32) {
-        let panel_w = self.preferred_width() as i32;
-        let panel_h = self.preferred_height() as i32;
-        let px = self.x.clamp(0, (buf_w as i32 - panel_w).max(0));
-        let py = self.y.clamp(0, (buf_h as i32 - panel_h).max(0));
-        (px, py, panel_w, panel_h)
+        Self::panel_rect_for(&self.entries, self.x, self.y, buf_w, buf_h)
     }
 
     /// True if pixel `(x, y)` (in chrome-buffer coords) falls inside the
     /// clamped panel rect.
     pub fn contains(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> bool {
-        let (px, py, pw, ph) = self.panel_rect(buf_w, buf_h);
+        Self::contains_at(&self.entries, self.x, self.y, buf_w, buf_h, x, y)
+    }
+
+    /// Cheap panel test over a pre-built entry list, without owning the
+    /// entries. Same geometry as [`Self::contains`]; lets a caller
+    /// hit-test a cached menu on every mouse move without re-cloning the
+    /// labels.
+    pub fn contains_at(
+        entries: &[ContextMenuEntry],
+        x0: i32,
+        y0: i32,
+        buf_w: usize,
+        buf_h: usize,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let (px, py, pw, ph) = Self::panel_rect_for(entries, x0, y0, buf_w, buf_h);
         x >= px && x < px + pw && y >= py && y < py + ph
     }
 
@@ -216,22 +253,41 @@ impl ContextMenuOverlay {
     /// still want to highlight them on hover for visual continuity. Gate
     /// activation on the entry's `enabled` flag at the call site.
     pub fn row_at(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> Option<usize> {
-        if !self.contains(buf_w, buf_h, x, y) {
+        Self::hit_test(&self.entries, self.x, self.y, buf_w, buf_h, x, y)
+    }
+
+    /// Resolve pixel `(x, y)` to a row index for a menu built from a
+    /// pre-existing `entries` list at requested origin `(x0, y0)`, or
+    /// `None` if the hit lands on a separator, on the border, or outside
+    /// the panel. Same geometry as [`Self::row_at`] but takes the entries
+    /// by reference — lets a caller hit-test a cached entry list on every
+    /// mouse move without re-cloning the labels.
+    ///
+    /// **Disabled rows are returned by index**, not filtered out — callers
+    /// still want to highlight them on hover for visual continuity. Gate
+    /// activation on the entry's `enabled` flag at the call site.
+    pub fn hit_test(
+        entries: &[ContextMenuEntry],
+        x0: i32,
+        y0: i32,
+        buf_w: usize,
+        buf_h: usize,
+        x: i32,
+        y: i32,
+    ) -> Option<usize> {
+        let (px, py, pw, ph) = Self::panel_rect_for(entries, x0, y0, buf_w, buf_h);
+        if !(x >= px && x < px + pw && y >= py && y < py + ph) {
             return None;
         }
-        let (_px, py, _pw, _ph) = self.panel_rect(buf_w, buf_h);
         let mut row_y = py + 1; // skip top border pixel
-        for (idx, entry) in self.entries.iter().enumerate() {
+        for (idx, entry) in entries.iter().enumerate() {
             let row_h = if entry.is_separator {
                 CONTEXT_MENU_SEP_HEIGHT as i32
             } else {
                 CONTEXT_MENU_ROW_HEIGHT as i32
             };
             if y >= row_y && y < row_y + row_h {
-                if entry.is_separator {
-                    return None;
-                }
-                return Some(idx);
+                return if entry.is_separator { None } else { Some(idx) };
             }
             row_y += row_h;
         }
@@ -316,6 +372,57 @@ mod tests {
         let expected =
             2 + CONTEXT_MENU_ROW_HEIGHT + CONTEXT_MENU_SEP_HEIGHT + CONTEXT_MENU_ROW_HEIGHT;
         assert_eq!(m.preferred_height(), expected);
+    }
+
+    #[test]
+    fn static_hit_test_resolves_rows_without_owned_overlay() {
+        // The per-event hit-test path (cached entries, no overlay) must
+        // resolve the same rows as the owned overlay the renderer paints.
+        let entries = vec![
+            ContextMenuEntry {
+                label: "Back".into(),
+                is_separator: false,
+                enabled: true,
+            },
+            ContextMenuEntry {
+                label: "".into(),
+                is_separator: true,
+                enabled: false,
+            },
+            ContextMenuEntry {
+                label: "Reload".into(),
+                is_separator: false,
+                enabled: true,
+            },
+        ];
+        let (px, py, _, _) = ContextMenuOverlay::panel_rect_for(&entries, 50, 60, 800, 600);
+        // First row centre.
+        let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
+        assert_eq!(
+            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, px + 10, row0_y),
+            Some(0)
+        );
+        // Separator row centre — non-selectable.
+        let sep_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 + CONTEXT_MENU_SEP_HEIGHT as i32 / 2;
+        assert_eq!(
+            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, px + 10, sep_y),
+            None
+        );
+        // Third (Reload) row centre.
+        let row2_y = py
+            + 1
+            + CONTEXT_MENU_ROW_HEIGHT as i32
+            + CONTEXT_MENU_SEP_HEIGHT as i32
+            + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
+        assert_eq!(
+            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, px + 10, row2_y),
+            Some(2)
+        );
+        // Outside panel.
+        assert_eq!(
+            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, 0, 0),
+            None
+        );
     }
 
     #[test]

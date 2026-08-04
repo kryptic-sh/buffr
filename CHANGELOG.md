@@ -93,6 +93,12 @@ and this project adheres to
 - The two per-keystroke SQLite queries — history's FTS5 search and the bookmark
   search — now use `prepare_cached`, so SQLite re-parses and re-plans them once
   instead of on every omnibar keystroke.
+- Removed per-event allocations on the UI thread: the 250 ms URL poll reuses the
+  tick's tab-id list instead of building `TabSummary` structs, the splash JS
+  push skips its 3-lock URL read between period boundaries, the context menu
+  hit-tests cached entries instead of re-cloning every label per mouse move, and
+  the loading animation draws chars directly instead of allocating a String per
+  cell.
 
 ## [0.14.9] - 2026-08-03
 

@@ -149,7 +149,7 @@ pub fn paint(
         };
         let px = rx as i32 + cell.x as i32 * advance as i32;
         let py = ry as i32 + cell.y as i32 * gh as i32;
-        buffr_ui::font::draw_text(buf, buf_w, buf_h, px, py, &cell.ch.to_string(), color);
+        buffr_ui::font::draw_char(buf, buf_w, buf_h, px, py, cell.ch, color);
     }
 }
 

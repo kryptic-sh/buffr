@@ -618,13 +618,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let (abs_x, abs_y) =
                         physical_cursor_to_dip(position.0.x, position.0.y, 0, hover_scale);
                     if let Some(cm) = self.context_menu.as_ref() {
-                        let overlay = cm.to_overlay(lwidth, lheight);
-                        if overlay.contains(lwidth as usize, lheight as usize, abs_x, abs_y) {
+                        let lw = lwidth as usize;
+                        let lh = lheight as usize;
+                        // Hit-test the cached entries — no overlay rebuild
+                        // (label clones) per mouse move.
+                        if cm.contains(lw, lh, abs_x, abs_y) {
                             // set_cursor needs event_loop but we don't have it here;
                             // cursor reset is a best-effort cosmetic — skip in this path.
                             // TODO(wayr): pass event_loop down to pump_cursor_changes.
-                            if let Some(row) =
-                                overlay.row_at(lwidth as usize, lheight as usize, abs_x, abs_y)
+                            if let Some(row) = cm.hit_test(lw, lh, abs_x, abs_y)
                                 && let Some(cm_mut) = self.context_menu.as_mut()
                                 && cm_mut.selected != row
                             {
@@ -748,10 +750,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let cef_y_offset = self.cef_child_rect(win_w, win_h).1 as i32;
                     let (abs_x, abs_y) = physical_cursor_to_dip(px, py + cef_y_offset, 0, scale);
                     if let Some(cm) = self.context_menu.as_ref() {
-                        let overlay = cm.to_overlay(lwidth, lheight);
-                        if overlay.contains(lwidth as usize, lheight as usize, abs_x, abs_y) {
-                            match overlay.row_at(lwidth as usize, lheight as usize, abs_x, abs_y) {
-                                Some(row) if overlay.entries[row].enabled => {
+                        let lw = lwidth as usize;
+                        let lh = lheight as usize;
+                        if cm.contains(lw, lh, abs_x, abs_y) {
+                            match cm.hit_test(lw, lh, abs_x, abs_y) {
+                                Some(row) if cm.is_enabled(row) => {
                                     // Activate by clicking — same as Enter.
                                     let cm = self.context_menu.take().unwrap();
                                     let item = cm.request.items[row].clone();
@@ -1697,23 +1700,29 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // for the session dirty flag.
         // Collect the poll results outside the borrow so we can call
         // `mark_session_dirty` (which takes &mut self) afterwards.
-        let url_poll_result: Option<(String, Option<usize>, Vec<TabId>, f64)> = if let Some(host) =
-            self.active_engine_dyn()
-        {
-            let now = Instant::now();
-            if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
-                self.last_url_poll = now;
-                let live = host.active_tab_live_url();
-                let active_idx = host.active_index();
-                let current_ids: Vec<TabId> = host.tabs_summary().iter().map(|t| t.id).collect();
-                let zoom = host.active_zoom_level();
-                Some((live, active_idx, current_ids, zoom))
+        let url_poll_result: Option<(String, Option<usize>, Vec<TabId>, f64)> =
+            if let Some(host) = self.active_engine_dyn() {
+                let now = Instant::now();
+                if now.duration_since(self.last_url_poll) >= Duration::from_millis(250) {
+                    self.last_url_poll = now;
+                    let live = host.active_tab_live_url();
+                    let active_idx = host.active_index();
+                    // Tab-list snapshot: reuse the id list `refresh_tab_strip`
+                    // populated last tick instead of materialising N
+                    // `TabSummary` structs (each with String title/url) just
+                    // to read their ids. One tick stale is fine — the
+                    // comparison below is against `last_session_tab_ids`, so
+                    // a change is still detected (a tick later) and marks the
+                    // session dirty.
+                    let current_ids = self.tab_ids.clone();
+                    let zoom = host.active_zoom_level();
+                    Some((live, active_idx, current_ids, zoom))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
         if let Some((live, active_idx, current_ids, zoom)) = url_poll_result {
             if !live.is_empty() && live != self.statusline.url {
                 self.statusline.url = live.clone();

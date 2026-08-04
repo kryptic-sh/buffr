@@ -187,6 +187,22 @@ pub fn draw_text(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, s
     }
 }
 
+/// Draw a single glyph at `(x, y)`. No per-char string allocation —
+/// callers animating per-cell (the loading splash) pass the `char`
+/// directly. One cache lookup for TTF faces, matching [`draw_text`]'s
+/// per-glyph path.
+pub fn draw_char(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, c: char, fg: u32) {
+    match face() {
+        FontFace::Ttf(f) => {
+            let entry = glyph_entry(f, c);
+            draw_ttf_char_with_entry(f, buf, width, height, x, y, &entry, fg);
+        }
+        FontFace::Bitmap => {
+            draw_bitmap_char(buf, width, height, x, y, bitmap_glyph(c), fg);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_ttf_char_with_entry(
     f: &TtfFace,
@@ -492,5 +508,20 @@ mod tests {
             buf.iter().any(|&px| px != bg),
             "draw_text must write at least one non-background pixel"
         );
+    }
+
+    #[test]
+    fn draw_char_matches_draw_text_for_single_glyph() {
+        // The per-cell splash path must render exactly like drawing the
+        // same char through draw_text — identical pixels prove the
+        // allocation-free path didn't change the output.
+        let w = 80;
+        let h = 40;
+        let fg = 0xEE_EE_EE;
+        let mut via_char = vec![0u32; w * h];
+        let mut via_text = vec![0u32; w * h];
+        draw_char(&mut via_char, w, h, 5, 8, 'H', fg);
+        draw_text(&mut via_text, w, h, 5, 8, "H", fg);
+        assert_eq!(via_char, via_text);
     }
 }

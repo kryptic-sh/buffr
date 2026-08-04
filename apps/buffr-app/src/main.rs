@@ -5562,6 +5562,17 @@ impl AppState {
     /// animation without input. Clears state when the user navigates
     /// away from the new-tab page.
     fn tick_splash_js_push(&mut self) {
+        // Gate: when a push deadline is armed and hasn't elapsed yet, the
+        // splash frame can't have advanced — skip the URL read (3 locks)
+        // and the tick entirely until the next period boundary. `None`
+        // means "check": either the page is new-tab with no push armed,
+        // or we navigated away and this tick must notice and clear the
+        // stale state below.
+        if let Some(at) = self.splash_js_next_push
+            && at > Instant::now()
+        {
+            return;
+        }
         let Some(engine) = self.active_engine_dyn() else {
             return;
         };

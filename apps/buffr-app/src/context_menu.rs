@@ -81,6 +81,11 @@ pub(crate) fn build_context_menu_items_from_neutral(
 /// Esc, Enter, or click-outside.
 pub(crate) struct ActiveContextMenu {
     pub(crate) request: ContextMenuRequest,
+    /// Pre-resolved overlay entries (label Strings, separator and enabled
+    /// flags). Built once when the menu opens — the item list cannot
+    /// change while it is open — so per-event hit-testing reuses this
+    /// instead of re-cloning every label on each mouse move.
+    entries: Vec<ContextMenuEntry>,
     /// Index into `request.items` of the currently highlighted row.
     /// Always points at a non-separator item; updated by Up/Down.
     pub(crate) selected: usize,
@@ -94,7 +99,28 @@ impl ActiveContextMenu {
             .iter()
             .position(|i| !i.is_separator())
             .unwrap_or(0);
-        Self { request, selected }
+        let entries = Self::build_entries(&request);
+        Self {
+            request,
+            entries,
+            selected,
+        }
+    }
+
+    /// Resolve the overlay entries for a request. A pure function of the
+    /// request — see the [`Self::entries`] field doc for why it is
+    /// computed once.
+    fn build_entries(request: &ContextMenuRequest) -> Vec<ContextMenuEntry> {
+        request
+            .items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| ContextMenuEntry {
+                label: item.label().to_string(),
+                is_separator: item.is_separator(),
+                enabled: Self::item_enabled(&request.items, idx),
+            })
+            .collect()
     }
 
     /// Move selection up, skipping separators. No-op at the first item.
@@ -132,7 +158,11 @@ impl ActiveContextMenu {
     /// Whether the item at `idx` should accept activation. Mirrors the
     /// `enabled` derivation in [`Self::to_overlay`].
     pub(crate) fn is_enabled(&self, idx: usize) -> bool {
-        match self.request.items.get(idx) {
+        Self::item_enabled(&self.request.items, idx)
+    }
+
+    fn item_enabled(items: &[ContextMenuItem], idx: usize) -> bool {
+        match items.get(idx) {
             Some(ContextMenuItem::HistoryBack { enabled }) => *enabled,
             Some(ContextMenuItem::HistoryForward { enabled }) => *enabled,
             Some(ContextMenuItem::TabCloseOthers { enabled }) => *enabled,
@@ -143,19 +173,12 @@ impl ActiveContextMenu {
     }
 
     /// Build the `ContextMenuOverlay` snapshot for the renderer.
+    ///
+    /// Called once per paint. Per-event hit-testing uses
+    /// [`Self::contains`] / [`Self::hit_test`] on the cached entries
+    /// instead, so the label Strings are not re-cloned on every mouse
+    /// move.
     pub(crate) fn to_overlay(&self, _win_w: u32, win_h: u32) -> ContextMenuOverlay {
-        let entries: Vec<ContextMenuEntry> = self
-            .request
-            .items
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| ContextMenuEntry {
-                label: item.label().to_string(),
-                is_separator: item.is_separator(),
-                enabled: self.is_enabled(idx),
-            })
-            .collect();
-
         // Convert CEF click coords (browser-local pixels) to chrome buffer
         // coords. CEF OSR pixel space == logical window pixels on 1× HiDPI;
         // at 2× CEF sends doubled values. We use the raw coords and clamp
@@ -164,11 +187,42 @@ impl ActiveContextMenu {
         let y = self.request.y.clamp(0, win_h as i32);
 
         ContextMenuOverlay {
-            entries,
+            entries: self.entries.clone(),
             selected: self.selected,
             x,
             y,
         }
+    }
+
+    /// Whether pixel `(x, y)` (logical chrome-buffer coords) falls inside
+    /// the open menu's clamped panel. Cheap: reuses the cached entries,
+    /// no overlay / label clones.
+    pub(crate) fn contains(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> bool {
+        ContextMenuOverlay::contains_at(
+            &self.entries,
+            self.request.x,
+            self.request.y,
+            buf_w,
+            buf_h,
+            x,
+            y,
+        )
+    }
+
+    /// Resolve pixel `(x, y)` to a row index in the open menu, or `None`
+    /// for separators, the border, or outside the panel. Same geometry as
+    /// the overlay the renderer paints; reuses the cached entries so a
+    /// mouse move costs no String allocations.
+    pub(crate) fn hit_test(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> Option<usize> {
+        ContextMenuOverlay::hit_test(
+            &self.entries,
+            self.request.x,
+            self.request.y,
+            buf_w,
+            buf_h,
+            x,
+            y,
+        )
     }
 }
 
