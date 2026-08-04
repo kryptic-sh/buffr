@@ -1167,6 +1167,11 @@ impl BrowserHost {
             host.was_resized();
         }
         self.set_active_index(final_idx);
+        // C7: a restored tab can sit outside the pinned block (its saved index
+        // predates later pin changes), breaking the pinned-first invariant the
+        // tab-strip hit-testing relies on. Re-partition like toggle_pin_active /
+        // set_pinned; active follows the restored tab by id.
+        self.enforce_pinned_ordering();
         Ok(Some(id))
     }
 
