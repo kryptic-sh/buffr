@@ -3850,6 +3850,19 @@ impl AppState {
             && !SMOKE_TEST_SAW_REDRAW.swap(true, Ordering::SeqCst)
         {
             tracing::info!("smoke-test: first paint completed; exiting 0");
+            // Smoke exits mid-frame with CEF and the wgpu worker thread
+            // still alive. std::process::exit runs atexit + static
+            // destructors, which raced the worker's present() and
+            // segfaulted at exit; the shutdown path skips them for the
+            // same reason (see "shutdown:" below). Flush stderr so the
+            // "exiting 0" line above isn't lost, then _exit.
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(0)
+            };
+            #[cfg(not(unix))]
             std::process::exit(0);
         }
 
