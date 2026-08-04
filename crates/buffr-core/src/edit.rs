@@ -70,6 +70,8 @@ pub enum ParseError {
     Json(#[from] serde_json::Error),
     #[error("unknown event type: {0:?}")]
     UnknownType(String),
+    #[error("edit payload too large: {0}")]
+    PayloadTooLarge(&'static str),
 }
 
 /// Coarse classification of the focused field. Drives Stage 2's DOM
@@ -168,6 +170,19 @@ struct TypeTag {
     kind: String,
 }
 
+// ---- payload size limits -------------------------------------------------
+//
+// The page nonce is readable by the page itself, so a hostile top frame can
+// emit authentic edit lines of arbitrary size (sentinel-prefixed lines also
+// bypass the `CONSOLE_LOG_MAX_LEN` redaction in the display handler). Cap
+// each field so a single event can't be attacker-sized (A4).
+
+/// Maximum byte length of a `field_id` in an edit-event payload.
+pub const EDIT_FIELD_ID_MAX_LEN: usize = 512;
+
+/// Maximum byte length of a `value` in an edit-event payload.
+pub const EDIT_VALUE_MAX_LEN: usize = 256 * 1024;
+
 /// Try to parse a console message line as an edit-mode event.
 ///
 /// `nonce` is the page nonce currently minted for the emitting browser
@@ -201,6 +216,12 @@ pub fn parse_payload(json: &str) -> Result<EditConsoleEvent, ParseError> {
     let event = match tag.kind.as_str() {
         "focus" => {
             let r: RawFocus = serde_json::from_str(json)?;
+            if r.field_id.len() > EDIT_FIELD_ID_MAX_LEN {
+                return Err(ParseError::PayloadTooLarge("field_id"));
+            }
+            if r.value.len() > EDIT_VALUE_MAX_LEN {
+                return Err(ParseError::PayloadTooLarge("value"));
+            }
             EditConsoleEvent::Focus {
                 field_id: r.field_id,
                 kind: r.kind,
@@ -211,12 +232,21 @@ pub fn parse_payload(json: &str) -> Result<EditConsoleEvent, ParseError> {
         }
         "blur" => {
             let r: RawBlur = serde_json::from_str(json)?;
+            if r.field_id.len() > EDIT_FIELD_ID_MAX_LEN {
+                return Err(ParseError::PayloadTooLarge("field_id"));
+            }
             EditConsoleEvent::Blur {
                 field_id: r.field_id,
             }
         }
         "mutate" => {
             let r: RawMutate = serde_json::from_str(json)?;
+            if r.field_id.len() > EDIT_FIELD_ID_MAX_LEN {
+                return Err(ParseError::PayloadTooLarge("field_id"));
+            }
+            if r.value.len() > EDIT_VALUE_MAX_LEN {
+                return Err(ParseError::PayloadTooLarge("value"));
+            }
             EditConsoleEvent::Mutate {
                 field_id: r.field_id,
                 value: r.value,
@@ -224,6 +254,9 @@ pub fn parse_payload(json: &str) -> Result<EditConsoleEvent, ParseError> {
         }
         "selection" => {
             let r: RawSelection = serde_json::from_str(json)?;
+            if r.value.len() > EDIT_VALUE_MAX_LEN {
+                return Err(ParseError::PayloadTooLarge("value"));
+            }
             EditConsoleEvent::Selection { value: r.value }
         }
         other => {
@@ -254,6 +287,28 @@ pub fn drain_edit_events(sink: &EditEventSink) -> Vec<EditConsoleEvent> {
     sink.lock()
         .map(|mut g| g.drain(..).collect())
         .unwrap_or_default()
+}
+
+/// Maximum number of [`EditConsoleEvent`]s held in the sink at once.
+///
+/// The producer is the CEF/WebKit callback thread and the drain runs on
+/// the UI tick, which parks while the window is occluded. A hostile top
+/// frame can emit events as fast as it likes (the page nonce is readable
+/// by the page itself), so an unbounded queue would grow without limit
+/// while the drain is stalled. Drop the oldest so the UI always sees the
+/// most recent events (A4).
+pub const EDIT_EVENT_SINK_CAP: usize = 1024;
+
+/// Push one event onto the sink, dropping the oldest when the queue is at
+/// capacity. Mirrors the context-menu sink's drop-oldest policy
+/// (`CONTEXT_MENU_REQUEST_QUEUE_CAP`).
+pub fn push_edit_event(sink: &EditEventSink, event: EditConsoleEvent) {
+    if let Ok(mut guard) = sink.lock() {
+        if guard.len() >= EDIT_EVENT_SINK_CAP {
+            guard.pop_front();
+        }
+        guard.push_back(event);
+    }
 }
 
 /// Build the JS string that `frame.execute_java_script` will execute.
@@ -559,5 +614,66 @@ mod tests {
     fn new_sink_is_empty() {
         let sink = new_edit_event_sink();
         assert!(drain_edit_events(&sink).is_empty());
+    }
+
+    #[test]
+    fn push_edit_event_drops_oldest_at_cap() {
+        let sink = new_edit_event_sink();
+        for i in 0..(EDIT_EVENT_SINK_CAP + 5) {
+            push_edit_event(
+                &sink,
+                EditConsoleEvent::Blur {
+                    field_id: format!("f{i}"),
+                },
+            );
+            // The queue must never exceed the cap at any point.
+            let len = sink.lock().unwrap().len();
+            assert!(
+                len <= EDIT_EVENT_SINK_CAP,
+                "queue exceeded cap after push {i}: len {len}"
+            );
+        }
+        let drained = drain_edit_events(&sink);
+        assert_eq!(drained.len(), EDIT_EVENT_SINK_CAP);
+        // The oldest 5 were dropped; the first survivor is the 6th pushed.
+        assert!(
+            matches!(&drained[0], EditConsoleEvent::Blur { field_id } if field_id == "f5"),
+            "expected the 6th-pushed event first, got {:?}",
+            drained[0]
+        );
+        assert!(
+            matches!(&drained[EDIT_EVENT_SINK_CAP - 1], EditConsoleEvent::Blur { field_id } if field_id == &format!("f{}", EDIT_EVENT_SINK_CAP + 4)),
+            "expected the last-pushed event last"
+        );
+    }
+
+    #[test]
+    fn parse_payload_rejects_oversized_field_id_and_value() {
+        // Oversized field_id on a focus payload → hard error, event dropped.
+        let big_id = "x".repeat(EDIT_FIELD_ID_MAX_LEN + 1);
+        let payload = format!(
+            r#"{{"type":"focus","field_id":"{big_id}","kind":"input","value":"v","selection_start":null,"selection_end":null}}"#
+        );
+        match parse_payload(&payload) {
+            Err(ParseError::PayloadTooLarge(what)) => assert_eq!(what, "field_id"),
+            other => panic!("expected PayloadTooLarge(field_id), got {other:?}"),
+        }
+
+        // Oversized value on a focus payload → hard error, event dropped.
+        let big_value = "y".repeat(EDIT_VALUE_MAX_LEN + 1);
+        let payload = format!(
+            r#"{{"type":"focus","field_id":"f","kind":"input","value":"{big_value}","selection_start":null,"selection_end":null}}"#
+        );
+        match parse_payload(&payload) {
+            Err(ParseError::PayloadTooLarge(what)) => assert_eq!(what, "value"),
+            other => panic!("expected PayloadTooLarge(value), got {other:?}"),
+        }
+
+        // A normal payload still parses.
+        let ok = parse_payload(
+            r#"{"type":"focus","field_id":"f","kind":"input","value":"hello","selection_start":0,"selection_end":0}"#,
+        )
+        .expect("normal payload must still parse");
+        assert!(matches!(ok, EditConsoleEvent::Focus { .. }));
     }
 }

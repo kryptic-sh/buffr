@@ -1347,9 +1347,8 @@ unsafe extern "C" fn on_edit_script_message(
         Some(Ok(event)) => {
             if let Ok(guard) = ctx.edit_sink.lock()
                 && let Some(sink) = guard.as_ref()
-                && let Ok(mut q) = sink.lock()
             {
-                q.push_back(event);
+                buffr_core::edit::push_edit_event(sink, event);
             }
         }
         Some(Err(e)) => {
