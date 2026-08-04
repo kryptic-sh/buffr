@@ -431,6 +431,363 @@ none of it is recoverable from `git log`.
 
 ---
 
+## 10. Code audit, 2026-08-04 — open findings
+
+A full-codebase correctness + security + perf pass (7 parallel read-only
+auditors, every finding re-verified by re-reading the cited location and tracing
+the failure scenario; the M13 claim was additionally confirmed empirically
+against glibc). Ranked most-severe first.
+
+### A1 HIGH — `buffr-src:` private-network guard bypass via non-canonical IPv4 encodings
+
+**Where:** `is_non_public_v4` / `is_non_public_host` in
+`crates/buffr-cef/src/view_source_scheme.rs` (207–265); `validate_target`
+(142–162) returns `Ok` for any host the guard fails to classify, with no
+initiator check.
+
+The guard only recognizes canonical dotted-quad **decimal** IPv4 and rejects
+(`return false`) anything else — so integer, octal, hex and short forms that
+glibc's `getaddrinfo` resolves to loopback / RFC1918 / link-local are treated as
+"public" and fetched from the browser process by `ureq`. Confirmed on this
+machine's glibc: `2852039166` → `169.254.169.254` (cloud metadata), `0177.0.0.1`
+→ `127.0.0.1` (octal loopback), `0x7f.0.0.1` → `127.0.0.1`, `2130706433` →
+`127.0.0.1`, `127.1` → `127.0.0.1`, `::ffff:7f00:1` → `127.0.0.1` (the
+IPv4-mapped branch requires a `.` in the last component, so this one also falls
+through). `fetch_and_render` does not re-apply the rule.
+
+```
+Repro: buffr-src:http://2852039166/latest/meta-data/ from a public page
+Expect: refused — 169.254.169.254 is non-public and the initiator differs
+Actual: ureq fetches the cloud-metadata endpoint and renders the body
+```
+
+Fix: parse the host with `Ipv4Addr::from_str`/`Ipv6Addr::from_str` (strict, no
+octal/hex/integer forms), reject any octet with a leading `0`, re-check
+`is_ipv4_mapped()` against the same rule, and treat numeric-looking hosts that
+fail the strict parse as non-public.
+
+### A2 MEDIUM — a first OSR frame skipped while the wgpu worker is busy is lost; the retry presents the previous tab's frame
+
+**Where:** `apps/buffr-app/src/main.rs` (3757–3790 SyntheticScratch, 3805–3814
+watermark advance, 3901–3906 retry schedule); `apps/buffr-app/src/render.rs`
+(141–145, 254, 1171–1176).
+
+A FreshOsr frame (gen G) whose `renderer.frame` returns `Submitted::No` (worker
+still presenting the previous frame) never reaches the GPU, but the watermark
+advances to G anyway. The +8 ms retry then takes SyntheticScratch, which always
+sets `skip_pixels: true` → the worker receives **empty** pixels, and
+`maybe_upload` refuses (`!pixels.is_empty()` fails) while leaving its own
+`last_generation` at G−1. The comment at 3805–3813 claims "the skipped pixels
+are not lost… the retry below re-uploads them" — the opposite of what the code
+does.
+
+```
+Repro: tab switch where the new tab's first on_paint lands while the worker
+       is presenting; static page that paints once
+Expect: new tab's first frame presented (animation already deactivated)
+Actual: previous tab's frame stays on screen until the new tab next paints
+```
+
+Fix: the retry must be able to upload — drop `skip_pixels` on the retry (upload
+whenever the watermark advanced past the GPU's generation), or track a separate
+"generation actually on the GPU" and only skip when it matches.
+
+### A3 MEDIUM — OSR `main_id` can be claimed by a popup, misrouting the main browser's paints forever
+
+**Where:** `OsrPaintHandler::resolve_frame_view` in
+`crates/buffr-cef/src/osr.rs` (341–348; the same lazy `main == -1` claim pattern
+is in `resolve_scale` and `resolve_dims`); the handler is built with
+`main_id = -1` in `crates/buffr-cef/src/host.rs` (1309–1314) and never
+re-validated.
+
+The handler treats the **first callback of any kind** as the main browser. A
+background tab (hidden via `was_hidden(1)`, host.rs:1391–1393) never paints; if
+its page opens a popup first (allow-popups iframe), the popup's first `OnPaint`
+shares the tab's client and stores `main_id = popup_id`. From then on the
+popup's paints write into the main frame buffer, and the main tab's own paints
+hit `resolve_frame_view(main_id)` → popup-map miss → `None` → dropped. `main_id`
+is only ever written when `== -1`, so the main tab stays blank for its lifetime.
+
+```
+Repro: background tab A whose page window.open()s before A is ever shown
+Expect: A's paints route to A's frame; popup paints via popup_frames
+Actual: main_id = popup_id; A's paints dropped forever, popup renders into A's buffer
+```
+
+Fix: set `main_id` eagerly from the identifier returned by
+`browser_host_create_browser_sync`, or never let an id present in `popup_frames`
+claim it.
+
+### A4 MEDIUM — `EditEventSink` is an unbounded queue fed by any top-frame page
+
+**Where:** `crates/buffr-core/src/edit.rs` (241–257); push sites
+`crates/buffr-cef/src/handlers.rs` (~1106) and
+`crates/buffr-webkit/src/platform/runtime.rs` (~1352).
+
+The sink has no capacity bound and every accepted `__buffr_edit__` line is
+appended unconditionally from the CEF callback thread; the drain runs on the UI
+tick, which parks when the window is minimized/occluded. Sentinel-prefixed
+console lines bypass the 120-byte `CONSOLE_LOG_MAX_LEN` redaction
+(handlers.rs:94, 127–130), so a hostile top frame (nonce is readable by the page
+— accepted threat model, but _unbounded accumulation_ is a separate property)
+can grow the queue without limit while the drain is parked.
+
+```
+Repro: page emits 10k forged __buffr_edit__ lines/s; window minimized
+Expect: bounded memory
+Actual: queue grows for as long as the page emits (RSS climbs until OOM or tab close)
+```
+
+Fix: drop-oldest at a cap (mirror `CONTEXT_MENU_REQUEST_QUEUE_CAP`), and/or cap
+`value`/`field_id` length at parse time.
+
+### A5 MEDIUM — history multi-word search is a single FTS5 phrase, not the documented implicit AND
+
+**Where:** `crates/buffr-history/src/lib.rs` (326–353, 368–369).
+
+The doc promises "`rust learn` uses FTS5 implicit AND across both `url` and
+`title`", but the needle wraps the whole query in one quoted phrase
+(`"\"{}\""`), which FTS5 matches only as adjacent, in-order tokens within a
+single column. Verified against an identical `fts5(url, title)` table:
+`"rust learn"` → 0 rows for a row with `url=https://rust-lang.org/learn`,
+`title=Learn Rust`; `"learn rust"` → 1 row. Reachable from the omnibar
+(main.rs:4254) and `buffr query history`.
+
+```
+Repro: History::search("rust learn") on a row whose url+title contain both words
+Expect: 1 row (documented AND semantics)
+Actual: 0 rows; "learn rust" returns 1 — order- and column-sensitive
+```
+
+Fix: build the MATCH value as per-token AND of quoted phrases
+(`"rust" AND "learn"`), keeping the `""` escaping per token; or fix the docs.
+
+### A6 MEDIUM — view-source triggers a network clone + native compile + dlopen on a cold grammar cache
+
+**Where:** `crates/buffr-view-source/src/lib.rs` (92–106); `hjkl-bonsai-0.41.0`
+`GrammarLoader::load` (loader.rs:117–139, "on a cache miss this clones the
+upstream repo over the network and compiles its C/C++ with the system compiler …
+subsequently `dlopen`ed and run in-process").
+
+The embedded registry ships only a manifest — no grammar `.so`s. On a fresh
+profile, the first `view-source:` of a highlightable language runs inside
+`render()` on the fetch worker: git clone + C compile (minutes, or a hang on a
+slow network) then `dlopen` + in-process execution. The grammar name comes from
+the fixed embedded registry, so the code is a pinned upstream repo rather than
+attacker-chosen — but it is unvetted network I/O + native execution triggered by
+a page render, and every distinct language costs one full clone+compile.
+
+```
+Repro: fresh profile, view-source:https://example.com/main.rs
+Expect: render highlights from installed artifacts, or falls back to <pre>
+Actual: blocks for a git clone + C compile of tree-sitter-rust, then dlopens it
+```
+
+Fix: use `GrammarLoader::lookup_only` + `Grammar::load_from_path` (installed
+artifacts only), fall back to plain `<pre>` when absent.
+
+### A7 MEDIUM — an empty keymap binding `"" = "action"` installs the action at the trie root
+
+**Where:** `crates/buffr-modal/src/keymap.rs` (345–351, 378–383);
+`crates/buffr-config/src/lib.rs` (837–851).
+
+`parse_keys("")` returns `Ok(vec![])` (pinned by the `empty_input` test), so
+validation accepts it and `bind_chords(&[], action)` writes the action to the
+root node. `resolve_timeout` seeds `last_action` from the root action, so every
+abandoned prefix (a lone `g`, `gT` partial…) fires the root action after the
+timeout instead of being dropped.
+
+```
+Repro: [keymap.normal] "" = "reload"; press g, wait past the timeout
+Expect: prefix dropped, nothing fired (default behavior)
+Actual: Reload fires; feed(g) returned Ambiguous, not Pending
+```
+
+Fix: reject empty keys in `validate`, or have `bind_chords`/`bind` error on an
+empty chord slice instead of writing to the root.
+
+### A8 LOW — internal-server accept loop dies permanently on a transient error
+
+**Where:** `crates/buffr-engine/src/internal_server.rs` (322–329).
+
+Only `WouldBlock` and `Interrupted` continue the loop; any other `accept()`
+error — `EMFILE` (transient fd exhaustion) or `ECONNABORTED` (connection reset
+before accept, common on Linux under churn) — `break`s out, so the internal
+server (`buffr://new` / `buffr://settings`) is dead for the rest of the process
+lifetime with no retry.
+
+```
+Repro: process briefly hits the fd limit; a client connects during it
+Expect: warn, sleep, continue serving
+Actual: accept thread exits; internal pages dead until restart
+```
+
+Fix: for `EMFILE`/`ECONNABORTED`-class errors, log + sleep + `continue`; reserve
+`break` for genuinely fatal conditions.
+
+### A9 LOW — Copy Image fetches attacker-chosen URLs with no scheme/host allowlist
+
+**Where:** `crates/buffr-core/src/image_copy.rs` (75–94, 98–110).
+
+The URL comes from the page (`request.source_url`); `fetch_image_bytes` issues
+`ureq` GETs from the browser process for any `http(s)` URL — including loopback,
+link-local and LAN — following redirects, and reads the body to EOF with only a
+15 s timeout (unbounded memory while the read lasts). The page can't read the
+response (it lands in the clipboard), so no data exfiltration — the realistic
+impact is unauthenticated state-changing GETs against internal services plus
+transient memory pressure.
+
+```
+Repro: <img src="http://attacker.test/img.png"> that 302s to http://127.0.0.1:8080/admin/action; Copy Image
+Expect: nothing fetched off the page's origin except the image itself
+Actual: buffr issues the GET to 127.0.0.1:8080
+```
+
+Fix: reject loopback/private hosts (or require same-origin), cap the response
+and `data:` payload sizes.
+
+### A10 LOW — input-bar cursor and scroll viewport use a fixed monospace advance while glyphs draw at real advances
+
+**Where:** `crates/buffr-ui/src/input_bar.rs` (354–356, 382–394);
+`crates/buffr-ui/src/font.rs` (135–150).
+
+`cursor_px = cursor_offset * (glyph_w() + 1)` and
+`chars_visible = inner_w / (glyph_w()+1)` assume every glyph is one cell, but
+`draw_text` advances each glyph by its real advance and the crate's own docs
+state CJK glyphs report ~2× `glyph_w`. With a wide-glyph face the cursor bar
+lands inside the glyph and the scroll window over-counts visible chars.
+
+```
+Repro: omnibar buffer "漢", cursor at end
+Expect: cursor bar at the glyph's right edge
+Actual: cursor drawn ≈glyph_w px short of the text end, overlapping the glyph
+```
+
+Fix: sum `font::char_width` over the visible slice instead of
+`cursor_offset * glyph_advance`.
+
+### A11 LOW — `enter_mode("insert")` enters Insert without setting `return_mode`
+
+**Where:** `crates/buffr-modal/src/engine.rs` (299–309, 273–277).
+
+`apply_implicit_mode` sets `return_mode = self.mode` only on the built-in
+`EnterInsertMode` arm; the `EnterMode(m)` arm (reached by the config action
+`enter_mode("insert")`) does not, yet `feed_edit_mode_key`'s Esc restores
+`return_mode`. Esc after a config-bound insert entry returns to Normal instead
+of the pre-insert mode.
+
+```
+Repro: [keymap.visual] "<F2>" = "enter_mode(\"insert\")"; v, F2, Esc
+Expect: back in Visual
+Actual: back in Normal
+```
+
+Fix: set `return_mode` in the `EnterMode(Insert)` arm too.
+
+### A12 LOW — a stale pending-popup alloc is consumed by a later popup, showing the wrong URL
+
+**Where:** `crates/buffr-cef/src/handlers.rs` (353–377).
+
+`on_before_popup` pushes an alloc (return 0) that is only removed by a later
+`on_after_created`. If CEF aborts the popup's creation (source browser torn down
+mid-creation), the stale entry stays in the FIFO and the next real popup pops it
+— `PopupCreated.url` (and the window's URL/title) report the previous, aborted
+popup's URL. Frame/view are fresh defaults, so only the reported URL is wrong.
+
+```
+Repro: window.open(A) → alloc pushed, creation aborted; window.open(B)
+Expect: popup B reports B's URL
+Actual: PopupCreated.url = A's URL
+```
+
+Fix: expire allocs on a timer, or key by something `on_after_created` can match.
+
+### A13 LOW — Netscape importer truncates URLs/titles containing `>` inside quoted attributes
+
+**Where:** `crates/buffr-bookmarks/src/lib.rs` (392–416).
+
+`<A\s+([^>]*)>` cannot cross a `>` even inside a double-quoted value, so a raw
+`>` in an HREF splits the anchor mid-attribute: the stored URL is truncated and
+the title mangled. Real browser exports escape `>` as `&gt;` (handled), but a
+hand-authored or third-party file — the fuzzed, attacker-controlled surface —
+silently corrupts one entry per occurrence.
+
+```
+Repro: import_netscape(r#"<A HREF="https://x/?a=1>2&b=3">label</A>"#)
+Expect: url = https://x/?a=1>2&b=3, title = label
+Actual: url = https://x/?a=1, title = "2&b=3">label"
+```
+
+Fix: match the open tag as `<A\s+((?:[^>"]|"[^"]*")*)>` (ditto `<H3[^>]*>`).
+
+### A14 LOW — one shared `SwipeDetector` is fed by both the main window and every popup
+
+**Where:** `apps/buffr-app/src/event_loop.rs` (1019–1041, main-window Scroll);
+`apps/buffr-app/src/main.rs` (5567–5576, popup Scroll); state `main.rs:1755`.
+
+Both arms call `AppState::detect_swipe` on the single `self.swipe` accumulator
+with no per-surface key. A main-window half-swipe followed by a popup scroll
+within the 200 ms gap combines into a commit that fires history navigation on
+the popup; a committed main-window swipe swallows the popup's scrolls.
+
+```
+Repro: half-swipe in the main window, then scroll a popup within 200 ms
+Expect: popup scrolls its page
+Actual: history navigation (or swallowed scrolls)
+```
+
+Fix: key the detector by `SurfaceId`, or reset it per surface.
+
+---
+
+## 11. Audit cleared + hardening, 2026-08-04
+
+Things suspected during the same pass and disproved by tracing (worth recording
+so they are not re-reported):
+
+- **Script injection via `build_inject_script` / `build_poll_script`** — every
+  interpolation is `serde_json`-escaped, splices land inside single-quoted JS
+  literals, and `execute_java_script` feeds V8 directly (no HTML parser, so
+  `</script>` is inert). Nonce separator/anchor handling is fail-closed and
+  covered by tests.
+- **SQL injection** — every query in the stores is parameterized; the FTS needle
+  is a bound MATCH value; the bookmarks LIKE pattern is escaped with
+  `ESCAPE '\'`. The netscape importer has no panic path on hostile input (byte
+  offsets always char-aligned, regex is linear-time).
+- **view-source XSS** — all interpolated text (body, spans, title) goes through
+  `html_escape`; the only unescaped values are class names compiled from the
+  bundled trusted query files.
+- **Lock ordering** — no `tabs`+`active` inversion anywhere (M15 held); paint
+  path takes only the per-host `osr_frame` mutex for the swap.
+- **The double-swap guard / scratch-buffer length invariant** — watermark
+  advances even on skipped frames; `last_osr_dims` is only written from
+  gate-accepted frames, so `osr_scratch.len()` always matches.
+- **`parse_console_event` panic paths** — bounds-checked prefixes, `serde_json`
+  errors on hostile input; UTF-8 handled via char APIs, never byte slicing.
+- **Context-menu / neutral-type mapping** — dead arm (`has_image_contents`
+  without `media_type`) is unreachable from the only producer.
+
+Hardening (correct today, fragile):
+
+- `popup_close` uses `close_browser(0)` (host.rs:818) — a `beforeunload` handler
+  on a popup may stall close, leaking the popup window + sinks until shutdown.
+  Manual test owed with a `beforeunload` popup.
+- `console_nonces` entries for popups are never forgotten (`on_before_close`
+  removes frames/browsers but not the nonce) — permanent ~128-byte entries per
+  popup ever opened. Call `console_nonces.forget(browser_id)` on close.
+- `--private --smoke-test` exits via `libc::_exit` before the `_private_tmp`
+  drop, leaking `$TMPDIR/buffr-private-<pid>-*` per smoke run (CI smoke does not
+  use `--private`, so no current trigger).
+- Config-watcher callback mutex can be poisoned by a panicking callback,
+  silently skipping later reloads.
+- `buffr-store::open_tuned` sets no `busy_timeout` — a second buffr process
+  sharing the profile could surface `SQLITE_BUSY` mid-write.
+- The Animation paint arm does not advance `last_osr_generation` — the gate can
+  accept the same generation twice during a dim-mismatch animation (harmless
+  today; defeats the double-swap guard's intent).
+
+---
+
 ## Corrections to the review itself
 
 Three findings in `code-review.md` were **wrong** and were deliberately not
