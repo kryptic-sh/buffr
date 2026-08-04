@@ -82,6 +82,10 @@ and this project adheres to
 - `Renderer::frame` now acquires the swapchain texture before painting chrome or
   cloning OSR pixels, so a skipped frame (timeout, occluded, validation, stale
   size) no longer wastes the CPU paint and the 8.3 MB alloc.
+- The chrome paint buffer is recycled instead of reallocated every dirty frame:
+  the render worker hands the consumed `Vec` back through the stats channel and
+  the UI thread reuses it, so the ~8 MB allocation is no longer freed on the
+  worker thread.
 
 ## [0.14.9] - 2026-08-03
 

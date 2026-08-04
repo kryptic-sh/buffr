@@ -463,39 +463,53 @@ fn render_worker(
     tx_stats: std::sync::mpsc::Sender<FrameStats>,
 ) {
     while let Ok(cmd) = rx_cmd.recv() {
+        // Destructure so the worker owns each field — notably `chrome_pixels`,
+        // which is sent back to the UI thread via the stats channel for reuse
+        // instead of being dropped (and freed) on this thread.
+        let RenderCommand {
+            surface_texture,
+            width,
+            height,
+            chrome_lw,
+            chrome_lh,
+            chrome_top_band_h,
+            chrome_bottom_band_h,
+            chrome_pixels,
+            osr,
+        } = cmd;
         let render_start = Instant::now();
 
         // Reconcile worker's cached dims with what the UI thread sent.
         // The UI thread drives resize (surface.configure) and mirrors the
         // new dims into every RenderCommand. The worker updates its GPU
         // state lazily here rather than via a separate channel message.
-        if cmd.chrome_lw != state.chrome_lw || cmd.chrome_lh != state.chrome_lh {
+        if chrome_lw != state.chrome_lw || chrome_lh != state.chrome_lh {
             tracing::debug!(
                 old_lw = state.chrome_lw,
                 old_lh = state.chrome_lh,
-                new_lw = cmd.chrome_lw,
-                new_lh = cmd.chrome_lh,
+                new_lw = chrome_lw,
+                new_lh = chrome_lh,
                 "render_worker: chrome dims changed, reallocating"
             );
-            state.reallocate_chrome(cmd.chrome_lw, cmd.chrome_lh);
+            state.reallocate_chrome(chrome_lw, chrome_lh);
         }
         // Mirror physical dims so OSR NDC calculations use the right surface size.
-        state.width = cmd.width;
-        state.height = cmd.height;
+        state.width = width;
+        state.height = height;
 
         // Write chrome texture if the UI thread sent new pixels.
-        if let Some(ref pixels) = cmd.chrome_pixels {
+        if let Some(ref pixels) = chrome_pixels {
             state.write_chrome(
                 pixels,
-                cmd.chrome_lw,
-                cmd.chrome_lh,
-                cmd.chrome_top_band_h,
-                cmd.chrome_bottom_band_h,
+                chrome_lw,
+                chrome_lh,
+                chrome_top_band_h,
+                chrome_bottom_band_h,
             );
         }
 
         // Write OSR texture if provided.
-        let has_osr = if let Some(ref osr) = cmd.osr {
+        let has_osr = if let Some(ref osr) = osr {
             if osr.width == 0 || osr.height == 0 {
                 false
             } else {
@@ -507,8 +521,7 @@ fn render_worker(
         };
 
         // Build encoder + render passes.
-        let frame_view = cmd
-            .surface_texture
+        let frame_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -557,7 +570,7 @@ fn render_worker(
         state.queue.submit(once(encoder.finish()));
         let submit_done_us = render_start.elapsed().as_micros() as u64;
 
-        cmd.surface_texture.present();
+        surface_texture.present();
         let present_us = (render_start.elapsed().as_micros() as u64).saturating_sub(submit_done_us);
 
         // Run wgpu's lazy-drop GC.  Without an explicit poll the
@@ -585,6 +598,12 @@ fn render_worker(
         let _ = tx_stats.send(FrameStats {
             present_us,
             submit_done_us,
+            // Hand the (still-dirty) chrome buffer back to the UI thread,
+            // which re-zeroes it via `resize` on the next dirty frame. The UI
+            // thread allocated it, so recycling it avoids the
+            // alloc-on-UI/free-on-worker ping-pong that defeats allocator
+            // thread caches. `None` when chrome wasn't dirty this frame.
+            chrome_scratch: chrome_pixels,
         });
     }
 }
@@ -615,6 +634,11 @@ pub struct Renderer {
     /// Most-recent `FrameStats` received from the render worker.
     /// Lags one frame behind.
     last_present_stats: FrameStats,
+    /// Recycled chrome pixel buffer returned by the worker via the stats
+    /// channel. `frame()` takes it (or allocates a fresh one) whenever chrome
+    /// is dirty, so the ~8 MB chrome buffer is allocated on the UI thread and
+    /// freed on the UI thread instead of being freed on the worker thread.
+    chrome_scratch: Option<Vec<u32>>,
     /// Count of `SurfaceTexture` acquisitions that have been sent to the
     /// worker but not yet `present()`-ed.
     ///
@@ -982,6 +1006,7 @@ impl Renderer {
             chrome_lh,
             render_chan,
             last_present_stats: FrameStats::default(),
+            chrome_scratch: None,
             frames_in_flight: 0,
             pending_resize: None,
         })
@@ -1059,10 +1084,17 @@ impl Renderer {
     /// before the paint-policy guard decides whether to skip the frame.
     pub fn poll_present_stats(&mut self) -> Option<FrameStats> {
         let mut latest = None;
-        while let Ok(s) = self.render_chan.rx_stats.try_recv() {
+        while let Ok(mut s) = self.render_chan.rx_stats.try_recv() {
+            // Recycle the worker's returned chrome buffer into `self` for the
+            // next dirty frame. The worker sent it back via the stats channel
+            // instead of dropping it, so the big buffer is freed on the UI
+            // thread that allocated it, not on the worker.
+            if let Some(scratch) = s.chrome_scratch.take() {
+                self.chrome_scratch = Some(scratch);
+            }
             self.last_present_stats = s;
             self.frames_in_flight = self.frames_in_flight.saturating_sub(1);
-            latest = Some(s);
+            latest = Some(self.last_present_stats.clone());
         }
         latest
     }
@@ -1141,7 +1173,7 @@ impl Renderer {
                 in_flight = self.frames_in_flight,
                 "renderer.frame: worker still busy with previous frame, skipping"
             );
-            return Ok((self.last_present_stats, Submitted::No));
+            return Ok((self.last_present_stats.clone(), Submitted::No));
         }
 
         // Acquire the swapchain texture.
@@ -1252,13 +1284,21 @@ impl Renderer {
         // Chrome CPU paint — only when dirty. The closure runs on the UI
         // thread because it captures AppState data that can't be sent to
         // the worker. The resulting Vec<u32> is sent to the worker which
-        // uploads it to the GPU chrome texture.
+        // uploads it to the GPU chrome texture. The buffer is recycled from
+        // the previous dirty frame (returned via the stats channel) so the
+        // ~8 MB allocation is reused instead of reallocated + zeroed per frame.
         let chrome_pixels = if chrome_dirty {
             let lw = self.chrome_lw as usize;
             let lh = self.chrome_lh as usize;
             // Zero the buffer first so previous chrome state doesn't bleed
             // into rows that are now transparent (e.g. after CEF rect shrinks).
-            let mut buf = vec![0u32; lw * lh];
+            // `resize` reuses the recycled allocation when the capacity fits;
+            // on a window resize it reallocates to the new dims — correct.
+            let mut buf = self
+                .chrome_scratch
+                .take()
+                .unwrap_or_else(|| Vec::with_capacity(lw * lh));
+            buf.resize(lw * lh, 0u32);
             paint_chrome(&mut buf, lw, lh);
             Some(buf)
         } else {
@@ -1344,6 +1384,10 @@ impl Renderer {
             FrameStats {
                 present_us: self.last_present_stats.present_us,
                 submit_done_us,
+                // The returned scratch travels back via the stats channel and
+                // is captured by `poll_present_stats`; the frame() return value
+                // only carries timing.
+                chrome_scratch: None,
             },
             submitted,
         ))
@@ -1398,14 +1442,19 @@ impl Drop for Renderer {
     }
 }
 
-/// Per-frame timing stats returned by [`Renderer::frame`].
+/// Per-frame stats + recycled scratch returned by [`Renderer::frame`].
 ///
-/// Used by the embedder's occlusion heuristic: a sustained jump in
-/// `present_us` or `submit_done_us` is the most reliable signal that the
-/// compositor stopped showing our surface (Wayland workspace switch,
-/// minimize, fully covered window) on platforms where winit doesn't
+/// The timing fields are used by the embedder's occlusion heuristic: a
+/// sustained jump in `present_us` or `submit_done_us` is the most reliable
+/// signal that the compositor stopped showing our surface (Wayland workspace
+/// switch, minimize, fully covered window) on platforms where winit doesn't
 /// fire `WindowEvent::Occluded` reliably.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `chrome_scratch` is not timing: the render worker returns the chrome pixel
+/// buffer the UI thread sent it, so the ~8 MB allocation is freed on the UI
+/// thread that made it instead of on the worker thread. `poll_present_stats`
+/// stores it back on the renderer for the next dirty frame.
+#[derive(Debug, Clone, Default)]
 pub struct FrameStats {
     /// Microseconds spent inside `wgpu::SurfaceTexture::present()` on the
     /// render worker thread. Healthy: <16 ms. Compositor-throttled
@@ -1421,6 +1470,10 @@ pub struct FrameStats {
     /// balloons to seconds — a SAME-frame signal that complements the
     /// lagged `present_us`.
     pub submit_done_us: u64,
+    /// The chrome pixel buffer the worker just consumed, returned for reuse.
+    /// `Some` only when that frame carried dirty chrome. Still-dirty — the
+    /// UI re-zeroes it via `Vec::resize` before painting.
+    pub chrome_scratch: Option<Vec<u32>>,
 }
 
 /// Whether [`Renderer::frame`] actually handed a `RenderCommand` to the
