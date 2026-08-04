@@ -1,9 +1,21 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use fontdue::{Font as FdFont, FontSettings, Metrics};
 
 const TARGET_PX: f32 = 15.0;
+
+/// One rasterized glyph: the fontdue metrics/bitmap plus the whole-pixel
+/// advance, cached together under an `Arc` so measuring and drawing a
+/// glyph share a single lookup and a cache hit hands out a refcount bump
+/// instead of copying the bitmap.
+struct GlyphEntry {
+    metrics: Metrics,
+    bitmap: Vec<u8>,
+    /// Advance width in whole pixels, excluding the 1-px inter-glyph gap
+    /// [`text_width`] and [`draw_text`] insert.
+    advance: usize,
+}
 
 struct TtfFace {
     font: FdFont,
@@ -12,18 +24,37 @@ struct TtfFace {
     /// position the baseline so caps are visually centred inside the
     /// `TARGET_PX`-tall cell instead of bottom-aligned.
     cap_height: usize,
-    cache: std::sync::Mutex<HashMap<char, (Metrics, Vec<u8>)>>,
-    /// Per-codepoint advance width in whole pixels. Memoised because
-    /// measuring is on the repaint hot path (every truncation walks a
-    /// string char by char) and `fontdue::Font::metrics` rebuilds the
-    /// glyph geometry on each call.
-    advances: std::sync::Mutex<HashMap<char, usize>>,
+    cache: std::sync::Mutex<HashMap<char, Arc<GlyphEntry>>>,
 }
 
 /// Take a mutex without ever propagating poison. A panic inside one
 /// rasterize must not permanently kill every future repaint (M28).
 fn lock_ignore_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Look up a glyph in the cache, rasterizing and inserting it on a
+/// miss. Returns an `Arc` clone — a refcount bump, never a bitmap
+/// copy — so callers can use the entry after the lock is released.
+fn glyph_entry(f: &TtfFace, c: char) -> Arc<GlyphEntry> {
+    if let Some(entry) = lock_ignore_poison(&f.cache).get(&c).cloned() {
+        return entry;
+    }
+    // Rasterize outside the lock: fontdue must never run while the
+    // cache mutex is held, or one panicking glyph would poison it for
+    // the life of the process. Poison is ignored on top of that, so a
+    // panic elsewhere can't stop the chrome repainting either.
+    let (metrics, bitmap) = f.font.rasterize(c, TARGET_PX);
+    let advance = metrics.advance_width.round().max(0.0) as usize;
+    let entry = Arc::new(GlyphEntry {
+        metrics,
+        bitmap,
+        advance,
+    });
+    lock_ignore_poison(&f.cache)
+        .entry(c)
+        .or_insert_with(|| entry.clone())
+        .clone()
 }
 
 enum FontFace {
@@ -73,7 +104,6 @@ fn load_face() -> FontFace {
                     advance: advance.max(1),
                     cap_height: metrics.height.max(1),
                     cache: std::sync::Mutex::new(HashMap::new()),
-                    advances: std::sync::Mutex::new(HashMap::new()),
                 });
             }
         });
@@ -106,17 +136,7 @@ pub fn glyph_w() -> usize {
 /// 0 so they stack on the preceding glyph instead of claiming a cell.
 pub fn char_width(c: char) -> usize {
     match face() {
-        FontFace::Ttf(f) => {
-            if let Some(&w) = lock_ignore_poison(&f.advances).get(&c) {
-                return w;
-            }
-            // Measured outside the lock; a duplicate measure under a
-            // race is harmless and cheaper than holding it across the
-            // fontdue call.
-            let w = f.font.metrics(c, TARGET_PX).advance_width.round().max(0.0) as usize;
-            lock_ignore_poison(&f.advances).insert(c, w);
-            w
-        }
+        FontFace::Ttf(f) => glyph_entry(f, c).advance,
         FontFace::Bitmap => BITMAP_GLYPH_W,
     }
 }
@@ -147,43 +167,39 @@ pub fn text_width(s: &str) -> usize {
 
 pub fn draw_text(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, s: &str, fg: u32) {
     let mut pen_x = x;
-    for c in s.chars() {
-        draw_char(buf, width, height, pen_x, y, c, fg);
-        pen_x += char_width(c) as i32 + 1;
-    }
-}
-
-fn draw_char(buf: &mut [u32], width: usize, height: usize, x: i32, y: i32, c: char, fg: u32) {
     match face() {
-        FontFace::Ttf(f) => draw_ttf_char(f, buf, width, height, x, y, c, fg),
-        FontFace::Bitmap => draw_bitmap_char(buf, width, height, x, y, bitmap_glyph(c), fg),
+        FontFace::Ttf(f) => {
+            for c in s.chars() {
+                // One lookup per glyph: the same entry both draws and
+                // advances, instead of `draw_char` + `char_width` doing
+                // two separate cache lookups.
+                let entry = glyph_entry(f, c);
+                draw_ttf_char_with_entry(f, buf, width, height, pen_x, y, &entry, fg);
+                pen_x += entry.advance as i32 + 1;
+            }
+        }
+        FontFace::Bitmap => {
+            for c in s.chars() {
+                draw_bitmap_char(buf, width, height, pen_x, y, bitmap_glyph(c), fg);
+                pen_x += BITMAP_GLYPH_W as i32 + 1;
+            }
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_ttf_char(
+fn draw_ttf_char_with_entry(
     f: &TtfFace,
     buf: &mut [u32],
     width: usize,
     height: usize,
     x: i32,
     y: i32,
-    c: char,
+    entry: &GlyphEntry,
     fg: u32,
 ) {
-    // Rasterize outside the lock: fontdue must never run while the
-    // cache mutex is held, or one panicking glyph would poison it for
-    // the life of the process. Poison is ignored on top of that, so a
-    // panic elsewhere can't stop the chrome repainting either.
-    let cached = lock_ignore_poison(&f.cache).get(&c).cloned();
-    let (metrics, bitmap) = match cached {
-        Some(entry) => entry,
-        None => {
-            let entry = f.font.rasterize(c, TARGET_PX);
-            lock_ignore_poison(&f.cache).insert(c, entry.clone());
-            entry
-        }
-    };
+    let metrics = entry.metrics;
+    let bitmap = &entry.bitmap;
 
     let fg_r = (fg >> 16) & 0xFF;
     let fg_g = (fg >> 8) & 0xFF;
