@@ -147,13 +147,6 @@ collector to send counters to. The only network request buffr makes by default
 is the update check; see [privacy.md](./privacy.md) and
 [updates.md](./updates.md).
 
-> **Known bug in `clear_on_exit`.** `cookies`, `history`, `bookmarks`, and
-> `downloads` work. `cache` and `local_storage` do not: `run_clear_on_exit`
-> (`apps/buffr-app/src/main.rs`) deletes `<XDG_CACHE_HOME>/buffr/Cache` and
-> `<XDG_CACHE_HOME>/buffr/Local Storage`, but CEF writes both under its
-> `root_cache_path`, which is the **data** dir. The deletes therefore hit a
-> directory CEF never populated and log `dir absent — skipping`.
-
 ### `[downloads]`
 
 | Key                  | Type  | Default | Notes                                                                                    |

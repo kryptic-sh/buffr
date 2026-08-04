@@ -87,19 +87,13 @@ enable_telemetry = false
 # Valid entries:
 #   "cookies"        — flush every cookie via CEF's global cookie
 #                      manager.
-#   "cache"          — delete <XDG_CACHE_HOME>/buffr/Cache.
+#   "cache"          — delete <XDG_DATA_HOME>/buffr/Cache.
 #   "history"        — wipe every row in history.sqlite.
 #   "bookmarks"      — wipe every row in bookmarks.sqlite. Destructive;
 #                      only honored when listed.
 #   "downloads"      — wipe every row in downloads.sqlite (regardless
 #                      of status).
-#   "local_storage"  — delete <XDG_CACHE_HOME>/buffr/Local Storage.
-#
-# KNOWN BUG: the "cache" and "local_storage" entries resolve against
-# the XDG *cache* dir, but CEF's root_cache_path is the XDG *data* dir
-# (~/.local/share/buffr) — see docs/config.md. So those two deletes hit
-# a directory CEF never writes to and log "dir absent — skipping".
-# "cookies", "history", "bookmarks", and "downloads" work as described.
+#   "local_storage"  — delete <XDG_DATA_HOME>/buffr/Local Storage.
 #
 # Example: paranoid web-browsing — wipe cookies, cache, and local
 # storage on exit; keep history + bookmarks.

@@ -1243,6 +1243,22 @@ fn resolve_paths(private: bool) -> Result<(ProfilePaths, Option<TempDir>)> {
     }
 }
 
+/// Directory (under the profile paths) that `item` wipes on exit, if any.
+/// Cache and LocalStorage are trees under CEF's `root_cache_path`, which
+/// is the *data* dir — NOT `paths.cache`. Cookies / History / Bookmarks /
+/// Downloads route through other teardown paths (cookie manager /
+/// `clear_all` stores) and return `None`.
+fn clear_dir_path(paths: &ProfilePaths, item: ClearableData) -> Option<PathBuf> {
+    match item {
+        ClearableData::Cache => Some(paths.data.join("Cache")),
+        ClearableData::LocalStorage => Some(paths.data.join("Local Storage")),
+        ClearableData::Cookies
+        | ClearableData::History
+        | ClearableData::Bookmarks
+        | ClearableData::Downloads => None,
+    }
+}
+
 /// Honour `[privacy] clear_on_exit` after the event loop returns and
 /// before `cef::shutdown()`. Each entry is processed independently —
 /// one failure doesn't skip the rest. Errors log at WARN; successes
@@ -1274,7 +1290,10 @@ fn run_clear_on_exit(
         }
         match item {
             ClearableData::Cookies => clear_cookies(backend),
-            ClearableData::Cache => clear_dir(&paths.cache.join("Cache"), "cache"),
+            ClearableData::Cache => clear_dir(
+                &clear_dir_path(paths, item).expect("Cache resolves to a wipe dir"),
+                "cache",
+            ),
             ClearableData::History => match history.clear_all() {
                 Ok(n) => info!(rows = n, "clear_on_exit: history cleared"),
                 Err(err) => warn!(error = %err, "clear_on_exit: history failed"),
@@ -1287,9 +1306,10 @@ fn run_clear_on_exit(
                 Ok(n) => info!(rows = n, "clear_on_exit: downloads cleared"),
                 Err(err) => warn!(error = %err, "clear_on_exit: downloads failed"),
             },
-            ClearableData::LocalStorage => {
-                clear_dir(&paths.cache.join("Local Storage"), "local_storage")
-            }
+            ClearableData::LocalStorage => clear_dir(
+                &clear_dir_path(paths, item).expect("LocalStorage resolves to a wipe dir"),
+                "local_storage",
+            ),
         }
     }
 }
@@ -5822,6 +5842,40 @@ mod tests {
     fn resolve_paths_persistent_returns_no_tempdir() {
         let (_paths, tmp) = resolve_paths(false).expect("resolve_paths(false)");
         assert!(tmp.is_none());
+    }
+
+    #[test]
+    fn clear_dir_path_cache_and_local_storage_under_data_not_cache() {
+        // Distinct cache/data roots: if the helper resolves against
+        // `paths.cache` the join lands under cache/ and these asserts fail.
+        let paths = ProfilePaths {
+            cache: PathBuf::from("/tmp/cache-root"),
+            data: PathBuf::from("/tmp/data-root"),
+        };
+        assert_eq!(
+            clear_dir_path(&paths, ClearableData::Cache),
+            Some(PathBuf::from("/tmp/data-root/Cache"))
+        );
+        assert_eq!(
+            clear_dir_path(&paths, ClearableData::LocalStorage),
+            Some(PathBuf::from("/tmp/data-root/Local Storage"))
+        );
+    }
+
+    #[test]
+    fn clear_dir_path_other_variants_route_elsewhere() {
+        let paths = ProfilePaths {
+            cache: PathBuf::from("/tmp/cache-root"),
+            data: PathBuf::from("/tmp/data-root"),
+        };
+        for item in [
+            ClearableData::Cookies,
+            ClearableData::History,
+            ClearableData::Bookmarks,
+            ClearableData::Downloads,
+        ] {
+            assert_eq!(clear_dir_path(&paths, item), None);
+        }
     }
 
     // ---- render-gate regression tests ------------------------------------
