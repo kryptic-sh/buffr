@@ -970,12 +970,12 @@ impl BrowserHost {
         // switch, DPI change) doesn't leave popups rendering at the old
         // factor.
         if let Ok(map) = self.popup_frames.lock() {
-            for (_id, (_frame, view)) in map.iter() {
+            for (_frame, view) in map.values() {
                 view.set_scale(scale);
             }
         }
         if let Ok(browsers) = self.popup_browsers.lock() {
-            for (_id, browser) in browsers.iter() {
+            for browser in browsers.values() {
                 if let Some(host) = browser.host() {
                     host.notify_screen_info_changed();
                 }
