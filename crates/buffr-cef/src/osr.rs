@@ -57,7 +57,15 @@ pub type PopupFrameMap = Arc<Mutex<HashMap<i32, (SharedOsrFrame, SharedOsrViewSt
 
 /// One popup's OSR allocation, made in `on_before_popup` before CEF has
 /// assigned a browser id and claimed in `on_after_created` once it has.
-pub type PopupAlloc = (SharedOsrFrame, SharedOsrViewState, String);
+pub struct PopupAlloc {
+    pub frame: SharedOsrFrame,
+    pub view: SharedOsrViewState,
+    pub url: String,
+    /// When the alloc was pushed (A12): an entry older than
+    /// [`POPUP_ALLOC_TTL`] was left behind by a popup creation CEF
+    /// aborted, and the next real popup must not consume its stale URL.
+    pub created_at: std::time::Instant,
+}
 
 /// FIFO of pending popup allocations (M16).
 ///
@@ -88,6 +96,33 @@ pub const PENDING_POPUP_ALLOC_CAP: usize = 32;
 /// Build an empty [`PendingPopupAllocQueue`].
 pub fn new_pending_popup_alloc_queue() -> PendingPopupAllocQueue {
     Arc::new(Mutex::new(VecDeque::new()))
+}
+
+/// How long a pending popup allocation may sit unclaimed before it is
+/// treated as stale (A12). CEF sequences `on_before_popup` →
+/// `on_after_created` on the same UI thread within milliseconds, so an
+/// alloc older than this was left behind by a popup creation CEF
+/// aborted.
+pub const POPUP_ALLOC_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pop the front allocation that is still fresh, discarding any stale
+/// entries ahead of it (A12). Pure in `now`/`ttl` so the expiry policy
+/// is unit-testable.
+pub fn take_fresh_alloc(
+    queue: &mut std::collections::VecDeque<PopupAlloc>,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+) -> Option<PopupAlloc> {
+    loop {
+        let a = queue.pop_front()?;
+        if now.duration_since(a.created_at) <= ttl {
+            return Some(a);
+        }
+        tracing::warn!(
+            url = %a.url,
+            "popup: dropping stale pending alloc (creation was aborted)"
+        );
+    }
 }
 
 // ── RenderHandler impl ─────────────────────────────────────────────────────────
@@ -559,5 +594,58 @@ mod tests {
         assert!(Arc::ptr_eq(&mf, &main_frame));
         assert!(Arc::ptr_eq(&mv, &main_view));
         assert_eq!(handler.main_id.load(Ordering::Relaxed), 7);
+    }
+
+    // ── A12: pending-alloc TTL expiry ────────────────────────────────────
+
+    /// An alloc with a fresh `created_at`, matching what `on_before_popup`
+    /// pushes. The old code (3-tuple, no timestamp) had no expiry at all —
+    /// `on_after_created` popped the front unconditionally, so an alloc left
+    /// behind by an aborted popup creation reported its stale URL on the next
+    /// real popup. These tests pin the expiry policy.
+    fn alloc(created_at: std::time::Instant) -> PopupAlloc {
+        PopupAlloc {
+            frame: Arc::new(Mutex::new(OsrFrame::new(800, 600))),
+            view: Arc::new(OsrViewState::new()),
+            url: String::from("about:blank"),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn take_fresh_alloc_skips_stale_front() {
+        let now = std::time::Instant::now();
+        let mut q = VecDeque::new();
+        q.push_back(alloc(now - std::time::Duration::from_secs(10)));
+        q.push_back(alloc(now - std::time::Duration::from_millis(1)));
+        let got = take_fresh_alloc(&mut q, now, POPUP_ALLOC_TTL).expect("fresh alloc returned");
+        assert_eq!(got.created_at, now - std::time::Duration::from_millis(1));
+        assert!(q.is_empty(), "stale front discarded, fresh consumed");
+    }
+
+    #[test]
+    fn take_fresh_alloc_all_stale_returns_none() {
+        let now = std::time::Instant::now();
+        let mut q = VecDeque::new();
+        q.push_back(alloc(now - std::time::Duration::from_secs(10)));
+        q.push_back(alloc(now - std::time::Duration::from_secs(20)));
+        assert!(take_fresh_alloc(&mut q, now, POPUP_ALLOC_TTL).is_none());
+        assert!(q.is_empty(), "all stale allocs drained");
+    }
+
+    #[test]
+    fn take_fresh_alloc_empty_returns_none() {
+        let mut q: VecDeque<PopupAlloc> = VecDeque::new();
+        assert!(take_fresh_alloc(&mut q, std::time::Instant::now(), POPUP_ALLOC_TTL).is_none());
+    }
+
+    #[test]
+    fn take_fresh_alloc_fresh_front() {
+        let now = std::time::Instant::now();
+        let mut q = VecDeque::new();
+        q.push_back(alloc(now - std::time::Duration::from_millis(1)));
+        let got = take_fresh_alloc(&mut q, now, POPUP_ALLOC_TTL).expect("fresh alloc returned");
+        assert_eq!(got.created_at, now - std::time::Duration::from_millis(1));
+        assert!(q.is_empty());
     }
 }

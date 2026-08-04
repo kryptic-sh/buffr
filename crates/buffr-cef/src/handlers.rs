@@ -74,8 +74,8 @@ type CefCursorArg = cef::sys::cef_cursor_handle_t;
 #[cfg(target_os = "macos")]
 type CefCursorArg = *mut u8;
 use crate::osr::{
-    OsrFrame, OsrViewState, PENDING_POPUP_ALLOC_CAP, PendingPopupAllocQueue, PopupFrameMap,
-    SharedOsrViewState,
+    OsrFrame, OsrViewState, PENDING_POPUP_ALLOC_CAP, POPUP_ALLOC_TTL, PendingPopupAllocQueue,
+    PopupAlloc, PopupFrameMap, SharedOsrViewState, take_fresh_alloc,
 };
 use crate::{PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue};
 use buffr_core::open_finder::{OsSpawn, open_path};
@@ -323,7 +323,12 @@ wrap_life_span_handler! {
                     );
                     queue.pop_front();
                 }
-                queue.push_back((frame, view, url_str));
+                queue.push_back(PopupAlloc {
+                    frame,
+                    view,
+                    url: url_str,
+                    created_at: std::time::Instant::now(),
+                });
             }
 
             // Configure the popup browser for OSR.
@@ -354,13 +359,18 @@ wrap_life_span_handler! {
             // the order `on_before_popup` was called and sequences both
             // callbacks on the browser-process UI thread, and
             // `on_after_created` carries no `popup_id` to key on, so
-            // front-of-queue is the matching allocation.
+            // front-of-queue is the matching allocation. Any alloc older than
+            // POPUP_ALLOC_TTL was left behind by a creation CEF aborted (A12)
+            // and is discarded rather than feeding its stale URL to the next
+            // real popup.
             let alloc = match self.pending_popup_alloc.lock() {
-                Ok(mut queue) => queue.pop_front(),
+                Ok(mut queue) => {
+                    take_fresh_alloc(&mut queue, std::time::Instant::now(), POPUP_ALLOC_TTL)
+                }
                 Err(_) => None,
             };
             let (frame, view, url) = match alloc {
-                Some(a) => a,
+                Some(a) => (a.frame, a.view, a.url),
                 None => {
                     // Registering the browser anyway is what keeps
                     // `close_all_browsers` able to see it — an unregistered
