@@ -63,6 +63,11 @@ and this project adheres to
   user-initiated navigation (a scripted `location = 'foo://…'` no longer pops a
   handler), and the spawned child is reaped instead of left as a zombie.
 
+### Performance
+
+- The omnibar's bookmark search is now capped at 8 rows inside SQL instead of
+  scanning the whole bookmarks table per keystroke (`search_limited`).
+
 ## [0.14.9] - 2026-08-03
 
 Five correctness fixes from the 2026-08-02 review pass, two of them

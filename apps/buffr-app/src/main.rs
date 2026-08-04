@@ -4144,7 +4144,7 @@ impl AppState {
             }
         }
         // Bookmarks next.
-        if let Ok(rows) = self.bookmarks.search(needle) {
+        if let Ok(rows) = self.bookmarks.search_limited(needle, Some(8)) {
             for bm in rows.into_iter().take(8) {
                 if seen_urls.insert(bm.url.clone()) {
                     let display = match bm.title.as_deref() {
