@@ -20,12 +20,17 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use hjkl_clipboard::{Clipboard, ClipboardError, MimeType, Selection};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::time::Duration;
 
 const FETCH_TIMEOUT_CONNECT: Duration = Duration::from_secs(5);
 const FETCH_TIMEOUT_READ: Duration = Duration::from_secs(15);
 const USER_AGENT: &str = concat!("buffr/", env!("CARGO_PKG_VERSION"));
+
+/// Maximum bytes accepted from an image source before refusing (16 MiB,
+/// generous for images). Applies to both http(s) bodies and decoded `data:`
+/// payloads (A9).
+const IMAGE_FETCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Spawn an off-thread worker that fetches `url`, decodes it, and
 /// pushes the PNG bytes to the system clipboard. The function returns
@@ -81,6 +86,7 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         // see issue #19 for the wider OSR clipboard story.
         return Err("blob: URLs not supported".into());
     }
+    check_fetch_host(url)?;
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(FETCH_TIMEOUT_CONNECT))
         .timeout_recv_response(Some(FETCH_TIMEOUT_READ))
@@ -88,9 +94,40 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         .build();
     let agent = ureq::Agent::new_with_config(config);
     let mut resp = agent.get(url).call().map_err(|e| format!("fetch: {e}"))?;
+    let mut body = Vec::new();
     resp.body_mut()
-        .read_to_vec()
-        .map_err(|e| format!("body read: {e}"))
+        .as_reader()
+        .take(IMAGE_FETCH_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("body read: {e}"))?;
+    if body.len() > IMAGE_FETCH_MAX_BYTES {
+        return Err("image response too large".into());
+    }
+    Ok(body)
+}
+
+/// Reject `http(s)` URLs whose host is loopback, private, link-local or
+/// numeric-shaped (A9). Copy Image runs in the browser process, so it must
+/// not pivot a page's request into the local network (the page cannot
+/// fetch loopback itself — CORS blocks it; buffr would be the proxy).
+fn check_fetch_host(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported scheme: {scheme}"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    // `host_str()` returns the bracketed serialization for IPv6 literals
+    // (e.g. `[::1]`), but the shared guard's IPv6 path expects the
+    // unbracketed form. Only IPv6 hosts ever carry brackets, so stripping
+    // them is lossless.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if crate::private_net::is_non_public_host(host) {
+        return Err(format!("refusing to fetch private-network host `{host}`"));
+    }
+    Ok(())
 }
 
 /// Decode the body of a `data:` URL (post-prefix). Accepts base64 and
@@ -101,10 +138,26 @@ fn decode_data_url(rest: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "data URL missing comma".to_string())?;
     let is_base64 = meta.split(';').any(|p| p.eq_ignore_ascii_case("base64"));
     if is_base64 {
-        B64.decode(payload.as_bytes())
-            .map_err(|e| format!("base64 decode: {e}"))
+        // base64 expands ~4/3; the +4 covers padding. Bound the encoded
+        // payload before decoding so a huge `data:` URL can't allocate
+        // unbounded memory (A9).
+        if payload.len() > IMAGE_FETCH_MAX_BYTES * 4 / 3 + 4 {
+            return Err("data: payload too large".into());
+        }
+        let bytes = B64
+            .decode(payload.as_bytes())
+            .map_err(|e| format!("base64 decode: {e}"))?;
+        if bytes.len() > IMAGE_FETCH_MAX_BYTES {
+            return Err("data: payload too large".into());
+        }
+        Ok(bytes)
     } else {
         // Percent-decoded payload — rare for images, but spec-legal.
+        // Decoded size ≤ payload.len(), so bounding the payload bounds the
+        // decode.
+        if payload.len() > IMAGE_FETCH_MAX_BYTES {
+            return Err("data: payload too large".into());
+        }
         Ok(percent_decode(payload))
     }
 }
@@ -214,5 +267,45 @@ mod tests {
     #[test]
     fn blob_url_rejected() {
         assert!(fetch_image_bytes("blob:https://example.com/abc").is_err());
+    }
+
+    #[test]
+    fn check_fetch_host_rejects_private_hosts() {
+        for url in [
+            "http://127.0.0.1/x",
+            "http://localhost/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.1/x",
+            "http://10.0.0.5/x",
+            // The integer form of the cloud-metadata endpoint: glibc's
+            // getaddrinfo resolves it to 169.254.169.254.
+            "http://2852039166/x",
+            // Bracketed by `host_str()`; `check_fetch_host` strips them so
+            // the shared guard's unbracketed IPv6 path sees `::1`.
+            "http://[::1]/x",
+        ] {
+            assert!(check_fetch_host(url).is_err(), "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn check_fetch_host_allows_public_hosts() {
+        for url in [
+            "https://example.com/img.png",
+            "http://93.184.216.34/img.png",
+        ] {
+            assert!(check_fetch_host(url).is_ok(), "{url} should be allowed");
+        }
+    }
+
+    #[test]
+    fn decode_data_url_rejects_oversized_payload() {
+        // base64 of exactly `IMAGE_FETCH_MAX_BYTES` bytes encodes to
+        // ceil(n/3)*4 = cap*4/3 rounded down — just under the pre-check
+        // ceiling — so go modestly over (+3 bytes) to push the encoded
+        // length past `cap*4/3 + 4`. ~16 MiB allocation, no decode.
+        let payload = "x".repeat(IMAGE_FETCH_MAX_BYTES + 3);
+        let rest = format!("image/png;base64,{}", B64.encode(payload.as_bytes()));
+        assert!(decode_data_url(&rest).is_err());
     }
 }

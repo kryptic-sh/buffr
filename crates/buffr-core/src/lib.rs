@@ -25,6 +25,7 @@ pub mod image_copy;
 pub mod inhibit;
 pub mod media_probe;
 pub mod open_finder;
+pub mod private_net;
 pub mod scripts;
 pub mod telemetry;
 pub mod updates;
