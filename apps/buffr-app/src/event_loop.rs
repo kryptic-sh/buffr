@@ -1031,7 +1031,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 );
                 if is_pixel {
                     let (swipe_dx, swipe_dy) = scroll_swipe_delta(&scroll_ev);
-                    if let Some(action) = self.detect_swipe(swipe_dx, swipe_dy) {
+                    if let Some(action) = self.detect_swipe(surface_id, swipe_dx, swipe_dy) {
                         self.dispatch_action(&action);
                         return;
                     }

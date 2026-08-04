@@ -1763,6 +1763,10 @@ struct AppState {
     /// commits, `swipe.committed` suppresses further nav until it
     /// restarts.
     swipe: SwipeDetector,
+    /// Surface the swipe detector is currently accumulating for. The
+    /// detector is shared between the main window and every popup, so a
+    /// gesture must not cross surfaces — see [`AppState::detect_swipe`].
+    swipe_surface: Option<SurfaceId>,
     /// Ctrl+C handler flag. Set to `true` by the `ctrlc` handler;
     /// polled in `about_to_wait` to exit with a single key press.
     shutdown_flag: Arc<AtomicBool>,
@@ -2141,6 +2145,7 @@ impl AppState {
             osr_wheel_velocity: (0.0, 0.0),
             osr_wheel_last_at: None,
             swipe: SwipeDetector::default(),
+            swipe_surface: None,
             shutdown_flag,
             internal_server: None,
             cef_next_pump_at: None,
@@ -3282,7 +3287,26 @@ impl AppState {
     /// screen pixels — see [`scroll_swipe_delta`] for mapping a
     /// single-axis `ScrollEvent` onto `(dx, dy)`. Thin clock wrapper
     /// around [`SwipeDetector::feed`], which holds the actual rules.
-    fn detect_swipe(&mut self, dx: f32, dy: f32) -> Option<buffr_modal::PageAction> {
+    /// The detector is shared between the main window and every popup;
+    /// keying on the feeding surface means a half-swipe in one window
+    /// followed by a scroll in another within the gap window can never
+    /// combine into a commit, and a committed gesture never swallows
+    /// another surface's scrolls. See [`AppState::swipe_surface`].
+    fn detect_swipe(
+        &mut self,
+        surface: SurfaceId,
+        dx: f32,
+        dy: f32,
+    ) -> Option<buffr_modal::PageAction> {
+        // A14: a gesture must not accumulate across surfaces — the main
+        // window and every popup share this detector, so a half-swipe in
+        // one window followed by a scroll in another within the 200 ms gap
+        // would combine and commit history navigation on the wrong surface.
+        // Reset when the feeding surface changes.
+        if self.swipe_surface != Some(surface) {
+            self.swipe = SwipeDetector::default();
+            self.swipe_surface = Some(surface);
+        }
         self.swipe.feed(dx, dy, Instant::now())
     }
 
@@ -5612,7 +5636,7 @@ impl AppState {
                 );
                 if is_pixel {
                     let (swipe_dx, swipe_dy) = scroll_swipe_delta(&scroll_ev);
-                    if let Some(action) = self.detect_swipe(swipe_dx, swipe_dy) {
+                    if let Some(action) = self.detect_swipe(window_id, swipe_dx, swipe_dy) {
                         if let Some(engine) = self.active_engine_dyn()
                             && browser_id >= 0
                         {
