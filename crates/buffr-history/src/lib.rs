@@ -348,9 +348,17 @@ impl History {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        // Wrap in FTS5 phrase-literal quotes; escape any embedded
-        // double-quotes by doubling them (FTS5 quoting convention).
-        let needle = format!("\"{}\"", query.replace('"', "\"\""));
+        // Multi-word queries AND their tokens together so order and column
+        // placement don't matter (A5): FTS5 treats a quoted string as a phrase
+        // (adjacent, in-order tokens in one column), but the documented contract
+        // is implicit AND across both url and title. Quote each whitespace token
+        // individually and join with AND; a single token behaves exactly as the
+        // old single-phrase form.
+        let needle = query
+            .split_whitespace()
+            .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let conn = self.conn.lock().map_err(|_| HistoryError::Poisoned)?;
         let now = self.clock.now().timestamp();
         let recent_cutoff = now - RECENCY_WINDOW_SECS;
@@ -787,6 +795,37 @@ mod tests {
         let results = h.search("learn rust", 10).unwrap();
         assert_eq!(results.len(), 1, "expected exactly one FTS match");
         assert_eq!(results[0].url, "https://rust-lang.org/learn");
+    }
+
+    #[test]
+    fn search_multiword_uses_implicit_and_not_phrase() {
+        // A5: multi-word queries use FTS5 implicit AND, not a phrase.
+        // The tokens of `rust learn` are never adjacent in one column
+        // (url token stream: `https rust lang org learn`; title: `learn
+        // rust`), yet the documented contract matches the row anyway.
+        let h = History::open_in_memory().unwrap();
+        h.record_visit(
+            "https://rust-lang.org/learn",
+            Some("Learn Rust"),
+            Transition::Link,
+        )
+        .unwrap();
+
+        let results = h.search("rust learn", 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "AND must not require tokens to be adjacent or in order"
+        );
+        assert_eq!(results[0].url, "https://rust-lang.org/learn");
+
+        let results = h.search("learn rust", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://rust-lang.org/learn");
+
+        // An embedded double-quote must be escaped, not parsed as an FTS5
+        // operator — a 0-row result is fine, an error is not.
+        assert!(h.search("it's \"fine\"", 10).is_ok());
     }
 
     #[test]
