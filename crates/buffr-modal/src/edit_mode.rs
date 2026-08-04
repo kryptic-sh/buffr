@@ -10,9 +10,8 @@
 
 use crate::host::BuffrHost;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hjkl_engine::{
-    Editor, KeybindingMode, Modifiers, PlannedInput, SpecialKey, VimMode, types::Options,
-};
+use hjkl_engine::{Editor, Modifiers, PlannedInput, SpecialKey, VimMode, types::Options};
+use hjkl_vim::VimEditorExt;
 use std::sync::Arc;
 
 /// Convert a crossterm [`KeyEvent`] into the engine's [`PlannedInput`].
@@ -62,25 +61,25 @@ fn key_event_to_planned(key: KeyEvent) -> Option<PlannedInput> {
 ///
 /// Owns the engine [`Editor`] generic over [`BuffrHost`]. The host
 /// (clipboard / time / intent fan-out) lives inside the editor —
-/// `Editor<hjkl_buffer::Buffer, BuffrHost>`. Pull-model:
+/// `Editor<hjkl_buffer::View, BuffrHost>`. Pull-model:
 /// per render frame the host calls [`EditSession::take_content_change`]
 /// and forwards any new content to the DOM.
 pub struct EditSession {
-    editor: Editor<hjkl_buffer::Buffer, BuffrHost>,
+    editor: Editor<hjkl_buffer::View, BuffrHost>,
 }
 
 impl EditSession {
     /// Boot the session with the field's current value.
     pub fn new(initial: &str) -> Self {
         let mut editor = Editor::new(
-            hjkl_buffer::Buffer::new(),
+            hjkl_buffer::View::new(),
             BuffrHost::new(),
             Options::default(),
         );
-        // Keybinding mode is a post-construction public field on Editor.
-        // Vim is the default already, but set explicitly so the intent
-        // stays visible at the call site.
-        editor.keybinding_mode = KeybindingMode::Vim;
+        // The vim discipline is a post-construction install: `Editor::new`
+        // leaves the discipline slot empty (the engine cannot name one),
+        // so without this call the editor ignores vim keys entirely.
+        hjkl_vim::install_vim_discipline(&mut editor);
         editor.set_content(initial);
         Self { editor }
     }
@@ -91,7 +90,7 @@ impl EditSession {
     /// no representation for, etc.).
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key_event_to_planned(key) {
-            Some(input) => self.editor.feed_input(input),
+            Some(input) => hjkl_vim::feed_input(&mut self.editor, input),
             None => false,
         }
     }
@@ -101,7 +100,7 @@ impl EditSession {
     /// constructs `PlannedInput` from winit's `KeyEvent` directly so
     /// the two crates never need a shared `crossterm` version.
     pub fn feed_planned(&mut self, input: hjkl_engine::PlannedInput) -> bool {
-        self.editor.feed_input(input)
+        hjkl_vim::feed_input(&mut self.editor, input)
     }
 
     /// Convenience: type a literal character with no modifiers. Used

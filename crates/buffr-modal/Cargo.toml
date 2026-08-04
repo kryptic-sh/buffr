@@ -36,10 +36,12 @@ serde = { version = "1", features = ["derive"] }
 bitflags = "2"
 
 # Edit-mode delegates to hjkl-engine against a mirrored Rope synced to
-# the DOM via CEF. Bumped to 0.5/0.6 — the public API used here
-# (Editor, Host, Buffer, Viewport) is fully additive across 0.1→0.5/0.6.
+# the DOM via CEF. Bumped to 0.41 — hjkl-engine no longer ships the vim
+# FSM (feed_input / vim_mode moved to hjkl-vim, installed via
+# install_vim_discipline).
 hjkl-engine.workspace = true
 hjkl-buffer.workspace = true
+hjkl-vim.workspace = true
 
 # crossterm KeyEvent is the engine's input type today; the host
 # bridges from CEF browser keys into it. When trait extraction lands a

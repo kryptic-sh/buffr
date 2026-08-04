@@ -6,7 +6,7 @@
 //!   command line. Owned by this crate.
 //! - **Insert mode** — typing in `<textarea>` / `contenteditable` / form
 //!   fields. Delegates to [`hjkl_engine::Editor`] against a mirrored
-//!   [`hjkl_buffer::Buffer`] synced to the DOM via CEF.
+//!   [`hjkl_buffer::View`] synced to the DOM via CEF.
 //!
 //! See `PLAN.md` "Edit-mode integration with `hjkl-*`" for the full
 //! data flow.
