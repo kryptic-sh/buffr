@@ -99,6 +99,10 @@ and this project adheres to
   hit-tests cached entries instead of re-cloning every label per mouse move, and
   the loading animation draws chars directly instead of allocating a String per
   cell.
+- The event loop's pump period is computed from `outputs()` once per second
+  instead of every tick, the chrome-paint closure clones the statusline and tab
+  strip only when chrome is actually repainted, and `hint_status()` is no longer
+  polled (two locks per tick) when hint mode is inactive.
 
 ## [0.14.9] - 2026-08-03
 

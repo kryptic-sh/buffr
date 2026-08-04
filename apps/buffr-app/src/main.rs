@@ -1747,6 +1747,13 @@ struct AppState {
     /// Set by `OnScheduleMessagePumpWork(delay_ms)`; cleared after
     /// pumping so we wait for CEF to schedule the next work item.
     cef_next_pump_at: Option<Instant>,
+    /// Cached event-loop pump period: `(computed_at, period)`. The tick
+    /// computes the wakeup deadline from the fastest live output's refresh
+    /// rate; `event_loop.outputs()` allocates a `Vec<OutputInfo>` with
+    /// per-output String name/description clones on every call, so it is
+    /// only re-queried once per second and the cached period is reused
+    /// for the intervening ~144 Hz ticks. `None` until first computed.
+    last_outputs_recompute: Option<(Instant, Duration)>,
     /// Ordered list of `TabId`s mirroring `tab_strip.tabs`. Refreshed
     /// every `about_to_wait` tick alongside the strip; used for
     /// tab-strip click hit-testing.
@@ -2106,6 +2113,7 @@ impl AppState {
             shutdown_flag,
             internal_server: None,
             cef_next_pump_at: None,
+            last_outputs_recompute: None,
             tab_ids: Vec::new(),
             session_dirty: false,
             session_dirty_since: None,
@@ -3488,17 +3496,6 @@ impl AppState {
 
         let chrome_dirty = self.chrome_generation != self.last_painted_chrome_gen;
 
-        // Clone/snapshot values needed in the chrome paint closure.
-        let statusline = self.statusline.clone();
-        let tab_strip = self.tab_strip.clone();
-        let confirm_close_pinned = self.confirm_close_pinned;
-        let permissions_prompt = self.permissions_prompt.clone();
-        let overlay_data = self.overlay.as_ref().map(|o| o.input().clone());
-        let context_menu_overlay = self
-            .context_menu
-            .as_ref()
-            .map(|cm| cm.to_overlay(lwidth, lheight));
-
         let frame_start = Instant::now();
 
         // Decide whether to show the loading animation instead of OSR.
@@ -3589,7 +3586,7 @@ impl AppState {
         }
 
         let splash = &self.splash;
-        let anim_fg = statusline.palette.accent;
+        let anim_fg = self.statusline.palette.accent;
         // bg: accent darkened 92% with black, matching the strip background.
         let anim_bg = buffr_ui::Palette::from_accent(anim_fg).bg;
 
@@ -3598,6 +3595,37 @@ impl AppState {
         let chrome_dirty_effective =
             should_force_chrome_repaint(chrome_dirty, want_anim, anim_just_deactivated);
         let paint_path = decide_paint_path(want_anim, osr_meta.is_some(), self.last_osr_dims);
+
+        // Clone/snapshot values needed in the chrome paint closure. Gated on
+        // `chrome_dirty_effective`: `renderer.frame` invokes its paint
+        // closure only when the chrome buffer is repainted (see render.rs),
+        // so a frame presenting a fresh OSR frame with unchanged chrome —
+        // the common per-tick case — skips the statusline/tab-strip clones
+        // and the context-menu overlay rebuild entirely. When the gate is
+        // closed the values are all `None` and `paint_strips` below is a
+        // no-op.
+        let (
+            statusline,
+            tab_strip,
+            confirm_close_pinned,
+            permissions_prompt,
+            overlay_data,
+            context_menu_overlay,
+        ) = if chrome_dirty_effective {
+            (
+                Some(self.statusline.clone()),
+                Some(self.tab_strip.clone()),
+                self.confirm_close_pinned,
+                self.permissions_prompt.clone(),
+                self.overlay.as_ref().map(|o| o.input().clone()),
+                self.context_menu
+                    .as_ref()
+                    .map(|cm| cm.to_overlay(lwidth, lheight)),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
         // Which chrome rows actually reached the GPU: by default only the
         // painted strip bands — the top band (tab strip + download notice,
         // a fixed upper bound: when no notice is queued it re-uploads a few
@@ -3624,19 +3652,38 @@ impl AppState {
         // arms differ only in what they hand the renderer as the OSR layer
         // (and, for `Animation`, in the splash blit layered on top).
         let paint_strips = |buf: &mut [u32], w: usize| {
+            let (
+                Some(statusline),
+                Some(tab_strip),
+                Some(confirm_close_pinned),
+                Some(permissions_prompt),
+                Some(overlay_data),
+                Some(context_menu_overlay),
+            ) = (
+                statusline.as_ref(),
+                tab_strip.as_ref(),
+                confirm_close_pinned.as_ref(),
+                permissions_prompt.as_ref(),
+                overlay_data.as_ref(),
+                context_menu_overlay.as_ref(),
+            )
+            else {
+                // Chrome not repainted this frame — nothing to paint.
+                return;
+            };
             paint_chrome_strips(
                 buf,
                 w,
                 lheight,
-                &statusline,
-                &tab_strip,
+                statusline,
+                tab_strip,
                 tab_y,
                 notice_y,
                 current_notice.as_ref(),
-                confirm_close_pinned,
-                permissions_prompt.as_ref(),
-                overlay_data.as_ref(),
-                context_menu_overlay.as_ref(),
+                Some(*confirm_close_pinned),
+                Some(permissions_prompt),
+                Some(overlay_data),
+                Some(context_menu_overlay),
             );
         };
         let res = match paint_path {

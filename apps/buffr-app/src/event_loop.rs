@@ -1468,15 +1468,23 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             if engine.pump_hint_events() {
                 self.request_redraw();
             }
-            let new_status = engine.hint_status().map(|h| UiHintStatus {
-                typed: h.typed,
-                match_count: h.match_count as u32,
-                background: h.background,
-            });
-            if new_status != self.statusline.hint_state {
-                self.statusline.hint_state = new_status;
-                self.mark_chrome_dirty();
-                self.request_redraw();
+            // `hint_status()` locks the host's tabs + active tab and clones
+            // the typed buffer on every tick; with no live session it can
+            // only ever yield `None`, so skip it unless hint mode is active.
+            // `pump_hint_events` above still drains every tick so mode
+            // transitions are noticed promptly, and `exit_hint_mode` clears
+            // `hint_state` on the way out.
+            if engine.is_hint_mode() {
+                let new_status = engine.hint_status().map(|h| UiHintStatus {
+                    typed: h.typed,
+                    match_count: h.match_count as u32,
+                    background: h.background,
+                });
+                if new_status != self.statusline.hint_state {
+                    self.statusline.hint_state = new_status;
+                    self.mark_chrome_dirty();
+                    self.request_redraw();
+                }
             }
         }
 
@@ -1986,14 +1994,28 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // so multi-monitor mixes pace to the fastest panel rather
         // than down-clocking to a stale 60Hz default. If no output
         // has reported yet (early startup) fall back to 60 Hz.
+        //
+        // `event_loop.outputs()` allocates a `Vec<OutputInfo>` with
+        // per-output String name/description clones, so it is only
+        // re-queried once per second and the cached period is reused
+        // for the intervening ticks (the loop otherwise runs at the
+        // display's refresh rate).
         let frame_period = {
-            let outputs = event_loop.outputs();
-            let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
-            if max_mhz > 0 {
-                // mhz -> period in ms: 1000 * 1000 / mhz.
-                Duration::from_micros(1_000_000_000 / max_mhz as u64)
-            } else {
-                Duration::from_millis(16)
+            let now = Instant::now();
+            match self.last_outputs_recompute {
+                Some((at, period)) if now.duration_since(at) < Duration::from_secs(1) => period,
+                _ => {
+                    let outputs = event_loop.outputs();
+                    let max_mhz = outputs.iter().map(|o| o.refresh_mhz).max().unwrap_or(0);
+                    let period = if max_mhz > 0 {
+                        // mhz -> period in ms: 1000 * 1000 / mhz.
+                        Duration::from_micros(1_000_000_000 / max_mhz as u64)
+                    } else {
+                        Duration::from_millis(16)
+                    };
+                    self.last_outputs_recompute = Some((now, period));
+                    period
+                }
             }
         };
         let next_wakeup = Instant::now() + frame_period;
