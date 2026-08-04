@@ -284,6 +284,17 @@ fn paint_buffer_len(buffer: *const u8, width: i32, height: i32) -> Option<(u32, 
 }
 
 impl OsrPaintHandler {
+    /// True when `id` is a registered popup browser (A3). A popup must never
+    /// claim the main slot: a background tab whose popup paints before the tab
+    /// itself would otherwise have `main_id` stolen, dropping the main tab's
+    /// paints forever.
+    fn is_registered_popup(&self, id: i32) -> bool {
+        self.popup_frames
+            .lock()
+            .map(|m| m.contains_key(&id))
+            .unwrap_or(false)
+    }
+
     /// Resolve the scale factor for the given browser id.
     fn resolve_scale(&self, browser_id: Option<i32>) -> f32 {
         if let Some(id) = browser_id {
@@ -303,9 +314,14 @@ impl OsrPaintHandler {
     /// Resolve (width, height) for the given browser id.
     fn resolve_dims(&self, browser_id: Option<i32>) -> (u32, u32) {
         if let Some(id) = browser_id {
-            // Check if this is the known main id.
+            // Check if this is the known main id. A popup must never claim the
+            // main slot (A3): a background tab whose popup paints before the
+            // tab itself would otherwise get `main_id` stolen by the popup,
+            // dropping the main tab's paints forever. Registration in
+            // `popup_frames` (on_after_created) precedes any popup paint, so
+            // membership is the reliable discriminator.
             let main = self.main_id.load(Ordering::Relaxed);
-            if main == id || main == -1 {
+            if !self.is_registered_popup(id) && (main == id || main == -1) {
                 // Set main_id lazily on first callback.
                 if main == -1 {
                     self.main_id.store(id, Ordering::Relaxed);
@@ -340,8 +356,12 @@ impl OsrPaintHandler {
     ) -> Option<(SharedOsrFrame, SharedOsrViewState)> {
         let id = browser_id?;
         let main = self.main_id.load(Ordering::Relaxed);
-        // Lazily set main_id on first on_paint call.
-        if main == -1 || main == id {
+        // A popup must never claim the main slot (A3): a background tab whose
+        // popup paints before the tab itself would otherwise get main_id stolen
+        // by the popup, dropping the main tab's paints forever. Registration in
+        // `popup_frames` (on_after_created) precedes any popup paint, so
+        // membership is the reliable discriminator.
+        if !self.is_registered_popup(id) && (main == -1 || main == id) {
             if main == -1 {
                 self.main_id.store(id, Ordering::Relaxed);
             }
@@ -485,5 +505,59 @@ mod tests {
         assert!((v.scale() - 1.5).abs() < 1e-3);
         assert_eq!(v.width.load(Ordering::Relaxed), 2000);
         assert_eq!(v.height.load(Ordering::Relaxed), 1400);
+    }
+
+    #[test]
+    fn popup_cannot_claim_the_main_slot() {
+        let popup_frames: PopupFrameMap = Arc::new(Mutex::new(HashMap::new()));
+        let main_frame: SharedOsrFrame = Arc::new(Mutex::new(OsrFrame::new(1, 1)));
+        let main_view = Arc::new(OsrViewState::new());
+        let popup_frame: SharedOsrFrame = Arc::new(Mutex::new(OsrFrame::new(2, 2)));
+        let popup_view = Arc::new(OsrViewState::new());
+        // `resolve_dims` reads the *view* atomics, so give the popup view
+        // distinct dims for the routing assertion below.
+        popup_view.width.store(2, Ordering::Relaxed);
+        popup_view.height.store(2, Ordering::Relaxed);
+        // Popup registered and paints FIRST (background tab): must route to
+        // the popup pair and NOT claim the main slot. The struct is built
+        // directly (not via `OsrPaintHandler::new`, which returns the
+        // `cef::RenderHandler` wrapper and hides the private members).
+        let handler = OsrPaintHandler {
+            main_id: Arc::new(AtomicI32::new(-1)),
+            frame: main_frame.clone(),
+            view: main_view.clone(),
+            popup_frames: popup_frames.clone(),
+            loading_busy: Arc::new(AtomicBool::new(false)),
+            cef_object: std::ptr::null_mut(),
+        };
+        popup_frames
+            .lock()
+            .unwrap()
+            .insert(42, (popup_frame.clone(), popup_view.clone()));
+        let (pf, pv) = handler
+            .resolve_frame_view(Some(42))
+            .expect("popup routes via popup_frames");
+        assert!(Arc::ptr_eq(&pf, &popup_frame));
+        assert!(Arc::ptr_eq(&pv, &popup_view));
+        assert_eq!(
+            handler.main_id.load(Ordering::Relaxed),
+            -1,
+            "popup must not claim main_id"
+        );
+        // resolve_dims for the popup returns the popup's dims and does not claim.
+        let (w, h) = handler.resolve_dims(Some(42));
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(
+            handler.main_id.load(Ordering::Relaxed),
+            -1,
+            "popup must not claim main_id via dims"
+        );
+        // The main tab's first paint then claims the slot and routes to the main pair.
+        let (mf, mv) = handler
+            .resolve_frame_view(Some(7))
+            .expect("main routes to main pair");
+        assert!(Arc::ptr_eq(&mf, &main_frame));
+        assert!(Arc::ptr_eq(&mv, &main_view));
+        assert_eq!(handler.main_id.load(Ordering::Relaxed), 7);
     }
 }
