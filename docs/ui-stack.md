@@ -20,6 +20,10 @@ statusline, tab strip, command line, hint overlay.
   Pulls in `wgpu`, `naga`, shaders, plus the OSR plumbing the `osr` feature
   already scaffolds.
 
+> **Superseded:** options A and B are historical alternatives — the decision
+> below (option C, wgpu OSR) is the only path, and no windowed or softbuffer
+> chrome mode remains in the tree.
+
 ## Decision — Option C, `wgpu` OSR on every platform
 
 CEF paints the page into an off-screen buffer, then the app composites that
