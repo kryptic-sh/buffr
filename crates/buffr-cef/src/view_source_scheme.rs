@@ -225,35 +225,37 @@ fn is_non_public_host(host: &str) -> bool {
         {
             return true;
         }
-        // IPv4-mapped (::ffff:127.0.0.1).
-        if let Some((_, v4)) = h.rsplit_once(':')
-            && v4.contains('.')
-            && is_non_public_v4(v4)
-        {
-            return true;
+        // Anything else must be a well-formed IPv6 literal before it is
+        // trusted as public — glibc's getaddrinfo otherwise reinterprets
+        // other numeric forms (e.g. `::ffff:7f00:1` is 127.0.0.1 in v6
+        // clothing).
+        if let Ok(addr) = h.parse::<std::net::Ipv6Addr>() {
+            return match addr.to_ipv4_mapped() {
+                // IPv4-mapped: classify by the embedded v4 address.
+                Some(v4) => is_non_public_v4(v4),
+                // A non-mapped, non-private v6 literal is public.
+                None => false,
+            };
         }
-        return false;
+        // Unparseable "IPv6" that still looks numeric: fail closed. Note
+        // `looks_numeric` deliberately excludes ':', so an invalid
+        // colon-literal falls to the public side where the fetch fails
+        // anyway — harmless.
+        return looks_numeric(h);
     }
-    is_non_public_v4(host)
+    // Canonical dotted quad (Rust's parser is strict: it rejects octal,
+    // hex, integer and shorthand forms that glibc would resolve).
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        return is_non_public_v4(addr);
+    }
+    // Not canonical, but getaddrinfo could still resolve it numerically
+    // (2852039166, 0177.0.0.1, 127.1, 0x7f.0.0.1, …) — fail closed.
+    looks_numeric(host)
 }
 
-/// `true` when `host` is a dotted-quad IPv4 literal in a non-public range.
-/// Non-numeric hosts return `false` (DNS names are resolved by the fetch
-/// itself; DNS-rebinding is out of scope for this guard).
-fn is_non_public_v4(host: &str) -> bool {
-    let octets: Vec<&str> = host.split('.').collect();
-    if octets.len() != 4 {
-        return false;
-    }
-    let mut parsed = [0u16; 4];
-    for (i, o) in octets.iter().enumerate() {
-        match o.parse::<u16>() {
-            Ok(v) if v <= 255 && !o.is_empty() => parsed[i] = v,
-            // Not a plain dotted quad — treat as a DNS name.
-            _ => return false,
-        }
-    }
-    let [a, b, _, _] = parsed;
+/// `true` when `host` is an IPv4 address in a non-public range.
+fn is_non_public_v4(addr: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = addr.octets();
     a == 0                                    // 0.0.0.0/8 "this network"
         || a == 127                           // loopback
         || a == 10                            // RFC1918
@@ -262,6 +264,16 @@ fn is_non_public_v4(host: &str) -> bool {
         || (a == 169 && b == 254)             // link-local + cloud metadata
         || (a == 100 && (64..=127).contains(&b)) // CGNAT
         || a >= 224 // multicast + reserved
+}
+
+/// `true` when `s` is a bare numeric-looking literal — every character is a
+/// hex digit, `.`, `x` or `X` — i.e. something glibc's `getaddrinfo` could
+/// resolve as a number. A DNS name (letters beyond hex, dashes, …) returns
+/// `false` and stays "public"; DNS rebinding is out of scope for this guard.
+fn looks_numeric(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | 'x' | 'X'))
 }
 
 // ---------------------------------------------------------------------------
@@ -712,8 +724,28 @@ mod tests {
             "192.169.0.1",
             "169.253.0.1",
             "2606:4700::1111",
+            "2606:4700:4700::1111",
         ] {
             assert!(!is_non_public_host(h), "{h} should be public");
+        }
+    }
+
+    #[test]
+    fn glibc_numeric_forms_are_non_public() {
+        // glibc's getaddrinfo accepts all of these numeric forms even though
+        // Rust's strict Ipv4Addr parser rejects them. Resolutions (verified
+        // on glibc): 2852039166 → 169.254.169.254, 0177.0.0.1 → 127.0.0.1,
+        // 127.1 → 127.0.0.1, 0x7f.0.0.1 → 127.0.0.1, 2130706433 → 127.0.0.1,
+        // ::ffff:7f00:1 → 127.0.0.1.
+        for h in [
+            "2852039166",
+            "0177.0.0.1",
+            "127.1",
+            "0x7f.0.0.1",
+            "2130706433",
+            "::ffff:7f00:1",
+        ] {
+            assert!(is_non_public_host(h), "{h} should be non-public");
         }
     }
 
@@ -739,6 +771,16 @@ mod tests {
         );
         // No initiator at all is treated as untrusted.
         assert!(validate_target("http://192.168.1.1/", None).is_err());
+        // The integer form of the cloud-metadata endpoint: previously
+        // slipped past the guard as "public" (getaddrinfo resolves it to
+        // 169.254.169.254).
+        assert!(
+            validate_target(
+                "http://2852039166/latest/meta-data/",
+                Some("https://evil.example/")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -754,6 +796,7 @@ mod tests {
         );
         // Different port on the same host is fine; different host is not.
         assert!(validate_target("http://127.0.0.1:9/x", Some("http://127.0.0.1:41235/y")).is_ok());
+        assert!(validate_target("http://127.0.0.1:8080/x", Some("http://127.0.0.1:8080/")).is_ok());
         assert!(validate_target("http://10.0.0.5/x", Some("http://127.0.0.1:41235/y")).is_err());
     }
 
