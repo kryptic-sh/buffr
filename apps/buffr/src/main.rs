@@ -472,6 +472,16 @@ mod unix {
             install_signal_forwarding(Arc::clone(&child_pid_slot), Arc::clone(&shutdown_requested));
 
         loop {
+            // §11-7: a shutdown signal can land while we sleep the restart
+            // cooldown below; don't spawn a fresh child after the user
+            // asked to quit. The handler stays armed (see
+            // install_signal_forwarding), so a second signal is handled
+            // rather than hitting the default disposition and orphaning
+            // the new child.
+            if shutdown_requested.load(Ordering::SeqCst) {
+                tracing::info!("shutdown requested during restart cooldown — not restarting");
+                return Ok(());
+            }
             // ── bind socket for this spawn ─────────────────────────────────
             let (sock_path, listener, hb_chan) = match (heartbeat_disable, runtime_dir.as_ref()) {
                 (false, Some(dir)) => match setup_heartbeat_socket(dir, supervisor_pid) {
@@ -826,10 +836,12 @@ mod unix {
 
     /// Install handlers for SIGINT and SIGTERM, once for the whole process.
     ///
-    /// On receipt, forward the signal to the *current* child's process group
-    /// via `killpg`, wait up to `GRACEFUL_TIMEOUT` for it to exit, then
-    /// SIGKILL if still alive. Sets `shutdown_requested` so the main loop
-    /// knows not to restart after the forwarded signal.
+    /// The handler stays armed for the supervisor's lifetime, handling every
+    /// signal (previously it unregistered after the first one). On receipt,
+    /// forward the signal to the *current* child's process group via `killpg`,
+    /// wait up to `GRACEFUL_TIMEOUT` for it to exit, then SIGKILL if still
+    /// alive. Sets `shutdown_requested` so the main loop knows not to restart
+    /// after the forwarded signal.
     ///
     /// The child pid is read from `child_pid_slot` at signal time rather than
     /// captured at install time: the supervisor restarts the child, and a
@@ -851,8 +863,12 @@ mod unix {
                 }
             };
 
-            // Block until the first signal arrives.
-            if let Some(sig) = signals.forever().next() {
+            // §11-7: stay armed. The old single-shot handler unregistered
+            // after the first signal, so a second Ctrl+C (e.g. while a
+            // fresh child was up after a restart-cooldown signal) hit the
+            // default disposition, killing the supervisor and orphaning
+            // the child. Re-arm by looping.
+            for sig in signals.forever() {
                 tracing::info!(
                     signal = sig,
                     "supervisor received signal; forwarding to child pgrp"
@@ -861,8 +877,11 @@ mod unix {
 
                 let raw = child_pid_slot.load(Ordering::SeqCst);
                 if raw <= 0 {
+                    // No live child to forward to (e.g. mid-restart
+                    // cooldown) — the main loop's shutdown checks handle
+                    // exit. Stay armed for the next signal.
                     tracing::info!("no live child to forward the signal to");
-                    return;
+                    continue;
                 }
                 // child_pid IS the pgid since the child called setsid().
                 let child_pid = Pid::from_raw(raw);
