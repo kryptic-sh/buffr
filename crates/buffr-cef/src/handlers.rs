@@ -1113,7 +1113,7 @@ wrap_display_handler! {
             if let Some(parsed) = buffr_core::edit::parse_console_event(&text, &page_nonce) {
                 match parsed {
                     Ok(event) => {
-                        buffr_core::edit::push_edit_event(&self.edit_sink, event);
+                        buffr_core::edit::push_edit_event(&self.edit_sink, browser_id, event);
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, line = %redact_console_text(&text), "edit: malformed console event");

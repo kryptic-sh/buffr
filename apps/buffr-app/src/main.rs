@@ -4692,7 +4692,26 @@ impl AppState {
     /// Drain queued edit-focus events and update `self.edit_focus`.
     fn drain_edit_focus_events(&mut self) {
         let mut mode_changed = false;
-        for ev in drain_edit_events(&self.edit_sink) {
+        // Only the active tab's browser may drive the active tab's edit
+        // state: a background or popup tab's Focus must not flip the active
+        // tab into Insert (keystroke capture), and its Blur/Mutate/Selection
+        // must not touch the active tab's edit state or clipboard (backlog
+        // §11 item 1). Popup keystrokes are delivered directly via
+        // popup_osr_key_event, so popups never need this path.
+        let active_browser = self
+            .active_engine_dyn()
+            .and_then(|e| e.active_tab())
+            .map(|t| t.browser_id);
+        for tagged in drain_edit_events(&self.edit_sink) {
+            if Some(tagged.browser_id) != active_browser {
+                tracing::trace!(
+                    browser_id = tagged.browser_id,
+                    ?active_browser,
+                    "edit event from non-active browser — dropped"
+                );
+                continue;
+            }
+            let ev = tagged.event;
             match ev {
                 EditConsoleEvent::Focus {
                     field_id, ref kind, ..
@@ -6429,10 +6448,22 @@ mod tests {
     /// Test the `EditFocus` FSM state transitions (None ↔ Editing).
     mod edit_focus_fsm_tests {
         use super::*;
-        use buffr_core::edit::{EditFieldKind, new_edit_event_sink};
+        use buffr_core::edit::{EditFieldKind, TaggedEditEvent, new_edit_event_sink};
 
         fn push_event(sink: &EditEventSink, ev: EditConsoleEvent) {
-            sink.lock().unwrap().push_back(ev);
+            sink.lock().unwrap().push_back(TaggedEditEvent {
+                browser_id: 0,
+                event: ev,
+            });
+        }
+
+        /// The sink now carries tagged events; the FSM mirror operates on the
+        /// untagged payload, so strip the tag the production drain applied.
+        fn drain_events(sink: &EditEventSink) -> Vec<EditConsoleEvent> {
+            drain_edit_events(sink)
+                .into_iter()
+                .map(|t| t.event)
+                .collect()
         }
 
         fn focus_event(id: &str) -> EditConsoleEvent {
@@ -6486,7 +6517,7 @@ mod tests {
         fn focus_moves_to_editing() {
             let sink = new_edit_event_sink();
             push_event(&sink, focus_event("f1"));
-            let evs = drain_edit_events(&sink);
+            let evs = drain_events(&sink);
 
             let mut focus = EditFocus::None;
             drain_into(&mut focus, evs);
@@ -6498,7 +6529,7 @@ mod tests {
             let sink = new_edit_event_sink();
             push_event(&sink, focus_event("f1"));
             push_event(&sink, blur_event("f1"));
-            let evs = drain_edit_events(&sink);
+            let evs = drain_events(&sink);
 
             let mut focus = EditFocus::None;
             drain_into(&mut focus, evs);
@@ -6512,7 +6543,7 @@ mod tests {
             let sink = new_edit_event_sink();
             push_event(&sink, focus_event("f1"));
             push_event(&sink, mutate_event("f1", "world"));
-            let evs = drain_edit_events(&sink);
+            let evs = drain_events(&sink);
 
             let mut focus = EditFocus::None;
             drain_into(&mut focus, evs);
@@ -6525,7 +6556,7 @@ mod tests {
             let sink = new_edit_event_sink();
             push_event(&sink, focus_event("f1"));
             push_event(&sink, blur_event("f99")); // different field
-            let evs = drain_edit_events(&sink);
+            let evs = drain_events(&sink);
 
             let mut focus = EditFocus::None;
             drain_into(&mut focus, evs);

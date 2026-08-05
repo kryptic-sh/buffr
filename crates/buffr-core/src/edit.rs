@@ -267,11 +267,23 @@ pub fn parse_payload(json: &str) -> Result<EditConsoleEvent, ParseError> {
     Ok(event)
 }
 
+/// An edit event tagged with the CEF browser id it originated from.
+///
+/// The id is known only to the handler (the wire format never carries it);
+/// the apps-layer drain drops events whose browser is not the active tab's
+/// so a background or popup tab cannot drive the active tab's edit state
+/// (backlog §11 item 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaggedEditEvent {
+    pub browser_id: i32,
+    pub event: EditConsoleEvent,
+}
+
 /// Queue shared between [`crate::handlers::BuffrDisplayHandler`] (writer)
 /// and the UI render loop (reader). Uses `VecDeque` so bursts of
 /// `focus → mutate → blur` events are preserved in order — unlike the
 /// hint sink which overwrites with a single slot.
-pub type EditEventSink = Arc<Mutex<VecDeque<EditConsoleEvent>>>;
+pub type EditEventSink = Arc<Mutex<VecDeque<TaggedEditEvent>>>;
 
 /// Construct a fresh, empty [`EditEventSink`].
 pub fn new_edit_event_sink() -> EditEventSink {
@@ -280,10 +292,11 @@ pub fn new_edit_event_sink() -> EditEventSink {
 
 /// Drain all queued events, returning them in arrival order.
 ///
-/// Returns an empty `Vec` when the queue is empty or the lock is
-/// poisoned. Callers should treat a poisoned lock as a no-op (the
-/// render loop will retry next tick).
-pub fn drain_edit_events(sink: &EditEventSink) -> Vec<EditConsoleEvent> {
+/// Each item is a [`TaggedEditEvent`] carrying the browser id the handler
+/// attached at push time. Returns an empty `Vec` when the queue is empty or
+/// the lock is poisoned. Callers should treat a poisoned lock as a no-op
+/// (the render loop will retry next tick).
+pub fn drain_edit_events(sink: &EditEventSink) -> Vec<TaggedEditEvent> {
     sink.lock()
         .map(|mut g| g.drain(..).collect())
         .unwrap_or_default()
@@ -302,12 +315,17 @@ pub const EDIT_EVENT_SINK_CAP: usize = 1024;
 /// Push one event onto the sink, dropping the oldest when the queue is at
 /// capacity. Mirrors the context-menu sink's drop-oldest policy
 /// (`CONTEXT_MENU_REQUEST_QUEUE_CAP`).
-pub fn push_edit_event(sink: &EditEventSink, event: EditConsoleEvent) {
+///
+/// The `browser_id` is attached here because only the handler knows which
+/// browser emitted the console line — the wire format never carries it.
+/// The apps-layer drain compares it against the active tab's browser id
+/// and drops events from background tabs or popups.
+pub fn push_edit_event(sink: &EditEventSink, browser_id: i32, event: EditConsoleEvent) {
     if let Ok(mut guard) = sink.lock() {
         if guard.len() >= EDIT_EVENT_SINK_CAP {
             guard.pop_front();
         }
-        guard.push_back(event);
+        guard.push_back(TaggedEditEvent { browser_id, event });
     }
 }
 
@@ -590,22 +608,37 @@ mod tests {
         let sink = new_edit_event_sink();
         {
             let mut g = sink.lock().unwrap();
-            g.push_back(EditConsoleEvent::Blur {
-                field_id: "a".to_string(),
+            g.push_back(TaggedEditEvent {
+                browser_id: 0,
+                event: EditConsoleEvent::Blur {
+                    field_id: "a".to_string(),
+                },
             });
-            g.push_back(EditConsoleEvent::Blur {
-                field_id: "b".to_string(),
+            g.push_back(TaggedEditEvent {
+                browser_id: 0,
+                event: EditConsoleEvent::Blur {
+                    field_id: "b".to_string(),
+                },
             });
-            g.push_back(EditConsoleEvent::Blur {
-                field_id: "c".to_string(),
+            g.push_back(TaggedEditEvent {
+                browser_id: 0,
+                event: EditConsoleEvent::Blur {
+                    field_id: "c".to_string(),
+                },
             });
         }
         let drained = drain_edit_events(&sink);
         assert_eq!(drained.len(), 3);
         // Order must be preserved.
-        assert!(matches!(&drained[0], EditConsoleEvent::Blur { field_id } if field_id == "a"));
-        assert!(matches!(&drained[1], EditConsoleEvent::Blur { field_id } if field_id == "b"));
-        assert!(matches!(&drained[2], EditConsoleEvent::Blur { field_id } if field_id == "c"));
+        assert!(
+            matches!(&drained[0].event, EditConsoleEvent::Blur { field_id } if field_id == "a")
+        );
+        assert!(
+            matches!(&drained[1].event, EditConsoleEvent::Blur { field_id } if field_id == "b")
+        );
+        assert!(
+            matches!(&drained[2].event, EditConsoleEvent::Blur { field_id } if field_id == "c")
+        );
         // Sink is now empty.
         assert!(drain_edit_events(&sink).is_empty());
     }
@@ -622,6 +655,7 @@ mod tests {
         for i in 0..(EDIT_EVENT_SINK_CAP + 5) {
             push_edit_event(
                 &sink,
+                i as i32,
                 EditConsoleEvent::Blur {
                     field_id: format!("f{i}"),
                 },
@@ -637,14 +671,33 @@ mod tests {
         assert_eq!(drained.len(), EDIT_EVENT_SINK_CAP);
         // The oldest 5 were dropped; the first survivor is the 6th pushed.
         assert!(
-            matches!(&drained[0], EditConsoleEvent::Blur { field_id } if field_id == "f5"),
+            matches!(&drained[0].event, EditConsoleEvent::Blur { field_id } if field_id == "f5"),
             "expected the 6th-pushed event first, got {:?}",
             drained[0]
         );
         assert!(
-            matches!(&drained[EDIT_EVENT_SINK_CAP - 1], EditConsoleEvent::Blur { field_id } if field_id == &format!("f{}", EDIT_EVENT_SINK_CAP + 4)),
+            matches!(&drained[EDIT_EVENT_SINK_CAP - 1].event, EditConsoleEvent::Blur { field_id } if field_id == &format!("f{}", EDIT_EVENT_SINK_CAP + 4)),
             "expected the last-pushed event last"
         );
+    }
+
+    #[test]
+    fn browser_id_round_trips_through_sink() {
+        let sink = new_edit_event_sink();
+        push_edit_event(
+            &sink,
+            42,
+            EditConsoleEvent::Blur {
+                field_id: "x".to_string(),
+            },
+        );
+        let drained = drain_edit_events(&sink);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].browser_id, 42);
+        assert!(matches!(
+            &drained[0].event,
+            EditConsoleEvent::Blur { field_id } if field_id == "x"
+        ));
     }
 
     #[test]
