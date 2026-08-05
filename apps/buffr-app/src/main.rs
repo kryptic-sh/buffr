@@ -1215,6 +1215,33 @@ fn update_indicator_from(status: &buffr_core::UpdateStatus) -> Option<buffr_ui::
     }
 }
 
+/// Restrict a profile directory to the owning user (0700). SQLite and
+/// CEF create files under it with the process umask (typically 0644),
+/// so the parent directory's 0700 is what keeps history, bookmarks,
+/// permissions, session and cache private from other local users
+/// (backlog §12 audit finding 4). No-op where the OS has no mode bits.
+#[cfg(unix)]
+fn restrict_dir(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restricting permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+/// Ensure the profile data dir exists, owner-only. The CLI
+/// short-circuits (`cli::dispatch`, main.rs:412) run before
+/// `resolve_paths` (main.rs:441), so without this a first-ever
+/// `--import-bookmarks` / `--clear-*` would create the data dir
+/// world-readable (backlog §12 audit finding 4).
+pub(crate) fn ensure_profile_data_dir(paths: &ProfilePaths) -> Result<()> {
+    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    restrict_dir(&paths.data)
+}
+
 /// Resolve the (cache, data) profile paths. Returns the resolved
 /// [`ProfilePaths`] plus an optional [`TempDir`] that owns
 /// the lifetime of the `--private` tree (so the caller can drop it
@@ -1239,11 +1266,15 @@ fn resolve_paths(private: bool) -> Result<(ProfilePaths, Option<TempDir>)> {
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&cache).context("creating private cache subdir")?;
         std::fs::create_dir_all(&data).context("creating private data subdir")?;
+        restrict_dir(&cache)?;
+        restrict_dir(&data)?;
         Ok((ProfilePaths { cache, data }, Some(tmp)))
     } else {
         let paths = profile_paths().context("resolving profile dirs")?;
         std::fs::create_dir_all(&paths.cache).context("creating profile cache dir")?;
         std::fs::create_dir_all(&paths.data).context("creating profile data dir")?;
+        restrict_dir(&paths.cache)?;
+        restrict_dir(&paths.data)?;
         Ok((paths, None))
     }
 }
@@ -5923,6 +5954,31 @@ mod tests {
         let dir_path = tmp.path().to_path_buf();
         drop(tmp);
         assert!(!dir_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_paths_restricts_private_subdirs_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (paths, _tmp) = resolve_paths(true).expect("resolve_paths(true)");
+        for dir in [&paths.cache, &paths.data] {
+            let mode = std::fs::metadata(dir)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} is group/other accessible ({mode:o})",
+                dir.display()
+            );
+            assert_eq!(
+                mode & 0o700,
+                0o700,
+                "{} lost owner rwx ({mode:o})",
+                dir.display()
+            );
+        }
     }
 
     #[test]

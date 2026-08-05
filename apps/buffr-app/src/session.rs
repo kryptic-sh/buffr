@@ -152,6 +152,12 @@ pub fn write(path: &Path, session: &Session) -> Result<()> {
     let json = serde_json::to_string_pretty(session).context("serializing session JSON")?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     info!(
@@ -240,5 +246,25 @@ mod tests {
         write(&path, &s).unwrap();
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "temp file should have been renamed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_restricts_session_file_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_path(dir.path());
+        let s = Session::default();
+        write(&path, &s).unwrap();
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "session file is group/other accessible ({mode:o})"
+        );
+        assert_eq!(mode & 0o600, 0o600, "session file lost owner rw ({mode:o})");
     }
 }

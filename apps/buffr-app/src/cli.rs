@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use buffr_config::{Config, ConfigSource};
 use buffr_permissions::Permissions;
 
-use crate::{profile_paths, session};
+use crate::{ensure_profile_data_dir, profile_paths, session};
 
 pub(crate) fn run_check_config(path: Option<&std::path::Path>) -> Result<()> {
     match buffr_config::load_and_validate(path) {
@@ -45,7 +45,7 @@ pub(crate) fn run_print_config(path: Option<&std::path::Path>) -> Result<()> {
 /// CLI short-circuits below (no CEF init needed).
 pub(crate) fn open_bookmarks_for_cli() -> Result<buffr_bookmarks::Bookmarks> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     let bm = buffr_bookmarks::Bookmarks::open(paths.data.join("bookmarks.sqlite"))
         .context("opening bookmarks database")?;
     Ok(bm)
@@ -87,7 +87,7 @@ pub(crate) fn run_list_bookmarks_tags() -> Result<()> {
 /// CLI short-circuits — no CEF init.
 pub(crate) fn open_downloads_for_cli() -> Result<buffr_downloads::Downloads> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     let dl = buffr_downloads::Downloads::open(paths.data.join("downloads.sqlite"))
         .context("opening downloads database")?;
     Ok(dl)
@@ -129,7 +129,7 @@ pub(crate) fn run_clear_completed_downloads() -> Result<()> {
 /// short-circuits — no CEF init.
 pub(crate) fn open_zoom_for_cli() -> Result<buffr_zoom::ZoomStore> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     let z = buffr_zoom::ZoomStore::open(paths.data.join("zoom.sqlite"))
         .context("opening zoom database")?;
     Ok(z)
@@ -155,7 +155,7 @@ pub(crate) fn run_clear_zoom() -> Result<()> {
 /// not for reading, so we pass the canonical defaults.
 pub(crate) fn open_history_for_cli() -> Result<buffr_history::History> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     let h = buffr_history::History::open(paths.data.join("history.sqlite"))
         .context("opening history database")?;
     Ok(h)
@@ -190,7 +190,7 @@ pub(crate) fn run_query_history(search: Option<&str>, limit: usize) -> Result<()
 /// CLI short-circuits — no CEF init.
 pub(crate) fn open_permissions_for_cli() -> Result<Permissions> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     let p = Permissions::open(paths.data.join("permissions.sqlite"))
         .context("opening permissions database")?;
     Ok(p)
@@ -234,7 +234,7 @@ pub(crate) fn run_forget_origin(origin: &str) -> Result<()> {
 /// callers — `--telemetry-status` and the live runtime resolve here.
 pub(crate) fn telemetry_path() -> Result<PathBuf> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     Ok(paths.data.join("usage-counters.json"))
 }
 
@@ -314,7 +314,7 @@ pub(crate) fn run_purge_crashes(config_path: Option<&std::path::Path>) -> Result
 /// the `--check-for-updates` / `--update-status` short-circuits.
 pub(crate) fn update_cache_path() -> Result<PathBuf> {
     let paths = profile_paths().context("resolving profile dirs")?;
-    std::fs::create_dir_all(&paths.data).context("creating data dir")?;
+    ensure_profile_data_dir(&paths)?;
     Ok(paths.data.join("update-cache.json"))
 }
 
