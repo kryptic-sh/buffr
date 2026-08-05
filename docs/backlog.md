@@ -601,9 +601,9 @@ browser id), `apps/buffr-app/src/main.rs:4700-4717` (drain applies every `Focus`
 to the active engine + Insert).
 
 `drain_edit_focus_events` (main.rs:4664) runs unconditionally every tick
-(event_loop.rs:1321) and, for a `Focus`, calls `run_edit_attach(&field_id)` on
-the active engine with a field id from _another_ tab's DOM. The event carries no
-browser id, so attribution is impossible.
+(event*loop.rs:1321) and, for a `Focus`, calls `run_edit_attach(&field_id)` on
+the active engine with a field id from \_another* tab's DOM. The event carries
+no browser id, so attribution is impossible.
 
 ```
 Repro: Ctrl+click / F-hint background-open a link to a page that autofocuses an input
@@ -1804,3 +1804,69 @@ last hit-test result; absorbed by finding 2's gating.
   bookmarks). Not settled: CEF `OnDownloadUpdated`'s real per-tick rate
   (Chromium throttles progress callbacks, ~1/s per download; finding 6's
   absolute cost scales with it). xtask/e2e/fuzz not traced (dev-only/cold).
+
+---
+
+## 15. Robustness audit 2026-08-05 — follow-ups from TODO.md
+
+Migrated from `TODO.md` (tracked file, removed 2026-08-05). The audit verified
+every item it raised; most turned out resolved, three still need a decision
+before any code change. Line references were refreshed against the current tree
+— several of the file's originals had drifted.
+
+### Open — need a decision
+
+#### 15-1. Internal-server token: panic on CSPRNG failure vs graceful fallback
+
+**Where:** `crates/buffr-engine/src/internal_server.rs:548` —
+`getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable")`.
+
+The comment explains the panic is intentional — a system without an OS CSPRNG is
+broken beyond recovery. But on minimal containers/CI the `getrandom` syscall can
+fail, and this is the per-launch auth token for the loopback server, so a panic
+bricks the whole browser. **Decision needed:** keep the panic, or fall back to a
+mixed entropy pool (wall-clock ^ counter ^ stack address, the same tradeoff
+`console_nonce` already documents at §12 audit finding 13).
+
+#### 15-2. `buffr-webkit` / `buffr-poc` code-quality review deferred
+
+**Where:** `Cargo.toml:55-67` — both excluded from the workspace (and CI) for
+the missing `wpewebkit-2.0` system deps; the webkit crate carries significant
+`unsafe` blocks.
+
+Deferred as experimental, not production code. Overlaps §2's "`buffr-webkit` is
+still not built by CI" verification gap — building it in a Linux job would be
+the first step toward reviewing it at all. **Decision needed:** keep both out of
+the workspace (status quo), or add a Linux-only CI job to at least compile them.
+
+#### 15-3. `BUFFR_CONNECT_GRACE_MS` has no bounds
+
+**Where:** `apps/buffr/src/main.rs:225-231` (unix) and `1010-1016` (windows
+twin) — `std::env::var("BUFFR_CONNECT_GRACE_MS")` parsed straight to a
+`Duration`, no clamp.
+
+An extreme value (0, or millions of ms) makes the supervisor time out
+immediately or wait effectively forever — harmless in production (the env var is
+a test override only, and never gates a security property: the accept thread's
+own `ACCEPT_DEADLINE_SLACK` deadline at main.rs:223 derives from the same grace,
+so it just scales with it), but a foot-gun for anyone scripting tests.
+**Decision needed:** leave it (documented test-only override), or clamp to a
+sane range (e.g. 10 ms..=5 min) at parse time.
+
+### Cleared — verified, no action needed
+
+Recorded so they are not re-raised as findings.
+
+- **`set_permissions` + `from_mode(0o600)`** (`apps/buffr/src/main.rs:694`) —
+  `std::fs::Permissions::from_mode()` is the stable `PermissionsExt` extension
+  (imported at main.rs:191), not an unstable API. Resolved.
+- **`signal::kill(child_pid, None)`** (main.rs:877-878) — `None` performs a
+  0-signal existence check; the `ESRCH` match is the correct way to detect a
+  reaped process. Resolved.
+- **`now_secs` epoch fallback** (`apps/buffr-app/src/crash_guard.rs:117-122`) —
+  `unwrap_or(0)` returns 1970 timestamps only when the system clock predates the
+  epoch; practically impossible on any real system. Resolved, low risk.
+- **`VACUUM` failures logged at `warn!`** after `clear_all()`
+  (`buffr-history lib.rs:428-429`, `buffr-downloads lib.rs:370-371`,
+  `buffr-bookmarks lib.rs:355-356`) — intentional and documented: the DELETE
+  already removed the data, VACUUM is storage hygiene. Resolved.
