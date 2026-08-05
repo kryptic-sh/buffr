@@ -580,3 +580,1227 @@ by the full workspace gate:
 - **All 12 perf findings** (P1–P8, N1–N5): commits `8621a90`..`2caa56f`, see
   section 7.
 - **CHANGELOG**: every fix recorded under `[Unreleased]` in the same commit.
+
+---
+
+## 11. Code review 2026-08-05 (8744e18) — findings
+
+Fresh full-codebase pass at low depth (correctness only) on a clean tree, split
+across four partitions (browser core, main app, engine/ui/supervisor,
+data/tooling). Every finding below was re-traced at its cited lines after the
+sub-agent pass. **One item in §10 was re-confirmed still open** (the
+`close_index` HIGH — see the correction under Cleared), not re-filed.
+
+### 1 MEDIUM — edit-mode events carry no browser attribution; a background or popup tab's page-driven field focus flips the ACTIVE tab into Insert mode
+
+**Where:** `crates/buffr-cef/src/handlers.rs:795` (edit.js injected into every
+main frame on `on_load_end`, no hidden/popup gate), `handlers.rs:1113-1117`
+(event authenticated against that browser's own nonce but pushed into the one
+shared sink), `crates/buffr-core/src/edit.rs:98-127` (`EditConsoleEvent` has no
+browser id), `apps/buffr-app/src/main.rs:4700-4717` (drain applies every `Focus`
+to the active engine + Insert).
+
+`drain_edit_focus_events` (main.rs:4664) runs unconditionally every tick
+(event_loop.rs:1321) and, for a `Focus`, calls `run_edit_attach(&field_id)` on
+the active engine with a field id from _another_ tab's DOM. The event carries no
+browser id, so attribution is impossible.
+
+```
+Repro: Ctrl+click / F-hint background-open a link to a page that autofocuses an input
+Expect: active tab stays in Normal mode
+Actual: the background tab's Focus puts the ACTIVE tab into Insert (keys pass
+       through to the page; last_focused_field points at the background tab's element)
+```
+
+Same path for popup-window focus events and for a hidden tab that focuses a
+field while not active.
+
+### 2 MEDIUM — middle-click closing the last tab exits without saving the session or marking a clean shutdown
+
+**Where:** `apps/buffr-app/src/event_loop.rs:894-902` vs the sibling paths
+`main.rs:2685-2703` (keyboard) and `context_menu.rs:638-644` — both call
+`save_session_now` + `mark_clean_shutdown` + set `shutdown_flag` before
+`event_loop.exit()`; the middle-click path calls only `event_loop.exit()`.
+
+```
+Repro: 3 tabs, middle-click each tab in the strip to close them all
+Expect: graceful exit — session saved, crash_guard launch.json cleared
+Actual: session.json keeps the stale list (restores the just-closed tab on next
+       launch); crash_guard never cleared, so two such exits within 60 s plus a
+       third launch trips LOOP_THRESHOLD (crash_guard.rs:69) and quarantines a
+       graceful session as a "crash loop"
+```
+
+### 3 MEDIUM — right-clicking inside a popup window shows the menu on the main window and acts on the active tab
+
+**Where:** `crates/buffr-cef/src/handlers.rs:1668-1777` (every browser's
+right-click lands in the shared `context_menu_sink`, `browser_id` populated),
+`crates/buffr-core/src/context_menu.rs:221-223` (browser_id documented "routes
+dispatch to the right tab" — never used),
+`apps/buffr-app/src/event_loop.rs:1494-1532` (drained from the active engine,
+rendered over the main window), and every arm of
+`apps/buffr-app/src/context_menu.rs:243ff` dispatches against
+`self.active_engine_dyn()`.
+
+```
+Repro: right-click on an image inside a popup window
+Expect: menu on the popup window; "Copy Image"/"Back" act on the popup's page
+Actual: menu renders on the main window; items act on the active tab, with
+       coordinates interpreted in main-window space
+```
+
+### 4 MEDIUM — closing a tab does not stop its media; the stashed browser keeps playing until stack eviction
+
+**Where:** `crates/buffr-cef/src/host.rs:1686-1720` (`close_index` stashable
+branch only calls `was_hidden(1)` + `set_focus(0)`; `close_browser` deferred to
+eviction), and the note at `host.rs:1531-1535` that `was_hidden(1)` does _not_
+cut audio. `any_audio_active` (host.rs:1569-1571) stays true.
+
+```
+Repro: play a song, `d` (close tab)
+Expect: playback stops
+Actual: the hidden "closed" browser keeps playing; statusline media indicator and
+       idle-inhibit stay engaged until CLOSED_STACK_CAP more tabs are closed or
+       the app exits; "reopen tab" resurrects a page that played on its own
+```
+
+### 5 MEDIUM — `any_video_active` only ever reflects the active tab; background-tab video releases the screen-lock inhibitor
+
+**Where:** `crates/buffr-cef/src/host.rs:1582-1585` (documents any-tab
+semantics), `host.rs:2746-2761` (`run_media_probe` injects into the active tab
+only), `apps/buffr-app/src/event_loop.rs:1386-1395` (probe runs on the active
+engine, and only while occluded), `handlers.rs:1131-1135` (the only writer).
+
+```
+Repro: tab A plays a video; switch to blank tab B and occlude the window
+Expect: screen stays awake (documented any-tab semantics)
+Actual: B's probe emits {video:false}, video_active flips false, the idle
+       inhibitor releases and the screen locks while A's video keeps playing
+```
+
+### 6 MEDIUM — Windows: heartbeat pipe thread is neither cancellable nor joined; each connect-timeout leaks a thread blocked in `ConnectNamedPipe`
+
+**Where:** `apps/buffr/src/main.rs:1297-1299` (spawn, `JoinHandle` discarded, no
+cancel flag), `1658-1680` (blocking `ConnectNamedPipe`, NULL overlapped; only
+exits are connect/error), `1329` (`drop(hb_rx)` does not wake it). The Unix side
+has the explicit answer this lacks: `hb_cancel` + `accept_deadline` + join
+(main.rs:519-528, 565-570, 708-782).
+
+```
+Repro: Windows; child fails to connect within connect_grace() (main.rs:1313-1321
+       kills + reaps it); restart's healthy child connects to the same pipe name
+Expect: timed-out iteration frees its thread + pipe instance; next child connects
+Actual: one blocked thread + pipe instance leaks per timeout; the kernel can match
+       the next connect to the stale instance, so the healthy child times out,
+       is killed and counted as a crash — repeating to the crash limit with no
+       browser ever running
+```
+
+The per-timeout leak is certain from the code; the starvation depends on named-
+pipe instance matching (not runtime-verified — no Windows host; consistent with
+§2's note that no Windows test job exists). Windows-only.
+
+### 7 MEDIUM — Unix: SIGINT/SIGTERM during the restart cooldown is ignored; a fresh child spawns after the user asked to quit, and the second signal orphans it
+
+**Where:** `apps/buffr/src/main.rs:624-630` (shutdown check only after a child
+outcome), `669` (250 ms `RESTART_COOLDOWN` sleep), `474-516` (loop top re-binds
+and spawns with no shutdown check), `855-866` (single-shot signal thread —
+`signals.forever().next()` then the thread exits and drops the `Signals`,
+unregistering the handlers). `child_pid_slot` is cleared to 0 at 571, so during
+the cooldown the handler logs "no live child" and returns.
+
+```
+Repro: Unix; child crashes; Ctrl+C lands inside the 250 ms cooldown window
+Expect: supervisor stops without spawning
+Actual: the loop wakes and spawns a fresh browser (setsid session leader,
+       main.rs:816-822); a second Ctrl+C now hits the default disposition,
+       killing the supervisor and leaving the new browser running orphaned and
+       unsupervised
+```
+
+### 8 MEDIUM (multi-engine configs only) — session restore applies pin/favicon-prefill to the active engine instead of the engine that opened the tab
+
+**Where:** `apps/buffr-app/src/main.rs:2880-2896` (`host` captured once from the
+active engine at 2829; `host.set_pinned(id)` and `host.tabs_summary().last()`
+run against it), `2240-2250` (`routed_open_tab_background` opens on
+`router.engine_for(url)`), `engine_router.rs:117-122`.
+
+```
+Repro: [engines] routes *.example.com → webkit; saved session has a pinned
+       example.com background tab
+Expect: tab created + pinned on webkit; prefill registered for webkit's browser_id
+Actual: the tab opens on webkit but set_pinned and the prefill run against the
+       active (cef) engine — a foreign TabId and the wrong browser_id — and the
+       tab never appears in the strip (refresh_tab_strip reads the active engine)
+```
+
+### 9 LOW-MEDIUM (multi-engine configs only) — session save persists only the active engine's tabs
+
+**Where:** `apps/buffr-app/src/main.rs:2769-2805` (`save_session_now` reads
+`host.tabs_summary()` from `self.active_engine_dyn()` only).
+
+```
+Repro: 1 tab on cef + 1 tab on webkit, then quit
+Expect: both tabs saved and restored
+Actual: every save drops the non-active-engine tabs; each restart loses them
+```
+
+### 10 LOW — `[privacy] skip_schemes = []` silently reverts to the defaults; "record everything" is impossible
+
+**Where:** `crates/buffr-config/src/lib.rs:465-466` (doc: "remove entries to
+record them (unusual but supported)"), `crates/buffr-history/src/lib.rs:484-488`
+(empty list substituted with `DEFAULT_SKIP_SCHEMES` before `is_skip_scheme` at
+526-532 ever sees it).
+
+```
+Repro: config.toml: [privacy] skip_schemes = []  then visit a file:// URL
+Expect: the visit is recorded
+Actual: HistoryBuilder substitutes the 5 defaults; record_visit returns early
+```
+
+### 11 LOW — Netscape importer: `<H3>`/`</DL>` markup inside an anchor label desyncs the folder stack
+
+**Where:** `crates/buffr-bookmarks/src/lib.rs:401-403` (independent regexes),
+`414-429` (byte-position token sort), `442-448` (push/pop).
+
+```
+Repro: <A HREF="https://ok.example/">lbl <H3>x</H3></A><DT><A HREF="https://next.example/">Next</A>
+Expect: next.example carries no spurious tag
+Actual: "x" is pushed as a folder and never popped (no </DL> belongs to it);
+       every later anchor is tagged "x" and the file's real </DL>s pop one level
+       too early. Fires only on malformed/hostile input — real Chrome/Firefox
+       exports escape `<` as &lt; — and the fuzzer can't catch it (nothing
+       asserts on tags).
+```
+
+### 12 LOW — `resolve_input` emits an unparseable URL for a port > 65535; navigation silently no-ops
+
+**Where:** `crates/buffr-config/src/search.rs:160-163` (any all-digit colon
+suffix accepted as a port, no range check), `104-107` (branch 2 emits
+`{prefix}://{trimmed}`), caller `apps/buffr-app/src/main.rs:2543-2545` (parse
+fails → warn + no-op). Violates the resolver's own contract (search.rs:74-76:
+"always a fully-qualified URL").
+
+```
+Repro: type or paste `localhost:99999` (classify_input → Host, main.rs:2535-2538)
+Expect: treated as a search or a loadable URL
+Actual: "https://localhost:99999" produced; url::Url::parse rejects the port;
+       open_tab_at fails, warn, nothing happens
+```
+
+### 13 LOW — `edit.js` teardown leaks the `focus` capture listener on every re-injection
+
+**Where:** `crates/buffr-core/assets/edit.js:286` (registers `focus`), `344-352`
+(teardown removes `focusin`/`focusout`/`input`/`mousedown`/`pointerdown`/
+`touchstart` — not `focus`); re-injection at edit.js:52-54 calls the previous
+copy's teardown.
+
+```
+Repro: soft-navigation SPA; each pushState re-triggers on_load_end re-injection
+Expect: each re-injection fully unwires the previous copy
+Actual: one stale `focus` capture closure accumulates per navigation (its events
+       are dropped by the rotated nonce, so inert, but the listener set grows
+       unboundedly over a long session)
+```
+
+### 14 LOW — hint `Ready` events are single-slot and untagged; a tab switch before the drain misroutes them
+
+**Where:** `crates/buffr-cef/src/host.rs:2247-2283` (`enter_hint_mode`),
+`handlers.rs:1095-1100` (single-slot `HintEventSink`, no browser id),
+`host.rs:2287-2308` (`pump_hint_events` applies the slot to the _currently
+active_ tab).
+
+```
+Repro: press `f` on A, switch to B before A's Ready round-trips through the
+       CEF message loop and is drained
+Expect: A's hint session receives A's hints
+Actual: A's Ready is applied to B — dropped if B has no session (A's hint mode
+       then dies: next key → Cancel), or B's hint list is replaced with A's
+       element ids (next hint key clicks the wrong element)
+```
+
+### 15 LOW — pinned-close confirmation is bypassed by a middle-click while a different confirm is pending
+
+**Where:** `apps/buffr-app/src/event_loop.rs:889-896` (guard is
+`pinned && confirm_close_pinned.is_none()` — fails open once any confirm is up;
+the modal swallows left presses only, 691-727).
+
+```
+Repro: <C-w> on pinned tab A (confirm up); middle-click pinned tab B
+Expect: B's close gated through the same confirmation
+Actual: B closes immediately, no prompt
+```
+
+### 16 LOW — a character needing 2 UTF-16 units (emoji, rare CJK) typed via the direct-text path is silently dropped
+
+**Where:** `apps/buffr-app/src/cef_translate.rs:310-318` (`resolve_char_unit`
+returns 0 for multi-unit chars), `389-391` (empty vec when vk and ch are both
+0), `405-419` (no `Char` event emitted when `ch == 0`). IME `Commit` events are
+the only surviving route; compose/hex-input emoji and direct-text keys bypass
+it.
+
+```
+Repro: focused text field; type "😀" via a direct-text path (text = "😀")
+Expect: the character reaches the page
+Actual: resolve_char_unit → 0, char_to_vk(0) → None; scancode-derived VK also 0
+       → empty vec → nothing sent (or a bare RawDown with no Char)
+```
+
+### Cleared
+
+Verified by re-reading the cited lines (✓) or traced by the sub-agent during the
+same pass (the rest):
+
+- ✓ Hint label generator is prefix-free — BFS pushes a parent's children to the
+  tail before advancing `offset`, so a parent is never in the candidate slice
+  with its own child (`hint.rs:173-226`).
+- ✓ IME UTF-16 selection range — byte→UTF-16 with clamping and reversed-pair
+  normalisation (`host.rs:2911-2934`).
+- ✓ `paint_buffer_len` / OSR FFI trust boundary — null buffer and non-positive
+  dims rejected before any pointer use; overflow-checked (`osr.rs:311-319`).
+- ✓ `render_spans` — every slice goes through `str::get`; out-of-order,
+  inverted, past-end and non-boundary spans are skipped without losing
+  surrounding text (`view_source lib.rs:147-187`).
+- ✓ Favicon BGRA→`0xAARRGGBB` packing — explicit pack matches the documented
+  compositor layout (`handlers.rs:1221-1231`).
+- Permission callback exactly-once — `take()` in `resolve`, `disarm()` on CEF
+  dismissal, `Drop` fires `cancel`/`DISMISS`; all arms covered
+  (`permissions.rs:181-318`).
+- Two `window.open()` in one task (FIFO alloc) — front-of-queue consumption
+  correct (M16); the residual stale-alloc URL reuse inside the 2 s TTL after an
+  _aborted_ popup is cosmetic (URL bar only).
+- `__buffrUserGesture` vestigial flag — written but never read in-page; no
+  behavioral effect.
+- `feed_hint_key` background-commit fallback — `OpenInBackground` committing as
+  a same-tab click is a documented, logged limitation (`host.rs:2323-2331`).
+- Tab-strip hit test — `i32::saturating_sub` saturates at `i32::MIN`, not 0, so
+  negative region-relative y survives and the reconstruction is exact (the
+  initial suspicion was wrong).
+- `scroll_to_cef_delta`'s discarded `is_pixel` flag — the distinction is encoded
+  in the delta magnitude (×10 vs ×120) before the flag is dropped.
+- Winit pointer units — physical pixels throughout; no unit mismatch.
+- OSR freshness gate / scratch swap / `chrome_upload_bands` / `ModalPanel`
+  centring / swipe detector — traced, self-consistent, edge cases unit-tested.
+- Single-instance socket — flock + atomic rename + peer-cred check hold up; the
+  reject-path write is 4 bytes and can't block.
+- `truncate_to_width` — walks `char_indices` + `len_utf8`, never byte-slices
+  mid-codepoint.
+- `blit_favicon` OOB/wrap — `checked_mul` + len guard, clamped Q16 sampling.
+- `classify` precedence (supervisor) — clean-flag overrides signal exit; hang
+  always restarts; non-zero normal exit propagates; all covered by tests.
+- History FTS5 quoting — bare `"`, `""""`, `"*"`, `OR AND` needles all return
+  `Ok`/0 rows from SQLite 3.53; `""` doubling + wrapping is the correct escape.
+- Bookmarks LIKE escaping — `escape_like` pairs with `ESCAPE '\'`; trailing
+  backslash and literal `50%`/`a_b` match literally.
+- Migration runner — `TooNew` check precedes all writes beyond the no-op
+  `CREATE TABLE IF NOT EXISTS`.
+- Downloads terminal-freeze / idempotent `record_started` — `update_progress`
+  guarded by `status='in_flight'`; double `OnBeforeDownload` reuses the row id.
+- Fuzz targets — no reachable panic in `parse_action`, `parse_keys`,
+  `import_netscape`, config round-trip; harnesses sound.
+
+**Correction to a sub-agent's Cleared claim:** one agent listed the
+`close_index` active-index math as cleared. It is not — I re-traced
+`close_index(0)` with `active = Some(2)` on [A, B, C]: `set_active_index(0)`'s
+guard `prev < tabs.len()` is `2 < 2` → false, so the old active (C) is never
+hidden. §10's HIGH finding remains open in the current tree; it was not re-filed
+above.
+
+### Hardening
+
+- `close_index`'s stashable branch and `set_active_index`'s hide-previous guard
+  interact exactly as §10 item 1 describes — the highest-value fix on this list.
+- `internal_server` accepts a request with no `Host` header — defence-weakening,
+  not a correctness bug; left for the audit pass.
+- `flatten_top_level` in xtask returns `Ok` on multiple matches despite a
+  comment saying bail — benign today (real Spotify archive has exactly one
+  `cef_binary_*` dir; sha1 gate precedes extraction); worth a comment fix.
+
+### Coverage
+
+- **Browser core** (cef/core/modal/view-source/helper): all read; deep-trace
+  coverage skipped
+  `crates/buffr-core/src/{crash.rs, telemetry.rs, updates.rs, favicon_cache.rs, inhibit/*}`,
+  `cmdline.rs` 100-249, and the head of `crates/buffr-cef/build.rs`.
+- **Main app** (apps/buffr-app): read in full except
+  `windowing/other/{cursor,ime,output,surface,window}.rs` (re-export shims) and
+  `art.txt`.
+- **Engine/ui/supervisor**: every `.rs` read (10,866 lines). The
+  `#[cfg(windows)]` supervisor module (main.rs:962-1710) was read but cannot be
+  executed here — finding 6 is structural control-flow analysis, not
+  runtime-verified.
+- **Data/tooling**: all crates read; `tests/e2e/pages/*.html` fixtures not read
+  beyond `README.md` + `e2e.js` (static inputs to the out-of-scope focus/Insert
+  logic). The sub-agent ran the in-scope suites (store 14, zoom 15, permissions
+  7, downloads 11, history 33, bookmarks 18, config 104, xtask 33 — all passed);
+  the full workspace gate was not run by the pass.
+- **Known drift found:** `tests/e2e/pages/README.md` contradicts
+  `expectations.tsv` on `autofocus.html` and `shadow_closed.html` (documentation
+  drift in the suite, not a runner defect).
+
+---
+
+## 12. Audit 2026-08-05 (8744e18) — findings
+
+Security + correctness audit, low depth, clean tree, same four partitions as
+§11. Every finding below was re-traced at its cited lines. **5 medium, 8 low — 0
+critical, 0 high.** Overall risk: low-to-moderate; the hard external boundaries
+(IPC socket, navigation input, permission prompts, pixel upload, internal-server
+token) held up, and the residual risk concentrates in the **page→app console
+bridge** (clipboard + Insert-mode) and the **browser-process fetch primitives**
+(buffr-src / Copy Image).
+
+### 1 MEDIUM — `buffr-src:` and Copy Image private-network guard classifies hostname strings, never resolutions; `127.0.0.1.nip.io`-class wildcard DNS bypasses it
+
+**Where:** `crates/buffr-cef/src/view_source_scheme.rs:150`
+(`if !is_non_public_host(&host) { return Ok(()) }`),
+`crates/buffr-core/src/private_net.rs:10-77` (`is_non_public_host` never
+resolves DNS; `:75` explicitly defers "DNS rebinding"),
+`view_source_scheme.rs:498` (ureq GET in the browser process),
+`crates/buffr-core/src/copy_image.rs:113-131` (`check_fetch_host`, same guard).
+
+```
+Repro: a page sets location.href = 'buffr-src:http://127.0.0.1.nip.io:8080/admin'
+       (scheme is STANDARD|SECURE; buffr-src has no CORS/fetch but top-level
+       navigation is the M13-intended path)
+Expect: private-network fetch refused
+Actual: "127.0.0.1.nip.io" is not localhost/.local, not an IP literal, not
+       numeric-looking → classified public → browser-process GET resolves it to
+       127.0.0.1 and renders the local service's response in the tab
+```
+
+No timing games needed — nip.io is a static resolution; the code's "DNS
+rebinding out of scope" note (private_net.rs:75) is not a boundary. Same guard,
+same bypass, in the Copy Image path (right-click → user-gesture-gated, lower
+impact). Fix: resolve-and-classify the resolved IPs, or reject the wildcard-DNS
+class. **Caveat:** reachability of the `buffr-src:` leg depends on CEF
+permitting content-initiated top-level navigation to a STANDARD|SECURE custom
+scheme — nothing in the handler enforces the "browser-initiated only" property
+the M13 comment asserts, and the M13 fix is untested at runtime (backlog §2).
+
+### 2 MEDIUM — a page can overwrite the system clipboard at any time via a forged edit-bridge `Selection` event (pastejacking)
+
+**Where:** `apps/buffr-app/src/main.rs:4752-4763` (`Selection` →
+`clipboard_set_text` unconditionally, drained every tick, no mode or gesture
+gate), reachable because the page nonce is page-readable
+(`crates/buffr-core/src/edit.rs:175-178`: "a hostile top frame can emit
+authentic edit lines"), accepted by `parse_console_event` (edit.rs:198-204),
+value capped at 256 KB (edit.rs:184). `window.__buffrEmitSelection` is also a
+page-callable global (`crates/buffr-core/assets/edit.js:449-453`).
+
+```
+Repro: any hostile page runs console.log('__buffr_edit__:<nonce>:' +
+       JSON.stringify({type:'selection', value:'https://evil.example/'}))
+       (the nonce is readable by hooking console.log, per §3 known-accepted)
+Expect: clipboard writes require a user gesture / Visual-mode yank
+Actual: the user's system clipboard is replaced at any time; a later paste lands
+       attacker-chosen content in a terminal or form
+```
+
+### 3 MEDIUM — page-driven focusin force-enters Insert mode; the documented gesture gate is dead code (keyboard hijack)
+
+**Where:** `apps/buffr-app/src/main.rs:1594-1599` (field doc: "pages can't drag
+us into Insert via autofocus or programmatic `.focus()`"), `4684-4717` (any
+`Focus` enters Insert; `insert_intent_at` merely cleared at 4701). Grep shows
+`insert_intent_at` is written (event_loop.rs:958, main.rs:2549), cleared (4701)
+and initialised (2115) — **never read as a gate**.
+
+```
+Repro: a page with a hidden <input> calls el.focus() (or autofocus) on load
+Expect: keystrokes keep going to the keymap (per the field's doc)
+Actual: Insert mode engages; every vim keystroke (:, /, o, y, d…) goes into the
+       page's field — keystroke capture with no user gesture needed
+```
+
+The any-Focus-enters-Insert behavior itself is documented as deliberate at
+main.rs:4684-4697 (a caret must accept typing); the defect is the dead
+`insert_intent_at` field whose doc promises the opposite, and the keystroke-
+hijack impact being accepted without a security note. Same root as §11 item 1
+(cross-tab misattribution) — this is the same-tab variant. Fix: implement the
+gesture gate or delete the field + doc and document the tradeoff.
+
+### 4 MEDIUM — profile data stores are created world-readable; any local user can read history, bookmarks, permission grants, session
+
+**Where:** `crates/buffr-store/src/lib.rs:58-61` (SQLite `READ_WRITE | CREATE` —
+file created `0666 & ~umask`, typically `0644`; `tune()` at 79-84 sets no mode),
+`apps/buffr-app/src/main.rs:1245-1246` (`create_dir_all` →
+`~/.local/share/buffr`, `~/.cache/buffr` at `0755`),
+`apps/buffr-app/src/session.rs:154` (`fs::write` → `0644`). The supervisor
+already shows the right standard — `ensure_private_dir` enforces 0700 + uid +
+symlink-reject (`apps/buffr/src/main.rs:346-372`) — but it is never applied to
+the XDG profile dirs.
+
+```
+Repro: multi-user box, default umask 022; user A browses; user B lists
+       ~A/.local/share/buffr/
+Expect: A's history, bookmarks, permissions (camera/mic/geolocation grants),
+       session.json and CEF cookie/cache trees are unreadable by B
+Actual: all readable (0644/0755); full browsing history + permission state
+       disclosed to any other local user
+```
+
+Umask-077 machines are immune. Fix: chmod profile dirs 0700 / files 0600 at
+`resolve_paths`/`open_tuned` (or SQLITE_OPEN_NOFOLLOW + explicit mode).
+
+### 5 MEDIUM (Windows-only) — predictable named-pipe heartbeat lets another local user force a kill/restart loop and the 3-strike supervisor exit
+
+**Where:** `apps/buffr/src/main.rs:1029-1032` (`\\.\pipe\buffr-supervisor-<pid>`
+— pid is enumerable), `1526-1543` (`CreateNamedPipeW` with a null security
+descriptor at 1541 — Microsoft documents the default pipe DACL as granting
+Everyone read access), `1658-1679` (first connection treated as the child),
+`1320` (no pings → `kill_and_reap`), `1407-1416` (3 hangs / 30 s → exit 1).
+
+```
+Repro: Windows; another local user enumerates buffr's pid and either opens the
+       pipe with GENERIC_READ or pre-creates their own instance of the name
+Expect: the watchdog only ever talks to the real child
+Actual: the attacker's handle completes ConnectNamedPipe → watchdog starts →
+       no pings → the browser is killed and restarted; 3× in 30 s → supervisor
+       exits 1, browser left dead
+```
+
+Unix is not affected (0600 socket in a 0700 per-uid dir, verified §11). Distinct
+from §11 item 6 (same pipe, thread-leak angle) — this is the cross-user DoS
+angle. Fix: per-launch random pipe-name suffix, an explicit creator-only DACL,
+or pass the handle via inheritance. **Caveat:** DACL facts are from Microsoft's
+documentation, not a local run; the connect-race semantics are inference.
+
+### 6 LOW-MEDIUM — server-chosen download filename is written to `default_dir` verbatim; an existing file is silently replaced
+
+**Where:** `crates/buffr-cef/src/handlers.rs:1295-1296`
+(`target_dir.join(safe_name)`), `:1310`
+(`show_dialog = if ask_each_time {1} else {0}`), `:1333` (`callback.cont`),
+`crates/buffr-config/src/lib.rs:565` (`ask_each_time` defaults **false**),
+`sanitise_filename` (handlers.rs:1822-1844 — traversal-safe but never
+uniquifies).
+
+```
+Repro: a page triggers a download whose suggested name already exists in
+       default_dir (e.g. "report.pdf")
+Expect: Chrome-style uniquification ("report (1).pdf")
+Actual: the existing file is replaced (Chrome uniquifies at this point)
+```
+
+**Caveat:** CEF's exact overwrite-vs-uniquify behaviour at this `cont` call
+cannot be verified from this tree — confirm against CEF before treating as
+exploitable. If CEF writes verbatim, add a `file (n)` pass or force
+`ask_each_time`.
+
+### 7 LOW — session restore hands URLs straight to CEF with no scheme allow-list
+
+**Where:** `apps/buffr-app/src/session.rs:123-142` (validates only `version`),
+restore paths `main.rs:2850` (`host.navigate`) and `2880`
+(`routed_open_tab_background`). Every other navigation entry point has a gate —
+IPC allow-list (`single_instance.rs:76-101`, excludes `javascript:`/`data:`),
+`resolve_input` (search.rs:214-228), `classify_navigation`
+(engine_router.rs:225, 245-254) — but a `javascript:`/`file:`/`chrome:` URL in
+`session.json` is handed to CEF at startup.
+
+```
+Repro: a same-user writer puts {"version":1,"tabs":["javascript:…"]} in session.json
+Expect: restored URLs pass the same scheme gate as every other entry point
+Actual: CEF navigates it directly at startup
+```
+
+Defense-in-depth asymmetry (same-user attacker already controls the machine);
+not a remote hole. Fix: run restored/CLI URLs through `resolve_input`-style
+scheme filtering.
+
+### 8 LOW — Windows single-instance IPC has no peer authorization; the forward allow-list even includes `file:`/`chrome:`
+
+**Where:** `apps/buffr-app/src/single_instance.rs:569-584` (`peer_is_us` on
+Windows returns `true` unconditionally — pid is only logged), `76-87`
+(`ALLOWED_FORWARD_SCHEMES` includes `file`, `about`, `chrome`, `view-source`,
+`mailto`; only `javascript:`/`data:` are excluded), pipe name derivable from the
+cache path (single_instance.rs:236-246). Unix is properly `SO_PEERCRED`-gated
+(542-565).
+
+```
+Repro: Windows; another local user opens the named pipe and sends {"urls":
+       ["file:///C:/Users/victim/secret.txt"]}
+Expect: the peer is verified as the same user before anything is honoured
+Actual: accepted unconditionally; the URL opens in the victim's browser
+       (content shown on the victim's screen, not exfiltrated)
+```
+
+Reachability depends on the pipe's default DACL (unverified here); the check
+itself is a no-op either way. Fix: real peer-credential check or a restrictive
+pipe security descriptor.
+
+### 9 LOW — the internal-server auth token is persisted to history and session files and shown in chrome, contradicting its "never written to disk" design
+
+**Where:** `crates/buffr-engine/src/internal_server.rs:12-14` (doc: "reset every
+launch, never written to disk"), `234-237` (`url_for` embeds `<token>` in the
+URL), `crates/buffr-cef/src/handlers.rs:717, 734-738` (`frame.url()` recorded
+verbatim via `record_visit`; `DEFAULT_SKIP_SCHEMES` doesn't cover `http`),
+`apps/buffr-app/src/main.rs:2791` (same raw URL into session.json),
+`host.rs:108-133` (`to_display_url` only handles `view-source:` — statusline
+shows it too).
+
+```
+Repro: open buffr://new (or any internal page); quit; read session.json /
+       history.db
+Expect: the token never touches disk
+Actual: http://127.0.0.1:<port>/<token>/new is stored verbatim in both files
+```
+
+Impact is bounded: the token only gates GET-only internal pages (handlers
+receive no request data — cleared), and it dies at the next launch. Fix (in
+buffr-cef/app): skip internal navigations in history/session recording or record
+the display URL.
+
+### 10 LOW — unbounded popup-window creation; no app-side cap on live popups
+
+**Where:** `apps/buffr-app/src/event_loop.rs:1563-1645` (every `PopupCreated`
+spawns a winit Toplevel + wgpu Renderer + CEF browser; `self.popups` never
+capped), `crates/buffr-cef/src/handlers.rs:240-330` (every NEW_POPUP/NEW_WINDOW
+disposition routed to a real window; `_user_gesture` at 248 ignored),
+`crates/buffr-cef/src/osr.rs:88-94` (`PENDING_POPUP_ALLOC_CAP = 32` bounds only
+the pre-`on_after_created` queue).
+
+```
+Repro: a page evades CEF's popup blocker (gesture-triggered chain, popunder)
+Expect: a cap on live popup windows
+Actual: unbounded windows/GPU/fds until the process degrades
+```
+
+Relies entirely on the engine's popup blocker today. Fix: cap `self.popups`
+(match the queue cap) or gate on `_user_gesture`.
+
+### 11 LOW — `import_netscape` has quadratic tag amplification: a sub-MB hostile bookmark file can hang import and bloat the store to 10⁸ rows
+
+**Where:** `crates/buffr-bookmarks/src/lib.rs:478-481` (per anchor, every
+ancestor folder cloned into `tags`, no depth cap), `639-644` (one
+`INSERT OR IGNORE` per tag inside the single import transaction),
+`apps/buffr-app/src/cli.rs:54-58` (import entry, file read unbounded).
+
+```
+Repro: ~800 KB file: 10⁴ nested <H3><DL> levels then 10⁴ anchors
+Expect: import work linear in file size
+Actual: 10⁴ tags × 10⁴ anchors = 10⁸ INSERTs in one transaction — tens of
+       minutes of CPU, GB-scale WAL growth, and a permanently bloated store
+       (every bookmark carries 10⁴ tags, slowing all later search/all)
+```
+
+Fix: cap folder depth / per-anchor tag count so work is linear in input.
+
+### 12 LOW (dev-only) — xtask CEF trust chain: SHA-1 protects against corruption only, and the download/decompress path is unbounded
+
+**Where:** `xtask/src/main.rs:460-493` (`verify_sha1` against the digest from
+`index.json`, fetched over the _same_ TLS channel as the archive at 216-272 — a
+hostile CDN can publish both), `381-408` (download, no size cap), `525-556`
+(`extract_tar_bz2`, bzip2 with no output bound).
+
+```
+Repro: compromised Spotify CDN serves a matching-hash decompression bomb, or
+       arbitrary libcef.so
+Expect: an independent root of trust, or at least size bounds
+Actual: the hash catches truncation/swapped downloads only (exactly what the
+       comment at 453-459 claims); a hostile CDN can ship arbitrary code into
+       every built binary, or exhaust the dev box's disk
+```
+
+Inherent to the design (same-channel digest) — the finding is the size bounds.
+`fetch-cef` is manually invoked, so exposure is the developer running it.
+
+### 13 LOW — console-IPC nonce falls back to a non-cryptographic RNG when `getrandom` fails
+
+**Where:** `crates/buffr-core/src/console_nonce.rs:66-81` (`new_console_nonce`),
+`84-107` (`fallback_entropy`: splitmix64 seeded from wall-clock ^ counter ^
+stack address). Documented as deliberate (59-65).
+
+```
+Repro: a broken sandbox where the OS CSPRNG is unavailable (the one environment
+       where the nonce is the only cross-frame boundary)
+Expect: cross-frame forgery stays closed
+Actual: the 128-bit token is seeded from guessable-ish values; a subframe could
+       forge hint/edit/media events
+```
+
+Fallback-only and explicitly a documented tradeoff ("degrades the hardening
+rather than bricking"); listed for completeness, not as a regression.
+
+### Cleared
+
+Re-verified by re-reading the cited lines (✓) or traced by the sub-agents (the
+rest):
+
+- ✓ `buffr-src:` script-injection / XSS — every interpolation is
+  `serde_json`-escaped, V8-fed directly; `capture_to_class` uses only bundled
+  grammar-query class names, all source text `html_escape`d.
+- ✓ Hint-commit injection via `__buffrHintCommit({id})` — `element_id` is
+  `u32`-typed by serde, the splice emits digits only.
+- ✓ `on_favicon_urlchange` — goes through CEF's own network stack
+  (`download_image`, favicon decode, 64 px cap), not the ureq path; not SSRF.
+- ✓ `sanitise_filename` traversal — `Path::file_name()` strips `../`; `.`/`..`
+  fall back to "download"; reserved stems pinned by tests.
+- ✓ Zip-slip / tar traversal in xtask — `validate_archive_name` (419-451) +
+  `tar_path_is_safe` (511-523) + the tar crate's `unpack_in` canonicalisation
+  (parents + link targets) with `Ok(false)` bailed on.
+- ✓ SQL injection (all stores) — every query parameterized; bookmarks LIKE
+  `ESCAPE '\'` + `escape_like`; history FTS needle `"…"`-quoted with `"`
+  doubled; `load_tags_bulk` chunks at 500.
+- ✓ Netscape importer panic paths — byte offsets char-aligned, entity bodies
+  capped at 12 bytes, all regexes linear-time. (The §11 folder-stack desync is
+  data-integrity only: `pop()` on an empty stack is a no-op, nothing reaches fs
+  or code.)
+- ✓ Internal-server request caps — 32 KiB request line → 414, 16 KiB header
+  block → 413, 32 inflight → 503, enforced _while_ reading; no OOM path.
+- ✓ Internal-server injection / confused deputy — request path/query/headers
+  never reach handlers (they take no args); GET-only; token CSPRNG 128-bit,
+  constant-time compare; exact-authority Host check incl. port.
+- ✓ Unix supervisor file hygiene — socket 0600 in a 0700 per-uid dir verified by
+  symlink_metadata + uid + mode; clean flag requires a regular file owned by us;
+  stale-socket unlink-before-bind safe.
+- ✓ IPC payloads — line cap, 100-URL / 1 KB-URL caps, scheme allow-list, serde
+  recursion limit — all present and tested; `javascript:`/`data:` rejected.
+- ✓ `resolve_input` / omnibar / paste / SearchSelection — `javascript:`/`data:`
+  map to a search query; no navigation injection.
+- ✓ Permission prompt — `resolve_permission` matches the prompt id against the
+  queue front; stale answers discarded.
+- ✓ OSR pixel upload — `is_osr_frame_fresh` enforces `pixels_len == w*h*4`
+  before `write_texture`.
+- ✓ New-tab HTML — keymap/splash substitutions escaped or static; splash JS push
+  JSON-escaped and gated to `buffr://new`.
+- ✓ Crash-guard/session writes — tmp+rename atomic and symlink-safe; corrupt
+  launch.json degrades to fresh; quarantine is rename-aside, not delete.
+- ✓ Ctrl+V insertText — `serde_json::to_string`-escaped before `execCommand`.
+- ✓ `data:` URLs in image_copy — bounded decode (`IMAGE_FETCH_MAX_BYTES`), no
+  network; `blob:` rejected.
+- ✓ buffr-ui — no HTML/JS built anywhere; page-derived strings render as
+  rasterized glyphs with bounds-checked blits; favicon `checked_mul` vs
+  `pixels.len()`.
+- ✓ media_js — coords and image URL `serde_json`-encoded before splicing.
+- ✓ Permission/popup queues — poisoned locks degrade to empty; answers applied
+  to the exact entry shown.
+- ✓ Fuzz harnesses — all five targets parse-and-discard, no assertions in the
+  fuzz path, fresh in-memory store per netscape input.
+
+### Hardening
+
+- `password-store=basic` — cookies/passwords plaintext in the profile dir;
+  deliberate (app.rs:153-161) but worth a config escape hatch to a real keyring.
+- `open_tuned` sets no `busy_timeout` (known, store lib.rs:79-84); watcher
+  callback mutex poisoning (known); downloads `u64 → i64` casts round-trip
+  losslessly today but any future `ORDER BY` on them would see negatives.
+- `resolve_default_dir` returns a relative `default_dir` verbatim (config
+  lib.rs:585-587) despite the doc claiming absolute-only — downloads land
+  relative to cwd.
+- Config `homepage`/`new_tab_url`/search-engine `url` templates never
+  scheme-validated at parse (same-user trust; navigation guards live elsewhere).
+- Store DB paths opened without `SQLITE_OPEN_NOFOLLOW` — a symlinked DB path is
+  followed (same-user trust).
+- Windows `%TEMP%\buffr` created with no owner/ACL verification
+  (main.rs:1168-1173); per-user TEMP makes it same-user-only today.
+- Unix signal-forwarding pgid-reuse window between child reap and
+  `child_pid_slot.store(0)` (main.rs:571) — milliseconds, same-uid.
+- `InternalServer::set_routes` silently drops a poisoned-lock update
+  (internal_server.rs:242) — routes freeze, no crash.
+- `WaylandNativeHandles` unsafe `Send`/`Sync` on raw pointers (types.rs:42-43) —
+  documented lifetime invariant, enforced nowhere; consumed by buffr-webkit.
+- §11's `close_index` HIGH remains the top correctness item; the page→app bridge
+  gate (fix for findings 2+3) is the top security item.
+
+### Coverage
+
+- **Browser core:** every CEF callback class traced (console, load,
+  context-menu, permission, audio, popup, download, find, favicon, cursor,
+  paint, buffr-src handler); every JS asset read. GAPs:
+  `crates/buffr-cef/build.rs` not read; `inhibit/{macos,windows,wayland}.rs`
+  contract-level only; apps-layer dispatch-side impact of the §11 attribution
+  items assessed only to the crate boundary.
+- **Main app:** cli, single_instance, crash_guard, session, engine_router,
+  context_menu, heartbeat, cef_translate, paint_policy, chrome_paint,
+  event_loop, main (startup/restore/omnibar/edit-bridge/permissions/shutdown),
+  render unsafe/pixel paths. GAP:
+  `windowing/other/{ime,keyboard,pointer,surface,window, geometry,output,cursor,event}.rs`
+  skimmed via grep only; wgpu shader/format handling not line-audited.
+- **Engine/ui/supervisor:** all 21 engine + 8 ui + 2 supervisor files read,
+  every checklist class walked. GAP: internal-page HTML assembly (keybind/splash
+  substitution) lives in apps/buffr-app — the real XSS surface for `buffr://new`
+  — outside the assigned paths, not examined here.
+- **Data/tooling:** all store crates, config, xtask (all 2761 lines), 5 fuzz
+  targets, e2e scripts read. GAPs: (a) buffr-core console parsers and CEF
+  download/zoom/permission handlers feeding the stores are out of scope — their
+  page-controlled strings reach the stores via recorders not audited here; (b)
+  Windows/macOS-only xtask paths (MSI/DMG) not compiled here; (c) Chromium's own
+  perms for the CEF cache/LocalStorage subdirectories not verified — finding 4
+  is scoped to buffr-created files.
+- Windows-gated code (supervisor pipes, single-instance IPC, inhibit) is
+  structurally traced but never executed on this Linux host — consistent with
+  §2's note that no Windows test job exists.
+
+**Summary:** 0 critical, 0 high, 5 medium, 8 low. Overall risk is
+low-to-moderate. Top fixes in order: (1) gate the page→app bridge — a real
+gesture/Visual-mode gate on the `Selection` clipboard write and the
+`Focus`→Insert transition (kills findings 2+3, same root: the console bridge
+treats page input as trusted); (2) resolve-and-classify in the private-network
+guard (finding 1) or reject the wildcard-DNS class; (3) chmod the profile dirs
+0700/files 0600 (finding 4) — the only cross-user data exposure; (4) the Windows
+pipe name/DACL (finding 5).
+
+---
+
+## 13. Tidy 2026-08-05 (8744e18) — cleanups
+
+Quality pass (behavior-preserving cleanups only) on the same four partitions.
+Every candidate below was verified against its call sites after the sub-agent
+pass (`rg` across the whole workspace — a `pub` item in a lib crate is not
+linter-flagged as dead, so grep is the only oracle). Ranked by size of win.
+
+### Dead code (delete)
+
+- **`crates/buffr-engine/src/media_js.rs` — the whole module is dead (99
+  lines).** Its six fns (`play_pause`, `toggle_mute`, `toggle_loop`,
+  `toggle_controls`, `picture_in_picture`, `copy_image_url`) have zero callers;
+  the live paths are the `BrowserEngine` trait methods (separate stubs,
+  engine.rs:410) implemented per-backend. Delete the file + `pub mod media_js;`
+  (engine lib.rs:54).
+- **Four dead `pub` methods on `BrowserHost`** (host.rs): `run_edit_apply`
+  (:2435, no trait counterpart), `print_active` (:2633),
+  `reload_ignore_cache_active` (:2628), `frame_del` (:2614) — zero call sites in
+  the workspace.
+- **`BrowserHost::new`** (host.rs:430-463) — 12-arg constructor forwarding
+  verbatim to `new_with_options`; zero callers. Delete, keep `new_with_options`.
+- **`make_client`** (handlers.rs:154-220) — 33-arg pass-through with a single
+  caller (host.rs:1316) forwarding every arg unchanged to the macro-generated
+  `BuffrClient::new`. Delete `make_client`, call `BuffrClient::new` directly.
+- **`insert_intent_at` dead field** (main.rs:1594-1599, init :2115, writes
+  :2549 + event_loop.rs:958, clear :4701) — write-only; the any-Focus-enters-
+  Insert behavior it was meant to gate is deliberate (audit §12-3). Delete the
+  field + both writes + the stale doc comment.
+- **`Mode` enum** (buffr-modal/src/actions.rs:20-28) — never constructed or
+  read; delete + its re-export (buffr-modal lib.rs:53, buffr-ui lib.rs:48).
+- **`PendingPopupAlloc` + `new_pending_popup_alloc`**
+  (buffr-engine/src/popup.rs:62, 76-78) — replaced by buffr-cef's own queue
+  (osr.rs:72 comment confirms); only re-exports remain (engine lib.rs:78, cef
+  lib.rs:91).
+- **`TabOptions` / `TabSession` in buffr-engine** (tab.rs:15-30) — only
+  references are the crate's own tests and the re-export (lib.rs:83); buffr-cef
+  defines its own `TabSession` (host.rs:75). Delete both + the re-export names.
+- **`pop_front` / `peek_front`** (buffr-engine/src/permissions.rs:88-100) plus
+  the four dead alias re-exports `new_permissions_queue` /
+  `peek_permission_front` / `pop_permission_front` / `permissions_queue_len`
+  (engine lib.rs:73-75) — apps uses
+  `peek_front_entry`/`take_front_matching`/`queue_len`; the two fns survive only
+  in their own in-file tests (delete the test usages too).
+- **`InternalServer::set_routes`** (internal_server.rs:241-245) — zero callers,
+  not even tests (its doc claims "tests use this" — they don't).
+- **`ContextMenuOverlay::row_at`** (buffr-ui context_menu.rs:255-257) and
+  **`InputBar::paint`** (input_bar.rs:310-312) — zero callers; apps use
+  `hit_test` and `paint_at`.
+- **`KeyChord::new`** (buffr-modal/src/key.rs:56), **`Keymap::leader`**
+  (keymap.rs:100), **`HintAlphabet::is_empty`** (buffr-core/src/hint.rs:129 —
+  can never return true by construction) — zero callers.
+- **`Engine::count`** (buffr-modal/src/engine.rs:151) — used only in its own
+  tests; `count_buffer` is the live accessor (main.rs:3026).
+- **`BuffrLoadHandler.edit_sink`** (handlers.rs:649, 542) — write-only; its only
+  "use" is `let _ = &self.edit_sink;` (799). Remove field + constructor arg +
+  the no-op line.
+- **windowing dead accessors** (apps/buffr-app, linter-invisible behind
+  `#[allow(dead_code)] mod windowing;`): `SurfaceId::as_u64` (surface.rs:20),
+  `OutputId::as_u64` (output.rs:17), `OutputInfo.description` (output.rs:30 —
+  always written `None`), `Position::ZERO` (geometry.rs:16). Leave `Rect`
+  (documented deliberate wayr shape-parity, main.rs:196-199).
+- **Dead computation in paint path** — `host_is_loading` (main.rs:3520-3523,
+  discarded at :3596) and the `browser_id` destructure in `pump_cursor_changes`
+  (main.rs:3206, :3216 — a comment claims it's "logged"; it isn't). Delete both.
+- **`_phantom: PhantomData<T>`** (windowing/other/event_loop.rs:146, init :166)
+  — `T` is already used by `inner` and `proxy`; delete field + init + the stale
+  doc ("Stash any `Window`s…" describes nothing that exists).
+- **Three unreachable `"space"` mapping arms** — each shadowed by an earlier
+  check in the same chain: `parse_named_key` (buffr-modal key.rs:262;
+  `parse_named` maps `"space"` to `Char(' ')` at :195 first), `map_named`
+  (adapter.rs:57; `chord_from_parts` handles it at :125), `WNamed::Space`
+  (winit_adapter.rs:129; `chord_from_logical` returns early at :90). Keep the
+  `NamedKey::Space` variant itself (matched at main.rs:4443).
+- **`fuzz/fuzz_targets/fuzz_target_keys.rs:7-14`** — a no-op loop
+  (`for chord in &chords { let _ = chord; }`) whose comment describes a
+  discarded approach. Drop the loop + comment; keep `parse_keys`.
+- **`cef_minimal_url`** (xtask:302) — test-only, lives in prod code under
+  `cfg_attr(not(test), allow(dead_code))`; move into the tests module.
+
+### Duplication (extract a helper)
+
+- **`run_heartbeat_loop` duplicated across unix/windows** (apps/buffr-app
+  heartbeat.rs:184-255 vs 722-783) — same ~60-line loop, differing only in the
+  stream type (`UnixStream` vs `std::fs::File`, both `io::Write`) and
+  "socket"/"pipe" in log strings. Unify as `run_heartbeat_loop<W: Write>`; the
+  identical `Heartbeat` struct + `mark_alive`/`is_fatal`/`tick` (69-169 vs
+  623-718) can share a non-cfg block. Caveat: the Windows arm is not compiled
+  locally; a Windows CI round-trip proves it.
+- **Atomic-write helper duplicated** — session.rs:147-164 and
+  crash_guard.rs:137-148 are the same create-dir-all → `to_string_pretty` →
+  `.json.tmp` → rename. Extract
+  `write_json_atomic(path, &impl Serialize, what)`.
+- **"Last tab gone → graceful exit" ×3** — main.rs:2689-2703, main.rs:2729-2738,
+  context_menu.rs:638-644 all run
+  `save_session_now(); mark_clean_shutdown(); shutdown_flag.store(true); request_redraw();`.
+  Extract `fn request_exit`.
+- **Deadline-clamp idiom ×9** — event*loop.rs:2024-2027, 2033-2036, 2039-2042,
+  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each `let
+  deadline = match self.X { Some(at) if at < deadline => at, * => deadline
+  }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
+- **`key_to_neutral_events`** (cef_translate.rs:395-431) — three near-identical
+  `NeutralKeyEvent` literals; `NeutralKeyEvent` is not `#[non_exhaustive]`
+  (buffr-engine input.rs:38), so build one base literal and use struct-update
+  `..base`. ~24 lines → ~10.
+- **`cli.rs` `open_*_for_cli` ×5** (cli.rs:46-52, 88-94, 130-136, 156-162,
+  191-197) — identical "profile_paths → create_dir_all(data) → store open"
+  scaffolding differing only in the store constructor. One helper taking
+  filename + `impl FnOnce(PathBuf) -> Result<T>`.
+- **chrome_paint modal-popup paint blocks** (chrome_paint.rs:224-263, 282-321) —
+  both destructure `ModalPanel`, fill border, fill inner, paint content. Extract
+  `paint_modal_panel`.
+- **Statusline right-pen cells ×7** (buffr-ui lib.rs:206-263) — `private`,
+  `update_indicator`, `find_query`, `hint_state`, `engine_hint`, `count_buffer`,
+  `zoom` repeat the same build-string → width → `right_pen -= w` → draw → `-= 8`
+  block. Extract `right_cell(...)`.
+- **`host_deb_arch` / `host_rpm_arch` / `host_msi_arch`** (xtask:310-342) —
+  identical `cfg!(target_arch)` chains differing only in the returned token. One
+  `fn host_arch_token(x86_64, aarch64) -> &'static str`.
+- **`cargo build -p buffr -p buffr-app -p buffr-helper` block** (xtask:664-682
+  vs 1044-1059) — copy-pasted; extract
+  `build_binaries(workspace, release, target)`. The
+  `if release { "release" } else { "debug" }` profile string also repeats at
+  658/1028/1532/1811.
+- **`copy_file_executable`** (xtask:946-958) inlines what `set_executable`
+  (1238-1251) already does — call it.
+- **`mode_name(PageMode)` duplicated in one crate** — config lib.rs:1006-1014
+  and keybinding.rs:300-308. Make one `pub(crate)`.
+- **host-head extraction** — search.rs:155-163 (`looks_like_url`) and 196-199
+  (`needs_http`) each re-implement `split(['/', '?', '#']).next()` +
+  `rsplit_once(':')` port-strip, both with a dead `.unwrap_or("")`. Extract
+  `fn host_head(s) -> &str`. Pure extraction only (the port>65535 finding §11-12
+  is separate).
+
+### YAGNI / over-abstraction
+
+- **`deserialize_keymap`** (config lib.rs:70, 657-664) — pure pass-through whose
+  doc admits it exists "so we can later add a normalization pass". That pass
+  never arrived; the derived deserializer behaves identically. Delete the
+  attribute + the fn.
+- **`Keymap::audit_default_bindings(_leader)`** (buffr-modal keymap.rs:227) —
+  dead parameter (named `_leader`), and the doc claims it "renders the resolved
+  `<leader>` chord" which the code does not do. Drop the param, the caller-side
+  leader resolution (cli.rs:375-389), and fix the doc (keymap.rs +
+  docs/site/keymap.md).
+- **`buffr_cef::new_tab` re-export module** (cef lib.rs:82-85) — no users; apps
+  import from `buffr_engine::newtab` (main.rs:156-161). The file's own comments
+  frame it as a deliberate Phase-6e compat shim — owner's call whether the shim
+  still earns its keep.
+- **Over-exposed pub API with no in-workspace users** — buffr-ui constants
+  `FAVICON_RENDER_SIZE` (tab_strip.rs:67), `SUGGESTION_ROW_HEIGHT`
+  (input_bar.rs:41), `PERMISSIONS_PROMPT_HEIGHT` (permissions_prompt.rs:23),
+  `CONTEXT_MENU_MIN_WIDTH` (context_menu.rs:28), `ACTION_HINT`
+  (permissions_prompt.rs:136) used only inside buffr-ui but exposed via the
+  `pub use` block (lib.rs:25-39); and `pub use raw_window_handle;` (engine
+  lib.rs:89) with zero users. Drop the re-exports, keep the items.
+- **Never-constructed enum variants** (flag, not action — documented future
+  surface): `MediaType::Canvas/File/Plugin` (buffr-engine types.rs:83-85),
+  `CertState::Secure/Insecure` (buffr-ui lib.rs:54-55).
+- **`Statusline::progress`** (buffr-ui lib.rs:101, paint block :289-305) —
+  write-only today (stays 1.0, bar never renders); documented Phase-3
+  placeholder for CEF's `OnLoadingProgressChange`. Lower confidence: deleting is
+  behavior-preserving but removes a planned-feature placeholder — wire it or
+  delete it, don't leave the write-only field.
+
+### Minor
+
+- **`tab_strip.rs:268-269`** — `two_char_px`/`badge_content_w` recomputed per
+  tab per frame inside the paint loop but depend only on constants; hoist.
+- `set_min_size`/`set_max_size` near-identical
+  (windowing/other/window.rs:36-57); `run_check_for_updates`/`run_update_status`
+  differ in one call (cli.rs:347-363); `cef_cursor_to_icon` if-else chain →
+  `match` (cef_translate.rs:101-176); `omnibar_suggestions` history/bookmark
+  loops share a dedup+display+cap body (main.rs:4303-4339); `const GUTTER`
+  declared inside a fn body (paint_policy.rs:326) — hoist to module scope so the
+  five test-local `const GUTTER: u32 = 4;` re-declarations (main.rs:6669-6731)
+  can reference it.
+
+### Known items — confirmed, with verdicts
+
+- **`__buffrUserGesture` in edit.js is write-only** — confirmed. Written by
+  `markGesture` + the mousedown/pointerdown/touchstart listeners (edit.js:75-79)
+  and by Rust (host.rs:2173, 2452; buffr-webkit out of scope); nothing reads it
+  in-page (the blur gate it documented was removed — edit.js:252-257). Delete
+  the flag + `markGesture` + the three listeners + their teardown lines
+  (edit.js:348-350) + the four Rust writers.
+- **`DEFAULT_SKIP_SCHEMES` duplicated across crates** (config lib.rs:453 vs
+  history lib.rs:49) — same 5-element list, no cross-check, and the runtime
+  always overrides the history default with the config value (main.rs:505,511),
+  so the history copy can silently drift. Fixing it "properly" would need a
+  dependency in the wrong direction — the cheap honest fix is a sync test like
+  the existing `default_hint_alphabet_matches_core` precedent.
+- **Store-crate shape duplication** (schema-error wrappers, open/open_in_memory
+  pairs, DELETE+VACUUM clear_all across the five stores) — verdict: leave the
+  error-enum + open-pair shape (deliberate M-hardening; collapsing needs a macro
+  or trait for ~12 saved lines). The `clear_all`+VACUUM trio is the one piece a
+  small `buffr_store::delete_all(conn, table)` would cleanly absorb —
+  borderline, owner's call.
+- **`drain_edit_focus_events` vs the test `drain_into` mirror**
+  (main.rs:6407-6474) — verdict: leave. The test double is a deliberately
+  simplified FSM (documented mirror); driving the real function needs a full
+  `AppState`.
+- §5 backlog items (`crate::*` globs, `mod tests` placement,
+  `wayr_key_to_planned` prefix) not re-reported.
+
+### Coverage
+
+- **Browser core** (cef/core/modal/view-source/helper): every line read, incl.
+  `inhibit/*`; platform-gated `inhibit/macos.rs`/`windows.rs` read but not
+  compiled here.
+- **Main app** (apps/buffr-app): every `.rs` read in full (incl. windowing/);
+  candidates verified via `rg` against call sites.
+- **Engine/ui/supervisor**: all 26 in-scope files read; `apps/buffr/tests/`
+  (integration tests) not read. Supervisor's restart/Windows-pipe machinery left
+  alone (open findings §11/§12).
+- **Data/tooling**: all store crates, config, xtask (2761 lines), 5 fuzz
+  targets, e2e scripts read; the 22 `tests/e2e/pages/*.html` fixtures not read
+  (data, not harness).
+
+---
+
+## 14. Performance review 2026-08-05 (8744e18) — findings
+
+Perf pass on the same four partitions. Every finding below was re-verified at
+its cited lines after the sub-agent pass. No O(n²) hot loops, no per-item I/O,
+no syscalls-in-loops, no lock-across-await anywhere; the waste is steady-state
+per-frame chrome work and a few per-interaction paths. Estimates are from
+allocation/lock counts, not measurements — see Coverage.
+
+### 1. Per-glyph mutex lock, twice per char, on every chrome frame
+
+**Where:** `crates/buffr-ui/src/font.rs:39-58` (`glyph_entry` takes
+`lock_ignore_poison(&f.cache)` + Arc clone per glyph), and every chrome path is
+measure-then-draw — `text_width`/`char_width` (font.rs:155-166, 137-142) then
+`draw_text` (font.rs:168-188) re-look-up each char.
+
+**Why hot:** `TabStrip::paint` (tab_strip.rs:257-369), `Statusline::paint`
+(lib.rs:189-287), `InputBar::paint_at` (input_bar.rs:357-397) — per dirty frame
+(keystroke, hover, load progress, cursor blink). A 20-tab strip × ~30-char
+titles ≈ 1200 locked lookups/frame ≈ 50-80 µs — ~4 ms/s of one core at 60 fps.
+The cache is only ever touched by the UI paint thread, so the mutex serializes
+single-threaded access.
+
+**Fix:** `thread_local!` + `RefCell` cache (rasterize-on-miss is already outside
+the lock, font.rs:43-58), or take the lock once per text run.
+
+### 2. Per-tick tab-strip resync: 3-4 O(N) passes, two HashSet builds, deep compare, every tick even when nothing changed
+
+**Where:** `apps/buffr-app/src/main.rs:2973-3015` (`refresh_tab_strip`) and
+`3110-3132` (favicon pump), both called unconditionally each tick
+(event_loop.rs:1799, 1807).
+
+**Why hot:** the idle path at 60 Hz. `tabs_summary()` (host.rs:1487-1492) locks
+`tabs` and clones 2 Strings per tab (`display_title`, `display_url_for` — the
+latter another per-tab mutex + clone, host.rs:612-614); a `HashSet<i32>` of live
+ids is built and `favicons.retain` against it every tick (2977-2979); the whole
+`Vec<TabView>` is rebuilt (second `title.clone()` per tab, 3003) and
+deep-compared char-by-char (3015); the favicon pump builds a second HashSet,
+retains again, and compares URLs (3111-3118). ~4-6N small heap allocs per tick
+even with zero state change.
+
+**Fix:** a host-side `tabs_generation: AtomicU64` bumped on title/URL change,
+open/close/select/move/navigate — skip the whole resync on idle ticks. Failing
+that, throttle the two `retain` passes (~30 s) and track `pinned_count`
+incrementally (also covers finding 9).
+
+### 3. Insert-mode keystrokes ship the entire field value over console-log IPC, re-parsed twice
+
+**Where:** `crates/buffr-core/assets/edit.js:319-333` (`onInput` emits the full
+`valueOf(el)`), `227-231` (`emit` → `console.log` over the whole string),
+`crates/buffr-core/src/edit.rs:210-268` (`parse_payload` runs two full
+`serde_json` passes — `TypeTag` at :214 then `RawMutate` at :243), capped at 256
+KB (edit.rs:184) that JS never knows about.
+
+**Why hot:** one `input` event per keystroke while typing in a field; the full
+field value crosses renderer→browser IPC and is tokenized twice per keystroke —
+a 100 KB textarea re-serializes ~100 KB + IPC + two parses per keypress.
+
+**Fix:** (a) one-pass tagged deserialization (custom `Visitor` or a
+`#[serde(tag="type")]` enum) — halves per-keystroke JSON cost, trivial win; (b)
+JS-side coalescing of `mutate` events (~100 ms) or a delta for the common append
+case — protocol complexity, optional.
+
+### 4. `tick_splash_js_push` polls the active URL every tick when the user is NOT on the new-tab page — 3 locks + String clone per tick
+
+**Where:** `apps/buffr-app/src/main.rs:5720-5756`. The gate (5727-5731) only
+short-circuits while `splash_js_next_push` is armed — which is set only on the
+new-tab page. On any normal page it stays `None`, so every tick runs
+`engine.active_tab_live_url()` (5735) → host.rs:635-649: locks `tabs`, locks
+`active`, then `display_url_for` (third lock + String clone), forever.
+
+**Fix:** drive it off the events that already exist — `pump_address_changes`
+(event_loop.rs:1437) and the tab-switch path: set a `splash_recheck_pending`
+flag and return immediately when clear. Alternative without touching the host:
+poll at a 500 ms cadence off the new-tab page.
+
+### 5. Per-paint mutex + Arc clones on the OSR routing path
+
+**Where:** `crates/buffr-cef/src/osr.rs:359` (`is_registered_popup` takes the
+`popup_frames` mutex per call), reached from `resolve_dims` (350-384) via
+`view_rect` (144-153, "called on every frame") and `screen_info` (155-181,
+"every frame paint"), and from `resolve_frame_view` (388-412) per `on_paint` —
+~3 uncontended mutex acquisitions + 2 Arc clones per paint at 60/s, even with
+zero popups open.
+
+**Fix:** once `main_id` is set and equals the painted id, cache a "main
+confirmed" `AtomicBool` and take a lock-free fast path; the A3 invariant
+(registration precedes any popup paint) makes this safe.
+
+### 6. Downloads `OnDownloadUpdated` tick: full-row hydrate + two round-trips per tick
+
+**Where:** `crates/buffr-downloads/src/lib.rs:303-315` (`get_by_cef_id` SELECTs
+all 12 columns; `row_to_download` allocates 5 Strings + a DateTime per tick
+purely to read `id`/`status`) and `223-244` (`update_progress` — a second,
+autocommit WAL write on every tick even when `received_bytes` is unchanged).
+Caller: `crates/buffr-cef/src/handlers.rs:1337-1438` (`on_download_updated`,
+fired periodically for the whole life of every in-flight download).
+
+**Fix:** narrow the per-tick SELECT to `id, status, received_bytes` (or key a
+handler-side `cef_id → row_id` map and skip the read), and skip the `UPDATE`
+when the bytes are unchanged.
+
+### 7. Measure-then-draw re-walks every glyph; the input bar walks its buffer ~4× per keystroke
+
+**Where:** `crates/buffr-ui/src/lib.rs:270`+`:287` (`truncate_to_width` then
+`draw_text`), `tab_strip.rs:368-369`, `input_bar.rs:376-397` (visible-char
+budget with a lock per char, cursor/total counts, a `visible` substring
+`collect`, `text_width` of the prefix, then `draw_text`). `truncate_to_width`'s
+early bail only triggers on overflow (lib.rs:346-364), so every fitting char is
+measured once and drawn once — 2 cache lookups/char regardless.
+
+**Fix:** a single-pass `draw_text_budget` that measures as it draws and returns
+the end pen position, eliminating the separate walk and the intermediate
+`String` collect. For titles/URLs stable between frames, caching the truncated
+result keyed by `(title, max_px)` is the memory-for-speed alternative.
+
+### 8. `__buffrHintFilter` rebuilds every hint's DOM on each hint keystroke
+
+**Where:** `crates/buffr-core/assets/hint.js:145-168` — for every still-matching
+hint (N up to 256), `textContent=''` + `createElement` + `createTextNode` + two
+`appendChild`s per keystroke, including hints whose match state did not change.
+Fired by Rust per hint `Filter` key (host.rs:2311-2365).
+
+**Fix:** retain per-overlay state (last `typed.length` seen) and skip overlays
+whose class/text would not change; rebuild the strike-through span only when the
+typed prefix grew. A few bytes of state per overlay.
+
+### 9. Loop-invariant constant recomputed per tab per frame — flagged by BOTH the tidy and perf passes
+
+**Where:** `crates/buffr-ui/src/tab_strip.rs:268` —
+`two_char_px = font::text_width("WW")` sits inside the per-tab loop's badge
+branch, so every tab re-runs 2 glyph lookups for a value identical across the
+whole frame (and every frame). Also `badge_content_w` (269).
+
+**Fix:** hoist above the loop. (Cross-cutting: this exact item is also §13
+tidy.)
+
+### 10. `open_pending_tabs` re-materializes the full tab list per restored tab — O(M×N) at startup
+
+**Where:** `apps/buffr-app/src/main.rs:2846-2904` — the restore loop calls
+`host.tabs_summary()` (each O(N) with per-tab locks + clones) just to read the
+last entry's `browser_id` (2869, 2891, 2900).
+
+**Fix:** an accessor for "the tab that was just opened" — the open calls already
+return the new `TabId`; expose `browser_id_of(id)` (one lookup) or capture the
+summary from the `open_tab` return. Startup-only, ~1-10 ms for a large session.
+
+### 11. Two nonce-table lookups (mutex + String clone each) per sentinel console line
+
+**Where:** `crates/buffr-cef/src/handlers.rs:1095, 1112` — any sentinel-prefixed
+line pays both `console_nonces.hint(...)` and `.page(...)`, each a lock +
+entry/or-insert + 32-byte String clone (console_nonce.rs:186-200), regardless of
+which subsystem the line belongs to.
+
+**Fix:** gate each accessor behind
+`text.starts_with(<that subsystem's sentinel>)` — the parsers already do that
+prefix check internally, so the lock is pure waste on lines that cannot match.
+
+### 12. `url_encode` allocates per escaped byte
+
+**Where:** `crates/buffr-config/src/search.rs:254` —
+`out.push_str(&format!("{b:02X}"))` inside the per-byte loop.
+
+**Why hot:** `resolve_input` runs per omnibar keystroke (suggestion path) and
+per submit. Queries are short; small absolute cost, constant fix.
+
+**Fix:** push two chars from a `const HEX: &[u8; 16] = b"0123456789ABCDEF"`.
+
+### 13. Omnibar submit resolves the input twice
+
+**Where:** `apps/buffr-app/src/main.rs:5279-5282` — `classify_input(&raw)`
+internally runs the full `resolve_input` (search.rs:47-70), then
+`resolve_input(&raw, &self.search_config)` runs it again (two `url::Url` parses
+
+- two string builds per submit; same pair in `paste_url` at main.rs:2536-2542).
+
+**Fix:** a combined `resolve(&input, &search) -> (InputKind, String)` that
+resolves once and derives the kind from the result (the logic already exists —
+`classify_input` derives the kind by inspecting the resolved string).
+
+### 14. Internal-server per-request waste: whole `Routes` table cloned per connection, String alloc per lookup
+
+**Where:** `crates/buffr-engine/src/internal_server.rs:298-303` (per-connection
+`routes.lock()` … `g.clone()` cloning every handler Arc + content-type String)
+and `146-158` (`lookup` → `normalize_path` allocates a fresh String for the
+HashMap key; paths already start with `/`).
+
+**Why hot:** per navigation to `buffr://new`/`buffr://settings` — not per-frame,
+but the clone is unnecessary per-request work.
+
+**Fix:** Arc'd `RouteEntry`s and key lookup on `&str` without the normalize
+alloc.
+
+### 15. Context-menu geometry recomputed on every mouse move
+
+**Where:** `crates/buffr-ui/src/context_menu.rs:97-105` (`preferred_width_for`
+runs `text_width` per label) reached from `panel_rect_for` (83-95) on every
+`contains_at`/`hit_test` while the menu is open (N ≤ ~10).
+
+**Fix:** cache the panel width, recompute only when `entries` changes.
+
+### 16. `hit_test_tab_strip` runs its mutex + O(N) pinned scan on every pointer move
+
+**Where:** `apps/buffr-app/src/event_loop.rs:589` (per `PointerMoved`, up to ~1
+kHz on high-polling mice) and per tick via `refresh_tab_strip` (main.rs:2994);
+the scan is `download_notice_queue_len` mutex + `filter(| t| t.pinned).count()`
+(main.rs:4048-4049).
+
+**Fix:** cache `pinned_count` in `AppState` (update on pin toggle) and reuse the
+last hit-test result; absorbed by finding 2's gating.
+
+### 17. Minor per-frame allocations
+
+- `crates/buffr-ui/src/lib.rs:225-262` — `format!`/`format_hint`/`format_find`
+  allocate 0-4 Strings per statusline frame.
+- `crates/buffr-ui/src/tab_strip.rs:256` — `pinned_glyph` allocates a String per
+  pinned tab per frame; `:293-299` — the badge `chars().take(2).collect()`
+  allocates per badge tab per frame.
+- `crates/buffr-permissions/src/lib.rs:244, 267, 283` — `as_storage_key()`
+  allocates even for unit variants; rare (per prompt).
+
+### Coverage
+
+- **Browser core:** full trace of the CEF handlers (console/load/OSR/audio/
+  downloads/popups), the IPC modules (edit/hint/media/console_nonce/sentinel),
+  buffr-modal engine/keymap, the injected JS. Skimmed (one-off/startup, no hot
+  loops): crash, cmdline, open_finder, image_copy, private_net, inhibit/\*,
+  new_tab.html, exit_insert/focus_first_input/media_probe_init.js.
+- **Main app:** the whole `about_to_wait` chain (event_loop.rs:1297-2108), the
+  full paint path, key/pointer/scroll dispatch, cef_translate, engine_router,
+  context_menu, paint_policy, session, single_instance, windowing bridge. Not
+  settled without profiling: absolute µs of the per-tick resync; the
+  CEF-internal cost of `pump_message_loop` per tick; the omnibar search's
+  dominant cost (FTS MATCH vs GROUP BY) — inside the accepted ~1 ms.
+- **Engine/ui/supervisor:** every file read; caller frequency established via
+  the dirty-repaint gate (chrome repaints only on dirty frames). Not settled:
+  ns-level cost of findings 1/2/7 needs a profiler; the child heartbeat cadence
+  (out of scope). Supervisor heartbeat verified cold and bounded (`recv_timeout`
+  slices, ≤3-entry `CrashWindow`).
+- **Data/tooling:** all store crates, config, search traced with callers
+  established (omnibar keystroke/submit, paste, downloads handler, zoom,
+  bookmarks). Not settled: CEF `OnDownloadUpdated`'s real per-tick rate
+  (Chromium throttles progress callbacks, ~1/s per download; finding 6's
+  absolute cost scales with it). xtask/e2e/fuzz not traced (dev-only/cold).
