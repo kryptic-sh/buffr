@@ -1870,3 +1870,34 @@ Recorded so they are not re-raised as findings.
   (`buffr-history lib.rs:428-429`, `buffr-downloads lib.rs:370-371`,
   `buffr-bookmarks lib.rs:355-356`) — intentional and documented: the DELETE
   already removed the data, VACUUM is storage hygiene. Resolved.
+
+---
+
+## Shipped 2026-08-05
+
+Backlog items fixed this session, each one commit verified by the full workspace
+gate (fmt --check, clippy --workspace -D warnings, build, nextest):
+
+- **§10-1 HIGH** — close_index stale active index left the old active tab
+  running as if foregrounded: `fe9ec53`.
+- **§11-2** — middle-click last-tab exit skipped session save and clean
+  shutdown: `c2f7e18` (shared `AppState::request_exit` across all four last-tab
+  exit paths).
+- **§12-4** — profile dirs world-readable: `1d4b44b` (0700 dirs incl. the CLI
+  short-circuits, 0600 session file).
+- **§12-1** — wildcard-DNS SSRF bypass in the fetch guards: `848a6fb`
+  (resolve-and-classify on the fetch worker, never CEF's IO thread; the
+  image_copy check was already off-thread).
+- **§11-1** — edit events without browser attribution: `575a271` (tagged sink;
+  drain drops non-active-browser events; webkit call site updated).
+- **§11-4** — closed tab kept playing media until stack eviction: `bab8298`
+  (pause + mute on stash, unmute on reopen).
+- **§11-7** — signal during restart cooldown ignored → orphaned respawn:
+  `ed46f3a` (loop-top shutdown check + persistent signal handler).
+
+**New findings from the review pass over the §12-1 fix (open):** the string
+guard's `is_non_public_v4` misses RFC 2544 benchmarking range `198.18.0.0/15`,
+and the IPv6 path misses deprecated site-local `fec0::/10` — a hostname (or
+literal) resolving to either is currently allowed. Pre-existing (both apply to
+the literal path too); natural to close alongside the resolve-and-classify work
+in `crates/buffr-core/src/private_net.rs`.
