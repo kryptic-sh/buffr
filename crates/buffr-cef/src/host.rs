@@ -135,6 +135,19 @@ fn merge_navigation_url(current: &str, incoming: &str) -> Option<String> {
     }
 }
 
+/// Correct the stored active index after the tab at `removed_idx` is
+/// removed: the active tab shifts down by one when the closed tab sat
+/// before it, otherwise the index is unchanged. This is what keeps
+/// `set_active_index`'s hide-previous guard seeing the real active tab
+/// (backlog §10 item 1 — closing a tab left of the active one used to
+/// leave the old active browser running as if foregrounded).
+fn active_after_close(active: Option<usize>, removed_idx: usize) -> Option<usize> {
+    match active {
+        Some(prev) if removed_idx < prev => Some(prev - 1),
+        other => other,
+    }
+}
+
 /// One open browser. The `browser` field is the live [`cef::Browser`]
 /// CEF returned from `browser_host_create_browser_sync`.
 pub struct Tab {
@@ -1737,6 +1750,12 @@ impl BrowserHost {
             return Ok(false);
         }
         let new_idx = if idx >= len { len - 1 } else { idx };
+        // The tab list shifted down by one when the closed tab sat before
+        // the active one; fix up the stored index so set_active_index's
+        // hide-previous guard still sees the tab that really is active.
+        if let Ok(mut a) = self.active.lock() {
+            *a = active_after_close(*a, idx);
+        }
         self.set_active_index(new_idx);
         Ok(true)
     }
@@ -3931,5 +3950,43 @@ mod tests {
         let (from, to) = super::utf16_selection_range("hello", Some((4, 1)));
         assert!(from <= to);
         assert_eq!((from, to), (1, 4));
+    }
+
+    // ── backlog §10 item 1: active-index fixup after a close ──────────────
+
+    #[test]
+    fn active_after_close_shifts_down_when_closing_left_of_active() {
+        // The §10-1 repro: [A,B,C] active=Some(2), close_index(0) → list is
+        // [B,C] but the stored index used to stay Some(2), so the
+        // hide-previous guard `prev < tabs.len()` (`2 < 2`) never fired and
+        // the old active browser kept running as if foregrounded.
+        assert_eq!(super::active_after_close(Some(2), 0), Some(1));
+    }
+
+    #[test]
+    fn active_after_close_shifts_down_when_closing_immediately_left_of_active() {
+        assert_eq!(super::active_after_close(Some(2), 1), Some(1));
+    }
+
+    #[test]
+    fn active_after_close_unchanged_when_closing_active_tab() {
+        // Closing the active tab itself — no shift; `set_active_index`
+        // will overwrite the stored index with the new active anyway.
+        assert_eq!(super::active_after_close(Some(2), 2), Some(2));
+    }
+
+    #[test]
+    fn active_after_close_unchanged_when_closing_active_tab_at_zero() {
+        assert_eq!(super::active_after_close(Some(0), 0), Some(0));
+    }
+
+    #[test]
+    fn active_after_close_unchanged_when_closing_after_active() {
+        assert_eq!(super::active_after_close(Some(1), 2), Some(1));
+    }
+
+    #[test]
+    fn active_after_close_none_stays_none() {
+        assert_eq!(super::active_after_close(None, 3), None);
     }
 }
