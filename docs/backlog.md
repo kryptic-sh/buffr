@@ -1901,3 +1901,575 @@ and the IPv6 path misses deprecated site-local `fec0::/10` — a hostname (or
 literal) resolving to either is currently allowed. Pre-existing (both apply to
 the literal path too); natural to close alongside the resolve-and-classify work
 in `crates/buffr-core/src/private_net.rs`.
+
+## 16. Code review 2026-08-06 (63b8a25) — findings
+
+Full-codebase review pass; the 2026-08-04/05 findings (sections 10-15) were
+treated as known and are not re-reported. Two new MEDIUMs, both in the
+`buffr-src:`/Copy Image surface the §12-1 fix (`848a6fb`) touched.
+
+### 1 MEDIUM — the same-host exception is dead on the worker path; view-source of private-host pages always shows the error page
+
+**Where:** `crates/buffr-cef/src/view_source_scheme.rs:116, 163-166, 327, 494`.
+
+`create` extracts the initiator's host string
+(`initiator_host = initiator.as_deref().and_then(http_host)` — :116) and hands
+it to the worker (`fetch_and_render(&url, initiator_host.as_deref())` — :327).
+The worker's authoritative check (`validate_target(url, initiator_host, true)` —
+:494) re-derives the initiator host with
+`let initiator_host = initiator.and_then(http_host);` (:163) — but `http_host`
+(:181) returns `None` for any string lacking an `http://`/`https://` prefix, and
+the worker receives a bare host. So `initiator_host` is always `None` on the
+worker path, the branch `if initiator_host.as_deref() == Some(host.as_str())`
+(:164) can never fire, and every non-public target is refused — including the
+same-host case the `848a6fb` commit message says it preserves. Unit tests pass
+because they call `validate_target` with full-URL initiators, never the
+bare-host shape the worker passes.
+
+```
+Repro: on buffr://new, navigate (omnibar) to buffr-src:http://127.0.0.1:41235/<token>/new
+Expect: view-source of the internal page (the same-host intent; also the worker
+        path with initiator = the internal page's own host, which http_host
+        extracted at create)
+Actual: worker re-runs http_host("127.0.0.1") → None → "refusing to fetch
+        private-network host `127.0.0.1` from a page on `<unknown origin>`" error page
+```
+
+Not a security hole — fail-closed (over-restrictive) — and the visible behavior
+predates the fix. The new defect is that the fix's plumbing is unreachable dead
+code no test exercises, and "view source of a local address from that same host"
+cannot work in any configuration. **Fix:** compare the already-extracted
+initiator host directly on the worker (don't re-run `http_host`), and add a test
+calling `validate_target` with a bare-host initiator.
+
+### 2 MEDIUM — both browser-process fetches follow redirects past the private-network guard
+
+**Where:** `crates/buffr-cef/src/view_source_scheme.rs:514-517`,
+`crates/buffr-core/src/image_copy.rs:96`; the guard covers only the original URL
+(`view_source_scheme.rs:494`, `image_copy.rs:89`).
+
+ureq 3.3.0 follows up to 10 redirects by default (`max_redirects: 10`, installed
+`ureq-3.3.0/src/config.rs:874`; `run.rs` re-issues the request to the `Location`
+target while `redirect_count < max_redirects`). Both agents set only timeouts
+(`view_source_scheme.rs:508-511`, `image_copy.rs:90-94`).
+`validate_target`/`check_fetch_host` classify only the URL they are given, so a
+redirect hop is fetched with no re-validation — the hop can be `127.0.0.1`, any
+RFC1918 address, or a wildcard-DNS name, defeating the string guard, the
+resolve-and-classify gate, and the same-host exception at once. Also flagged by
+the audit pass (§17-1).
+
+```
+Repro: a page navigates the top frame to buffr-src:https://attacker.example/r;
+       attacker.example replies 302 Location: http://127.0.0.1:41235/<token>/new
+Expect: the private-network guard is evaluated for every host actually fetched
+Actual: validate_target approves attacker.example (public); ureq follows the
+       redirect and the browser process GETs 127.0.0.1 directly
+```
+
+Pre-existing (redirects were followed before `848a6fb` too) but never recorded —
+the §12-1 audit listed the nip.io hole but not the redirect path. Impact
+bounded: GET-only, response rendered locally / lands on the local clipboard, no
+exfiltration — but GET side effects on local admin endpoints and the internal
+server are reachable. **Fix:** `.redirects(0)` on both agents (a 3xx then fails
+the `200..300` check and renders the error page), or re-run the guard per
+redirect hop.
+
+### Cleared
+
+- `close_index` fixup (`fe9ec53`) — `active_after_close` traced for all four
+  cases (close left of active, close active, stashable branch hides/pauses/mutes
+  before re-select). Correct.
+- `request_exit` extraction (`c2f7e18`) — all four last-tab paths run
+  save+clean+flag+redraw; the middle-click path sums `tab_count()` across
+  engines. Correct.
+- Supervisor signal loop (`ed46f3a`) — loop-top `shutdown_requested` check
+  before respawn; handler loops in `signals.forever()` so a second Ctrl+C is
+  consumed after the child-wait. No orphan path.
+- Edit attribution (`575a271`) — id spaces match on both backends: CEF pushes
+  `cef::ImplBrowser::identifier(browser)`, `Tab.browser_id` is
+  `t.browser.identifier()` (host.rs:1624); webkit pushes `ctx.tab_id.0 as i32`
+  and its `TabSummary.browser_id` is the same (runtime.rs:98, 1351). Popup /
+  background events dropped by the drain.
+- Pause-on-stash (`bab8298`) — unmute on reopen present (host.rs:1197); eviction
+  closes the browser; `set_audio_muted` is a real `cef::BrowserHost` method.
+- Profile-dir chmod (`1d4b44b`) — `restrict_dir` applied to both `--private` and
+  persistent branches and every CLI short-circuit; session `.json.tmp` chmod'd
+  0600 before rename; cfg(unix) tests assert the modes.
+- `host_resolves_public` — fail-closed on resolve error and zero addresses;
+  IPv4-mapped IPv6 round-trips the string guard correctly; the RFC 2544
+  `198.18.0.0/15` / `fec0::/10` misses are already recorded (Shipped note
+  below).
+- hint.js / edit.js — `__buffrHintCommit` id is u32-typed by serde, splice emits
+  digits only; the `data-buffr-hint-target-id` attribute-collision clicks a page
+  element — same trust as the page's own handlers. edit.js dual
+  `focus`+`focusin` registration idempotent via `lastFocusId`.
+- view-source worker permit / read path — `_permit` held for the whole fetch,
+  dropped on every exit; `read` bounds-checked against `body.len()`;
+  poisoned-lock and null-callback paths serve synchronously.
+
+### Hardening
+
+- **WebAudio-only audio on a stashed tab.** `pause_media.js` pauses only
+  `<video>`/`<audio>` elements; an `AudioContext` keeps producing audio. Whether
+  a muted CEF browser still emits `OnAudioStreamStopped` (which clears the §11-4
+  indicator) is a CEF runtime detail this tree cannot verify.
+- **Stale `EditFocus` after tab round-trip (`575a271` side effect).** While tab
+  B is active, tab A's `Blur`/`Focus` events are dropped, so returning to A can
+  show Insert mode against a field the page has since blurred; no edit-state
+  resync on tab switch. Narrower than the misattribution bug it replaced;
+  self-heals on the next real focus.
+- **`ureq` default redirects elsewhere.** `updates.rs:104-114` (GitHub API)
+  inherits the same default; benign for the pinned upstream URL, but the
+  redirect default is a standing foot-gun for any future browser-process fetch.
+
+### Coverage
+
+Reviewed at depth: all 8 post-`8744e18` commits and their touched code
+(`host.rs` close/reopen/`set_active_index`/`navigate`, `view_source_scheme.rs`
+in full, `private_net.rs` in full, `edit.rs` in full, `image_copy.rs` in full,
+`main.rs` drain/exit/restore, `session.rs` write path, `context_menu.rs`
+dispatch, `event_loop.rs` about_to_wait chain, `apps/buffr/src/main.rs`
+supervisor loop + signal thread, `handlers.rs` console bridge + downloads,
+`osr.rs` paint routing, `updates.rs`, cmdline/crash/telemetry, all six JS
+assets, ureq 3.3.0 installed source). Not re-reviewed (covered by 2026-08-05
+passes, findings recorded): buffr-modal keymap/engine, buffr-ui
+painting/hit-testing, `windowing/*`, `single_instance.rs` in full, the Windows
+supervisor arm (never executed on this host), `buffr-view-source` renderer,
+`buffr-zoom`, `buffr-permissions`, the store crates' full bodies, `xtask`,
+`fuzz/`, `tests/e2e/*`. Known items confirmed: §11-13 (edit.js teardown omits
+`focus` from its removal list — edit.js:286 registered, teardown removes
+`focusin`/`focusout`/`input`/`mousedown`/`pointerdown`/`touchstart` only); the
+§12-1 range-gap follow-ups still open as recorded.
+
+## 17. Audit 2026-08-06 (63b8a25) — findings
+
+Fresh pass over the whole workspace; the 2026-08-04/05 findings (sections 10-15)
+treated as known. One MEDIUM, two LOW — 0 critical, 0 high.
+
+### 1 MEDIUM — `buffr-src:` and Copy Image follow HTTP redirects past the private-network gate
+
+**Where:** `crates/buffr-cef/src/view_source_scheme.rs:494` (worker gate) vs
+`:507-517` (fetch); same pattern `crates/buffr-core/src/image_copy.rs:90-96`;
+ureq 3.3.0 defaults `max_redirects = 10` (`config.rs:874`, installed copy).
+
+`validate_target` (with `resolve=true`) classifies the _original_ URL's host and
+nothing else; `agent.get(url).call()` then follows up to 10 redirects, each hop
+fetched with no re-validation. The `848a6fb` fix closed the wildcard-DNS leg of
+the SSRF; the redirect leg was never gated, before or after the fix. Same root
+in Copy Image (`check_fetch_host` at :89, fetch at :96).
+
+Trace: hostile page at `evil.example` runs
+`location.href = 'buffr-src:http://evil.example/redir'`. The string gate passes;
+the worker's authoritative gate resolves `evil.example` → public → `Ok`; the
+fetch 302s to `Location: http://127.0.0.1:8080/admin`; ureq follows and the
+browser process GETs the loopback service. Copy Image: right-click an
+`<img src="http://evil.example/redir">` → redirect to a private host →
+browser-process GET (response must decode as an image; lands in the user's own
+clipboard).
+
+Impact: blind single GETs against loopback/private services with the user's
+network privileges, response rendered in the tab or on the clipboard. No
+exfiltration (GET-only; the rendered source is escape-only per §12 Cleared) —
+same impact profile as the accepted §12-1, reached through a hop the gate never
+inspected. Reachability of the `buffr-src:` leg carries the §12-1 CEF-behaviour
+caveat (content-initiated top-level navigation to a STANDARD|SECURE scheme).
+
+**Fix:** `max_redirects(0)` in both agents (a 3xx then fails the `200..300`
+status check and renders the error page), or a manual redirect loop re-running
+`validate_target`/`check_fetch_host` per hop. The first is the cheap correct
+answer — view-source and copy-image have no legitimate need to follow redirects.
+
+### 2 LOW — edit-bridge browser attribution collides across engines: webkit `TabId` and CEF `browser.identifier()` share one `i32` space
+
+**Where:** `apps/buffr-app/src/main.rs:4701-4712` (`drain_edit_focus_events`
+trusts `browser_id`);
+`crates/buffr-webkit/src/platform/runtime.rs:893, 1348-1353` (events tagged
+`ctx.tab_id.0 as i32`); webkit mints `TabId(st.next_id)` starting at 1
+(`worker.rs:81`, `runtime.rs:3878`). CEF identifiers also start at 1 and
+increment per browser.
+
+The §11-1 fix compares a page's tagged `browser_id` against the active engine's
+active-tab `browser_id` as a single flat integer. Both backends number tabs from
+1, so in a cef+webkit config a webkit tab's id collides with a CEF tab's id. A
+page on a **background webkit tab** can forge a `Focus` event (the page nonce is
+page-readable — known accepted limitation, §3) tagged with its own tab id; if
+that id equals the active CEF tab's identifier, the event is accepted and the
+CEF tab flips into Insert — the exact cross-tab keystroke-capture the fix
+closed, restored across the engine boundary.
+
+Caveat: cef-only configs (the production default) are sound — all browsers share
+the CEF id space. Only multi-engine configs with webkit are exposed; webkit is
+experimental and not built by CI; the attacker cannot choose which ids its tabs
+receive. Fragile but real.
+
+**Fix:** namespace the attribution (`engine_id + browser_id`), or gate
+webkit-tagged events to webkit-active-tabs at the engine level.
+
+### 3 LOW — "View Page Source" on any internal (`buffr://`) page always renders the error page
+
+**Where:** `apps/buffr-app/src/context_menu.rs:486-498`
+(`format!("buffr-src:{current_url}")` from `active_tab_live_url()`),
+`crates/buffr-cef/src/host.rs:648-662` (live URL prefers the `buffr://new`
+display override), `crates/buffr-cef/src/view_source_scheme.rs:156-158`
+(`http_host("buffr://new")` → `None` → "only http:// and https:// URLs can be
+viewed as source").
+
+Trace: on `buffr://new`, View Page Source produces `buffr-src:buffr://new`;
+`validate_target` rejects it at the scheme check, before the same-host loopback
+exception the M13 design comment (`:140-146`) claims keeps internal-page
+view-source working. The M13 "buffr:// internal page" path is dead: the app
+hands the gate a non-http URL instead of the
+`http://127.0.0.1:<port>/<token>/new` the same-host rule was written for.
+Functionality, not security (no privilege boundary crossed) — but the exact
+runtime behaviour the §2 "M13 untested" gap was meant to catch. Related to §16-1
+(same-host exception also dead on the worker path): fixing only §16-1 does not
+make this work — the app-side URL must change too.
+
+**Fix:** build the view-source URL from the tab's CEF URL (`t.url`, the loopback
+form) rather than the display URL, or special-case `buffr://` in `buffr-src:`
+handling.
+
+### Cleared
+
+- `buffr-src`/image_copy gate internals — `http_host` parsing,
+  `host_resolves_public` fail-closed on resolution error/empty/mixed results,
+  `is_non_public_host` numeric-form coverage, M14 fetch pool and `FetchPermit`
+  accounting, `open`'s synchronous fallback — all traced; no new reachable gap
+  beyond finding 1.
+- `close_index` (`fe9ec53`), media stash (`bab8298`), `request_exit`
+  (`c2f7e18`), supervisor signal loop (`ed46f3a`) — re-traced; correct.
+- Profile-dir hardening (`1d4b44b`) — 0700 dirs incl. CLI short-circuits, 0600
+  session tmp+rename; umask-independent. `updates.rs`/`telemetry.rs`/`crash.rs`/
+  `favicon_cache.rs` — bounded, parameterized, no network exfil, `create_new`
+  crash reports.
+- Internal-page HTML assembly — keymap/chord strings escaped, splash spans
+  static, push JSON-escaped and gated; no XSS.
+- `buffr-helper` — argv pass-through to `execute_subprocess` only. `buffr-poc` —
+  dev demo, private stores, no network surface.
+- `open_finder` — `xdg-open`/`open`/`explorer.exe` argv, never a shell;
+  `sanitise_filename` reserved-stem and traversal tests solid.
+- Console bridge — nonce anchored + rotated per load/session, parsers
+  length-capped, edit/hint/media sinks bounded; the same-tab
+  forged-`Selection`→clipboard and forged-`Focus`→Insert paths confirmed still
+  present exactly as recorded in §12-2/§12-3 (known, not re-filed).
+- Supervisor signal thread after `ed46f3a` — second signal during the graceful
+  wait is queued and handled after; `child_pid_slot` cleared before the loop
+  re-checks. No new race.
+
+### Hardening
+
+- Internal server accepts a request with no `Host` header
+  (`internal_server.rs:444`): defence-weakening only, not exploitable — the
+  128-bit per-launch token is still required, browsers always send `Host`, and a
+  raw-socket attacker who already holds the token gains nothing from omitting
+  the header.
+- §12-1 follow-ups already recorded (RFC 2544 `198.18.0.0/15`, IPv6 `fec0::/10`)
+  — confirmed present in the tree.
+- `tick_splash_js_push` gate `url.starts_with("buffr://new")` is loose but the
+  scheme is unreachable from page content and the pushed HTML is static —
+  cosmetic only.
+- Webkit URI-scheme clipboard handler (`runtime.rs:1400-1569`): gated to pages
+  whose URI starts with `buffr://`; all such documents are app-served. The
+  10k-line webkit FFI/worker/wpe_subclass code otherwise remains §15-2's
+  deferred item — not audited beyond the scheme handler and id-space check.
+
+### Coverage
+
+Walked in full or traced line-by-line: the console bridge (`handlers.rs`
+`on_console_message`/`on_load_end`), `edit.rs`/`edit.js`, `hint.js`,
+`pause_media.js`, `console_nonce.rs`/`console_sentinel.rs`,
+`view_source_scheme.rs` (whole), `private_net.rs` (whole), `host.rs`
+close/reopen/`set_active_index`/media-probe/audio/JS-injection call sites,
+`internal_server.rs` (whole), `session.rs`, `cli.rs`, `single_instance.rs` (Unix
+half), downloads handler + `sanitise_filename` + `open_finder.rs`,
+`image_copy.rs` (whole), `buffr-helper`, `buffr-poc`, new-tab/splash assembly,
+and the previously-unread `buffr-core` modules (`crash.rs`, `telemetry.rs`,
+`updates.rs`, `favicon_cache.rs`) and `buffr-cef/build.rs`. Skimmed via grep,
+not line-audited: the full diff of the eight fix commits, the webkit crate
+beyond the scheme handler, `windowing/other/*`, `tests/e2e/pages/*.html`
+fixtures. No tests run — read-only pass.
+
+Known items confirmed, one line each: §12-2 pastejacking, §12-3 dead
+`insert_intent_at` gate, §12-6 download overwrite, §12-7 session-restore scheme
+allow-list, §12-9 token persisted, §12-10 unbounded popups, §12-11 import
+amplification, §11-5 video probe on active tab only, §11-14 untagged hint sink —
+all still present as recorded; §10-1/§11-2/§11-4/§11-7/§12-1/§12-4 fixes
+verified working.
+
+**Summary: 1 medium, 2 low new findings — 0 critical, 0 high.** Overall risk
+remains low-to-moderate, unchanged from the prior pass: the hard boundaries (IPC
+socket peer-cred, internal-server token, permission callbacks, pixel upload,
+nonce-anchored parsers) held, and residual risk still concentrates in the
+page→app console bridge and the browser-process fetch primitives. Fix in order:
+(1) `max_redirects(0)` on the ureq agents in `view_source_scheme.rs` and
+`image_copy.rs` — one line each, closes the only new guard bypass; (2) namespace
+the edit-attribution id per engine; (3) decide/implement the §12-2 clipboard
+gate, the top open security item.
+
+## 18. Tidy 2026-08-06 (63b8a25) — cleanups
+
+Quality-only sweep (behavior-preserving cleanups; no correctness findings).
+Working tree clean at HEAD; backlog §1, §2, §10-§15 read first — items already
+recorded there are not re-reported, except as one-line confirmations. Only code
+changed since the last tidy pass (`8744e18`) is the 7 fix commits; every hunk of
+those diffs was reviewed, then whole-tree sweeps ran over the unchanged surface
+too.
+
+### Dead code (each verified: whole-workspace `rg` shows zero callers)
+
+1. **`crates/buffr-cef/src/view_source_scheme.rs:497-505` — two unreachable
+   checks in `fetch_and_render`.** The `848a6fb` rewrite added
+   `validate_target(url, initiator_host, true)` at :494, which already returns
+   `Err` for both an empty URL (:153-154) and a non-http scheme (:156-158) —
+   with the exact same error strings. The follow-up `if url.is_empty()`
+   (:497-499) and `if http_host(url).is_none()` (:500-505) blocks are dead; they
+   were the pre-`848a6fb` inline belt-and-braces the new gate superseded.
+   **Action:** delete both blocks (the `error_page` calls they produce are
+   byte-identical to `validate_target`'s `Err`).
+2. **`crates/buffr-cef/src/host.rs:769-777` — dead `BrowserHost` favicon
+   accessor pair.** `favicons_enabled()` (:769-771) and `set_favicon_enabled()`
+   (:775-777) have zero call sites. The display handler reads the flag directly
+   off the shared `FaviconEnabled` Arc (`handlers.rs:952`,
+   `favicon_is_enabled`), not through these methods, and no runtime toggle
+   exists — the doc's "reflects any runtime toggle via
+   [`Self::set_favicon_enabled`]" describes a feature that was never wired
+   (favicon enablement is startup-only, `main.rs:592`). **Action:** delete both
+   methods and their doc comments.
+3. **`crates/buffr-modal/src/engine.rs:121-123` — dead `Engine::keymap_mut`.**
+   Zero callers (the live surface is `keymap()` at :117 and `set_keymap()` at
+   :128, called from `main.rs:806`). **Action:** delete.
+4. **`apps/buffr-app/src/windowing/other/window.rs:36-57` and `:175-185` — four
+   dead size methods** (linter-invisible behind
+   `#[allow(dead_code)] mod windowing` at `main.rs:200`):
+   `Window::set_min_size`/`set_max_size` (:36-57) and
+   `ToplevelBuilder::with_min_size`/`with_max_size` (:175-185) — zero callers;
+   both builder call sites (`event_loop.rs:104-108`, `:1572-1575`) set only
+   title/app-id/size. Keep the builder _fields_ `min_size`/`max_size` (:151-152)
+   — read by `build_window` (`event_loop.rs:243-246`). Supersedes the §13
+   "set_min_size/set_max_size near-identical" note: they are dead, not merely
+   duplicated. **Action:** delete all four methods.
+5. **`apps/buffr-app/src/render.rs:193-194` — `OsrTexture::view` is
+   write-only.** Written at :212 and :242, never read (only `texture` is read,
+   at :257); the field exists solely under `#[allow(dead_code)]`. The bind group
+   created from `&view` holds wgpu's own refcount on the view, so the field
+   handle is redundant. _Lower confidence:_ relies on wgpu resource-lifetime
+   semantics, not compiled (tree kept pristine). **Action:** delete the `view`
+   field (keep the local in `new`/`maybe_upload`), or keep it and drop the
+   `#[allow(dead_code)]` with a comment saying the handle is held for the bind
+   group's lifetime.
+6. **`crates/buffr-webkit/src/platform/engine.rs:380-381` —
+   `set_newtab_html_provider` and the `newtab_html_provider` field are
+   write-only** (field :59, written :332/:381, never read; setter has no
+   callers). Experimental crate, excluded from the workspace, review deferred
+   (§15-2) — reported for completeness, not expected to be actioned with the
+   rest. **Action:** delete setter + field, or wire the read.
+
+### Nothing new found in
+
+- duplication (machete: no unused deps; no new copies of the §13 helper patterns
+  in the changed code — `ensure_profile_data_dir`/`restrict_dir` and
+  `request_exit` are themselves the extractions §13 asked for),
+- over-abstraction or indirection in the new code,
+- needless clones/allocations in the new code (the `host_resolves_public`
+  `to_string()` round-trip is a documented "one copy, no drift" choice, and
+  `image_copy`/`view_source` call it on worker threads only).
+
+### Known items confirmed (still open at HEAD — recorded in §13/§12/§11, not new)
+
+- §13 dead code, all still present: `media_js.rs` module (all 6 fns),
+  `BrowserHost::{run_edit_apply :2467, print_active :2665, frame_del :2646, reload_ignore_cache_active}`,
+  `BrowserHost::new` (host.rs:443), `make_client` (handlers.rs:154),
+  `insert_intent_at` (main.rs:1630, still write-only under
+  `#[allow(dead_code)]`), `Mode` enum (buffr-modal/src/actions.rs:21),
+  `PendingPopupAlloc` re-export, `TabOptions` (buffr-engine/src/tab.rs:23),
+  `pop_front`/`peek_front` (buffr-engine/src/permissions.rs:88,96),
+  `InternalServer::set_routes`, `ContextMenuOverlay::row_at`, `InputBar::paint`,
+  `KeyChord::new`, `Keymap::leader` (keymap.rs:100), `HintAlphabet::is_empty`
+  (buffr-core/src/hint.rs:129), `Engine::count` (engine.rs:151),
+  `BuffrLoadHandler.edit_sink` write-only (handlers.rs:799), windowing accessors
+  `SurfaceId::as_u64`/`OutputId::as_u64`/`OutputInfo.description`/
+  `Position::ZERO`, `fuzz_target_keys.rs` no-op loop
+  (fuzz/fuzz_targets/fuzz_target_keys.rs:8-14).
+- §13 YAGNI, all still present: `deserialize_keymap` (config lib.rs),
+  `Keymap::audit_default_bindings` dead `_leader` param, `buffr_cef::new_tab`
+  re-export shim, the buffr-ui `pub use` constant block, `Statusline::progress`
+  write-only.
+- §13 duplication, still present: `run_heartbeat_loop` unix/windows twin,
+  atomic-write helper (session.rs:147-164 vs crash*guard.rs:137-148 — session.rs
+  now additionally chmods the tmp file), deadline-clamp idiom ×9
+  (event_loop.rs:2024-2093), `key_to_neutral_events` (cef_translate.rs:395-431),
+  cli
+  `open*\*\_for_cli`store-open scaffolding, chrome_paint modal-panel paint blocks, statusline right-pen cells ×7, xtask arch/build helpers,`mode_name(PageMode)`
+  ×2, host-head extraction (search.rs:155-163 vs 196-199).
+- §13 minor, still present: `tab_strip.rs:268-269` loop-invariant glyph width
+  (also §14-9), `cef_cursor_to_icon` if-else chain, `omnibar_suggestions` dedup
+  loops, `const GUTTER` hoist.
+- §13 known items, still present: `__buffrUserGesture` write-only
+  (edit.js:75-79,348-350, writers host.rs:2205,2484), `DEFAULT_SKIP_SCHEMES`
+  cross-crate duplicate, store-crate shape.
+- §13 "last-tab graceful exit ×3" is **shipped** (`c2f7e18` —
+  `AppState::request_exit`, main.rs:2766; all four last-tab sites call it).
+
+### Coverage
+
+- Changed since last tidy (`8744e18..HEAD`): every hunk of all 7 fix commits
+  read and cross-checked against callers — `private_net.rs`
+  (`host_resolves_public`), `scripts.rs` (`PAUSE_MEDIA_JS` + test),
+  `view_source_scheme.rs` (`initiator_host` plumbing, `validate_target` resolve
+  flag, `fetch_and_render` — finding 1), `edit.rs` (`TaggedEditEvent`),
+  `session.rs` (chmod), `host.rs` (`active_after_close`, pause+mute on stash,
+  `set_audio_muted`), `handlers.rs` (tagged push), `image_copy.rs`, `main.rs`
+  (`restrict_dir`/
+  `ensure_profile_data_dir`/`request_exit`/`drain_edit_focus_events`), `cli.rs`,
+  `event_loop.rs`, `context_menu.rs`, `apps/buffr/src/main.rs` (signal loop),
+  `pause_media.js`, webkit `runtime.rs`.
+- Sweeps over the whole tree: `#[allow(dead_code)]` sites (each read and judged
+  — `single_instance.rs:132` flock holder, `inhibit/mod.rs:112` NoopInhibitor,
+  `main.rs:1736` lifetime-held `update_checker` are deliberate, not re-flagged);
+  `todo!`/`unimplemented!`/`unreachable!` (all in documented test stubs —
+  `engine_router.rs` StubEngine, `engine.rs` NoOpEngine); whole-workspace pub-fn
+  occurrence analysis (findings 2-6); `impl From`/`Deref` shims, clone-on-Copy,
+  write-only fields, machete.
+- Previously-unread files covered: `apps/buffr/tests/*` (7 integration test
+  files + `common/mod.rs` — clean), `buffr-helper` (clean), `buffr-poc`
+  (experimental demo, clean).
+- Not walked in depth: `buffr-webkit` internals beyond the changed hunks and
+  finding 6 (experimental, not in the workspace, §15-2 defers its review);
+  `tests/e2e/pages/*.html` fixtures (data); JS assets beyond confirming the
+  known `__buffrUserGesture` item (fully read by the previous pass, unchanged
+  since).
+- No build/test/format run — the tree stays pristine.
+
+## 19. Performance review 2026-08-06 (63b8a25) — findings
+
+Fresh pass; backlog §7 (2026-08-04 perf) and §14 (2026-08-05 perf) treated as
+known and not re-reported. The three findings below are in code the 2026-08-05
+pass only skimmed (`buffr-view-source` / `view_source_scheme.rs`) plus one
+sibling of a known item. No O(n²) loops, no per-item I/O, no syscalls-in-loops,
+no lock-across-await found in the previously-untouched crates (buffr-store,
+buffr-history, buffr-bookmarks, buffr-downloads, buffr-zoom, buffr-modal,
+buffr-permissions, fuzz/, xtask/) — those are cold-path (open/migrate/import/
+clear at startup or on user action) or bounded-small-N (omnibar search capped in
+SQL, keymap trie = 1-2 HashMap hops per keystroke, hint `feed` = one `retain`
+over ≤256 labels per keystroke).
+
+### 1 MEDIUM — view-source rebuilds the entire highlight setup chain (registry, loader, grammar dlopen, highlighter) per request
+
+**Where:** `crates/buffr-view-source/src/lib.rs:75`
+(`GrammarRegistry::embedded()`), `:91` (`GrammarLoader::user_default(meta)`),
+`:109` (`Grammar::load_from_path`), `:117` (`Highlighter::new(grammar)`), all
+inside `try_highlight`, called from `render()` (`:57`) for every view-source
+navigation.
+
+Every `buffr-src:` request re-parses the embedded `bonsai.toml` manifest into a
+fresh `HashMap`, re-resolves the XDG data/cache dirs
+(`SourceCache::user_default`, `QuerySourceCache::user_default` — env read + path
+build each), re-walks the three grammar dirs in `lookup_only` (:103),
+**re-`dlopen`s the grammar `.so`** (`Grammar::load_from_path` → `Library::new` +
+symbol lookup), and constructs a fresh tree-sitter `Parser` + predicate
+registry. Only the compiled query artifacts are cached (hjkl-bonsai's
+process-global `COMPILED_CACHE` keyed by content hash — installed 0.41.0 source,
+`highlighter.rs:373-378`), so the dlopen and env/dir plumbing is paid on every
+request.
+
+Why it matters: per view-source navigation (worker spawned at
+`crates/buffr-cef/src/view_source_scheme.rs:322-334`, `render` called at :535),
+including reloads and restored pinned view-source tabs at startup (up to 8
+concurrent, `MAX_INFLIGHT_FETCHES`). The dlopen is the dominant term (~100 µs–1
+ms on a cold page cache) plus a handful of stat/env syscalls — all of it
+identical work on the second request for the same language as on the first. For
+a small source file this setup is a meaningful fraction of total render time.
+
+**Fix:** cache per language — a
+`static GRAMMARS: OnceLock<Mutex<HashMap<&'static str, Arc<Grammar>>>>` keyed by
+language name makes the dlopen + load happen once per language per process (the
+`Arc<Grammar>` is already what `Highlighter::new` takes), plus a second
+`OnceLock` for the registry+loader pair. Trade: a handful of MB of loaded
+grammars retained for process lifetime — the standard memory-for-speed trade;
+grammars are small C objects. The existing A6 comment (:99-102) forbids
+`Grammar::load` (network compile); the cache is orthogonal — keep `lookup_only`
+as the only resolution path.
+
+### 2 LOW-MEDIUM — `render_spans` makes ~4-5 heap allocations per span and copies escaped content twice
+
+**Where:** `crates/buffr-view-source/src/lib.rs:171-173` inside the span walk
+`render_spans` (:147-187): `capture_to_class(capture)` allocates twice
+(`capture.replace('.', "-")` at :191 then `format!("hl-{normalized}")` at :192),
+`html_escape(content)` allocates a fresh `String` per span (:196-209), then
+`html.push_str(&format!("<span class=\"{class}\">{escaped}</span>"))` copies the
+just-escaped bytes again (:173), plus `html_escape(plain)` per inter-span gap
+(:168).
+
+Why it matters: the same per-view-source path as finding 1. A 10 MiB source (the
+`MAX_SOURCE_BYTES` cap, :25) at ~40 bytes per token span ≈ 250 K spans ≈ 1 M
+heap allocations and 2× re-copy of nearly every byte of the source before the
+final page string is assembled. Dominant Rust-side cost of highlighting large
+files — the case the 10 MiB cap exists for.
+
+**Fix:** write into the existing buffer instead of allocating intermediates — a
+small `push_escaped(&mut String, &str)` helper escaping straight into `html`, a
+`push_str("<span class=\"") + push(class) + push_str("\">")` sequence, and
+precompute the class string via a `match` on the bounded set of tree-sitter
+capture names (the CSS table at :270-294 already enumerates them — the
+`replace`+`format` per span only ever produces one of ~30 values). Same
+complexity, zero per-span heap traffic.
+
+### 3 LOW — `json_string_literal` allocates a `String` per escaped non-ASCII char on the hint-filter keystroke path
+
+**Where:** `crates/buffr-cef/src/host.rs:2911` —
+`out.push_str(&format!("\\u{unit:04x}"))` inside the per-char loop of
+`json_string_literal` (:2897-2918).
+
+One `format!` heap allocation per non-ASCII (or otherwise non-printable)
+codepoint in the typed hint filter string. Runs on every hint `Filter`/backspace
+keystroke (`host.rs:2373-2376` and `:2416-2419` — the `__buffrHintFilter`
+splice). ASCII text (the common case) hits the `is_ascii_graphic` arm and pays
+nothing, so this only bites when the hint filter contains non-ASCII — but it is
+the same per-char-alloc class §14-12 flagged at `search.rs:254` (`url_encode`),
+a second copy in a per-keystroke path.
+
+**Fix:** identical to §14-12's — push the two hex digits from a
+`const HEX: &[u8; 16]` table instead of `format!` (or `write!` into `out`).
+Constant fix, no memory trade.
+
+### Coverage
+
+Traced fully (with callers/frequency established): the whole per-tick
+`about_to_wait` chain (`event_loop.rs:1297-2108` — session flush, notice expiry,
+tab-strip resync, favicon pump, telemetry flush, cursor blink, loading anim),
+key/pointer/scroll/IME dispatch, `pump_address_changes`, `pump_cursor_changes`,
+`drain_edit_focus_events`, hint filter JS + Rust session feed, omnibar
+suggestions + resolve path, internal server accept/handle loop, OSR
+`on_paint`/`view_rect`/`screen_info`/`resolve_dims`/`resolve_frame_view`,
+downloads `on_download_updated` + store, media probe poll cadence
+(occluded-only, active engine, 2 s — cold), console-message scrape path, favicon
+cache get/put, view-source scheme create/fetch/render/read, image_copy,
+private_net guards, session save, zoom/bookmark/history/store crates,
+buffr-modal engine+keymap, config search, all core JS assets,
+supervisor/cli/crash_guard/ heartbeat/single_instance (cold), fuzz targets,
+xtask.
+
+Known items confirmed (recorded in §14 — not re-reported, one line each): 14-1
+font glyph mutex per char per frame (font.rs:39-58); 14-2 per-tick
+`refresh_tab_strip` + favicon pump (main.rs:2973-3015, 3110-3132); 14-3 edit
+full-value IPC + two-pass JSON parse per keystroke (edit.js:332,
+edit.rs:214/243); 14-4 `tick_splash_js_push` polls active URL every tick off the
+new-tab page; 14-5 OSR per-paint popup mutex + Arc clones (osr.rs:326-331,
+388-412); 14-6 downloads per-tick full-row hydrate (downloads lib.rs:303-315,
+223-244); 14-8 hint.js DOM rebuild per filter keystroke (hint.js:145-168); 14-9
+`two_char_px` loop-invariant (tab_strip.rs:268-269); 14-11 two nonce-table
+lookups per sentinel line (handlers.rs:1095, 1112); 14-12 `url_encode` per-byte
+`format!` (search.rs:254); 14-14 internal-server routes-table clone per
+connection (internal_server.rs:298-303).
+
+Not settled without profiling: absolute µs of the view-source highlight setup vs
+the highlight itself (finding 1's rank assumes dlopen + dir/env resolution
+dominates for small files; finding 2 is unambiguous allocation count); whether
+hjkl-bonsai's `Highlighter::new` `PredicateRegistry::with_builtins()` is
+material at request rates. `buffr-webkit`/`buffr-poc` remain out of the
+workspace (per §15-2) and were not compiled or line-audited.
+
+**Verdict:** nothing blocking. Two genuine per-request wins in the newest code
+(view-source), one minor per-keystroke alloc; the rest of the previously
+unreached tree is cold or bounded-small-N. Findings 1-2 are the next queue
+entries when perf work resumes.
