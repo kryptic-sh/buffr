@@ -71,3 +71,20 @@ pub const MEDIA_PROBE_INIT_JS: &str = include_str!("../assets/media_probe_init.j
 /// cef-rs's `Frame::execute_java_script`; using the `window` property
 /// sidesteps that limitation without requiring a custom scheme bridge.
 pub const MEDIA_PROBE_POLL_JS_TEMPLATE: &str = include_str!("../assets/media_probe_poll.js");
+
+/// Pause every media element in the document. Injected when a tab is
+/// closed but stashed for undo — `was_hidden(1)` does not cut audio
+/// (backlog §11 item 4).
+pub const PAUSE_MEDIA_JS: &str = include_str!("../assets/pause_media.js");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_media_script_targets_all_media_elements() {
+        assert!(PAUSE_MEDIA_JS.contains("querySelectorAll('video,audio')"));
+        assert!(PAUSE_MEDIA_JS.contains(".pause()"));
+        assert!(PAUSE_MEDIA_JS.contains("try {"));
+    }
+}

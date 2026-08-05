@@ -1194,6 +1194,7 @@ impl BrowserHost {
             && let Some(host) = t.browser.host()
         {
             host.was_hidden(0);
+            host.set_audio_muted(0);
             host.was_resized();
         }
         self.set_active_index(final_idx);
@@ -1704,6 +1705,18 @@ impl BrowserHost {
             if let Some(host) = removed.browser.host() {
                 host.was_hidden(1);
                 host.set_focus(0);
+                // §11-4: a closed tab must not keep playing. was_hidden(1)
+                // does not cut audio (see osr_sleep's audio note), so pause
+                // every media element — that stops the CEF audio stream,
+                // clearing any_audio_active and the statusline indicator —
+                // and mute the browser as the hard guarantee against
+                // page-driven auto-resume (playlist autoplay etc.).
+                host.set_audio_muted(1);
+            }
+            if let Some(frame) = removed.browser.main_frame() {
+                let code = CefString::from(buffr_core::scripts::PAUSE_MEDIA_JS);
+                let script_url = CefString::from("buffr://pause-media");
+                frame.execute_java_script(Some(&code), Some(&script_url), 0);
             }
             let evicted: Vec<Tab> = if let Ok(mut stack) = self.closed_stack.lock() {
                 stack.push(ClosedTab {
