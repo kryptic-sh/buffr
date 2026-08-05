@@ -124,7 +124,9 @@ fn check_fetch_host(url: &str) -> Result<(), String> {
     // unbracketed form. Only IPv6 hosts ever carry brackets, so stripping
     // them is lossless.
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    if crate::private_net::is_non_public_host(host) {
+    if crate::private_net::is_non_public_host(host)
+        || !crate::private_net::host_resolves_public(host)
+    {
         return Err(format!("refusing to fetch private-network host `{host}`"));
     }
     Ok(())
@@ -290,10 +292,7 @@ mod tests {
 
     #[test]
     fn check_fetch_host_allows_public_hosts() {
-        for url in [
-            "https://example.com/img.png",
-            "http://93.184.216.34/img.png",
-        ] {
+        for url in ["https://8.8.8.8/img.png", "http://93.184.216.34/img.png"] {
             assert!(check_fetch_host(url).is_ok(), "{url} should be allowed");
         }
     }

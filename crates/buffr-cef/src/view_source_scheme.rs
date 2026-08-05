@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::host::BUFFR_SRC_PREFIX;
 use crate::html::html_escape;
-use buffr_core::private_net::is_non_public_host;
+use buffr_core::private_net::{host_resolves_public, is_non_public_host};
 
 /// Register the `buffr-src` scheme with CEF.
 ///
@@ -97,11 +97,13 @@ wrap_scheme_handler_factory! {
             // the origin allowed to reach its own private-network host.
             let initiator = frame.map(|f| CefStringUtf16::from(&f.url()).to_string());
 
-            // M13: validate before the handler is ever constructed. A
-            // rejected target still gets a handler so the user sees the
-            // reason instead of a bare CEF error overlay — the handler just
-            // starts with the error page pre-rendered and never fetches.
-            let rejection = validate_target(&underlying, initiator.as_deref()).err();
+            // M13: run the fast string gate here — `create` is on CEF's IO
+            // thread and must not block on DNS. The DNS-resolving check runs
+            // on the fetch worker (see `fetch_and_render`). A rejected
+            // target still gets a handler so the user sees the reason
+            // instead of a bare CEF error overlay — the handler just starts
+            // with the error page pre-rendered and never fetches.
+            let rejection = validate_target(&underlying, initiator.as_deref(), false).err();
             if let Some(reason) = rejection.as_deref() {
                 tracing::warn!(
                     url = %underlying,
@@ -111,12 +113,14 @@ wrap_scheme_handler_factory! {
                 );
             }
 
+            let initiator_host = initiator.as_deref().and_then(http_host);
             Some(BuffrSrcResourceHandler::new(
                 Arc::new(Mutex::new(
                     rejection.map(|r| error_page(&underlying, &r).into_bytes()),
                 )),
                 underlying,
                 Arc::new(AtomicUsize::new(0)),
+                initiator_host,
             ))
         }
     }
@@ -140,14 +144,20 @@ wrap_scheme_handler_factory! {
 ///    That keeps "view source of a `buffr://` internal page" working (the
 ///    internal server is on 127.0.0.1) while blocking a public page from
 ///    pivoting into the local network.
-fn validate_target(url: &str, initiator: Option<&str>) -> Result<(), String> {
+///
+/// With `resolve = false` only the string guard runs — no DNS — so this is
+/// the fast gate for CEF's IO thread (`create`). With `resolve = true` the
+/// host is resolved and every address classified; this authoritative form
+/// runs on the fetch worker thread before the network is touched.
+fn validate_target(url: &str, initiator: Option<&str>, resolve: bool) -> Result<(), String> {
     if url.is_empty() {
         return Err("no URL to fetch (buffr-src: prefix with empty suffix)".to_string());
     }
     let Some(host) = http_host(url) else {
         return Err("only http:// and https:// URLs can be viewed as source".to_string());
     };
-    if !is_non_public_host(&host) {
+    let non_public = is_non_public_host(&host) || (resolve && !host_resolves_public(&host));
+    if !non_public {
         return Ok(());
     }
     let initiator_host = initiator.and_then(http_host);
@@ -221,6 +231,10 @@ wrap_resource_handler! {
         underlying_url: String,
         // Read cursor into `body`.
         cursor: Arc<AtomicUsize>,
+        // Host of the page that triggered the navigation; handed to the
+        // worker so the authoritative check can allow a same-host private
+        // destination.
+        initiator_host: Option<String>,
     }
 
     impl ResourceHandler {
@@ -303,13 +317,14 @@ wrap_resource_handler! {
 
             let body_slot = Arc::clone(&self.body);
             let url = self.underlying_url.clone();
+            let initiator_host = self.initiator_host.clone();
 
             let spawned = std::thread::Builder::new()
                 .name("buffr-src-fetch".to_string())
                 .spawn(move || {
                     // Held for the whole fetch; released on every exit path.
                     let _permit = permit;
-                    let html = fetch_and_render(&url);
+                    let html = fetch_and_render(&url, initiator_host.as_deref());
                     let bytes = html.into_bytes();
                     if let Ok(mut slot) = body_slot.lock() {
                         *slot = Some(bytes);
@@ -471,13 +486,14 @@ impl Drop for FetchPermit {
 /// On any error (empty URL, network failure, non-2xx, body too large)
 /// returns an HTML error page so the user sees *something* useful rather
 /// than a CEF error overlay.
-fn fetch_and_render(url: &str) -> String {
-    // Belt-and-braces: `create` already validated the target, but this is
-    // the function that actually touches the network so it re-checks.
-    // `initiator = None` here — a same-host private destination that was
-    // approved at `create` time would be rejected again, so the caller must
-    // not reach this path for one (it doesn't: rejected targets never spawn
-    // a worker).
+fn fetch_and_render(url: &str, initiator_host: Option<&str>) -> String {
+    // `create`'s check is string-only — it runs on CEF's IO thread, which
+    // must not block on DNS. This worker-thread call is the authoritative
+    // private-network gate, DNS resolution included, and runs before the
+    // fetch touches the network.
+    if let Err(reason) = validate_target(url, initiator_host, true) {
+        return error_page(url, &reason);
+    }
     if url.is_empty() {
         return error_page(url, "no URL to fetch (buffr-src: prefix with empty suffix)");
     }
@@ -641,33 +657,39 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_http_schemes() {
-        assert!(validate_target("file:///etc/passwd", None).is_err());
-        assert!(validate_target("data:text/html,<b>hi", None).is_err());
-        assert!(validate_target("", None).is_err());
+        assert!(validate_target("file:///etc/passwd", None, false).is_err());
+        assert!(validate_target("data:text/html,<b>hi", None, false).is_err());
+        assert!(validate_target("", None, false).is_err());
     }
 
     #[test]
     fn validate_rejects_ssrf_from_public_page() {
         // The exact payload from the finding.
-        let err = validate_target("http://127.0.0.1:8080/admin", Some("https://evil.example/"))
-            .unwrap_err();
+        let err = validate_target(
+            "http://127.0.0.1:8080/admin",
+            Some("https://evil.example/"),
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("127.0.0.1"), "{err}");
         assert!(
             validate_target(
                 "http://169.254.169.254/latest/meta-data/",
-                Some("https://evil.example/")
+                Some("https://evil.example/"),
+                false
             )
             .is_err()
         );
         // No initiator at all is treated as untrusted.
-        assert!(validate_target("http://192.168.1.1/", None).is_err());
+        assert!(validate_target("http://192.168.1.1/", None, false).is_err());
         // The integer form of the cloud-metadata endpoint: previously
         // slipped past the guard as "public" (getaddrinfo resolves it to
         // 169.254.169.254).
         assert!(
             validate_target(
                 "http://2852039166/latest/meta-data/",
-                Some("https://evil.example/")
+                Some("https://evil.example/"),
+                false
             )
             .is_err()
         );
@@ -680,22 +702,59 @@ mod tests {
         assert!(
             validate_target(
                 "http://127.0.0.1:41235/tok/new",
-                Some("http://127.0.0.1:41235/tok/new")
+                Some("http://127.0.0.1:41235/tok/new"),
+                false
             )
             .is_ok()
         );
         // Different port on the same host is fine; different host is not.
-        assert!(validate_target("http://127.0.0.1:9/x", Some("http://127.0.0.1:41235/y")).is_ok());
-        assert!(validate_target("http://127.0.0.1:8080/x", Some("http://127.0.0.1:8080/")).is_ok());
-        assert!(validate_target("http://10.0.0.5/x", Some("http://127.0.0.1:41235/y")).is_err());
+        assert!(
+            validate_target(
+                "http://127.0.0.1:9/x",
+                Some("http://127.0.0.1:41235/y"),
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_target(
+                "http://127.0.0.1:8080/x",
+                Some("http://127.0.0.1:8080/"),
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_target("http://10.0.0.5/x", Some("http://127.0.0.1:41235/y"), false).is_err()
+        );
     }
 
     #[test]
     fn validate_allows_ordinary_public_pages() {
         assert!(
-            validate_target("https://example.com/page", Some("https://other.example/")).is_ok()
+            validate_target(
+                "https://93.184.216.34/page",
+                Some("https://other.example/"),
+                false
+            )
+            .is_ok()
         );
-        assert!(validate_target("http://example.com/page", None).is_ok());
+        assert!(validate_target("http://93.184.216.34/page", None, false).is_ok());
+
+        // The resolve=true (worker) path, offline-safe via IP literals.
+        assert!(
+            validate_target("http://93.184.216.34/page", None, true).is_ok(),
+            "public literal passes the resolved gate"
+        );
+        assert!(
+            validate_target(
+                "http://127.0.0.1:8080/admin",
+                Some("https://evil.example/"),
+                true
+            )
+            .is_err(),
+            "private literal fails the resolved gate"
+        );
     }
 
     // ── M14: bounded fetch pool ───────────────────────────────────────────

@@ -4,6 +4,8 @@
 //! fail-closed rule backs every browser-process network read — view-source
 //! and "Copy Image" alike — without drifting into a second copy.
 
+use std::net::ToSocketAddrs;
+
 /// `true` when `host` names a loopback, link-local, unique-local or
 /// RFC1918 destination. Conservative: an unparseable literal that *looks*
 /// numeric is treated as non-public.
@@ -56,6 +58,41 @@ pub fn is_non_public_host(host: &str) -> bool {
     looks_numeric(host)
 }
 
+/// `true` when every address `host` currently resolves to is public.
+///
+/// The string guard ([`is_non_public_host`]) only classifies literals and
+/// the localhost/.local names, so a hostname whose A/AAAA records point at
+/// a private network (e.g. `127.0.0.1.nip.io`) was treated as public. This
+/// closes that by resolving the host and classifying each address.
+/// Fail-closed: a resolution error or zero addresses returns `false`.
+///
+/// The caller fetches the URL after this returns, and that fetch resolves
+/// again — DNS rebinding between the two is out of scope, as before. The
+/// port is irrelevant to classification. This blocks on the system
+/// resolver; every caller runs it off the CEF IO thread — the view-source
+/// fetch worker and the image-copy worker.
+pub fn host_resolves_public(host: &str) -> bool {
+    let addrs = match (host, 0u16).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return false,
+    };
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        // Round-trip through the string guard so the resolution path
+        // classifies with exactly the same ranges as the literal path —
+        // one copy, no drift.
+        let ip = match addr {
+            std::net::SocketAddr::V4(v4) => v4.ip().to_string(),
+            std::net::SocketAddr::V6(v6) => v6.ip().to_string(),
+        };
+        if is_non_public_host(&ip) {
+            return false;
+        }
+    }
+    any
+}
+
 /// `true` when `host` is an IPv4 address in a non-public range.
 pub(crate) fn is_non_public_v4(addr: std::net::Ipv4Addr) -> bool {
     let [a, b, _, _] = addr.octets();
@@ -72,7 +109,9 @@ pub(crate) fn is_non_public_v4(addr: std::net::Ipv4Addr) -> bool {
 /// `true` when `s` is a bare numeric-looking literal — every character is a
 /// hex digit, `.`, `x` or `X` — i.e. something glibc's `getaddrinfo` could
 /// resolve as a number. A DNS name (letters beyond hex, dashes, …) returns
-/// `false` and stays "public"; DNS rebinding is out of scope for this guard.
+/// `false` and stays "public". This string guard does not resolve DNS;
+/// callers that must classify a name's addresses apply [`host_resolves_public`]
+/// as a separate step.
 pub(crate) fn looks_numeric(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -117,5 +156,23 @@ mod tests {
         ] {
             assert!(is_non_public_host(h), "{h} should be non-public");
         }
+    }
+
+    #[test]
+    fn host_resolves_public_classifies_literals() {
+        assert!(host_resolves_public("8.8.8.8"), "public v4 literal");
+        assert!(host_resolves_public("2606:4700::1111"), "public v6 literal");
+        assert!(!host_resolves_public("127.0.0.1"), "loopback literal");
+        assert!(!host_resolves_public("::1"), "v6 loopback literal");
+        // `localhost` does run the getaddrinfo path (via /etc/hosts), but
+        // its verdict is also reachable through the string guard alone, so
+        // this does not pin the DNS branch. The wildcard-DNS SSRF case (a
+        // name like 127.0.0.1.nip.io resolving to a private address) cannot
+        // be tested offline; the worker-path tests in view_source_scheme
+        // cover the resolve-and-classify mechanism with IP literals.
+        assert!(
+            !host_resolves_public("localhost"),
+            "localhost resolves to loopback"
+        );
     }
 }
