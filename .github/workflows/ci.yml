@@ -171,6 +171,16 @@ jobs:
       - name: build buffr-app (debug)
         run: cargo build -p buffr-app
 
+      - name: set chrome-sandbox suid bit
+        run: |
+          # Chromium's SUID sandbox helper must be root-owned with mode
+          # 4755 or the browser aborts at startup ("The SUID sandbox helper
+          # binary was found, but is not configured correctly"). The build
+          # lands it in target/debug as the runner user, so the setuid bit
+          # is missing; GitHub-hosted runners have passwordless sudo.
+          sudo chown root:root target/debug/chrome-sandbox
+          sudo chmod 4755 target/debug/chrome-sandbox
+
       - name: run edit-mode e2e suite
         run: ./tests/e2e/suite.sh
 
@@ -268,6 +278,14 @@ jobs:
 
       - name: build buffr-app (debug)
         run: cargo build -p buffr-app
+
+      - name: set chrome-sandbox suid bit (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Same as the e2e job: Chromium's SUID sandbox helper must be
+          # root-owned with mode 4755 or buffr-app aborts at startup.
+          sudo chown root:root target/debug/chrome-sandbox
+          sudo chmod 4755 target/debug/chrome-sandbox
 
       - name: run smoke under headless sway (Linux)
         if: matrix.os == 'ubuntu-latest'
