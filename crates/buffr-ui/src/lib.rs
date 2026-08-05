@@ -1,6 +1,6 @@
 //! Browser chrome — Phase 3 statusline (the rest is deferred).
 //!
-//! See `docs/ui-stack.md` for the rendering decision: chrome lives in
+//! See `docs/site/ui-stack.md` for the rendering decision: chrome lives in
 //! a `softbuffer` strip docked to the bottom of the buffr window, in
 //! the same `winit` window as the CEF child window above it.
 //!
@@ -40,7 +40,7 @@ pub use tab_strip::{
 
 /// Statusline strip height in pixels. 30 px fits a 14-px glyph row
 /// with comfortable padding above + below; matches the recommendation
-/// in `docs/ui-stack.md`. Bumping this requires the host window to
+/// in `docs/site/ui-stack.md`. Bumping this requires the host window to
 /// re-layout the CEF child rect.
 pub const STATUSLINE_HEIGHT: u32 = 30;
 
@@ -493,7 +493,7 @@ impl Palette {
         self
     }
 
-    /// Phase 6 high-contrast palette. Documented in `docs/accessibility.md`.
+    /// Phase 6 high-contrast palette. Documented in `docs/site/accessibility.md`.
     /// Pure white-on-black + saturated yellow accent that survives both
     /// black and white backgrounds. Semantic signals collapse to white
     /// so the chrome stays legible for low-vision users.

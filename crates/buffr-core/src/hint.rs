@@ -1,6 +1,6 @@
 //! Hint mode — DOM-injected overlay labels (Vimium-style follow-by-letter).
 //!
-//! Architecture: option 2 from `docs/ui-stack.md`. We render hints as real
+//! Architecture: option 2 from `docs/site/ui-stack.md`. We render hints as real
 //! DOM elements injected into the page via
 //! [`cef::Frame::execute_java_script`]. The hints are absolutely-positioned
 //! `<div class="buffr-hint-overlay">` overlays styled in-page and visible

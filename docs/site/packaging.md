@@ -12,9 +12,9 @@ Distribution artifacts for all three tier-1 targets. Everything below is
 | Windows  | `cargo xtask package-windows-msi` | `target/dist/windows/buffr-<ver>-<x64\|arm64>.msi` |
 
 The macOS bundle assembly (driving the DMG) lives in
-[`docs/macos-signing.md`](./macos-signing.md); the Windows MSI flow has its own
-[`docs/windows-packaging.md`](./windows-packaging.md). The rest of this document
-covers Linux end-to-end.
+[`docs/site/macos-signing.md`](./macos-signing.md); the Windows MSI flow has its
+own [`docs/site/windows-packaging.md`](./windows-packaging.md). The rest of this
+document covers Linux end-to-end.
 
 ## Linux
 

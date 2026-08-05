@@ -150,8 +150,8 @@ cargo run --bin buffr-app
 > [github.com/kryptic-sh/buffr/releases](https://github.com/kryptic-sh/buffr/releases),
 > or build from source as shown above.
 
-See [`docs/dev.md`](docs/dev.md) for full prerequisites, platform matrix, and
-CEF path overrides.
+See [`docs/site/dev.md`](docs/site/dev.md) for full prerequisites, platform
+matrix, and CEF path overrides.
 
 ## Known limitations
 
@@ -165,7 +165,7 @@ CEF path overrides.
 
 There is no CONTRIBUTING.md yet — open an issue or a PR. Local gates before you
 push: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test`. See [`docs/dev.md`](docs/dev.md).
+`cargo test`. See [`docs/site/dev.md`](docs/site/dev.md).
 
 ## License
 

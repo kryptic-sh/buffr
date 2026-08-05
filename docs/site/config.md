@@ -3,7 +3,7 @@
 User config is a single TOML file. Every key has a default; the loader emits an
 error with a line/column span when a key is misspelt, unknown, or has the wrong
 type. A copy-pasteable defaults-equivalent lives at
-[`config.example.toml`](../config.example.toml) at the repo root.
+[`config.example.toml`](../../config.example.toml) at the repo root.
 
 ## File location
 

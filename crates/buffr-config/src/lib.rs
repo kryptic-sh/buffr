@@ -180,7 +180,7 @@ pub struct Theme {
     /// Phase 6 accessibility: when `true`, the chrome (statusline,
     /// tab strip, input bar, prompt) renders with a high-contrast
     /// palette instead of the accent-tinted default. See
-    /// `docs/accessibility.md` for the colour values.
+    /// `docs/site/accessibility.md` for the colour values.
     pub high_contrast: bool,
 }
 
@@ -226,7 +226,7 @@ pub fn parse_hex_rgb(s: &str) -> Option<u32> {
 /// performs **one** GET per `check_interval_hours` against the GitHub
 /// releases API; no PII is sent. To opt out fully set
 /// `enabled = false` — that path makes **zero** network calls. See
-/// `docs/privacy.md`.
+/// `docs/site/privacy.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -253,7 +253,7 @@ impl Default for UpdateConfig {
 /// tab strip, prompts) is keyboard-first; a screen-reader bridge is
 /// post-1.0 because it requires platform-specific bindings (AT-SPI on
 /// Linux, NSAccessibility on macOS, MSAA on Windows). See
-/// `docs/accessibility.md`.
+/// `docs/site/accessibility.md`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessibilityConfig {
@@ -324,7 +324,7 @@ fn default_engine_id() -> String {
 /// `data_dir` is parsed and passed to the backend, but the CEF backend
 /// discards it — no per-engine `RequestContext` is created, so every
 /// instance shares CEF's process-global `root_cache_path`. See
-/// `docs/config.md` and kryptic-sh/buffr#158.
+/// `docs/site/config.md` and kryptic-sh/buffr#158.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineInstance {

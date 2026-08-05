@@ -69,7 +69,7 @@ progress = "#66c2ff"
 update = "#e0c85a"
 # Phase 6 a11y: switch chrome to a high-contrast palette
 # (white-on-black with a saturated yellow accent). Overrides every
-# colour above. See `docs/accessibility.md` for the values.
+# colour above. See `docs/site/accessibility.md` for the values.
 high_contrast = false
 
 [privacy]
@@ -78,7 +78,7 @@ high_contrast = false
 # searches_run, bookmarks_added, downloads_completed) and writes them
 # to `<data>/usage-counters.json` for the user to inspect. No network
 # endpoint exists; buffr never sends telemetry anywhere. Even on opt-in
-# the counters stay local. See `docs/privacy.md`.
+# the counters stay local. See `docs/site/privacy.md`.
 enable_telemetry = false
 # Categories wiped on shutdown. Each entry is processed independently:
 # one failure doesn't skip the rest. Successes log at INFO; failures
@@ -147,7 +147,7 @@ alphabet = "asdfghjkl;weruio"
 # panic hook that writes JSON crash files under `<data>/crashes/`.
 # Reports stay on disk for the user to inspect or mail; nothing is
 # uploaded. CEF native-crash capture (crashpad/breakpad) is not yet
-# configured — see `docs/privacy.md`.
+# configured — see `docs/site/privacy.md`.
 enabled = false
 # Cutoff for `--purge-crashes`. Reports older than this many days are
 # removed. Default 30. Must be > 0 — `0` is rejected at load time
@@ -159,7 +159,7 @@ purge_after_days = 30
 # default — one HTTP GET per `check_interval_hours` against the
 # GitHub releases API, no PII. Set `enabled = false` to disable
 # entirely; that path makes ZERO network calls. See
-# `docs/privacy.md` and `docs/updates.md`.
+# `docs/site/privacy.md` and `docs/site/updates.md`.
 enabled = true
 # Minimum hours between live `--check-for-updates` queries. Reads
 # inside the window come from the on-disk cache.
@@ -173,7 +173,7 @@ github_repo = "kryptic-sh/buffr"
 # Platform screen readers (Orca/AT-SPI on Linux, VoiceOver on macOS,
 # NVDA/JAWS on Windows) consume that tree. Default `false` because
 # building the tree adds a non-trivial per-frame cost; users with an
-# AT should turn it on. See `docs/accessibility.md`.
+# AT should turn it on. See `docs/site/accessibility.md`.
 force_renderer_accessibility = false
 
 [idle_inhibit]
@@ -257,7 +257,7 @@ default = "cef"
 # defaults — several rows here deliberately differ from the shipped
 # keymap (e.g. buffr's default `H`/`L` are tab prev/next and `o` opens
 # a new tab to the right). The authoritative default table is
-# `docs/keymap.md`, or run `buffr --audit-keymap`.
+# `docs/site/keymap.md`, or run `buffr --audit-keymap`.
 
 [keymap.normal]
 "j" = "scroll_down"

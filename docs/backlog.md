@@ -1,7 +1,8 @@
 # Backlog
 
-Everything left over from the full-codebase review in
-[`code-review.md`](./code-review.md), plus what surfaced while fixing it.
+Everything left over from the full-codebase reviews (v0.14.6 at `3eb8840` and
+2026-08-04 at `a38fa86`), plus what surfaced while fixing them. `code-review.md`
+is gone — its still-open findings are consolidated below.
 
 Nothing here is a known-broken **build**: `main` is green on CI (all three
 OSes), `cargo deny`, `cargo machete`, and the fuzz workflow. These are the items
@@ -185,23 +186,13 @@ rediscovered as findings.
   session-less runner, not a fix for the ICU crash it was once blamed for. The
   smoke test passes locally without it; worth retrying once the job has been
   stable for a while.
-- **`docs/code-review.md` is deliberately not in `SUMMARY.md`.** The book is the
+- **`docs/backlog.md` is deliberately not in `SUMMARY.md`.** The book is the
   public user-facing site; listing it would publish unfixed security findings
   with reproduction steps.
 
 ---
 
-## 4. Small cleanups
-
-Mechanical, low-risk, no decision needed.
-
-- The review's own `Summary` counts in `code-review.md` are frozen at the time
-  of writing and no longer reflect what has been fixed; the `Status` section
-  above them is the live view.
-
----
-
-## 5. Release follow-ups
+## 4. Release follow-ups
 
 - **`buffr-modal` owes itself a minor bump.** The C3 fix changed
   `Keymap::bind_chords` from returning `()` to `Result<(), BindError>` and made
@@ -303,7 +294,7 @@ Mechanical, low-risk, no decision needed.
 
 ---
 
-## 6. `main.rs` decomposition — partly done
+## 5. `main.rs` decomposition — partly done
 
 `apps/buffr-app/src/main.rs` was 11,628 lines. Seven slices took it to 6,994,
 each a separate commit verified with `cargo fmt --all`,
@@ -348,7 +339,7 @@ methods instead of cutting a range. The natural groups:
 
 ---
 
-## 7. Found while cleaning up, not actioned
+## 6. Found while cleaning up, not actioned
 
 - **`--private` profile directories are never reaped.** Each
   `buffr-app --private` launch creates `$TMPDIR/buffr-private-<pid>-<rand>/` and
@@ -377,7 +368,7 @@ methods instead of cutting a range. The natural groups:
 
 ---
 
-## 8. Performance review, 2026-08-04 — shipped
+## 7. Performance review, 2026-08-04 — shipped
 
 A read-only pass over the current tree (2026-08-04) re-verified the 2026-08-02
 findings (P1–P8, all still present then) and added N1–N5. **All of them are
@@ -405,7 +396,7 @@ live compositor is not (no Wayland session) — see section 2.
 
 ---
 
-## 9. Working practice, learned the hard way
+## 8. Working practice, learned the hard way
 
 Not repo defects. Recorded because each one cost real time or real work, and
 none of it is recoverable from `git log`.
@@ -431,7 +422,7 @@ none of it is recoverable from `git log`.
 
 ---
 
-## 10. Audit cleared + hardening, 2026-08-04
+## 9. Audit cleared + hardening, 2026-08-04
 
 Things suspected during the same pass and disproved by tracing (worth recording
 so they are not re-reported):
@@ -479,10 +470,89 @@ Hardening (correct today, fragile):
 
 ---
 
+## 10. Code review 2026-08-04 (a38fa86) — open findings
+
+Fresh full-codebase pass at low depth (correctness only; no style) on a clean
+tree. Three of its seven findings were fixed the same day and are not listed: 2
+(`buffr-src:` numeric-host guard bypass — `7bb805f`), 5 (`<C-c>` bound twice —
+`7cefca1`, the M39 decision), 6 (edit-mode console sink unbounded — `447d448`).
+The rest are still open:
+
+### 1 HIGH — closing a tab left of the active tab leaves the old active tab running as if foregrounded
+
+**Where:** `crates/buffr-cef/src/host.rs:1663` (`close_index`); the "hide the
+previous tab" guard at `set_active_index` (`host.rs:1430-1437`).
+
+`close_index` removes the tab and then calls `set_active_index(new_idx)` while
+the stored `active` index still points at the removed tab's slot, so the guard
+(`prev < tabs.len()`) never fires and the previously-active browser is never
+hidden.
+
+Repro: tabs [A, B, C], active = 2 (C visible). `close_index(0)` → [B, C], stored
+`active` is still `Some(2)`, `new_idx = 0`; in `set_active_index` the guard
+`prev < tabs.len()` is `2 < 2` → false, so C keeps `was_hidden(0)` with focus
+and its timers, animations and audio run as if foregrounded until the next tab
+switch. (The per-tab OSR frame is per-`BrowserHost`, so it is C's own render
+budget that keeps burning.)
+
+**Fix:** when `idx < old_active`, decrement the stored active index before
+calling `set_active_index`, or hide by tab id rather than raw index.
+
+### 3 MEDIUM — context-menu "Close tab" exits the app on the active engine's count alone
+
+**Where:** `apps/buffr-app/src/context_menu.rs:631-636`.
+
+Every other tab-close path — keyboard `close_active_tab_or_exit`
+(`main.rs:2688`) and the pinned-close resolution (`main.rs:2728`) — sums
+`tab_count()` across **all** engines before deciding to exit. The context-menu
+path counts only the active engine, so closing the last tab of the active engine
+while another engine still has tabs triggers `shutdown_flag`.
+
+Repro: engines E1 (1 tab) and E2 (3 tabs); E1 active. Right-click the E1 tab in
+the strip → Close Tab: `host.close_tab(id)` → E1 now 0 tabs → `host.tab_count()`
+= 0 → `save_session_now` + `shutdown_flag` → the browser exits while E2 still
+has 3 tabs.
+
+**Fix:** sum `self.engines.values().map(|e| e.tab_count())` like the other two
+paths.
+
+### 4 LOW — webkit `move_tab` lands rightward moves one slot short; `MoveTabRight` is a no-op
+
+**Where:** `crates/buffr-webkit/src/platform/runtime.rs:4559-4570`.
+
+`insert_at = if to > from { to - 1 } else { to }` treats `to` as a pre-move
+index, but the trait contract (`buffr-engine/src/engine.rs:84`), the CEF backend
+(`host.rs:1745-1746`) and every caller use `to` as the final position.
+Experimental backend only, and not built by CI.
+
+Repro: tabs [A, B, C], `MoveTabRight` on B → `move_tab(1, 2)`; `remove(1)` → [A,
+C]; `insert_at = 2 - 1 = 1` → [A, B, C] (unchanged). Expect [A, C, B].
+
+**Fix:** `tabs.insert(to, entry)` unconditionally (and mirror it in the
+`engine_state` branch at `runtime.rs:4569-4570`).
+
+### 7 LOW — context-menu tab target resolved by stale slot index
+
+**Where:** `apps/buffr-app/src/context_menu.rs:713-724`.
+
+`resolve_tab_target` indexes the _current_ tab list by the slot recorded when
+the menu opened. Any tab-list change while the menu is open (a page's
+`window.open` landing a background tab, another tab closing) shifts indices and
+the action fires against the wrong tab. Narrow: most interactions dismiss the
+menu first, and the pinned-close confirmation covers the misaim it cares about.
+
+Repro: open the context menu on the tab at index 1; a background `window.open`
+adds a tab at index 1 (shifting the target to 2); choose Close Tab — the tab now
+at slot 1 is closed.
+
+**Fix:** resolve by tab id at dispatch time, or re-locate by id.
+
+---
+
 ## Corrections to the review itself
 
-Three findings in `code-review.md` were **wrong** and were deliberately not
-"fixed". Recorded here so nobody re-files them:
+Three findings in the v0.14.6 code review were **wrong** and were deliberately
+not "fixed". Recorded here so nobody re-files them:
 
 - **L39** — `TYPEFLAG_FRAME` does have a caller
   (`crates/buffr-core/src/context_menu.rs` — there are now three files by that
@@ -508,5 +578,5 @@ by the full workspace gate:
   and trait methods removed, history builder, gesture-gated clipboard and
   `xdg-open`.
 - **All 12 perf findings** (P1–P8, N1–N5): commits `8621a90`..`2caa56f`, see
-  section 8.
+  section 7.
 - **CHANGELOG**: every fix recorded under `[Unreleased]` in the same commit.

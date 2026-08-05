@@ -28,7 +28,7 @@ cargo xtask fetch-cef
 cargo build --release -p buffr-bin
 ```
 
-See [`docs/dev.md`](../../docs/dev.md) for full prerequisites.
+See [`docs/site/dev.md`](../../docs/site/dev.md) for full prerequisites.
 
 ## Usage
 

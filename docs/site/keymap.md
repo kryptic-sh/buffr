@@ -256,7 +256,7 @@ on the prompt strip. After resolving one the next prompt appears on the
 following frame.
 
 See
-[`crates/buffr-permissions/README.md`](../crates/buffr-permissions/README.md)
+[`crates/buffr-permissions/README.md`](../../crates/buffr-permissions/README.md)
 for the decision-precedence rules.
 
 ## Mouse / context menu

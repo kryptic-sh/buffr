@@ -15,7 +15,8 @@
 - Windows 10+, MSVC build tools.
 
 For a Mac-specific first-run checklist, including Homebrew packages and the
-plain `cargo run` CEF layout, see [`docs/macos-running.md`](./macos-running.md).
+plain `cargo run` CEF layout, see
+[`docs/site/macos-running.md`](./macos-running.md).
 
 ## First build
 
@@ -80,7 +81,8 @@ buffr/
 ├── xtask/                  # cargo xtask: fetch-cef, packaging
 ├── fuzz/                   # EXCLUDED from the workspace (cargo-fuzz)
 ├── vendor/cef/             # downloaded CEF binaries (gitignored)
-├── docs/                   # this file
+├── docs/                   # backlog (site sources live in docs/site/)
+│   └── site/               # mdBook src — this file
 └── TODO.md                 # near-term task list
 ```
 
@@ -116,7 +118,7 @@ message when it is not `wayland`. X11/XWayland is not a supported target.
 The page is rendered off-screen (CEF windowless mode) and composited with the
 chrome into one window via `wgpu` on every platform; there is no XWayland
 round-trip and no CEF child window on Linux. See
-[`docs/ui-stack.md`](./ui-stack.md).
+[`docs/site/ui-stack.md`](./ui-stack.md).
 
 ## macOS bundling
 
@@ -162,7 +164,7 @@ Notes:
   framework-existence check; bundle assembly still finishes, the resulting app
   just won't run.
 - Distribution-grade signing + notarization is documented in
-  [`docs/macos-signing.md`](./macos-signing.md). Phase 6 work.
+  [`docs/site/macos-signing.md`](./macos-signing.md). Phase 6 work.
 
 ## Linux packaging
 
@@ -186,7 +188,7 @@ The AUR PKGBUILD is regenerated at `pkg/aur/PKGBUILD` with the current workspace
 version on every run.
 
 Full guide (layout, depends, glibc, sandbox caveats, signing TODO):
-[`docs/packaging.md`](./packaging.md).
+[`docs/site/packaging.md`](./packaging.md).
 
 ## Crash-restart supervisor
 
@@ -248,8 +250,8 @@ cargo test --workspace
 ## UI
 
 Chrome (statusline, tab strip, input bar, prompts) lives in `crates/buffr-ui`.
-Rendering decisions are in [`docs/ui-stack.md`](./ui-stack.md): CEF renders the
-page off-screen and the app composites page + chrome into one `winit` window
+Rendering decisions are in [`docs/site/ui-stack.md`](./ui-stack.md): CEF renders
+the page off-screen and the app composites page + chrome into one `winit` window
 with `wgpu` on every platform. The 30-pixel statusline
 (`buffr_ui::STATUSLINE_HEIGHT`) rasterizes glyphs with `fontdue` at a fixed 15
 px, with per-glyph advance widths (`crates/buffr-ui/src/font.rs`). Find-in-page
@@ -299,10 +301,10 @@ macOS and Windows use the **same** XDG layout — there is no
 
 `buffr-config` reads `~/.config/buffr/config.toml` — the same path on Linux,
 macOS, and Windows, with `$XDG_CONFIG_HOME` honored everywhere (debug builds use
-`buffr-debug`). Schema reference: [`docs/config.md`](./config.md). A
+`buffr-debug`). Schema reference: [`docs/site/config.md`](./config.md). A
 copy-pasteable defaults file ships at
-[`config.example.toml`](../config.example.toml) at the repo root — drop it into
-`$XDG_CONFIG_HOME/buffr/config.toml` to start customising.
+[`config.example.toml`](../../config.example.toml) at the repo root — drop it
+into `$XDG_CONFIG_HOME/buffr/config.toml` to start customising.
 
 ```sh
 buffr --check-config            # validate ~/.config/buffr/config.toml
@@ -379,7 +381,7 @@ Caveats:
 wipes after the event loop returns and before `cef::shutdown()`. Cookies route
 through CEF's global cookie manager; history / bookmarks / downloads call
 `clear_all` on their respective stores. See
-[`config.example.toml`](../config.example.toml) for the full list of valid
+[`config.example.toml`](../../config.example.toml) for the full list of valid
 entries.
 
 The `cache` and `local_storage` entries are **currently broken**:

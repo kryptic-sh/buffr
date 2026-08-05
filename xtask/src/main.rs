@@ -727,7 +727,7 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
         "           codesign --force --deep --sign - {}",
         app_dir.display()
     );
-    eprintln!("xtask: For distribution: see docs/macos-signing.md (TODO)");
+    eprintln!("xtask: For distribution: see docs/site/macos-signing.md (TODO)");
     Ok(())
 }
 
@@ -1621,7 +1621,7 @@ fn package_macos_dmg(args: Vec<String>) -> Result<()> {
     eprintln!("       artifact: {}", dmg_path.display());
     eprintln!("       NOTE: unsigned. First-run users must clear the quarantine xattr:");
     eprintln!("           xattr -d com.apple.quarantine /Applications/Buffr.app");
-    eprintln!("       Signing + notarization land alongside docs/macos-signing.md.");
+    eprintln!("       Signing + notarization land alongside docs/site/macos-signing.md.");
     Ok(())
 }
 
@@ -1955,7 +1955,7 @@ fn package_windows_msi(args: Vec<String>) -> Result<()> {
     eprintln!("       artifact: {}", msi_path.display());
     eprintln!(
         "       NOTE: unsigned. SmartScreen will warn until Authenticode signing lands \
-         (see docs/windows-packaging.md)."
+         (see docs/site/windows-packaging.md)."
     );
     Ok(())
 }
@@ -2009,7 +2009,7 @@ fn collect_windows_payload(workspace: &Path, profile: &str) -> Result<WindowsPay
         "no Windows payload found under any of {} \
          — build via `cargo build --target x86_64-pc-windows-msvc --release` (Windows host) \
          or `cargo build --target x86_64-pc-windows-gnu --release` (Linux cross) first.\n\
-         Cross-build prerequisites: see docs/windows-packaging.md",
+         Cross-build prerequisites: see docs/site/windows-packaging.md",
         candidates
             .iter()
             .map(|p| p.display().to_string())

@@ -322,7 +322,7 @@ impl Keymap {
     }
 
     /// Default vim-flavoured bindings. `leader` is the configured
-    /// leader char (vim default is `\`). See `docs/keymap.md` for
+    /// leader char (vim default is `\`). See `docs/site/keymap.md` for
     /// the full table.
     pub fn default_bindings(leader: char) -> Self {
         let mut km = Keymap::new();
@@ -476,10 +476,10 @@ fn action_kind(a: &PageAction) -> &'static str {
 }
 
 /// Default keymap table. Static so test can validate every entry
-/// parses cleanly. See `docs/keymap.md` for the human-readable
+/// parses cleanly. See `docs/site/keymap.md` for the human-readable
 /// version.
 ///
-/// Bindings mirror Vieb defaults; see docs/keymap.md for intentional
+/// Bindings mirror Vieb defaults; see docs/site/keymap.md for intentional
 /// divergences (`=` as ZoomReset, `<C-c>` as StopLoading, `o` kept).
 const DEFAULT_BINDINGS: &[(PageMode, &str, PageAction)] = &[
     // -- scroll ---------------------------------------------------

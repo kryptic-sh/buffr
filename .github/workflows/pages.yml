@@ -70,11 +70,11 @@ jobs:
           set -euo pipefail
           missing=0
           while IFS= read -r path; do
-            if [ -n "$path" ] && [ ! -f "docs/$path" ]; then
-              echo "::error::SUMMARY.md references missing file: docs/$path"
+            if [ -n "$path" ] && [ ! -f "docs/site/$path" ]; then
+              echo "::error::SUMMARY.md references missing file: docs/site/$path"
               missing=1
             fi
-          done < <(grep -oE '\(\./[^)]+\)' docs/SUMMARY.md | sed 's/(\.\///;s/)$//')
+          done < <(grep -oE '\(\./[^)]+\)' docs/site/SUMMARY.md | sed 's/(\.\///;s/)$//')
           test "$missing" -eq 0
 
       - name: Build
@@ -84,7 +84,7 @@ jobs:
       # when it is absent, so losing this file does not fail anything — it
       # quietly moves the site to kryptic-sh.github.io/buffr/ and breaks
       # every link. It arrives via mdBook's copy of non-chapter files out of
-      # `docs/`, which is behaviour worth asserting rather than trusting.
+      # `docs/site/`, which is behaviour worth asserting rather than trusting.
       - name: Check the custom domain survived the build
         run: |
           set -euo pipefail

@@ -1,6 +1,6 @@
 # mdBook configuration for buffr's docs site.
 #
-# Generates a static HTML site from `docs/*.md`. The rendered output
+# Generates a static HTML site from `docs/site/*.md`. The rendered output
 # lives in `docs-site/` (gitignored target dir) and is published to
 # `https://buffr.kryptic.sh/` by this repo's own Pages workflow.
 #
@@ -10,8 +10,8 @@
 # rather than the pull request that caused it, and the docs only went live
 # on the website's daily cron. The build now lives with the docs.
 #
-# `docs/CNAME` is the custom domain; mdBook copies non-chapter files out of
-# `src` into the build directory, and the workflow checks it arrived.
+# `docs/site/CNAME` is the custom domain; mdBook copies non-chapter files out
+# of `src` into the build directory, and the workflow checks it arrived.
 #
 # Run locally:
 #   mdbook build       -> emits HTML into docs-site/
@@ -22,7 +22,7 @@ title = "buffr"
 description = "Vim-modal browser. Native shell, GPU-accelerated compositing via CEF."
 authors = ["mxaddict <mxaddict@kryptic.sh>"]
 language = "en"
-src = "docs"
+src = "docs/site"
 multilingual = false
 
 [build]
@@ -48,7 +48,6 @@ site-url = "/"
 "/docs/README.html" = "/index.html"
 "/docs/accessibility.html" = "/accessibility.html"
 "/docs/backlog.html" = "/backlog.html"
-"/docs/code-review.html" = "/code-review.html"
 "/docs/config.html" = "/config.html"
 "/docs/context-menu.html" = "/context-menu.html"
 "/docs/dev.html" = "/dev.html"

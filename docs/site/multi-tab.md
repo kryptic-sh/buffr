@@ -1,6 +1,6 @@
 # Multi-tab architecture
 
-[`BrowserHost`](../crates/buffr-cef/src/host.rs) is a manager owning a
+[`BrowserHost`](../../crates/buffr-cef/src/host.rs) is a manager owning a
 `Vec<Tab>` of CEF browsers. All tabs belong to the **same** window (the winit
 window the embedder constructed); only the active browser is visible. Switching
 tabs flips visibility and focus.

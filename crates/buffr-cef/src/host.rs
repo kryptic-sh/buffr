@@ -15,7 +15,7 @@
 //! history / downloads / find sinks). Each tab owns its own
 //! [`cef::Browser`]; switching tabs calls
 //! `was_hidden(true)` on the previous and `was_hidden(false)` +
-//! `set_focus(true)` on the next. See `docs/multi-tab.md`.
+//! `set_focus(true)` on the next. See `docs/site/multi-tab.md`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
