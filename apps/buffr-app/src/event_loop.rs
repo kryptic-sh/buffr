@@ -898,7 +898,8 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                     let total_remaining: usize = self.engines.values().map(|e| e.tab_count()).sum();
                     self.refresh_tab_strip();
                     if total_remaining == 0 {
-                        event_loop.exit();
+                        info!("tab_close: last tab gone (all engines) — requesting graceful exit");
+                        self.request_exit();
                     }
                     return;
                 }

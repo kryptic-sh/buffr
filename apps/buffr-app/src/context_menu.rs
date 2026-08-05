@@ -636,11 +636,7 @@ impl AppState {
                     };
                     self.refresh_tab_strip();
                     if remaining == 0 {
-                        self.save_session_now();
-                        self.mark_clean_shutdown();
-                        // Graceful exit — see close_active_tab_or_exit.
-                        self.shutdown_flag.store(true, Ordering::SeqCst);
-                        self.request_redraw();
+                        self.request_exit();
                     }
                     self.mark_session_dirty();
                 }

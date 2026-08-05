@@ -2688,18 +2688,7 @@ impl AppState {
                 let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
                 if !still_open || total_tabs == 0 {
                     info!("tab_close: last tab gone (all engines) — requesting graceful exit");
-                    self.save_session_now();
-                    self.mark_clean_shutdown();
-                    // Signal the event loop to exit on the next `about_to_wait`
-                    // tick instead of `std::process::exit(0)`. Direct exit()
-                    // bypasses Rust `Drop` so the WPE WebKit worker thread keeps
-                    // running and WebKit's libc atexit destructors then SIGABRT
-                    // unwinding a half-initialised display. Routing through
-                    // `event_loop.exit()` runs the post-`run_app` shutdown
-                    // sequence (engine drops, backend.shutdown(), …) before
-                    // libc atexit fires.
-                    self.shutdown_flag.store(true, Ordering::SeqCst);
-                    self.request_redraw();
+                    self.request_exit();
                 }
                 true
             }
@@ -2728,17 +2717,26 @@ impl AppState {
             let total_tabs: usize = self.engines.values().map(|e| e.tab_count()).sum();
             if total_tabs == 0 {
                 info!("tab_close: last tab gone (all engines) — requesting graceful exit");
-                self.save_session_now();
-                self.mark_clean_shutdown();
-                // See close_active_tab_or_exit for the rationale: signal
-                // the event loop so the post-run_app shutdown sequence
-                // tears down engines + workers before libc atexit fires.
-                self.shutdown_flag.store(true, Ordering::SeqCst);
-                self.request_redraw();
+                self.request_exit();
             }
             self.refresh_tab_strip();
             self.mark_session_dirty();
         }
+    }
+
+    /// Last tab gone (across all engines) — run the graceful-exit
+    /// sequence: persist the session, clear the crash-loop tracker, and
+    /// signal the event loop to exit on the next `about_to_wait` tick.
+    /// Direct `event_loop.exit()` bypasses Rust `Drop` so the WPE WebKit
+    /// worker thread keeps running and WebKit's libc atexit destructors
+    /// then SIGABRT unwinding a half-initialised display; routing through
+    /// the flag runs the post-`run_app` shutdown sequence (engine drops,
+    /// backend.shutdown(), …) before libc atexit fires.
+    fn request_exit(&mut self) {
+        self.save_session_now();
+        self.mark_clean_shutdown();
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.request_redraw();
     }
 
     /// Clear the crash-loop tracker. Call only at genuine graceful
