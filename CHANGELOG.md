@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- Store connections now set an explicit 10 s `busy_timeout` (up from the bundled
+  SQLite's incidental 5 s default), so a second buffr process sharing the
+  profile waits for a transient lock instead of surfacing `SQLITE_BUSY`
+  mid-write.
 - Typing an out-of-range port (e.g. `localhost:99999`) no longer produces an
   unparseable `https://localhost:99999` that silently no-ops — it resolves as a
   search query instead, matching the resolver's "always a fully-qualified URL"

@@ -75,11 +75,15 @@ pub fn open_tuned_in_memory() -> rusqlite::Result<Connection> {
 /// writer is active; `synchronous=NORMAL` is safe under WAL and avoids
 /// fsync-per-commit thrash. `foreign_keys=ON` is belt-and-braces —
 /// not every store has FKs today, but every future migration that adds
-/// them will Just Work.
+/// them will Just Work. `busy_timeout` stops a second buffr process
+/// sharing the profile from surfacing `SQLITE_BUSY` mid-write — set
+/// explicitly (deliberately above the bundled SQLite's incidental 5000 ms
+/// default) so the value survives a switch to a system libsqlite3-sys.
 fn tune(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "busy_timeout", 10_000)?;
     Ok(())
 }
 
@@ -216,6 +220,10 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1);
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 10_000);
     }
 
     #[cfg(feature = "chrono")]
