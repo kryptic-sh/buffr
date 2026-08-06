@@ -661,6 +661,26 @@ impl BrowserHost {
         }
     }
 
+    /// The URL the active tab actually navigated to, display override
+    /// aside — for `buffr://` pages this is the loopback
+    /// `http://127.0.0.1:<port>/<token>/…` form, which is what
+    /// `buffr-src:` needs to reach (the gate accepts only `http(s)://`
+    /// targets and the same-host loopback exception covers this case).
+    /// Empty string if no active tab.
+    pub fn active_tab_cef_url(&self) -> String {
+        let Ok(tabs) = self.tabs.lock() else {
+            return String::new();
+        };
+        let active_idx = self.active.lock().ok().and_then(|g| *g);
+        if let Some(idx) = active_idx
+            && let Some(t) = tabs.get(idx)
+        {
+            t.url.clone()
+        } else {
+            String::new()
+        }
+    }
+
     /// Drain all queued `on_address_change` events and apply them to the
     /// matching tab's `url` field. Returns `true` when at least one tab
     /// URL changed so the caller can request a redraw and mark the
@@ -3150,6 +3170,10 @@ impl buffr_engine::BrowserEngine for BrowserHost {
 
     fn active_tab_live_url(&self) -> String {
         self.active_tab_live_url()
+    }
+
+    fn active_tab_cef_url(&self) -> String {
+        self.active_tab_cef_url()
     }
 
     fn pump_address_changes(&self) -> bool {

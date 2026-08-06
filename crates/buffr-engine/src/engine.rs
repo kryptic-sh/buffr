@@ -123,6 +123,17 @@ pub trait BrowserEngine: Send + Sync {
     /// Cached main-frame URL of the active tab. Empty when no active tab.
     fn active_tab_live_url(&self) -> String;
 
+    /// The URL the active tab actually navigated to — for `buffr://`
+    /// pages this is the loopback `http://127.0.0.1:<port>/<token>/…`
+    /// form, where [`Self::active_tab_live_url`] returns the user-facing
+    /// `buffr://` override. View-source builds its `buffr-src:` target
+    /// from this so the private-network gate sees a real `http://` host
+    /// (audit §17-3). Backends without the display distinction fall back
+    /// to the live URL.
+    fn active_tab_cef_url(&self) -> String {
+        self.active_tab_live_url()
+    }
+
     /// Drain queued `on_address_change` events. Returns `true` when at
     /// least one URL changed.
     fn pump_address_changes(&self) -> bool;

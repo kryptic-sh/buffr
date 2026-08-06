@@ -485,9 +485,13 @@ impl AppState {
             // ── Page ─────────────────────────────────────────────────────────
             I::ViewPageSource => {
                 tracing::info!(target: "buffr::context_menu", action = "view_page_source", "dispatch");
+                // Use the URL CEF actually navigated, not the display URL:
+                // on a `buffr://` page the display form is `buffr://new`,
+                // which the buffr-src: gate rejects (not http(s)); the
+                // loopback form is what the same-host exception covers.
                 let current_url = self
                     .active_engine_dyn()
-                    .map(|e| e.active_tab_live_url())
+                    .map(|e| e.active_tab_cef_url())
                     .unwrap_or_default();
                 if current_url.is_empty() {
                     return;
