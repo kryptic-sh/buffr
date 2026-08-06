@@ -34,7 +34,10 @@ export LIBGL_ALWAYS_SOFTWARE=1
 cat > "$WORK/inner.sh" <<INNER
 #!/usr/bin/env bash
 export XDG_SESSION_TYPE=wayland
-export BUFFR_DISABLE_ZYGOTE=1
+# No BUFFR_DISABLE_ZYGOTE here: the renderer sandbox is enabled, and
+# Chromium refuses --no-zygote together with the sandbox ("Zygote cannot
+# be disabled if sandbox is enabled"). The flag was only ever a
+# precaution for an ICU crash traced to LD_LIBRARY_PATH, not the zygote.
 # BUFFR_LOG_CONSOLE is required: page console output is the harness's only
 # feedback channel and is gated off by default for privacy.
 export RUST_LOG=info,buffr_core=debug

@@ -210,10 +210,6 @@ rediscovered as findings.
   `quick-xml` (via `wayland-scanner` and `plist`) and one for `ttf-parser` (via
   `fontdb`/`fontdue`). Re-checked against the current lock; drop conditions are
   recorded in the file.
-- **`BUFFR_DISABLE_ZYGOTE=1` in the Linux smoke job** is a precaution on a
-  session-less runner, not a fix for the ICU crash it was once blamed for. The
-  smoke test passes locally without it; worth retrying once the job has been
-  stable for a while.
 - **`docs/backlog.md` is deliberately not in `SUMMARY.md`.** The book is the
   public user-facing site; listing it would publish unfixed security findings
   with reproduction steps.
