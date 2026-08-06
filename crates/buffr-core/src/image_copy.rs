@@ -87,12 +87,7 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         return Err("blob: URLs not supported".into());
     }
     check_fetch_host(url)?;
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(FETCH_TIMEOUT_CONNECT))
-        .timeout_recv_response(Some(FETCH_TIMEOUT_READ))
-        .user_agent(USER_AGENT)
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = build_agent();
     let mut resp = agent.get(url).call().map_err(|e| format!("fetch: {e}"))?;
     let mut body = Vec::new();
     resp.body_mut()
@@ -104,6 +99,22 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         return Err("image response too large".into());
     }
     Ok(body)
+}
+
+/// Build the ureq agent used for image fetches.
+///
+/// `.max_redirects(0)` is load-bearing (§17-1): `check_fetch_host` clears
+/// only the URL it is given, so a hostile origin could 302 a public URL
+/// into a loopback or RFC1918 address. A 3xx is returned as-is instead of
+/// being followed.
+fn build_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(FETCH_TIMEOUT_CONNECT))
+        .timeout_recv_response(Some(FETCH_TIMEOUT_READ))
+        .user_agent(USER_AGENT)
+        .max_redirects(0)
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 /// Reject `http(s)` URLs whose host is loopback, private, link-local or
@@ -295,6 +306,33 @@ mod tests {
         for url in ["https://8.8.8.8/img.png", "http://93.184.216.34/img.png"] {
             assert!(check_fetch_host(url).is_ok(), "{url} should be allowed");
         }
+    }
+
+    #[test]
+    fn agent_does_not_follow_redirects() {
+        // §17-1: the host guard clears only the original URL; a 302 hop
+        // must never be fetched. The agent returns the 3xx as-is.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/x\r\n\
+                      Content-Length: 0\r\n\r\n",
+                );
+            }
+        });
+        let resp = build_agent()
+            .get(&format!("http://{addr}/redir"))
+            .call()
+            .expect("fetch should succeed and return the 3xx");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "a 3xx must be returned, not followed"
+        );
+        let _ = thread.join();
     }
 
     #[test]

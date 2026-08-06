@@ -530,6 +530,12 @@ fn fetch_and_render(url: &str, initiator_host: Option<&str>) -> String {
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(std::time::Duration::from_secs(10)))
             .timeout_recv_response(Some(std::time::Duration::from_secs(10)))
+            // §16-2: never follow redirects — `validate_target` gates the
+            // URL it is given, and every hop after a 3xx would be fetched
+            // with no re-validation, so a public origin could 302 into a
+            // loopback/RFC1918 address. `max_redirects(0)` returns the 3xx
+            // as-is, which the 200..300 check below turns into an error page.
+            .max_redirects(0)
             .build();
         let agent = ureq::Agent::new_with_config(config);
 
@@ -825,5 +831,68 @@ mod tests {
             FetchPermit::acquire().is_some(),
             "capacity must come back after the permits drop"
         );
+    }
+
+    // ── §16-2: no redirect following ─────────────────────────────────────
+
+    /// Serve one canned HTTP response on an ephemeral loopback port.
+    struct OneShotServer {
+        addr: std::net::SocketAddr,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl OneShotServer {
+        fn spawn(response: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let thread = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Write;
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self { addr, thread }
+        }
+    }
+
+    #[test]
+    fn fetch_does_not_follow_redirects() {
+        // The gate clears only the URL it is given; a redirect hop must
+        // never be fetched. A 3xx surfaces as an error page, not as the
+        // redirect target's body.
+        //
+        // The target server is expected to receive NO connection — the
+        // redirect must not be followed — so its thread parks in accept()
+        // and is never joined.
+        let target = OneShotServer::spawn(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+             Content-Length: 21\r\n\r\nREDIRECT_TARGET_BODY"
+                .into(),
+        );
+        let redirect = OneShotServer::spawn(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{}/target\r\n\
+             Content-Length: 0\r\n\r\n",
+            target.addr
+        ));
+
+        // Same-host initiator (bare form, as `create` passes to the worker)
+        // lets the loopback fetch through the private-network gate so the
+        // redirect behavior itself is what is exercised.
+        let page = fetch_and_render(
+            &format!("http://{}/redir", redirect.addr),
+            Some("127.0.0.1"),
+        );
+        assert!(
+            page.contains("HTTP 302"),
+            "a redirect must surface as an error page, got: {page}"
+        );
+        assert!(
+            !page.contains("REDIRECT_TARGET_BODY"),
+            "the redirect target must never be fetched"
+        );
+        // Join only the redirect server (it served one request). The target
+        // server's accept() stays parked for the rest of the test process;
+        // never join it.
+        let _ = redirect.thread.join();
     }
 }

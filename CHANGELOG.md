@@ -14,6 +14,10 @@ and this project adheres to
   worker received the initiator host as a bare string (no scheme), which the
   host parser rejected, so every private-network source — including `buffr://`
   internal pages — was refused. The bare-host shape is now accepted.
+- `buffr-src:` and Copy Image no longer follow HTTP redirects in the browser
+  process. A redirect hop was fetched without re-running the private-network
+  gate, so a public URL could 302 into a loopback or RFC1918 address; a 3xx now
+  surfaces as an error page instead.
 - The hint-mode statusline no longer renders a meaningless `(n/n)` counter —
   numerator and denominator were the same field, so it always read e.g.
   `f: as (3/3)`. It now shows just the typed prefix (`f: as`).
