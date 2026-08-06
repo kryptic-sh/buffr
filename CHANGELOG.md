@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- Typing an out-of-range port (e.g. `localhost:99999`) no longer produces an
+  unparseable `https://localhost:99999` that silently no-ops — it resolves as a
+  search query instead, matching the resolver's "always a fully-qualified URL"
+  contract.
 - `[privacy] skip_schemes = []` now means "record every scheme" as the config
   docs promise; an empty list used to silently fall back to the five default
   skip schemes, making "record everything" impossible.

@@ -156,9 +156,17 @@ fn looks_like_url(s: &str) -> bool {
     if head.is_empty() {
         return false;
     }
-    // Strip optional `:port`.
+    // Strip optional `:port`. An out-of-range port (> 65535) keeps the
+    // input out of the URL branch — `https://localhost:99999` would fail
+    // `url::Url::parse` and the navigation would silently no-op.
     let host = match head.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        Some((h, p))
+            if !p.is_empty()
+                && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().is_ok() =>
+        {
+            h
+        }
         _ => head,
     };
     if host.is_empty() {
@@ -195,7 +203,13 @@ fn looks_like_url(s: &str) -> bool {
 fn needs_http(s: &str) -> bool {
     let head = s.split(['/', '?', '#']).next().unwrap_or("");
     let host = match head.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        Some((h, p))
+            if !p.is_empty()
+                && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().is_ok() =>
+        {
+            h
+        }
         _ => head,
     };
     host.eq_ignore_ascii_case("localhost") || is_ipv4(host)
@@ -322,6 +336,29 @@ mod tests {
         let s = search();
         assert_eq!(resolve_input("192.168.1.1", &s), "http://192.168.1.1");
         assert_eq!(resolve_input("10.0.0.1:8080", &s), "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn out_of_range_port_falls_back_to_search() {
+        // §11-12: `localhost:99999` used to resolve to
+        // `https://localhost:99999`, which `url::Url::parse` rejects and
+        // the navigation silently no-opped. It must be treated as a search
+        // instead of emitting an unparseable URL.
+        let s = search();
+        assert_eq!(
+            resolve_input("localhost:99999", &s),
+            "https://duckduckgo.com/?q=localhost%3A99999"
+        );
+        assert_eq!(
+            resolve_input("example.com:99999", &s),
+            "https://duckduckgo.com/?q=example.com%3A99999"
+        );
+        // In-range ports still resolve as URLs.
+        assert_eq!(
+            resolve_input("example.com:65535", &s),
+            "https://example.com:65535"
+        );
+        assert_eq!(resolve_input("localhost:3000", &s), "http://localhost:3000");
     }
 
     #[test]
