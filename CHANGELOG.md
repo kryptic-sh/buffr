@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Fixed
 
+- Edit-mode script teardown now also removes the `focus` capture listener it
+  registers, so a soft-navigation re-injection no longer leaks one stale
+  listener per navigation.
 - "View Page Source" on a `buffr://` internal page now works: the app used to
   build the target from the display URL (`buffr://new`), which the `buffr-src:`
   gate rejects; it now uses the loopback URL the tab actually navigated to,

@@ -343,6 +343,7 @@
 
     window.__buffrEditTeardown = function () {
         document.removeEventListener('focusin', onFocusIn, true);
+        document.removeEventListener('focus', onFocusIn, true);
         document.removeEventListener('focusout', onFocusOut, true);
         document.removeEventListener('input', onInput, true);
         document.removeEventListener('mousedown', markGesture, true);
