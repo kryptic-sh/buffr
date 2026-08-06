@@ -438,7 +438,7 @@ impl History {
 pub struct HistoryBuilder {
     path: Option<PathBuf>, // None => in-memory
     clock: Box<dyn Clock>,
-    skip_schemes: Vec<String>, // empty => DEFAULT_SKIP_SCHEMES
+    skip_schemes: Option<Vec<String>>, // None => DEFAULT_SKIP_SCHEMES
 }
 
 impl Default for HistoryBuilder {
@@ -446,7 +446,7 @@ impl Default for HistoryBuilder {
         Self {
             path: None,
             clock: Box::new(SystemClock),
-            skip_schemes: Vec::new(),
+            skip_schemes: None,
         }
     }
 }
@@ -472,20 +472,21 @@ impl HistoryBuilder {
     }
 
     /// Replace the canonical [`DEFAULT_SKIP_SCHEMES`] list. Pass
-    /// `config.privacy.skip_schemes.clone()` here.
+    /// `config.privacy.skip_schemes.clone()` here. An explicitly empty
+    /// list records every scheme — the config's "remove entries to record
+    /// them" contract; only omitting this call keeps the defaults.
     pub fn skip_schemes(mut self, schemes: Vec<String>) -> Self {
-        self.skip_schemes = schemes;
+        self.skip_schemes = Some(schemes);
         self
     }
 
-    /// Build the [`History`]. An empty skip-schemes list resolves to
-    /// the canonical [`DEFAULT_SKIP_SCHEMES`].
+    /// Build the [`History`]. Omitting [`Self::skip_schemes`] resolves to
+    /// the canonical [`DEFAULT_SKIP_SCHEMES`]; an explicit empty list is
+    /// honored as "no scheme is skipped".
     pub fn build(self) -> Result<History, HistoryError> {
-        let skip_schemes = if self.skip_schemes.is_empty() {
-            DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect()
-        } else {
-            self.skip_schemes
-        };
+        let skip_schemes = self
+            .skip_schemes
+            .unwrap_or_else(|| DEFAULT_SKIP_SCHEMES.iter().map(|s| s.to_string()).collect());
         let mut conn = match self.path {
             Some(path) => {
                 buffr_store::open_tuned(&path).map_err(|source| HistoryError::Open { source })?
@@ -730,6 +731,22 @@ mod tests {
         h.record_visit("https://example.com/", None, Transition::Link)
             .unwrap();
         assert_eq!(h.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn empty_skip_schemes_records_everything() {
+        // §11-10: `[privacy] skip_schemes = []` means "record all
+        // schemes", not "fall back to the defaults".
+        let h = History::builder()
+            .in_memory()
+            .skip_schemes(Vec::new())
+            .build()
+            .unwrap();
+        h.record_visit("file:///etc/passwd", None, Transition::Link)
+            .unwrap();
+        h.record_visit("about:blank", None, Transition::Link)
+            .unwrap();
+        assert_eq!(h.count().unwrap(), 2);
     }
 
     #[test]

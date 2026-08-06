@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Fixed
 
+- `[privacy] skip_schemes = []` now means "record every scheme" as the config
+  docs promise; an empty list used to silently fall back to the five default
+  skip schemes, making "record everything" impossible.
 - View-page-source now honors its same-host exception on the fetch worker: the
   worker received the initiator host as a bare string (no scheme), which the
   host parser rejected, so every private-network source — including `buffr://`
