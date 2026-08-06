@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Fixed
 
+- Context-menu "Close Tab" now counts tabs across all engines before deciding to
+  exit — closing the active engine's last tab while another engine still has
+  tabs used to trigger a full shutdown.
 - Context-menu tab actions now resolve the clicked tab by id instead of by the
   slot recorded when the menu opened — a background `window.open` or another tab
   closing could shift indices and make "Close Tab" fire against the wrong tab.

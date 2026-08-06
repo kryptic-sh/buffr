@@ -628,12 +628,13 @@ impl AppState {
                         self.request_redraw();
                         return;
                     }
-                    let remaining = if let Some(host) = self.active_engine_dyn() {
+                    if let Some(host) = self.active_engine_dyn() {
                         let _ = host.close_tab(id);
-                        host.tab_count()
-                    } else {
-                        0
-                    };
+                    }
+                    // Phase 3: "last tab" exit must check across ALL
+                    // engines — closing the active engine's last tab while
+                    // another engine still has tabs is not an exit.
+                    let remaining: usize = self.engines.values().map(|e| e.tab_count()).sum();
                     self.refresh_tab_strip();
                     if remaining == 0 {
                         self.request_exit();
