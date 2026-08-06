@@ -12,6 +12,34 @@ Grouped by what is actually blocking them.
 
 ---
 
+## Shipped 2026-08-06
+
+Worked from this backlog one slice at a time, each commit verified by the full
+workspace gate (fmt --check, clippy --workspace -D warnings, build, nextest):
+
+| Item                                                         | Commit    |
+| ------------------------------------------------------------ | --------- |
+| §16-1 same-host exception dead on the view-source worker     | `ac9b395` |
+| §16-2/§17-1 redirects past the private-network gate          | `f630585` |
+| §11-10 `skip_schemes = []` reverted to the defaults          | `1f8db30` |
+| §11-12 out-of-range port emitted an unparseable URL          | `beb4824` |
+| §9 `open_tuned` set no `busy_timeout`                        | `794fca2` |
+| §12-7 session-restore/CLI URLs carried `javascript:`/`data:` | `f479118` |
+| §10-7 context-menu tab target resolved by stale slot         | `86382ab` |
+| §10-3 context-menu Close tab exited on active engine's count | `c70aed7` |
+| §17-3 view-source of `buffr://` pages always error page      | `a6b7482` |
+| §11-13 edit.js teardown leaked the `focus` listener          | `76a4b12` |
+| §11-15 pinned-close confirm bypassed while another was up    | `8705de9` |
+| §11-16 surrogate-pair chars dropped on the direct-text path  | `f183ad9` |
+| §12-9 internal-server auth token persisted to history        | `b3b8aac` |
+
+Each fix shipped with a test that was proven red on the old code where a unit
+test was writable; the rest (CEF/js runtime paths) are compile-verified and
+noted in their sections. The 2026-08-06 finding sections below still list items
+that remain open.
+
+---
+
 ## 1. Needs a product decision
 
 Each of these has a real defect behind it, but two or more defensible
@@ -462,8 +490,6 @@ Hardening (correct today, fragile):
   use `--private`, so no current trigger).
 - Config-watcher callback mutex can be poisoned by a panicking callback,
   silently skipping later reloads.
-- `buffr-store::open_tuned` sets no `busy_timeout` — a second buffr process
-  sharing the profile could surface `SQLITE_BUSY` mid-write.
 - The Animation paint arm does not advance `last_osr_generation` — the gate can
   accept the same generation twice during a dim-mismatch animation (harmless
   today; defeats the double-swap guard's intent).
@@ -477,44 +503,6 @@ tree. Three of its seven findings were fixed the same day and are not listed: 2
 (`buffr-src:` numeric-host guard bypass — `7bb805f`), 5 (`<C-c>` bound twice —
 `7cefca1`, the M39 decision), 6 (edit-mode console sink unbounded — `447d448`).
 The rest are still open:
-
-### 1 HIGH — closing a tab left of the active tab leaves the old active tab running as if foregrounded
-
-**Where:** `crates/buffr-cef/src/host.rs:1663` (`close_index`); the "hide the
-previous tab" guard at `set_active_index` (`host.rs:1430-1437`).
-
-`close_index` removes the tab and then calls `set_active_index(new_idx)` while
-the stored `active` index still points at the removed tab's slot, so the guard
-(`prev < tabs.len()`) never fires and the previously-active browser is never
-hidden.
-
-Repro: tabs [A, B, C], active = 2 (C visible). `close_index(0)` → [B, C], stored
-`active` is still `Some(2)`, `new_idx = 0`; in `set_active_index` the guard
-`prev < tabs.len()` is `2 < 2` → false, so C keeps `was_hidden(0)` with focus
-and its timers, animations and audio run as if foregrounded until the next tab
-switch. (The per-tab OSR frame is per-`BrowserHost`, so it is C's own render
-budget that keeps burning.)
-
-**Fix:** when `idx < old_active`, decrement the stored active index before
-calling `set_active_index`, or hide by tab id rather than raw index.
-
-### 3 MEDIUM — context-menu "Close tab" exits the app on the active engine's count alone
-
-**Where:** `apps/buffr-app/src/context_menu.rs:631-636`.
-
-Every other tab-close path — keyboard `close_active_tab_or_exit`
-(`main.rs:2688`) and the pinned-close resolution (`main.rs:2728`) — sums
-`tab_count()` across **all** engines before deciding to exit. The context-menu
-path counts only the active engine, so closing the last tab of the active engine
-while another engine still has tabs triggers `shutdown_flag`.
-
-Repro: engines E1 (1 tab) and E2 (3 tabs); E1 active. Right-click the E1 tab in
-the strip → Close Tab: `host.close_tab(id)` → E1 now 0 tabs → `host.tab_count()`
-= 0 → `save_session_now` + `shutdown_flag` → the browser exits while E2 still
-has 3 tabs.
-
-**Fix:** sum `self.engines.values().map(|e| e.tab_count())` like the other two
-paths.
 
 ### 4 LOW — webkit `move_tab` lands rightward moves one slot short; `MoveTabRight` is a no-op
 
@@ -530,22 +518,6 @@ C]; `insert_at = 2 - 1 = 1` → [A, B, C] (unchanged). Expect [A, C, B].
 
 **Fix:** `tabs.insert(to, entry)` unconditionally (and mirror it in the
 `engine_state` branch at `runtime.rs:4569-4570`).
-
-### 7 LOW — context-menu tab target resolved by stale slot index
-
-**Where:** `apps/buffr-app/src/context_menu.rs:713-724`.
-
-`resolve_tab_target` indexes the _current_ tab list by the slot recorded when
-the menu opened. Any tab-list change while the menu is open (a page's
-`window.open` landing a background tab, another tab closing) shifts indices and
-the action fires against the wrong tab. Narrow: most interactions dismiss the
-menu first, and the pinned-close confirmation covers the misaim it cares about.
-
-Repro: open the context menu on the tab at index 1; a background `window.open`
-adds a tab at index 1 (shifting the target to 2); choose Close Tab — the tab now
-at slot 1 is closed.
-
-**Fix:** resolve by tab id at dispatch time, or re-locate by id.
 
 ---
 
@@ -745,19 +717,6 @@ Expect: both tabs saved and restored
 Actual: every save drops the non-active-engine tabs; each restart loses them
 ```
 
-### 10 LOW — `[privacy] skip_schemes = []` silently reverts to the defaults; "record everything" is impossible
-
-**Where:** `crates/buffr-config/src/lib.rs:465-466` (doc: "remove entries to
-record them (unusual but supported)"), `crates/buffr-history/src/lib.rs:484-488`
-(empty list substituted with `DEFAULT_SKIP_SCHEMES` before `is_skip_scheme` at
-526-532 ever sees it).
-
-```
-Repro: config.toml: [privacy] skip_schemes = []  then visit a file:// URL
-Expect: the visit is recorded
-Actual: HistoryBuilder substitutes the 5 defaults; record_visit returns early
-```
-
 ### 11 LOW — Netscape importer: `<H3>`/`</DL>` markup inside an anchor label desyncs the folder stack
 
 **Where:** `crates/buffr-bookmarks/src/lib.rs:401-403` (independent regexes),
@@ -771,36 +730,6 @@ Actual: "x" is pushed as a folder and never popped (no </DL> belongs to it);
        too early. Fires only on malformed/hostile input — real Chrome/Firefox
        exports escape `<` as &lt; — and the fuzzer can't catch it (nothing
        asserts on tags).
-```
-
-### 12 LOW — `resolve_input` emits an unparseable URL for a port > 65535; navigation silently no-ops
-
-**Where:** `crates/buffr-config/src/search.rs:160-163` (any all-digit colon
-suffix accepted as a port, no range check), `104-107` (branch 2 emits
-`{prefix}://{trimmed}`), caller `apps/buffr-app/src/main.rs:2543-2545` (parse
-fails → warn + no-op). Violates the resolver's own contract (search.rs:74-76:
-"always a fully-qualified URL").
-
-```
-Repro: type or paste `localhost:99999` (classify_input → Host, main.rs:2535-2538)
-Expect: treated as a search or a loadable URL
-Actual: "https://localhost:99999" produced; url::Url::parse rejects the port;
-       open_tab_at fails, warn, nothing happens
-```
-
-### 13 LOW — `edit.js` teardown leaks the `focus` capture listener on every re-injection
-
-**Where:** `crates/buffr-core/assets/edit.js:286` (registers `focus`), `344-352`
-(teardown removes `focusin`/`focusout`/`input`/`mousedown`/`pointerdown`/
-`touchstart` — not `focus`); re-injection at edit.js:52-54 calls the previous
-copy's teardown.
-
-```
-Repro: soft-navigation SPA; each pushState re-triggers on_load_end re-injection
-Expect: each re-injection fully unwires the previous copy
-Actual: one stale `focus` capture closure accumulates per navigation (its events
-       are dropped by the rotated nonce, so inert, but the listener set grows
-       unboundedly over a long session)
 ```
 
 ### 14 LOW — hint `Ready` events are single-slot and untagged; a tab switch before the drain misroutes them
@@ -817,33 +746,6 @@ Expect: A's hint session receives A's hints
 Actual: A's Ready is applied to B — dropped if B has no session (A's hint mode
        then dies: next key → Cancel), or B's hint list is replaced with A's
        element ids (next hint key clicks the wrong element)
-```
-
-### 15 LOW — pinned-close confirmation is bypassed by a middle-click while a different confirm is pending
-
-**Where:** `apps/buffr-app/src/event_loop.rs:889-896` (guard is
-`pinned && confirm_close_pinned.is_none()` — fails open once any confirm is up;
-the modal swallows left presses only, 691-727).
-
-```
-Repro: <C-w> on pinned tab A (confirm up); middle-click pinned tab B
-Expect: B's close gated through the same confirmation
-Actual: B closes immediately, no prompt
-```
-
-### 16 LOW — a character needing 2 UTF-16 units (emoji, rare CJK) typed via the direct-text path is silently dropped
-
-**Where:** `apps/buffr-app/src/cef_translate.rs:310-318` (`resolve_char_unit`
-returns 0 for multi-unit chars), `389-391` (empty vec when vk and ch are both
-0), `405-419` (no `Char` event emitted when `ch == 0`). IME `Commit` events are
-the only surviving route; compose/hex-input emoji and direct-text keys bypass
-it.
-
-```
-Repro: focused text field; type "😀" via a direct-text path (text = "😀")
-Expect: the character reaches the page
-Actual: resolve_char_unit → 0, char_to_vk(0) → None; scancode-derived VK also 0
-       → empty vec → nothing sent (or a bare RawDown with no Char)
 ```
 
 ### Cleared
@@ -1086,26 +988,6 @@ cannot be verified from this tree — confirm against CEF before treating as
 exploitable. If CEF writes verbatim, add a `file (n)` pass or force
 `ask_each_time`.
 
-### 7 LOW — session restore hands URLs straight to CEF with no scheme allow-list
-
-**Where:** `apps/buffr-app/src/session.rs:123-142` (validates only `version`),
-restore paths `main.rs:2850` (`host.navigate`) and `2880`
-(`routed_open_tab_background`). Every other navigation entry point has a gate —
-IPC allow-list (`single_instance.rs:76-101`, excludes `javascript:`/`data:`),
-`resolve_input` (search.rs:214-228), `classify_navigation`
-(engine_router.rs:225, 245-254) — but a `javascript:`/`file:`/`chrome:` URL in
-`session.json` is handed to CEF at startup.
-
-```
-Repro: a same-user writer puts {"version":1,"tabs":["javascript:…"]} in session.json
-Expect: restored URLs pass the same scheme gate as every other entry point
-Actual: CEF navigates it directly at startup
-```
-
-Defense-in-depth asymmetry (same-user attacker already controls the machine);
-not a remote hole. Fix: run restored/CLI URLs through `resolve_input`-style
-scheme filtering.
-
 ### 8 LOW — Windows single-instance IPC has no peer authorization; the forward allow-list even includes `file:`/`chrome:`
 
 **Where:** `apps/buffr-app/src/single_instance.rs:569-584` (`peer_is_us` on
@@ -1126,28 +1008,6 @@ Actual: accepted unconditionally; the URL opens in the victim's browser
 Reachability depends on the pipe's default DACL (unverified here); the check
 itself is a no-op either way. Fix: real peer-credential check or a restrictive
 pipe security descriptor.
-
-### 9 LOW — the internal-server auth token is persisted to history and session files and shown in chrome, contradicting its "never written to disk" design
-
-**Where:** `crates/buffr-engine/src/internal_server.rs:12-14` (doc: "reset every
-launch, never written to disk"), `234-237` (`url_for` embeds `<token>` in the
-URL), `crates/buffr-cef/src/handlers.rs:717, 734-738` (`frame.url()` recorded
-verbatim via `record_visit`; `DEFAULT_SKIP_SCHEMES` doesn't cover `http`),
-`apps/buffr-app/src/main.rs:2791` (same raw URL into session.json),
-`host.rs:108-133` (`to_display_url` only handles `view-source:` — statusline
-shows it too).
-
-```
-Repro: open buffr://new (or any internal page); quit; read session.json /
-       history.db
-Expect: the token never touches disk
-Actual: http://127.0.0.1:<port>/<token>/new is stored verbatim in both files
-```
-
-Impact is bounded: the token only gates GET-only internal pages (handlers
-receive no request data — cleared), and it dies at the next launch. Fix (in
-buffr-cef/app): skip internal navigations in history/session recording or record
-the display URL.
 
 ### 10 LOW — unbounded popup-window creation; no app-side cap on live popups
 
@@ -1280,9 +1140,9 @@ rest):
 
 - `password-store=basic` — cookies/passwords plaintext in the profile dir;
   deliberate (app.rs:153-161) but worth a config escape hatch to a real keyring.
-- `open_tuned` sets no `busy_timeout` (known, store lib.rs:79-84); watcher
-  callback mutex poisoning (known); downloads `u64 → i64` casts round-trip
-  losslessly today but any future `ORDER BY` on them would see negatives.
+- Watcher callback mutex poisoning (known — still open); downloads `u64 → i64`
+  casts round-trip losslessly today but any future `ORDER BY` on them would see
+  negatives.
 - `resolve_default_dir` returns a relative `default_dir` verbatim (config
   lib.rs:585-587) despite the doc claiming absolute-only — downloads land
   relative to cwd.
@@ -1906,73 +1766,8 @@ in `crates/buffr-core/src/private_net.rs`.
 
 Full-codebase review pass; the 2026-08-04/05 findings (sections 10-15) were
 treated as known and are not re-reported. Two new MEDIUMs, both in the
-`buffr-src:`/Copy Image surface the §12-1 fix (`848a6fb`) touched.
-
-### 1 MEDIUM — the same-host exception is dead on the worker path; view-source of private-host pages always shows the error page
-
-**Where:** `crates/buffr-cef/src/view_source_scheme.rs:116, 163-166, 327, 494`.
-
-`create` extracts the initiator's host string
-(`initiator_host = initiator.as_deref().and_then(http_host)` — :116) and hands
-it to the worker (`fetch_and_render(&url, initiator_host.as_deref())` — :327).
-The worker's authoritative check (`validate_target(url, initiator_host, true)` —
-:494) re-derives the initiator host with
-`let initiator_host = initiator.and_then(http_host);` (:163) — but `http_host`
-(:181) returns `None` for any string lacking an `http://`/`https://` prefix, and
-the worker receives a bare host. So `initiator_host` is always `None` on the
-worker path, the branch `if initiator_host.as_deref() == Some(host.as_str())`
-(:164) can never fire, and every non-public target is refused — including the
-same-host case the `848a6fb` commit message says it preserves. Unit tests pass
-because they call `validate_target` with full-URL initiators, never the
-bare-host shape the worker passes.
-
-```
-Repro: on buffr://new, navigate (omnibar) to buffr-src:http://127.0.0.1:41235/<token>/new
-Expect: view-source of the internal page (the same-host intent; also the worker
-        path with initiator = the internal page's own host, which http_host
-        extracted at create)
-Actual: worker re-runs http_host("127.0.0.1") → None → "refusing to fetch
-        private-network host `127.0.0.1` from a page on `<unknown origin>`" error page
-```
-
-Not a security hole — fail-closed (over-restrictive) — and the visible behavior
-predates the fix. The new defect is that the fix's plumbing is unreachable dead
-code no test exercises, and "view source of a local address from that same host"
-cannot work in any configuration. **Fix:** compare the already-extracted
-initiator host directly on the worker (don't re-run `http_host`), and add a test
-calling `validate_target` with a bare-host initiator.
-
-### 2 MEDIUM — both browser-process fetches follow redirects past the private-network guard
-
-**Where:** `crates/buffr-cef/src/view_source_scheme.rs:514-517`,
-`crates/buffr-core/src/image_copy.rs:96`; the guard covers only the original URL
-(`view_source_scheme.rs:494`, `image_copy.rs:89`).
-
-ureq 3.3.0 follows up to 10 redirects by default (`max_redirects: 10`, installed
-`ureq-3.3.0/src/config.rs:874`; `run.rs` re-issues the request to the `Location`
-target while `redirect_count < max_redirects`). Both agents set only timeouts
-(`view_source_scheme.rs:508-511`, `image_copy.rs:90-94`).
-`validate_target`/`check_fetch_host` classify only the URL they are given, so a
-redirect hop is fetched with no re-validation — the hop can be `127.0.0.1`, any
-RFC1918 address, or a wildcard-DNS name, defeating the string guard, the
-resolve-and-classify gate, and the same-host exception at once. Also flagged by
-the audit pass (§17-1).
-
-```
-Repro: a page navigates the top frame to buffr-src:https://attacker.example/r;
-       attacker.example replies 302 Location: http://127.0.0.1:41235/<token>/new
-Expect: the private-network guard is evaluated for every host actually fetched
-Actual: validate_target approves attacker.example (public); ureq follows the
-       redirect and the browser process GETs 127.0.0.1 directly
-```
-
-Pre-existing (redirects were followed before `848a6fb` too) but never recorded —
-the §12-1 audit listed the nip.io hole but not the redirect path. Impact
-bounded: GET-only, response rendered locally / lands on the local clipboard, no
-exfiltration — but GET side effects on local admin endpoints and the internal
-server are reachable. **Fix:** `.redirects(0)` on both agents (a 3xx then fails
-the `200..300` check and renders the error page), or re-run the guard per
-redirect hop.
+`buffr-src:`/Copy Image surface the §12-1 fix (`848a6fb`) touched. Both were
+fixed on 2026-08-06 (`ac9b395`, `f630585`).
 
 ### Cleared
 
@@ -2044,40 +1839,8 @@ supervisor arm (never executed on this host), `buffr-view-source` renderer,
 ## 17. Audit 2026-08-06 (63b8a25) — findings
 
 Fresh pass over the whole workspace; the 2026-08-04/05 findings (sections 10-15)
-treated as known. One MEDIUM, two LOW — 0 critical, 0 high.
-
-### 1 MEDIUM — `buffr-src:` and Copy Image follow HTTP redirects past the private-network gate
-
-**Where:** `crates/buffr-cef/src/view_source_scheme.rs:494` (worker gate) vs
-`:507-517` (fetch); same pattern `crates/buffr-core/src/image_copy.rs:90-96`;
-ureq 3.3.0 defaults `max_redirects = 10` (`config.rs:874`, installed copy).
-
-`validate_target` (with `resolve=true`) classifies the _original_ URL's host and
-nothing else; `agent.get(url).call()` then follows up to 10 redirects, each hop
-fetched with no re-validation. The `848a6fb` fix closed the wildcard-DNS leg of
-the SSRF; the redirect leg was never gated, before or after the fix. Same root
-in Copy Image (`check_fetch_host` at :89, fetch at :96).
-
-Trace: hostile page at `evil.example` runs
-`location.href = 'buffr-src:http://evil.example/redir'`. The string gate passes;
-the worker's authoritative gate resolves `evil.example` → public → `Ok`; the
-fetch 302s to `Location: http://127.0.0.1:8080/admin`; ureq follows and the
-browser process GETs the loopback service. Copy Image: right-click an
-`<img src="http://evil.example/redir">` → redirect to a private host →
-browser-process GET (response must decode as an image; lands in the user's own
-clipboard).
-
-Impact: blind single GETs against loopback/private services with the user's
-network privileges, response rendered in the tab or on the clipboard. No
-exfiltration (GET-only; the rendered source is escape-only per §12 Cleared) —
-same impact profile as the accepted §12-1, reached through a hop the gate never
-inspected. Reachability of the `buffr-src:` leg carries the §12-1 CEF-behaviour
-caveat (content-initiated top-level navigation to a STANDARD|SECURE scheme).
-
-**Fix:** `max_redirects(0)` in both agents (a 3xx then fails the `200..300`
-status check and renders the error page), or a manual redirect loop re-running
-`validate_target`/`check_fetch_host` per hop. The first is the cheap correct
-answer — view-source and copy-image have no legitimate need to follow redirects.
+treated as known. One MEDIUM, two LOW — 0 critical, 0 high. Findings 1 and 3
+were fixed on 2026-08-06 (`f630585`, `a6b7482`); only 2 remains open.
 
 ### 2 LOW — edit-bridge browser attribution collides across engines: webkit `TabId` and CEF `browser.identifier()` share one `i32` space
 
@@ -2104,30 +1867,6 @@ receive. Fragile but real.
 
 **Fix:** namespace the attribution (`engine_id + browser_id`), or gate
 webkit-tagged events to webkit-active-tabs at the engine level.
-
-### 3 LOW — "View Page Source" on any internal (`buffr://`) page always renders the error page
-
-**Where:** `apps/buffr-app/src/context_menu.rs:486-498`
-(`format!("buffr-src:{current_url}")` from `active_tab_live_url()`),
-`crates/buffr-cef/src/host.rs:648-662` (live URL prefers the `buffr://new`
-display override), `crates/buffr-cef/src/view_source_scheme.rs:156-158`
-(`http_host("buffr://new")` → `None` → "only http:// and https:// URLs can be
-viewed as source").
-
-Trace: on `buffr://new`, View Page Source produces `buffr-src:buffr://new`;
-`validate_target` rejects it at the scheme check, before the same-host loopback
-exception the M13 design comment (`:140-146`) claims keeps internal-page
-view-source working. The M13 "buffr:// internal page" path is dead: the app
-hands the gate a non-http URL instead of the
-`http://127.0.0.1:<port>/<token>/new` the same-host rule was written for.
-Functionality, not security (no privilege boundary crossed) — but the exact
-runtime behaviour the §2 "M13 untested" gap was meant to catch. Related to §16-1
-(same-host exception also dead on the worker path): fixing only §16-1 does not
-make this work — the app-side URL must change too.
-
-**Fix:** build the view-source URL from the tab's CEF URL (`t.url`, the loopback
-form) rather than the display URL, or special-case `buffr://` in `buffr-src:`
-handling.
 
 ### Cleared
 
@@ -2200,11 +1939,11 @@ verified working.
 remains low-to-moderate, unchanged from the prior pass: the hard boundaries (IPC
 socket peer-cred, internal-server token, permission callbacks, pixel upload,
 nonce-anchored parsers) held, and residual risk still concentrates in the
-page→app console bridge and the browser-process fetch primitives. Fix in order:
-(1) `max_redirects(0)` on the ureq agents in `view_source_scheme.rs` and
-`image_copy.rs` — one line each, closes the only new guard bypass; (2) namespace
-the edit-attribution id per engine; (3) decide/implement the §12-2 clipboard
-gate, the top open security item.
+page→app console bridge and the browser-process fetch primitives. Item (1)
+(`max_redirects(0)`) and the §17-3 view-source fix shipped on 2026-08-06
+(`f630585`, `a6b7482`). Remaining: (2) namespace the edit-attribution id per
+engine; (3) decide/implement the §12-2 clipboard gate, the top open security
+item.
 
 ## 18. Tidy 2026-08-06 (63b8a25) — cleanups
 
