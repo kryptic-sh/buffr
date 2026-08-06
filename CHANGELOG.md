@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Fixed
 
+- Context-menu tab actions now resolve the clicked tab by id instead of by the
+  slot recorded when the menu opened — a background `window.open` or another tab
+  closing could shift indices and make "Close Tab" fire against the wrong tab.
 - Restored sessions and CLI URLs can no longer carry `javascript:` or `data:`
   schemes — every other navigation entry point already rejects them, so a
   hand-edited `session.json` couldn't drive script execution at startup.

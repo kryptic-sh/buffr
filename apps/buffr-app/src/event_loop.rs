@@ -836,7 +836,13 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         y: anchor_y,
                         browser_id: 0,
                         items,
-                        target: ContextMenuTarget::Tab { index: idx },
+                        target: ContextMenuTarget::Tab {
+                            index: idx,
+                            // The tab's id at menu-open time, so dispatch
+                            // can re-locate it if the list shifts (a
+                            // background window.open, another close).
+                            id: self.tab_ids.get(idx).map(|t| t.0).unwrap_or(0),
+                        },
                         link_url: url,
                         source_url: String::new(),
                         selection_text: String::new(),

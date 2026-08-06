@@ -204,8 +204,10 @@ pub enum ContextMenuTarget {
     Page,
     /// A click on a tab strip entry. `index` is the tab's slot in the
     /// runtime tab order at the moment the menu opened — dispatch should
-    /// tolerate the tab list having changed since.
-    Tab { index: usize },
+    /// tolerate the tab list having changed since; `id` is that tab's
+    /// id (`0` if it could not be captured), so dispatch re-locates the
+    /// tab instead of trusting the slot.
+    Tab { index: usize, id: u64 },
 }
 
 /// A right-click that has been translated into a menu model.

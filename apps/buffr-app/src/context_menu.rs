@@ -704,18 +704,24 @@ impl AppState {
     /// Resolve a [`ContextMenuTarget::Tab`] request to
     /// `(slot_index, tab_id, url, pinned)` against the *current* tab
     /// list. Returns `None` if the request isn't a tab target or the
-    /// recorded slot no longer exists (the tab list changed since the
-    /// menu opened).
+    /// recorded tab is gone.
+    ///
+    /// The tab is located by the id captured when the menu opened, never
+    /// by the recorded slot — a background `window.open` or another close
+    /// can shift indices while the menu is open, and acting on the slot
+    /// would fire against the wrong tab (review §10-7). The returned
+    /// index is the tab's *current* position, for the close-to-the-right
+    /// arm.
     pub(crate) fn resolve_tab_target(
         &self,
         request: &ContextMenuRequest,
     ) -> Option<(usize, TabId, String, bool)> {
-        let ContextMenuTarget::Tab { index } = request.target else {
+        let ContextMenuTarget::Tab { id, .. } = request.target else {
             return None;
         };
         let host = self.active_engine_dyn()?;
         let summaries = host.tabs_summary();
-        let t = summaries.get(index)?;
+        let (index, t) = locate_tab_by_id(&summaries, id)?;
         Some((index, t.id, t.url.clone(), t.pinned))
     }
 
@@ -778,5 +784,69 @@ impl AppState {
                 false
             }
         }
+    }
+}
+
+/// Locate a tab by id in a summary list, returning its current slot.
+///
+/// Used by [`AppState::resolve_tab_target`] so context-menu tab actions
+/// re-locate the clicked tab instead of trusting a slot index that may
+/// have shifted since the menu opened (review §10-7).
+fn locate_tab_by_id(
+    summaries: &[buffr_engine::TabSummary],
+    id: u64,
+) -> Option<(usize, &buffr_engine::TabSummary)> {
+    summaries.iter().enumerate().find(|(_, t)| t.id.0 == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locate_tab_by_id_ignores_slot_index() {
+        let summaries = vec![
+            buffr_engine::TabSummary {
+                id: TabId(10),
+                browser_id: 1,
+                title: "a".into(),
+                url: "https://a.example/".into(),
+                progress: 1.0,
+                is_loading: false,
+                pinned: false,
+                private: false,
+            },
+            buffr_engine::TabSummary {
+                id: TabId(20),
+                browser_id: 2,
+                title: "b".into(),
+                url: "https://b.example/".into(),
+                progress: 1.0,
+                is_loading: false,
+                pinned: false,
+                private: false,
+            },
+            buffr_engine::TabSummary {
+                id: TabId(30),
+                browser_id: 3,
+                title: "c".into(),
+                url: "https://c.example/".into(),
+                progress: 1.0,
+                is_loading: false,
+                pinned: true,
+                private: false,
+            },
+        ];
+        // The menu opened on the tab at slot 1 (id 20); a background
+        // open inserted a tab at slot 1. The lookup must follow the id.
+        let (idx, t) = locate_tab_by_id(&summaries, 20).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(t.id, TabId(20));
+        let (idx, t) = locate_tab_by_id(&summaries, 30).unwrap();
+        assert_eq!(idx, 2);
+        assert!(t.pinned);
+        // A tab closed while the menu was open resolves to nothing — the
+        // action is dropped, never misaimed onto a different tab.
+        assert!(locate_tab_by_id(&summaries, 99).is_none());
     }
 }
