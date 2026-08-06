@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.10] - 2026-08-06
+
 ### Fixed
 
 - Internal pages are no longer recorded in history: the raw
@@ -57,6 +59,35 @@ and this project adheres to
   process. A redirect hop was fetched without re-running the private-network
   gate, so a public URL could 302 into a loopback or RFC1918 address; a 3xx now
   surfaces as an error page instead.
+- A closed tab stashed for undo no longer keeps playing: CEF's `was_hidden` does
+  not cut audio, so the tab's media — and the statusline's audio indicator —
+  survived until the tab aged out of the undo stack. Closing now mutes the
+  browser and injects a pause-all-media script, which stops the CEF audio
+  stream; reopening a stashed tab restores its sound.
+- Pressing Ctrl+C during the supervisor's restart cooldown now stops the
+  restart: the shutdown check ran only around the child spawn, so a signal that
+  landed while the loop slept still spawned a fresh child. The signal handler
+  also stays armed for the supervisor's lifetime, so a second Ctrl+C terminates
+  the supervisor instead of killing it and orphaning the new child.
+- Edit-mode events now carry the browser that produced them, and the drain drops
+  events from any browser other than the active tab's — a background tab's or
+  popup's page-driven focus can no longer flip the active tab into Insert
+  (capturing keystrokes into the wrong page) or yank its selection to the
+  clipboard.
+- `buffr-src:` and Copy Image now refuse hosts whose DNS resolves to a loopback
+  or private address (e.g. `127.0.0.1.nip.io`): the guards classified hostname
+  strings only, so a name statically resolving to loopback passed as public and
+  let a page pivot the browser-process fetch into the local network. The guards
+  now resolve the host and classify every address, failing closed on resolution
+  errors.
+- Profile directories are now owner-only: `cache` and `data` are chmod 0700 on
+  every launch and `session.json` is written 0600, where a default umask used to
+  leave them 0755/0644 — readable by any local user (history, bookmarks,
+  permissions, session and cache).
+- Closing a tab left of the active one no longer leaves the old active browser
+  running foregrounded — timers, animation and audio — until the next tab
+  switch: the stored active index is now fixed up before the new active tab is
+  selected.
 - The hint-mode statusline no longer renders a meaningless `(n/n)` counter —
   numerator and denominator were the same field, so it always read e.g.
   `f: as (3/3)`. It now shows just the typed prefix (`f: as`).
@@ -2248,7 +2279,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.9...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.10...HEAD
+[0.14.10]: https://github.com/kryptic-sh/buffr/compare/v0.14.9...v0.14.10
 [0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.0
