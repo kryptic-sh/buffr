@@ -913,8 +913,20 @@ fn main() -> Result<()> {
                         active = ?s.active,
                         "session: restored",
                     );
-                    let entries: Vec<(String, bool)> =
-                        s.entries().map(|(u, p)| (u.to_string(), p)).collect();
+                    let entries: Vec<(String, bool)> = s
+                        .entries()
+                        .filter_map(|(u, p)| {
+                            if AppState::is_startup_navigation_safe(u) {
+                                Some((u.to_string(), p))
+                            } else {
+                                warn!(
+                                    url = u,
+                                    "session: dropping restored tab with disallowed scheme"
+                                );
+                                None
+                            }
+                        })
+                        .collect();
                     (entries, s.active)
                 }
                 Ok(None) => (Vec::new(), None),
@@ -1006,6 +1018,14 @@ fn main() -> Result<()> {
             // background tabs after session restore; order: positional then --new-tab.
             let mut tabs = cli.urls.clone();
             tabs.extend(cli.new_tab.clone());
+            tabs.retain(|u| {
+                if AppState::is_startup_navigation_safe(u) {
+                    true
+                } else {
+                    warn!(url = u, "cli-url: dropping URL with disallowed scheme");
+                    false
+                }
+            });
             tabs
         },
         pending_session_tabs,
@@ -2843,6 +2863,22 @@ impl AppState {
         // forward indefinitely so the flush would never fire.
         if self.session_dirty_since.is_none() {
             self.session_dirty_since = Some(Instant::now());
+        }
+    }
+
+    /// Schemes a restored-session or CLI URL may carry at startup.
+    ///
+    /// Mirrors the IPC allow-list (`single_instance`) and
+    /// `classify_navigation`'s `DISALLOWED_NAV_SCHEMES`: `javascript:`
+    /// and `data:` are never navigated from startup data, so a
+    /// hand-edited `session.json` cannot drive script execution or
+    /// attacker-controlled content (audit §12-7). Every other navigation
+    /// entry point already gates these two schemes.
+    fn is_startup_navigation_safe(url: &str) -> bool {
+        match url::Url::parse(url) {
+            Ok(parsed) => !matches!(parsed.scheme(), "javascript" | "data"),
+            // Unparseable URLs fail loudly at navigate/open anyway.
+            Err(_) => true,
         }
     }
 
@@ -5848,6 +5884,28 @@ mod tests {
     use clap::CommandFactory;
 
     // ---- OSR sleep policy tests --------------------------------------------
+
+    #[test]
+    fn startup_navigation_safe_rejects_javascript_and_data() {
+        // §12-7: a hand-edited session.json or CLI arg must not be able
+        // to drive script execution via schemes every other entry point
+        // already gates.
+        assert!(!AppState::is_startup_navigation_safe("javascript:alert(1)"));
+        assert!(!AppState::is_startup_navigation_safe(
+            "data:text/html,<b>xss</b>"
+        ));
+        // Case-insensitive scheme matching.
+        assert!(!AppState::is_startup_navigation_safe("JaVaScRiPt:alert(1)"));
+        // Legitimate startup URLs pass.
+        assert!(AppState::is_startup_navigation_safe("https://example.com/"));
+        assert!(AppState::is_startup_navigation_safe(
+            "file:///home/u/notes.md"
+        ));
+        assert!(AppState::is_startup_navigation_safe("about:blank"));
+        assert!(AppState::is_startup_navigation_safe("buffr://new"));
+        // Unparseable strings are left for navigate/open to fail on.
+        assert!(AppState::is_startup_navigation_safe("not a url"));
+    }
 
     #[test]
     fn paint_policy_visible_no_media() {

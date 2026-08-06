@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Fixed
 
+- Restored sessions and CLI URLs can no longer carry `javascript:` or `data:`
+  schemes — every other navigation entry point already rejects them, so a
+  hand-edited `session.json` couldn't drive script execution at startup.
 - Store connections now set an explicit 10 s `busy_timeout` (up from the bundled
   SQLite's incidental 5 s default), so a second buffr process sharing the
   profile waits for a transient lock instead of surfacing `SQLITE_BUSY`
