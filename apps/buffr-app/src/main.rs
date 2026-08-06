@@ -5096,6 +5096,12 @@ impl AppState {
         // natively — no Rust-side editor model.
         if let Some(host) = self.active_engine_dyn() {
             let mods = mods_to_cef(&self.modifiers);
+            // A surrogate-pair character (emoji, rare CJK) cannot travel
+            // as a CHAR key event — insert it as text instead (§11-16).
+            if let Some(text) = multi_unit_char_text(event.text.as_deref()) {
+                self.insert_text_via_exec(text);
+                return true;
+            }
             // edit_mode_handle_key only runs when EditFocus::Editing is
             // active, so a text input is always focused here.
             let cef_events = key_to_neutral_events(event, mods, true);
@@ -5115,6 +5121,31 @@ impl AppState {
             }
         }
         true
+    }
+
+    /// Inject `text` into the page's focused element via
+    /// `execCommand('insertText')` — the delivery Ctrl+V paste uses.
+    ///
+    /// Needed for characters that cannot travel as a single UTF-16-unit
+    /// CHAR key event: a surrogate pair (emoji, rare CJK) makes
+    /// `resolve_char_unit` return 0, so the key-event path drops it, and
+    /// sending a lone unit renders as U+FFFD (finding §11-16). Inserting
+    /// the text bypasses the key-event channel entirely.
+    fn insert_text_via_exec(&self, text: &str) {
+        let Some(engine) = self.active_engine_dyn() else {
+            return;
+        };
+        let json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+        let js = format!(
+            "(function(){{var t={};\
+             var el=document.activeElement;\
+             if(!el)return;\
+             try{{document.execCommand('insertText',false,t);}}\
+             catch(e){{}}\
+             }})();",
+            json
+        );
+        let _ = engine.run_js(&js);
     }
 
     /// Bring the on-screen permission prompt in line with the front of the

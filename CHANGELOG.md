@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- Emoji and other supplementary-plane characters typed via direct-text paths
+  (compose, hex-input) are now inserted as text instead of being silently
+  dropped — a CHAR key event carries a single UTF-16 unit, so a surrogate pair
+  used to resolve to nothing.
 - A pinned tab can no longer be closed without confirmation while a different
   pinned-close prompt is already pending: the middle-click and context-menu
   paths used to fall through to an unconfirmed close whenever

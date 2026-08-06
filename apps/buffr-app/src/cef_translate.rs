@@ -317,6 +317,26 @@ pub(crate) fn resolve_char_unit(text: Option<&str>) -> u16 {
         .unwrap_or(0)
 }
 
+/// The text of a key event that a CHAR event cannot carry: exactly one
+/// character needing 2 UTF-16 units (a surrogate pair — emoji, rare CJK).
+///
+/// Sending such a character as key events drops it: `resolve_char_unit`
+/// returns 0 for it, and a lone surrogate unit renders as U+FFFD. Callers
+/// must insert the text via `execCommand('insertText')` instead (the same
+/// delivery Ctrl+V uses). Returns `None` for everything else — ASCII,
+/// BMP chars, named keys, multi-char strings.
+pub(crate) fn multi_unit_char_text(text: Option<&str>) -> Option<&str> {
+    text.and_then(|t| {
+        let mut chars = t.chars();
+        let c = chars.next()?;
+        if chars.next().is_none() && c.len_utf16() == 2 {
+            Some(t)
+        } else {
+            None
+        }
+    })
+}
+
 /// Map a printable ASCII character to its Windows VK code.
 ///
 /// Used when the typed character disagrees with the physical scancode —
@@ -445,5 +465,28 @@ pub(crate) fn button_to_neutral(
         PointerButton::Right => Some(buffr_engine::MouseButton::Right),
         PointerButton::Middle => Some(buffr_engine::MouseButton::Middle),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_unit_char_text_detects_surrogate_pairs() {
+        // §11-16: an emoji is one char needing 2 UTF-16 units — the key
+        // event channel cannot carry it and must fall back to text insert.
+        assert_eq!(multi_unit_char_text(Some("😀")), Some("😀"));
+        // Rare CJK outside the BMP.
+        assert_eq!(multi_unit_char_text(Some("𠜎")), Some("𠜎"));
+    }
+
+    #[test]
+    fn multi_unit_char_text_rejects_single_unit_and_others() {
+        assert_eq!(multi_unit_char_text(Some("a")), None);
+        assert_eq!(multi_unit_char_text(Some("é")), None); // BMP, 1 unit
+        assert_eq!(multi_unit_char_text(Some("ab")), None); // multi-char
+        assert_eq!(multi_unit_char_text(Some("😀x")), None); // pair + extra
+        assert_eq!(multi_unit_char_text(None), None);
     }
 }
