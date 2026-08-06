@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- View-page-source now honors its same-host exception on the fetch worker: the
+  worker received the initiator host as a bare string (no scheme), which the
+  host parser rejected, so every private-network source — including `buffr://`
+  internal pages — was refused. The bare-host shape is now accepted.
 - The hint-mode statusline no longer renders a meaningless `(n/n)` counter —
   numerator and denominator were the same field, so it always read e.g.
   `f: as (3/3)`. It now shows just the typed prefix (`f: as`).

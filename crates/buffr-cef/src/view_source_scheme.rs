@@ -160,7 +160,7 @@ fn validate_target(url: &str, initiator: Option<&str>, resolve: bool) -> Result<
     if !non_public {
         return Ok(());
     }
-    let initiator_host = initiator.and_then(http_host);
+    let initiator_host = initiator_host_of(initiator);
     if initiator_host.as_deref() == Some(host.as_str()) {
         return Ok(());
     }
@@ -170,6 +170,28 @@ fn validate_target(url: &str, initiator: Option<&str>, resolve: bool) -> Result<
          same host",
         initiator_host.as_deref().unwrap_or("<unknown origin>")
     ))
+}
+
+/// Normalize an initiator reference to a bare lower-cased host.
+///
+/// The fast gate (`create`) passes a full `http(s)://` frame URL, from
+/// which [`http_host`] extracts the host. The worker (`fetch_and_render`)
+/// passes the host `create` already extracted — a bare string with no
+/// scheme — so `http_host` alone would return `None` there and the
+/// same-host exception could never fire on the authoritative path. Accept
+/// both shapes; reject anything that still carries a scheme after
+/// `http_host` failed (defensive — a malformed initiator must not be able
+/// to claim a host).
+fn initiator_host_of(initiator: Option<&str>) -> Option<String> {
+    initiator.and_then(|i| {
+        http_host(i).or_else(|| {
+            if i.contains("://") {
+                None
+            } else {
+                Some(i.to_ascii_lowercase())
+            }
+        })
+    })
 }
 
 /// Extract the lower-cased host of an `http`/`https` URL.
@@ -726,6 +748,31 @@ mod tests {
         );
         assert!(
             validate_target("http://10.0.0.5/x", Some("http://127.0.0.1:41235/y"), false).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_same_host_bare_initiator() {
+        // The worker path: `create` extracts the initiator host and passes
+        // it as a bare string (no scheme). The same-host exception must
+        // still fire there, or view-source of a `buffr://` internal page
+        // always lands on the error page.
+        assert!(
+            validate_target("http://127.0.0.1:41235/tok/new", Some("127.0.0.1"), true).is_ok(),
+            "bare-host initiator on the same host must pass the resolved gate"
+        );
+        // A different bare host is still refused.
+        assert!(
+            validate_target("http://127.0.0.1:41235/tok/new", Some("127.0.0.2"), true).is_err()
+        );
+        // A full-URL initiator keeps working on the same gate.
+        assert!(
+            validate_target(
+                "http://127.0.0.1:41235/tok/new",
+                Some("http://127.0.0.1:41235/tok/new"),
+                true
+            )
+            .is_ok()
         );
     }
 
