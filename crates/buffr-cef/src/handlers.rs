@@ -183,6 +183,7 @@ pub fn make_client(
     context_menu_sink: ContextMenuSink,
     console_nonces: ConsoleNonces,
     main_osr_view: SharedOsrViewState,
+    internal_url_prefix: Option<String>,
 ) -> Client {
     BuffrClient::new(
         history,
@@ -216,6 +217,7 @@ pub fn make_client(
         context_menu_sink,
         console_nonces,
         main_osr_view,
+        internal_url_prefix,
     )
 }
 
@@ -519,6 +521,10 @@ wrap_client! {
         // C8: main view's scale seeds each popup view at creation and
         // keeps popups in step when the device scale changes.
         main_osr_view: SharedOsrViewState,
+        // URL prefix of the internal-server pages (`http://127.0.0.1:<port>/<token>/`),
+        // so the load handler can keep them out of history — recording the
+        // raw URL would persist the per-launch auth token (§12-9).
+        internal_url_prefix: Option<String>,
     }
 
     impl Client {
@@ -542,6 +548,7 @@ wrap_client! {
                 self.edit_sink.clone(),
                 self.loading_busy.clone(),
                 self.console_nonces.clone(),
+                self.internal_url_prefix.clone(),
             ))
         }
 
@@ -656,6 +663,10 @@ wrap_load_handler! {
         // spliced into the scripts injected below, so the display
         // handler can tell our own console lines from a page's forgery.
         console_nonces: ConsoleNonces,
+        // URL prefix of the internal-server pages; visits under it are
+        // kept out of history so the per-launch auth token is never
+        // persisted (§12-9).
+        internal_url_prefix: Option<String>,
     }
 
     impl LoadHandler {
@@ -731,8 +742,14 @@ wrap_load_handler! {
             let transition = browser_id
                 .and_then(|id| self.pending_transitions.lock().ok()?.remove(&id))
                 .unwrap_or(Transition::Link);
-            if let Err(err) =
-                self.history.record_visit(&url, None, transition)
+            // Keep internal-server pages out of history: recording the raw
+            // URL would persist the per-launch auth token to disk (§12-9).
+            let is_internal = self
+                .internal_url_prefix
+                .as_deref()
+                .is_some_and(|p| url.starts_with(p));
+            if !is_internal
+                && let Err(err) = self.history.record_visit(&url, None, transition)
             {
                 tracing::warn!(error = %err, %url, "history: record_visit failed");
             }

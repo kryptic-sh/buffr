@@ -1379,6 +1379,13 @@ impl BrowserHost {
             self.context_menu_sink.clone(),
             self.console_nonces.clone(),
             self.osr_view.clone(),
+            // Prefix of the internal-server pages, so the load handler can
+            // keep their URLs (which embed the per-launch auth token) out of
+            // history (§12-9).
+            self.internal_server
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.url_for("/"))),
         );
         let mut rc_guard = self
             .request_context

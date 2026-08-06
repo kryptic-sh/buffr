@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- Internal pages are no longer recorded in history: the raw
+  `http://127.0.0.1:<port>/<token>/…` URL used to be persisted, leaking the
+  per-launch auth token to disk despite its "never written to disk" design.
+  (Session files already stored the user-facing `buffr://` form.)
 - Emoji and other supplementary-plane characters typed via direct-text paths
   (compose, hex-input) are now inserted as text instead of being silently
   dropped — a CHAR key event carries a single UTF-16 unit, so a surrogate pair
