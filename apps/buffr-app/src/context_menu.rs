@@ -625,11 +625,15 @@ impl AppState {
             I::TabClose => {
                 tracing::info!(target: "buffr::context_menu", action = "tab_close", "dispatch");
                 if let Some((_, id, _, pinned)) = self.resolve_tab_target(request) {
-                    if pinned && self.confirm_close_pinned.is_none() {
-                        // Mirror the middle-click guard: don't let a
-                        // pinned tab be lost from a context-menu misaim.
-                        self.confirm_close_pinned = Some(id);
-                        self.request_redraw();
+                    if pinned {
+                        // A pinned tab is never closed silently: arm the
+                        // confirmation — or, if one is already pending
+                        // (possibly for a different tab), do nothing rather
+                        // than fall through to an unconfirmed close (§11-15).
+                        if self.confirm_close_pinned.is_none() {
+                            self.confirm_close_pinned = Some(id);
+                            self.request_redraw();
+                        }
                         return;
                     }
                     if let Some(host) = self.active_engine_dyn() {

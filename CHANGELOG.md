@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- A pinned tab can no longer be closed without confirmation while a different
+  pinned-close prompt is already pending: the middle-click and context-menu
+  paths used to fall through to an unconfirmed close whenever
+  `confirm_close_pinned` was already armed.
 - Edit-mode script teardown now also removes the `focus` capture listener it
   registers, so a soft-navigation re-injection no longer leaks one stale
   listener per navigation.

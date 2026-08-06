@@ -79,20 +79,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 if text.is_empty() {
                     return;
                 }
-                let Some(engine) = self.active_engine_dyn() else {
-                    return;
-                };
-                let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
-                let js = format!(
-                    "(function(){{var t={};\
-                     var el=document.activeElement;\
-                     if(!el)return;\
-                     try{{document.execCommand('insertText',false,t);}}\
-                     catch(e){{}}\
-                     }})();",
-                    json
-                );
-                let _ = engine.run_js(&js);
+                self.insert_text_via_exec(&text);
             }
         }
     }
@@ -892,9 +879,15 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .active_engine_dyn()
                         .and_then(|e| e.tabs_summary().get(idx).map(|t| t.pinned))
                         .unwrap_or(false);
-                    if pinned && self.confirm_close_pinned.is_none() {
-                        self.confirm_close_pinned = Some(id);
-                        self.request_redraw();
+                    if pinned {
+                        // A pinned tab is never closed silently: arm the
+                        // confirmation — or, if one is already pending
+                        // (possibly for a different tab), do nothing rather
+                        // than fall through to an unconfirmed close (§11-15).
+                        if self.confirm_close_pinned.is_none() {
+                            self.confirm_close_pinned = Some(id);
+                            self.request_redraw();
+                        }
                         return;
                     }
                     if let Some(host) = self.active_engine_dyn() {
@@ -1213,7 +1206,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         let pass_through =
                             matches!(post_mode, PageMode::Insert | PageMode::Command);
                         if pass_through {
-                            if let Some(host) = self.active_engine_dyn() {
+                            // A surrogate-pair character (emoji, rare CJK)
+                            // cannot travel as a CHAR key event — insert it
+                            // as text instead (§11-16).
+                            if let Some(text) = multi_unit_char_text(event.text.as_deref()) {
+                                self.insert_text_via_exec(text);
+                            } else if let Some(host) = self.active_engine_dyn() {
                                 let mods = mods_to_cef(&self.modifiers);
                                 // Reject path: in Insert/Command modes a
                                 // text input may or may not be focused.
