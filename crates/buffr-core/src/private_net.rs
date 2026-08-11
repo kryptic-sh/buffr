@@ -20,11 +20,15 @@ pub fn is_non_public_host(host: &str) -> bool {
         if h == "::1" || h == "::" {
             return true;
         }
-        // fe80::/10 link-local, fc00::/7 unique-local.
+        // fe80::/10 link-local, fec0::/10 site-local, fc00::/7 unique-local.
         if h.starts_with("fe8")
             || h.starts_with("fe9")
             || h.starts_with("fea")
             || h.starts_with("feb")
+            || h.starts_with("fec")
+            || h.starts_with("fed")
+            || h.starts_with("fee")
+            || h.starts_with("fef")
             || h.starts_with("fc")
             || h.starts_with("fd")
         {
@@ -103,6 +107,7 @@ pub(crate) fn is_non_public_v4(addr: std::net::Ipv4Addr) -> bool {
         || (a == 192 && b == 168)             // RFC1918
         || (a == 169 && b == 254)             // link-local + cloud metadata
         || (a == 100 && (64..=127).contains(&b)) // CGNAT
+        || (a == 198 && (18..=19).contains(&b)) // RFC 2544 benchmarking
         || a >= 224 // multicast + reserved
 }
 
@@ -156,6 +161,37 @@ mod tests {
         ] {
             assert!(is_non_public_host(h), "{h} should be non-public");
         }
+    }
+
+    #[test]
+    fn benchmark_and_site_local_ranges_are_non_public() {
+        // RFC 2544 benchmarking (198.18.0.0/15) and the deprecated IPv6
+        // site-local range (fec0::/10) were both previously classified
+        // public (§12-1 follow-up).
+        for h in [
+            "198.18.0.1",
+            "198.18.255.255",
+            "198.19.0.1",
+            "198.19.255.255",
+            "fec0::1",
+            "fed0::1",
+            "fee0::1",
+            "feff::ffff",
+        ] {
+            assert!(is_non_public_host(h), "{h} should be non-public");
+        }
+        // Just outside each range stays public.
+        for h in ["198.17.255.255", "198.20.0.1", "2001:db8::1"] {
+            assert!(!is_non_public_host(h), "{h} should be public");
+        }
+    }
+
+    #[test]
+    fn host_resolves_public_classifies_benchmark_and_site_local() {
+        // Numeric literals resolve offline via getaddrinfo, so the
+        // resolve-and-classify path can be pinned without DNS.
+        assert!(!host_resolves_public("198.18.0.1"), "RFC 2544 v4 literal");
+        assert!(!host_resolves_public("fec0::1"), "site-local v6 literal");
     }
 
     #[test]

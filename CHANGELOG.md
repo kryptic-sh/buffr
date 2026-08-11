@@ -21,6 +21,10 @@ and this project adheres to
 
 ### Security
 
+- The private-network fetch guard now also classifies the RFC 2544 benchmarking
+  range (`198.18.0.0/15`) and the deprecated IPv6 site-local range (`fec0::/10`)
+  as non-public — a hostname or literal resolving to either could previously
+  reach a local service through `buffr-src:` or Copy Image.
 - "View Page Source" on an internal page no longer leaks the per-launch auth
   token into history: the `buffr-src:`-wrapped loopback URL now takes the same
   skip path as the raw internal URL, closing the gap left by the 0.14.10 fix.
