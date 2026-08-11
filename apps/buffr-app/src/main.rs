@@ -2894,8 +2894,10 @@ impl AppState {
     /// `classify_navigation`'s `DISALLOWED_NAV_SCHEMES`: `javascript:`
     /// and `data:` are never navigated from startup data, so a
     /// hand-edited `session.json` cannot drive script execution or
-    /// attacker-controlled content (audit §12-7). Every other navigation
-    /// entry point already gates these two schemes.
+    /// attacker-controlled content (audit §12-7). The one startup URL
+    /// this does *not* cover is the homepage (`general.homepage` /
+    /// `--homepage`): it is trusted config, and an initial navigation has
+    /// no document for `javascript:` to run in.
     fn is_startup_navigation_safe(url: &str) -> bool {
         match url::Url::parse(url) {
             Ok(parsed) => !matches!(parsed.scheme(), "javascript" | "data"),
