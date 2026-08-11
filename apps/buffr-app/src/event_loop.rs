@@ -879,15 +879,11 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         .active_engine_dyn()
                         .and_then(|e| e.tabs_summary().get(idx).map(|t| t.pinned))
                         .unwrap_or(false);
-                    if pinned {
-                        // A pinned tab is never closed silently: arm the
-                        // confirmation — or, if one is already pending
-                        // (possibly for a different tab), do nothing rather
-                        // than fall through to an unconfirmed close (§11-15).
-                        if self.confirm_close_pinned.is_none() {
-                            self.confirm_close_pinned = Some(id);
-                            self.request_redraw();
-                        }
+                    // A pinned tab is never closed silently: arm the
+                    // confirmation — or block on one already pending
+                    // (possibly for a different tab) — rather than fall
+                    // through to an unconfirmed close (§11-15).
+                    if pinned && self.arm_pinned_close(id) {
                         return;
                     }
                     if let Some(host) = self.active_engine_dyn() {

@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- Closing the active tab no longer falls through to an unconfirmed close of a
+  pinned tab when a close-confirmation for a _different_ tab is already pending
+  — the guard now arms-or-blocks like the middle-click and context-menu paths.
+  The three sites share one `arm_pinned_close` helper.
 - Session restore now lands on the tab the user closed on when the scheme gate
   drops `javascript:`/`data:` entries from a hand-edited `session.json`: the
   saved active index is re-based onto the filtered tab list instead of being

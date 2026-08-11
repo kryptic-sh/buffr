@@ -2718,25 +2718,41 @@ impl AppState {
         }
     }
 
+    /// A pinned tab is never closed silently. Arm the close-confirmation
+    /// overlay for `id` if none is pending (a pending one, possibly for a
+    /// different tab, is left as-is), mark the chrome dirty and request a
+    /// redraw so the overlay paints this frame, and report that the caller
+    /// must stop — a confirm is now, or already was, up, so falling through
+    /// to the close would skip the confirmation (§11-15, §20-3).
+    fn arm_pinned_close(&mut self, id: TabId) -> bool {
+        if self.confirm_close_pinned.is_none() {
+            self.confirm_close_pinned = Some(id);
+            self.mark_chrome_dirty();
+            self.request_redraw();
+        }
+        true
+    }
+
     /// Close the active tab. If it was the last one, signal the
     /// caller to exit. Returns `true` if more tabs remain.
     ///
     /// Closing a *pinned* active tab is gated through the
-    /// confirmation overlay: if no confirmation is currently pending,
-    /// arm one and return without closing. The user's response (y or
-    /// the Yes button) reaches `confirm_close_now` which calls this
-    /// path again with the confirmation already cleared.
+    /// confirmation overlay: `arm_pinned_close` puts one up — or
+    /// blocks on one already pending — and the close does not
+    /// proceed. The user's response (y or the Yes button) reaches
+    /// `resolve_pinned_close`, which closes the tab directly with the
+    /// confirmation cleared.
     fn close_active_tab_or_exit(&mut self) -> bool {
         let Some(host) = self.active_engine_dyn() else {
             return false;
         };
-        if self.confirm_close_pinned.is_none()
-            && let Some(t) = host.active_tab()
+        // `arm_pinned_close` blocks even when a confirmation for a
+        // *different* tab is already pending — the old `is_none` guard
+        // fell through to an unconfirmed close in that case (§20-3).
+        if let Some(t) = host.active_tab()
             && t.pinned
+            && self.arm_pinned_close(t.id)
         {
-            self.confirm_close_pinned = Some(t.id);
-            self.mark_chrome_dirty();
-            self.request_redraw();
             return true;
         }
         match host.close_active() {
