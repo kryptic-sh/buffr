@@ -294,6 +294,12 @@ methods instead of cutting a range. The natural groups:
 - **`tests/e2e/pages/README.md` contradicts `expectations.tsv`** on
   `autofocus.html` and `shadow_closed.html` — documentation drift in the e2e
   suite, not a runner defect.
+- **`HintConfig::default`'s sync test doesn't exist.** The comment at config
+  lib.rs:526-529 says the duplicated alphabet is "kept in sync via the
+  `default_hint_alphabet_matches_core` test in `buffr-core/src/hint.rs`" — no
+  such test exists in the tree (grep confirms). The alphabet literal
+  `"asdfghjkl;weruio"` is duplicated in `buffr-config` with nothing pinning it
+  to `buffr_core::DEFAULT_HINT_ALPHABET`. Write the test or drop the claim.
 
 ---
 
@@ -766,9 +772,8 @@ is the only oracle). Ranked by size of win.
   `save_session_now(); mark_clean_shutdown(); shutdown_flag.store(true); request_redraw();`.
   Extract `fn request_exit`.
 - **Deadline-clamp idiom ×9** — event*loop.rs:2024-2027, 2033-2036, 2039-2042,
-  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each `let
-  deadline = match self.X { Some(at) if at < deadline => at, * => deadline
-  }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
+  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each
+  `let deadline = match self.X { Some(at) if at < deadline => at, * => deadline }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
 - **`key_to_neutral_events`** (cef_translate.rs:395-431) — three near-identical
   `NeutralKeyEvent` literals; `NeutralKeyEvent` is not `#[non_exhaustive]`
   (buffr-engine input.rs:38), so build one base literal and use struct-update
@@ -844,23 +849,6 @@ is the only oracle). Ranked by size of win.
   declared inside a fn body (paint_policy.rs:326) — hoist to module scope so the
   five test-local `const GUTTER: u32 = 4;` re-declarations (main.rs:6669-6731)
   can reference it.
-
-### Known items — confirmed, actionable
-
-- **`__buffrUserGesture` in edit.js is write-only** — confirmed. Written by
-  `markGesture` + the mousedown/pointerdown/touchstart listeners (edit.js:75-79)
-  and by Rust (host.rs:2173, 2452; buffr-webkit out of scope); nothing reads it
-  in-page (the blur gate it documented was removed — edit.js:252-257). Delete
-  the flag + `markGesture` + the three listeners + their teardown lines
-  (edit.js:348-350) + the four Rust writers.
-- **`DEFAULT_SKIP_SCHEMES` duplicated across crates** (config lib.rs:453 vs
-  history lib.rs:49) — same 5-element list, no cross-check, and the runtime
-  always overrides the history default with the config value (main.rs:505,511),
-  so the history copy can silently drift. Fixing it "properly" would need a
-  dependency in the wrong direction — the cheap honest fix is a sync test like
-  the existing `default_hint_alphabet_matches_core` precedent.
-
----
 
 ## 14. Performance review 2026-08-05 (8744e18) — findings
 
@@ -1012,16 +1000,6 @@ which subsystem the line belongs to.
 **Fix:** gate each accessor behind
 `text.starts_with(<that subsystem's sentinel>)` — the parsers already do that
 prefix check internally, so the lock is pure waste on lines that cannot match.
-
-### 12. `url_encode` allocates per escaped byte
-
-**Where:** `crates/buffr-config/src/search.rs:254` —
-`out.push_str(&format!("{b:02X}"))` inside the per-byte loop.
-
-**Why hot:** `resolve_input` runs per omnibar keystroke (suggestion path) and
-per submit. Queries are short; small absolute cost, constant fix.
-
-**Fix:** push two chars from a `const HEX: &[u8; 16] = b"0123456789ABCDEF"`.
 
 ### 13. Omnibar submit resolves the input twice
 
@@ -1252,24 +1230,6 @@ precompute the class string via a `match` on the bounded set of tree-sitter
 capture names (the CSS table at :270-294 already enumerates them — the
 `replace`+`format` per span only ever produces one of ~30 values). Same
 complexity, zero per-span heap traffic.
-
-### 3 LOW — `json_string_literal` allocates a `String` per escaped non-ASCII char on the hint-filter keystroke path
-
-**Where:** `crates/buffr-cef/src/host.rs:2911` —
-`out.push_str(&format!("\\u{unit:04x}"))` inside the per-char loop of
-`json_string_literal` (:2897-2918).
-
-One `format!` heap allocation per non-ASCII (or otherwise non-printable)
-codepoint in the typed hint filter string. Runs on every hint `Filter`/backspace
-keystroke (`host.rs:2373-2376` and `:2416-2419` — the `__buffrHintFilter`
-splice). ASCII text (the common case) hits the `is_ascii_graphic` arm and pays
-nothing, so this only bites when the hint filter contains non-ASCII — but it is
-the same per-char-alloc class §14-12 flagged at `search.rs:254` (`url_encode`),
-a second copy in a per-keystroke path.
-
-**Fix:** identical to §14-12's — push the two hex digits from a
-`const HEX: &[u8; 16]` table instead of `format!` (or `write!` into `out`).
-Constant fix, no memory trade.
 
 ## 21. Audit 2026-08-11 (63b8a25..HEAD) — findings
 
