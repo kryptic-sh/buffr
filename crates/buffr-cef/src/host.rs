@@ -2213,10 +2213,6 @@ impl BrowserHost {
             }
 
             A::FocusFirstInput => {
-                // Mark user gesture before focusing — edit.js's focusin
-                // handler blurs any focus that arrives without a gesture
-                // flag, so without this the script would self-cancel.
-                self.run_js("window.__buffrUserGesture = true;");
                 self.run_js(buffr_core::scripts::FOCUS_FIRST_INPUT);
             }
 
@@ -2503,14 +2499,7 @@ impl BrowserHost {
 
     /// Re-focus a field by its buffr-assigned ID via `__buffrEditFocus`.
     pub fn run_edit_focus(&self, field_id: &str) {
-        // Mark user gesture so edit.js's focusin gate doesn't blur the
-        // re-focus call. This is invoked from `i` / FocusFirstInput
-        // when last_focused_field is set — both are deliberate.
-        self.call_edit_fn(
-            "__buffrEditFocus",
-            &[js_arg(field_id)],
-            "window.__buffrUserGesture = true; ",
-        );
+        self.call_edit_fn("__buffrEditFocus", &[js_arg(field_id)], "");
     }
 
     /// Move focus to the next (or previous) visible input via

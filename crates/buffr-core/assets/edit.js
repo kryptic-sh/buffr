@@ -60,24 +60,6 @@
     var SENTINEL = '%%SENTINEL%%';
     var OVERLAY_CLASS = '%%OVERLAY_CLASS%%';
 
-    // User-gesture gate. Stays false until the user actually interacts
-    // with the page (mouse / touch / pen). The Rust side flips this to
-    // true via run_js before deliberate keyboard-driven focuses (i,
-    // FocusFirstInput, etc.). Until it flips, every DOM focus is
-    // immediately blurred — pages that autofocus inputs on load
-    // (or post-load via setTimeout / rAF / observers) would otherwise
-    // keep the caret blinking, which forces continuous on_paint frames
-    // from CEF and pegs buffr's render pipeline at idle.
-    //
-    // Preserved across a re-wire: the user's gesture on this document
-    // already happened, and re-arming the gate would silently blur the
-    // field they are typing in.
-    if (window.__buffrUserGesture !== true) { window.__buffrUserGesture = false; }
-    function markGesture() { window.__buffrUserGesture = true; }
-    document.addEventListener('mousedown', markGesture, true);
-    document.addEventListener('pointerdown', markGesture, true);
-    document.addEventListener('touchstart', markGesture, true);
-
     // A field that is already focused when this script installs — the
     // classic case being `autofocus`, which fires before injection — never
     // produces a `focusin` we can see. Report it once at install time so it
@@ -346,9 +328,6 @@
         document.removeEventListener('focus', onFocusIn, true);
         document.removeEventListener('focusout', onFocusOut, true);
         document.removeEventListener('input', onInput, true);
-        document.removeEventListener('mousedown', markGesture, true);
-        document.removeEventListener('pointerdown', markGesture, true);
-        document.removeEventListener('touchstart', markGesture, true);
         window.__buffrEditWired = false;
     };
 
