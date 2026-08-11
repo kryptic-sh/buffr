@@ -18,3 +18,9 @@ tracing = "0.1"
 chrono = { workspace = true, features = ["serde", "clock"] }
 url = "2"
 buffr-store = { workspace = true, features = ["chrono"] }
+
+[dev-dependencies]
+# Only for the DEFAULT_SKIP_SCHEMES sync test — the runtime default lives in
+# buffr-config and is always passed in by the app (main.rs), so this crate's
+# copy must not drift from it. Not a product dependency.
+buffr-config.workspace = true

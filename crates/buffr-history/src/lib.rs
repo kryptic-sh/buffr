@@ -46,6 +46,10 @@ pub mod schema;
 /// `about:blank` / `about:srcdoc`; `cef:` and `chrome:` cover internal
 /// browser UI; `data:` and `file:` are noisy and privacy-sensitive.
 /// Surfaced as `config.privacy.skip_schemes` (Phase 4).
+///
+/// The app always overrides this with `config.privacy.skip_schemes`, so
+/// the copy in `buffr-config` is the one that actually runs — keep the
+/// two in sync via the `default_skip_schemes_matches_config` test.
 pub const DEFAULT_SKIP_SCHEMES: &[&str] = &["about", "cef", "chrome", "data", "file"];
 
 /// Dedupe window. If a row exists for the same canonical URL whose
@@ -538,6 +542,19 @@ mod tests {
 
     fn fixed_clock(secs: i64) -> MockClock {
         MockClock::new(DateTime::<Utc>::from_timestamp(secs, 0).expect("ts"))
+    }
+
+    /// The runtime default lives in `buffr-config` (the app passes
+    /// `config.privacy.skip_schemes` at startup), so this crate's
+    /// copy is only a fallback — it must not drift from the config one.
+    #[test]
+    fn default_skip_schemes_matches_config() {
+        assert_eq!(
+            DEFAULT_SKIP_SCHEMES,
+            buffr_config::DEFAULT_SKIP_SCHEMES,
+            "history's DEFAULT_SKIP_SCHEMES drifted from buffr-config's; \
+             update both together"
+        );
     }
 
     /// M54: a profile written by a newer buffr must be refused, not
