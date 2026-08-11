@@ -59,6 +59,17 @@ use cef::*;
 use buffr_core::cursor::SharedCursorState;
 use buffr_core::favicon::{FaviconEnabled, FaviconSink, FaviconUpdate, favicon_is_enabled};
 
+/// True when `url` targets the internal server — directly, or via the
+/// `buffr-src:` wrapper "View Page Source" puts around the loopback URL.
+/// Recording either form would persist the per-launch auth token to disk
+/// (§12-9, §20-1); the wrapper is stripped before comparing because
+/// `buffr-src` is not in the default `skip_schemes`.
+fn is_internal_url(url: &str, prefix: &str) -> bool {
+    url.strip_prefix("buffr-src:")
+        .unwrap_or(url)
+        .starts_with(prefix)
+}
+
 // CEF's `on_cursor_change` second arg is the OS-native cursor handle.
 // cef-rs ports it as a different Rust type per platform, and not always
 // the `cef::sys::cef_cursor_handle_t` typedef:
@@ -744,10 +755,12 @@ wrap_load_handler! {
                 .unwrap_or(Transition::Link);
             // Keep internal-server pages out of history: recording the raw
             // URL would persist the per-launch auth token to disk (§12-9).
+            // "View Page Source" wraps the loopback URL in `buffr-src:`
+            // (§20-1), so strip that wrapper before the prefix check.
             let is_internal = self
                 .internal_url_prefix
                 .as_deref()
-                .is_some_and(|p| url.starts_with(p));
+                .is_some_and(|p| is_internal_url(&url, p));
             if !is_internal
                 && let Err(err) = self.history.record_visit(&url, None, transition)
             {
@@ -1874,6 +1887,39 @@ mod tests {
 
     fn raw_flagged(source: T, flag: T) -> u32 {
         source as u32 | flag as u32
+    }
+
+    #[test]
+    fn is_internal_url_matches_raw_loopback() {
+        let prefix = "http://127.0.0.1:41235/abc123def/";
+        assert!(is_internal_url(
+            "http://127.0.0.1:41235/abc123def/new",
+            prefix
+        ));
+    }
+
+    #[test]
+    fn is_internal_url_matches_buffr_src_wrapper() {
+        // "View Page Source" on an internal page wraps the loopback URL in
+        // the buffr-src: scheme (§20-1); the token must not reach history
+        // through that path either.
+        let prefix = "http://127.0.0.1:41235/abc123def/";
+        assert!(is_internal_url(
+            "buffr-src:http://127.0.0.1:41235/abc123def/new",
+            prefix
+        ));
+    }
+
+    #[test]
+    fn is_internal_url_rejects_public_urls() {
+        let prefix = "http://127.0.0.1:41235/abc123def/";
+        assert!(!is_internal_url("https://example.com/", prefix));
+        // A buffr-src: view of a public page is not internal and stays
+        // recorded.
+        assert!(!is_internal_url("buffr-src:https://example.com/", prefix));
+        // A loopback URL that merely *starts* with the host but not the
+        // token prefix is not internal.
+        assert!(!is_internal_url("http://127.0.0.1:41235/other/new", prefix));
     }
 
     #[test]

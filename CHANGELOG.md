@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Security
 
+- "View Page Source" on an internal page no longer leaks the per-launch auth
+  token into history: the `buffr-src:`-wrapped loopback URL now takes the same
+  skip path as the raw internal URL, closing the gap left by the 0.14.10 fix.
 - Updated `quick-xml` to 0.41.0 (via `wayland-scanner` and `plist`), closing
   RUSTSEC-2026-0194 and RUSTSEC-2026-0195 — quadratic-time start-tag parsing DoS
   in the 0.39 line. The matching entries were dropped from `deny.toml`'s ignore
