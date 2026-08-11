@@ -35,15 +35,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 
 const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
-/// CEF major version we pin against the `cef` crate (147.x).
+/// CEF major version we pin against the `cef` crate (148.x).
 ///
-/// Spotify CDN entries look like `cef_binary_147.0.10+gXXXXX+chromium-...`;
-/// we pick the newest entry whose version starts with this prefix.
-const CEF_VERSION_PREFIX: &str = "147.";
+/// Spotify CDN entries look like `cef_binary_148.0.10+gXXXXX+chromium-...`;
+/// we pick the newest entry whose version starts with this prefix. Keep the
+/// major line in lockstep with the `cef` crate resolved by Cargo.toml — the
+/// wrapper it compiles must talk to the same API version the vendored
+/// libcef reports, or every binary aborts with "Request for unsupported CEF
+/// API version" at startup.
+const CEF_VERSION_PREFIX: &str = "148.";
 
 /// Embedded `Info.plist` template for the main `Buffr.app` bundle.
 const MAIN_PLIST_TEMPLATE: &str = include_str!("../templates/main.plist");
@@ -104,7 +108,7 @@ struct CefVersion {
     files: Vec<CefFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CefFile {
     #[serde(rename = "type")]
     file_type: String,
@@ -286,6 +290,18 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
 
     flatten_top_level(&vendor_dir)
         .with_context(|| format!("flattening {}", vendor_dir.display()))?;
+
+    // `cef-dll-sys` (the `cef` crate's build script) resolves the CEF tree
+    // through this same directory when CEF_PATH is set: it first looks for
+    // `$CEF_PATH/<bundled-cef-version>/<os_arch>/`, then falls back to
+    // `$CEF_PATH` itself only if `archive.json` there matches its expected
+    // version. Without the file it re-downloads the distribution into a
+    // versioned subdir — a ~200 MB fetch per platform per CI run, and a
+    // second runtime copy racing the one we stage. Serialize the index entry
+    // we just verified so the wrapper is built from these very sources.
+    let archive_json = serde_json::to_string_pretty(&file).context("serializing archive.json")?;
+    fs::write(vendor_dir.join("archive.json"), archive_json)
+        .with_context(|| format!("writing {}", vendor_dir.join("archive.json").display()))?;
 
     eprintln!("xtask: done. CEF extracted at {}", vendor_dir.display());
     eprintln!("       set CEF_PATH={} to override", vendor_dir.display());

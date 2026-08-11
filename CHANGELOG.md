@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Fixed
 
+- Fixed a startup crash on macOS and Windows (and a racy crash on Linux) where
+  every binary aborted with "Request for unsupported CEF API version 14800": the
+  `cef` crate's wrapper had moved to the 148 line while the vendored libcef
+  runtime was still 147. `xtask fetch-cef` now pins the same 148.x major as the
+  crate, and writes the `archive.json` the crate's build script looks for, so CI
+  builds the wrapper and ships the runtime from the same distribution.
 - Hint mode no longer misroutes one tab's hint overlay to another when a tab
   switch lands between `f` and the renderer's Ready round-trip: hint events are
   tagged with the emitting browser and applied to that tab, matching the

@@ -5140,6 +5140,7 @@ dependencies = [
  "anyhow",
  "bzip2",
  "serde",
+ "serde_json",
  "sha1",
  "tar",
  "ureq",
