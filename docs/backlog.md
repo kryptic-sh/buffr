@@ -12,6 +12,24 @@ Grouped by what is actually blocking them.
 
 ---
 
+## Shipped 2026-08-11
+
+Worked from this backlog one slice at a time, each commit verified by the full
+workspace gate (fmt --check, clippy --workspace -D warnings, build, nextest):
+
+| Item                                                  | Commit    |
+| ----------------------------------------------------- | --------- |
+| §20-1/§21-1 token in history via `buffr-src:` wrapper | `d33e123` |
+| §20-2/§21-2 stale session-restore active index        | `5f07efc` |
+| §20-3/§22-1 pinned-close guard arm-or-block + helper  | `c1b922c` |
+| §12-1 follow-up RFC 2544 + IPv6 site-local ranges     | `b4054db` |
+| §18 tidy dead code (items 1–5)                        | `46ffb66` |
+| §11-14 hint Ready events tagged per browser           | `96f9b54` |
+| §9 popup console-nonce forget on close                | `045d77e` |
+| §20-4 homepage-gate doc claim corrected               | `70a357f` |
+
+---
+
 ## Shipped 2026-08-06
 
 Worked from this backlog one slice at a time, each commit verified by the full
@@ -480,7 +498,8 @@ Hardening (correct today, fragile):
   Manual test owed with a `beforeunload` popup.
 - `console_nonces` entries for popups are never forgotten (`on_before_close`
   removes frames/browsers but not the nonce) — permanent ~128-byte entries per
-  popup ever opened. Call `console_nonces.forget(browser_id)` on close.
+  popup ever opened. Call `console_nonces.forget(browser_id)` on close. **Closed
+  `045d77e`.**
 - `--private --smoke-test` exits via `libc::_exit` before the `_private_tmp`
   drop, leaking `$TMPDIR/buffr-private-<pid>-*` per smoke run (CI smoke does not
   use `--private`, so no current trigger).
@@ -730,19 +749,10 @@ Actual: "x" is pushed as a folder and never popped (no </DL> belongs to it);
 
 ### 14 LOW — hint `Ready` events are single-slot and untagged; a tab switch before the drain misroutes them
 
-**Where:** `crates/buffr-cef/src/host.rs:2247-2283` (`enter_hint_mode`),
-`handlers.rs:1095-1100` (single-slot `HintEventSink`, no browser id),
-`host.rs:2287-2308` (`pump_hint_events` applies the slot to the _currently
-active_ tab).
-
-```
-Repro: press `f` on A, switch to B before A's Ready round-trips through the
-       CEF message loop and is drained
-Expect: A's hint session receives A's hints
-Actual: A's Ready is applied to B — dropped if B has no session (A's hint mode
-       then dies: next key → Cancel), or B's hint list is replaced with A's
-       element ids (next hint key clicks the wrong element)
-```
+**Closed `96f9b54`** — hint events are now tagged with the emitting browser at
+the handler and `pump_hint_events` applies `Ready` to the tab that owns it,
+mirroring the edit-attribution fix. WebKit's single-session pump unwraps the tag
+and keeps its behaviour (crate not in the workspace).
 
 ### Cleared
 
@@ -1756,7 +1766,9 @@ guard's `is_non_public_v4` misses RFC 2544 benchmarking range `198.18.0.0/15`,
 and the IPv6 path misses deprecated site-local `fec0::/10` — a hostname (or
 literal) resolving to either is currently allowed. Pre-existing (both apply to
 the literal path too); natural to close alongside the resolve-and-classify work
-in `crates/buffr-core/src/private_net.rs`.
+in `crates/buffr-core/src/private_net.rs`. **Closed `b4054db`** — both ranges
+now classified non-public in the string guard and pinned in the resolve path
+with tests.
 
 ## 16. Code review 2026-08-06 (63b8a25) — findings
 
@@ -1898,8 +1910,8 @@ webkit-tagged events to webkit-active-tabs at the engine level.
   128-bit per-launch token is still required, browsers always send `Host`, and a
   raw-socket attacker who already holds the token gains nothing from omitting
   the header.
-- §12-1 follow-ups already recorded (RFC 2544 `198.18.0.0/15`, IPv6 `fec0::/10`)
-  — confirmed present in the tree.
+- §12-1 follow-ups (RFC 2544 `198.18.0.0/15`, IPv6 `fec0::/10`) — **closed
+  `b4054db`**, ranges now non-public in the string guard + resolve path.
 - `tick_splash_js_push` gate `url.starts_with("buffr://new")` is loose but the
   scheme is unreachable from page content and the pushed HTML is static —
   cosmetic only.
@@ -1952,46 +1964,13 @@ too.
 
 ### Dead code (each verified: whole-workspace `rg` shows zero callers)
 
-1. **`crates/buffr-cef/src/view_source_scheme.rs:497-505` — two unreachable
-   checks in `fetch_and_render`.** The `848a6fb` rewrite added
-   `validate_target(url, initiator_host, true)` at :494, which already returns
-   `Err` for both an empty URL (:153-154) and a non-http scheme (:156-158) —
-   with the exact same error strings. The follow-up `if url.is_empty()`
-   (:497-499) and `if http_host(url).is_none()` (:500-505) blocks are dead; they
-   were the pre-`848a6fb` inline belt-and-braces the new gate superseded.
-   **Action:** delete both blocks (the `error_page` calls they produce are
-   byte-identical to `validate_target`'s `Err`).
-2. **`crates/buffr-cef/src/host.rs:769-777` — dead `BrowserHost` favicon
-   accessor pair.** `favicons_enabled()` (:769-771) and `set_favicon_enabled()`
-   (:775-777) have zero call sites. The display handler reads the flag directly
-   off the shared `FaviconEnabled` Arc (`handlers.rs:952`,
-   `favicon_is_enabled`), not through these methods, and no runtime toggle
-   exists — the doc's "reflects any runtime toggle via
-   [`Self::set_favicon_enabled`]" describes a feature that was never wired
-   (favicon enablement is startup-only, `main.rs:592`). **Action:** delete both
-   methods and their doc comments.
-3. **`crates/buffr-modal/src/engine.rs:121-123` — dead `Engine::keymap_mut`.**
-   Zero callers (the live surface is `keymap()` at :117 and `set_keymap()` at
-   :128, called from `main.rs:806`). **Action:** delete.
-4. **`apps/buffr-app/src/windowing/other/window.rs:36-57` and `:175-185` — four
-   dead size methods** (linter-invisible behind
-   `#[allow(dead_code)] mod windowing` at `main.rs:200`):
-   `Window::set_min_size`/`set_max_size` (:36-57) and
-   `ToplevelBuilder::with_min_size`/`with_max_size` (:175-185) — zero callers;
-   both builder call sites (`event_loop.rs:104-108`, `:1572-1575`) set only
-   title/app-id/size. Keep the builder _fields_ `min_size`/`max_size` (:151-152)
-   — read by `build_window` (`event_loop.rs:243-246`). Supersedes the §13
-   "set_min_size/set_max_size near-identical" note: they are dead, not merely
-   duplicated. **Action:** delete all four methods.
-5. **`apps/buffr-app/src/render.rs:193-194` — `OsrTexture::view` is
-   write-only.** Written at :212 and :242, never read (only `texture` is read,
-   at :257); the field exists solely under `#[allow(dead_code)]`. The bind group
-   created from `&view` holds wgpu's own refcount on the view, so the field
-   handle is redundant. _Lower confidence:_ relies on wgpu resource-lifetime
-   semantics, not compiled (tree kept pristine). **Action:** delete the `view`
-   field (keep the local in `new`/`maybe_upload`), or keep it and drop the
-   `#[allow(dead_code)]` with a comment saying the handle is held for the bind
-   group's lifetime.
+Items 1–5 were deleted on 2026-08-11 (`46ffb66`): the unreachable
+`fetch_and_render` checks (identical to `validate_target`'s errors), the
+`BrowserHost` favicon accessor pair, `Engine::keymap_mut`, the four dead
+window-size methods (builder fields kept), and the write-only `OsrTexture.view`
+field (the bind group's `StatelessTracker` holds the wgpu refcount — verified
+against the installed wgpu-core 30.0.0 source).
+
 6. **`crates/buffr-webkit/src/platform/engine.rs:380-381` —
    `set_newtab_html_provider` and the `newtab_html_provider` field are
    write-only** (field :59, written :332/:381, never read; setter has no
@@ -2218,77 +2197,18 @@ getrandom 0.4, rusqlite 0.40, fontdb 0.24, base64 0.23, sha1 0.11) — with the
 rest of the tree carried by §16/§18 and re-spot-checked where the delta reaches.
 Findings ranked most-severe first; nothing critical or high.
 
-### 20-1 (LOW) — view-source of an internal page persists the per-launch auth token to history
-
-**Where:** `crates/buffr-cef/src/handlers.rs:747-752` (the `is_internal` skip
-added by `b3b8aac`), reached from `apps/buffr-app/src/context_menu.rs:486-509`.
-
-The §12-9 fix skips only URLs that start with the raw internal-server prefix
-(`http://127.0.0.1:<port>/<token>/`). Since `a6b7482` made view-source of a
-`buffr://` page actually work, "View Page Source" on an internal page navigates
-a new tab to `buffr-src:http://127.0.0.1:<port>/<token>/new`
-(context_menu.rs:499). `on_load_end` then records that frame URL: the
-`buffr-src:` wrapper does not match the prefix, `buffr-src` is not in the
-config's default `skip_schemes` (`about`, `cef`, `chrome`, `data`, `file`), and
-`url::Url::parse` accepts it as an opaque non-special-scheme URL — so the
-per-launch token lands in `history.sqlite`.
-
-Verified empirically, not just traced: a scratch integration test in
-`buffr-history` recorded `buffr-src:http://127.0.0.1:41235/<token>/new` via
-`History::record_visit` (count 1); the file was deleted after the check.
-
-```
-Repro: open buffr://new → context menu → View Page Source → quit → read history.sqlite
-Expect: no buffr-src:http://127.0.0.1:<port>/<token>/… row
-Actual: the URL (auth token included) is recorded
-```
-
-Severity is LOW — the token is documented defence-in-depth, "not authentication"
-(`internal_server.rs`), and history is only readable by local processes, never
-by web content — but it defeats the exact guarantee `b3b8aac` made. Fix: skip
-`buffr-src:` URLs whose _stripped_ form starts with the prefix, or add
-`buffr-src` to the default skip list.
-
-### 20-2 (LOW) — session-restore active index goes stale when the scheme gate drops entries
-
-**Where:** `apps/buffr-app/src/main.rs:916-930` (filter builds `entries`, passes
-the original `s.active` through unchanged) vs `main.rs:2964-2969` (index applied
-to the now-filtered tab list).
-
-When a hand-edited `session.json` contains a `javascript:`/`data:` entry before
-the saved active index, the filter drops it and `summaries.get(idx)` either
-selects the wrong tab or (out of range) selects nothing, so the user lands on
-tab 0 instead of the tab they closed on.
-
-```
-Repro: session.json = ["https://a.example/", "javascript:alert(1)", "https://b.example/"], active = 2
-Expect: restored tabs [a, b], active = b
-Actual: tabs [a, b]; summaries.get(2) is None → no selection, lands on a
-```
-
-Fix: subtract the count of dropped entries at index < `s.active` (and leave
-`None` when the adjusted index is out of range). Only reachable in the
-adversarial case the gate exists for, hence LOW.
-
 ### Hardening
 
-- **`close_active_tab_or_exit` falls through to an unconfirmed pinned close when
-  a confirm is pending** (`main.rs:2727-2735`). If `confirm_close_pinned` is
-  `Some` (pending for another tab), the guard does not arm and the match below
-  closes the active tab anyway — the exact §11-15 shape fixed in the two sibling
-  sites. Unreachable today: while a confirm is pending, `confirm_handle_key`
-  (`main.rs:5311-5340`) returns `true` for every key, so neither caller
-  (`A::TabClose` at 2555, `:q` at 4568) can reach it. But any future non-key
-  path (mouse gesture, menu) would close a pinned tab silently. Reconcile it to
-  the armed-or-blocked shape of the other two.
 - **`is_startup_navigation_safe`'s doc claim overstates coverage**
   (`main.rs:2866-2882`: "Every other navigation entry point already gates these
   two schemes"). `--homepage` / `general.homepage` (`main.rs:608-611` →
-  `event_loop.rs:168` initial_url) is not gated, and neither the engine
+  `event_loop.rs:168` initial*url) is not gated, and neither the engine
   (`host.rs` navigate/open_tab) nor `classify_navigation` sees it. Practically
-  inert — a `javascript:` URL as an _initial_ navigation has no document to run
+  inert — a `javascript:` URL as an \_initial* navigation has no document to run
   in, and config/CLI are user-trusted inputs — but the sentence is false as
-  written and should be corrected or the homepage gated.
+  written and should be corrected or the homepage gated. **Doc corrected
+  (`70a357f`); gating the homepage is still open if defence-in-depth on config
+  input is ever wanted.**
 
 ### Cleared
 
@@ -2348,28 +2268,10 @@ the history load handler, session restore and CLI URL handling, key-event text
 injection, and the internal-server token. 0 critical, 0 high, 2 low, 3
 hardening. Overall risk: low.
 
-### 21-1 (LOW) — per-launch internal-server token persisted to history via the `buffr-src:` wrapper
-
-Same finding as §20-1, security framing: `b3b8aac` closed the raw-loopback
-history leak, but "View Page Source" on an internal page (reachable since
-`a6b7482`) records `buffr-src:http://127.0.0.1:<port>/<token>/…` in
-`history.sqlite`, bypassing the prefix skip (`handlers.rs:747-752`). Exposure is
-local-only — history is never readable by web content — so severity LOW, but it
-defeats the defence-in-depth guarantee the §12-9 fix just made. Fix as described
-in §20-1.
-
-### 21-2 (LOW) — session-restore active index not adjusted for dropped entries
-
-§20-2. Correctness of the defensive path, no security impact: the gate's purpose
-is to keep `javascript:`/`data:` from reaching an engine, which it does; the
-stale index only mis-selects the restored tab.
-
 ### Hardening
 
-- §20-3: `close_active_tab_or_exit` pinned-close fall-through (unreachable
-  today; overlay consumes all keys).
 - §20-4: homepage/`--homepage` not covered by the scheme gate (initial
-  navigation, trusted input).
+  navigation, trusted input) — doc corrected `70a357f`; gating still open.
 - `session.json` persists the raw loopback URL for `buffr://` pages — the same
   token class, pre-existing and documented (`host.rs:388-393`, M19), out of the
   delta. Noted so a future "fix the token in history" doesn't stop at
@@ -2402,25 +2304,6 @@ code inside the store crates, `fuzz/` targets, `buffr-webkit`/`buffr-poc`.
 
 Scope: the delta since the 2026-08-06 tidy (§18). Quality-only, nothing that
 changes behavior.
-
-### 22-1 — pinned-close guard is now written three times
-
-`apps/buffr-app/src/event_loop.rs:882-892`,
-`apps/buffr-app/src/context_menu.rs:628-638`,
-`apps/buffr-app/src/main.rs:2727-2735`. The two menu/middle-click sites are
-identical; the third is the same intent with a different tail (it falls through
-to the close when a confirm is pending — see §20-3). Extract one helper on
-`AppState`:
-
-```rust
-/// Arm the pinned-close confirmation if none is pending. Returns true if
-/// the caller must stop (a confirm is now or already was up).
-fn arm_pinned_close(&mut self, id: TabId) -> bool
-```
-
-used as `if pinned && !self.arm_pinned_close(id) { return; }`. Applying it to
-the two identical sites is behavior-preserving; reconciling the third to the
-same shape is a deliberate behavior decision (it is also the §20-3 hardening).
 
 Nothing else material in the delta — the repetition that existed was already
 extracted (`insert_text_via_exec` shared by both key paths, `build_agent`,
