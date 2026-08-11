@@ -568,6 +568,7 @@ dependencies = [
 name = "buffr-history"
 version = "0.1.2"
 dependencies = [
+ "buffr-config",
  "buffr-store",
  "chrono",
  "rusqlite",
