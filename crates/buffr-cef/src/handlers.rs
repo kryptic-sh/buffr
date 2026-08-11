@@ -1125,9 +1125,7 @@ wrap_display_handler! {
             if let Some(parsed) = parse_console_event(&text, &self.console_nonces.hint(browser_id)) {
                 match parsed {
                     Ok(event) => {
-                        if let Ok(mut guard) = self.hint_sink.lock() {
-                            *guard = Some(event);
-                        }
+                        buffr_core::hint::push_hint_event(&self.hint_sink, browser_id, event);
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, line = %redact_console_text(&text), "hint: malformed console event");

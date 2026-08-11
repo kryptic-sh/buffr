@@ -740,9 +740,7 @@ unsafe extern "C" fn on_hint_script_message(
     let nonce = ctx.console_nonces.hint(ctx.tab_id.0 as i32);
     match parse_console_event(raw, &nonce) {
         Some(Ok(event)) => {
-            if let Ok(mut guard) = ctx.sink.lock() {
-                *guard = Some(event);
-            }
+            buffr_core::hint::push_hint_event(&ctx.sink, ctx.tab_id.0 as i32, event);
         }
         Some(Err(e)) => {
             tracing::warn!(error = %e, raw, "webkit: malformed hint event");

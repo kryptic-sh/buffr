@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- Hint mode no longer misroutes one tab's hint overlay to another when a tab
+  switch lands between `f` and the renderer's Ready round-trip: hint events are
+  tagged with the emitting browser and applied to that tab, matching the
+  edit-mode attribution fix.
 - Closing the active tab no longer falls through to an unconfirmed close of a
   pinned tab when a close-confirmation for a _different_ tab is already pending
   — the guard now arms-or-blocks like the middle-click and context-menu paths.

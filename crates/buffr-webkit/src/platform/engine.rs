@@ -1334,6 +1334,13 @@ impl BrowserEngine for WebKitEngine {
         let Some(event) = take_hint_event(&self.worker.hint_sink) else {
             return false;
         };
+        // WebKit keeps a single engine-wide hint session, so the emitting
+        // tab's id is not consulted here (unlike the CEF host, which routes
+        // Ready to the tab that emitted it — §11-14).
+        let buffr_core::hint::TaggedHintEvent {
+            browser_id: _,
+            event,
+        } = event;
         match event {
             HintConsoleEvent::Ready { hints, alphabet: _ } => {
                 let alphabet = self.hint_alphabet.clone();

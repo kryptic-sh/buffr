@@ -408,16 +408,27 @@ pub enum HintConsoleEvent {
     Error { message: String },
 }
 
+/// A hint event tagged with the browser that emitted it. The handler
+/// knows which browser a console line came from and attaches it here so
+/// the drain can apply the event to that tab even after the user has
+/// switched away (§11-14) — a single-slot untagged sink misrouted one
+/// tab's `Ready` to whatever tab happened to be active at drain time.
+#[derive(Debug)]
+pub struct TaggedHintEvent {
+    pub browser_id: i32,
+    pub event: HintConsoleEvent,
+}
+
 /// One-slot mailbox shared by [`crate::handlers::BuffrDisplayHandler`]
 /// and [`crate::host::BrowserHost`]. The display handler writes a
-/// parsed [`HintConsoleEvent`] each time the renderer emits a
+/// [`TaggedHintEvent`] each time the renderer emits a
 /// `__buffr_hint__:`-prefixed console line; the host drains the slot
 /// from its UI tick.
 ///
 /// One-slot (rather than a queue) because the protocol only has a
 /// single "ready" event per session and we'd rather drop a stale
 /// duplicate than queue them up.
-pub type HintEventSink = Arc<Mutex<Option<HintConsoleEvent>>>;
+pub type HintEventSink = Arc<Mutex<Option<TaggedHintEvent>>>;
 
 /// Construct a fresh, empty [`HintEventSink`].
 pub fn new_hint_event_sink() -> HintEventSink {
@@ -426,8 +437,16 @@ pub fn new_hint_event_sink() -> HintEventSink {
 
 /// Drain the latest hint event, returning `Some` exactly once per
 /// write. Mirrors [`crate::find::take_latest`].
-pub fn take_hint_event(sink: &HintEventSink) -> Option<HintConsoleEvent> {
+pub fn take_hint_event(sink: &HintEventSink) -> Option<TaggedHintEvent> {
     sink.lock().ok().and_then(|mut guard| guard.take())
+}
+
+/// Write a hint event tagged with the emitting browser's id. Only the
+/// handler knows which browser a console line came from.
+pub fn push_hint_event(sink: &HintEventSink, browser_id: i32, event: HintConsoleEvent) {
+    if let Ok(mut guard) = sink.lock() {
+        *guard = Some(TaggedHintEvent { browser_id, event });
+    }
 }
 
 /// Try to parse a console message line as a hint event.
@@ -942,6 +961,35 @@ mod tests {
         let line = wire("not json");
         let parsed = parse_console_event(&line, NONCE).unwrap();
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn hint_sink_round_trips_the_browser_tag() {
+        // The §11-14 fix rides on the tag surviving push → take; the
+        // host-side routing to the emitting tab is the other half.
+        let sink = new_hint_event_sink();
+        let event = HintConsoleEvent::Ready {
+            hints: Vec::new(),
+            alphabet: "asdf".to_string(),
+        };
+        push_hint_event(&sink, 7, event);
+        let taken = take_hint_event(&sink).expect("one event pushed");
+        assert_eq!(taken.browser_id, 7);
+        assert!(matches!(
+            taken.event,
+            HintConsoleEvent::Ready { hints, .. } if hints.is_empty()
+        ));
+        // Single-slot: a second push overwrites, and the drain sees it once.
+        push_hint_event(
+            &sink,
+            8,
+            HintConsoleEvent::Error {
+                message: "x".into(),
+            },
+        );
+        let second = take_hint_event(&sink).unwrap();
+        assert_eq!(second.browser_id, 8);
+        assert!(take_hint_event(&sink).is_none());
     }
 
     // ---- H5: forged hint events ---------------------------------------

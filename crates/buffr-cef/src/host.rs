@@ -2328,22 +2328,36 @@ impl BrowserHost {
         }
     }
 
-    /// Drain renderer-side hint events and finalise the active tab's
-    /// session. Returns `true` if the session changed.
+    /// Drain renderer-side hint events and finalise the hint session of
+    /// the tab that emitted them. Returns `true` if a session changed.
     pub fn pump_hint_events(&self) -> bool {
         let Some(event) = buffr_core::hint::take_hint_event(&self.hint_sink) else {
             return false;
         };
+        let buffr_core::hint::TaggedHintEvent { browser_id, event } = event;
         match event {
             buffr_core::hint::HintConsoleEvent::Ready { hints, alphabet: _ } => {
                 let alphabet = self.hint_alphabet.clone();
-                self.with_active(|t| {
-                    if let Some(existing) = t.session.hint_session.as_mut() {
-                        let background = existing.background;
-                        *existing = HintSession::new(alphabet, hints, background);
+                // Apply to the tab that owns the emitting browser, not the
+                // currently active one — the user may have switched tabs
+                // before the Ready event round-tripped through the CEF
+                // message loop, and the old single-slot drain then applied
+                // one tab's hints to whatever tab was active (§11-14).
+                let Ok(mut tabs) = self.tabs.lock() else {
+                    return false;
+                };
+                let mut applied = false;
+                for t in tabs.iter_mut() {
+                    if t.browser.identifier() == browser_id {
+                        if let Some(existing) = t.session.hint_session.as_mut() {
+                            let background = existing.background;
+                            *existing = HintSession::new(alphabet, hints, background);
+                        }
+                        applied = true;
+                        break;
                     }
-                });
-                true
+                }
+                applied
             }
             buffr_core::hint::HintConsoleEvent::Error { message } => {
                 warn!(message, "hint mode: renderer reported error");
