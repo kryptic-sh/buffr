@@ -187,11 +187,13 @@ struct RenderChannel {
 /// emitted. The renderer GPU-stretches it (linear sampler) to fill the
 /// live browser_rect, so when CEF's buffer dims lag the window dims the
 /// stale frame visually scales to fit instead of letterboxing.
+///
+/// The `TextureView` is not stored: the bind group created from it keeps
+/// wgpu's own refcount on the view for as long as it exists, so the local
+/// handle can be dropped after `make_bind_group`.
 struct OsrTexture {
     #[allow(dead_code)]
     texture: wgpu::Texture,
-    #[allow(dead_code)]
-    view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -212,7 +214,6 @@ impl OsrTexture {
         let bind_group = make_bind_group(device, bgl, uniform_buf, &view, sampler);
         Self {
             texture,
-            view,
             bind_group,
             width,
             height,
@@ -239,7 +240,6 @@ impl OsrTexture {
             let (texture, view) = make_texture(device, upload.width, upload.height, format);
             self.bind_group = make_bind_group(device, bgl, uniform_buf, &view, sampler);
             self.texture = texture;
-            self.view = view;
             self.width = upload.width;
             self.height = upload.height;
             self.last_generation = u64::MAX;

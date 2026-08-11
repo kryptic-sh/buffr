@@ -118,10 +118,6 @@ impl Engine {
         &self.keymap
     }
 
-    pub fn keymap_mut(&mut self) -> &mut Keymap {
-        &mut self.keymap
-    }
-
     /// Replace the live keymap and reset the pending chord buffer.
     /// Used by hot-reload in `apps/buffr` so config edits swap bindings
     /// without restarting CEF.

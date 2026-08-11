@@ -32,30 +32,6 @@ impl Window {
         self.inner.set_title(&title.into());
     }
 
-    /// Set the minimum logical size.
-    pub fn set_min_size(&self, size: Option<Size>) {
-        match size {
-            Some(s) => self
-                .inner
-                .set_min_inner_size(Some(winit::dpi::LogicalSize::new(s.width, s.height))),
-            None => self
-                .inner
-                .set_min_inner_size(None::<winit::dpi::LogicalSize<u32>>),
-        }
-    }
-
-    /// Set the maximum logical size.
-    pub fn set_max_size(&self, size: Option<Size>) {
-        match size {
-            Some(s) => self
-                .inner
-                .set_max_inner_size(Some(winit::dpi::LogicalSize::new(s.width, s.height))),
-            None => self
-                .inner
-                .set_max_inner_size(None::<winit::dpi::LogicalSize<u32>>),
-        }
-    }
-
     /// Physical buffer size in pixels.
     pub fn physical_size(&self) -> Size {
         let s = self.inner.inner_size();
@@ -169,18 +145,6 @@ impl ToplevelBuilder {
     /// Set the initial logical surface size.
     pub fn with_initial_size(mut self, size: Size) -> Self {
         self.initial_size = Some(size);
-        self
-    }
-
-    /// Set the minimum logical size.
-    pub fn with_min_size(mut self, size: Size) -> Self {
-        self.min_size = Some(size);
-        self
-    }
-
-    /// Set the maximum logical size.
-    pub fn with_max_size(mut self, size: Size) -> Self {
-        self.max_size = Some(size);
         self
     }
 

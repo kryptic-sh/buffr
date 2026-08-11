@@ -516,15 +516,6 @@ fn fetch_and_render(url: &str, initiator_host: Option<&str>) -> String {
     if let Err(reason) = validate_target(url, initiator_host, true) {
         return error_page(url, &reason);
     }
-    if url.is_empty() {
-        return error_page(url, "no URL to fetch (buffr-src: prefix with empty suffix)");
-    }
-    if http_host(url).is_none() {
-        return error_page(
-            url,
-            "only http:// and https:// URLs can be viewed as source",
-        );
-    }
 
     let result = (|| -> Result<Vec<u8>, String> {
         let config = ureq::Agent::config_builder()

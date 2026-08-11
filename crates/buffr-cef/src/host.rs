@@ -54,7 +54,6 @@ use buffr_core::context_menu::{ContextMenuRequest, ContextMenuSink, new_context_
 use buffr_core::cursor::{CursorState, SharedCursorState};
 use buffr_core::download_notice::DownloadNoticeQueue;
 use buffr_core::edit::EditEventSink;
-use buffr_core::favicon::favicon_is_enabled;
 use buffr_core::favicon::{FaviconEnabled, FaviconSink, new_favicon_enabled, new_favicon_sink};
 use buffr_core::find::FindResultSink;
 use buffr_core::hint::{
@@ -782,18 +781,6 @@ impl BrowserHost {
     /// per-tab favicon cache.
     pub fn favicon_sink(&self) -> FaviconSink {
         self.favicon_sink.clone()
-    }
-
-    /// Read the current favicon enable flag. Mirrors `[general] show_favicons`
-    /// at startup and reflects any runtime toggle via [`Self::set_favicon_enabled`].
-    pub fn favicons_enabled(&self) -> bool {
-        favicon_is_enabled(&self.favicon_enabled)
-    }
-
-    /// Toggle favicon downloads at runtime. The display handler picks up the
-    /// new value on the next `on_favicon_urlchange`.
-    pub fn set_favicon_enabled(&self, value: bool) {
-        buffr_core::favicon::set_favicon_enabled(&self.favicon_enabled, value);
     }
 
     /// Install a wake callback fired from `OsrPaintHandler::on_paint`
