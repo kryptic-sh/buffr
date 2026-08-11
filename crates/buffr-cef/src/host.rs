@@ -2911,6 +2911,8 @@ impl BrowserHost {
 /// Format a string as a JS double-quoted literal, escaping every
 /// non-ASCII codepoint to `\uXXXX`. Used for the inline filter call
 /// so the splice survives any input the user might type.
+const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+
 fn json_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -2925,7 +2927,11 @@ fn json_string_literal(s: &str) -> String {
             c => {
                 let mut buf = [0u16; 2];
                 for unit in c.encode_utf16(&mut buf).iter() {
-                    out.push_str(&format!("\\u{unit:04x}"));
+                    out.push_str("\\u");
+                    out.push(LOWER_HEX[(unit >> 12) as usize] as char);
+                    out.push(LOWER_HEX[((unit >> 8) & 0x0F) as usize] as char);
+                    out.push(LOWER_HEX[((unit >> 4) & 0x0F) as usize] as char);
+                    out.push(LOWER_HEX[(unit & 0x0F) as usize] as char);
                 }
             }
         }
@@ -3709,6 +3715,17 @@ mod tests {
     fn tab_id_displays_with_prefix() {
         assert_eq!(format!("{}", TabId(0)), "tab#0");
         assert_eq!(format!("{}", TabId(42)), "tab#42");
+    }
+
+    // The hint-filter splice runs on every keystroke, so the literal
+    // must escape anything the user can type — including astral chars
+    // (surrogate pairs) that must come out as two `\uXXXX` escapes.
+    #[test]
+    fn json_string_literal_escapes_non_ascii() {
+        assert_eq!(json_string_literal("plain"), "\"plain\"");
+        assert_eq!(json_string_literal("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+        assert_eq!(json_string_literal("café"), "\"caf\\u00e9\"");
+        assert_eq!(json_string_literal("emoji 🚀"), "\"emoji \\ud83d\\ude80\"");
     }
 
     #[test]

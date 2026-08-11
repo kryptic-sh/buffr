@@ -255,6 +255,8 @@ fn is_ipv4(s: &str) -> bool {
 /// avoid pulling `percent-encoding` for one call site — the rules
 /// here are: ASCII letters/digits and `-_.~` pass through, space →
 /// `+`, everything else → `%XX` upper-hex.
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -265,7 +267,8 @@ fn url_encode(s: &str) -> String {
             b' ' => out.push('+'),
             _ => {
                 out.push('%');
-                out.push_str(&format!("{b:02X}"));
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
             }
         }
     }
