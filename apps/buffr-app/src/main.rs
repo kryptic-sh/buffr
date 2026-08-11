@@ -913,21 +913,27 @@ fn main() -> Result<()> {
                         active = ?s.active,
                         "session: restored",
                     );
-                    let entries: Vec<(String, bool)> = s
-                        .entries()
-                        .filter_map(|(u, p)| {
-                            if AppState::is_startup_navigation_safe(u) {
-                                Some((u.to_string(), p))
-                            } else {
-                                warn!(
-                                    url = u,
-                                    "session: dropping restored tab with disallowed scheme"
-                                );
-                                None
-                            }
-                        })
+                    // The scheme gate drops `javascript:`/`data:` entries
+                    // (a hand-edited session must not drive script
+                    // execution); `filter_entries` re-bases the saved
+                    // active index onto the kept list so the user lands
+                    // on the tab they closed on (§20-2).
+                    let (entries, active) = session::filter_entries(s.entries(), s.active, |u| {
+                        if AppState::is_startup_navigation_safe(u) {
+                            true
+                        } else {
+                            warn!(
+                                url = u,
+                                "session: dropping restored tab with disallowed scheme"
+                            );
+                            false
+                        }
+                    });
+                    let entries: Vec<(String, bool)> = entries
+                        .into_iter()
+                        .map(|(u, p)| (u.to_string(), p))
                         .collect();
-                    (entries, s.active)
+                    (entries, active)
                 }
                 Ok(None) => (Vec::new(), None),
                 Err(err) => {

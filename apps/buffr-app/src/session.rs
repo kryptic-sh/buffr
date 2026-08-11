@@ -112,6 +112,39 @@ impl Session {
     }
 }
 
+/// Filter a session's entries through `keep`, re-basing `active` onto
+/// the kept list. The saved `active` index refers to the *pre-filter*
+/// [`Session::entries`] order, so every dropped entry before it shifts
+/// the active tab down by one; an adjusted index past the end of the
+/// kept list comes back `None` and the restorer falls back to tab 0
+/// (§20-2).
+pub fn filter_entries<'a, F>(
+    entries: impl Iterator<Item = (&'a str, bool)>,
+    active: Option<usize>,
+    mut keep: F,
+) -> (Vec<(&'a str, bool)>, Option<usize>)
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut dropped_before_active = 0usize;
+    let kept: Vec<(&'a str, bool)> = entries
+        .enumerate()
+        .filter_map(|(i, (url, pinned))| {
+            if keep(url) {
+                Some((url, pinned))
+            } else {
+                if active.is_some_and(|a| i < a) {
+                    dropped_before_active += 1;
+                }
+                None
+            }
+        })
+        .collect();
+    let adjusted = active.map(|a| a.saturating_sub(dropped_before_active));
+    let kept_len = kept.len();
+    (kept, adjusted.filter(|&a| a < kept_len))
+}
+
 /// Default path: `<data_dir>/session.json` where `<data_dir>` matches
 /// `buffr_core::profile_paths().data`.
 pub fn default_path(data_dir: &Path) -> PathBuf {
@@ -236,6 +269,58 @@ mod tests {
         let back = read(&path).unwrap().unwrap();
         assert!(back.pinned.is_empty());
         assert!(back.tabs.is_empty());
+    }
+
+    #[test]
+    fn filter_entries_rebases_active_across_dropped_entries() {
+        // §20-2 repro: a dropped entry before the saved active index
+        // shifts it down by one.
+        let mut s = Session::from_tabs([
+            ("https://a.example/", false),
+            ("javascript:alert(1)", false),
+            ("https://b.example/", false),
+        ]);
+        s.active = Some(2);
+        let (kept, active) = filter_entries(s.entries(), s.active, |u| {
+            !matches!(u, "javascript:alert(1)")
+        });
+        assert_eq!(
+            kept.iter().map(|(u, _)| *u).collect::<Vec<_>>(),
+            vec!["https://a.example/", "https://b.example/"]
+        );
+        assert_eq!(active, Some(1), "active should land on b.example");
+    }
+
+    #[test]
+    fn filter_entries_drops_after_active_do_not_shift_it() {
+        let mut s = Session::from_tabs([
+            ("https://a.example/", false),
+            ("https://b.example/", false),
+            ("javascript:alert(1)", false),
+        ]);
+        s.active = Some(1);
+        let (kept, active) =
+            filter_entries(s.entries(), s.active, |u| !u.starts_with("javascript:"));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(active, Some(1), "drop after active is index-neutral");
+    }
+
+    #[test]
+    fn filter_entries_adjusted_index_out_of_range_becomes_none() {
+        // Two drops before `active`, but only one slot to absorb them:
+        // the adjusted index points past the kept list, so restore
+        // falls back to tab 0.
+        let mut s = Session::from_tabs([
+            ("https://a.example/", false),
+            ("javascript:alert(1)", false),
+            ("https://b.example/", false),
+            ("javascript:alert(2)", false),
+        ]);
+        s.active = Some(3);
+        let (kept, active) =
+            filter_entries(s.entries(), s.active, |u| !u.starts_with("javascript:"));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(active, None);
     }
 
     #[test]

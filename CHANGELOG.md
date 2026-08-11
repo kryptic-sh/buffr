@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Session restore now lands on the tab the user closed on when the scheme gate
+  drops `javascript:`/`data:` entries from a hand-edited `session.json`: the
+  saved active index is re-based onto the filtered tab list instead of being
+  applied to the wrong slot.
+
 ### Security
 
 - "View Page Source" on an internal page no longer leaks the per-launch auth
