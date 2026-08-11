@@ -247,6 +247,9 @@ wrap_life_span_handler! {
         popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
         // C8: main view's scale seeds each popup view at creation.
         main_osr_view: SharedOsrViewState,
+        // The popup's page/hint nonces are forgotten on close so the
+        // table doesn't grow one ~128-byte entry per popup ever opened.
+        console_nonces: ConsoleNonces,
     }
 
     impl LifeSpanHandler {
@@ -435,6 +438,10 @@ wrap_life_span_handler! {
             if let Ok(mut sink) = self.popup_close_sink.lock() {
                 sink.push_back(browser_id);
             }
+            // The popup's page/hint console nonces die with it — forgetting
+            // them keeps the table from accumulating one ~128-byte entry per
+            // popup ever opened (§9 hardening).
+            self.console_nonces.forget(browser_id);
             tracing::debug!(browser_id, "on_before_close: popup browser deregistered");
         }
     }
@@ -608,6 +615,7 @@ wrap_client! {
                 self.popup_close_sink.clone(),
                 self.popup_browsers.clone(),
                 self.main_osr_view.clone(),
+                self.console_nonces.clone(),
             ))
         }
 
