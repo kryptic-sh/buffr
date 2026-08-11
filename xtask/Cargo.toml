@@ -21,7 +21,6 @@ ignored = []
 anyhow.workspace = true
 ureq.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 tar.workspace = true
 bzip2.workspace = true
 # SHA-1 is the only digest the Spotify CEF `index.json` publishes, so the

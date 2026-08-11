@@ -35,7 +35,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha1::{Digest, Sha1};
 
 const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
@@ -108,7 +108,7 @@ struct CefVersion {
     files: Vec<CefFile>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 struct CefFile {
     #[serde(rename = "type")]
     file_type: String,
@@ -290,18 +290,6 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
 
     flatten_top_level(&vendor_dir)
         .with_context(|| format!("flattening {}", vendor_dir.display()))?;
-
-    // `cef-dll-sys` (the `cef` crate's build script) resolves the CEF tree
-    // through this same directory when CEF_PATH is set: it first looks for
-    // `$CEF_PATH/<bundled-cef-version>/<os_arch>/`, then falls back to
-    // `$CEF_PATH` itself only if `archive.json` there matches its expected
-    // version. Without the file it re-downloads the distribution into a
-    // versioned subdir — a ~200 MB fetch per platform per CI run, and a
-    // second runtime copy racing the one we stage. Serialize the index entry
-    // we just verified so the wrapper is built from these very sources.
-    let archive_json = serde_json::to_string_pretty(&file).context("serializing archive.json")?;
-    fs::write(vendor_dir.join("archive.json"), archive_json)
-        .with_context(|| format!("writing {}", vendor_dir.join("archive.json").display()))?;
 
     eprintln!("xtask: done. CEF extracted at {}", vendor_dir.display());
     eprintln!("       set CEF_PATH={} to override", vendor_dir.display());
