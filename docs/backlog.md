@@ -496,10 +496,6 @@ Hardening (correct today, fragile):
 - `popup_close` uses `close_browser(0)` (host.rs:818) — a `beforeunload` handler
   on a popup may stall close, leaking the popup window + sinks until shutdown.
   Manual test owed with a `beforeunload` popup.
-- `console_nonces` entries for popups are never forgotten (`on_before_close`
-  removes frames/browsers but not the nonce) — permanent ~128-byte entries per
-  popup ever opened. Call `console_nonces.forget(browser_id)` on close. **Closed
-  `045d77e`.**
 - `--private --smoke-test` exits via `libc::_exit` before the `_private_tmp`
   drop, leaking `$TMPDIR/buffr-private-<pid>-*` per smoke run (CI smoke does not
   use `--private`, so no current trigger).
@@ -575,48 +571,7 @@ by the full workspace gate:
 Fresh full-codebase pass at low depth (correctness only) on a clean tree, split
 across four partitions (browser core, main app, engine/ui/supervisor,
 data/tooling). Every finding below was re-traced at its cited lines after the
-sub-agent pass. **One item in §10 was re-confirmed still open** (the
-`close_index` HIGH — see the correction under Cleared), not re-filed.
-
-### 1 MEDIUM — edit-mode events carry no browser attribution; a background or popup tab's page-driven field focus flips the ACTIVE tab into Insert mode
-
-**Where:** `crates/buffr-cef/src/handlers.rs:795` (edit.js injected into every
-main frame on `on_load_end`, no hidden/popup gate), `handlers.rs:1113-1117`
-(event authenticated against that browser's own nonce but pushed into the one
-shared sink), `crates/buffr-core/src/edit.rs:98-127` (`EditConsoleEvent` has no
-browser id), `apps/buffr-app/src/main.rs:4700-4717` (drain applies every `Focus`
-to the active engine + Insert).
-
-`drain_edit_focus_events` (main.rs:4664) runs unconditionally every tick
-(event*loop.rs:1321) and, for a `Focus`, calls `run_edit_attach(&field_id)` on
-the active engine with a field id from \_another* tab's DOM. The event carries
-no browser id, so attribution is impossible.
-
-```
-Repro: Ctrl+click / F-hint background-open a link to a page that autofocuses an input
-Expect: active tab stays in Normal mode
-Actual: the background tab's Focus puts the ACTIVE tab into Insert (keys pass
-       through to the page; last_focused_field points at the background tab's element)
-```
-
-Same path for popup-window focus events and for a hidden tab that focuses a
-field while not active.
-
-### 2 MEDIUM — middle-click closing the last tab exits without saving the session or marking a clean shutdown
-
-**Where:** `apps/buffr-app/src/event_loop.rs:894-902` vs the sibling paths
-`main.rs:2685-2703` (keyboard) and `context_menu.rs:638-644` — both call
-`save_session_now` + `mark_clean_shutdown` + set `shutdown_flag` before
-`event_loop.exit()`; the middle-click path calls only `event_loop.exit()`.
-
-```
-Repro: 3 tabs, middle-click each tab in the strip to close them all
-Expect: graceful exit — session saved, crash_guard launch.json cleared
-Actual: session.json keeps the stale list (restores the just-closed tab on next
-       launch); crash_guard never cleared, so two such exits within 60 s plus a
-       third launch trips LOOP_THRESHOLD (crash_guard.rs:69) and quarantines a
-       graceful session as a "crash loop"
-```
+sub-agent pass.
 
 ### 3 MEDIUM — right-clicking inside a popup window shows the menu on the main window and acts on the active tab
 
@@ -634,21 +589,6 @@ Repro: right-click on an image inside a popup window
 Expect: menu on the popup window; "Copy Image"/"Back" act on the popup's page
 Actual: menu renders on the main window; items act on the active tab, with
        coordinates interpreted in main-window space
-```
-
-### 4 MEDIUM — closing a tab does not stop its media; the stashed browser keeps playing until stack eviction
-
-**Where:** `crates/buffr-cef/src/host.rs:1686-1720` (`close_index` stashable
-branch only calls `was_hidden(1)` + `set_focus(0)`; `close_browser` deferred to
-eviction), and the note at `host.rs:1531-1535` that `was_hidden(1)` does _not_
-cut audio. `any_audio_active` (host.rs:1569-1571) stays true.
-
-```
-Repro: play a song, `d` (close tab)
-Expect: playback stops
-Actual: the hidden "closed" browser keeps playing; statusline media indicator and
-       idle-inhibit stay engaged until CLOSED_STACK_CAP more tabs are closed or
-       the app exits; "reopen tab" resurrects a page that played on its own
 ```
 
 ### 5 MEDIUM — `any_video_active` only ever reflects the active tab; background-tab video releases the screen-lock inhibitor
@@ -686,24 +626,6 @@ Actual: one blocked thread + pipe instance leaks per timeout; the kernel can mat
 The per-timeout leak is certain from the code; the starvation depends on named-
 pipe instance matching (not runtime-verified — no Windows host; consistent with
 §2's note that no Windows test job exists). Windows-only.
-
-### 7 MEDIUM — Unix: SIGINT/SIGTERM during the restart cooldown is ignored; a fresh child spawns after the user asked to quit, and the second signal orphans it
-
-**Where:** `apps/buffr/src/main.rs:624-630` (shutdown check only after a child
-outcome), `669` (250 ms `RESTART_COOLDOWN` sleep), `474-516` (loop top re-binds
-and spawns with no shutdown check), `855-866` (single-shot signal thread —
-`signals.forever().next()` then the thread exits and drops the `Signals`,
-unregistering the handlers). `child_pid_slot` is cleared to 0 at 571, so during
-the cooldown the handler logs "no live child" and returns.
-
-```
-Repro: Unix; child crashes; Ctrl+C lands inside the 250 ms cooldown window
-Expect: supervisor stops without spawning
-Actual: the loop wakes and spawns a fresh browser (setsid session leader,
-       main.rs:816-822); a second Ctrl+C now hits the default disposition,
-       killing the supervisor and leaving the new browser running orphaned and
-       unsupervised
-```
 
 ### 8 MEDIUM (multi-engine configs only) — session restore applies pin/favicon-prefill to the active engine instead of the engine that opened the tab
 
@@ -746,13 +668,6 @@ Actual: "x" is pushed as a folder and never popped (no </DL> belongs to it);
        exports escape `<` as &lt; — and the fuzzer can't catch it (nothing
        asserts on tags).
 ```
-
-### 14 LOW — hint `Ready` events are single-slot and untagged; a tab switch before the drain misroutes them
-
-**Closed `96f9b54`** — hint events are now tagged with the emitting browser at
-the handler and `pump_hint_events` applies `Ready` to the tab that owns it,
-mirroring the edit-attribution fix. WebKit's single-session pump unwraps the tag
-and keeps its behaviour (crate not in the workspace).
 
 ### Cleared
 
@@ -807,17 +722,8 @@ same pass (the rest):
 - Fuzz targets — no reachable panic in `parse_action`, `parse_keys`,
   `import_netscape`, config round-trip; harnesses sound.
 
-**Correction to a sub-agent's Cleared claim:** one agent listed the
-`close_index` active-index math as cleared. It is not — I re-traced
-`close_index(0)` with `active = Some(2)` on [A, B, C]: `set_active_index(0)`'s
-guard `prev < tabs.len()` is `2 < 2` → false, so the old active (C) is never
-hidden. §10's HIGH finding remains open in the current tree; it was not re-filed
-above.
-
 ### Hardening
 
-- `close_index`'s stashable branch and `set_active_index`'s hide-previous guard
-  interact exactly as §10 item 1 describes — the highest-value fix on this list.
 - `internal_server` accepts a request with no `Host` header — defence-weakening,
   not a correctness bug; left for the audit pass.
 - `flatten_top_level` in xtask returns `Ok` on multiple matches despite a
@@ -858,34 +764,6 @@ token) held up, and the residual risk concentrates in the **page→app console
 bridge** (clipboard + Insert-mode) and the **browser-process fetch primitives**
 (buffr-src / Copy Image).
 
-### 1 MEDIUM — `buffr-src:` and Copy Image private-network guard classifies hostname strings, never resolutions; `127.0.0.1.nip.io`-class wildcard DNS bypasses it
-
-**Where:** `crates/buffr-cef/src/view_source_scheme.rs:150`
-(`if !is_non_public_host(&host) { return Ok(()) }`),
-`crates/buffr-core/src/private_net.rs:10-77` (`is_non_public_host` never
-resolves DNS; `:75` explicitly defers "DNS rebinding"),
-`view_source_scheme.rs:498` (ureq GET in the browser process),
-`crates/buffr-core/src/copy_image.rs:113-131` (`check_fetch_host`, same guard).
-
-```
-Repro: a page sets location.href = 'buffr-src:http://127.0.0.1.nip.io:8080/admin'
-       (scheme is STANDARD|SECURE; buffr-src has no CORS/fetch but top-level
-       navigation is the M13-intended path)
-Expect: private-network fetch refused
-Actual: "127.0.0.1.nip.io" is not localhost/.local, not an IP literal, not
-       numeric-looking → classified public → browser-process GET resolves it to
-       127.0.0.1 and renders the local service's response in the tab
-```
-
-No timing games needed — nip.io is a static resolution; the code's "DNS
-rebinding out of scope" note (private_net.rs:75) is not a boundary. Same guard,
-same bypass, in the Copy Image path (right-click → user-gesture-gated, lower
-impact). Fix: resolve-and-classify the resolved IPs, or reject the wildcard-DNS
-class. **Caveat:** reachability of the `buffr-src:` leg depends on CEF
-permitting content-initiated top-level navigation to a STANDARD|SECURE custom
-scheme — nothing in the handler enforces the "browser-initiated only" property
-the M13 comment asserts, and the M13 fix is untested at runtime (backlog §2).
-
 ### 2 MEDIUM — a page can overwrite the system clipboard at any time via a forged edit-bridge `Selection` event (pastejacking)
 
 **Where:** `apps/buffr-app/src/main.rs:4752-4763` (`Selection` →
@@ -923,32 +801,10 @@ Actual: Insert mode engages; every vim keystroke (:, /, o, y, d…) goes into th
 The any-Focus-enters-Insert behavior itself is documented as deliberate at
 main.rs:4684-4697 (a caret must accept typing); the defect is the dead
 `insert_intent_at` field whose doc promises the opposite, and the keystroke-
-hijack impact being accepted without a security note. Same root as §11 item 1
-(cross-tab misattribution) — this is the same-tab variant. Fix: implement the
-gesture gate or delete the field + doc and document the tradeoff.
-
-### 4 MEDIUM — profile data stores are created world-readable; any local user can read history, bookmarks, permission grants, session
-
-**Where:** `crates/buffr-store/src/lib.rs:58-61` (SQLite `READ_WRITE | CREATE` —
-file created `0666 & ~umask`, typically `0644`; `tune()` at 79-84 sets no mode),
-`apps/buffr-app/src/main.rs:1245-1246` (`create_dir_all` →
-`~/.local/share/buffr`, `~/.cache/buffr` at `0755`),
-`apps/buffr-app/src/session.rs:154` (`fs::write` → `0644`). The supervisor
-already shows the right standard — `ensure_private_dir` enforces 0700 + uid +
-symlink-reject (`apps/buffr/src/main.rs:346-372`) — but it is never applied to
-the XDG profile dirs.
-
-```
-Repro: multi-user box, default umask 022; user A browses; user B lists
-       ~A/.local/share/buffr/
-Expect: A's history, bookmarks, permissions (camera/mic/geolocation grants),
-       session.json and CEF cookie/cache trees are unreadable by B
-Actual: all readable (0644/0755); full browsing history + permission state
-       disclosed to any other local user
-```
-
-Umask-077 machines are immune. Fix: chmod profile dirs 0700 / files 0600 at
-`resolve_paths`/`open_tuned` (or SQLITE_OPEN_NOFOLLOW + explicit mode).
+hijack impact being accepted without a security note. Same root as the
+edit-bridge misattribution (§11-1, shipped `575a271`) — this is the same-tab
+variant. Fix: implement the gesture gate or delete the field + doc and document
+the tradeoff.
 
 ### 5 MEDIUM (Windows-only) — predictable named-pipe heartbeat lets another local user force a kill/restart loop and the 3-strike supervisor exit
 
@@ -1761,14 +1617,14 @@ gate (fmt --check, clippy --workspace -D warnings, build, nextest):
 - **§11-7** — signal during restart cooldown ignored → orphaned respawn:
   `ed46f3a` (loop-top shutdown check + persistent signal handler).
 
-**New findings from the review pass over the §12-1 fix (open):** the string
-guard's `is_non_public_v4` misses RFC 2544 benchmarking range `198.18.0.0/15`,
-and the IPv6 path misses deprecated site-local `fec0::/10` — a hostname (or
-literal) resolving to either is currently allowed. Pre-existing (both apply to
-the literal path too); natural to close alongside the resolve-and-classify work
-in `crates/buffr-core/src/private_net.rs`. **Closed `b4054db`** — both ranges
-now classified non-public in the string guard and pinned in the resolve path
-with tests.
+**New findings from the review pass over the §12-1 fix:** the string guard's
+`is_non_public_v4` misses RFC 2544 benchmarking range `198.18.0.0/15`, and the
+IPv6 path misses deprecated site-local `fec0::/10` — a hostname (or literal)
+resolving to either is currently allowed. Pre-existing (both apply to the
+literal path too); natural to close alongside the resolve-and-classify work in
+`crates/buffr-core/src/private_net.rs`. **Closed `b4054db`** — both ranges now
+classified non-public in the string guard and pinned in the resolve path with
+tests.
 
 ## 16. Code review 2026-08-06 (63b8a25) — findings
 
@@ -1842,7 +1698,7 @@ supervisor arm (never executed on this host), `buffr-view-source` renderer,
 `fuzz/`, `tests/e2e/*`. Known items confirmed: §11-13 (edit.js teardown omits
 `focus` from its removal list — edit.js:286 registered, teardown removes
 `focusin`/`focusout`/`input`/`mousedown`/`pointerdown`/`touchstart` only); the
-§12-1 range-gap follow-ups still open as recorded.
+§12-1 range-gap follow-ups were closed on 2026-08-11 (`b4054db`).
 
 ## 17. Audit 2026-08-06 (63b8a25) — findings
 
@@ -1939,9 +1795,9 @@ fixtures. No tests run — read-only pass.
 Known items confirmed, one line each: §12-2 pastejacking, §12-3 dead
 `insert_intent_at` gate, §12-6 download overwrite, §12-7 session-restore scheme
 allow-list, §12-9 token persisted, §12-10 unbounded popups, §12-11 import
-amplification, §11-5 video probe on active tab only, §11-14 untagged hint sink —
-all still present as recorded; §10-1/§11-2/§11-4/§11-7/§12-1/§12-4 fixes
-verified working.
+amplification, §11-5 video probe on active tab only — all still present as
+recorded; §10-1/§11-2/§11-4/§11-7/§12-1/§12-4 fixes verified working (§11-14
+shipped later as `96f9b54`).
 
 **Summary: 1 medium, 2 low new findings — 0 critical, 0 high.** Overall risk
 remains low-to-moderate, unchanged from the prior pass: the hard boundaries (IPC
