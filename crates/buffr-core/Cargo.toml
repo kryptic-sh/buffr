@@ -36,7 +36,7 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
     "gif",
 ] }
-base64 = "0.22"
+base64 = "0.23"
 url = "2"
 rusqlite = { workspace = true, features = ["bundled"] }
 

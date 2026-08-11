@@ -15,5 +15,5 @@ ignored = []
 
 [dependencies]
 buffr-modal.workspace = true
-fontdb = { version = "0.23", default-features = false, features = ["fs", "memmap"] }
+fontdb = { version = "0.24", default-features = false, features = ["fs", "memmap"] }
 fontdue = "0.9"

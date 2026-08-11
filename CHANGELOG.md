@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- Updated `quick-xml` to 0.41.0 (via `wayland-scanner` and `plist`), closing
+  RUSTSEC-2026-0194 and RUSTSEC-2026-0195 — quadratic-time start-tag parsing DoS
+  in the 0.39 line. The matching entries were dropped from `deny.toml`'s ignore
+  list.
+
 ## [0.14.10] - 2026-08-06
 
 ### Fixed

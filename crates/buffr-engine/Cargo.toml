@@ -14,7 +14,7 @@ publish.workspace = true
 ignored = []
 
 [dependencies]
-getrandom = "0.2"
+getrandom = "0.4"
 # raw-window-handle 0.6 lets backends accept a host wl_surface for native
 # subsurface compositing (Phase 3 of the WPE WebKit umbrella, #109). Type-
 # only crate; no transitive runtime weight.

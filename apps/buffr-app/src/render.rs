@@ -570,7 +570,7 @@ fn render_worker(
         state.queue.submit(once(encoder.finish()));
         let submit_done_us = render_start.elapsed().as_micros() as u64;
 
-        surface_texture.present();
+        state.queue.present(surface_texture);
         let present_us = (render_start.elapsed().as_micros() as u64).saturating_sub(submit_done_us);
 
         // Run wgpu's lazy-drop GC.  Without an explicit poll the
@@ -701,6 +701,7 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .or_else(|_| {
             tracing::warn!("wgpu: HighPerformance adapter unavailable; trying LowPower");
@@ -708,6 +709,7 @@ impl Renderer {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             }))
         })
         .or_else(|_| {
@@ -718,6 +720,7 @@ impl Renderer {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: true,
+                apply_limit_buckets: false,
             }))
         })
         .context(
@@ -816,6 +819,7 @@ impl Renderer {
             alpha_mode: composite_alpha,
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 

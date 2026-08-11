@@ -67,13 +67,13 @@ bzip2 = "0.6"
 # Integrity check for the CEF tarball in `cargo xtask fetch-cef`. The
 # Spotify CDN index publishes SHA-1 digests only, so that's what we
 # verify against.
-sha1 = "0.10"
+sha1 = "0.11"
 clap = { version = "4", features = ["derive"] }
 notify = "8"
 # History store deps. `rusqlite`'s `bundled` feature is opted-in by
 # `buffr-history` — we expose the workspace base here without features
 # so other crates can later pick a different bundling mode if needed.
-rusqlite = "0.39"
+rusqlite = "0.40"
 chrono = { version = "0.4", default-features = false }
 url = "2"
 # Used by `buffr-bookmarks` for Netscape HTML import. Format is loose
@@ -85,9 +85,9 @@ tempfile = "3"
 # wgpu present layer — replaces the old softbuffer blit. CPU-composite
 # buffer is uploaded to a single GPU texture and drawn as a fullscreen
 # triangle. No platform branching: Vulkan on Linux, Metal on macOS, DX12.
-wgpu = "29"
+wgpu = "30"
 # block_on for async adapter / device request
-pollster = "0.4"
+pollster = "1.0"
 # safe cast from &[u32] to &[u8] for texture upload
 bytemuck = { version = "1", features = ["derive"] }
 # Phase 6 update channel: `UpdateChecker` compares the running version
@@ -99,7 +99,7 @@ semver = { version = "1", features = ["serde"] }
 # / `getentropy`) — and `getrandom` is the no-dependency leaf crate that
 # `rand` itself sits on. It is already in `Cargo.lock` as a transitive dep,
 # so this adds no new code to the build.
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Buffr-* crates are now plain monorepo members under crates/<name>/.
 # All deps resolve directly via path — no registry pins or [patch.crates-io] needed.

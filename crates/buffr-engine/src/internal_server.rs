@@ -545,7 +545,7 @@ fn generate_token() -> String {
     // hand a local attacker a trivially-guessable token, so we surface
     // the failure as a panic — a system without /dev/urandom / equivalent
     // is broken in ways buffr can't recover from anyway.
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    getrandom::fill(&mut buf).expect("OS CSPRNG unavailable");
     let mut s = String::with_capacity(32);
     for b in buf {
         use std::fmt::Write;
