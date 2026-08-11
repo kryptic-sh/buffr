@@ -2208,3 +2208,251 @@ workspace (per §15-2) and were not compiled or line-audited.
 (view-source), one minor per-keystroke alloc; the rest of the previously
 unreached tree is cold or bounded-small-N. Findings 1-2 are the next queue
 entries when perf work resumes.
+
+## 20. Code review 2026-08-11 (63b8a25..HEAD) — findings
+
+Sweep pass over the whole workspace (tree clean, so full-codebase scope). Fresh
+deep review of everything changed since the 2026-08-06 passes — the 14 fix
+commits between `63b8a25` and `HEAD` plus the deps bump (`ab1b810`, wgpu 30,
+getrandom 0.4, rusqlite 0.40, fontdb 0.24, base64 0.23, sha1 0.11) — with the
+rest of the tree carried by §16/§18 and re-spot-checked where the delta reaches.
+Findings ranked most-severe first; nothing critical or high.
+
+### 20-1 (LOW) — view-source of an internal page persists the per-launch auth token to history
+
+**Where:** `crates/buffr-cef/src/handlers.rs:747-752` (the `is_internal` skip
+added by `b3b8aac`), reached from `apps/buffr-app/src/context_menu.rs:486-509`.
+
+The §12-9 fix skips only URLs that start with the raw internal-server prefix
+(`http://127.0.0.1:<port>/<token>/`). Since `a6b7482` made view-source of a
+`buffr://` page actually work, "View Page Source" on an internal page navigates
+a new tab to `buffr-src:http://127.0.0.1:<port>/<token>/new`
+(context_menu.rs:499). `on_load_end` then records that frame URL: the
+`buffr-src:` wrapper does not match the prefix, `buffr-src` is not in the
+config's default `skip_schemes` (`about`, `cef`, `chrome`, `data`, `file`), and
+`url::Url::parse` accepts it as an opaque non-special-scheme URL — so the
+per-launch token lands in `history.sqlite`.
+
+Verified empirically, not just traced: a scratch integration test in
+`buffr-history` recorded `buffr-src:http://127.0.0.1:41235/<token>/new` via
+`History::record_visit` (count 1); the file was deleted after the check.
+
+```
+Repro: open buffr://new → context menu → View Page Source → quit → read history.sqlite
+Expect: no buffr-src:http://127.0.0.1:<port>/<token>/… row
+Actual: the URL (auth token included) is recorded
+```
+
+Severity is LOW — the token is documented defence-in-depth, "not authentication"
+(`internal_server.rs`), and history is only readable by local processes, never
+by web content — but it defeats the exact guarantee `b3b8aac` made. Fix: skip
+`buffr-src:` URLs whose _stripped_ form starts with the prefix, or add
+`buffr-src` to the default skip list.
+
+### 20-2 (LOW) — session-restore active index goes stale when the scheme gate drops entries
+
+**Where:** `apps/buffr-app/src/main.rs:916-930` (filter builds `entries`, passes
+the original `s.active` through unchanged) vs `main.rs:2964-2969` (index applied
+to the now-filtered tab list).
+
+When a hand-edited `session.json` contains a `javascript:`/`data:` entry before
+the saved active index, the filter drops it and `summaries.get(idx)` either
+selects the wrong tab or (out of range) selects nothing, so the user lands on
+tab 0 instead of the tab they closed on.
+
+```
+Repro: session.json = ["https://a.example/", "javascript:alert(1)", "https://b.example/"], active = 2
+Expect: restored tabs [a, b], active = b
+Actual: tabs [a, b]; summaries.get(2) is None → no selection, lands on a
+```
+
+Fix: subtract the count of dropped entries at index < `s.active` (and leave
+`None` when the adjusted index is out of range). Only reachable in the
+adversarial case the gate exists for, hence LOW.
+
+### Hardening
+
+- **`close_active_tab_or_exit` falls through to an unconfirmed pinned close when
+  a confirm is pending** (`main.rs:2727-2735`). If `confirm_close_pinned` is
+  `Some` (pending for another tab), the guard does not arm and the match below
+  closes the active tab anyway — the exact §11-15 shape fixed in the two sibling
+  sites. Unreachable today: while a confirm is pending, `confirm_handle_key`
+  (`main.rs:5311-5340`) returns `true` for every key, so neither caller
+  (`A::TabClose` at 2555, `:q` at 4568) can reach it. But any future non-key
+  path (mouse gesture, menu) would close a pinned tab silently. Reconcile it to
+  the armed-or-blocked shape of the other two.
+- **`is_startup_navigation_safe`'s doc claim overstates coverage**
+  (`main.rs:2866-2882`: "Every other navigation entry point already gates these
+  two schemes"). `--homepage` / `general.homepage` (`main.rs:608-611` →
+  `event_loop.rs:168` initial_url) is not gated, and neither the engine
+  (`host.rs` navigate/open_tab) nor `classify_navigation` sees it. Practically
+  inert — a `javascript:` URL as an _initial_ navigation has no document to run
+  in, and config/CLI are user-trusted inputs — but the sentence is false as
+  written and should be corrected or the homepage gated.
+
+### Cleared
+
+- `initiator_host_of` (`view_source_scheme.rs:185-195`) — the bare-host form is
+  only ever produced internally (`create` extracts it from a real frame URL via
+  `http_host`); a string still carrying a scheme is rejected; the comparison is
+  exact on a lower-cased host. No spoofing path for web content.
+- History-skip prefix check — `url_for("/")` ends with `/`, so a longer token
+  cannot collide; the server is started (`main.rs:767-787`) before any client
+  captures the prefix. `t.url` for `buffr://` pages is the loopback form, so the
+  skip does fire for them.
+- `multi_unit_char_text` / `insert_text_via_exec` — exactly-one-char plus
+  `len_utf16() == 2` gate; BMP (`é`) and multi-char strings take the key-event
+  path exactly as before; `resolve_char_unit` returning 0 for pairs is the
+  documented trigger.
+- Pinned-close guards in `event_loop.rs:882-892` and `context_menu.rs:628-638` —
+  both arm-or-block; a pending confirm for a different tab does nothing, no
+  unconfirmed close.
+- Context-menu tab actions — all seven `I::Tab*` arms resolve through
+  `resolve_tab_target` (id-based); the two that use `index` (TabDuplicate,
+  TabCloseToRight) use the _current_ index returned by the lookup.
+- `search.rs` out-of-range port — `localhost:99999`, `example.com:99999` and
+  `1.2.3.4:99999` all fall back to search (the label check rejects the `:` in
+  the port), `:65535` still resolves as a URL; matches the new tests.
+- edit.js teardown — the added `focus` removal (line 346) matches the
+  registration (line 286); the `load` listener is `{once: true}`.
+- Deps-bump surface — `getrandom::fill` exists in the installed 0.4.2 source;
+  wgpu 30's `Queue::present`, `apply_limit_buckets` and `color_space` are the
+  new required fields and are set on every adapter path; fontdb 0.24 / base64
+  0.23 / sha1 0.11 call sites are semantically unchanged; quick-xml 0.41 is
+  transitive only (the RUSTSEC-2026-0194/-0195 fixes).
+
+### Coverage
+
+Deep-reviewed: every hunk of `63b8a25..HEAD` — `cef_translate.rs`,
+`context_menu.rs`, `event_loop.rs`, `main.rs` (session restore/CLI keys, startup
+gate, `insert_text_via_exec`), `render.rs` (wgpu-30), `handlers.rs` load path,
+`host.rs` display/cef_url, `view_source_scheme.rs` in full, `search.rs`,
+`image_copy.rs`, `engine.rs` trait, `internal_server.rs` token, `history/lib.rs`
+builder, `store/lib.rs` tune, `edit.js`. Plus the areas the delta reaches:
+history record path (verified with a scratch test, since removed), session
+save/restore, pinned-close, context-menu dispatch.
+
+Not re-reviewed line-by-line (covered by §16/§18 on 2026-08-06 and earlier
+passes, findings recorded): buffr-modal keymap/engine, buffr-ui
+painting/hit-testing, `windowing/*`, `single_instance.rs` in full,
+buffr-view-source renderer, buffr-zoom, buffr-permissions, the store crates'
+full bodies, supervisor/CLI, `fuzz/`, `tests/e2e/*`, `xtask`, and
+`buffr-webkit`/`buffr-poc` (out of the workspace, per §15-2).
+
+## 21. Audit 2026-08-11 (63b8a25..HEAD) — findings
+
+Same scope as the review: the delta since the 2026-08-06 audit (§17) is the only
+code change in the tree, so the attack surface is the delta plus the deps bump.
+Entry points walked: the `buffr-src:` custom-scheme create/fetch-worker path,
+the history load handler, session restore and CLI URL handling, key-event text
+injection, and the internal-server token. 0 critical, 0 high, 2 low, 3
+hardening. Overall risk: low.
+
+### 21-1 (LOW) — per-launch internal-server token persisted to history via the `buffr-src:` wrapper
+
+Same finding as §20-1, security framing: `b3b8aac` closed the raw-loopback
+history leak, but "View Page Source" on an internal page (reachable since
+`a6b7482`) records `buffr-src:http://127.0.0.1:<port>/<token>/…` in
+`history.sqlite`, bypassing the prefix skip (`handlers.rs:747-752`). Exposure is
+local-only — history is never readable by web content — so severity LOW, but it
+defeats the defence-in-depth guarantee the §12-9 fix just made. Fix as described
+in §20-1.
+
+### 21-2 (LOW) — session-restore active index not adjusted for dropped entries
+
+§20-2. Correctness of the defensive path, no security impact: the gate's purpose
+is to keep `javascript:`/`data:` from reaching an engine, which it does; the
+stale index only mis-selects the restored tab.
+
+### Hardening
+
+- §20-3: `close_active_tab_or_exit` pinned-close fall-through (unreachable
+  today; overlay consumes all keys).
+- §20-4: homepage/`--homepage` not covered by the scheme gate (initial
+  navigation, trusted input).
+- `session.json` persists the raw loopback URL for `buffr://` pages — the same
+  token class, pre-existing and documented (`host.rs:388-393`, M19), out of the
+  delta. Noted so a future "fix the token in history" doesn't stop at
+  history.sqlite.
+
+### Cleared
+
+- `buffr-src:` same-host exception cannot be spoofed by web content: the
+  initiator host is extracted from the real frame URL; a public page's initiator
+  is its own host and is refused for loopback/RFC1918 targets.
+- Redirects: both browser-process fetches now run `max_redirects(0)`
+  (`view_source_scheme.rs` fetch worker, `image_copy.rs` `build_agent`), each
+  with a test proving the 3xx surfaces instead of a hop being fetched.
+- The history-skip prefix embeds the unguessable per-launch token, so no
+  attacker-crafted URL can land under it; the skip only ever hides chrome
+  navigations.
+- `is_startup_navigation_safe` — scheme matching is case-insensitive
+  (`Url::parse` normalizes); unparseable strings fail loudly at navigate.
+- `getrandom::fill` — same CSPRNG, API rename only (verified against the
+  installed 0.4.2 source).
+
+### Coverage
+
+Walked: every delta entry point above, plus the internal-server token
+generation/constant-time comparison path. Not re-walked (recorded §17 2026-08-06
+and earlier): `single_instance.rs` IPC forwarding in full, parsing/allocation
+code inside the store crates, `fuzz/` targets, `buffr-webkit`/`buffr-poc`.
+
+## 22. Tidy 2026-08-11 (63b8a25..HEAD) — cleanups
+
+Scope: the delta since the 2026-08-06 tidy (§18). Quality-only, nothing that
+changes behavior.
+
+### 22-1 — pinned-close guard is now written three times
+
+`apps/buffr-app/src/event_loop.rs:882-892`,
+`apps/buffr-app/src/context_menu.rs:628-638`,
+`apps/buffr-app/src/main.rs:2727-2735`. The two menu/middle-click sites are
+identical; the third is the same intent with a different tail (it falls through
+to the close when a confirm is pending — see §20-3). Extract one helper on
+`AppState`:
+
+```rust
+/// Arm the pinned-close confirmation if none is pending. Returns true if
+/// the caller must stop (a confirm is now or already was up).
+fn arm_pinned_close(&mut self, id: TabId) -> bool
+```
+
+used as `if pinned && !self.arm_pinned_close(id) { return; }`. Applying it to
+the two identical sites is behavior-preserving; reconciling the third to the
+same shape is a deliberate behavior decision (it is also the §20-3 hardening).
+
+Nothing else material in the delta — the repetition that existed was already
+extracted (`insert_text_via_exec` shared by both key paths, `build_agent`,
+`locate_tab_by_id`, `initiator_host_of`), and no dead code was orphaned.
+
+**Coverage:** the delta and the code it touches. Whole-tree tidiness carried by
+§18 (2026-08-06) and §13.
+
+## 23. Performance review 2026-08-11 (63b8a25..HEAD) — findings
+
+No findings. Every new path in the delta is cold or bounded-small-N, with the
+caller that establishes it:
+
+- `locate_tab_by_id` (`context_menu.rs`) — O(n) linear scan, but n = open tabs
+  and it runs once per context-menu dispatch (cold user gesture).
+- `active_tab_cef_url` (`host.rs:661-686`) — one String clone per menu-open,
+  cold.
+- `is_startup_navigation_safe` — one `Url::parse` per session entry / CLI URL,
+  once at startup.
+- `multi_unit_char_text` — constant work per keystroke; `insert_text_via_exec`
+  only fires for surrogate-pair chars (rare).
+- History skip (`handlers.rs:747-752`) — one `starts_with` per main-frame load,
+  dwarfed by the `record_visit` it often replaces.
+- wgpu-30 changes (`render.rs`) — `Queue::present` and the two new config fields
+  are the same per-frame cost as before; `apply_limit_buckets: false` is a
+  correctness/limits choice, not a hot path.
+- `search.rs` port check — one `u16` parse per omnibar submit.
+
+Known items from §14/§19 are unchanged and were not re-reported.
+
+**Coverage:** traced the delta paths with callers/frequency as above; the wider
+tree's hot paths were measured and reported in §19 on 2026-08-06 and not
+re-profiled.
+
+**Verdict:** nothing blocking; no new work items for perf.
