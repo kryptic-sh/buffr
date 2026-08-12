@@ -300,34 +300,28 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
 /// strict about the value matching the `Architecture:` field in
 /// DEBIAN/control.
 fn host_deb_arch() -> &'static str {
-    if cfg!(target_arch = "x86_64") {
-        "amd64"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "unknown"
-    }
+    host_arch_token("amd64", "arm64")
 }
 
 /// RPM `ExclusiveArch` value for the host. rpmbuild rejects the build
 /// outright if the spec arch doesn't match the build host.
 fn host_rpm_arch() -> &'static str {
-    if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "unknown"
-    }
+    host_arch_token("x86_64", "aarch64")
 }
 
 /// MSI / WiX architecture token. Plumbed through `{ARCH}` in
 /// `buffr.wxs` and used in the output filename.
 fn host_msi_arch() -> &'static str {
+    host_arch_token("x64", "arm64")
+}
+
+/// The host's architecture token from two per-arch spellings, or
+/// `"unknown"` for anything neither x86_64 nor aarch64.
+fn host_arch_token(x86_64: &'static str, aarch64: &'static str) -> &'static str {
     if cfg!(target_arch = "x86_64") {
-        "x64"
+        x86_64
     } else if cfg!(target_arch = "aarch64") {
-        "arm64"
+        aarch64
     } else {
         "unknown"
     }
@@ -596,7 +590,10 @@ fn flatten_top_level(dir: &Path) -> Result<()> {
                 .starts_with("cef_binary_")
         {
             if top.is_some() {
-                // Multiple matches — bail rather than guess.
+                // Multiple matches — give up on flattening rather than
+                // guess. Benign today: the real Spotify archive has
+                // exactly one `cef_binary_*` dir, and the sha1 gate
+                // precedes extraction.
                 return Ok(());
             }
             top = Some(path);
@@ -974,13 +971,7 @@ fn copy_file_executable(src: &Path, dest: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::copy(src, dest).with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(dest)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(dest, perms)?;
-    }
+    set_executable(dest)?;
     Ok(())
 }
 
