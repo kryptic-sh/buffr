@@ -187,15 +187,6 @@ rediscovered as findings.
 
 ## 4. Release follow-ups
 
-- **`buffr-modal` owes itself a minor bump.** The C3 fix changed
-  `Keymap::bind_chords` from returning `()` to `Result<(), BindError>` and made
-  `mode_map`/`mode_map_mut` return `Option` — breaking, and the crate is at
-  `0.1.5`, so pre-1.0 rules make that a **minor** bump to `0.2.0`, not a patch.
-  Nothing forced the issue at the time: every dependant is a path dependency
-  with no version requirement, the workspace is `publish = false`, and the crate
-  version is independent of the workspace version a release tag carries. Bump it
-  whenever `buffr-modal` is next versioned for its own sake.
-
 - **`buffr-bin` on the AUR is stuck at `0.14.6-1`.** The pending action is a
   **re-run, not a new release**: re-run the failed `Publish buffr-bin to AUR`
   job on the `v0.14.9` tag run once `ssh aur@aur.archlinux.org help` answers.
@@ -291,9 +282,10 @@ methods instead of cutting a range. The natural groups:
   (`bec1f30`) and need a real rebase, not a cherry-pick.
   `archive/wl-subsurface-poc` is the subsurface work the removed native
   compositing trio referred to.
-- **Root `Cargo.toml` declares `bitflags = "2"` with no inheriting crate.**
-  `buffr-modal` pins its own direct copy; nothing uses
-  `bitflags.workspace = true`. Remove the unused workspace entry.
+- **`cef` stays on the 148 line.** 151.3.0 is the latest release, but the
+  vendored libcef runtime and `xtask fetch-cef` pin 148.x and wrapper/runtime
+  must agree — bumping means a coordinated runtime upgrade, not a routine dep
+  bump. Revisit when the runtime is fetched at 151.
 
 ---
 
@@ -438,12 +430,6 @@ Actual: every save drops the non-active-engine tabs; each restart loses them
 
 ### Hardening
 
-- `internal_server` accepts a request with no `Host` header — defence-weakening,
-  not a correctness bug; left for the audit pass.
-- `flatten_top_level` in xtask returns `Ok` on multiple matches despite a
-  comment saying bail — benign today (real Spotify archive has exactly one
-  `cef_binary_*` dir; sha1 gate precedes extraction); worth a comment fix.
-
 ---
 
 ## 12. Audit 2026-08-05 (8744e18) — findings
@@ -554,23 +540,6 @@ Reachability depends on the pipe's default DACL (unverified here); the check
 itself is a no-op either way. Fix: real peer-credential check or a restrictive
 pipe security descriptor.
 
-### 11 LOW — `import_netscape` has quadratic tag amplification: a sub-MB hostile bookmark file can hang import and bloat the store to 10⁸ rows
-
-**Where:** `crates/buffr-bookmarks/src/lib.rs:478-481` (per anchor, every
-ancestor folder cloned into `tags`, no depth cap), `639-644` (one
-`INSERT OR IGNORE` per tag inside the single import transaction),
-`apps/buffr-app/src/cli.rs:54-58` (import entry, file read unbounded).
-
-```
-Repro: ~800 KB file: 10⁴ nested <H3><DL> levels then 10⁴ anchors
-Expect: import work linear in file size
-Actual: 10⁴ tags × 10⁴ anchors = 10⁸ INSERTs in one transaction — tens of
-       minutes of CPU, GB-scale WAL growth, and a permanently bloated store
-       (every bookmark carries 10⁴ tags, slowing all later search/all)
-```
-
-Fix: cap folder depth / per-anchor tag count so work is linear in input.
-
 ### 13 LOW — console-IPC nonce falls back to a non-cryptographic RNG when `getrandom` fails
 
 **Where:** `crates/buffr-core/src/console_nonce.rs:66-81` (`new_console_nonce`),
@@ -644,12 +613,9 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   `save_session_now(); mark_clean_shutdown(); shutdown_flag.store(true); request_redraw();`.
   Extract `fn request_exit`.
 - **Deadline-clamp idiom ×9** — event*loop.rs:2024-2027, 2033-2036, 2039-2042,
-  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each
-  `let deadline = match self.X { Some(at) if at < deadline => at, * => deadline }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
-- **`key_to_neutral_events`** (cef_translate.rs:395-431) — three near-identical
-  `NeutralKeyEvent` literals; `NeutralKeyEvent` is not `#[non_exhaustive]`
-  (buffr-engine input.rs:38), so build one base literal and use struct-update
-  `..base`. ~24 lines → ~10.
+  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each `let
+  deadline = match self.X { Some(at) if at < deadline => at, * => deadline
+  }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
 - **`cli.rs` `open_*_for_cli` ×5** (cli.rs:46-52, 88-94, 130-136, 156-162,
   191-197) — identical "profile_paths → create_dir_all(data) → store open"
   scaffolding differing only in the store constructor. One helper taking
@@ -661,29 +627,14 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   `update_indicator`, `find_query`, `hint_state`, `engine_hint`, `count_buffer`,
   `zoom` repeat the same build-string → width → `right_pen -= w` → draw → `-= 8`
   block. Extract `right_cell(...)`.
-- **`host_deb_arch` / `host_rpm_arch` / `host_msi_arch`** (xtask:310-342) —
-  identical `cfg!(target_arch)` chains differing only in the returned token. One
-  `fn host_arch_token(x86_64, aarch64) -> &'static str`.
 - **`cargo build -p buffr -p buffr-app -p buffr-helper` block** (xtask:664-682
   vs 1044-1059) — copy-pasted; extract
   `build_binaries(workspace, release, target)`. The
   `if release { "release" } else { "debug" }` profile string also repeats at
   658/1028/1532/1811.
-- **`copy_file_executable`** (xtask:946-958) inlines what `set_executable`
-  (1238-1251) already does — call it.
-- **`mode_name(PageMode)` duplicated in one crate** — config lib.rs:1006-1014
-  and keybinding.rs:300-308. Make one `pub(crate)`.
-- **host-head extraction** — search.rs:155-163 (`looks_like_url`) and 196-199
-  (`needs_http`) each re-implement `split(['/', '?', '#']).next()` +
-  `rsplit_once(':')` port-strip, both with a dead `.unwrap_or("")`. Extract
-  `fn host_head(s) -> &str`. Pure extraction only.
 
 ### YAGNI / over-abstraction
 
-- **`deserialize_keymap`** (config lib.rs:70, 657-664) — pure pass-through whose
-  doc admits it exists "so we can later add a normalization pass". That pass
-  never arrived; the derived deserializer behaves identically. Delete the
-  attribute + the fn.
 - **`Keymap::audit_default_bindings(_leader)`** (buffr-modal keymap.rs:227) —
   dead parameter (named `_leader`), and the doc claims it "renders the resolved
   `<leader>` chord" which the code does not do. Drop the param, the caller-side
@@ -706,8 +657,7 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
 
 - `set_min_size`/`set_max_size` near-identical
   (windowing/other/window.rs:36-57); `run_check_for_updates`/`run_update_status`
-  differ in one call (cli.rs:347-363); `cef_cursor_to_icon` if-else chain →
-  `match` (cef_translate.rs:101-176); `omnibar_suggestions` history/bookmark
+  differ in one call (cli.rs:347-363); `omnibar_suggestions` history/bookmark
   loops share a dedup+display+cap body (main.rs:4303-4339). (The
   `two_char_px`/`badge_content_w` hoist and the `GUTTER` module-scope move
   shipped 2026-08-12 — 01fe932, 82f4a78.)
@@ -828,18 +778,6 @@ last entry's `browser_id` (2869, 2891, 2900).
 **Fix:** an accessor for "the tab that was just opened" — the open calls already
 return the new `TabId`; expose `browser_id_of(id)` (one lookup) or capture the
 summary from the `open_tab` return. Startup-only, ~1-10 ms for a large session.
-
-### 13. Omnibar submit resolves the input twice
-
-**Where:** `apps/buffr-app/src/main.rs:5279-5282` — `classify_input(&raw)`
-internally runs the full `resolve_input` (search.rs:47-70), then
-`resolve_input(&raw, &self.search_config)` runs it again — two `url::Url`
-parses + two string builds per submit; same pair in `paste_url` at
-main.rs:2536-2542.
-
-**Fix:** a combined `resolve(&input, &search) -> (InputKind, String)` that
-resolves once and derives the kind from the result (the logic already exists —
-`classify_input` derives the kind by inspecting the resolved string).
 
 ### 14. Internal-server per-request waste: whole `Routes` table cloned per connection, String alloc per lookup
 
