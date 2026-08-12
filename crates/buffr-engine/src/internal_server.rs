@@ -166,7 +166,6 @@ pub struct InternalServer {
     addr: SocketAddr,
     token: String,
     shutdown: Arc<AtomicBool>,
-    routes: Arc<Mutex<Routes>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -214,7 +213,6 @@ impl InternalServer {
             addr: actual_addr,
             token,
             shutdown,
-            routes: routes_mu,
             thread: Some(thread),
         })
     }
@@ -234,14 +232,6 @@ impl InternalServer {
     pub fn url_for(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
         format!("http://{}/{}/{}", self.addr, self.token, path)
-    }
-
-    /// Replace the routing table. Useful for hot-reloading internal pages
-    /// without restarting the server (tests use this to swap handlers).
-    pub fn set_routes(&self, routes: Routes) {
-        if let Ok(mut guard) = self.routes.lock() {
-            *guard = routes;
-        }
     }
 }
 

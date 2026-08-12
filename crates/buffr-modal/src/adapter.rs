@@ -54,7 +54,6 @@ pub(crate) fn map_named(name: &str) -> Option<NamedKey> {
         "Return" | "KP_Enter" => NamedKey::CR,
         "Tab" | "ISO_Left_Tab" => NamedKey::Tab,
         "BackSpace" => NamedKey::BS,
-        "space" => NamedKey::Space,
         "Up" => NamedKey::Up,
         "Down" => NamedKey::Down,
         "Left" => NamedKey::Left,

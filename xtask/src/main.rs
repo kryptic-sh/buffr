@@ -296,18 +296,6 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Build the CDN URL for a `(platform, cef_version)` pair.
-///
-/// Spotify ships minimal builds at
-/// `<cdn>/cef_binary_<version>_<platform>_minimal.tar.bz2`. The full
-/// filename is normally read out of `index.json`; we expose the
-/// generator separately so unit tests can lock the URL pattern down
-/// without hitting the network.
-#[cfg_attr(not(test), allow(dead_code))]
-fn cef_minimal_url(cdn: &str, platform: &str, cef_version: &str) -> String {
-    format!("{cdn}/cef_binary_{cef_version}_{platform}_minimal.tar.bz2")
-}
-
 /// Debian package architecture suffix for the host. `dpkg-deb` is
 /// strict about the value matching the `Architecture:` field in
 /// DEBIAN/control.
@@ -2127,6 +2115,15 @@ fn stage_windows_payload(bin_dest: &Path, cef_dest: &Path, p: &WindowsPayload) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spotify ships minimal builds at
+    /// `<cdn>/cef_binary_<version>_<platform>_minimal.tar.bz2`. The full
+    /// filename is normally read out of `index.json`; we expose the
+    /// generator separately so unit tests can lock the URL pattern down
+    /// without hitting the network.
+    fn cef_minimal_url(cdn: &str, platform: &str, cef_version: &str) -> String {
+        format!("{cdn}/cef_binary_{cef_version}_{platform}_minimal.tar.bz2")
+    }
 
     #[test]
     fn cef_minimal_url_macosarm64() {

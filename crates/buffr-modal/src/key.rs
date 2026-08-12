@@ -255,7 +255,6 @@ fn parse_named_key(name: &str) -> Result<NamedKey, ParseError> {
         "bs" | "backspace" => NamedKey::BS,
         "tab" => NamedKey::Tab,
         "backtab" => NamedKey::BackTab,
-        "space" => NamedKey::Space,
         "up" => NamedKey::Up,
         "down" => NamedKey::Down,
         "left" => NamedKey::Left,

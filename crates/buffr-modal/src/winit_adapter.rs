@@ -126,7 +126,6 @@ fn map_named(n: WNamed) -> Option<NamedKey> {
         WNamed::Enter => NamedKey::CR,
         WNamed::Tab => NamedKey::Tab,
         WNamed::Backspace => NamedKey::BS,
-        WNamed::Space => NamedKey::Space,
         WNamed::ArrowUp => NamedKey::Up,
         WNamed::ArrowDown => NamedKey::Down,
         WNamed::ArrowLeft => NamedKey::Left,
