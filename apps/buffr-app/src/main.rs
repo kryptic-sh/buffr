@@ -3802,7 +3802,18 @@ impl AppState {
                 // Animation path: paint animation into chrome buffer at the browser
                 // rect region (opaque), then composite chrome alone (osr: None).
                 // Chrome buffer is logical-sized; use l_browser_* for the animation.
-                new_osr_generation = self.last_osr_generation;
+                //
+                // A fresh frame can be swapped in while the animation is up
+                // (dim-mismatch mid-resize). The animation does not present it,
+                // but its generation must still be recorded: the freshness gate
+                // compares against last_osr_generation, and leaving it behind
+                // would let the gate accept the same generation a second time on
+                // the next tick, swapping the leftover Vec back into
+                // osr_scratch — the exact invariant described where
+                // `last_osr_generation` is committed below.
+                new_osr_generation = osr_meta
+                    .map(|(_, _, frame_gen)| frame_gen)
+                    .unwrap_or(self.last_osr_generation);
                 renderer.frame(
                     chrome_dirty_effective,
                     chrome_top_band_h,
