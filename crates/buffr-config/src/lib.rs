@@ -695,7 +695,7 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Hint alphabet validation. Surface any of the three failure modes
     // (empty, duplicate, non-ASCII) as a [`ConfigError::Validate`] so
     // the user gets a friendly toml-aware message instead of a panic
-    // deep inside `BrowserHost::new`.
+    // deep inside host construction.
     {
         let alpha = &cfg.hint.alphabet;
         if alpha.is_empty() {

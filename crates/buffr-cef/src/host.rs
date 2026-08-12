@@ -434,50 +434,9 @@ impl buffr_engine::ClipboardRead for ClipboardReader {
 }
 
 impl BrowserHost {
-    /// Create the host with a single initial tab loading `url`.
-    ///
-    /// All platforms run OSR; CEF paints into a buffer the embedder
-    /// composites itself. No window handle is needed at construction.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        url: &str,
-        history: Arc<History>,
-        downloads: Arc<Downloads>,
-        downloads_config: Arc<DownloadsConfig>,
-        zoom: Arc<ZoomStore>,
-        permissions: Arc<Permissions>,
-        notice_queue: DownloadNoticeQueue,
-        find_sink: FindResultSink,
-        hint_sink: HintEventSink,
-        edit_sink: EditEventSink,
-        hint_alphabet: HintAlphabet,
-        initial_size: (u32, u32),
-    ) -> Result<Self, CoreError> {
-        Self::new_with_options(
-            url,
-            history,
-            downloads,
-            downloads_config,
-            zoom,
-            permissions,
-            notice_queue,
-            find_sink,
-            hint_sink,
-            edit_sink,
-            hint_alphabet,
-            initial_size,
-            false,
-            None,
-            true,
-            None,
-            None,
-        )
-    }
-
-    /// Like [`Self::new`] but lets the embedder mark every browser as
-    /// private. The flag is purely informational — the underlying CEF
-    /// profile dirs are already swapped at process start by the
-    /// `--private` CLI flag.
+    /// Lets the embedder mark every browser as private. The flag is
+    /// purely informational — the underlying CEF profile dirs are
+    /// already swapped at process start by the `--private` CLI flag.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_options(
         url: &str,
@@ -1334,7 +1293,7 @@ impl BrowserHost {
             self.loading_busy.clone(),
         ));
 
-        let mut client = handlers::make_client(
+        let mut client = handlers::BuffrClient::new(
             self.history.clone(),
             self.downloads.clone(),
             self.downloads_config.clone(),
@@ -2474,8 +2433,8 @@ impl BrowserHost {
 
     /// Call an `edit.js` entry point on the active tab's main frame.
     ///
-    /// L3: `run_edit_apply` / `run_edit_attach` / `run_edit_focus` /
-    /// `run_edit_detach` were four copies of the same
+    /// L3: `run_edit_attach` / `run_edit_focus` / `run_edit_detach`
+    /// are three copies of the same
     /// `serde_json::to_string(..).unwrap_or_else(..)` + `format!` against
     /// `"buffr://edit"`. `args` are raw JS expressions — pass them through
     /// [`js_arg`] so page-supplied field ids can't break out of the call.
@@ -2485,11 +2444,6 @@ impl BrowserHost {
             &format!("{prelude}if (window.{name}) window.{name}({joined})"),
             "buffr://edit",
         );
-    }
-
-    /// Push a new value into the focused field via `__buffrEditApply`.
-    pub fn run_edit_apply(&self, field_id: &str, value: &str) {
-        self.call_edit_fn("__buffrEditApply", &[js_arg(field_id), js_arg(value)], "");
     }
 
     /// Add the edit-active CSS class to the field via `__buffrEditAttach`.
@@ -2659,34 +2613,11 @@ impl BrowserHost {
         }
     }
 
-    /// Send Delete to the active tab's focused frame.
-    pub fn frame_del(&self) {
-        if self.with_focused_frame(|f| f.del()).is_none() {
-            warn!("frame_del: no focused frame");
-        }
-    }
-
     /// Send SelectAll to the active tab's focused frame.
     pub fn frame_select_all(&self) {
         if self.with_focused_frame(|f| f.select_all()).is_none() {
             warn!("frame_select_all: no focused frame");
         }
-    }
-
-    /// Reload the active tab ignoring cache.
-    pub fn reload_ignore_cache_active(&self) {
-        self.with_active(|t| t.browser.reload_ignore_cache());
-    }
-
-    /// Print the active tab (opens system print dialog).
-    pub fn print_active(&self) {
-        self.with_active(|t| {
-            if let Some(host) = t.browser.host() {
-                host.print();
-            } else {
-                warn!("print_active: browser.host() returned None");
-            }
-        });
     }
 
     /// Trigger a file-as-download for `url` via CEF's download manager.

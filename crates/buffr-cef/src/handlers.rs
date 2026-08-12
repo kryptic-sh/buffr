@@ -15,12 +15,11 @@
 //!   [`buffr_config::DownloadsConfig::default_dir`] and routes
 //!   progress / lifecycle ticks into [`buffr_downloads::Downloads`].
 //!
-//! All three are exposed through [`make_client`], which spins a tiny
-//! `BuffrClient` whose only job is to hand the load + display +
-//! download handlers to CEF when it asks. `BrowserHost::new` passes
-//! the resulting `Client` to `browser_host_create_browser_sync` so CEF
-//! actually invokes our callbacks (without a custom `Client`, CEF
-//! defaults to a no-op client and our handlers never fire).
+//! All three are exposed through [`BuffrClient`], which
+//! `BrowserHost::new_with_options` hands to
+//! `browser_host_create_browser_sync` so CEF actually invokes our
+//! callbacks (without a custom `Client`, CEF defaults to a no-op
+//! client and our handlers never fire).
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
@@ -152,84 +151,6 @@ fn redact_console_text(text: &str) -> std::borrow::Cow<'_, str> {
         &text[..end],
         text.len() - end
     ))
-}
-
-/// Build a CEF `Client` that returns our load + display + download
-/// handlers when CEF asks for them. This is the entry point
-/// `BrowserHost::new` uses; consumers don't construct `BuffrClient`
-/// directly.
-///
-/// `render_handler` is `Some` only in OSR mode; windowed mode passes `None`
-/// and the default no-op path is preserved.
-#[allow(clippy::too_many_arguments)]
-pub fn make_client(
-    history: Arc<History>,
-    downloads: Arc<Downloads>,
-    downloads_config: Arc<DownloadsConfig>,
-    zoom: Arc<ZoomStore>,
-    permissions: Arc<Permissions>,
-    neutral_permissions_queue: buffr_engine::PermissionsQueue,
-    cef_callback_registry: crate::permissions::CefCallbackRegistry,
-    find_sink: FindResultSink,
-    hint_sink: HintEventSink,
-    edit_sink: EditEventSink,
-    counters: Option<Arc<UsageCounters>>,
-    notice_queue: DownloadNoticeQueue,
-    render_handler: Option<RenderHandler>,
-    popup_queue: PopupQueue,
-    address_sink: crate::host::AddressSink,
-    popup_title_sink: crate::host::AddressSink,
-    popup_frames: PopupFrameMap,
-    pending_popup_alloc: PendingPopupAllocQueue,
-    popup_create_sink: PopupCreateSink,
-    popup_close_sink: PopupCloseSink,
-    popup_browsers: Arc<Mutex<HashMap<i32, cef::Browser>>>,
-    cursor_state: SharedCursorState,
-    favicon_sink: FaviconSink,
-    favicon_enabled: FaviconEnabled,
-    loading_busy: Arc<AtomicBool>,
-    audio_sink: AudioStateSink,
-    audio_queue: AudioEventQueue,
-    video_active: Arc<AtomicBool>,
-    context_menu_sink: ContextMenuSink,
-    console_nonces: ConsoleNonces,
-    main_osr_view: SharedOsrViewState,
-    internal_url_prefix: Option<String>,
-) -> Client {
-    BuffrClient::new(
-        history,
-        downloads,
-        downloads_config,
-        zoom,
-        permissions,
-        neutral_permissions_queue,
-        cef_callback_registry,
-        find_sink,
-        hint_sink,
-        edit_sink,
-        counters,
-        notice_queue,
-        render_handler,
-        popup_queue,
-        address_sink,
-        popup_title_sink,
-        popup_frames,
-        pending_popup_alloc,
-        popup_create_sink,
-        popup_close_sink,
-        popup_browsers,
-        cursor_state,
-        favicon_sink,
-        favicon_enabled,
-        loading_busy,
-        audio_sink,
-        audio_queue,
-        video_active,
-        context_menu_sink,
-        console_nonces,
-        main_osr_view,
-        internal_url_prefix,
-    )
 }
 
 // L17: `make_load_handler` / `make_display_handler` /
@@ -563,7 +484,6 @@ wrap_client! {
                 self.zoom.clone(),
                 self.counters.clone(),
                 Arc::new(Mutex::new(HashMap::new())),
-                self.edit_sink.clone(),
                 self.loading_busy.clone(),
                 self.console_nonces.clone(),
                 self.internal_url_prefix.clone(),
@@ -670,9 +590,6 @@ wrap_load_handler! {
         zoom: Arc<ZoomStore>,
         counters: Option<Arc<UsageCounters>>,
         pending_transitions: Arc<Mutex<HashMap<i32, Transition>>>,
-        // Shared with BuffrDisplayHandler: write the injected edit.js
-        // script on load; display handler reads events from the queue.
-        edit_sink: EditEventSink,
         // loading_busy: set on main-frame on_load_start, cleared on
         // the next OsrPaintHandler::on_paint. The embedder reads
         // this via `BrowserHost::is_loading` to play the buffr ASCII
@@ -832,9 +749,6 @@ wrap_load_handler! {
             let cef_url = CefString::from("buffr://edit-inject");
             frame.execute_java_script(Some(&cef_script), Some(&cef_url), 1);
             tracing::debug!(target: "buffr_core::handlers", %url, "edit: injected edit.js into main frame");
-            // `self.edit_sink` is held for Stage 2 sink ownership; the
-            // display handler writes into it when console events arrive.
-            let _ = &self.edit_sink;
 
             // Media-probe Phase 1.5: inject the patched-constructor init
             // script once per main-frame load. The script is idempotent
