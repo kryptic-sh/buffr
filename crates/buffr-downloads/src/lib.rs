@@ -111,6 +111,17 @@ pub struct Download {
     pub failure: Option<String>,
 }
 
+/// Narrow decode of the `downloads` row for the per-tick
+/// `OnDownloadUpdated` path — see [`Downloads::tick_row_by_cef_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadTickRow {
+    pub id: DownloadId,
+    pub status: DownloadStatus,
+    pub received_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub suggested_name: String,
+}
+
 /// Errors surfaced from [`Downloads`].
 #[derive(Debug, Error)]
 pub enum DownloadError {
@@ -297,18 +308,34 @@ impl Downloads {
         Ok(row)
     }
 
-    /// Look up a download by CEF id. Used by the CEF
-    /// `OnDownloadUpdated` handler to find the row matching the live
-    /// `DownloadItem`.
-    pub fn get_by_cef_id(&self, cef_id: u32) -> Result<Option<Download>, DownloadError> {
+    /// Narrow row for the per-tick `OnDownloadUpdated` path: only the
+    /// columns the tick handler reads — `id`/`status` for the terminal
+    /// gate, `received_bytes`/`total_bytes` for the unchanged-bytes skip,
+    /// `suggested_name` for the completion/failure notices. Hydrating the
+    /// full 12-column row (5 Strings + a DateTime per tick) just to read
+    /// these was the dominant cost of every in-flight tick (perf §14-6).
+    pub fn tick_row_by_cef_id(
+        &self,
+        cef_id: u32,
+    ) -> Result<Option<DownloadTickRow>, DownloadError> {
         let conn = self.conn.lock().map_err(|_| DownloadError::Poisoned)?;
         let row = conn
             .query_row(
-                "SELECT id, cef_id, url, suggested_name, mime, total_bytes, \
-                 received_bytes, status, started_at, finished_at, full_path, failure \
+                "SELECT id, status, received_bytes, total_bytes, suggested_name \
                  FROM downloads WHERE cef_id = ?1",
                 params![cef_id as i64],
-                row_to_download,
+                |row| {
+                    let status_s: String = row.get(1)?;
+                    let received: i64 = row.get(2)?;
+                    let total: Option<i64> = row.get(3)?;
+                    Ok(DownloadTickRow {
+                        id: DownloadId(row.get(0)?),
+                        status: DownloadStatus::parse(&status_s),
+                        received_bytes: received as u64,
+                        total_bytes: total.map(|n| n as u64),
+                        suggested_name: row.get(4)?,
+                    })
+                },
             )
             .optional()?;
         Ok(row)
@@ -626,13 +653,16 @@ mod tests {
     }
 
     #[test]
-    fn get_by_cef_id_returns_matching_row() {
+    fn tick_row_by_cef_id_returns_matching_row() {
         let d = Downloads::open_in_memory().unwrap();
         let id = d
             .record_started(99, "https://x.test/a", "a", None, None)
             .unwrap();
-        let row = d.get_by_cef_id(99).unwrap().expect("exists");
+        let row = d.tick_row_by_cef_id(99).unwrap().expect("exists");
         assert_eq!(row.id, id);
-        assert!(d.get_by_cef_id(123).unwrap().is_none());
+        assert_eq!(row.status, DownloadStatus::InFlight);
+        assert_eq!(row.received_bytes, 0);
+        assert_eq!(row.suggested_name, "a");
+        assert!(d.tick_row_by_cef_id(123).unwrap().is_none());
     }
 }

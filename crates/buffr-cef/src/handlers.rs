@@ -1304,7 +1304,7 @@ wrap_download_handler! {
                 return;
             };
             let cef_id = item.id();
-            let row = match self.downloads.get_by_cef_id(cef_id) {
+            let row = match self.downloads.tick_row_by_cef_id(cef_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     // No row for this cef_id (handler races?) — log
@@ -1313,7 +1313,7 @@ wrap_download_handler! {
                     return;
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, cef_id, "downloads: get_by_cef_id failed");
+                    tracing::warn!(error = %err, cef_id, "downloads: tick_row_by_cef_id failed");
                     return;
                 }
             };
@@ -1389,6 +1389,15 @@ wrap_download_handler! {
                         },
                     );
                 }
+                return;
+            }
+
+            // Skip the write when nothing changed since the last tick —
+            // CEF re-emits OnDownloadUpdated periodically for the whole
+            // life of the download, and the common tick reports the same
+            // byte counts (perf §14-6: one autocommit WAL write per tick
+            // even when the row is unchanged).
+            if received_u == row.received_bytes && total_u == row.total_bytes {
                 return;
             }
 
