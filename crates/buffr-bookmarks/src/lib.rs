@@ -398,35 +398,41 @@ impl Bookmarks {
         // effect: a tag with an unclosed quote no longer matches at
         // all, so that entry is skipped rather than corrupted —
         // acceptable degradation for malformed input.
-        let h3_re = Regex::new(r#"(?is)<H3((?:[^>"]|"[^"]*")*)>(.*?)</H3>"#).expect("h3 regex");
-        let a_re = Regex::new(r#"(?is)<A\s+((?:[^>"]|"[^"]*")*)>(.*?)</A>"#).expect("a regex");
-        let dl_close_re = Regex::new(r"(?i)</DL>").expect("dl regex");
         let attr_re = Regex::new(r#"(?i)(\w+)\s*=\s*"([^"]*)""#).expect("attr regex");
+        // One regex, not three independent passes: the anchor alternative
+        // comes first, so a whole `<A ...>...</A>` is consumed as a single
+        // token and any `<H3>` / `</DL>` markup inside its label is never
+        // seen as a folder token. The old three-regex tokenizer matched
+        // `<H3>x</H3>` inside an anchor label, pushed "x" as a folder that
+        // no `</DL>` ever popped, tagged every later anchor with it, and
+        // popped the real folders one level early.
+        let tok_re = Regex::new(
+            r#"(?is)(?P<anchor><A\s+(?P<anchor_attrs>(?:[^>"]|"[^"]*")*)>(?P<anchor_label>.*?)</A>)|(?P<h3><H3(?P<h3_attrs>(?:[^>"]|"[^"]*")*)>(?P<h3_label>.*?)</H3>)|(?P<dl></DL>)"#,
+        )
+        .expect("netscape token regex");
 
-        // Collect every match with its byte position so we can sort
-        // them into one ordered token stream.
+        // Collect every match into one ordered token stream. A single
+        // regex pass yields document order, so no re-sort is needed.
         enum Tok<'a> {
             FolderOpen(&'a str),
             FolderClose,
             Anchor { attrs: &'a str, label: &'a str },
         }
-        let mut toks: Vec<(usize, Tok<'_>)> = Vec::new();
-        for m in h3_re.captures_iter(html) {
-            let pos = m.get(0).map(|m| m.start()).unwrap_or(0);
-            // Group 2: group 1 is now the open-tag attrs body.
-            let label = m.get(2).map(|m| m.as_str()).unwrap_or("");
-            toks.push((pos, Tok::FolderOpen(label)));
+        let mut toks: Vec<Tok<'_>> = Vec::new();
+        for m in tok_re.captures_iter(html) {
+            if m.name("anchor").is_some() {
+                toks.push(Tok::Anchor {
+                    attrs: m.name("anchor_attrs").map(|m| m.as_str()).unwrap_or(""),
+                    label: m.name("anchor_label").map(|m| m.as_str()).unwrap_or(""),
+                });
+            } else if m.name("h3").is_some() {
+                toks.push(Tok::FolderOpen(
+                    m.name("h3_label").map(|m| m.as_str()).unwrap_or(""),
+                ));
+            } else {
+                toks.push(Tok::FolderClose);
+            }
         }
-        for m in dl_close_re.find_iter(html) {
-            toks.push((m.start(), Tok::FolderClose));
-        }
-        for m in a_re.captures_iter(html) {
-            let pos = m.get(0).map(|m| m.start()).unwrap_or(0);
-            let attrs = m.get(1).map(|m| m.as_str()).unwrap_or("");
-            let label = m.get(2).map(|m| m.as_str()).unwrap_or("");
-            toks.push((pos, Tok::Anchor { attrs, label }));
-        }
-        toks.sort_by_key(|(pos, _)| *pos);
 
         // Walk: folder stack mirrors `<DL>` nesting via `<H3>` opens
         // and `</DL>` closes. The Netscape format places one `<H3>`
@@ -437,7 +443,7 @@ impl Bookmarks {
         let mut count = 0usize;
         let mut conn = self.conn.lock().map_err(|_| BookmarkError::Poisoned)?;
         let tx = conn.transaction()?;
-        for (_, tok) in toks {
+        for tok in toks {
             match tok {
                 Tok::FolderOpen(label) => {
                     let cleaned = strip_html(label).trim().to_string();
@@ -1006,6 +1012,30 @@ mod tests {
         let imported = b.import_netscape(html).unwrap();
         assert_eq!(imported, 1);
         assert_eq!(b.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn import_netscape_ignores_markup_inside_anchor_labels() {
+        // A hostile/malformed file can put `<H3>` inside an anchor label.
+        // The old three-regex tokenizer treated it as a folder open: "x"
+        // was pushed onto the folder stack with no `</DL>` to pop it,
+        // every later anchor inherited tag "x", and the file's real
+        // `</DL>`s popped one level too early. The anchor must be
+        // consumed as one token so inner markup never becomes a folder.
+        let b = Bookmarks::open_in_memory().unwrap();
+        let html = r#"<DL>
+            <DT><A HREF="https://ok.example/">lbl <H3>x</H3></A>
+            <DT><A HREF="https://next.example/">Next</A>
+            <DT><A HREF="https://third.example/">Third</A>
+        </DL>"#;
+        let imported = b.import_netscape(html).unwrap();
+        assert_eq!(imported, 3);
+        // No spurious "x" folder tag anywhere.
+        assert!(b.by_tag("x").unwrap().is_empty());
+        // Later anchors carry no inherited tag.
+        let next = b.search("next.example").unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].tags.is_empty());
     }
 
     // ----- M40: search / by_tag pushed into SQL -----
