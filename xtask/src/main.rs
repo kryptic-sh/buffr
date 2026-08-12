@@ -370,6 +370,19 @@ fn workspace_root() -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
+/// Cap on the downloaded CEF archive. The real minimal builds are a few
+/// hundred MiB; anything beyond 1 GiB is a hostile or broken CDN response,
+/// not a legitimate archive. Bound the disk use of `fetch-cef` (audit
+/// §12-12: the download path was previously unbounded).
+const MAX_CEF_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Cap on the total uncompressed size of an extracted CEF tree. The real
+/// trees are ~1.7 GB per platform; the bzip2 stream was previously
+/// unbounded, so a decompression bomb could exhaust the dev box's disk.
+/// Stays below the 8 GiB−1 ceiling of the tar octal size field so the
+/// guard can actually fire on a hostile header.
+const MAX_CEF_EXTRACTED_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
+
 fn download(url: &str, dest: &Path) -> Result<()> {
     eprintln!("xtask: downloading {url}");
     let resp = ureq::get(url)
@@ -386,6 +399,15 @@ fn download(url: &str, dest: &Path) -> Result<()> {
         }
         file.write_all(&buf[..n])?;
         total += n as u64;
+        if total > MAX_CEF_ARCHIVE_BYTES {
+            // Drop the partial file so a half-downloaded archive can't be
+            // picked up by a later step as if it were complete.
+            let _ = fs::remove_file(dest);
+            bail!(
+                "download of {url} exceeded the {:.1} GiB cap — refusing to continue",
+                MAX_CEF_ARCHIVE_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
         if total.is_multiple_of(8 * 1024 * 1024) {
             eprintln!("       {} MiB", total / (1024 * 1024));
         }
@@ -518,9 +540,21 @@ fn extract_tar_bz2(archive: &Path, dest: &Path) -> Result<()> {
     let file = File::open(archive)?;
     let bz2 = bzip2::read::BzDecoder::new(file);
     let mut tar = tar::Archive::new(bz2);
+    // Total uncompressed bytes across all entries. A hostile archive can
+    // claim an enormous size in an entry header; bail before writing
+    // anything so a decompression bomb can't fill the disk (audit §12-12).
+    let mut total_bytes: u64 = 0;
     for entry in tar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        total_bytes = total_bytes.saturating_add(entry.header().size()?);
+        if total_bytes > MAX_CEF_EXTRACTED_BYTES {
+            bail!(
+                "refusing to extract {}: uncompressed contents exceed the {:.1} GiB cap — refusing a decompression bomb",
+                archive.display(),
+                MAX_CEF_EXTRACTED_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
         if !tar_path_is_safe(&path) {
             bail!(
                 "refusing to extract `{}` from {}: entry path escapes the destination",
@@ -2123,6 +2157,44 @@ mod tests {
     /// without hitting the network.
     fn cef_minimal_url(cdn: &str, platform: &str, cef_version: &str) -> String {
         format!("{cdn}/cef_binary_{cef_version}_{platform}_minimal.tar.bz2")
+    }
+
+    #[test]
+    fn extract_rejects_oversized_archive() {
+        use std::io::Write as _;
+        // A hostile tar header claiming 7 GiB of content (no actual data).
+        // Extraction must bail on the header before writing anything.
+        let mut header = [0u8; 512];
+        header[..5].copy_from_slice(b"huge!");
+        header[100..108].copy_from_slice(b"0000644\0");
+        let seven_gib = 7u64 * 1024 * 1024 * 1024;
+        header[124..136].copy_from_slice(format!("{seven_gib:011o}\0").as_bytes());
+        header[156] = b'0';
+        // ustar checksum: sum of all bytes with the checksum field
+        // treated as spaces, stored as 6 octal digits, NUL, space.
+        header[148..156].fill(b' ');
+        let sum: u32 = header.iter().map(|&b| b as u32).sum();
+        header[148..154].copy_from_slice(format!("{sum:06o}").as_bytes());
+        let mut compressed = Vec::new();
+        {
+            let mut enc =
+                bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
+            enc.write_all(&header).unwrap();
+            enc.finish().unwrap();
+        }
+        let dir =
+            std::env::temp_dir().join(format!("xtask-extract-bomb-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("bomb.tar.bz2");
+        fs::write(&archive_path, &compressed).unwrap();
+        let dest = dir.join("out");
+        let err = extract_tar_bz2(&archive_path, &dest).unwrap_err();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("cap"),
+            "expected a size-cap error, got: {err}"
+        );
     }
 
     #[test]
