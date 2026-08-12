@@ -53,10 +53,6 @@ pub struct KeyChord {
 }
 
 impl KeyChord {
-    pub const fn new(modifiers: Modifiers, key: Key) -> Self {
-        Self { modifiers, key }
-    }
-
     pub const fn plain(key: Key) -> Self {
         Self {
             modifiers: Modifiers::empty(),

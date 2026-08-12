@@ -13,7 +13,7 @@
 //!
 //! # Layout
 //!
-//! - [`actions`] — [`PageAction`] / [`PageMode`] / [`Mode`]
+//! - [`actions`] — [`PageAction`] / [`PageMode`]
 //! - [`key`] — vim-notation parser → [`KeyChord`] / [`Modifiers`]
 //! - [`keymap`] — mode-scoped trie + ambiguity resolution
 //! - [`edit_mode`] — [`EditSession`] wrapping `hjkl_engine::Editor`
@@ -50,7 +50,7 @@ pub mod wayr_adapter;
 #[cfg(feature = "bridge")]
 pub mod bridge_adapter;
 
-pub use actions::{Mode, PageAction, PageMode};
+pub use actions::{PageAction, PageMode};
 pub use edit_mode::EditSession;
 pub use engine::{DEFAULT_TIMEOUT, EditModeStep, Engine, Step};
 pub use host::{BuffrEditIntent, BuffrHost};

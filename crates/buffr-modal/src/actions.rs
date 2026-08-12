@@ -12,23 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Coarse mode displayed in the status line. `Insert` is a single state
-/// here even though `hjkl_engine` may be in Normal/Insert/Visual
-/// internally — the page-mode FSM doesn't care which sub-mode the
-/// embedded editor is in, only that page-level keystrokes route to
-/// `BuffrHost` instead of the page action dispatcher.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Mode {
-    #[default]
-    Normal,
-    Visual,
-    Command,
-    Hint,
-    Insert,
-}
-
-/// Page-mode FSM states. Distinct from [`Mode`] (the status-line
-/// summary) — `PageMode` is what the keymap trie dispatches against.
+/// Page-mode FSM states. Distinct from the status-line mode summary —
+/// `PageMode` is what the keymap trie dispatches against.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PageMode {

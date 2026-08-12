@@ -246,22 +246,12 @@ impl ContextMenuOverlay {
         x >= px && x < px + pw && y >= py && y < py + ph
     }
 
-    /// Resolve pixel `(x, y)` to a row index, or `None` if the hit lands
-    /// on a separator, on the border, or outside the panel.
-    ///
-    /// **Disabled rows are returned by index**, not filtered out — callers
-    /// still want to highlight them on hover for visual continuity. Gate
-    /// activation on the entry's `enabled` flag at the call site.
-    pub fn row_at(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> Option<usize> {
-        Self::hit_test(&self.entries, self.x, self.y, buf_w, buf_h, x, y)
-    }
-
     /// Resolve pixel `(x, y)` to a row index for a menu built from a
     /// pre-existing `entries` list at requested origin `(x0, y0)`, or
     /// `None` if the hit lands on a separator, on the border, or outside
-    /// the panel. Same geometry as [`Self::row_at`] but takes the entries
-    /// by reference — lets a caller hit-test a cached entry list on every
-    /// mouse move without re-cloning the labels.
+    /// the panel. Takes the entries by reference — lets a caller
+    /// hit-test a cached entry list on every mouse move without
+    /// re-cloning the labels.
     ///
     /// **Disabled rows are returned by index**, not filtered out — callers
     /// still want to highlight them on hover for visual continuity. Gate
@@ -426,6 +416,31 @@ mod tests {
     }
 
     #[test]
+    fn hit_test_returns_disabled_rows_for_hover_continuity() {
+        // Disabled rows still resolve by index so callers can highlight
+        // them on hover; activation gating happens at the call site.
+        // Only separators / outside hits return None.
+        let entries = vec![
+            ContextMenuEntry {
+                label: "Back".into(),
+                is_separator: false,
+                enabled: false, // disabled
+            },
+            ContextMenuEntry {
+                label: "Reload".into(),
+                is_separator: false,
+                enabled: true,
+            },
+        ];
+        let (px, py, _, _) = ContextMenuOverlay::panel_rect_for(&entries, 10, 10, 800, 600);
+        let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
+        assert_eq!(
+            ContextMenuOverlay::hit_test(&entries, 10, 10, 800, 600, px + 10, row0_y),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn contains_inside_and_outside() {
         let m = simple_menu(50, 60);
         let (x, y, w, h) = m.panel_rect(800, 600);
@@ -434,53 +449,5 @@ mod tests {
         assert!(!m.contains(800, 600, x - 1, y));
         assert!(!m.contains(800, 600, x, y - 1));
         assert!(!m.contains(800, 600, x + w, y));
-    }
-
-    #[test]
-    fn row_at_resolves_selectable_rows() {
-        let m = simple_menu(50, 60);
-        let (px, py, _, _) = m.panel_rect(800, 600);
-        // First row centre.
-        let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
-        assert_eq!(m.row_at(800, 600, px + 10, row0_y), Some(0));
-        // Separator row centre — non-selectable.
-        let sep_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 + CONTEXT_MENU_SEP_HEIGHT as i32 / 2;
-        assert_eq!(m.row_at(800, 600, px + 10, sep_y), None);
-        // Third (Reload) row centre.
-        let row2_y = py
-            + 1
-            + CONTEXT_MENU_ROW_HEIGHT as i32
-            + CONTEXT_MENU_SEP_HEIGHT as i32
-            + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
-        assert_eq!(m.row_at(800, 600, px + 10, row2_y), Some(2));
-        // Outside panel.
-        assert_eq!(m.row_at(800, 600, 0, 0), None);
-    }
-
-    #[test]
-    fn row_at_returns_disabled_rows_for_hover_continuity() {
-        // Disabled rows should still resolve via row_at so callers can
-        // highlight them on hover; activation gating happens at the call
-        // site. Only separators / outside hits return None.
-        let m = ContextMenuOverlay {
-            entries: vec![
-                ContextMenuEntry {
-                    label: "Back".into(),
-                    is_separator: false,
-                    enabled: false, // disabled
-                },
-                ContextMenuEntry {
-                    label: "Reload".into(),
-                    is_separator: false,
-                    enabled: true,
-                },
-            ],
-            selected: 1,
-            x: 10,
-            y: 10,
-        };
-        let (px, py, _, _) = m.panel_rect(800, 600);
-        let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
-        assert_eq!(m.row_at(800, 600, px + 10, row0_y), Some(0));
     }
 }

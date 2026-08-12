@@ -143,20 +143,10 @@ impl Engine {
         &self.pending
     }
 
-    /// Currently buffered count (0 = none).
-    pub fn count(&self) -> u32 {
-        self.count
-    }
-
     /// Pending count buffer surfaced for the statusline. `None` when
     /// no count has accumulated yet (the next count-bearing action
     /// will get an implicit `1`); `Some(n)` once the user has typed
     /// at least one digit.
-    ///
-    /// This is the chrome-friendly companion to [`Engine::count`] —
-    /// `count` returns the raw `u32` (0 for "none") which conflates
-    /// the absence of a count with the unrepresentable count of zero.
-    /// `count_buffer` does the obvious thing.
     pub fn count_buffer(&self) -> Option<u32> {
         if self.count == 0 {
             None
@@ -643,7 +633,6 @@ mod tests {
         let r = e.feed(parse_key("r").unwrap(), t(0));
         // Reload has no count slot — count is silently dropped.
         assert_eq!(r, Step::Resolved(PageAction::Reload));
-        assert_eq!(e.count(), 0);
     }
 
     #[test]

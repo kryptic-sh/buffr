@@ -16,11 +16,6 @@ use super::geometry::Size;
 pub struct SurfaceId(NonZeroU64);
 
 impl SurfaceId {
-    /// Extract the raw `u64`.
-    pub fn as_u64(self) -> u64 {
-        self.0.get()
-    }
-
     /// Internal constructor — used by the event-loop dispatch path
     /// when allocating ids for newly-created winit windows.
     pub(super) fn from_nonzero(n: NonZeroU64) -> Self {

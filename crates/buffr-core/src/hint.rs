@@ -120,14 +120,13 @@ impl HintAlphabet {
     }
 
     /// Number of distinct characters.
+    /// Never 0 — `from_str` rejects alphabets shorter than two chars —
+    /// so there is deliberately no `is_empty` (clippy's
+    /// `len_without_is_empty` fires; the invariant is enforced at
+    /// construction).
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.0.len()
-    }
-
-    /// Whether the alphabet is empty (it never is — `from_str` rejects
-    /// short input — but `Vec`-style is_empty mirrors std for symmetry).
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     /// Borrow the alphabet as a slice of characters.

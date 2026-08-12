@@ -303,14 +303,6 @@ impl InputBar {
         INPUT_HEIGHT + rows * SUGGESTION_ROW_HEIGHT
     }
 
-    /// Paint the input bar into the *top* `INPUT_HEIGHT` rows of
-    /// `buffer`, then any visible suggestion rows below that. Rows
-    /// below `total_height()` are left untouched — the caller has
-    /// either reserved that space or has nothing else to draw there.
-    pub fn paint(&self, buffer: &mut [u32], width: usize, height: usize) {
-        self.paint_at(buffer, width, height, 0, 0, width, height);
-    }
-
     /// Paint into a sub-rectangle of the surface buffer. `x`, `y`, `w`, `h`
     /// are pixel positions in the full surface (stride = `buf_w`). The bar
     /// draws at the top of the rect; suggestions extend downward within it.
@@ -658,7 +650,7 @@ mod tests {
         b.cursor = 5;
         b.set_suggestions(vec![s("first"), s("second")]);
         b.handle_down();
-        b.paint(&mut buf, w, h);
+        b.paint_at(&mut buf, w, h, 0, 0, w, h);
         // Input row painted with bar bg.
         assert_eq!(buf[0], b.palette.bg);
     }

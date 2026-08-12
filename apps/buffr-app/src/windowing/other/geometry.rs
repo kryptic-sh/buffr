@@ -12,9 +12,6 @@ pub struct Position {
 }
 
 impl Position {
-    /// Origin (0, 0).
-    pub const ZERO: Self = Self { x: 0, y: 0 };
-
     /// Construct a new `Position`.
     pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }

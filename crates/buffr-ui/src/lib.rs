@@ -24,18 +24,16 @@ pub mod tab_strip;
 
 pub use confirm_prompt::{CONFIRM_PROMPT_HEIGHT, ConfirmPrompt, ConfirmRect, rect_contains};
 pub use context_menu::{
-    CONTEXT_MENU_MIN_WIDTH, CONTEXT_MENU_PADDING_X, CONTEXT_MENU_ROW_HEIGHT,
-    CONTEXT_MENU_SEP_HEIGHT, ContextMenuEntry, ContextMenuOverlay,
+    CONTEXT_MENU_PADDING_X, CONTEXT_MENU_ROW_HEIGHT, CONTEXT_MENU_SEP_HEIGHT, ContextMenuEntry,
+    ContextMenuOverlay,
 };
 pub use download_notice::{DOWNLOAD_NOTICE_HEIGHT, DownloadNoticeKind, DownloadNoticeStrip};
 pub use input_bar::{
-    INPUT_HEIGHT, InputBar, MAX_SUGGESTIONS, Palette as InputPalette, SUGGESTION_ROW_HEIGHT,
-    Suggestion, SuggestionKind,
+    INPUT_HEIGHT, InputBar, MAX_SUGGESTIONS, Palette as InputPalette, Suggestion, SuggestionKind,
 };
-pub use permissions_prompt::{ACTION_HINT, PERMISSIONS_PROMPT_HEIGHT, PermissionsPrompt};
+pub use permissions_prompt::PermissionsPrompt;
 pub use tab_strip::{
-    FAVICON_RENDER_SIZE, MAX_TAB_WIDTH, MIN_TAB_WIDTH, TAB_STRIP_HEIGHT, TabFavicon, TabStrip,
-    TabView,
+    MAX_TAB_WIDTH, MIN_TAB_WIDTH, TAB_STRIP_HEIGHT, TabFavicon, TabStrip, TabView,
 };
 
 /// Statusline strip height in pixels. 30 px fits a 14-px glyph row
@@ -43,9 +41,6 @@ pub use tab_strip::{
 /// in `docs/site/ui-stack.md`. Bumping this requires the host window to
 /// re-layout the CEF child rect.
 pub const STATUSLINE_HEIGHT: u32 = 30;
-
-/// Public re-export so embedders can pull `Mode` from one place.
-pub use buffr_modal::Mode;
 
 /// Coarse certificate state for the URL display. Phase 3 wires only
 /// `Unknown`; CEF cert plumbing lands later.

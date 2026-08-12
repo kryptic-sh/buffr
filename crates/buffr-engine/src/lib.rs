@@ -79,8 +79,3 @@ pub use popup::{
 pub use profile::ProfilePaths;
 pub use tab::{TabId, TabSummary};
 pub use types::{AudioEvent, ContextMenuRequest, WaylandNativeHandles};
-
-/// Re-export of the raw-window-handle crate so backends + apps share the
-/// same RawWindowHandle / RawDisplayHandle types without independent
-/// version-pinning.
-pub use raw_window_handle;

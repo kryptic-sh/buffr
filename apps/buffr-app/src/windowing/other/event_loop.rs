@@ -140,10 +140,6 @@ pub struct EventLoop<T: 'static> {
     /// `set_control_flow(Wait | WaitUntil)` from inside the dispatch
     /// callback. Single-shot — matches wayr.
     wait_until: Option<Instant>,
-    /// Stash any `Window`s created via the builder during a
-    /// callback. The callback returns the `Window` to the caller
-    /// once the borrow ends.
-    _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: 'static> EventLoop<T> {
@@ -163,7 +159,6 @@ impl<T: 'static> EventLoop<T> {
             last_cursor_pos_per_window: HashMap::new(),
             exit_requested: false,
             wait_until: None,
-            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -213,7 +208,6 @@ impl<T: 'static> EventLoop<T> {
             out.push(OutputInfo {
                 id: OutputId(idx as u64 + 1),
                 name: monitor.name(),
-                description: None,
                 scale: scale.max(1),
                 physical_size: Size::new(size.width, size.height),
                 position: (pos.x, pos.y),

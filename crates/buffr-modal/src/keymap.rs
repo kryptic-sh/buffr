@@ -95,12 +95,6 @@ impl Keymap {
         Self::default()
     }
 
-    /// Configured leader char. `None` means `<leader>` references
-    /// fail to bind.
-    pub fn leader(&self) -> Option<char> {
-        self.leader
-    }
-
     pub fn set_leader(&mut self, leader: char) {
         self.leader = Some(leader);
     }
