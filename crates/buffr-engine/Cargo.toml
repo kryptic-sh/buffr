@@ -15,10 +15,6 @@ ignored = []
 
 [dependencies]
 getrandom = "0.4"
-# raw-window-handle 0.6 lets backends accept a host wl_surface for native
-# subsurface compositing (Phase 3 of the WPE WebKit umbrella, #109). Type-
-# only crate; no transitive runtime weight.
-raw-window-handle = "0.6"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

@@ -550,7 +550,6 @@ dependencies = [
  "buffr-modal",
  "buffr-permissions",
  "getrandom 0.4.3",
- "raw-window-handle",
  "serde",
  "thiserror 2.0.20",
  "tracing",
