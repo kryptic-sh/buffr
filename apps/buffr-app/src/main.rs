@@ -2582,14 +2582,14 @@ impl AppState {
                 if trimmed.is_empty() {
                     return;
                 }
+                let (kind, resolved) = buffr_config::search::resolve(trimmed, &self.search_config);
                 if !matches!(
-                    buffr_config::search::classify_input(trimmed),
+                    kind,
                     buffr_config::search::InputKind::Url | buffr_config::search::InputKind::Host
                 ) {
                     debug!(text = trimmed, "paste_url: clipboard isn't a URL — no-op");
                     return;
                 }
-                let resolved = buffr_config::search::resolve_input(trimmed, &self.search_config);
                 if let Err(err) = host.open_tab_at(&resolved, insert_idx) {
                     warn!(error = %err, url = %resolved, "paste_url: open_tab_at failed");
                 }
@@ -5392,10 +5392,11 @@ impl AppState {
             // would fall through to the search-engine template.
             // Selecting a history/bookmark suggestion does NOT count
             // as a search — those are direct navigations.
-            if buffr_config::classify_input(&raw) == buffr_config::InputKind::Search {
+            let (kind, resolved) = buffr_config::resolve(&raw, &self.search_config);
+            if kind == buffr_config::InputKind::Search {
                 self.counters.increment(buffr_core::KEY_SEARCHES_RUN);
             }
-            buffr_config::resolve_input(&raw, &self.search_config)
+            resolved
         };
         if target.is_empty() {
             return;

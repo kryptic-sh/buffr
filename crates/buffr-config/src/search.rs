@@ -40,33 +40,47 @@ pub enum InputKind {
     Search,
 }
 
-/// Classify which branch `resolve_input` would take for this input,
-/// without reproducing the resolved string. Implemented by delegating
-/// to [`resolve_input`] with a default search config, so the two can
-/// never drift.
-pub fn classify_input(input: &str) -> InputKind {
+/// Resolve `input` and classify the branch it took, in one pass.
+///
+/// Callers that need both the navigable URL and the kind (omnibar
+/// submit, paste-url) used to call [`classify_input`] and then
+/// [`resolve_input`], resolving the input twice — two `url::Url`
+/// parses and two string builds per submit — and mixing the default
+/// search config (which `classify_input` resolves with) into the
+/// classification. This derives the kind from a single resolution, so
+/// the two can never disagree.
+pub fn resolve(input: &str, search: &Search) -> (InputKind, String) {
     let trimmed = input.trim();
-    let resolved = resolve_input(input, &Search::default());
-    if resolved.is_empty() {
-        return InputKind::Empty;
+    let resolved = resolve_input(input, search);
+    let kind = if resolved.is_empty() {
+        InputKind::Empty
     }
     // Branch 2 of `resolve_input` prepends `http://` or `https://` to
     // the raw input, so a resolved string of exactly `{prefix}://{trimmed}`
     // means the scheme came from the resolver, not from the input.
-    if let Some(prefix) = resolved.strip_suffix(trimmed)
+    else if let Some(prefix) = resolved.strip_suffix(trimmed)
         && matches!(prefix, "http://" | "https://")
     {
-        return InputKind::Host;
+        InputKind::Host
     }
     // Branch 1 of `resolve_input` requires the input to parse with a
     // real scheme; everything else it returns is a search-engine URL
     // (default-engine template or prefix shortcut).
-    if let Ok(parsed) = url::Url::parse(trimmed)
+    else if let Ok(parsed) = url::Url::parse(trimmed)
         && is_real_scheme(parsed.scheme())
     {
-        return InputKind::Url;
-    }
-    InputKind::Search
+        InputKind::Url
+    } else {
+        InputKind::Search
+    };
+    (kind, resolved)
+}
+
+/// Classify which branch `resolve_input` would take for this input,
+/// without reproducing the resolved string. Delegates to [`resolve`]
+/// with a default search config, so the two can never drift.
+pub fn classify_input(input: &str) -> InputKind {
+    resolve(input, &Search::default()).0
 }
 
 /// Resolve a raw input string to a navigable URL.
@@ -492,6 +506,25 @@ mod tests {
         assert_eq!(classify_input("localhost:3000"), InputKind::Host);
         assert_eq!(classify_input("foobar"), InputKind::Search);
         assert_eq!(classify_input("foo bar"), InputKind::Search);
+    }
+
+    #[test]
+    fn resolve_returns_kind_and_url_together() {
+        let s = search();
+        for input in [
+            "",
+            "example.com",
+            "localhost:3000",
+            "https://example.com",
+            "foobar",
+            "g rust",
+        ] {
+            assert_eq!(
+                resolve(input, &s),
+                (classify_input(input), resolve_input(input, &s)),
+                "resolve({input:?}) must agree with classify+resolve"
+            );
+        }
     }
 
     #[test]

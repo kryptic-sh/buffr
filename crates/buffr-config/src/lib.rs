@@ -37,7 +37,7 @@ mod watcher;
 
 pub use keybinding::{KeyBinding, KeyBindingError, parse_action};
 pub use loader::{ConfigSource, default_config_path, load, load_from_path};
-pub use search::{InputKind, classify_input, resolve_input};
+pub use search::{InputKind, classify_input, resolve, resolve_input};
 pub use watcher::{ConfigWatcher, watch};
 
 /// Top-level config.
