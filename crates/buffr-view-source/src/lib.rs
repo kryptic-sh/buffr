@@ -13,7 +13,9 @@
 //! assert!(html.starts_with("<!DOCTYPE html>"));
 //! ```
 
-use std::{path::Path, sync::Arc};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hjkl_bonsai::{
     highlighter::Highlighter,
@@ -23,6 +25,36 @@ use tracing::warn;
 
 /// Maximum source size (10 MiB) before falling back to a size-cap notice.
 const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Registry + loader pair, built once per process. Rebuilding either on
+/// every view-source request re-parsed the embedded `bonsai.toml`
+/// manifest and re-resolved the XDG data/cache dirs each time (perf
+/// §19-1); the `&str` returned by `name_for_path` borrows from the
+/// registry, so once this lives in a `OnceLock` the language names are
+/// `'static` and can key the grammar cache below.
+struct GrammarEnv {
+    registry: GrammarRegistry,
+    loader: GrammarLoader,
+}
+
+static GRAMMAR_ENV: OnceLock<Option<GrammarEnv>> = OnceLock::new();
+
+/// Loaded grammars by canonical language name. The `dlopen` + query
+/// parse happens once per language per process; later requests for the
+/// same language hit the map (hjkl-bonsai additionally caches the
+/// compiled query artifacts process-globally, keyed by content hash).
+/// `None` is cached when the environment itself cannot be built.
+static GRAMMARS: OnceLock<Mutex<HashMap<&'static str, Arc<Grammar>>>> = OnceLock::new();
+
+fn grammar_env() -> Option<&'static GrammarEnv> {
+    GRAMMAR_ENV
+        .get_or_init(|| {
+            let registry = GrammarRegistry::embedded().ok()?;
+            let loader = GrammarLoader::user_default(registry.meta()).ok()?;
+            Some(GrammarEnv { registry, loader })
+        })
+        .as_ref()
+}
 
 /// Renders a syntax-highlighted HTML page for `view-source:<url>`.
 ///
@@ -72,45 +104,44 @@ pub fn render(url: &str, source: &[u8]) -> String {
 /// Returns `Some(html_fragment)` on success, `None` when no grammar matches or
 /// any step fails (caller falls back to plain `<pre>`).
 fn try_highlight(url: &str, text: &str) -> Option<String> {
-    let registry = match GrammarRegistry::embedded() {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("buffr-view-source: failed to load grammar registry: {e:#}");
-            return None;
-        }
-    };
+    let env = grammar_env()?;
 
     // `name_for_path` and `detect_for_path` take &Path; we pass the URL string
     // as a path — tree-sitter extension detection only looks at the extension
     // component, so this works for ordinary file extensions in URLs.
     let url_path = Path::new(url);
 
-    let lang_name = registry.name_for_path(url_path)?;
-    let meta = registry.meta();
-
-    let loader = match GrammarLoader::user_default(meta) {
-        Ok(l) => l,
-        Err(e) => {
-            warn!("buffr-view-source: failed to build grammar loader: {e:#}");
-            return None;
-        }
-    };
+    let lang_name = env.registry.name_for_path(url_path)?;
 
     // A6: never clone/compile a grammar over the network from the render
     // path — hjkl-bonsai's Grammar::load does exactly that on a cache miss
     // (git clone + system C/C++ compiler + dlopen, in-process). Resolve only
     // installed artifacts and fall back to plain <pre> when none exists.
-    let Some(so) = loader.lookup_only(lang_name) else {
+    let Some(so) = env.loader.lookup_only(lang_name) else {
         tracing::debug!(
             "buffr-view-source: no installed grammar artifact for '{lang_name}'; skipping highlight"
         );
         return None;
     };
-    let grammar = match Grammar::load_from_path(lang_name, &so) {
-        Ok(g) => Arc::new(g),
-        Err(e) => {
-            warn!("buffr-view-source: failed to load grammar '{lang_name}': {e:#}");
-            return None;
+
+    // Grammar cache (perf §19-1): the dlopen + query parse runs once per
+    // language per process. `lang_name` is `'static` (borrowed from the
+    // static registry), so it keys the map directly.
+    let grammar = {
+        let cache = GRAMMARS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache.lock().ok()?;
+        if let Some(g) = cache.get(lang_name) {
+            Arc::clone(g)
+        } else {
+            let g = match Grammar::load_from_path(lang_name, &so) {
+                Ok(g) => Arc::new(g),
+                Err(e) => {
+                    warn!("buffr-view-source: failed to load grammar '{lang_name}': {e:#}");
+                    return None;
+                }
+            };
+            cache.insert(lang_name, Arc::clone(&g));
+            g
         }
     };
 
@@ -165,12 +196,23 @@ fn render_spans<'a>(
         };
 
         // Emit any plain text before this span.
-        html.push_str(&html_escape(plain));
+        push_escaped(&mut html, plain);
 
-        // Emit this highlighted span.
-        let class = capture_to_class(capture);
-        let escaped = html_escape(content);
-        html.push_str(&format!("<span class=\"{class}\">{escaped}</span>"));
+        // Emit this highlighted span. The palette styles a bounded set of
+        // capture names (the CSS block enumerates exactly these classes);
+        // anything outside it falls back to the generic dotted form so an
+        // unstyled capture still gets a span.
+        html.push_str("<span class=\"");
+        match capture_to_class(capture) {
+            Some(class) => html.push_str(class),
+            None => {
+                let class = format!("hl-{}", capture.replace('.', "-"));
+                html.push_str(&class);
+            }
+        }
+        html.push_str("\">");
+        push_escaped(&mut html, content);
+        html.push_str("</span>");
 
         cursor = range.end;
     }
@@ -178,7 +220,7 @@ fn render_spans<'a>(
     // Emit any trailing plain text. `cursor` is always a char boundary
     // (it only ever advances to the end of a successfully sliced range).
     if let Some(tail) = text.get(cursor..) {
-        html.push_str(&html_escape(tail));
+        push_escaped(&mut html, tail);
     }
 
     html.push_str("</code></pre>");
@@ -186,10 +228,58 @@ fn render_spans<'a>(
     html
 }
 
-/// Converts a capture name like `function.macro` to a CSS class `hl-function-macro`.
-fn capture_to_class(capture: &str) -> String {
-    let normalized = capture.replace('.', "-");
-    format!("hl-{normalized}")
+/// Maps a capture name like `function.macro` to its CSS class
+/// `hl-function-macro`. Returns `None` for names outside the palette's
+/// bounded set — the caller falls back to the generic dotted form. The
+/// `&'static str` result means the common path (grammars emit exactly
+/// these names) allocates nothing per span, whereas the old
+/// `replace` + `format!` allocated twice per span (perf §19-2).
+fn capture_to_class(capture: &str) -> Option<&'static str> {
+    Some(match capture {
+        "keyword" => "hl-keyword",
+        "keyword.control" => "hl-keyword-control",
+        "keyword.operator" => "hl-keyword-operator",
+        "function" => "hl-function",
+        "function.macro" => "hl-function-macro",
+        "function.method" => "hl-function-method",
+        "string" => "hl-string",
+        "string.special" => "hl-string-special",
+        "comment" => "hl-comment",
+        "comment.line" => "hl-comment-line",
+        "comment.block" => "hl-comment-block",
+        "number" => "hl-number",
+        "type" => "hl-type",
+        "type.builtin" => "hl-type-builtin",
+        "variable" => "hl-variable",
+        "variable.builtin" => "hl-variable-builtin",
+        "constant" => "hl-constant",
+        "constant.builtin" => "hl-constant-builtin",
+        "operator" => "hl-operator",
+        "punctuation" => "hl-punctuation",
+        "punctuation.bracket" => "hl-punctuation-bracket",
+        "punctuation.delimiter" => "hl-punctuation-delimiter",
+        "attribute" => "hl-attribute",
+        "label" => "hl-label",
+        "namespace" => "hl-namespace",
+        "module" => "hl-module",
+        _ => return None,
+    })
+}
+
+/// Appends `s` to `out`, escaping HTML metacharacters as it goes. The
+/// per-span escape previously allocated a fresh `String` and the
+/// `<span>` `format!` copied the escaped bytes again (perf §19-2).
+fn push_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
 }
 
 /// Escapes `<`, `>`, `&`, `"`, and `'` for safe HTML embedding.
@@ -312,9 +402,36 @@ mod tests {
     }
 
     #[test]
-    fn capture_to_class_dots_become_dashes() {
-        assert_eq!(capture_to_class("function.macro"), "hl-function-macro");
-        assert_eq!(capture_to_class("keyword"), "hl-keyword");
+    fn capture_to_class_maps_palette_names_statically() {
+        assert_eq!(
+            capture_to_class("function.macro"),
+            Some("hl-function-macro")
+        );
+        assert_eq!(capture_to_class("keyword"), Some("hl-keyword"));
+        assert_eq!(
+            capture_to_class("punctuation.bracket"),
+            Some("hl-punctuation-bracket")
+        );
+        // Names outside the palette get no static class — the caller
+        // falls back to the generic dotted form.
+        assert_eq!(capture_to_class("unknown.capture"), None);
+    }
+
+    #[test]
+    fn render_spans_falls_back_to_generic_class_for_unknown_captures() {
+        let text = "let x = 1;";
+        let html = render_spans(text, [(0..1, "unknown.capture")]);
+        assert!(
+            html.contains("<span class=\"hl-unknown-capture\">l</span>"),
+            "expected the generic fallback class, got: {html}"
+        );
+    }
+
+    #[test]
+    fn push_escaped_matches_html_escape() {
+        let mut out = String::new();
+        push_escaped(&mut out, "<>&\"'café");
+        assert_eq!(out, html_escape("<>&\"'café"));
     }
 
     #[test]
