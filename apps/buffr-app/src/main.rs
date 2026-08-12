@@ -1648,12 +1648,6 @@ struct AppState {
     /// Current edit-mode focus state. Drives keyboard routing.
     /// Updated via [`drain_edit_events`] each tick and by the Esc path.
     edit_focus: EditFocus,
-    /// Wall-clock instant of the most recent user gesture that should
-    /// allow auto-entering Insert mode on the next page-driven focusin
-    /// (left mouse press, `i` chord). When unset or stale, focusin
-    /// events from the page are ignored — pages can't drag us into
-    /// Insert via autofocus or programmatic `.focus()` calls.
-    insert_intent_at: Option<Instant>,
     /// Wall-clock of the most recent in-Insert-mode Blur. The mode
     /// flip to Normal is deferred by `BLUR_TRANSFER_WINDOW` so a
     /// Tab/Shift+Tab navigation between fields (which fires
@@ -2169,7 +2163,6 @@ impl AppState {
             hint_sink,
             edit_sink,
             edit_focus: EditFocus::None,
-            insert_intent_at: None,
             pending_blur_at: None,
             tab_drag_src: None,
             cancel_closes_tab: None,
@@ -2602,8 +2595,6 @@ impl AppState {
                 }
             }
             A::FocusFirstInput => {
-                // User gesture — allow the next focusin to enter Insert.
-                self.insert_intent_at = Some(Instant::now());
                 if let Some(ref id) = self.last_focused_field.clone() {
                     // Re-focus the previously-focused field by its stable
                     // buffr ID rather than always jumping to the first one.
@@ -3292,7 +3283,7 @@ impl AppState {
         let Some(engine) = self.active_engine_dyn() else {
             return;
         };
-        let Some((browser_id, raw)) = engine.take_cursor_change() else {
+        let Some((_, raw)) = engine.take_cursor_change() else {
             return;
         };
         let icon = cef_cursor_to_icon(raw);
@@ -3300,9 +3291,7 @@ impl AppState {
         // raw Wayland are), so apply to every live window: the main
         // toplevel + every popup. winit silently ignores the request
         // for non-focused windows, so whichever surface holds pointer
-        // focus picks up the cursor. We log the originating browser_id
-        // for diagnostics but don't route on it.
-        let _ = browser_id;
+        // focus picks up the cursor.
         if let Some(win) = self.window.as_ref() {
             win.set_cursor(event_loop, icon);
         }
@@ -3603,14 +3592,6 @@ impl AppState {
             None
         };
 
-        // Query the active engine's loading state before taking the mutable
-        // renderer borrow — `active_engine_dyn()` clones the Arc so this doesn't
-        // keep a borrow on `self`, allowing `renderer.as_mut()` below.
-        let host_is_loading = self
-            .active_engine_dyn()
-            .map(|e| e.is_loading())
-            .unwrap_or(false);
-
         // Native-compositing engines (WebKit on Wayland) render directly into a
         // Wayland subsurface; the chrome quad's browser region stays fully
         // transparent (alpha = 0) so the subsurface shows through. The loading
@@ -3666,23 +3647,9 @@ impl AppState {
         // dims don't match the current browser rect (mid-resize / first
         // paint), or the renderer flagged a stale-size buffer drift on
         // the previous paint.
-        //
-        // `host_is_loading` is deliberately NOT part of this gate.  The
-        // atomic that drives it is cleared by the engine's
-        // load-state-changed signal handler on the active tab only, so
-        // it gets pinned true forever whenever a tab switch races a
-        // LOAD_COMMITTED, a navigation errors before commit, or a
-        // page-state callback drops a signal — symptom seen in
-        // production: animation never gives way to the page despite
-        // fresh frames arriving.  Loading progress belongs in the
-        // statusline / progress spinner, not the full-screen splash;
-        // user-visible "I can see the page now" maps to "we have
-        // pixels at the right dims", which is exactly what
-        // `should_show_loading_anim` measures.
         let want_anim = (should_show_loading_anim(self.last_osr_dims, browser_w, browser_h)
             || self.surface_drifted)
             && !host_is_using_native_compositing;
-        let _ = host_is_loading;
 
         // Idle short-circuit. If nothing has changed since the last paint —
         // chrome buffer up to date, no fresh CEF paint queued, no animation
@@ -4806,7 +4773,6 @@ impl AppState {
                     // never reach here — edit.js classifies checkboxes,
                     // radios, ranges and friends as not editable.
                     if !already_editing {
-                        self.insert_intent_at = None;
                         self.pending_blur_at = None;
                         if let Some(engine) = self.active_engine_dyn() {
                             engine.run_edit_attach(&field_id);
@@ -6864,7 +6830,6 @@ mod tests {
         // Gutter = 4; pinned_w = PINNED_TAB_WIDTH (32).
         // Tab 0: x in [4, 36).  Tab 1: x in [40, 72).
         let pinned_w = buffr_ui::tab_strip::PINNED_TAB_WIDTH;
-        const GUTTER: u32 = 4;
         // Cursor in tab 0.
         let x0 = GUTTER + pinned_w / 2;
         let r0 = hit_test_tab_strip_pure(TS_W, TS_H, x0, tab_y_inside(), false, 2, 2);
@@ -6879,7 +6844,6 @@ mod tests {
     fn tab_hit_unpinned_single_returns_index_0() {
         // 0 pinned, 1 unpinned. Width computed by the pure function.
         // Just verify a cursor well inside the strip returns Some(0).
-        const GUTTER: u32 = 4;
         let x = GUTTER + 10;
         let result = hit_test_tab_strip_pure(TS_W, TS_H, x, tab_y_inside(), false, 0, 1);
         assert_eq!(result, Some(0));
@@ -6891,7 +6855,6 @@ mod tests {
         // gutter_total = (3+1)*4 = 16; avail = 1000-0-16 = 984; raw_w = 328;
         // clamped to MAX_TAB_WIDTH (220).
         // Tab 0: [4, 224).  Tab 1: [228, 448).  Tab 2: [452, 672).
-        const GUTTER: u32 = 4;
         let unpinned_w = buffr_ui::MAX_TAB_WIDTH; // clamped at 220
         let x0 = GUTTER + unpinned_w / 2;
         let x1 = GUTTER + unpinned_w + GUTTER + unpinned_w / 2;
@@ -6909,7 +6872,6 @@ mod tests {
         // 0 pinned, 7 unpinned.
         // gutter_total = (7+1)*4 = 32; avail = 1000-32 = 968; raw_w = 138;
         // 138 is in [MIN_TAB_WIDTH=80, MAX_TAB_WIDTH=220] — not clamped.
-        const GUTTER: u32 = 4;
         let unpinned_w: u32 = 138; // = 968 / 7
         for i in 0u32..7 {
             let x = GUTTER + i * (unpinned_w + GUTTER) + unpinned_w / 2;
@@ -6926,7 +6888,6 @@ mod tests {
     fn tab_hit_hidpi_sanity() {
         // The pure function works in logical space; physical scale must not
         // affect the result when inputs are already in logical coords.
-        const GUTTER: u32 = 4;
         let x = GUTTER + 10;
         let r1x = hit_test_tab_strip_pure(TS_W, TS_H, x, tab_y_inside(), false, 0, 1);
         // Same logical coords regardless of physical scale — pure fn is scale-agnostic.

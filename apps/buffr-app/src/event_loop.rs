@@ -947,11 +947,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                         // is the place the user finally tells CEF the
                         // page is theirs to interact with.
                         host.osr_focus(true);
-                        // Left-click is a user gesture that may focus
-                        // an input — allow the next focusin to enter
-                        // Insert mode.
                         if button == MouseButton::Left {
-                            self.insert_intent_at = Some(Instant::now());
                             // Track drag origin so a left-button release
                             // far from the press point promotes the
                             // engine to Visual mode (CEF natively

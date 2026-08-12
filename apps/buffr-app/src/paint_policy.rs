@@ -288,6 +288,9 @@ impl ResizePaintWatchdog {
 // Group 3: Tab-strip hit-test (pure)
 // ---------------------------------------------------------------------------
 
+/// Logical gutter between tab pills, in DIPs.
+pub(crate) const GUTTER: u32 = 4;
+
 /// Pure tab-strip hit-test.  All inputs are in **logical** (DIP) pixels.
 ///
 /// `log_full_w` / `log_full_h` — full window logical size.
@@ -323,7 +326,6 @@ pub(crate) fn hit_test_tab_strip_pure(
         return None;
     }
 
-    pub(crate) const GUTTER: u32 = 4;
     let unpinned_count = total_count.saturating_sub(pinned_count);
     let pinned_total_w = pinned_count * buffr_ui::tab_strip::PINNED_TAB_WIDTH;
     let gutter_total = (total_count + 1) * GUTTER;
