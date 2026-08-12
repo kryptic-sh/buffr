@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.11] - 2026-08-13
+
 ### Fixed
 
 - Fixed a startup crash on macOS and Windows (and a racy crash on Linux) where
@@ -27,6 +29,22 @@ and this project adheres to
   drops `javascript:`/`data:` entries from a hand-edited `session.json`: the
   saved active index is re-based onto the filtered tab list instead of being
   applied to the wrong slot.
+- Netscape bookmark import no longer misreads `<H3>` markup inside an anchor
+  label as a folder: each `<A>…</A>` is consumed as a single token, so inner
+  markup can't push a phantom folder tag onto every later bookmark or pop the
+  real folders one level early.
+- Netscape bookmark import is now linear in the file size: folder depth
+  contributes at most 16 tags per anchor and a `TAGS=` attribute at most 64, so
+  a pathological file can no longer hang import or bloat the store with
+  quadratic INSERTs.
+- Live popup windows are capped at 32, matching the CEF-side pre-creation cap —
+  a page that evades the popup blocker (gesture-triggered chain, popunder) can
+  no longer grow unbounded windows, GPU surfaces and fds. Over the cap the
+  browser is closed without a window.
+- Config hot-reload keeps working after a watcher callback panics: the callback
+  no longer runs while holding the transport mutex (so a panic can't poison it
+  and silently stop all later reloads), and each invocation is isolated with
+  `catch_unwind` — reloads continue and the panic is logged.
 
 ### Security
 
@@ -41,6 +59,26 @@ and this project adheres to
   RUSTSEC-2026-0194 and RUSTSEC-2026-0195 — quadratic-time start-tag parsing DoS
   in the 0.39 line. The matching entries were dropped from `deny.toml`'s ignore
   list.
+- The update-check HTTP client no longer follows redirects (`max_redirects(0)`,
+  matching the `buffr-src:` and image-copy fetchers) — a 3xx from the pinned
+  release URL now fails the status check instead of silently landing on an
+  arbitrary hop.
+
+### Performance
+
+- The omnibar resolves the typed input once per submit and per paste instead of
+  twice — `classify_input` and `resolve_input` were each parsing the input. The
+  new `buffr_config::search::resolve` returns the URL and its branch kind from a
+  single resolution.
+- View-source syntax highlighting caches the grammar registry and the compiled
+  grammars per process and renders spans straight into the output buffer — the
+  second request for a language pays only a stat-walk.
+- The downloads tick narrows to rows whose values actually changed and skips
+  no-change writes, instead of rebuilding and rewriting every row per tick.
+- Tab-strip badge metrics are hoisted out of per-frame recompute and the
+  context-menu width is cached.
+- Hint/edit nonce lookups are gated behind each sentinel's own prefix, so the
+  common path skips the full parse.
 
 ## [0.14.10] - 2026-08-06
 
@@ -2313,7 +2351,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.10...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.11...HEAD
+[0.14.11]: https://github.com/kryptic-sh/buffr/compare/v0.14.10...v0.14.11
 [0.14.10]: https://github.com/kryptic-sh/buffr/compare/v0.14.9...v0.14.10
 [0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/buffr/releases/tag/v0.11.1
