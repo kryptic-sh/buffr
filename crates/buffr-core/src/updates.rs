@@ -105,6 +105,11 @@ impl HttpClient for UreqClient {
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_recv_response(Some(Duration::from_secs(5)))
             .user_agent(USER_AGENT)
+            // Never follow redirects: the release URL is pinned, and a
+            // browser-process fetch must not silently land on an
+            // attacker-chosen hop. A 3xx comes back as-is and fails the
+            // caller's status check.
+            .max_redirects(0)
             .build();
         let agent = ureq::Agent::new_with_config(config);
         let mut resp = agent
