@@ -187,20 +187,10 @@ rediscovered as findings.
 
 ## 4. Release follow-ups
 
-- **`buffr-bin` on the AUR is stuck at `0.14.6-1`.** The pending action is a
-  **re-run, not a new release**: re-run the failed `Publish buffr-bin to AUR`
-  job on the `v0.14.9` tag run once `ssh aur@aur.archlinux.org help` answers.
-  The maintenance gate sits on every AUR **command** — not on authentication —
-  so HTTP and the bare `ssh -T` handshake both report "up" through a closed
-  window; `help` is the cheap valid signal (same gate, no repo, no clone). The
-  tag's workflow already carries the ssh fix, so a re-run is a real test of it.
-  Do not cut another version just to retry.
-
-- **The `known_hosts` pin has never actually been exercised for github.com.**
-  The runner image appends github.com's keys to `/etc/ssh/ssh_known_hosts`, so
-  the brew-tap and scoop-bucket jobs verified against the global file while the
-  per-job pin was never read — a wrong pin there would still pass today. Verify
-  it on the next publish.
+- **The `known_hosts` pin was exercised and held on `v0.14.11`** (2026-08-13):
+  the brew-tap and scoop-bucket publish jobs ran against the per-job pins and
+  both succeeded. The AUR publish also landed `0.14.11-1` — the ssh fix that the
+  `0.14.6-1` hang blocked is proven end-to-end.
 
 - **The sibling repos are fixed but unexercised.** `gpur`, `hjkl`, `hodl`,
   `hrdr`, `inbx`, `krypt`, `pikr` and `sqeel` all carried the same unexpanded
