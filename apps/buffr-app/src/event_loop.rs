@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 
 use crate::*;
 
+/// Cap on live popup windows. A page that evades CEF's popup blocker
+/// (a gesture-triggered chain, a popunder) must not grow unbounded
+/// windows / GPU surfaces / fds. Matches the CEF-side pending-alloc
+/// queue cap (`PENDING_POPUP_ALLOC_CAP` in buffr-cef's osr.rs), which
+/// bounds the same flood before `on_after_created`.
+const MAX_LIVE_POPUPS: usize = 32;
+
 impl ApplicationHandler<BuffrUserEvent> for AppState {
     fn user_event(&mut self, event_loop: &mut EventLoop<BuffrUserEvent>, event: BuffrUserEvent) {
         // Heartbeat + shutdown check: fold the logic that was in new_events (winit)
@@ -1559,6 +1566,26 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         // + wgpu renderer for each new popup browser.
         let popup_creates = drain_popup_creates(&self.popup_create_sink);
         for created in popup_creates {
+            // Cap live popup windows: a page that evades CEF's popup
+            // blocker (a gesture-triggered chain, a popunder) must not
+            // grow unbounded windows / GPU surfaces / fds. Matches the
+            // CEF-side pending-alloc queue cap (PENDING_POPUP_ALLOC_CAP
+            // in buffr-cef's osr.rs), which bounds the same flood
+            // before on_after_created. Over the cap the browser is
+            // closed without a window; its teardown drains through the
+            // popup-close sink below (no window id registered, so the
+            // drop path is a no-op).
+            if self.popups.len() >= MAX_LIVE_POPUPS {
+                warn!(
+                    cap = MAX_LIVE_POPUPS,
+                    browser_id = created.browser_id,
+                    "popup: live window cap reached — closing browser without a window"
+                );
+                if let Some(engine) = self.active_engine_dyn() {
+                    engine.popup_close(created.browser_id);
+                }
+                continue;
+            }
             let title = if created.url.is_empty() {
                 "buffr popup".to_string()
             } else {
