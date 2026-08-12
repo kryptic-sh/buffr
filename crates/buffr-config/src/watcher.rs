@@ -9,7 +9,6 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,7 +86,6 @@ where
             source: std::io::Error::other(e.to_string()),
         })?;
 
-    let cb = Arc::new(Mutex::new(callback));
     let path_for_thread = path.clone();
     let handle = thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -117,8 +115,13 @@ where
                     validate(&cfg)?;
                     Ok(cfg)
                 });
-                if let Ok(cb) = cb.lock() {
-                    cb(result);
+                // Isolate a panicking callback: it must neither poison a
+                // shared lock (skipping every later reload silently) nor
+                // kill this thread. Reloads continue; the panic is logged.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(result)))
+                    .is_err()
+                {
+                    eprintln!("[buffr-config] config watcher callback panicked; reloads continue");
                 }
             }
         }));
@@ -141,6 +144,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Poll `f` until it returns true or `timeout` elapses.
@@ -174,6 +178,35 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(5), || hits.load(Ordering::SeqCst) > 0),
             "watcher never fired for its own file"
+        );
+    }
+
+    #[test]
+    fn panicking_callback_does_not_skip_later_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let cfg_path = root.join("config.toml");
+        std::fs::write(&cfg_path, "[general]\nleader = \" \"\n").unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = Arc::clone(&calls);
+        let _guard = watch(cfg_path.clone(), move |_res| {
+            // Panic on the first reload, then succeed. A panicking
+            // callback must not poison a shared lock and skip every
+            // later reload.
+            if calls_cb.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("first callback panics on purpose");
+            }
+        })
+        .unwrap();
+
+        std::fs::write(&cfg_path, "[general]\nleader = \",\"\n").unwrap();
+        // Space the writes past the debounce so they are distinct reloads.
+        thread::sleep(DEBOUNCE * 2);
+        std::fs::write(&cfg_path, "[general]\nleader = \".\"\n").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || calls.load(Ordering::SeqCst) >= 2),
+            "reloads stopped after a panicking callback"
         );
     }
 
