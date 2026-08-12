@@ -46,6 +46,16 @@ use tracing::{debug, trace};
 
 pub mod schema;
 
+/// Import caps: `import_netscape` must do work linear in the file size.
+/// A hostile sub-MB file can nest folders thousands of levels deep or
+/// stuff an unbounded `TAGS=` attribute — without caps, every anchor
+/// clones each ancestor folder into its tag list and one INSERT is
+/// issued per tag, so import work and store growth go quadratic in the
+/// input. Real exports nest well under 16 levels and carry a handful of
+/// tags per anchor. Kept as the innermost (most specific) folders.
+const MAX_NETSCAPE_FOLDER_DEPTH: usize = 16;
+const MAX_NETSCAPE_TAGS_PER_ANCHOR: usize = 64;
+
 /// Strongly-typed bookmark id. New-type around `i64` so callers can't
 /// accidentally pass a history id or a tab id where a bookmark id is
 /// expected.
@@ -384,6 +394,12 @@ impl Bookmarks {
     /// HREFs and titles are HTML-entity-decoded (M41), so a real
     /// browser export of `https://example.com/?a=1&amp;b=2` is stored
     /// with a literal `&`.
+    ///
+    /// **Work is linear in the file size.** Folder depth contributes at
+    /// most [`MAX_NETSCAPE_FOLDER_DEPTH`] tags per anchor and a
+    /// `TAGS=` attribute at most [`MAX_NETSCAPE_TAGS_PER_ANCHOR`], so a
+    /// pathological file cannot amplify into a quadratic INSERT storm or
+    /// a permanently bloated store.
     pub fn import_netscape(&self, html: &str) -> Result<usize, BookmarkError> {
         // Tokens we walk in document order. We can't reuse a single
         // regex because `regex` doesn't support overlapping captures,
@@ -447,6 +463,13 @@ impl Bookmarks {
             match tok {
                 Tok::FolderOpen(label) => {
                     let cleaned = strip_html(label).trim().to_string();
+                    // Keep the innermost folders: once the stack is at
+                    // depth, drop the outermost entry before pushing so
+                    // a pathological nesting level can't grow the tag
+                    // list (or the stack) without bound.
+                    if folder_stack.len() >= MAX_NETSCAPE_FOLDER_DEPTH {
+                        folder_stack.remove(0);
+                    }
                     folder_stack.push(cleaned);
                 }
                 Tok::FolderClose => {
@@ -470,6 +493,9 @@ impl Bookmarks {
                                     if !trimmed.is_empty() {
                                         tags.push(trimmed.to_string());
                                     }
+                                    if tags.len() >= MAX_NETSCAPE_TAGS_PER_ANCHOR {
+                                        break;
+                                    }
                                 }
                             }
                             _ => {}
@@ -480,12 +506,16 @@ impl Bookmarks {
                         continue;
                     };
                     // Folders → tags. Filter empties so `<H3></H3>`
-                    // doesn't poison the tag list.
+                    // doesn't poison the tag list. The folder loop is
+                    // already bounded by MAX_NETSCAPE_FOLDER_DEPTH; the
+                    // truncate also caps the attribute tags when the
+                    // file's own count exceeds the cap.
                     for folder in &folder_stack {
                         if !folder.is_empty() {
                             tags.push(folder.clone());
                         }
                     }
+                    tags.truncate(MAX_NETSCAPE_TAGS_PER_ANCHOR);
                     let title = strip_html(label);
                     let title_opt = if title.trim().is_empty() {
                         None
@@ -1036,6 +1066,43 @@ mod tests {
         let next = b.search("next.example").unwrap();
         assert_eq!(next.len(), 1);
         assert!(next[0].tags.is_empty());
+    }
+
+    #[test]
+    fn import_netscape_caps_folder_depth_and_tag_count() {
+        let b = Bookmarks::open_in_memory().unwrap();
+
+        // 100 nested folders, one anchor at the bottom: only the
+        // innermost MAX_NETSCAPE_FOLDER_DEPTH become tags, so a hostile
+        // nesting level can't amplify into 10^4 tags per anchor.
+        let mut html = String::from("<DL><p>");
+        for i in 0..100 {
+            html.push_str(&format!(r#"<DT><H3>folder{i:03}</H3><DL><p>"#));
+        }
+        html.push_str(r#"<DT><A HREF="https://deep.example/">Deep</A>"#);
+        for _ in 0..100 {
+            html.push_str("</DL><p>");
+        }
+        let imported = b.import_netscape(&html).unwrap();
+        assert_eq!(imported, 1);
+        let deep = b.search("deep.example").unwrap();
+        assert_eq!(deep.len(), 1);
+        assert_eq!(deep[0].tags.len(), MAX_NETSCAPE_FOLDER_DEPTH);
+        assert!(deep[0].tags.contains(&"folder099".to_string()));
+        assert!(!deep[0].tags.contains(&"folder000".to_string()));
+
+        // One anchor with 1000 TAGS= entries: capped at
+        // MAX_NETSCAPE_TAGS_PER_ANCHOR.
+        let attrs: String = (0..1000).map(|i| format!("tag{i:04},")).collect();
+        let html = format!(
+            r#"<DL><p><DT><A HREF="https://tags.example/" TAGS="{attrs}">Tags</A></DL><p>"#
+        );
+        let imported = b.import_netscape(&html).unwrap();
+        assert_eq!(imported, 1);
+        let hit = b.by_tag("tag0000").unwrap();
+        assert_eq!(hit.len(), 1);
+        let bm = b.get(hit[0].id).unwrap().expect("exists");
+        assert_eq!(bm.tags.len(), MAX_NETSCAPE_TAGS_PER_ANCHOR);
     }
 
     // ----- M40: search / by_tag pushed into SQL -----
