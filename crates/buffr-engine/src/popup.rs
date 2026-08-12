@@ -10,8 +10,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::{SharedOsrFrame, SharedOsrViewState};
-
 // Re-export `PopupCreated` from `tab` so callers can use one import path.
 pub use crate::tab::PopupCreated;
 
@@ -57,10 +55,6 @@ pub type PopupCreateSink = Arc<Mutex<VecDeque<PopupCreated>>>;
 /// Queue of `browser_id` values for closed popup browsers.
 pub type PopupCloseSink = Arc<Mutex<VecDeque<i32>>>;
 
-/// Single-slot pending popup alloc: allocated by `on_before_popup`,
-/// consumed by `on_after_created`.
-pub type PendingPopupAlloc = Arc<Mutex<Option<(SharedOsrFrame, SharedOsrViewState, String)>>>;
-
 pub fn new_popup_queue() -> PopupQueue {
     Arc::new(Mutex::new(VecDeque::new()))
 }
@@ -71,10 +65,6 @@ pub fn new_popup_create_sink() -> PopupCreateSink {
 
 pub fn new_popup_close_sink() -> PopupCloseSink {
     Arc::new(Mutex::new(VecDeque::new()))
-}
-
-pub fn new_pending_popup_alloc() -> PendingPopupAlloc {
-    Arc::new(Mutex::new(None))
 }
 
 /// Take everything currently queued in a shared `VecDeque`, leaving it

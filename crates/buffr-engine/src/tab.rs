@@ -11,24 +11,6 @@ impl std::fmt::Display for TabId {
     }
 }
 
-/// Per-tab UI state preserved across tab switches.
-#[derive(Debug, Default, Clone)]
-pub struct TabSession {
-    pub find_query: Option<String>,
-    // hint session is opaque at the engine level; carried as a boxed type.
-}
-
-/// Options for opening a new tab.
-#[derive(Debug, Default, Clone)]
-pub struct TabOptions {
-    /// Open in the background (don't activate).
-    pub background: bool,
-    /// Insert at this position in the tab strip (clamped).
-    pub insert_idx: Option<usize>,
-    /// Mark as pinned immediately.
-    pub pinned: bool,
-}
-
 /// Copy-friendly snapshot of a tab. Used by chrome / UI threads that
 /// don't want to hold the manager mutex.
 #[derive(Debug, Clone)]
@@ -99,20 +81,6 @@ mod tests {
         let c = a.clone(); // exercise Clone impl explicitly
         assert_eq!(a, b);
         assert_eq!(a, c);
-    }
-
-    #[test]
-    fn tab_options_default_safe() {
-        let opts = TabOptions::default();
-        assert!(!opts.background);
-        assert!(opts.insert_idx.is_none());
-        assert!(!opts.pinned);
-    }
-
-    #[test]
-    fn tab_session_default_find_query_is_none() {
-        let sess = TabSession::default();
-        assert!(sess.find_query.is_none());
     }
 
     #[test]

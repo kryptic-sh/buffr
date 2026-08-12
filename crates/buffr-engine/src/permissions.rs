@@ -84,25 +84,10 @@ pub fn queue_len(queue: &PermissionsQueue) -> usize {
     queue.lock().map(|g| g.len()).unwrap_or(0)
 }
 
-/// Pop the front of the queue, if any.
-pub fn pop_front(queue: &PermissionsQueue) -> Option<PendingPermission> {
-    queue.lock().ok().and_then(|mut g| g.pop_front())
-}
-
-/// Inspect (without removing) the front of the queue.
-///
-/// Returns `(origin, capabilities)` so the UI can render the strip
-/// without touching backend-internal state.
-pub fn peek_front(queue: &PermissionsQueue) -> Option<(String, Vec<Capability>)> {
-    let g = queue.lock().ok()?;
-    let front = g.front()?;
-    Some((front.origin.clone(), front.capabilities.clone()))
-}
-
 /// Clone the front entry (without removing it), if any.
 ///
-/// Unlike [`peek_front`] this keeps the `resolve_id`, so a UI layer can
-/// remember *which* request it put on screen — see [`PromptIdentity`].
+/// Keeps the `resolve_id`, so a UI layer can remember *which* request it
+/// put on screen — see [`PromptIdentity`].
 pub fn peek_front_entry(queue: &PermissionsQueue) -> Option<PendingPermission> {
     let g = queue.lock().ok()?;
     g.front().cloned()
@@ -237,38 +222,6 @@ mod tests {
     fn queue_starts_empty() {
         let q = new_queue();
         assert_eq!(queue_len(&q), 0);
-        assert!(pop_front(&q).is_none());
-        assert!(peek_front(&q).is_none());
-    }
-
-    #[test]
-    fn push_and_peek_front() {
-        let q = new_queue();
-        q.lock().unwrap().push_back(PendingPermission {
-            origin: "https://example.com".to_string(),
-            capabilities: vec![Capability::Geolocation],
-            resolve_id: Some("id-1".to_string()),
-        });
-        assert_eq!(queue_len(&q), 1);
-        let (origin, caps) = peek_front(&q).unwrap();
-        assert_eq!(origin, "https://example.com");
-        assert_eq!(caps, vec![Capability::Geolocation]);
-        // peek does not consume
-        assert_eq!(queue_len(&q), 1);
-    }
-
-    #[test]
-    fn pop_front_consumes() {
-        let q = new_queue();
-        q.lock().unwrap().push_back(PendingPermission {
-            origin: "https://a.com".to_string(),
-            capabilities: vec![Capability::Camera, Capability::Microphone],
-            resolve_id: None,
-        });
-        let p = pop_front(&q).unwrap();
-        assert_eq!(p.origin, "https://a.com");
-        assert_eq!(p.capabilities.len(), 2);
-        assert!(pop_front(&q).is_none());
     }
 
     #[test]

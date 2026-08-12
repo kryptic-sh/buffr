@@ -22,7 +22,6 @@ raw-window-handle = "0.6"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_json.workspace = true
 buffr-modal.workspace = true
 # Only pulls the `Capability` / `Decision` type surface. The SQLite store
 # is gated behind buffr-permissions' `store` feature, which we don't

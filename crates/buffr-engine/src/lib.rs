@@ -51,7 +51,6 @@ pub mod favicon;
 pub mod hint;
 pub mod input;
 pub mod internal_server;
-pub mod media_js;
 pub mod newtab;
 pub mod osr;
 pub mod permissions;
@@ -71,16 +70,14 @@ pub use input::{KeyEventKind, MouseButton, NeutralKeyEvent};
 pub use osr::{OsrFrame, OsrViewState, SharedOsrFrame, SharedOsrViewState};
 pub use permissions::{
     PendingPermission, PermissionsQueue, PromptOutcome, drain_queue as drain_permissions_queue,
-    new_queue as new_permissions_queue, peek_front as peek_permission_front,
-    pop_front as pop_permission_front, queue_len as permissions_queue_len,
 };
 pub use popup::{
-    PendingPopupAlloc, PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue,
-    drain_popup_closes, drain_popup_creates, drain_popup_targets, new_pending_popup_alloc,
-    new_popup_close_sink, new_popup_create_sink, new_popup_queue,
+    PopupCloseSink, PopupCreateSink, PopupCreated, PopupQueue, drain_popup_closes,
+    drain_popup_creates, drain_popup_targets, new_popup_close_sink, new_popup_create_sink,
+    new_popup_queue,
 };
 pub use profile::ProfilePaths;
-pub use tab::{TabId, TabOptions, TabSession, TabSummary};
+pub use tab::{TabId, TabSummary};
 pub use types::{AudioEvent, ContextMenuRequest, WaylandNativeHandles};
 
 /// Re-export of the raw-window-handle crate so backends + apps share the
