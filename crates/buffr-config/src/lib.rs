@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hjkl_config::AppConfig;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use buffr_modal::{PageAction, PageMode};
@@ -67,7 +67,6 @@ pub struct Config {
     /// carrying a `match` glob and an `engine` id. Rules are tested in
     /// declaration order; the first matching rule wins.
     pub engines: Engines,
-    #[serde(deserialize_with = "deserialize_keymap")]
     pub keymap: HashMap<PageMode, HashMap<String, KeyBinding>>,
 }
 
@@ -648,21 +647,6 @@ pub(crate) fn locate(src: &str, byte_offset: usize) -> (usize, usize, String) {
     (line_no, col, line_text)
 }
 
-/// `[keymap]` deserializes as `HashMap<PageMode, HashMap<String, KeyBinding>>`,
-/// but we want unknown modes to error out rather than silently slip past.
-/// The standard `HashMap<PageMode, _>` deserializer surfaces unknown keys
-/// as serde errors automatically (since `PageMode` is `deny_unknown_fields`
-/// over its rename_all snake_case variants). The wrapper exists so we can
-/// later add a normalization pass without changing the public type.
-fn deserialize_keymap<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<PageMode, HashMap<String, KeyBinding>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    HashMap::<PageMode, HashMap<String, KeyBinding>>::deserialize(deserializer)
-}
-
 /// Message for a `[keymap.insert]` section. Shared by [`validate`] and
 /// the tests that pin the wording, since it is the only thing telling a
 /// user why their binding was refused and how to get out of Insert.
@@ -1003,7 +987,7 @@ pub fn build_keymap(cfg: &Config) -> Result<buffr_modal::Keymap, ConfigError> {
     Ok(km)
 }
 
-fn mode_name(mode: PageMode) -> &'static str {
+pub(crate) fn mode_name(mode: PageMode) -> &'static str {
     match mode {
         PageMode::Normal => "normal",
         PageMode::Visual => "visual",

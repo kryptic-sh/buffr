@@ -166,23 +166,7 @@ fn looks_like_url(s: &str) -> bool {
     }
     // Split off path portion at the first `/` (if any) and any
     // query/fragment, then validate the host[:port] head.
-    let head = s.split(['/', '?', '#']).next().unwrap_or("");
-    if head.is_empty() {
-        return false;
-    }
-    // Strip optional `:port`. An out-of-range port (> 65535) keeps the
-    // input out of the URL branch — `https://localhost:99999` would fail
-    // `url::Url::parse` and the navigation would silently no-op.
-    let host = match head.rsplit_once(':') {
-        Some((h, p))
-            if !p.is_empty()
-                && p.chars().all(|c| c.is_ascii_digit())
-                && p.parse::<u16>().is_ok() =>
-        {
-            h
-        }
-        _ => head,
-    };
+    let host = host_head(s);
     if host.is_empty() {
         return false;
     }
@@ -215,8 +199,17 @@ fn looks_like_url(s: &str) -> bool {
 /// heuristic well enough that pasting `localhost:3000` lands on a dev
 /// server without TLS errors.
 fn needs_http(s: &str) -> bool {
-    let head = s.split(['/', '?', '#']).next().unwrap_or("");
-    let host = match head.rsplit_once(':') {
+    host_head(s).eq_ignore_ascii_case("localhost") || is_ipv4(host_head(s))
+}
+
+/// Scheme-less URL's host head: the part before any `/`, `?` or `#`,
+/// with an optional `:port` stripped. An out-of-range port (> 65535) is
+/// left in place so the input falls through to the search branch instead
+/// of emitting an unparseable URL. `split` always yields at least one
+/// element, so `next()` cannot return `None`.
+fn host_head(s: &str) -> &str {
+    let head = s.split(['/', '?', '#']).next().unwrap();
+    match head.rsplit_once(':') {
         Some((h, p))
             if !p.is_empty()
                 && p.chars().all(|c| c.is_ascii_digit())
@@ -225,8 +218,7 @@ fn needs_http(s: &str) -> bool {
             h
         }
         _ => head,
-    };
-    host.eq_ignore_ascii_case("localhost") || is_ipv4(host)
+    }
 }
 
 /// Schemes we treat as fully-qualified URLs in branch 1. Anything

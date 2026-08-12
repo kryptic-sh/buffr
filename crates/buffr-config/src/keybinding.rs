@@ -279,7 +279,7 @@ fn action_to_string(action: &PageAction) -> String {
         OpenCommandLine => "open_command_line".into(),
         EnterHintMode => "enter_hint_mode".into(),
         EnterHintModeBackground => "enter_hint_mode_background".into(),
-        EnterMode(m) => format!("enter_mode({:?})", mode_name(*m)),
+        EnterMode(m) => format!("enter_mode({:?})", crate::mode_name(*m)),
         Find { forward } => format!("find(forward = {forward})"),
         FindNext => "find_next".into(),
         FindPrev => "find_prev".into(),
@@ -294,16 +294,6 @@ fn action_to_string(action: &PageAction) -> String {
         FocusFirstInput => "focus_first_input".into(),
         ExitInsertMode => "exit_insert_mode".into(),
         Engine(id) => format!("engine({id})"),
-    }
-}
-
-fn mode_name(m: PageMode) -> &'static str {
-    match m {
-        PageMode::Normal => "normal",
-        PageMode::Visual => "visual",
-        PageMode::Command => "command",
-        PageMode::Hint => "hint",
-        PageMode::Insert => "insert",
     }
 }
 
