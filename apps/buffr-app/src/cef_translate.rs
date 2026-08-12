@@ -98,81 +98,47 @@ pub(crate) fn cef_cursor_to_icon(raw: u32) -> CursorIcon {
     const CT_DND_COPY: u32 = 36;
     const CT_DND_LINK: u32 = 37;
 
-    if raw == CT_POINTER {
-        CursorIcon::Default
-    } else if raw == CT_CROSS {
-        CursorIcon::Crosshair
-    } else if raw == CT_HAND {
-        CursorIcon::Pointer
-    } else if raw == CT_IBEAM {
-        CursorIcon::Text
-    } else if raw == CT_WAIT {
-        CursorIcon::Wait
-    } else if raw == CT_HELP {
-        CursorIcon::Help
-    } else if raw == CT_EASTRESIZE {
-        CursorIcon::EResize
-    } else if raw == CT_NORTHRESIZE {
-        CursorIcon::NResize
-    } else if raw == CT_NORTHEASTRESIZE {
-        CursorIcon::NeResize
-    } else if raw == CT_NORTHWESTRESIZE {
-        CursorIcon::NwResize
-    } else if raw == CT_SOUTHRESIZE {
-        CursorIcon::SResize
-    } else if raw == CT_SOUTHEASTRESIZE {
-        CursorIcon::SeResize
-    } else if raw == CT_SOUTHWESTRESIZE {
-        CursorIcon::SwResize
-    } else if raw == CT_WESTRESIZE {
-        CursorIcon::WResize
-    } else if raw == CT_NORTHSOUTHRESIZE {
-        CursorIcon::NsResize
-    } else if raw == CT_EASTWESTRESIZE {
-        CursorIcon::EwResize
-    } else if raw == CT_NORTHEASTSOUTHWESTRESIZE {
-        CursorIcon::NeswResize
-    } else if raw == CT_NORTHWESTSOUTHEASTRESIZE {
-        CursorIcon::NwseResize
-    } else if raw == CT_COLUMNRESIZE {
-        CursorIcon::ColResize
-    } else if raw == CT_ROWRESIZE {
-        CursorIcon::RowResize
-    } else if raw == CT_MOVE {
-        CursorIcon::Move
-    } else if raw == CT_VERTICALTEXT {
-        CursorIcon::VerticalText
-    } else if raw == CT_CELL {
-        CursorIcon::Cell
-    } else if raw == CT_CONTEXTMENU {
-        CursorIcon::ContextMenu
-    } else if raw == CT_ALIAS {
-        CursorIcon::Alias
-    } else if raw == CT_PROGRESS {
-        CursorIcon::Progress
-    } else if raw == CT_NODROP || raw == CT_NOTALLOWED {
-        CursorIcon::NotAllowed
-    } else if raw == CT_COPY || raw == CT_DND_COPY {
-        CursorIcon::Copy
-    } else if raw == CT_NONE {
-        // winit has no "hide cursor" CursorIcon variant; closest match.
-        CursorIcon::Default
-    } else if raw == CT_ZOOMIN {
-        CursorIcon::ZoomIn
-    } else if raw == CT_ZOOMOUT {
-        CursorIcon::ZoomOut
-    } else if raw == CT_GRAB {
-        CursorIcon::Grab
-    } else if raw == CT_GRABBING {
-        CursorIcon::Grabbing
-    } else if raw == CT_DND_NONE {
-        CursorIcon::NotAllowed
-    } else if raw == CT_DND_MOVE {
-        CursorIcon::Move
-    } else if raw == CT_DND_LINK {
-        CursorIcon::Alias
-    } else {
-        CursorIcon::Default
+    match raw {
+        CT_POINTER => CursorIcon::Default,
+        CT_CROSS => CursorIcon::Crosshair,
+        CT_HAND => CursorIcon::Pointer,
+        CT_IBEAM => CursorIcon::Text,
+        CT_WAIT => CursorIcon::Wait,
+        CT_HELP => CursorIcon::Help,
+        CT_EASTRESIZE => CursorIcon::EResize,
+        CT_NORTHRESIZE => CursorIcon::NResize,
+        CT_NORTHEASTRESIZE => CursorIcon::NeResize,
+        CT_NORTHWESTRESIZE => CursorIcon::NwResize,
+        CT_SOUTHRESIZE => CursorIcon::SResize,
+        CT_SOUTHEASTRESIZE => CursorIcon::SeResize,
+        CT_SOUTHWESTRESIZE => CursorIcon::SwResize,
+        CT_WESTRESIZE => CursorIcon::WResize,
+        CT_NORTHSOUTHRESIZE => CursorIcon::NsResize,
+        CT_EASTWESTRESIZE => CursorIcon::EwResize,
+        CT_NORTHEASTSOUTHWESTRESIZE => CursorIcon::NeswResize,
+        CT_NORTHWESTSOUTHEASTRESIZE => CursorIcon::NwseResize,
+        CT_COLUMNRESIZE => CursorIcon::ColResize,
+        CT_ROWRESIZE => CursorIcon::RowResize,
+        CT_MOVE => CursorIcon::Move,
+        CT_VERTICALTEXT => CursorIcon::VerticalText,
+        CT_CELL => CursorIcon::Cell,
+        CT_CONTEXTMENU => CursorIcon::ContextMenu,
+        CT_ALIAS => CursorIcon::Alias,
+        CT_PROGRESS => CursorIcon::Progress,
+        CT_NODROP | CT_NOTALLOWED => CursorIcon::NotAllowed,
+        CT_COPY | CT_DND_COPY => CursorIcon::Copy,
+        CT_NONE => {
+            // winit has no "hide cursor" CursorIcon variant; closest match.
+            CursorIcon::Default
+        }
+        CT_ZOOMIN => CursorIcon::ZoomIn,
+        CT_ZOOMOUT => CursorIcon::ZoomOut,
+        CT_GRAB => CursorIcon::Grab,
+        CT_GRABBING => CursorIcon::Grabbing,
+        CT_DND_NONE => CursorIcon::NotAllowed,
+        CT_DND_MOVE => CursorIcon::Move,
+        CT_DND_LINK => CursorIcon::Alias,
+        _ => CursorIcon::Default,
     }
 }
 
@@ -410,28 +376,26 @@ pub(crate) fn key_to_neutral_events(
         return Vec::new();
     }
 
+    // Shared field values for every event we emit; each arm only
+    // overrides `kind` (and `windows_key_code` for the Char event).
+    let base = NeutralKeyEvent {
+        kind: KeyEventKind::RawDown,
+        windows_key_code: vk,
+        native_key_code: 0,
+        character: ch,
+        unmodified_character: ch,
+        modifiers,
+        is_system_key: false,
+        focus_on_editable_field,
+    };
     match event.state {
         crate::windowing::KeyState::Pressed => {
-            let raw = NeutralKeyEvent {
-                kind: KeyEventKind::RawDown,
-                windows_key_code: vk,
-                native_key_code: 0,
-                character: ch,
-                unmodified_character: ch,
-                modifiers,
-                is_system_key: false,
-                focus_on_editable_field,
-            };
+            let raw = NeutralKeyEvent { ..base };
             if ch != 0 {
                 let char_ev = NeutralKeyEvent {
                     kind: KeyEventKind::Char,
                     windows_key_code: ch as i32,
-                    native_key_code: 0,
-                    character: ch,
-                    unmodified_character: ch,
-                    modifiers,
-                    is_system_key: false,
-                    focus_on_editable_field,
+                    ..base
                 };
                 vec![raw, char_ev]
             } else {
@@ -441,13 +405,7 @@ pub(crate) fn key_to_neutral_events(
         crate::windowing::KeyState::Released => {
             vec![NeutralKeyEvent {
                 kind: KeyEventKind::Up,
-                windows_key_code: vk,
-                native_key_code: 0,
-                character: ch,
-                unmodified_character: ch,
-                modifiers,
-                is_system_key: false,
-                focus_on_editable_field,
+                ..base
             }]
         }
     }
