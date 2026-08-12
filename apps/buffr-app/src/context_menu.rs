@@ -86,6 +86,10 @@ pub(crate) struct ActiveContextMenu {
     /// change while it is open — so per-event hit-testing reuses this
     /// instead of re-cloning every label on each mouse move.
     entries: Vec<ContextMenuEntry>,
+    /// Panel width in DIPs, measured once from `entries` (perf §14-15).
+    /// Per-mouse-move contains/hit_test reuse it instead of re-measuring
+    /// every label with a glyph-lock lookup each.
+    panel_w: u32,
     /// Index into `request.items` of the currently highlighted row.
     /// Always points at a non-separator item; updated by Up/Down.
     pub(crate) selected: usize,
@@ -100,9 +104,11 @@ impl ActiveContextMenu {
             .position(|i| !i.is_separator())
             .unwrap_or(0);
         let entries = Self::build_entries(&request);
+        let panel_w = ContextMenuOverlay::preferred_width_for(&entries);
         Self {
             request,
             entries,
+            panel_w,
             selected,
         }
     }
@@ -200,6 +206,7 @@ impl ActiveContextMenu {
     pub(crate) fn contains(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> bool {
         ContextMenuOverlay::contains_at(
             &self.entries,
+            self.panel_w,
             self.request.x,
             self.request.y,
             buf_w,
@@ -216,6 +223,7 @@ impl ActiveContextMenu {
     pub(crate) fn hit_test(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> Option<usize> {
         ContextMenuOverlay::hit_test(
             &self.entries,
+            self.panel_w,
             self.request.x,
             self.request.y,
             buf_w,

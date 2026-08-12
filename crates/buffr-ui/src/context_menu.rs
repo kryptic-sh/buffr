@@ -94,7 +94,12 @@ impl ContextMenuOverlay {
         (px, py, panel_w, panel_h)
     }
 
-    fn preferred_width_for(entries: &[ContextMenuEntry]) -> u32 {
+    /// Compute the pixel width required to display all entry labels.
+    /// The measurement point for the panel width: callers with a stable
+    /// entry list cache the result and pass it to [`Self::contains_at`] /
+    /// [`Self::hit_test`] instead of re-measuring every label per event
+    /// (perf §14-15).
+    pub fn preferred_width_for(entries: &[ContextMenuEntry]) -> u32 {
         let label_w = entries
             .iter()
             .filter(|e| !e.is_separator)
@@ -226,15 +231,27 @@ impl ContextMenuOverlay {
     /// True if pixel `(x, y)` (in chrome-buffer coords) falls inside the
     /// clamped panel rect.
     pub fn contains(&self, buf_w: usize, buf_h: usize, x: i32, y: i32) -> bool {
-        Self::contains_at(&self.entries, self.x, self.y, buf_w, buf_h, x, y)
+        Self::contains_at(
+            &self.entries,
+            self.preferred_width(),
+            self.x,
+            self.y,
+            buf_w,
+            buf_h,
+            x,
+            y,
+        )
     }
 
     /// Cheap panel test over a pre-built entry list, without owning the
     /// entries. Same geometry as [`Self::contains`]; lets a caller
     /// hit-test a cached menu on every mouse move without re-cloning the
-    /// labels.
+    /// labels. `panel_w` is the caller-cached [`Self::preferred_width_for`]
+    /// so per-event checks don't re-measure every label.
+    #[allow(clippy::too_many_arguments)]
     pub fn contains_at(
         entries: &[ContextMenuEntry],
+        panel_w: u32,
         x0: i32,
         y0: i32,
         buf_w: usize,
@@ -242,8 +259,25 @@ impl ContextMenuOverlay {
         x: i32,
         y: i32,
     ) -> bool {
-        let (px, py, pw, ph) = Self::panel_rect_for(entries, x0, y0, buf_w, buf_h);
+        let (px, py, pw, ph) = Self::panel_rect_for_width(entries, panel_w, x0, y0, buf_w, buf_h);
         x >= px && x < px + pw && y >= py && y < py + ph
+    }
+
+    /// Panel rect for a caller-cached `panel_w`. Shared by the
+    /// [`Self::contains_at`] / [`Self::hit_test`] per-event path so a
+    /// mouse move reuses the measured width instead of recomputing it.
+    pub fn panel_rect_for_width(
+        entries: &[ContextMenuEntry],
+        panel_w: u32,
+        x0: i32,
+        y0: i32,
+        buf_w: usize,
+        buf_h: usize,
+    ) -> (i32, i32, i32, i32) {
+        let panel_h = Self::preferred_height_for(entries) as i32;
+        let px = x0.clamp(0, (buf_w as i32 - panel_w as i32).max(0));
+        let py = y0.clamp(0, (buf_h as i32 - panel_h).max(0));
+        (px, py, panel_w as i32, panel_h)
     }
 
     /// Resolve pixel `(x, y)` to a row index for a menu built from a
@@ -251,13 +285,16 @@ impl ContextMenuOverlay {
     /// `None` if the hit lands on a separator, on the border, or outside
     /// the panel. Takes the entries by reference — lets a caller
     /// hit-test a cached entry list on every mouse move without
-    /// re-cloning the labels.
+    /// re-cloning the labels. `panel_w` is the caller-cached
+    /// [`Self::preferred_width_for`].
     ///
     /// **Disabled rows are returned by index**, not filtered out — callers
     /// still want to highlight them on hover for visual continuity. Gate
     /// activation on the entry's `enabled` flag at the call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn hit_test(
         entries: &[ContextMenuEntry],
+        panel_w: u32,
         x0: i32,
         y0: i32,
         buf_w: usize,
@@ -265,7 +302,7 @@ impl ContextMenuOverlay {
         x: i32,
         y: i32,
     ) -> Option<usize> {
-        let (px, py, pw, ph) = Self::panel_rect_for(entries, x0, y0, buf_w, buf_h);
+        let (px, py, pw, ph) = Self::panel_rect_for_width(entries, panel_w, x0, y0, buf_w, buf_h);
         if !(x >= px && x < px + pw && y >= py && y < py + ph) {
             return None;
         }
@@ -385,17 +422,18 @@ mod tests {
                 enabled: true,
             },
         ];
+        let panel_w = ContextMenuOverlay::preferred_width_for(&entries);
         let (px, py, _, _) = ContextMenuOverlay::panel_rect_for(&entries, 50, 60, 800, 600);
         // First row centre.
         let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
         assert_eq!(
-            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, px + 10, row0_y),
+            ContextMenuOverlay::hit_test(&entries, panel_w, 50, 60, 800, 600, px + 10, row0_y),
             Some(0)
         );
         // Separator row centre — non-selectable.
         let sep_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 + CONTEXT_MENU_SEP_HEIGHT as i32 / 2;
         assert_eq!(
-            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, px + 10, sep_y),
+            ContextMenuOverlay::hit_test(&entries, panel_w, 50, 60, 800, 600, px + 10, sep_y),
             None
         );
         // Third (Reload) row centre.
@@ -405,12 +443,12 @@ mod tests {
             + CONTEXT_MENU_SEP_HEIGHT as i32
             + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
         assert_eq!(
-            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, px + 10, row2_y),
+            ContextMenuOverlay::hit_test(&entries, panel_w, 50, 60, 800, 600, px + 10, row2_y),
             Some(2)
         );
         // Outside panel.
         assert_eq!(
-            ContextMenuOverlay::hit_test(&entries, 50, 60, 800, 600, 0, 0),
+            ContextMenuOverlay::hit_test(&entries, panel_w, 50, 60, 800, 600, 0, 0),
             None
         );
     }
@@ -432,10 +470,11 @@ mod tests {
                 enabled: true,
             },
         ];
+        let panel_w = ContextMenuOverlay::preferred_width_for(&entries);
         let (px, py, _, _) = ContextMenuOverlay::panel_rect_for(&entries, 10, 10, 800, 600);
         let row0_y = py + 1 + CONTEXT_MENU_ROW_HEIGHT as i32 / 2;
         assert_eq!(
-            ContextMenuOverlay::hit_test(&entries, 10, 10, 800, 600, px + 10, row0_y),
+            ContextMenuOverlay::hit_test(&entries, panel_w, 10, 10, 800, 600, px + 10, row0_y),
             Some(0)
         );
     }

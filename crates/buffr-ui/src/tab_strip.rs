@@ -168,6 +168,10 @@ impl TabStrip {
         let progress_y = start_y as i32 + strip_h as i32 - 2;
 
         let mut x = GUTTER as i32;
+        // Widest 2-char badge label + its side padding — loop-invariant,
+        // measured once per frame instead of per tab (perf §14-9).
+        let two_char_px = font::text_width("WW") as i32;
+        let badge_content_w = two_char_px + 2 * BADGE_SIDE_PAD;
         for (i, tab) in self.tabs.iter().enumerate() {
             // Cap so we don't draw past the right edge.
             let max_right = width as i32 - 1;
@@ -265,8 +269,6 @@ impl TabStrip {
                 // horizontal padding on each side. Only painted when the router
                 // has more than one engine registered and this tab's engine is
                 // not the primary "cef" engine.
-                let two_char_px = font::text_width("WW") as i32; // widest 2-char label
-                let badge_content_w = two_char_px + 2 * BADGE_SIDE_PAD;
                 let badge_w: i32 = if tab.engine_badge.is_some() {
                     badge_content_w
                 } else {
