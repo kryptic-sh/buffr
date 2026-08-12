@@ -6,7 +6,8 @@
  input{display:block;width:300px;height:40px;font-size:16px;margin:12px 0}
  #pad{height:60px}</style>
 <h1>page autofocuses on load</h1>
-<!-- No user gesture happened, so this must NOT put the browser in Insert. -->
+<!-- No user gesture: the page's own .focus() must still reach Insert — a
+     caret has to accept typing (see the Focus-handler note in buffr-app). -->
 <div id="pad"></div>
 <input id="auto" type="text" placeholder="autofocused" autofocus>
 <script>

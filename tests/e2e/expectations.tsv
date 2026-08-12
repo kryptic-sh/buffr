@@ -9,7 +9,7 @@ shadow_open.html	insert	focusin retargets to the shadow host
 shadow_closed.html	normal	closed shadow root is opaque to injection (backlog E2)
 shadow_nested.html	insert	two shadow boundaries deep
 shadow_delegates_focus.html	insert	delegatesFocus puts the host in activeElement
-async_focus.html	insert	focus 600ms later, past the old intent window
+async_focus.html	insert	focus 600ms later, long after load
 modal_late.html	insert	dialog focuses its input two rAFs later
 dynamic_input.html	insert	field created then focused
 react_rerender.html	insert	focused node replaced by a keyed re-render
