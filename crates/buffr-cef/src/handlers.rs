@@ -1044,7 +1044,10 @@ wrap_display_handler! {
             // hint.js emits `__buffr_hint__:<nonce>:{...}` lines. The hint
             // nonce rotates per session, so a nonce leaked during one
             // session is dead by the next `enter_hint_mode`.
-            if let Some(parsed) = parse_console_event(&text, &self.console_nonces.hint(browser_id)) {
+            if text.starts_with(buffr_core::hint::HINT_CONSOLE_SENTINEL)
+                && let Some(parsed) =
+                    parse_console_event(&text, &self.console_nonces.hint(browser_id))
+            {
                 match parsed {
                     Ok(event) => {
                         buffr_core::hint::push_hint_event(&self.hint_sink, browser_id, event);
@@ -1055,43 +1058,49 @@ wrap_display_handler! {
                 }
             }
 
-            // ---- edit mode IPC ------------------------------------------
+            // ---- edit mode IPC + media probe ----------------------------
             // edit.js emits `__buffr_edit__:<nonce>:{...}` lines on
-            // focus/blur/mutate. The page nonce is minted per main-frame
-            // load by `BuffrLoadHandler::on_load_end`.
-            let page_nonce = self.console_nonces.page(browser_id);
-            if let Some(parsed) = buffr_core::edit::parse_console_event(&text, &page_nonce) {
-                match parsed {
-                    Ok(event) => {
-                        buffr_core::edit::push_edit_event(&self.edit_sink, browser_id, event);
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, line = %redact_console_text(&text), "edit: malformed console event");
+            // focus/blur/mutate; media_probe_poll.js emits
+            // `__buffr_media__:<nonce>:{...}` lines on every transition.
+            // Both authenticate against the page nonce (minted per
+            // main-frame load by `BuffrLoadHandler::on_load_end`). Fetch it
+            // only when the line could be one of these, so a hint line
+            // doesn't pay the page-nonce lock + String clone.
+            if text.starts_with(buffr_core::edit::EDIT_CONSOLE_SENTINEL)
+                || text.starts_with(buffr_core::media_probe::MEDIA_PROBE_SENTINEL)
+            {
+                let page_nonce = self.console_nonces.page(browser_id);
+                if let Some(parsed) = buffr_core::edit::parse_console_event(&text, &page_nonce) {
+                    match parsed {
+                        Ok(event) => {
+                            buffr_core::edit::push_edit_event(&self.edit_sink, browser_id, event);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, line = %redact_console_text(&text), "edit: malformed console event");
+                        }
                     }
                 }
-            }
 
-            // ---- media probe IPC ----------------------------------------
-            // media_probe_poll.js emits `__buffr_media__:<nonce>:{...}`
-            // lines on every transition. Flip the shared video_active
-            // atomic so the apps-layer idle-inhibit policy picks it up next
-            // tick — which is exactly why the nonce matters here: an
-            // unauthenticated `{"video":true}` loop pins the platform idle
-            // inhibitor on and the user's screen never locks.
-            if let Some(parsed) = buffr_core::media_probe::parse(&text, &page_nonce) {
-                match parsed {
-                    Ok(event) => {
-                        self.video_active
-                            .store(event.video, std::sync::atomic::Ordering::Relaxed);
-                        tracing::debug!(
-                            target: "buffr_core::media_probe",
-                            media = event.media,
-                            video = event.video,
-                            "media probe transition"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, line = %redact_console_text(&text), "media_probe: malformed sentinel");
+                // Media probe: flipping the shared video_active atomic
+                // makes the apps-layer idle-inhibit policy pick it up next
+                // tick — which is exactly why the nonce matters here: an
+                // unauthenticated `{"video":true}` loop pins the platform
+                // idle inhibitor on and the user's screen never locks.
+                if let Some(parsed) = buffr_core::media_probe::parse(&text, &page_nonce) {
+                    match parsed {
+                        Ok(event) => {
+                            self.video_active
+                                .store(event.video, std::sync::atomic::Ordering::Relaxed);
+                            tracing::debug!(
+                                target: "buffr_core::media_probe",
+                                media = event.media,
+                                video = event.video,
+                                "media probe transition"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, line = %redact_console_text(&text), "media_probe: malformed sentinel");
+                        }
                     }
                 }
             }
