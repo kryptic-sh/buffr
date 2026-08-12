@@ -430,10 +430,13 @@ fn handle_connection(stream: TcpStream, routes: &Routes, token: &str, port: u16)
     // DNS-rebinding defence: a browser always sends `Host`, and a page
     // on `http://attacker.example` that has rebound its name to
     // 127.0.0.1 sends `Host: attacker.example`. Only our own
-    // loopback authority is accepted.
-    if let Some(host) = host_header.as_deref()
-        && !host_is_ours(host, port)
-    {
+    // loopback authority is accepted. A request with no `Host` at all
+    // is not a browser (HTTP/1.1 requires it); fail closed rather than
+    // letting it through on the assumption it is ours.
+    let Some(host) = host_header.as_deref() else {
+        return write_status(stream, 400, "Bad Request", b"missing Host header");
+    };
+    if !host_is_ours(host, port) {
         return write_status(stream, 403, "Forbidden", b"bad Host header");
     }
 
@@ -713,6 +716,20 @@ mod tests {
         let buf = raw_exchange(server.addr(), &req);
         let status = std::str::from_utf8(&buf).unwrap();
         assert!(status.starts_with("HTTP/1.1 405"), "got: {status}");
+    }
+
+    #[test]
+    fn rejects_missing_host_header() {
+        let routes = Routes::new().html("/new", Arc::new(|| b"unused".to_vec()));
+        let server = InternalServer::start(routes).expect("start");
+        let path = format!("/{}/new", server.token());
+
+        // No Host header at all — the DNS-rebinding defence must fail
+        // closed instead of treating "no Host" as ours.
+        let req = format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n");
+        let buf = raw_exchange(server.addr(), &req);
+        let status = std::str::from_utf8(&buf).unwrap();
+        assert!(status.starts_with("HTTP/1.1 400"), "got: {status}");
     }
 
     #[test]
