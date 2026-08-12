@@ -599,6 +599,18 @@ mod tests {
     }
 
     #[test]
+    fn default_hint_alphabet_matches_config() {
+        // `HintConfig::default` cannot import the core const (config →
+        // core dep cycle) and duplicates the literal; this pins the two
+        // copies together so a drift fails here rather than shipping a
+        // label set the config silently overrides.
+        assert_eq!(
+            DEFAULT_HINT_ALPHABET,
+            buffr_config::HintConfig::default().alphabet
+        );
+    }
+
+    #[test]
     fn alphabet_rejects_single_char() {
         assert_eq!(
             HintAlphabet::from_str("a"),
