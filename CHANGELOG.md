@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.12] - 2026-08-13
+
 ### Fixed
 
 - Fixed a frozen-screen bug where the loaded page never replaced the loading
@@ -2361,7 +2363,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.11...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.12...HEAD
+[0.14.12]: https://github.com/kryptic-sh/buffr/compare/v0.14.11...v0.14.12
 [0.14.11]: https://github.com/kryptic-sh/buffr/compare/v0.14.10...v0.14.11
 [0.14.10]: https://github.com/kryptic-sh/buffr/compare/v0.14.9...v0.14.10
 [0.12.0]: https://github.com/kryptic-sh/buffr/releases/tag/v0.12.0
