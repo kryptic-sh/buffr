@@ -117,9 +117,15 @@ has observed.
   headers and by grep, but the crate cannot compile in this environment
   (`wpewebkit-2.0` absent) and is not built by CI — the first real compile is
   still owed.
-- **The 2026-08-04 render-path fixes (P2/P3/P6/N5) are unit-verified only.** The
-  banded chrome upload, scratch recycling and acquire-before-paint run under a
-  live compositor; no Wayland session was available to smoke them.
+- **The 2026-08-04 render-path fixes (P2/P3/P6/N5) were smoke-tested headless on
+  2026-08-13** under sway + llvmpipe — and the smoke caught a real bug: the
+  scratch-recycling change (`e924f92`) never cleared the reused chrome buffer
+  (`Vec::resize` is a no-op at unchanged length), so the loading animation's
+  opaque browser-region fill occluded the page forever. Fixed in `267dd9a`
+  (`take_cleared_chrome_buffer` clears before resizing; regression-tested). The
+  banded chrome upload and acquire-before-paint were exercised and are fine; the
+  startup `vkAcquireNextImageKHR` fence-in-use validation noise seen under
+  llvmpipe is benign (renders correctly) and predates the perf pass.
 - **`buffr-src:` allow-list (M13) is untested at runtime.** The scheme dropped
   `CORS_ENABLED | FETCH_ENABLED` and gained a scheme/host check. "View page
   source" needs a manual pass, including on a `buffr://` internal page.
