@@ -151,8 +151,10 @@ fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
 
     // Shared libraries. Linux ships ~6 runtime .so files alongside libcef.so
     // (libEGL, libGLESv2, libvk_swiftshader, libvulkan, etc.) plus
-    // vk_swiftshader_icd.json. Copy all of them so dev runs don't hit
-    // "libGLESv2.so: cannot open shared object file" in the GPU subprocess.
+    // vk_swiftshader_icd.json and the chrome-sandbox SUID helper. Copy all of
+    // them so dev runs don't hit "libGLESv2.so: cannot open shared object
+    // file" in the GPU subprocess and the sandbox helper is staged for CI
+    // jobs that chown/chmod it to root:4755.
     #[cfg(target_os = "linux")]
     {
         if lib_dir.exists() {
@@ -168,6 +170,7 @@ fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
                         || name.starts_with("libvk_swiftshader.so")
                         || name.starts_with("libvulkan.so")
                         || name == "vk_swiftshader_icd.json"
+                        || name == "chrome-sandbox"
                     {
                         copy_into_dir(&path, &target_dir)?;
                     }
