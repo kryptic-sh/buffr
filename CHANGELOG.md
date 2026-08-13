@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.13] - 2026-08-13
+
+### Fixed
+
+- Fixed the Linux CI e2e/smoke jobs failing before the suite ran: nothing staged
+  CEF's `chrome-sandbox` SUID helper into `target/debug`, so the jobs depended
+  on a stale copy lingering in the target cache (a fresh build after a version
+  bump had none). `buffr-cef`'s build script now copies it alongside the rest of
+  the CEF runtime. This release also ships the frozen-screen render fix from
+  0.14.12, whose tag CI failed before any package was published.
+
 ## [0.14.12] - 2026-08-13
 
 ### Fixed
@@ -2363,7 +2374,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.12...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.13...HEAD
+[0.14.13]: https://github.com/kryptic-sh/buffr/compare/v0.14.12...v0.14.13
 [0.14.12]: https://github.com/kryptic-sh/buffr/compare/v0.14.11...v0.14.12
 [0.14.11]: https://github.com/kryptic-sh/buffr/compare/v0.14.10...v0.14.11
 [0.14.10]: https://github.com/kryptic-sh/buffr/compare/v0.14.9...v0.14.10
