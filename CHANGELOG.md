@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a frozen-screen bug where the loaded page never replaced the loading
+  animation: the recycled chrome paint buffer was not actually cleared between
+  frames (the perf work that reused the ~8 MB buffer made `Vec::resize(len, 0)`
+  a no-op when the worker returned the buffer at the same length), so the
+  animation's opaque fill of the browser region stayed in the chrome texture and
+  occluded the page forever. Every dirty frame now starts with a fully zeroed
+  buffer; regression tests cover the recycling.
+
 ## [0.14.11] - 2026-08-13
 
 ### Fixed

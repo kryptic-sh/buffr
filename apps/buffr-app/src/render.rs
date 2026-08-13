@@ -1103,6 +1103,29 @@ impl Renderer {
         latest
     }
 
+    /// Prepare the chrome paint buffer for a dirty frame: take the recycled
+    /// buffer (or allocate a fresh one) and zero it fully.
+    ///
+    /// Zeroing is not optional. The worker returns the buffer via the stats
+    /// channel at the *same length* it was sent, so `Vec::resize(len, 0)` alone
+    /// is a no-op and the previous frame's pixels survive into the next one —
+    /// most damagingly the loading animation's opaque fill of the browser
+    /// region, which then occludes the OSR page forever after the animation
+    /// deactivates (the deactivation frame only repaints the strips, leaving
+    /// the browser-region rows to whatever the buffer already held).
+    fn take_cleared_chrome_buffer(
+        scratch: &mut Option<Vec<u32>>,
+        lw: usize,
+        lh: usize,
+    ) -> Vec<u32> {
+        let mut buf = scratch
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(lw * lh));
+        buf.clear();
+        buf.resize(lw * lh, 0u32);
+        buf
+    }
+
     /// Composite one frame.
     ///
     /// UI thread responsibilities:
@@ -1296,13 +1319,10 @@ impl Renderer {
             let lh = self.chrome_lh as usize;
             // Zero the buffer first so previous chrome state doesn't bleed
             // into rows that are now transparent (e.g. after CEF rect shrinks).
-            // `resize` reuses the recycled allocation when the capacity fits;
-            // on a window resize it reallocates to the new dims — correct.
-            let mut buf = self
-                .chrome_scratch
-                .take()
-                .unwrap_or_else(|| Vec::with_capacity(lw * lh));
-            buf.resize(lw * lh, 0u32);
+            // The worker returns the buffer at the same length it was sent,
+            // so `resize` alone would be a no-op — see
+            // `take_cleared_chrome_buffer`.
+            let mut buf = Self::take_cleared_chrome_buffer(&mut self.chrome_scratch, lw, lh);
             paint_chrome(&mut buf, lw, lh);
             Some(buf)
         } else {
@@ -1794,5 +1814,38 @@ mod chrome_band_tests {
         let (top, bottom) = chrome_upload_bands(1280, 800, 5000, 30);
         assert_eq!(top, Some(band(0, 800, 0)));
         assert_eq!(bottom, None);
+    }
+}
+
+#[cfg(test)]
+mod chrome_scratch_tests {
+    use super::Renderer;
+
+    /// Regression for the frozen-frame bug: the render worker hands the
+    /// chrome buffer back via the stats channel at the *same length* it
+    /// was sent, so `Vec::resize(len, 0)` was a no-op and the previous
+    /// frame's pixels survived into the next dirty frame — most damagingly
+    /// the loading animation's opaque fill of the browser region, which
+    /// occluded the OSR page forever after the animation deactivated.
+    #[test]
+    fn recycled_chrome_buffer_is_fully_cleared() {
+        let mut scratch = Some(vec![0xDEAD_BEEFu32; 4 * 4]);
+        let buf = Renderer::take_cleared_chrome_buffer(&mut scratch, 4, 4);
+        assert_eq!(buf.len(), 4 * 4);
+        assert!(
+            buf.iter().all(|&p| p == 0),
+            "recycled buffer must be zeroed, not left with last frame's pixels"
+        );
+        assert!(scratch.is_none(), "the recycled buffer was taken for reuse");
+    }
+
+    /// A buffer recycled at a smaller size than the new frame reallocates
+    /// and is still fully zeroed.
+    #[test]
+    fn recycled_buffer_grows_and_clears() {
+        let mut scratch = Some(vec![0xDEAD_BEEFu32; 2 * 2]);
+        let buf = Renderer::take_cleared_chrome_buffer(&mut scratch, 8, 8);
+        assert_eq!(buf.len(), 8 * 8);
+        assert!(buf.iter().all(|&p| p == 0));
     }
 }
