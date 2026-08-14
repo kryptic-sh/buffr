@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.14] - 2026-08-14
+
 ### Fixed
 
 - Fixed the browser chrome (tab strip pills and the statusline) not rendering at
@@ -2385,7 +2387,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.13...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.14...HEAD
+[0.14.14]: https://github.com/kryptic-sh/buffr/compare/v0.14.13...v0.14.14
 [0.14.13]: https://github.com/kryptic-sh/buffr/compare/v0.14.12...v0.14.13
 [0.14.12]: https://github.com/kryptic-sh/buffr/compare/v0.14.11...v0.14.12
 [0.14.11]: https://github.com/kryptic-sh/buffr/compare/v0.14.10...v0.14.11
