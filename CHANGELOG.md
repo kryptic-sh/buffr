@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the browser chrome (tab strip pills and the statusline) not rendering at
+  all: the chrome-paint closure gated on optional overlays (`Some(...)` for the
+  pinned-close confirm, permissions prompt, omnibar and context menu), which are
+  `None` unless such an overlay is open — so the whole paint was a no-op on
+  every normal frame and the strip + statusline showed as the transparent
+  swapchain clear color. The closure now requires only the always-present strip
+  widgets and passes the overlays through optionally. A new pixel-based render
+  e2e suite covers it.
+
 ## [0.14.13] - 2026-08-13
 
 ### Fixed

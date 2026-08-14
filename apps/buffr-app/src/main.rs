@@ -3763,21 +3763,12 @@ impl AppState {
         // arms differ only in what they hand the renderer as the OSR layer
         // (and, for `Animation`, in the splash blit layered on top).
         let paint_strips = |buf: &mut [u32], w: usize| {
-            let (
-                Some(statusline),
-                Some(tab_strip),
-                Some(confirm_close_pinned),
-                Some(permissions_prompt),
-                Some(overlay_data),
-                Some(context_menu_overlay),
-            ) = (
-                statusline.as_ref(),
-                tab_strip.as_ref(),
-                confirm_close_pinned.as_ref(),
-                permissions_prompt.as_ref(),
-                overlay_data.as_ref(),
-                context_menu_overlay.as_ref(),
-            )
+            // Only the strip widgets are required every dirty frame; the
+            // overlays are optional and must NOT gate the whole paint (a
+            // `Some(...)` guard on them made this closure a no-op whenever
+            // no confirm/prompt/omnibar/menu was open — the tab strip and
+            // statusline never painted, leaving the chrome transparent).
+            let (Some(statusline), Some(tab_strip)) = (statusline.as_ref(), tab_strip.as_ref())
             else {
                 // Chrome not repainted this frame — nothing to paint.
                 return;
@@ -3791,10 +3782,10 @@ impl AppState {
                 tab_y,
                 notice_y,
                 current_notice.as_ref(),
-                Some(*confirm_close_pinned),
-                Some(permissions_prompt),
-                Some(overlay_data),
-                Some(context_menu_overlay),
+                confirm_close_pinned,
+                permissions_prompt.as_ref(),
+                overlay_data.as_ref(),
+                context_menu_overlay.as_ref(),
             );
         };
         let res = match paint_path {

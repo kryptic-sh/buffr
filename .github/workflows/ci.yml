@@ -146,7 +146,8 @@ jobs:
             libgl1 libegl1 libgles2 \
             libglib2.0-dev \
             sway xwayland \
-            mesa-vulkan-drivers vulkan-tools
+            mesa-vulkan-drivers vulkan-tools \
+            grim imagemagick
 
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -183,6 +184,9 @@ jobs:
 
       - name: run edit-mode e2e suite
         run: ./tests/e2e/suite.sh
+
+      - name: run render e2e suite
+        run: ./tests/e2e/render_suite.sh
 
   smoke:
     # Cross-platform event-loop smoke. Builds buffr-app + supervisor
