@@ -600,9 +600,6 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   identical `Heartbeat` struct + `mark_alive`/`is_fatal`/`tick` (69-169 vs
   623-718) can share a non-cfg block. Caveat: the Windows arm is not compiled
   locally; a Windows CI round-trip proves it.
-- **Deadline-clamp idiom ×9** — event*loop.rs:2024-2027, 2033-2036, 2039-2042,
-  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each
-  `let deadline = match self.X { Some(at) if at < deadline => at, * => deadline }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
 - **`cli.rs` `open_*_for_cli` ×5** (cli.rs:46-52, 88-94, 130-136, 156-162,
   191-197) — identical "profile_paths → create_dir_all(data) → store open"
   scaffolding differing only in the store constructor. One helper taking
