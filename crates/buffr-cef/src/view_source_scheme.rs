@@ -518,17 +518,16 @@ fn fetch_and_render(url: &str, initiator_host: Option<&str>) -> String {
     }
 
     let result = (|| -> Result<Vec<u8>, String> {
-        let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(10)))
-            .timeout_recv_response(Some(std::time::Duration::from_secs(10)))
-            // §16-2: never follow redirects — `validate_target` gates the
-            // URL it is given, and every hop after a 3xx would be fetched
-            // with no re-validation, so a public origin could 302 into a
-            // loopback/RFC1918 address. `max_redirects(0)` returns the 3xx
-            // as-is, which the 200..300 check below turns into an error page.
-            .max_redirects(0)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+        // Shared agent (buffr_core::http): 10 s timeouts, buffr UA, and
+        // §16-2: never follow redirects — `validate_target` gates the URL it
+        // is given, and every hop after a 3xx would be fetched with no
+        // re-validation, so a public origin could 302 into a
+        // loopback/RFC1918 address. `max_redirects(0)` returns the 3xx as-is,
+        // which the 200..300 check below turns into an error page.
+        let agent = buffr_core::http::agent(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+        );
 
         let mut resp = agent
             .get(url)

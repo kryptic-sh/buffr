@@ -25,7 +25,6 @@ use std::time::Duration;
 
 const FETCH_TIMEOUT_CONNECT: Duration = Duration::from_secs(5);
 const FETCH_TIMEOUT_READ: Duration = Duration::from_secs(15);
-const USER_AGENT: &str = concat!("buffr/", env!("CARGO_PKG_VERSION"));
 
 /// Maximum bytes accepted from an image source before refusing (16 MiB,
 /// generous for images). Applies to both http(s) bodies and decoded `data:`
@@ -108,13 +107,7 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// into a loopback or RFC1918 address. A 3xx is returned as-is instead of
 /// being followed.
 fn build_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(FETCH_TIMEOUT_CONNECT))
-        .timeout_recv_response(Some(FETCH_TIMEOUT_READ))
-        .user_agent(USER_AGENT)
-        .max_redirects(0)
-        .build();
-    ureq::Agent::new_with_config(config)
+    crate::http::agent(FETCH_TIMEOUT_CONNECT, FETCH_TIMEOUT_READ)
 }
 
 /// Reject `http(s)` URLs whose host is loopback, private, link-local or

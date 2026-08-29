@@ -30,10 +30,6 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// User-Agent set on every GitHub API request. GitHub rejects requests
-/// without one, so this is mandatory.
-const USER_AGENT: &str = concat!("buffr/", env!("CARGO_PKG_VERSION"));
-
 // `UpdateConfig` is defined in `buffr-config` (the [updates] section
 // of the user TOML) and re-exported here for convenience.
 pub use buffr_config::UpdateConfig;
@@ -101,17 +97,11 @@ pub struct UreqClient;
 
 impl HttpClient for UreqClient {
     fn get(&self, url: &str) -> Result<String, String> {
-        let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_recv_response(Some(Duration::from_secs(5)))
-            .user_agent(USER_AGENT)
-            // Never follow redirects: the release URL is pinned, and a
-            // browser-process fetch must not silently land on an
-            // attacker-chosen hop. A 3xx comes back as-is and fails the
-            // caller's status check.
-            .max_redirects(0)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+        // Shared agent: bounded timeouts, buffr UA, and no redirects — a
+        // browser-process fetch must not silently land on an
+        // attacker-chosen hop; a 3xx comes back as-is and fails the
+        // caller's status check.
+        let agent = crate::http::agent(Duration::from_secs(5), Duration::from_secs(5));
         let mut resp = agent
             .get(url)
             .header("Accept", "application/vnd.github+json")

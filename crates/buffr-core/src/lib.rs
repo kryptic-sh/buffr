@@ -21,6 +21,7 @@ pub mod favicon;
 pub mod favicon_cache;
 pub mod find;
 pub mod hint;
+pub mod http;
 pub mod image_copy;
 pub mod inhibit;
 pub mod media_probe;
