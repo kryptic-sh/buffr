@@ -1600,6 +1600,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 Ok(w) => Arc::new(w),
                 Err(err) => {
                     warn!(error = %err, browser_id = created.browser_id, "popup: create_window failed");
+                    // Close the popup *browser* so its OSR frame/view are
+                    // drained and it doesn't linger registered but unrendered
+                    // (audio/JS keep running; nothing else would close it).
+                    if let Some(engine) = self.active_engine_dyn() {
+                        engine.popup_close(created.browser_id);
+                    }
                     continue;
                 }
             };
@@ -1611,6 +1617,12 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 Ok(r) => r,
                 Err(err) => {
                     warn!(error = %err, browser_id = created.browser_id, "popup: renderer init failed");
+                    // Same as the create-window failure above: without this
+                    // the CEF popup browser outlives us with no window and
+                    // no path to teardown until shutdown.
+                    if let Some(engine) = self.active_engine_dyn() {
+                        engine.popup_close(created.browser_id);
+                    }
                     continue;
                 }
             };
