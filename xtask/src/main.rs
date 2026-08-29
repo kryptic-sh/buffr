@@ -39,6 +39,27 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 
 const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
+
+/// Per-phase timeouts for CEF downloads (hardening §22): the default
+/// ureq agent has no timeouts at all, so a hung CDN stalls CI until the
+/// runner timeout. Per-phase, not global: the archive is ~150 MB and a
+/// slow-but-alive connection must be allowed to finish. `recv_body`
+/// restarts per read, so it bounds "no bytes arrived" stalls, not total
+/// download time.
+const FETCH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const FETCH_RECV_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FETCH_RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// ureq agent for CEF index + archive fetches with the timeouts above.
+fn fetch_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(FETCH_CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(FETCH_RECV_RESPONSE_TIMEOUT))
+        .timeout_recv_body(Some(FETCH_RECV_BODY_TIMEOUT))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 /// CEF major version we pin against the `cef` crate (148.x).
 ///
 /// Spotify CDN entries look like `cef_binary_148.0.10+gXXXXX+chromium-...`;
@@ -219,7 +240,8 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
 
     let index_url = format!("{DEFAULT_CDN}/index.json");
     eprintln!("xtask: fetching index from {index_url}");
-    let index: CefIndex = ureq::get(&index_url)
+    let index: CefIndex = fetch_agent()
+        .get(&index_url)
         .call()
         .context("fetching CEF index.json")?
         .body_mut()
@@ -379,7 +401,8 @@ const MAX_CEF_EXTRACTED_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
 
 fn download(url: &str, dest: &Path) -> Result<()> {
     eprintln!("xtask: downloading {url}");
-    let resp = ureq::get(url)
+    let resp = fetch_agent()
+        .get(url)
         .call()
         .with_context(|| format!("GET {url}"))?;
     let mut reader = resp.into_body().into_reader();
