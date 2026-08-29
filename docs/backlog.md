@@ -1086,11 +1086,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   labels escaper hint.rs:508-531, `crates/buffr-cef/src/host.rs:2845-2872`
   (`json_string_literal`). Promote one to `pub` in buffr-core, delete the other
   two bodies.
-- **A-T2 — delete two zero-caller `pub` fns** (whole-workspace rg verified):
-  `crates/buffr-core/src/hint.rs:472-474` (`parse_payload`) and
-  `crates/buffr-core/src/media_probe.rs:57-59` (`parse_payload`). The would-be
-  consumer (webkit) documents that payloads never reach Rust (runtime.rs:4860).
-  `edit::parse_payload` stays — it is the live decode step (edit.rs:203).
 - **A-T4 — third near-identical ureq agent config** (timeout/UA/
   `max_redirects(0)`): updates.rs:104-114, image_copy.rs:111-118,
   view_source_scheme.rs:521-531. One `buffr_core` helper returning a configured
