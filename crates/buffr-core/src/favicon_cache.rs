@@ -188,8 +188,12 @@ impl FaviconCache {
             );
             return None;
         }
+        // `bgra.len()` is a verified multiple of 4 (see the length guard
+        // above), so `as_chunks`'s remainder is always empty.
         let pixels: Vec<u32> = bgra
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let b = c[0] as u32;
                 let g = c[1] as u32;
