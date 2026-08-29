@@ -103,12 +103,21 @@ pub const CONSOLE_LOG_ENV: &str = "BUFFR_LOG_CONSOLE";
 /// Byte budget for a non-sentinel console line before it is truncated.
 const CONSOLE_LOG_MAX_LEN: usize = 120;
 
+/// Byte budget for a sentinel-prefixed line before it is truncated.
+///
+/// Larger than [`CONSOLE_LOG_MAX_LEN`] because these carry our own protocol
+/// (nonce + JSON payload) and the full line is genuinely useful for debugging
+/// a malformed event. Still bounded: a page that knows the sentinel string
+/// (handlers.rs:109-111) can emit arbitrarily long authentic-looking lines,
+/// and logging them verbatim is the A-A1 unbounded-log vector.
+const CONSOLE_SENTINEL_LOG_MAX_LEN: usize = 512;
+
 /// Sentinel prefixes emitted by buffr's own injected scripts. These are
-/// protocol, not user content, so they are logged in full.
+/// protocol, not user content, so they get a larger logging budget.
 ///
 /// Note this is a *logging* policy only — a page can trivially prefix a
-/// line with one of these and get it logged verbatim. Authenticity is
-/// decided by the nonce check in the parsers, not here.
+/// line with one of these and get it logged. Authenticity is decided by the
+/// nonce check in the parsers, not here.
 const CONSOLE_SENTINEL_PREFIXES: &[&str] = &[
     buffr_core::hint::HINT_CONSOLE_SENTINEL,
     buffr_core::edit::EDIT_CONSOLE_SENTINEL,
@@ -128,21 +137,13 @@ fn console_logging_enabled() -> bool {
     })
 }
 
-/// Truncate a console line unless it is one of buffr's own sentinels.
-///
-/// Truncation is on a char boundary so page-controlled UTF-8 can never
-/// panic the slicing.
-fn redact_console_text(text: &str) -> std::borrow::Cow<'_, str> {
-    if CONSOLE_SENTINEL_PREFIXES
-        .iter()
-        .any(|p| text.starts_with(p))
-    {
+/// Truncate a console line to `budget` bytes, on a char boundary so
+/// page-controlled UTF-8 can never panic the slicing.
+fn truncate_console_text(text: &str, budget: usize) -> std::borrow::Cow<'_, str> {
+    if text.len() <= budget {
         return std::borrow::Cow::Borrowed(text);
     }
-    if text.len() <= CONSOLE_LOG_MAX_LEN {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut end = CONSOLE_LOG_MAX_LEN;
+    let mut end = budget;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -151,6 +152,21 @@ fn redact_console_text(text: &str) -> std::borrow::Cow<'_, str> {
         &text[..end],
         text.len() - end
     ))
+}
+
+/// Bound a console line for logging: sentinel-prefixed lines (our own
+/// protocol) get [`CONSOLE_SENTINEL_LOG_MAX_LEN`], everything else gets
+/// [`CONSOLE_LOG_MAX_LEN`].
+fn redact_console_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let budget = if CONSOLE_SENTINEL_PREFIXES
+        .iter()
+        .any(|p| text.starts_with(p))
+    {
+        CONSOLE_SENTINEL_LOG_MAX_LEN
+    } else {
+        CONSOLE_LOG_MAX_LEN
+    };
+    truncate_console_text(text, budget)
 }
 
 // L17: `make_load_handler` / `make_display_handler` /
@@ -1825,6 +1841,62 @@ mod tests {
 
     fn raw_flagged(source: T, flag: T) -> u32 {
         source as u32 | flag as u32
+    }
+
+    #[test]
+    fn sentinel_lines_are_bounded_like_everything_else() {
+        // A-A1: a page that knows a sentinel string can emit arbitrarily
+        // long authentic-looking lines; they must be truncated, not logged
+        // verbatim (the old code returned them Borrowed in full).
+        let long = format!(
+            "{}<nonce>:{}",
+            buffr_core::edit::EDIT_CONSOLE_SENTINEL,
+            "A".repeat(10_000)
+        );
+        let redacted = redact_console_text(&long);
+        assert!(
+            redacted.len() < 600,
+            "sentinel line must be capped, got {}",
+            redacted.len()
+        );
+        assert!(redacted.contains("bytes truncated"));
+    }
+
+    #[test]
+    fn short_sentinel_line_passes_through() {
+        let line = format!(
+            "{}<nonce>:{}",
+            buffr_core::hint::HINT_CONSOLE_SENTINEL,
+            r#"{"kind":"ready","hints":[]}"#
+        );
+        assert_eq!(redact_console_text(&line), line);
+    }
+
+    #[test]
+    fn plain_lines_keep_the_120_byte_budget() {
+        let short = "hello";
+        assert_eq!(redact_console_text(short), short);
+        let long = "x".repeat(500);
+        let redacted = redact_console_text(&long);
+        assert!(
+            redacted.len() <= 150,
+            "plain line capped at 120, got {}",
+            redacted.len()
+        );
+    }
+
+    #[test]
+    fn truncation_lands_on_a_char_boundary() {
+        // Multi-byte chars must not be sliced mid-codepoint.
+        let long = format!(
+            "{}<nonce>:{}",
+            buffr_core::media_probe::MEDIA_PROBE_SENTINEL,
+            "é".repeat(10_000)
+        );
+        let redacted = redact_console_text(&long);
+        assert!(redacted.is_char_boundary(redacted.len()));
+        // And the truncated prefix must itself be valid UTF-8.
+        std::str::from_utf8(redacted.as_bytes()).expect("redacted output is valid UTF-8");
     }
 
     #[test]
