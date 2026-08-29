@@ -206,16 +206,6 @@ impl ConsoleNonces {
             map.remove(&browser_id);
         }
     }
-
-    /// Number of tracked browsers (tests / diagnostics).
-    pub fn len(&self) -> usize {
-        self.inner.lock().map(|m| m.len()).unwrap_or(0)
-    }
-
-    /// Whether the table is empty (tests / diagnostics).
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[cfg(test)]
@@ -291,10 +281,10 @@ mod tests {
     #[test]
     fn unknown_browser_mints_rather_than_matching() {
         let nonces = ConsoleNonces::new();
-        assert!(nonces.is_empty());
         let a = nonces.page(42);
         assert_eq!(a.len(), CONSOLE_NONCE_LEN);
-        assert_eq!(nonces.len(), 1);
+        // The minted entry persists rather than re-rolling per lookup.
+        assert_eq!(nonces.page(42), a, "unknown-browser nonce must be stable");
     }
 
     #[test]
@@ -302,7 +292,6 @@ mod tests {
         let nonces = ConsoleNonces::new();
         let first = nonces.rotate_page(9);
         nonces.forget(9);
-        assert!(nonces.is_empty());
-        assert_ne!(nonces.page(9), first);
+        assert_ne!(nonces.page(9), first, "forgotten browser must mint afresh");
     }
 }
