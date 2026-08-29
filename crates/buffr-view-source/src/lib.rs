@@ -13,7 +13,7 @@
 //! assert!(html.starts_with("<!DOCTYPE html>"));
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -45,6 +45,13 @@ static GRAMMAR_ENV: OnceLock<Option<GrammarEnv>> = OnceLock::new();
 /// compiled query artifacts process-globally, keyed by content hash).
 /// `None` is cached when the environment itself cannot be built.
 static GRAMMARS: OnceLock<Mutex<HashMap<&'static str, Arc<Grammar>>>> = OnceLock::new();
+
+/// Languages whose grammar failed to load. A load failure is not
+/// transient — the artifact either exists on disk or it does not — so a
+/// failed dlopen is cached too, or every view-source request for that
+/// language re-runs the load + query parse before falling back to `<pre>`
+/// (perf §22 D-P2).
+static FAILED_GRAMMARS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 fn grammar_env() -> Option<&'static GrammarEnv> {
     GRAMMAR_ENV
@@ -126,8 +133,15 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
 
     // Grammar cache (perf §19-1): the dlopen + query parse runs once per
     // language per process. `lang_name` is `'static` (borrowed from the
-    // static registry), so it keys the map directly.
+    // static registry), so it keys the map directly. Load *failures* are
+    // cached too (perf §22 D-P2): a failed dlopen is not transient, so
+    // re-running it per request just repeats the work before the same
+    // `<pre>` fallback.
     let grammar = {
+        let failed = FAILED_GRAMMARS.get_or_init(|| Mutex::new(HashSet::new()));
+        if failed.lock().ok()?.contains(lang_name) {
+            return None;
+        }
         let cache = GRAMMARS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut cache = cache.lock().ok()?;
         if let Some(g) = cache.get(lang_name) {
@@ -137,6 +151,9 @@ fn try_highlight(url: &str, text: &str) -> Option<String> {
                 Ok(g) => Arc::new(g),
                 Err(e) => {
                     warn!("buffr-view-source: failed to load grammar '{lang_name}': {e:#}");
+                    if let Ok(mut failed) = failed.lock() {
+                        failed.insert(lang_name);
+                    }
                     return None;
                 }
             };
