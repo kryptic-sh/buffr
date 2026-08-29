@@ -967,22 +967,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Audit findings (security)
 
-- **C-A1 MEDIUM — font glyph cache is unbounded and is fed by page-controlled
-  text.** Where: `crates/buffr-ui/src/font.rs:39-58` — `glyph_entry` inserts
-  every first-seen `char` into a process-lifetime `HashMap` (`FACE` OnceLock,
-  font.rs:65); no eviction, no cap (verified: no clear/retain/remove anywhere in
-  font.rs). Tab titles and the URL statusline are page-controlled and walked per
-  painted frame, so a page rewriting `document.title` with fresh exotic
-  characters inserts ~20-50 new glyphs per dirty frame — hundreds of MB over a
-  long session. Truncation bounds chars-per-title per frame, slowing but not
-  capping.
-  ```
-  Repro: setInterval(() => document.title = <fresh random chars>)
-  Expect: bounded cache
-  Actual: every distinct char ever measured is retained for the process
-  ```
-  Fix: cap/flush the map past ~4k entries (re-rasterizing evicted glyphs is
-  cheap) or switch to an LRU.
 - **A-A2 LOW (caveated) — `on_console_message` converts every console line to a
   Rust String before any prefix gate.** Where: `handlers.rs:1005-1006`
   (`let text = message.to_string();`), sentinel fast-path and redaction only
