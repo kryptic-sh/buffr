@@ -948,21 +948,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Cross-cutting (flagged by two or more areas)
 
-1. **B-R1 MEDIUM — popup window/renderer build failure orphans the live CEF
-   popup browser.** Where: `apps/buffr-app/src/event_loop.rs:1601-1615`. The
-   `create_window` and `Renderer::new` error arms `continue` without
-   `engine.popup_close(...)` — only the cap path (:1578-1587) closes. The popup
-   browser stays registered in `popup_browsers`/`popup_frames`, keeps playing
-   audio and running JS, and nothing drains it until shutdown.
-   ```
-   Repro: page calls window.open() in a way that makes Toplevel::builder()
-          fail (or Renderer::new fail — GPU device loss)
-   Expect: browser closed, teardown drains through popup_close_sink
-   Actual: live CEF popup browser leaks for the session
-   ```
-   Fix: call `popup_close(created.browser_id)` in both error arms. Flagged from
-   two directions (the area-B review pass; same shape as the M16 leak).
-2. **C-P1 MEDIUM — context-menu paint re-measures every label per dirty frame;
+1. **C-P1 MEDIUM — context-menu paint re-measures every label per dirty frame;
    01fe932 cached the hit-test path but not the paint path.** Where:
    `crates/buffr-ui/src/context_menu.rs:133` (`paint` → `preferred_width()` →
    per-glyph locked walk over every label, context_menu.rs:102-110) from
@@ -971,7 +957,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
    (`ActiveContextMenu.panel_w`, apps context_menu.rs:107) already holds the
    identical value. Fix: store `panel_w`/`panel_h` on `ContextMenuOverlay` at
    construction, or thread the cached width into `paint`.
-3. **B-XA LOW — CEF pending-alloc eviction can mispair frame/view/url with the
+2. **B-XA LOW — CEF pending-alloc eviction can mispair frame/view/url with the
    next popup.** Where: `crates/buffr-cef/src/handlers.rs:284-290`
    (`on_before_popup` evicts the oldest alloc at the 32-cap, but still returns 0
    and lets CEF create the browser) + handlers.rs:296-317 (`on_after_created`
@@ -981,7 +967,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
    frames/URLs go to the wrong windows after a 32-popup burst. Fix: evict-oldest
    only when NOT allowing creation, or return a nonzero code to cancel that
    popup when the queue is full.
-4. **`html_escape` exists in four crates** (merged area-A tidy + verified
+3. **`html_escape` exists in four crates** (merged area-A tidy + verified
    wider): `crates/buffr-cef/src/html.rs:15`,
    `crates/buffr-view-source/ src/lib.rs:286`,
    `apps/buffr-app/src/main.rs:1218`, `crates/buffr-core` escaping inside
@@ -989,7 +975,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
    says it consolidated "two"). Extract one `pub` helper (buffr-core, already a
    dep of all four users' crates' siblings). Verified: same match arms in each
    copy.
-5. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
+4. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
    verified wider than reported): `buffr-ui/src/lib.rs:397-405` and
    `apps/buffr-app/src/main.rs:5811` return UPPERCASE;
    `buffr-modal/src/ keymap.rs:406-414` and `buffr-config/src/lib.rs:990-998`
