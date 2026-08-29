@@ -1052,13 +1052,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   Per anchor row on import: a 100k-bookmark export issues ~500k
   `sqlite3_prepare` calls inside one transaction. Fix: `prepare_cached` for the
   SELECT/INSERT/DELETE/tag-INSERT (and the `update` block at :200-217).
-- **D-P2 — view-source grammar load-failure is retried per request.** Where:
-  `crates/buffr-view-source/src/lib.rs:136-141` — on `Grammar::load_from_path`
-  failure the function returns `None` without caching, so every render of that
-  language repeats dlopen + query parse. Per view-source request
-  (user-triggered, bounded); a corrupt present artifact turns every render into
-  a failed load attempt. Fix: cache the negative result alongside the positive
-  map.
 - **D-P3 (noted, deliberate) — `buffr_lower` full-scans with two `to_lowercase`
   allocations per row per omnibar keystroke** (bookmarks/ src/lib.rs:566-580):
   the M40 tradeoff, documented in the crate; recorded so it is not re-derived.
