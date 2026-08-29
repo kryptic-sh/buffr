@@ -948,15 +948,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Cross-cutting (flagged by two or more areas)
 
-1. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
-   verified wider than reported): `buffr-ui/src/lib.rs:397-405` and
-   `apps/buffr-app/src/main.rs:5811` return UPPERCASE;
-   `buffr-modal/src/ keymap.rs:406-414` and `buffr-config/src/lib.rs:990-998`
-   return lowercase. Fix: one source in buffr-modal (`PageMode::name()`),
-   uppercase at the two call sites that need it (`.to_uppercase()` on a
-   `&'static str` is `Cow`-free for ASCII; or keep two thin wrappers over one
-   match).
-
 ### Audit findings (security)
 
 ### Tidy (behaviour-preserving)
