@@ -316,9 +316,6 @@ none of it is recoverable from `git log`.
 - `popup_close` uses `close_browser(0)` (host.rs:818) — a `beforeunload` handler
   on a popup may stall close, leaking the popup window + sinks until shutdown.
   Manual test owed with a `beforeunload` popup.
-- `--private --smoke-test` exits via `libc::_exit` before the `_private_tmp`
-  drop, leaking `$TMPDIR/buffr-private-<pid>-*` per smoke run (CI smoke does not
-  use `--private`, so no current trigger).
 
 ---
 
