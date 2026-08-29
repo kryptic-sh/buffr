@@ -600,10 +600,6 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   identical `Heartbeat` struct + `mark_alive`/`is_fatal`/`tick` (69-169 vs
   623-718) can share a non-cfg block. Caveat: the Windows arm is not compiled
   locally; a Windows CI round-trip proves it.
-- **"Last tab gone → graceful exit" ×3** — main.rs:2689-2703, main.rs:2729-2738,
-  context_menu.rs:638-644 all run
-  `save_session_now(); mark_clean_shutdown(); shutdown_flag.store(true); request_redraw();`.
-  Extract `fn request_exit`.
 - **Deadline-clamp idiom ×9** — event*loop.rs:2024-2027, 2033-2036, 2039-2042,
   2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each
   `let deadline = match self.X { Some(at) if at < deadline => at, * => deadline }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
