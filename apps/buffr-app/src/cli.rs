@@ -41,14 +41,26 @@ pub(crate) fn run_print_config(path: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the profile data dir and open a store file inside it.
+///
+/// Shared scaffolding for every `open_*_for_cli` below: resolve the
+/// standard profile paths, ensure the data dir exists, then hand the
+/// `<data>/<filename>` path to `open` (the store-specific constructor).
+pub(crate) fn open_store<T>(
+    filename: &str,
+    open: impl FnOnce(&std::path::Path) -> Result<T>,
+) -> Result<T> {
+    let paths = profile_paths().context("resolving profile dirs")?;
+    ensure_profile_data_dir(&paths)?;
+    open(&paths.data.join(filename))
+}
+
 /// Open the bookmarks store at the standard data path. Used by the
 /// CLI short-circuits below (no CEF init needed).
 pub(crate) fn open_bookmarks_for_cli() -> Result<buffr_bookmarks::Bookmarks> {
-    let paths = profile_paths().context("resolving profile dirs")?;
-    ensure_profile_data_dir(&paths)?;
-    let bm = buffr_bookmarks::Bookmarks::open(paths.data.join("bookmarks.sqlite"))
-        .context("opening bookmarks database")?;
-    Ok(bm)
+    open_store("bookmarks.sqlite", |path| {
+        buffr_bookmarks::Bookmarks::open(path).context("opening bookmarks database")
+    })
 }
 
 pub(crate) fn run_import_bookmarks(path: &std::path::Path) -> Result<()> {
@@ -86,11 +98,9 @@ pub(crate) fn run_list_bookmarks_tags() -> Result<()> {
 /// Open the downloads store at the standard data path. Used by the
 /// CLI short-circuits — no CEF init.
 pub(crate) fn open_downloads_for_cli() -> Result<buffr_downloads::Downloads> {
-    let paths = profile_paths().context("resolving profile dirs")?;
-    ensure_profile_data_dir(&paths)?;
-    let dl = buffr_downloads::Downloads::open(paths.data.join("downloads.sqlite"))
-        .context("opening downloads database")?;
-    Ok(dl)
+    open_store("downloads.sqlite", |path| {
+        buffr_downloads::Downloads::open(path).context("opening downloads database")
+    })
 }
 
 pub(crate) fn run_list_downloads() -> Result<()> {
@@ -128,11 +138,9 @@ pub(crate) fn run_clear_completed_downloads() -> Result<()> {
 /// Open the zoom store at the standard data path. Used by the CLI
 /// short-circuits — no CEF init.
 pub(crate) fn open_zoom_for_cli() -> Result<buffr_zoom::ZoomStore> {
-    let paths = profile_paths().context("resolving profile dirs")?;
-    ensure_profile_data_dir(&paths)?;
-    let z = buffr_zoom::ZoomStore::open(paths.data.join("zoom.sqlite"))
-        .context("opening zoom database")?;
-    Ok(z)
+    open_store("zoom.sqlite", |path| {
+        buffr_zoom::ZoomStore::open(path).context("opening zoom database")
+    })
 }
 
 pub(crate) fn run_list_zoom() -> Result<()> {
@@ -154,11 +162,9 @@ pub(crate) fn run_clear_zoom() -> Result<()> {
 /// short-circuits — no CEF init. Skip-schemes only matter for recording,
 /// not for reading, so we pass the canonical defaults.
 pub(crate) fn open_history_for_cli() -> Result<buffr_history::History> {
-    let paths = profile_paths().context("resolving profile dirs")?;
-    ensure_profile_data_dir(&paths)?;
-    let h = buffr_history::History::open(paths.data.join("history.sqlite"))
-        .context("opening history database")?;
-    Ok(h)
+    open_store("history.sqlite", |path| {
+        buffr_history::History::open(path).context("opening history database")
+    })
 }
 
 /// `--list-history` / `--search-history` short-circuit.
@@ -189,11 +195,9 @@ pub(crate) fn run_query_history(search: Option<&str>, limit: usize) -> Result<()
 /// Open the permissions store at the standard data path. Used by the
 /// CLI short-circuits — no CEF init.
 pub(crate) fn open_permissions_for_cli() -> Result<Permissions> {
-    let paths = profile_paths().context("resolving profile dirs")?;
-    ensure_profile_data_dir(&paths)?;
-    let p = Permissions::open(paths.data.join("permissions.sqlite"))
-        .context("opening permissions database")?;
-    Ok(p)
+    open_store("permissions.sqlite", |path| {
+        Permissions::open(path).context("opening permissions database")
+    })
 }
 
 pub(crate) fn run_list_permissions() -> Result<()> {
