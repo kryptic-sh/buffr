@@ -1007,13 +1007,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   (`[keymap.visual] j = ...`), where the count behaviour is arguably better —
   but code contradicts comment. Fix: widen the comment or narrow the guard,
   deliberately.
-- **A-R1 LOW — `on_audio_stream_error` resets the browser's whole stream count
-  to zero.** Where: `crates/buffr-cef/src/audio.rs:158-159`. Two playing
-  streams, one errors → `stream_count = 0; active = false`; the
-  indicator/idle-inhibit flip off while the sibling still plays, and the next
-  real `stopped` decrements a saturated 0. Fix:
-  `stream_count = stream_count.saturating_sub(1)` like the stopped path, keeping
-  the active=false edge only at 0.
 - **A-R2 LOW — find results are untagged; a background tab's in-flight find
   stream overwrites the active tab's statusline counts.** Where:
   `crates/buffr-cef/src/handlers.rs:552-585` pushes into the one-slot
