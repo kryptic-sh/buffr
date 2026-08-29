@@ -503,22 +503,7 @@ pub fn build_inject_script(
             labels_lit.push(',');
         }
         labels_lit.push('"');
-        for c in label.chars() {
-            match c {
-                '"' => labels_lit.push_str("\\\""),
-                '\\' => labels_lit.push_str("\\\\"),
-                '\n' => labels_lit.push_str("\\n"),
-                '\r' => labels_lit.push_str("\\r"),
-                '\t' => labels_lit.push_str("\\t"),
-                c if c.is_ascii_graphic() || c == ' ' => labels_lit.push(c),
-                c => {
-                    let mut buf = [0u16; 2];
-                    for unit in c.encode_utf16(&mut buf).iter() {
-                        labels_lit.push_str(&format!("\\u{unit:04x}"));
-                    }
-                }
-            }
-        }
+        labels_lit.push_str(&crate::js::escape(label));
         labels_lit.push('"');
     }
     labels_lit.push(']');
@@ -545,34 +530,12 @@ pub fn build_inject_script(
 /// fine for valid alphabets but defeats the spec's "ASCII-only,
 /// regardless of input" guarantee. Escape manually so the JS string
 /// literal is always pure ASCII.
+///
+/// Shared implementation in [`crate::js::escape`] (A-T1) — it escapes
+/// both quote characters, and `\"` inside the single-quoted splice
+/// evaluates to a bare `"`, so the extra escaping is harmless.
 fn json_string_inner(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            // Single-quote: the asset uses `'...'`, escape so the
-            // splice can't terminate the literal.
-            '\'' => out.push_str("\\'"),
-            // Backslash: belt-and-braces — serde_json would have
-            // escaped these but we're hand-rolling.
-            '\\' => out.push_str("\\\\"),
-            // Embedded newline / CR / tab → JS escapes.
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            // Plain printable ASCII passes through.
-            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
-            // Everything else (including double quotes inside JS
-            // strings, control chars, and non-ASCII): emit \uXXXX
-            // surrogate pairs for codepoints above the BMP.
-            c => {
-                let mut buf = [0u16; 2];
-                for unit in c.encode_utf16(&mut buf).iter() {
-                    out.push_str(&format!("\\u{unit:04x}"));
-                }
-            }
-        }
-    }
-    out
+    crate::js::escape(s)
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ pub mod html;
 pub mod http;
 pub mod image_copy;
 pub mod inhibit;
+pub mod js;
 pub mod media_probe;
 pub mod open_finder;
 pub mod private_net;

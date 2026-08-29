@@ -2842,31 +2842,14 @@ impl BrowserHost {
 /// Format a string as a JS double-quoted literal, escaping every
 /// non-ASCII codepoint to `\uXXXX`. Used for the inline filter call
 /// so the splice survives any input the user might type.
-const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
-
+///
+/// Shared implementation in [`buffr_core::js::escape`] (A-T1): it also
+/// escapes `'`, which inside a double-quoted literal evaluates to a
+/// bare `'` — harmless.
 fn json_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
-            c => {
-                let mut buf = [0u16; 2];
-                for unit in c.encode_utf16(&mut buf).iter() {
-                    out.push_str("\\u");
-                    out.push(LOWER_HEX[(unit >> 12) as usize] as char);
-                    out.push(LOWER_HEX[((unit >> 8) & 0x0F) as usize] as char);
-                    out.push(LOWER_HEX[((unit >> 4) & 0x0F) as usize] as char);
-                    out.push(LOWER_HEX[(unit & 0x0F) as usize] as char);
-                }
-            }
-        }
-    }
+    out.push_str(&buffr_core::js::escape(s));
     out.push('"');
     out
 }
