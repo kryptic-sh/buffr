@@ -948,16 +948,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Cross-cutting (flagged by two or more areas)
 
-1. **C-P1 MEDIUM — context-menu paint re-measures every label per dirty frame;
-   01fe932 cached the hit-test path but not the paint path.** Where:
-   `crates/buffr-ui/src/context_menu.rs:133` (`paint` → `preferred_width()` →
-   per-glyph locked walk over every label, context_menu.rs:102-110) from
-   `chrome_paint.rs:325-327` every dirty frame while a menu is open; hover marks
-   chrome dirty per pointer-move. The apps-side cache
-   (`ActiveContextMenu.panel_w`, apps context_menu.rs:107) already holds the
-   identical value. Fix: store `panel_w`/`panel_h` on `ContextMenuOverlay` at
-   construction, or thread the cached width into `paint`.
-2. **B-XA LOW — CEF pending-alloc eviction can mispair frame/view/url with the
+1. **B-XA LOW — CEF pending-alloc eviction can mispair frame/view/url with the
    next popup.** Where: `crates/buffr-cef/src/handlers.rs:284-290`
    (`on_before_popup` evicts the oldest alloc at the 32-cap, but still returns 0
    and lets CEF create the browser) + handlers.rs:296-317 (`on_after_created`
@@ -967,7 +958,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
    frames/URLs go to the wrong windows after a 32-popup burst. Fix: evict-oldest
    only when NOT allowing creation, or return a nonzero code to cancel that
    popup when the queue is full.
-3. **`html_escape` exists in four crates** (merged area-A tidy + verified
+2. **`html_escape` exists in four crates** (merged area-A tidy + verified
    wider): `crates/buffr-cef/src/html.rs:15`,
    `crates/buffr-view-source/ src/lib.rs:286`,
    `apps/buffr-app/src/main.rs:1218`, `crates/buffr-core` escaping inside
@@ -975,7 +966,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
    says it consolidated "two"). Extract one `pub` helper (buffr-core, already a
    dep of all four users' crates' siblings). Verified: same match arms in each
    copy.
-4. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
+3. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
    verified wider than reported): `buffr-ui/src/lib.rs:397-405` and
    `apps/buffr-app/src/main.rs:5811` return UPPERCASE;
    `buffr-modal/src/ keymap.rs:406-414` and `buffr-config/src/lib.rs:990-998`
