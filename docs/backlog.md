@@ -1094,9 +1094,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 - **D-T2 — hoist the two `Regex::new` calls in `import_netscape` to OnceLocks**
   (buffr-bookmarks/src/lib.rs:415-427): recompiled per import; the same file
   already uses the idiom (`strip_html`, :774-775).
-- **D-T3 — stale flatpak comment:** flatpak/sh.kryptic.buffr.yml:101-105 says CI
-  "symlinks the tarball as `flatpak/payload.tar.gz`"; CI actually extracts into
-  `payload/` (ci.yml:1155-1166). Comment-only.
 - **C-T2 — buffr-modal's edit-mode layer (~540 lines) has zero callers outside
   its own crate** (whole-workspace rg; apps' own comment says "no Rust
   EditSession", apps/buffr-app/src/main.rs:828): `edit_mode.rs` `EditSession`
