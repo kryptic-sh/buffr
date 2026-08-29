@@ -1212,22 +1212,11 @@ fn render_new_tab_html(engine: &Arc<Mutex<Engine>>) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Minimal HTML escaper for the new-tab page renderer. Covers the
-/// five characters that matter when injecting keybinding labels into
-/// table cells.
+/// HTML escaper for the new-tab page renderer. Covers the five
+/// characters that matter when injecting keybinding labels into table
+/// cells; shared implementation lives in `buffr_core::html`.
 fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
+    buffr_core::html::escape(s)
 }
 
 /// Project [`buffr_core::UpdateStatus`] onto the

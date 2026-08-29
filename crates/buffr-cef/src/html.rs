@@ -4,28 +4,16 @@
 //! *different* escape sets — `new_tab.rs` escaped only `& < >` while
 //! `view_source_scheme.rs` escaped `& < > " '` (L13). Two same-named
 //! helpers with different security properties invite the weaker one being
-//! reused in an attribute context, so only the strict version survives and
-//! it lives here.
+//! reused in an attribute context, so only the strict version survives.
+//! It now lives in `buffr_core::html` and is re-exported here so this
+//! crate's call sites keep a one-line path.
 
 /// HTML-escape `&`, `<`, `>`, `"` and `'`.
 ///
 /// Safe for both element-text and quoted-attribute contexts. Do **not**
 /// use for unquoted attribute values, `<script>`/`<style>` bodies, or URL
 /// contexts — those need different encodings entirely.
-pub(crate) fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
+pub(crate) use buffr_core::html::escape as html_escape;
 
 #[cfg(test)]
 mod tests {
