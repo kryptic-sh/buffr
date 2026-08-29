@@ -1013,21 +1013,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   ```
   Fix: cap/flush the map past ~4k entries (re-rasterizing evicted glyphs is
   cheap) or switch to an LRU.
-- **A-A1 LOW — a page can flood the log with unbounded attacker-chosen bytes via
-  malformed sentinel lines.** Where:
-  `crates/buffr-cef/src/handlers.rs:1078-1080` (edit) and :1101-1103 (media):
-  `tracing::warn!(line = %redact_console_text(&text), ...)` —
-  `redact_console_text` (handlers.rs:135-154) returns the text UNTRUNCATED for
-  sentinel-prefixed lines (its own comment concedes pages can carry these
-  prefixes, handlers.rs:109-111), and the `BUFFR_LOG_CONSOLE` gate covers only
-  the non-sentinel mirror (handlers.rs:1028-1031). Sweep-owner correction to the
-  agent's report: the app logs to **stderr**
-  (apps/buffr-app/src/main.rs:423-428) and the supervisor does not redirect it
-  (apps/buffr/src/main.rs:669), so the default flood surface is the
-  terminal/pipe, not disk; disk fill needs a redirect. `warn!` passes the
-  default info filter, so the unbounded rate stands. Fix: apply
-  `CONSOLE_LOG_MAX_LEN` to sentinel lines too (keep a modest sentinel-specific
-  budget, e.g. 512 B).
 - **A-A2 LOW (caveated) — `on_console_message` converts every console line to a
   Rust String before any prefix gate.** Where: `handlers.rs:1005-1006`
   (`let text = message.to_string();`), sentinel fast-path and redaction only
