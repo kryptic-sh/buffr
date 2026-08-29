@@ -1086,12 +1086,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   and `host.rs` `BuffrHost`/`BuffrEditIntent`/`BuffrBufferId`. The crate is
   published, so this is API surface — wire it (Phase-2 intent) or drop it in the
   next breaking window (c7b861f shows the pattern). Owner's call.
-- **B-T1 (corrected) — windowing `other` bridge types: `Rect`
-  (windowing/other/geometry.rs:39) and `ContentPurpose` (windowing/other/
-  ime.rs:14) are dead and not even re-exported** — deletable. The area-B agent's
-  `Surface` claim was WRONG: removing `Surface` from the main.rs:208 import
-  breaks the build (`event_loop.rs:1636` resolves `.id()` through the trait);
-  verified by temporarily removing it and restoring.
 
 ### Performance
 
