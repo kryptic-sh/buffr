@@ -26,7 +26,7 @@ use cef::*;
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// Per-browser audio state tracked by [`BuffrAudioHandler`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AudioState {
     /// `true` while at least one audio stream is active.
     pub active: bool,
@@ -74,6 +74,23 @@ pub fn any_audio_active(sink: &AudioStateSink) -> bool {
         .unwrap_or(false)
 }
 
+/// Decrement the browser's active-stream count and report whether it
+/// hit zero — the N→0 edge. Returns `true` exactly when the browser
+/// became inactive, so the caller emits one `active: false` event.
+///
+/// Saturated at zero, so an error/stopped callback that races ahead of
+/// its `started` cannot drive the count negative or emit a spurious
+/// edge from an already-inactive browser.
+fn decrement_stream(entry: &mut AudioState) -> bool {
+    entry.stream_count = entry.stream_count.saturating_sub(1);
+    if entry.stream_count == 0 && entry.active {
+        entry.active = false;
+        true
+    } else {
+        false
+    }
+}
+
 // ── CEF handler ───────────────────────────────────────────────────────────────
 
 wrap_audio_handler! {
@@ -118,14 +135,7 @@ wrap_audio_handler! {
             let browser_id = browser.map(|b| b.identifier()).unwrap_or(-1);
             let became_inactive = {
                 let Ok(mut map) = self.sink.lock() else { return };
-                let entry = map.entry(browser_id).or_default();
-                entry.stream_count = entry.stream_count.saturating_sub(1);
-                if entry.stream_count == 0 && entry.active {
-                    entry.active = false;
-                    true
-                } else {
-                    false
-                }
+                decrement_stream(map.entry(browser_id).or_default())
             };
             // Only push an event on the N→0 edge.
             if became_inactive
@@ -150,17 +160,13 @@ wrap_audio_handler! {
         ) {
             // Treat an error the same as a stopped stream so we don't
             // leave the browser permanently marked active after an error.
+            // Decrement, don't wipe: with several streams playing, one
+            // errored stream must not clear the browser's active state
+            // while its siblings are still producing audio.
             let browser_id = browser.map(|b| b.identifier()).unwrap_or(-1);
             let became_inactive = {
                 let Ok(mut map) = self.sink.lock() else { return };
-                let entry = map.entry(browser_id).or_default();
-                if entry.active {
-                    entry.stream_count = 0;
-                    entry.active = false;
-                    true
-                } else {
-                    false
-                }
+                decrement_stream(map.entry(browser_id).or_default())
             };
             if became_inactive
                 && let Ok(mut q) = self.queue.lock()
@@ -184,5 +190,62 @@ impl BuffrAudioHandler {
     /// and returns the CEF-compatible `AudioHandler` wrapper.
     pub fn make(sink: AudioStateSink, queue: AudioEventQueue) -> AudioHandler {
         Self::new(sink, queue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrement_from_one_emits_edge_and_clears_active() {
+        let mut entry = AudioState {
+            active: true,
+            stream_count: 1,
+        };
+        assert!(decrement_stream(&mut entry));
+        assert!(!entry.active);
+        assert_eq!(entry.stream_count, 0);
+    }
+
+    #[test]
+    fn decrement_above_one_keeps_active() {
+        // Two streams playing; one errors out. The browser must stay
+        // active until the sibling stops too — the R1 fix.
+        let mut entry = AudioState {
+            active: true,
+            stream_count: 2,
+        };
+        assert!(!decrement_stream(&mut entry));
+        assert!(entry.active);
+        assert_eq!(entry.stream_count, 1);
+        assert!(decrement_stream(&mut entry));
+        assert!(!entry.active);
+    }
+
+    #[test]
+    fn decrement_from_zero_is_saturated() {
+        // An error/stopped that races ahead of its started must not
+        // drive the count negative or emit a spurious edge.
+        let mut entry = AudioState::default();
+        assert!(!decrement_stream(&mut entry));
+        assert_eq!(entry.stream_count, 0);
+        assert!(!entry.active);
+    }
+
+    #[test]
+    fn error_and_stopped_share_the_same_edges() {
+        // Wipe-vs-decrement was the whole bug; pin that both callbacks
+        // route through the identical transition.
+        let mut error_path = AudioState {
+            active: true,
+            stream_count: 3,
+        };
+        let mut stopped_path = error_path.clone();
+        assert_eq!(
+            decrement_stream(&mut error_path),
+            decrement_stream(&mut stopped_path)
+        );
+        assert_eq!(error_path, stopped_path);
     }
 }
