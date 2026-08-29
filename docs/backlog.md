@@ -1000,13 +1000,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Review findings (correctness)
 
-- **C-R1 LOW — Engine count-prefix accepts counts in Visual mode while its
-  comment claims Normal-only.** Where:
-  `crates/buffr-modal/src/engine.rs: 171-173` (comment "only apply in Normal
-  mode", guard `Normal | Visual`). Reachable only via a user-bound Visual key
-  (`[keymap.visual] j = ...`), where the count behaviour is arguably better —
-  but code contradicts comment. Fix: widen the comment or narrow the guard,
-  deliberately.
 - **A-R2 LOW — find results are untagged; a background tab's in-flight find
   stream overwrites the active tab's statusline counts.** Where:
   `crates/buffr-cef/src/handlers.rs:552-585` pushes into the one-slot
