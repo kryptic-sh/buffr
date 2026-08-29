@@ -967,15 +967,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Audit findings (security)
 
-- **A-A2 LOW (caveated) — `on_console_message` converts every console line to a
-  Rust String before any prefix gate.** Where: `handlers.rs:1005-1006`
-  (`let text = message.to_string();`), sentinel fast-path and redaction only
-  afterwards. A page looping `console.log( bigString)` allocates the full
-  UTF-16→UTF-8 copy per line in the browser process. Caveat: Chromium may cap
-  console message length itself — not verifiable from this tree; A2 is also A1's
-  amplifier. Fix if confirmed: length-check `message` (UTF-16 length is cheap)
-  before converting.
-
 ### Tidy (behaviour-preserving)
 
 - **A-T1 — three copies of the ASCII-forcing JS-string escaper:**
