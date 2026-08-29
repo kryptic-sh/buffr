@@ -33,6 +33,16 @@ fn lock_ignore_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Upper bound on glyphs kept in the per-face raster cache.
+///
+/// A page can rewrite `document.title` with fresh exotic characters a
+/// few times a second, feeding never-before-seen glyphs into the cache
+/// at up to 60 fps — unbounded growth would reach hundreds of MB over
+/// a long session (audit §22 C-A1). The glyphs actually visible in one
+/// frame are few (truncated titles/URLs), so evicting the whole cache
+/// when it outgrows this bound is cheap: misses simply re-rasterize.
+const GLYPH_CACHE_CAP: usize = 4096;
+
 /// Look up a glyph in the cache, rasterizing and inserting it on a
 /// miss. Returns an `Arc` clone — a refcount bump, never a bitmap
 /// copy — so callers can use the entry after the lock is released.
@@ -51,10 +61,16 @@ fn glyph_entry(f: &TtfFace, c: char) -> Arc<GlyphEntry> {
         bitmap,
         advance,
     });
-    lock_ignore_poison(&f.cache)
-        .entry(c)
-        .or_insert_with(|| entry.clone())
-        .clone()
+    let mut cache = lock_ignore_poison(&f.cache);
+    // Bound the cache (C-A1): once it outgrows the cap, drop everything
+    // rather than evicting one entry — the visible glyph set is small,
+    // so a flush costs only re-rasterization on the next miss, and it
+    // stays O(1) per insert. The entry being inserted is then re-added
+    // below, so this insert is never lost.
+    if cache.len() >= GLYPH_CACHE_CAP {
+        cache.clear();
+    }
+    cache.entry(c).or_insert_with(|| entry.clone()).clone()
 }
 
 enum FontFace {
@@ -486,6 +502,23 @@ mod tests {
     fn text_width_hi_sane() {
         let w = text_width("hi");
         assert!(w > 0, "text_width(\"hi\") must be positive, got {w}");
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded_after_cap() {
+        // C-A1: a page rewriting document.title with fresh exotic chars
+        // feeds never-before-seen glyphs into the process-lifetime cache;
+        // it must flush past the cap instead of growing without limit.
+        // Only the Ttf face has a cache — the Bitmap fallback has none.
+        let FontFace::Ttf(face) = face() else { return };
+        for c in (0x2_0000u32..0x2_0000 + GLYPH_CACHE_CAP as u32 + 500).filter_map(char::from_u32) {
+            char_width(c);
+        }
+        let len = lock_ignore_poison(&face.cache).len();
+        assert!(
+            len <= GLYPH_CACHE_CAP,
+            "glyph cache must stay at or under the cap, got {len}"
+        );
     }
 
     #[test]
