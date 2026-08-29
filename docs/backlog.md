@@ -1015,13 +1015,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   The early bail at :212-216 only checks `Release`/`libcef.so`, so a stale-file
   vendor dir reaches this path. Fix: only `remove_dir_all` when the loop moved
   everything.
-- **B-R2 LOW — single-instance forwarder treats any ack as success.** Where:
-  `apps/buffr-app/src/single_instance.rs:352-357` (client reads any non-empty
-  line — or EOF — and returns `ConnectOutcome::Forwarded`) vs the server acking
-  `OK` after dropping every URL (:676-686) and `ERR` for bad payloads
-  (:645-657). A user whose URLs were all rejected by the scheme gate sees
-  "forwarded" and the window comes forward with nothing opened. Fix: parse the
-  ack (`OK` vs `ERR`), treat `ERR`/EOF as failure.
 
 ### Audit findings (security)
 
