@@ -948,15 +948,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Cross-cutting (flagged by two or more areas)
 
-1. **`html_escape` exists in four crates** (merged area-A tidy + verified
-   wider): `crates/buffr-cef/src/html.rs:15`,
-   `crates/buffr-view-source/ src/lib.rs:286`,
-   `apps/buffr-app/src/main.rs:1218`, `crates/buffr-core` escaping inside
-   hint.rs — all the same five-metacharacter escaper (html.rs:3's comment even
-   says it consolidated "two"). Extract one `pub` helper (buffr-core, already a
-   dep of all four users' crates' siblings). Verified: same match arms in each
-   copy.
-2. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
+1. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
    verified wider than reported): `buffr-ui/src/lib.rs:397-405` and
    `apps/buffr-app/src/main.rs:5811` return UPPERCASE;
    `buffr-modal/src/ keymap.rs:406-414` and `buffr-config/src/lib.rs:990-998`
