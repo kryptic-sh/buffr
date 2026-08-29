@@ -683,6 +683,47 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `cargo build -p buffr -p buffr-app -p buffr-helper` with the
+/// requested profile/target, failing loudly on a nonzero status.
+///
+/// Shared by `bundle-macos` and `package-linux` (they both need the
+/// three binaries staged before bundling).
+fn build_binaries(workspace: &Path, release: bool, target: Option<&str>) -> Result<()> {
+    let profile = if release { "release" } else { "debug" };
+    eprintln!(
+        "xtask: building buffr (supervisor) + buffr-app (browser) + buffr-helper ({profile})"
+    );
+    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.current_dir(workspace)
+        .arg("build")
+        .arg("-p")
+        .arg("buffr")
+        .arg("-p")
+        .arg("buffr-app")
+        .arg("-p")
+        .arg("buffr-helper");
+    if release {
+        cmd.arg("--release");
+    }
+    if let Some(t) = target {
+        cmd.arg("--target").arg(t);
+    }
+    let status = cmd.status().context("spawning cargo build")?;
+    if !status.success() {
+        bail!("cargo build failed (status {status:?})");
+    }
+    Ok(())
+}
+
+/// Cargo's per-target output dir: `target/<target>/<profile>` when a
+/// cross-target is set, else `target/<profile>`.
+fn cargo_target_dir(workspace: &Path, profile: &str, target: Option<&str>) -> PathBuf {
+    match target {
+        Some(t) => workspace.join("target").join(t).join(profile),
+        None => workspace.join("target").join(profile),
+    }
+}
+
 // ----------------------------- bundle-macos ------------------------------
 
 /// Args for `cargo xtask bundle-macos`.
@@ -715,34 +756,10 @@ fn bundle_macos(args: Vec<String>) -> Result<()> {
     let profile = if parsed.release { "release" } else { "debug" };
 
     // 1. Build the binaries.
-    eprintln!(
-        "xtask: building buffr (supervisor) + buffr-app (browser) + buffr-helper ({profile})"
-    );
-    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.current_dir(&workspace)
-        .arg("build")
-        .arg("-p")
-        .arg("buffr")
-        .arg("-p")
-        .arg("buffr-app")
-        .arg("-p")
-        .arg("buffr-helper");
-    if parsed.release {
-        cmd.arg("--release");
-    }
-    if let Some(t) = parsed.target.as_deref() {
-        cmd.arg("--target").arg(t);
-    }
-    let status = cmd.status().context("spawning cargo build")?;
-    if !status.success() {
-        bail!("cargo build failed (status {status:?})");
-    }
+    build_binaries(&workspace, parsed.release, parsed.target.as_deref())?;
 
     // Resolve cargo's per-target output dir.
-    let target_dir = match parsed.target.as_deref() {
-        Some(t) => workspace.join("target").join(t).join(profile),
-        None => workspace.join("target").join(profile),
-    };
+    let target_dir = cargo_target_dir(&workspace, profile, parsed.target.as_deref());
 
     let supervisor_bin = target_dir.join("buffr");
     let buffr_app_bin = target_dir.join("buffr-app");
@@ -1089,27 +1106,9 @@ fn package_linux(args: Vec<String>) -> Result<()> {
 
     // 1. Build the workspace binaries. The buffr-core build.rs will stage
     //    libcef.so, *.pak, locales/, icudtl.dat next to the binaries.
-    eprintln!(
-        "xtask: building buffr (supervisor) + buffr-app (browser) + buffr-helper ({profile})"
-    );
-    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.current_dir(&workspace)
-        .arg("build")
-        .arg("-p")
-        .arg("buffr")
-        .arg("-p")
-        .arg("buffr-app")
-        .arg("-p")
-        .arg("buffr-helper");
-    if parsed.release {
-        cmd.arg("--release");
-    }
-    let status = cmd.status().context("spawning cargo build")?;
-    if !status.success() {
-        bail!("cargo build failed (status {status:?})");
-    }
+    build_binaries(&workspace, parsed.release, None)?;
 
-    let target_dir = workspace.join("target").join(profile);
+    let target_dir = cargo_target_dir(&workspace, profile, None);
     let payload = collect_runtime_payload(&target_dir)?;
 
     // 2. Always (re)write the AUR PKGBUILD with the current version. It
