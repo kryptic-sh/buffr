@@ -1092,12 +1092,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   `Surface` claim was WRONG: removing `Surface` from the main.rs:208 import
   breaks the build (`event_loop.rs:1636` resolves `.id()` through the trait);
   verified by temporarily removing it and restoring.
-- **C-T4 — `NamedKey::Space`/`BackTab` arms unreachable on every active input
-  path:** the parser canonicalises space to `Char(' ')` (key.rs: 189-196), the
-  bridge adapter likewise (adapter.rs:124-129) and has no `BackTab` mapping
-  (adapter.rs:52-80; winit delivers Shift+Tab as `Tab`+SHIFT). Concrete
-  deletion: apps `main.rs:4501` (Space) and part of :4476 (BackTab) overlay
-  arms. The modal variant stays until the `winit` feature is deleted or wired.
 
 ### Performance
 
