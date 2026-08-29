@@ -606,9 +606,7 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   block. Extract `right_cell(...)`.
 - **`cargo build -p buffr -p buffr-app -p buffr-helper` block** (xtask:664-682
   vs 1044-1059) — copy-pasted; extract
-  `build_binaries(workspace, release, target)`. The
-  `if release { "release" } else { "debug" }` profile string also repeats at
-  658/1028/1532/1811.
+  `build_binaries(workspace, release, target)`.
 
 ### YAGNI / over-abstraction
 
