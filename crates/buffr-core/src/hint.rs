@@ -465,14 +465,6 @@ pub fn parse_console_event(
     crate::console_sentinel::parse_sentinel(message, HINT_CONSOLE_SENTINEL, nonce)
 }
 
-/// Decode a bare hint JSON payload (no sentinel, no nonce).
-///
-/// For backends that receive the payload over a trusted channel instead of
-/// scraping `console.log`, so they don't have to synthesise a wire line.
-pub fn parse_payload(json: &str) -> Result<HintConsoleEvent, serde_json::Error> {
-    serde_json::from_str(json)
-}
-
 /// Build the JS payload to send via `frame.execute_java_script`.
 ///
 /// Substitutes the four placeholders the asset uses:

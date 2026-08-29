@@ -50,14 +50,6 @@ pub fn parse(line: &str, nonce: &str) -> Option<Result<MediaProbeEvent, serde_js
     crate::console_sentinel::parse_sentinel(line, MEDIA_PROBE_SENTINEL, nonce)
 }
 
-/// Decode a bare media-probe JSON payload (no sentinel, no nonce).
-///
-/// For backends that receive the payload over a trusted channel instead of
-/// scraping `console.log`, so they don't have to synthesise a wire line.
-pub fn parse_payload(json: &str) -> Result<MediaProbeEvent, serde_json::Error> {
-    serde_json::from_str(json)
-}
-
 /// Build the media-probe poll script with `nonce` spliced in.
 ///
 /// Substitutes the one placeholder the asset uses:
@@ -177,8 +169,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_payload_skips_the_wire_framing() {
-        let ev = parse_payload(r#"{"media":true,"video":false}"#).unwrap();
+    fn wire_line_decodes_media_and_video_flags() {
+        let ev = parse(&line(r#"{"media":true,"video":false}"#), NONCE)
+            .unwrap()
+            .unwrap();
         assert!(ev.media);
         assert!(!ev.video);
     }
