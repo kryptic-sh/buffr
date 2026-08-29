@@ -139,11 +139,6 @@ pub enum HistoryError {
         #[from]
         source: rusqlite::Error,
     },
-    #[error("invalid url")]
-    Url {
-        #[from]
-        source: url::ParseError,
-    },
     #[error("history mutex poisoned")]
     Poisoned,
 }
