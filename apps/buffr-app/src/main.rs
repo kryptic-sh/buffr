@@ -1015,6 +1015,7 @@ fn main() -> Result<()> {
         cli.private,
         paths.cache.clone(),
         paths.data.clone(),
+        _private_tmp,
         find_sink,
         hint_sink,
         edit_sink,
@@ -1141,9 +1142,9 @@ fn main() -> Result<()> {
     info!("shutdown: dropping app_state remainder");
     drop(app_state);
     info!("shutdown: app_state dropped");
-    // Tempdir drops here (after CEF is gone), removing the private
-    // profile root tree.
-    drop(_private_tmp);
+    // The private-mode tempdir was a field of `app_state`, so it dropped
+    // with it (after CEF is gone), removing the private profile root
+    // tree.
     info!("shutdown: complete");
     // Bypass libc atexit + static destructors. We've already torn down
     // every long-lived resource explicitly (engines, renderer, backend,
@@ -1612,11 +1613,16 @@ struct AppState {
     /// Root of the user-data directory for this session. In normal mode
     /// this is `<XDG_DATA_HOME>/buffr` (or equivalent); in `--private`
     /// mode it is `$TMPDIR/buffr-private-<pid>/data` (deleted on Drop
-    /// by the TempDir held in main). Per-engine profile dirs land under
+    /// by the TempDir held here). Per-engine profile dirs land under
     /// `<data_root>/engines/<id>/` so `--private` mode truly isolates
     /// every engine's storage to the throwaway tempdir, and persistent
     /// state survives system cache wipes.
     data_root: PathBuf,
+    /// The private-mode tempdir, kept on `AppState` so the smoke-test
+    /// exit path (which `_exit`s before the main shutdown sequence runs)
+    /// can drop it and remove `$TMPDIR/buffr-private-<pid>-*` (§9). `None`
+    /// in normal mode.
+    private_tmp: Option<TempDir>,
     modifiers: Modifiers,
     startup: Instant,
     /// Last full window title we set. Cached so we only call winit's
@@ -2084,6 +2090,7 @@ impl AppState {
         private: bool,
         cache_root: PathBuf,
         data_root: PathBuf,
+        private_tmp: Option<TempDir>,
         find_sink: FindResultSink,
         hint_sink: HintEventSink,
         edit_sink: EditEventSink,
@@ -2133,6 +2140,7 @@ impl AppState {
             downloads_config,
             zoom,
             permissions,
+            private_tmp,
             permissions_prompt: None,
             permissions_prompt_id: None,
             confirm_close_pinned: None,
@@ -3955,6 +3963,11 @@ impl AppState {
             // segfaulted at exit; the shutdown path skips them for the
             // same reason (see "shutdown:" below). Flush stderr so the
             // "exiting 0" line above isn't lost, then _exit.
+            //
+            // Drop the private-mode tempdir first: `_exit` skips the
+            // field's Drop, and without this `--private --smoke-test`
+            // leaked `$TMPDIR/buffr-private-<pid>-*` per run (§9).
+            self.private_tmp.take();
             use std::io::Write;
             let _ = std::io::stderr().flush();
             #[cfg(unix)]
