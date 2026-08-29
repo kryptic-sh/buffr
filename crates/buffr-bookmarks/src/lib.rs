@@ -197,27 +197,24 @@ impl Bookmarks {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
-            tx.execute(
-                "UPDATE bookmarks SET title = ?1, modified = ?2 WHERE id = ?3",
-                params![t_owned, now, id.0],
-            )?;
+            let mut stmt =
+                tx.prepare_cached("UPDATE bookmarks SET title = ?1, modified = ?2 WHERE id = ?3")?;
+            stmt.execute(params![t_owned, now, id.0])?;
         }
         if let Some(new_tags) = tags {
             let normalised = normalise_tags(new_tags);
-            tx.execute(
-                "DELETE FROM bookmark_tags WHERE bookmark_id = ?1",
-                params![id.0],
+            let mut del_tags =
+                tx.prepare_cached("DELETE FROM bookmark_tags WHERE bookmark_id = ?1")?;
+            del_tags.execute(params![id.0])?;
+            let mut ins_tag = tx.prepare_cached(
+                "INSERT OR IGNORE INTO bookmark_tags (bookmark_id, tag) VALUES (?1, ?2)",
             )?;
             for tag in &normalised {
-                tx.execute(
-                    "INSERT OR IGNORE INTO bookmark_tags (bookmark_id, tag) VALUES (?1, ?2)",
-                    params![id.0, tag],
-                )?;
+                ins_tag.execute(params![id.0, tag])?;
             }
-            tx.execute(
-                "UPDATE bookmarks SET modified = ?1 WHERE id = ?2",
-                params![now, id.0],
-            )?;
+            let mut touch =
+                tx.prepare_cached("UPDATE bookmarks SET modified = ?1 WHERE id = ?2")?;
+            touch.execute(params![now, id.0])?;
         }
 
         tx.commit()?;
@@ -646,37 +643,38 @@ fn add_in_tx(
         .map(str::to_owned);
     let now = Utc::now().timestamp();
 
-    let existing: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM bookmarks WHERE url = ?1",
-            params![canon],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let existing: Option<i64> = {
+        let mut stmt = tx.prepare_cached("SELECT id FROM bookmarks WHERE url = ?1")?;
+        stmt.query_row(params![canon], |row| row.get(0))
+            .optional()?
+    };
 
     let id = if let Some(id) = existing {
-        tx.execute(
-            "UPDATE bookmarks SET title = ?1, modified = ?2 WHERE id = ?3",
-            params![title_owned, now, id],
-        )?;
-        tx.execute(
-            "DELETE FROM bookmark_tags WHERE bookmark_id = ?1",
-            params![id],
-        )?;
+        {
+            let mut stmt =
+                tx.prepare_cached("UPDATE bookmarks SET title = ?1, modified = ?2 WHERE id = ?3")?;
+            stmt.execute(params![title_owned, now, id])?;
+        }
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM bookmark_tags WHERE bookmark_id = ?1")?;
+            stmt.execute(params![id])?;
+        }
         id
     } else {
-        tx.execute(
+        let mut stmt = tx.prepare_cached(
             "INSERT INTO bookmarks (url, title, added, modified) VALUES (?1, ?2, ?3, ?3)",
-            params![canon, title_owned, now],
         )?;
+        stmt.execute(params![canon, title_owned, now])?;
         tx.last_insert_rowid()
     };
 
-    for tag in &normalised_tags {
-        tx.execute(
+    {
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO bookmark_tags (bookmark_id, tag) VALUES (?1, ?2)",
-            params![id, tag],
         )?;
+        for tag in &normalised_tags {
+            stmt.execute(params![id, tag])?;
+        }
     }
 
     Ok(BookmarkId(id))
