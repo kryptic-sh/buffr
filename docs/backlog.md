@@ -974,11 +974,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   labels escaper hint.rs:508-531, `crates/buffr-cef/src/host.rs:2845-2872`
   (`json_string_literal`). Promote one to `pub` in buffr-core, delete the other
   two bodies.
-- **A-T4 — third near-identical ureq agent config** (timeout/UA/
-  `max_redirects(0)`): updates.rs:104-114, image_copy.rs:111-118,
-  view_source_scheme.rs:521-531. One `buffr_core` helper returning a configured
-  Agent keeps the load-bearing redirect-off policy from being re-defaulted by a
-  future fourth fetch.
 - **C-T2 — buffr-modal's edit-mode layer (~540 lines) has zero callers outside
   its own crate** (whole-workspace rg; apps' own comment says "no Rust
   EditSession", apps/buffr-app/src/main.rs:828): `edit_mode.rs` `EditSession`
