@@ -988,13 +988,7 @@ pub fn build_keymap(cfg: &Config) -> Result<buffr_modal::Keymap, ConfigError> {
 }
 
 pub(crate) fn mode_name(mode: PageMode) -> &'static str {
-    match mode {
-        PageMode::Normal => "normal",
-        PageMode::Visual => "visual",
-        PageMode::Command => "command",
-        PageMode::Hint => "hint",
-        PageMode::Insert => "insert",
-    }
+    mode.name()
 }
 
 /// Serialize `cfg` back to TOML. Used by `--print-config`.

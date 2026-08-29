@@ -1493,9 +1493,8 @@ impl SwipeDetector {
 /// - `startup` — wall-clock instant the event loop began. The engine
 ///   is clock-agnostic: it just needs a monotonic `Duration`. We pass
 ///   `startup.elapsed()` on every `feed`/`tick`.
-/// - `current_mode_label` — last mode rendered into the window title;
-///   only call `set_title` when this changes. winit's `set_title` is
-///   idempotent but cheap → cheaper still to skip.
+/// - `current_title` — last full window title we set; only call winit's
+///   `set_title` when mode or URL actually changes.
 struct AppState {
     /// Active backend — process-model lifecycle (library load, init,
     /// shutdown, message pump, scheme registration, engine construction).
@@ -1619,7 +1618,6 @@ struct AppState {
     data_root: PathBuf,
     modifiers: Modifiers,
     startup: Instant,
-    current_mode_label: &'static str,
     /// Last full window title we set. Cached so we only call winit's
     /// `set_title` when mode or URL actually changes.
     current_title: String,
@@ -2146,7 +2144,6 @@ impl AppState {
             data_root,
             modifiers: Modifiers::default(),
             startup: Instant::now(),
-            current_mode_label: mode_label(PageMode::Normal),
             current_title: String::new(),
             find_sink,
             hint_sink,
@@ -3096,9 +3093,8 @@ impl AppState {
             Err(_) => (PageMode::Normal, None),
         };
         let label = mode_label(mode);
-        self.current_mode_label = label;
         let url = self.statusline.url.clone();
-        let title = self.title_for(label, &url);
+        let title = self.title_for(&label, &url);
         let title_changed = title != self.current_title;
         if title_changed {
             self.current_title = title.clone();
@@ -5803,15 +5799,10 @@ impl AppState {
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 /// Map a [`PageMode`] to the status-line label rendered into the
-/// window title.
-fn mode_label(mode: PageMode) -> &'static str {
-    match mode {
-        PageMode::Normal => "NORMAL",
-        PageMode::Visual => "VISUAL",
-        PageMode::Command => "COMMAND",
-        PageMode::Hint => "HINT",
-        PageMode::Insert => "INSERT",
-    }
+/// window title. Uppercase form of [`PageMode::name`] — the table
+/// itself lives in buffr-modal (C-T1).
+fn mode_label(mode: PageMode) -> String {
+    mode.name().to_uppercase()
 }
 
 impl AppState {

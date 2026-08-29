@@ -28,6 +28,24 @@ pub enum PageMode {
     Insert,
 }
 
+impl PageMode {
+    /// Lowercase canonical name, e.g. `"normal"`. The single source of
+    /// the mode→label table: the statusline (buffr-ui), the window title
+    /// (buffr-app) and the keymap/config error messages used to each
+    /// carry their own copy (C-T1), which drifted into UPPERCASE /
+    /// lowercase variants. Call sites that want the uppercase label do
+    /// `.name().to_uppercase()`.
+    pub fn name(self) -> &'static str {
+        match self {
+            PageMode::Normal => "normal",
+            PageMode::Visual => "visual",
+            PageMode::Command => "command",
+            PageMode::Hint => "hint",
+            PageMode::Insert => "insert",
+        }
+    }
+}
+
 /// Page-level actions emitted by the modal dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,6 +226,20 @@ mod tests {
         .unwrap();
         let back: Wrap = toml::from_str(&s).unwrap();
         assert_eq!(back.m, PageMode::Visual);
+    }
+
+    #[test]
+    fn page_mode_name_maps_every_variant() {
+        // The single mode→label source (C-T1): uppercase call sites
+        // derive from this, so the strings here ARE the statusline and
+        // window-title labels.
+        assert_eq!(PageMode::Normal.name(), "normal");
+        assert_eq!(PageMode::Visual.name(), "visual");
+        assert_eq!(PageMode::Command.name(), "command");
+        assert_eq!(PageMode::Hint.name(), "hint");
+        assert_eq!(PageMode::Insert.name(), "insert");
+        // The uppercase form used by statusline/window title.
+        assert_eq!(PageMode::Insert.name().to_uppercase(), "INSERT");
     }
 
     #[test]

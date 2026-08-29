@@ -96,7 +96,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
             return;
         }
         let window = match Toplevel::builder()
-            .with_title(self.title_for(self.current_mode_label, &self.statusline.url))
+            .with_title(self.title_for(
+                &PageMode::Normal.name().to_uppercase(),
+                &self.statusline.url,
+            ))
             .with_app_id("sh.kryptic.buffr")
             .with_initial_size(crate::windowing::Size::new(1280, 800))
             .build(event_loop)

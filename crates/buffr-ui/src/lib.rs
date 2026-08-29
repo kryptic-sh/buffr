@@ -181,7 +181,7 @@ impl Statusline {
         // Mode block — leftmost cell, accent-on-dark so the label
         // pops against the rest of the strip.
         let mode_text = mode_label(self.mode);
-        let mode_w = font::text_width(mode_text) + 12;
+        let mode_w = font::text_width(&mode_text) + 12;
         fill_rect(
             buffer,
             width,
@@ -193,7 +193,7 @@ impl Statusline {
             mode_accent,
         );
         let text_y = strip_y as i32 + ((strip_h as i32 - font::glyph_h() as i32) / 2);
-        font::draw_text(buffer, width, height, 6, text_y, mode_text, mode_bg);
+        font::draw_text(buffer, width, height, 6, text_y, &mode_text, mode_bg);
 
         // Right-side cell: count buffer, find status, update channel,
         // and PRIVATE marker. Drawn right-to-left so each piece pads
@@ -391,17 +391,11 @@ pub(crate) fn fill_rect(
     }
 }
 
-/// Mode label rendered into the leftmost statusline cell. Matches the
-/// strings used by `apps/buffr` for the window title — keep these in
-/// sync.
-fn mode_label(mode: PageMode) -> &'static str {
-    match mode {
-        PageMode::Normal => "NORMAL",
-        PageMode::Visual => "VISUAL",
-        PageMode::Command => "COMMAND",
-        PageMode::Hint => "HINT",
-        PageMode::Insert => "INSERT",
-    }
+/// Mode label rendered into the leftmost statusline cell. Uppercase
+/// form of [`PageMode::name`] — the table itself lives in buffr-modal
+/// (C-T1).
+fn mode_label(mode: PageMode) -> String {
+    mode.name().to_uppercase()
 }
 
 // ---- colour table (BGRA packed, alpha = 0xFF) -----------------------

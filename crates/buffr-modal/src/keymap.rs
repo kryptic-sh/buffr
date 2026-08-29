@@ -221,7 +221,7 @@ impl Keymap {
     pub fn audit_default_bindings(_leader: char) -> Vec<(&'static str, &'static str, PageAction)> {
         let mut rows: Vec<(&'static str, &'static str, PageAction)> = DEFAULT_BINDINGS
             .iter()
-            .map(|(mode, keys, action)| (mode_label(*mode), *keys, action.clone()))
+            .map(|(mode, keys, action)| (mode.name(), *keys, action.clone()))
             .collect();
         rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
         rows
@@ -400,16 +400,6 @@ impl ModeMap {
             }
         }
         last_action
-    }
-}
-
-fn mode_label(mode: PageMode) -> &'static str {
-    match mode {
-        PageMode::Normal => "normal",
-        PageMode::Visual => "visual",
-        PageMode::Command => "command",
-        PageMode::Hint => "hint",
-        PageMode::Insert => "insert",
     }
 }
 
