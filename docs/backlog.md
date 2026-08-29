@@ -1023,9 +1023,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Hardening (correct today but fragile)
 
-- **fetch-cef ureq calls have no timeouts** (xtask/src/main.rs:222, 382 —
-  default agent, `timeouts = None` in ureq 3.4.0): a hung CDN stalls CI until
-  the runner timeout. Same fix shape as view-source's 10 s.
 - Tar symlink entries: `unpack_in` blocks writes THROUGH an outpointing symlink
   but the symlink itself is created unvalidated — dangling links remain in
   `vendor/cef/` (same trust as the archive; cosmetic).
