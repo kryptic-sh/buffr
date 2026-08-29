@@ -269,12 +269,20 @@ wrap_life_span_handler! {
             // and orphan the second popup — never registered, never closed
             // at shutdown, leaked into `cef::shutdown()`.
             if let Ok(mut queue) = self.pending_popup_alloc.lock() {
-                while queue.len() >= PENDING_POPUP_ALLOC_CAP {
+                if queue.len() >= PENDING_POPUP_ALLOC_CAP {
+                    // Queue full: cancel THIS popup instead of evicting the
+                    // oldest alloc. Evicting is off-by-one — the oldest alloc
+                    // may belong to a popup CEF is about to create, and
+                    // on_after_created claims front-of-queue, so dropping it
+                    // would pair every later popup with the wrong frame/view/
+                    // url (B-XA). Refusing the new popup keeps existing
+                    // pairings intact; stale allocs are already discarded at
+                    // consume time by take_fresh_alloc's TTL (A12).
                     tracing::warn!(
                         cap = PENDING_POPUP_ALLOC_CAP,
-                        "on_before_popup: pending-alloc queue full — evicting oldest"
+                        "on_before_popup: pending-alloc queue full — cancelling this popup"
                     );
-                    queue.pop_front();
+                    return 1;
                 }
                 queue.push_back(PopupAlloc {
                     frame,
