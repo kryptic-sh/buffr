@@ -600,10 +600,6 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   identical `Heartbeat` struct + `mark_alive`/`is_fatal`/`tick` (69-169 vs
   623-718) can share a non-cfg block. Caveat: the Windows arm is not compiled
   locally; a Windows CI round-trip proves it.
-- **Atomic-write helper duplicated** — session.rs:147-164 and
-  crash_guard.rs:137-148 are the same create-dir-all → `to_string_pretty` →
-  `.json.tmp` → rename. Extract
-  `write_json_atomic(path, &impl Serialize, what)`.
 - **"Last tab gone → graceful exit" ×3** — main.rs:2689-2703, main.rs:2729-2738,
   context_menu.rs:638-644 all run
   `save_session_now(); mark_clean_shutdown(); shutdown_flag.store(true); request_redraw();`.
