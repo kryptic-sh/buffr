@@ -163,8 +163,10 @@ impl Engine {
             return Step::EditModeActive;
         }
 
-        // Count prefixes only apply in Normal mode and only when no
-        // chords are pending.
+        // Count prefixes apply in Normal and Visual mode and only when no
+        // chords are pending. (Visual counts are intentional: vim's
+        // `3j` selects three lines down, and a user-bound Visual digit
+        // falls through to the trie only when it is deliberately bound.)
         if matches!(self.mode, PageMode::Normal | PageMode::Visual) && self.pending.is_empty() {
             // Digits 1-9 always start a count. `0` only starts a
             // count if a count is already in progress (vim
