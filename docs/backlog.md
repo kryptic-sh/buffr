@@ -965,17 +965,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
    `&'static str` is `Cow`-free for ASCII; or keep two thin wrappers over one
    match).
 
-### Review findings (correctness)
-
-- **A-R2 LOW — find results are untagged; a background tab's in-flight find
-  stream overwrites the active tab's statusline counts.** Where:
-  `crates/buffr-cef/src/handlers.rs:552-585` pushes into the one-slot
-  `FindResultSink` with no browser id; consumed undiscriminated at
-  `apps/buffr-app/src/main.rs:3306-3327`. Same class as the hint misattribution
-  fixed by 96f9b54 (`TaggedHintEvent`, hint.rs:432-449); `FindResultSink` never
-  got the tagging. Fix: tag with browser_id and drop non-active-tab results at
-  the drain (apps half).
-
 ### Audit findings (security)
 
 - **C-A1 MEDIUM — font glyph cache is unbounded and is fed by page-controlled
