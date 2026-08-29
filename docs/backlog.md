@@ -1037,12 +1037,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Performance
 
-- **D-P1 — `add_in_tx` recompiles every statement per imported bookmark.**
-  Where: `crates/buffr-bookmarks/src/lib.rs:658-679` — 4 `tx.execute` + 1
-  `tx.query_row` compile fresh; only `prepare_cached` hits the statement cache.
-  Per anchor row on import: a 100k-bookmark export issues ~500k
-  `sqlite3_prepare` calls inside one transaction. Fix: `prepare_cached` for the
-  SELECT/INSERT/DELETE/tag-INSERT (and the `update` block at :200-217).
 - **D-P3 (noted, deliberate) — `buffr_lower` full-scans with two `to_lowercase`
   allocations per row per omnibar keystroke** (bookmarks/ src/lib.rs:566-580):
   the M40 tradeoff, documented in the crate; recorded so it is not re-derived.
