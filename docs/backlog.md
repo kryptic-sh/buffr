@@ -1099,9 +1099,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   view_source_scheme.rs:521-531. One `buffr_core` helper returning a configured
   Agent keeps the load-bearing redirect-off policy from being re-defaulted by a
   future fourth fetch.
-- **D-T1 — delete the dead `HistoryError::Url` variant** (buffr-history/
-  src/lib.rs:142-146): the only `Url::parse` call uses `.ok()` (:528), so the
-  `#[from]` conversion is unreachable. (`BookmarkError::Url` is live.)
 - **D-T2 — hoist the two `Regex::new` calls in `import_netscape` to OnceLocks**
   (buffr-bookmarks/src/lib.rs:415-427): recompiled per import; the same file
   already uses the idiom (`strip_html`, :774-775).
