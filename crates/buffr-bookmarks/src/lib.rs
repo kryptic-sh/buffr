@@ -411,7 +411,8 @@ impl Bookmarks {
         // effect: a tag with an unclosed quote no longer matches at
         // all, so that entry is skipped rather than corrupted —
         // acceptable degradation for malformed input.
-        let attr_re = Regex::new(r#"(?i)(\w+)\s*=\s*"([^"]*)""#).expect("attr regex");
+        let attr_re =
+            ATTR_RE.get_or_init(|| Regex::new(r#"(?i)(\w+)\s*=\s*"([^"]*)""#).expect("attr regex"));
         // One regex, not three independent passes: the anchor alternative
         // comes first, so a whole `<A ...>...</A>` is consumed as a single
         // token and any `<H3>` / `</DL>` markup inside its label is never
@@ -419,10 +420,12 @@ impl Bookmarks {
         // `<H3>x</H3>` inside an anchor label, pushed "x" as a folder that
         // no `</DL>` ever popped, tagged every later anchor with it, and
         // popped the real folders one level early.
-        let tok_re = Regex::new(
-            r#"(?is)(?P<anchor><A\s+(?P<anchor_attrs>(?:[^>"]|"[^"]*")*)>(?P<anchor_label>.*?)</A>)|(?P<h3><H3(?P<h3_attrs>(?:[^>"]|"[^"]*")*)>(?P<h3_label>.*?)</H3>)|(?P<dl></DL>)"#,
-        )
-        .expect("netscape token regex");
+        let tok_re = NETSCAPE_TOK_RE.get_or_init(|| {
+            Regex::new(
+                r#"(?is)(?P<anchor><A\s+(?P<anchor_attrs>(?:[^>"]|"[^"]*")*)>(?P<anchor_label>.*?)</A>)|(?P<h3><H3(?P<h3_attrs>(?:[^>"]|"[^"]*")*)>(?P<h3_label>.*?)</H3>)|(?P<dl></DL>)"#,
+            )
+            .expect("netscape token regex")
+        });
 
         // Collect every match into one ordered token stream. A single
         // regex pass yields document order, so no re-sort is needed.
@@ -610,6 +613,15 @@ fn register_lower(conn: &Connection) -> Result<(), BookmarkError> {
     .map_err(|source| BookmarkError::Open { source })?;
     Ok(())
 }
+
+/// Regexes used by `import_netscape`, compiled once per process.
+///
+/// `Regex::new` compiles the pattern on every call; imports (and the
+/// per-request `strip_html` above) run often enough that hoisting to
+/// `OnceLock` removes repeated compile work (D-T2). `ATTR_RE` parses
+/// attribute values; `NETSCAPE_TOK_RE` tokenizes the Netscape HTML.
+static ATTR_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static NETSCAPE_TOK_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
 /// Escape the `LIKE` metacharacters so a query of `50%` or `a_b`
 /// matches literally. Pairs with `ESCAPE '\'` in [`SEARCH_SQL`].
