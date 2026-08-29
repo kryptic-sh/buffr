@@ -99,10 +99,10 @@ modules:
       - install -Dm644 sh.kryptic.buffr.metainfo.xml
         /app/share/metainfo/sh.kryptic.buffr.metainfo.xml
     sources:
-      # The tarball is staged in CI before flatpak-builder runs. The
-      # `path:` source unpacks `<dir>/buffr/` from the tarball into
-      # the build dir as `payload/`. CI symlinks the tarball as
-      # `flatpak/payload.tar.gz` after extracting it.
+      # The tarball is staged in CI before flatpak-builder runs. CI
+      # extracts it into `flatpak/payload/` (ci.yml "Stage tarball
+      # payload": `tar xzf ... -C payload --strip-components=1`), so the
+      # `path:` source below resolves against the unpacked directory.
       - type: dir
         path: payload
         dest: payload
