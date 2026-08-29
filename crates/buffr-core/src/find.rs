@@ -23,6 +23,11 @@ use std::sync::{Arc, Mutex};
 /// a stream during a search; consumers care about the latest only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FindResult {
+    /// The CEF browser id this result belongs to. The sink is shared
+    /// across tabs, so a background tab's in-flight find must not
+    /// overwrite the active tab's statusline counts — the drain compares
+    /// this against the active tab's `browser_id` (A-R2).
+    pub browser_id: i32,
     /// Total matches on the page.
     pub count: u32,
     /// 1-based index of the active match. `0` while CEF is still
@@ -68,12 +73,14 @@ mod tests {
         {
             let mut guard = sink.lock().unwrap();
             *guard = Some(FindResult {
+                browser_id: 7,
                 count: 3,
                 current: 1,
                 final_update: false,
             });
         }
         let r = take_latest(&sink).expect("sink populated");
+        assert_eq!(r.browser_id, 7);
         assert_eq!(r.count, 3);
         assert_eq!(r.current, 1);
         assert!(!r.final_update);
@@ -87,6 +94,7 @@ mod tests {
         {
             let mut g = sink.lock().unwrap();
             *g = Some(FindResult {
+                browser_id: 7,
                 count: 1,
                 current: 1,
                 final_update: false,
@@ -95,12 +103,14 @@ mod tests {
         {
             let mut g = sink.lock().unwrap();
             *g = Some(FindResult {
+                browser_id: 7,
                 count: 5,
                 current: 2,
                 final_update: true,
             });
         }
         let r = take_latest(&sink).unwrap();
+        assert_eq!(r.browser_id, 7);
         assert_eq!(r.count, 5);
         assert_eq!(r.current, 2);
         assert!(r.final_update);

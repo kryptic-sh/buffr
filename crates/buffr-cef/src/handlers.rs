@@ -581,7 +581,7 @@ wrap_find_handler! {
     impl FindHandler {
         fn on_find_result(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _identifier: ::std::os::raw::c_int,
             count: ::std::os::raw::c_int,
             _selection_rect: Option<&Rect>,
@@ -596,7 +596,12 @@ wrap_find_handler! {
             // located).
             let count = count.max(0) as u32;
             let current = active_match_ordinal.max(0) as u32;
+            // Tag with the emitting browser so the shared sink's drain
+            // can drop results from a background tab's in-flight search
+            // instead of overwriting the active tab's statusline (A-R2).
+            let browser_id = browser.map(|b| cef::ImplBrowser::identifier(b)).unwrap_or(-1);
             let result = FindResult {
+                browser_id,
                 count,
                 current,
                 final_update: final_update != 0,

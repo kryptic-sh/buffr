@@ -3305,6 +3305,22 @@ impl AppState {
     /// the next paint.
     fn pump_find_results(&mut self) {
         if let Some(result) = buffr_core::take_find_result(&self.find_sink) {
+            // Only the active tab's browser may drive the active tab's
+            // statusline: a background tab's in-flight find stream must
+            // not overwrite the active tab's counts (A-R2). Same
+            // active-browser gate as the edit-event drain.
+            let active_browser = self
+                .active_engine_dyn()
+                .and_then(|e| e.active_tab())
+                .map(|t| t.browser_id);
+            if Some(result.browser_id) != active_browser {
+                tracing::trace!(
+                    browser_id = result.browser_id,
+                    ?active_browser,
+                    "find result from non-active browser — dropped"
+                );
+                return;
+            }
             // Preserve the user's query string — `FindResult` only
             // carries counts. If `find_query` is `None` the caller
             // hasn't issued a `start_find` yet (legitimate during
