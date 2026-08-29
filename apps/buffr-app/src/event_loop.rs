@@ -2060,76 +2060,49 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
         };
         let next_wakeup = Instant::now() + frame_period;
         // If CEF has scheduled a pump, wake up no later than that.
-        let deadline = match self.cef_next_pump_at {
-            Some(at) if at < next_wakeup => at,
-            _ => next_wakeup,
-        };
+        let deadline = next_wakeup.min(self.cef_next_pump_at.unwrap_or(next_wakeup));
         // If the loading animation is active, wake up at ~12 fps so it
         // advances even when no other event arrives. The animation path
         // requests a redraw inside paint_chrome_with, and `WaitUntil`
         // ensures the loop wakes to service it. Clamp to the earliest of
         // the three candidates so we never sleep *past* an animation tick.
-        let deadline = match self.loading_anim_next_wake {
-            Some(anim_at) if anim_at < deadline => anim_at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.loading_anim_next_wake.unwrap_or(deadline));
         // If a debounced CEF resize is pending, wake up no later than its
         // deadline so the resize fires promptly after the drag ends.
-        let deadline = match self.pending_cef_resize.deadline() {
-            Some(resize_at) if resize_at < deadline => resize_at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.pending_cef_resize.deadline().unwrap_or(deadline));
         // Same for any pending popup resize.
         let deadline = self
             .popups
             .values()
             .filter_map(|p| p.pending_cef_resize)
             .map(|(_, _, at)| at)
-            .fold(deadline, |acc, at| if at < acc { at } else { acc });
+            .fold(deadline, |acc, at| acc.min(at));
         // ...and for any popup frame the renderer skipped.
         let deadline = self
             .popups
             .values()
             .filter_map(|p| p.repaint_retry_at)
-            .fold(deadline, |acc, at| if at < acc { at } else { acc });
+            .fold(deadline, |acc, at| acc.min(at));
         // If the resize-paint watchdog is armed, wake up no later than its
         // deadline so the force-repaint nudge fires on time.
-        let deadline = match self.resize_paint_watchdog.deadline() {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.resize_paint_watchdog.deadline().unwrap_or(deadline));
         // Occlude debounce: if a debounce is pending, wake up no later
         // than its deadline so the sleep transition fires promptly after
         // the grace window expires (occlude detection without busy-wait).
-        let deadline = match self.sleep_deadline {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.sleep_deadline.unwrap_or(deadline));
         // Media probe: if a probe fire is due, ensure we wake up to dispatch it.
-        let deadline = match self.media_probe_next {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.media_probe_next.unwrap_or(deadline));
         // Occlusion wake probe: while heuristically sleeping, wake up at
         // the scheduled probe time so we can present once and check whether
         // the compositor is releasing buffers again.
-        let deadline = match self.next_probe_at {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.next_probe_at.unwrap_or(deadline));
         // Skipped-frame retry: wake up to re-attempt a paint the renderer
         // dropped, so the pending chrome/OSR update isn't stranded until
         // the next unrelated event.
-        let deadline = match self.repaint_retry_at {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.repaint_retry_at.unwrap_or(deadline));
         // New-tab splash JS push: clamp wake to the next splash period so
         // the animation advances without input.
-        let deadline = match self.splash_js_next_push {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        };
+        let deadline = deadline.min(self.splash_js_next_push.unwrap_or(deadline));
         // Heartbeat liveness probe: stamp the atomic the background
         // heartbeat thread reads.  No socket write happens here — the
         // bg thread owns the supervisor socket and sends pings on its
