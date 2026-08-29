@@ -4473,7 +4473,7 @@ impl AppState {
                 }
                 self.request_redraw();
             }
-            (Key::Named(NamedKey::BackTab), _) | (Key::Named(NamedKey::Up), _) => {
+            (Key::Named(NamedKey::Up), _) => {
                 if let Some(o) = self.overlay.as_mut() {
                     o.input_mut().handle_up();
                 }
@@ -4494,15 +4494,6 @@ impl AppState {
             (Key::Named(NamedKey::BS), _) => {
                 if let Some(o) = self.overlay.as_mut() {
                     o.input_mut().handle_back();
-                }
-                self.refresh_overlay_suggestions();
-                self.request_redraw();
-            }
-            (Key::Named(NamedKey::Space), _) => {
-                // winit reports space as a Named key, not Char(' ').
-                // The omnibar is text input — space is just a literal.
-                if let Some(o) = self.overlay.as_mut() {
-                    o.input_mut().handle_text(' ');
                 }
                 self.refresh_overlay_suggestions();
                 self.request_redraw();
