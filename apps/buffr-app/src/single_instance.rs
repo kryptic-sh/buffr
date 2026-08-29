@@ -299,6 +299,10 @@ fn make_name(path: &Path) -> Result<interprocess::local_socket::Name<'static>> {
 enum ConnectOutcome {
     /// Payload delivered and acknowledged by a live singleton.
     Forwarded,
+    /// The singleton is alive but refused the payload (`ERR` ack — e.g. the
+    /// scheme gate rejected every URL) or closed without acking. The socket
+    /// belongs to a live process, so this must NOT be treated as "no server".
+    Rejected(String),
     /// Nothing is listening (`ENOENT` / `ECONNREFUSED`). The socket file, if
     /// one exists, is genuinely stale and may be replaced.
     Stale,
@@ -349,13 +353,33 @@ fn try_forward(path: &Path, urls: &[String]) -> Result<ConnectOutcome> {
         .write_all(b"\n")
         .context("writing newline to server")?;
 
-    // Read ack (any non-empty line; server sends "OK\n").
+    // Read the ack. The server sends exactly "OK\n" when it accepted the
+    // payload or "ERR\n" when it rejected it (bad payload, scheme gate).
     let mut ack = String::new();
-    BufReader::new(&stream)
+    let n = BufReader::new(&stream)
         .read_line(&mut ack)
         .context("reading ack from server")?;
     debug!(ack = %ack.trim(), "single_instance: forwarding ack received");
-    Ok(ConnectOutcome::Forwarded)
+    Ok(classify_ack(n, &ack))
+}
+
+/// Classify the server's ack line into a [`ConnectOutcome`].
+///
+/// - `"OK"` → the payload was accepted → [`ConnectOutcome::Forwarded`].
+/// - `"ERR"` → rejected (bad payload, or the scheme gate dropped every URL) —
+///   the client must not report "forwarded".
+/// - EOF / empty line (`n == 0`) → the server closed without acking — wedged
+///   or died mid-handling; not success either.
+/// - anything else → fail closed as `Rejected` with the raw line.
+fn classify_ack(n: usize, ack: &str) -> ConnectOutcome {
+    let ack = ack.trim();
+    if n == 0 || ack.is_empty() {
+        return ConnectOutcome::Rejected("server closed without an ack".to_string());
+    }
+    if ack == "OK" {
+        return ConnectOutcome::Forwarded;
+    }
+    ConnectOutcome::Rejected(ack.to_string())
 }
 
 /// Bind the singleton listener at `path`.
@@ -434,6 +458,12 @@ pub fn try_acquire(profile_id: &str, urls: &[String]) -> Result<AcquireResult> {
     // Step 1: try to forward to an existing instance.
     match forward_with_retries(&path, urls)? {
         ConnectOutcome::Forwarded => return Ok(AcquireResult::Forwarded),
+        ConnectOutcome::Rejected(msg) => {
+            anyhow::bail!(
+                "the running buffr instance refused the forwarded URL(s) \
+                 (second instance exits; nothing was opened): {msg}"
+            );
+        }
         ConnectOutcome::Stale => {}
         ConnectOutcome::Ambiguous(msg) => {
             anyhow::bail!(
@@ -459,7 +489,7 @@ pub fn try_acquire(profile_id: &str, urls: &[String]) -> Result<AcquireResult> {
                     ConnectOutcome::Forwarded => Ok(AcquireResult::Forwarded),
                     other => {
                         let detail = match other {
-                            ConnectOutcome::Ambiguous(msg) => msg,
+                            ConnectOutcome::Ambiguous(msg) | ConnectOutcome::Rejected(msg) => msg,
                             _ => "socket not listening".to_string(),
                         };
                         Err(anyhow::anyhow!(
@@ -489,6 +519,9 @@ fn forward_with_retries(path: &Path, urls: &[String]) -> Result<ConnectOutcome> 
     for attempt in 1..=CONNECT_ATTEMPTS {
         match try_forward(path, urls)? {
             ConnectOutcome::Forwarded => return Ok(ConnectOutcome::Forwarded),
+            // Rejected/Stale are final — a refusal or an absent server is not
+            // going to resolve by retrying.
+            ConnectOutcome::Rejected(msg) => return Ok(ConnectOutcome::Rejected(msg)),
             ConnectOutcome::Stale => return Ok(ConnectOutcome::Stale),
             ConnectOutcome::Ambiguous(msg) => {
                 last = ConnectOutcome::Ambiguous(msg);
@@ -674,7 +707,10 @@ pub fn spawn_accept_thread(
                     .collect();
                 if safe_urls.is_empty() {
                     warn!("single_instance: all forwarded URLs were rejected — skipping event");
-                    let _ = stream.write_all(b"OK\n");
+                    // ERR, not OK: nothing was accepted, and the client must
+                    // not report "forwarded" when it is (a) about to exit and
+                    // (b) leaving the user with nothing opened.
+                    let _ = stream.write_all(b"ERR\n");
                     continue;
                 }
                 // Send event to the winit loop.
@@ -695,7 +731,47 @@ pub fn spawn_accept_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_FORWARD_URL_LEN, is_safe_forward_url, profile_id_from};
+    use super::{
+        ConnectOutcome, MAX_FORWARD_URL_LEN, classify_ack, is_safe_forward_url, profile_id_from,
+    };
+
+    // ---- Group 1: ack classification -----------------------------------------
+    //
+    // The client must not report "forwarded" unless the server actually took
+    // the payload. Regression: the old code returned Forwarded on any line
+    // including EOF, so `buffr <rejected-url>` with a live singleton silently
+    // "succeeded" while nothing was opened.
+
+    #[test]
+    fn ok_ack_is_forwarded() {
+        assert!(matches!(classify_ack(3, "OK\n"), ConnectOutcome::Forwarded));
+    }
+
+    #[test]
+    fn err_ack_is_rejected() {
+        assert!(matches!(
+            classify_ack(4, "ERR\n"),
+            ConnectOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn eof_without_ack_is_rejected() {
+        assert!(matches!(classify_ack(0, ""), ConnectOutcome::Rejected(_)));
+    }
+
+    #[test]
+    fn empty_line_is_rejected() {
+        assert!(matches!(classify_ack(1, "\n"), ConnectOutcome::Rejected(_)));
+    }
+
+    #[test]
+    fn unknown_ack_fails_closed() {
+        assert!(matches!(
+            classify_ack(4, "??\n"),
+            ConnectOutcome::Rejected(_)
+        ));
+    }
 
     // ---- Group 2: profile_id sha256 derivation ------------------------------
     //
