@@ -952,16 +952,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
 
 ### Tidy (behaviour-preserving)
 
-- **A-T1 — three copies of the ASCII-forcing JS-string escaper:**
-  `crates/buffr-core/src/hint.rs:556-584` (`json_string_inner`), the inline
-  labels escaper hint.rs:508-531, `crates/buffr-cef/src/host.rs:2845-2872`
-  (`json_string_literal`). **Verified caveat (2026-08-30):** the three are NOT
-  interchangeable — `json_string_literal` escapes `"` but not `'`, while
-  `json_string_inner` escapes `'` but not `"` (single-quoted JS context). A
-  blind "promote the superset" is wrong; the fix needs a combined escaper that
-  escapes both quotes (valid in both contexts) or two thin wrappers over one
-  match. The labels loop (hint.rs:508-531) is the double-quoted twin of
-  `json_string_inner`.
 - **C-T2 — buffr-modal's edit-mode layer (~540 lines) has zero callers outside
   its own crate** (whole-workspace rg; apps' own comment says "no Rust
   EditSession", apps/buffr-app/src/main.rs:828): `edit_mode.rs` `EditSession`
