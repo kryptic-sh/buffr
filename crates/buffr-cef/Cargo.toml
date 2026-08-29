@@ -23,7 +23,6 @@ cef.workspace = true
 tracing = "0.1"
 hjkl-config.workspace = true
 serde_json = "1"
-ureq = { version = "3", features = ["json"] }
 buffr-core.workspace = true
 buffr-engine.workspace = true
 buffr-modal.workspace = true
