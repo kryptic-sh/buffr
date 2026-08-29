@@ -1091,9 +1091,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   `crates/buffr-core/src/media_probe.rs:57-59` (`parse_payload`). The would-be
   consumer (webkit) documents that payloads never reach Rust (runtime.rs:4860).
   `edit::parse_payload` stays — it is the live decode step (edit.rs:203).
-- **A-T3 — delete `ConsoleNonces::len`/`is_empty`** (console_nonce.rs: 211-218):
-  zero callers outside the module's own tests; the tests can assert on
-  `page(9) != first` as `forget_drops_the_entry` already does.
 - **A-T4 — third near-identical ureq agent config** (timeout/UA/
   `max_redirects(0)`): updates.rs:104-114, image_copy.rs:111-118,
   view_source_scheme.rs:521-531. One `buffr_core` helper returning a configured
