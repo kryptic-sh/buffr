@@ -180,6 +180,7 @@ use buffr_ui::{
     Statusline, Suggestion, SuggestionKind, TAB_STRIP_HEIGHT, TabStrip, TabView,
 };
 
+mod atomic_write;
 mod cef_translate;
 mod chrome_paint;
 mod cli;

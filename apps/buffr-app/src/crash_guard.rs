@@ -135,16 +135,7 @@ fn read(path: &Path) -> Result<LaunchLog> {
 }
 
 fn write(path: &Path, log: &LaunchLog) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating launch-log parent {}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(log).context("serializing launch log")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    crate::atomic_write::write_json_atomic(path, log, "launch log")
 }
 
 #[cfg(test)]

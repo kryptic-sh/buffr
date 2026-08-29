@@ -174,25 +174,11 @@ pub fn read(path: &Path) -> Result<Option<Session>> {
     Ok(Some(session))
 }
 
-/// Atomically write `session` to `path`. Parent dir is created on
-/// demand. We `write_all` to a sibling tempfile then `rename`, so a
-/// crash mid-write can't corrupt the previous good state.
+/// Atomically write `session` to `path` (shared
+/// [`crate::atomic_write::write_json_atomic`] implementation: sibling
+/// tempfile + rename + owner-only perms on unix).
 pub fn write(path: &Path, session: &Session) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating session parent directory {}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(session).context("serializing session JSON")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting permissions on {}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    crate::atomic_write::write_json_atomic(path, session, "session file")?;
     info!(
         path = %path.display(),
         pinned = session.pinned.len(),
