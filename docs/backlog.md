@@ -1025,9 +1025,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   view_source_scheme.rs:521-531. One `buffr_core` helper returning a configured
   Agent keeps the load-bearing redirect-off policy from being re-defaulted by a
   future fourth fetch.
-- **D-T2 — hoist the two `Regex::new` calls in `import_netscape` to OnceLocks**
-  (buffr-bookmarks/src/lib.rs:415-427): recompiled per import; the same file
-  already uses the idiom (`strip_html`, :774-775).
 - **C-T2 — buffr-modal's edit-mode layer (~540 lines) has zero callers outside
   its own crate** (whole-workspace rg; apps' own comment says "no Rust
   EditSession", apps/buffr-app/src/main.rs:828): `edit_mode.rs` `EditSession`
