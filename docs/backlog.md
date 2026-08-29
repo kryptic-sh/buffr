@@ -597,10 +597,6 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   identical `Heartbeat` struct + `mark_alive`/`is_fatal`/`tick` (69-169 vs
   623-718) can share a non-cfg block. Caveat: the Windows arm is not compiled
   locally; a Windows CI round-trip proves it.
-- **`cli.rs` `open_*_for_cli` ×5** (cli.rs:46-52, 88-94, 130-136, 156-162,
-  191-197) — identical "profile_paths → create_dir_all(data) → store open"
-  scaffolding differing only in the store constructor. One helper taking
-  filename + `impl FnOnce(PathBuf) -> Result<T>`.
 - **chrome_paint modal-popup paint blocks** (chrome_paint.rs:224-263, 282-321) —
   both destructure `ModalPanel`, fill border, fill inner, paint content. Extract
   `paint_modal_panel`.
