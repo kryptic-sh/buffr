@@ -192,11 +192,18 @@ impl ActiveContextMenu {
         let x = self.request.x;
         let y = self.request.y.clamp(0, win_h as i32);
 
+        // Panel width was already measured once when the menu opened
+        // (perf §14-15); reuse it here so `paint` doesn't re-walk every
+        // label per dirty frame (perf §22 C-P1).
+        let panel_w = self.panel_w;
+        let panel_h = ContextMenuOverlay::preferred_height_for(&self.entries);
         ContextMenuOverlay {
             entries: self.entries.clone(),
             selected: self.selected,
             x,
             y,
+            panel_w,
+            panel_h,
         }
     }
 

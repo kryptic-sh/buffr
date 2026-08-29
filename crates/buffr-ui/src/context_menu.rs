@@ -63,6 +63,17 @@ pub struct ContextMenuOverlay {
     /// stays inside `(buf_w, buf_h)`.
     pub x: i32,
     pub y: i32,
+    /// Panel width in pixels, measured once at construction.
+    ///
+    /// The measurement walks every non-separator label through the
+    /// glyph cache (per-glyph mutex lock); the overlay is rebuilt per
+    /// dirty frame while a menu is open, so re-measuring in `paint`
+    /// repeated that walk per frame (perf §22 C-P1). The caller caches
+    /// the same value for hit-testing (`ActiveContextMenu::panel_w`).
+    pub panel_w: u32,
+    /// Panel height in pixels, computed once at construction (pure
+    /// arithmetic over `entries` — no font lookups).
+    pub panel_h: u32,
 }
 
 impl ContextMenuOverlay {
@@ -74,6 +85,24 @@ impl ContextMenuOverlay {
     /// Compute the pixel height of the entire panel.
     pub fn preferred_height(&self) -> u32 {
         Self::preferred_height_for(&self.entries)
+    }
+
+    /// Measure both dimensions once and return a panel geometry for
+    /// `entries` — the "cache at construction" entry point. Callers that
+    /// rebuild an overlay each frame (e.g. `to_overlay` on every paint)
+    /// must reuse the cached [`Self::panel_w`] / [`Self::panel_h`]
+    /// instead of re-measuring inside the paint path.
+    pub fn for_entries(entries: Vec<ContextMenuEntry>, selected: usize, x: i32, y: i32) -> Self {
+        let panel_w = Self::preferred_width_for(&entries);
+        let panel_h = Self::preferred_height_for(&entries);
+        Self {
+            entries,
+            selected,
+            x,
+            y,
+            panel_w,
+            panel_h,
+        }
     }
 
     /// Panel geometry for a menu built from `entries` at requested origin
@@ -109,7 +138,7 @@ impl ContextMenuOverlay {
         (label_w + 2 * CONTEXT_MENU_PADDING_X + 2).max(CONTEXT_MENU_MIN_WIDTH)
     }
 
-    fn preferred_height_for(entries: &[ContextMenuEntry]) -> u32 {
+    pub fn preferred_height_for(entries: &[ContextMenuEntry]) -> u32 {
         let mut h: u32 = 2; // top + bottom border px
         for e in entries {
             h += if e.is_separator {
@@ -130,8 +159,11 @@ impl ContextMenuOverlay {
             return;
         }
 
-        let panel_w = self.preferred_width() as i32;
-        let panel_h = self.preferred_height() as i32;
+        // Measured once at construction — re-measuring here re-walked
+        // every label through the glyph cache per dirty frame (perf §22
+        // C-P1).
+        let panel_w = self.panel_w as i32;
+        let panel_h = self.panel_h as i32;
 
         // Clamp to viewport.
         let px = self.x.clamp(0, (buf_w as i32 - panel_w).max(0));
@@ -331,8 +363,8 @@ mod tests {
     }
 
     fn simple_menu(x: i32, y: i32) -> ContextMenuOverlay {
-        ContextMenuOverlay {
-            entries: vec![
+        ContextMenuOverlay::for_entries(
+            vec![
                 ContextMenuEntry {
                     label: "Back".into(),
                     is_separator: false,
@@ -349,10 +381,10 @@ mod tests {
                     enabled: true,
                 },
             ],
-            selected: 0,
+            0,
             x,
             y,
-        }
+        )
     }
 
     #[test]

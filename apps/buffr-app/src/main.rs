@@ -7467,8 +7467,8 @@ mod tests {
         // cursor coords.
         let scale = 2.0;
         let (lw, lh) = logical_chrome_dims(2000, 1600, scale);
-        let overlay = buffr_ui::ContextMenuOverlay {
-            entries: vec![
+        let overlay = buffr_ui::ContextMenuOverlay::for_entries(
+            vec![
                 buffr_ui::ContextMenuEntry {
                     label: "Back".to_string(),
                     is_separator: false,
@@ -7480,10 +7480,10 @@ mod tests {
                     enabled: true,
                 },
             ],
-            selected: 0,
-            x: 100,
-            y: 120,
-        };
+            0,
+            100,
+            120,
+        );
         let (px, py, pw, ph) = overlay.panel_rect(lw as usize, lh as usize);
         let (cx, cy) = (px + pw / 2, py + ph / 2);
         // Physical cursor over that logical pixel.
