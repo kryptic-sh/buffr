@@ -155,11 +155,6 @@ impl Engine {
         }
     }
 
-    /// Configured ambiguity timeout.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     /// Feed one chord. The `now` argument is the current wall-clock
     /// duration since some fixed epoch (the engine never reads the
     /// clock itself; the host owns timekeeping).
