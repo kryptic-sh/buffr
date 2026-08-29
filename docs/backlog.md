@@ -1103,9 +1103,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   and `host.rs` `BuffrHost`/`BuffrEditIntent`/`BuffrBufferId`. The crate is
   published, so this is API surface — wire it (Phase-2 intent) or drop it in the
   next breaking window (c7b861f shows the pattern). Owner's call.
-- **C-T3 — `Engine::timeout()` is dead everywhere including tests**
-  (engine.rs:158-161, rg verified). Delete; same owner's-call treatment for
-  `pending()`/`with_timeout`/`Keymap::new()` (used only by in-crate tests).
 - **B-T1 (corrected) — windowing `other` bridge types: `Rect`
   (windowing/other/geometry.rs:39) and `ContentPurpose` (windowing/other/
   ime.rs:14) are dead and not even re-exported** — deletable. The area-B agent's
