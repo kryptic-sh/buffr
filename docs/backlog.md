@@ -609,9 +609,8 @@ unreachable "space" arms, the fuzz no-op loop and cef_minimal_url are all gone.
   `save_session_now(); mark_clean_shutdown(); shutdown_flag.store(true); request_redraw();`.
   Extract `fn request_exit`.
 - **Deadline-clamp idiom ×9** — event*loop.rs:2024-2027, 2033-2036, 2039-2042,
-  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each `let
-  deadline = match self.X { Some(at) if at < deadline => at, * => deadline
-  }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
+  2058-2061, 2065-2068, 2070-2073, 2077-2080, 2084-2087, 2090-2093, each
+  `let deadline = match self.X { Some(at) if at < deadline => at, * => deadline }`→`let deadline = deadline.min(self.X.unwrap_or(deadline))`.
 - **`cli.rs` `open_*_for_cli` ×5** (cli.rs:46-52, 88-94, 130-136, 156-162,
   191-197) — identical "profile_paths → create_dir_all(data) → store open"
   scaffolding differing only in the store constructor. One helper taking
@@ -937,3 +936,321 @@ heap traffic on the common path.
   token class, pre-existing and documented (`host.rs:388-393`), out of the
   delta. Noted so a future "fix the token in history" doesn't stop at
   history.sqlite.
+
+## 22. Sweep 2026-08-28 (63b8a25..3bdd7ec verified) — four-pass, whole codebase
+
+Full-codebase sweep (tree clean at 3bdd7ec): four parallel read-only agents
+(engine boundary / app layer / stores+xtask / ui+modal+config+inhibit), each
+running review + audit + tidy + perf, briefed against §10-21. Every finding
+below was re-verified line-by-line at the cited file by the sweep owner;
+candidates that died under verification are listed under Cleared with the
+reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
+
+### Cross-cutting (flagged by two or more areas)
+
+1. **B-R1 MEDIUM — popup window/renderer build failure orphans the live CEF
+   popup browser.** Where: `apps/buffr-app/src/event_loop.rs:1601-1615`. The
+   `create_window` and `Renderer::new` error arms `continue` without
+   `engine.popup_close(...)` — only the cap path (:1578-1587) closes. The popup
+   browser stays registered in `popup_browsers`/`popup_frames`, keeps playing
+   audio and running JS, and nothing drains it until shutdown.
+   ```
+   Repro: page calls window.open() in a way that makes Toplevel::builder()
+          fail (or Renderer::new fail — GPU device loss)
+   Expect: browser closed, teardown drains through popup_close_sink
+   Actual: live CEF popup browser leaks for the session
+   ```
+   Fix: call `popup_close(created.browser_id)` in both error arms. Flagged from
+   two directions (the area-B review pass; same shape as the M16 leak).
+2. **C-P1 MEDIUM — context-menu paint re-measures every label per dirty frame;
+   01fe932 cached the hit-test path but not the paint path.** Where:
+   `crates/buffr-ui/src/context_menu.rs:133` (`paint` → `preferred_width()` →
+   per-glyph locked walk over every label, context_menu.rs:102-110) from
+   `chrome_paint.rs:325-327` every dirty frame while a menu is open; hover marks
+   chrome dirty per pointer-move. The apps-side cache
+   (`ActiveContextMenu.panel_w`, apps context_menu.rs:107) already holds the
+   identical value. Fix: store `panel_w`/`panel_h` on `ContextMenuOverlay` at
+   construction, or thread the cached width into `paint`.
+3. **B-XA LOW — CEF pending-alloc eviction can mispair frame/view/url with the
+   next popup.** Where: `crates/buffr-cef/src/handlers.rs:284-290`
+   (`on_before_popup` evicts the oldest alloc at the 32-cap, but still returns 0
+   and lets CEF create the browser) + handlers.rs:296-317 (`on_after_created`
+   claims front-of-queue). Every browser after an eviction claims the _next_
+   alloc — off-by-one mispairing; the last popup gets "no pending alloc" and is
+   registered without OSR routing. No leak (all browsers registered), but
+   frames/URLs go to the wrong windows after a 32-popup burst. Fix: evict-oldest
+   only when NOT allowing creation, or return a nonzero code to cancel that
+   popup when the queue is full.
+4. **`html_escape` exists in four crates** (merged area-A tidy + verified
+   wider): `crates/buffr-cef/src/html.rs:15`,
+   `crates/buffr-view-source/ src/lib.rs:286`,
+   `apps/buffr-app/src/main.rs:1218`, `crates/buffr-core` escaping inside
+   hint.rs — all the same five-metacharacter escaper (html.rs:3's comment even
+   says it consolidated "two"). Extract one `pub` helper (buffr-core, already a
+   dep of all four users' crates' siblings). Verified: same match arms in each
+   copy.
+5. **mode→label table is a sync-by-comment quad, two case-variants** (C-T1,
+   verified wider than reported): `buffr-ui/src/lib.rs:397-405` and
+   `apps/buffr-app/src/main.rs:5811` return UPPERCASE;
+   `buffr-modal/src/ keymap.rs:406-414` and `buffr-config/src/lib.rs:990-998`
+   return lowercase. Fix: one source in buffr-modal (`PageMode::name()`),
+   uppercase at the two call sites that need it (`.to_uppercase()` on a
+   `&'static str` is `Cow`-free for ASCII; or keep two thin wrappers over one
+   match).
+
+### Review findings (correctness)
+
+- **C-R1 LOW — Engine count-prefix accepts counts in Visual mode while its
+  comment claims Normal-only.** Where:
+  `crates/buffr-modal/src/engine.rs: 171-173` (comment "only apply in Normal
+  mode", guard `Normal | Visual`). Reachable only via a user-bound Visual key
+  (`[keymap.visual] j = ...`), where the count behaviour is arguably better —
+  but code contradicts comment. Fix: widen the comment or narrow the guard,
+  deliberately.
+- **A-R1 LOW — `on_audio_stream_error` resets the browser's whole stream count
+  to zero.** Where: `crates/buffr-cef/src/audio.rs:158-159`. Two playing
+  streams, one errors → `stream_count = 0; active = false`; the
+  indicator/idle-inhibit flip off while the sibling still plays, and the next
+  real `stopped` decrements a saturated 0. Fix:
+  `stream_count = stream_count.saturating_sub(1)` like the stopped path, keeping
+  the active=false edge only at 0.
+- **A-R2 LOW — find results are untagged; a background tab's in-flight find
+  stream overwrites the active tab's statusline counts.** Where:
+  `crates/buffr-cef/src/handlers.rs:552-585` pushes into the one-slot
+  `FindResultSink` with no browser id; consumed undiscriminated at
+  `apps/buffr-app/src/main.rs:3306-3327`. Same class as the hint misattribution
+  fixed by 96f9b54 (`TaggedHintEvent`, hint.rs:432-449); `FindResultSink` never
+  got the tagging. Fix: tag with browser_id and drop non-active-tab results at
+  the drain (apps half).
+- **D-R1 LOW — `flatten_top_level` silently deletes extracted entries whose
+  destination already exists.** Where: `xtask/src/main.rs:608-616`.
+  `if to.exists() { continue }` leaves the entry inside `top`, which the
+  unconditional `fs::remove_dir_all(&top)` then deletes — skip means discard.
+  The early bail at :212-216 only checks `Release`/`libcef.so`, so a stale-file
+  vendor dir reaches this path. Fix: only `remove_dir_all` when the loop moved
+  everything.
+- **B-R2 LOW — single-instance forwarder treats any ack as success.** Where:
+  `apps/buffr-app/src/single_instance.rs:352-357` (client reads any non-empty
+  line — or EOF — and returns `ConnectOutcome::Forwarded`) vs the server acking
+  `OK` after dropping every URL (:676-686) and `ERR` for bad payloads
+  (:645-657). A user whose URLs were all rejected by the scheme gate sees
+  "forwarded" and the window comes forward with nothing opened. Fix: parse the
+  ack (`OK` vs `ERR`), treat `ERR`/EOF as failure.
+
+### Audit findings (security)
+
+- **C-A1 MEDIUM — font glyph cache is unbounded and is fed by page-controlled
+  text.** Where: `crates/buffr-ui/src/font.rs:39-58` — `glyph_entry` inserts
+  every first-seen `char` into a process-lifetime `HashMap` (`FACE` OnceLock,
+  font.rs:65); no eviction, no cap (verified: no clear/retain/remove anywhere in
+  font.rs). Tab titles and the URL statusline are page-controlled and walked per
+  painted frame, so a page rewriting `document.title` with fresh exotic
+  characters inserts ~20-50 new glyphs per dirty frame — hundreds of MB over a
+  long session. Truncation bounds chars-per-title per frame, slowing but not
+  capping.
+  ```
+  Repro: setInterval(() => document.title = <fresh random chars>)
+  Expect: bounded cache
+  Actual: every distinct char ever measured is retained for the process
+  ```
+  Fix: cap/flush the map past ~4k entries (re-rasterizing evicted glyphs is
+  cheap) or switch to an LRU.
+- **A-A1 LOW — a page can flood the log with unbounded attacker-chosen bytes via
+  malformed sentinel lines.** Where:
+  `crates/buffr-cef/src/handlers.rs:1078-1080` (edit) and :1101-1103 (media):
+  `tracing::warn!(line = %redact_console_text(&text), ...)` —
+  `redact_console_text` (handlers.rs:135-154) returns the text UNTRUNCATED for
+  sentinel-prefixed lines (its own comment concedes pages can carry these
+  prefixes, handlers.rs:109-111), and the `BUFFR_LOG_CONSOLE` gate covers only
+  the non-sentinel mirror (handlers.rs:1028-1031). Sweep-owner correction to the
+  agent's report: the app logs to **stderr**
+  (apps/buffr-app/src/main.rs:423-428) and the supervisor does not redirect it
+  (apps/buffr/src/main.rs:669), so the default flood surface is the
+  terminal/pipe, not disk; disk fill needs a redirect. `warn!` passes the
+  default info filter, so the unbounded rate stands. Fix: apply
+  `CONSOLE_LOG_MAX_LEN` to sentinel lines too (keep a modest sentinel-specific
+  budget, e.g. 512 B).
+- **A-A2 LOW (caveated) — `on_console_message` converts every console line to a
+  Rust String before any prefix gate.** Where: `handlers.rs:1005-1006`
+  (`let text = message.to_string();`), sentinel fast-path and redaction only
+  afterwards. A page looping `console.log( bigString)` allocates the full
+  UTF-16→UTF-8 copy per line in the browser process. Caveat: Chromium may cap
+  console message length itself — not verifiable from this tree; A2 is also A1's
+  amplifier. Fix if confirmed: length-check `message` (UTF-16 length is cheap)
+  before converting.
+
+### Tidy (behaviour-preserving)
+
+- **A-T1 — three copies of the ASCII-forcing JS-string escaper:**
+  `crates/buffr-core/src/hint.rs:556-584` (`json_string_inner`), the inline
+  labels escaper hint.rs:508-531, `crates/buffr-cef/src/host.rs:2845-2872`
+  (`json_string_literal`). Promote one to `pub` in buffr-core, delete the other
+  two bodies.
+- **A-T2 — delete two zero-caller `pub` fns** (whole-workspace rg verified):
+  `crates/buffr-core/src/hint.rs:472-474` (`parse_payload`) and
+  `crates/buffr-core/src/media_probe.rs:57-59` (`parse_payload`). The would-be
+  consumer (webkit) documents that payloads never reach Rust (runtime.rs:4860).
+  `edit::parse_payload` stays — it is the live decode step (edit.rs:203).
+- **A-T3 — delete `ConsoleNonces::len`/`is_empty`** (console_nonce.rs: 211-218):
+  zero callers outside the module's own tests; the tests can assert on
+  `page(9) != first` as `forget_drops_the_entry` already does.
+- **A-T4 — third near-identical ureq agent config** (timeout/UA/
+  `max_redirects(0)`): updates.rs:104-114, image_copy.rs:111-118,
+  view_source_scheme.rs:521-531. One `buffr_core` helper returning a configured
+  Agent keeps the load-bearing redirect-off policy from being re-defaulted by a
+  future fourth fetch.
+- **D-T1 — delete the dead `HistoryError::Url` variant** (buffr-history/
+  src/lib.rs:142-146): the only `Url::parse` call uses `.ok()` (:528), so the
+  `#[from]` conversion is unreachable. (`BookmarkError::Url` is live.)
+- **D-T2 — hoist the two `Regex::new` calls in `import_netscape` to OnceLocks**
+  (buffr-bookmarks/src/lib.rs:415-427): recompiled per import; the same file
+  already uses the idiom (`strip_html`, :774-775).
+- **D-T3 — stale flatpak comment:** flatpak/sh.kryptic.buffr.yml:101-105 says CI
+  "symlinks the tarball as `flatpak/payload.tar.gz`"; CI actually extracts into
+  `payload/` (ci.yml:1155-1166). Comment-only.
+- **C-T2 — buffr-modal's edit-mode layer (~540 lines) has zero callers outside
+  its own crate** (whole-workspace rg; apps' own comment says "no Rust
+  EditSession", apps/buffr-app/src/main.rs:828): `edit_mode.rs` `EditSession`
+  and `host.rs` `BuffrHost`/`BuffrEditIntent`/`BuffrBufferId`. The crate is
+  published, so this is API surface — wire it (Phase-2 intent) or drop it in the
+  next breaking window (c7b861f shows the pattern). Owner's call.
+- **C-T3 — `Engine::timeout()` is dead everywhere including tests**
+  (engine.rs:158-161, rg verified). Delete; same owner's-call treatment for
+  `pending()`/`with_timeout`/`Keymap::new()` (used only by in-crate tests).
+- **B-T1 (corrected) — windowing `other` bridge types: `Rect`
+  (windowing/other/geometry.rs:39) and `ContentPurpose` (windowing/other/
+  ime.rs:14) are dead and not even re-exported** — deletable. The area-B agent's
+  `Surface` claim was WRONG: removing `Surface` from the main.rs:208 import
+  breaks the build (`event_loop.rs:1636` resolves `.id()` through the trait);
+  verified by temporarily removing it and restoring.
+- **C-T4 — `NamedKey::Space`/`BackTab` arms unreachable on every active input
+  path:** the parser canonicalises space to `Char(' ')` (key.rs: 189-196), the
+  bridge adapter likewise (adapter.rs:124-129) and has no `BackTab` mapping
+  (adapter.rs:52-80; winit delivers Shift+Tab as `Tab`+SHIFT). Concrete
+  deletion: apps `main.rs:4501` (Space) and part of :4476 (BackTab) overlay
+  arms. The modal variant stays until the `winit` feature is deleted or wired.
+
+### Performance
+
+- **D-P1 — `add_in_tx` recompiles every statement per imported bookmark.**
+  Where: `crates/buffr-bookmarks/src/lib.rs:658-679` — 4 `tx.execute` + 1
+  `tx.query_row` compile fresh; only `prepare_cached` hits the statement cache.
+  Per anchor row on import: a 100k-bookmark export issues ~500k
+  `sqlite3_prepare` calls inside one transaction. Fix: `prepare_cached` for the
+  SELECT/INSERT/DELETE/tag-INSERT (and the `update` block at :200-217).
+- **D-P2 — view-source grammar load-failure is retried per request.** Where:
+  `crates/buffr-view-source/src/lib.rs:136-141` — on `Grammar::load_from_path`
+  failure the function returns `None` without caching, so every render of that
+  language repeats dlopen + query parse. Per view-source request
+  (user-triggered, bounded); a corrupt present artifact turns every render into
+  a failed load attempt. Fix: cache the negative result alongside the positive
+  map.
+- **D-P3 (noted, deliberate) — `buffr_lower` full-scans with two `to_lowercase`
+  allocations per row per omnibar keystroke** (bookmarks/ src/lib.rs:566-580):
+  the M40 tradeoff, documented in the crate; recorded so it is not re-derived.
+
+### Cleared (suspected and disproved — highlights; full lists per area in the task transcripts)
+
+- **§17-3 hardening item is FIXED by 8d8847c** — `handle_connection` now returns
+  400 before the token check when `Host` is absent (internal_server.rs:436-441),
+  `host_is_ours` rejects no-port/wrong-port/ foreign-name/empty forms (tests
+  :986-1040), pinned by `rejects_missing_host_header` (:722-733).
+- A-R3 (internal server "empty request gets 405") — refuted:
+  `parse_request_line` returns `None` for a 0-2-token line (empty line →
+  `parts.next()` on raw_path is `None`, internal_server.rs:492) → 400 at
+  :421-424; a 3-token non-GET line is exactly what 405 is for.
+- 61c2702 nonce-gating is behaviour-preserving — each branch still runs the full
+  sentinel+nonce parse; the prefix gate only skips nonce-table lookups.
+- ba8ffd9 redirect-off is complete and nothing needed redirects — the only
+  request is the pinned api.github.com URL; a 3xx body fails release-JSON
+  parsing → `NetworkError`.
+- InflightGuard acquire is not off-by-one (fetch-add-then-check yields exactly
+  MAX_INFLIGHT; rejected caller decrements).
+- 267dd9a recycled-buffer zeroing covers the resize-vs-swapped-Vec hole
+  (osr.rs:269-284 re-allocates then copy_from_slice).
+- 9906066 watcher fix is complete: inner `catch_unwind` wraps only the callback;
+  nothing left to poison after the commit removed the Arc<Mutex>; outer catch
+  covers loop machinery; canary test fails pre-fix.
+- 4f6122c, 01fe932, 3e3f6b2 verified behaviour-preserving (details in the Area C
+  transcript): empty-head guard survives the host_head extraction; the
+  panel-width cache cannot go stale (entries immutable for menu life); widgets
+  are stateless-by-contract so paint-every-frame holds no stale state.
+- 81aa343 no-change skip cannot skip a needed write (writes only received/total
+  bytes, skip compares exactly those, terminal gate precedes); 15cb0a5 caps
+  bound the parse linearly; ef0d8f4 anchor-as-one- token holds; c12da19 grammar
+  cache is sound (single-lock check+insert, Sync via tree-sitter/libloading
+  impls, all span slices bounded).
+- bea7ec4 bounds are genuinely mid-stream: download cap checked per chunk before
+  continuing; extraction sums header sizes and bails before unpacking the
+  offending entry; header-only bomb test proves no write precedes the bail.
+- SQL across all five stores parameterized; the only string-built SQL is the
+  count-derived `IN (?,…)` list (bookmarks :718-725); `escape_like` + FTS
+  quote-doubling correct; migrations transactional with TooNew guard.
+- view-source/image_copy SSRF: 3xx not followed, worker re-validates with DNS,
+  same-host exception only fires when the navigating page is already on that
+  host (CEF supplies frame.url); integer/odd IPv4 caught fail-closed; `data:`
+  images memory-bounded pre/post decode.
+- Downloads `sanitise_filename` traversal-safe; `open_path` never routes through
+  a shell (regression-tested for cmd.exe re-parsing).
+- Favicon blit rejects bogus CEF-supplied dimensions (checked_mul + length
+  guard); bilinear taps clamped.
+- `truncate_to_width` unicode-safe; InputBar `+1` scroll is the cursor-slot
+  reservation, not an off-by-one; Statusline right-pen underflow cannot panic
+  (draw_text clips).
+- keybinding.rs slicing panic-free (quote-anchored ASCII slices behind len
+  guards); fuzz targets cover both parsers.
+- `mpsc::SyncSender` in WorkerInhibitor compiles green where cfg-compiled
+  (current-toolchain `SyncSender: Sync`).
+- Inhibit FFI: wayland null-checks both pointers; windows return-0 checked;
+  macOS constants match IOKit typedefs; channel-full drops recovered by each
+  worker's disconnect cleanup.
+
+### Hardening (correct today but fragile)
+
+- **fetch-cef ureq calls have no timeouts** (xtask/src/main.rs:222, 382 —
+  default agent, `timeouts = None` in ureq 3.4.0): a hung CDN stalls CI until
+  the runner timeout. Same fix shape as view-source's 10 s.
+- Tar symlink entries: `unpack_in` blocks writes THROUGH an outpointing symlink
+  but the symlink itself is created unvalidated — dangling links remain in
+  `vendor/cef/` (same trust as the archive; cosmetic).
+- Permissions origin PK stored verbatim (handlers.rs:1435-1437): a missing
+  origin becomes `""` and would satisfy precheck for later no-origin requests;
+  case variants duplicate sticky rows. CEF canonicalizes today.
+- `UpdateChecker` interpolates `github_repo` into the URL unvalidated (same-user
+  trust; a `^[A-Za-z0-9_.-]+/...` check would close it).
+- Popup re-routes carry page-supplied URLs into `open_tab` with no scheme gate
+  (f479118 covers session/CLI only) — Chromium blocks renderer- initiated
+  `file:`, so defence-in-depth.
+- Internal server: consider `Cross-Origin-Resource-Policy: same-origin`.
+- Theme colours never reach ConfirmPrompt/PermissionsPrompt/InputBar (fixed
+  COLOUR_* constants) — `theme.high_contrast` skips the prompts and omnibar;
+  needs wiring when theme hot-apply lands (main.rs:802-825).
+- `pub` fields with documented-but-unenforced invariants: `InputBar:: cursor`
+  (char boundary), `ContextMenuOverlay::selected` (bounds).
+- inhibit: wedged-worker with held inhibitor leaves `active=true` with no
+  recovery (accepted never-block design); macOS constants transcribed from
+  headers, not verified against an installed SDK; macOS/Windows bodies have had
+  zero compilations (cfg-gated, no CI) — name/ABI drift possible.
+- Known §12 hardening items (SQLITE_OPEN_NOFOLLOW, u64↔i64 casts) still present
+  — cited, not re-reported.
+
+### Coverage
+
+- Area A (buffr-core/-engine/-cef + assets): read end-to-end incl. all injected
+  JS. Not reviewed: inhibit platform bodies (moved to C),
+  context_menu.rs:300-702 lower arms (entry traced), vendored cef crate
+  internals.
+- Area B (buffr-app/buffr/buffr-helper): headline findings verified by the sweep
+  owner; the agent's FULL report was lost to delivery truncation — its
+  cleared/hardening detail beyond the headline list is unrecoverable and
+  constitutes the sweep's main coverage GAP (main.rs is 7.7k lines; only the
+  traced slices are covered by verified findings).
+- Area C (buffr-ui/-modal/-config + inhibit): all 24 files read end-to-end. Not
+  reviewed: dependency sources (fontdue/notify/wayland read via docs, not
+  installed copies), tests/e2e/render_* beyond the commit diff.
+- Area D (stores/xtask/fuzz/CI/packaging): all read end-to-end incl. all 2825
+  xtask lines and all five fuzz targets. Not reviewed: pkg/homebrew + pkg/scoop
+  manifests, docs-site, vendor/.
+- Platform-gated (never compiled locally or in CI): buffr-webkit (excluded
+  §15-2), buffr-core/src/inhibit/{macos,windows}, all `#[cfg(windows)]` arms,
+  buffr-app windowing `other` non-Linux paths. Static review only.
