@@ -33,19 +33,3 @@ impl Size {
         Self { width, height }
     }
 }
-
-/// Axis-aligned rectangle: a [`Position`] and a [`Size`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Rect {
-    /// Top-left corner.
-    pub position: Position,
-    /// Width and height.
-    pub size: Size,
-}
-
-impl Rect {
-    /// Construct a new `Rect`.
-    pub const fn new(position: Position, size: Size) -> Self {
-        Self { position, size }
-    }
-}

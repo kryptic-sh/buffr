@@ -8,40 +8,6 @@
 //! discarded (wayr doesn't emit them — IME enable is consumer-driven
 //! on the Linux backend).
 
-/// Semantic purpose of a text input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ContentPurpose {
-    /// Default — generic text.
-    Normal,
-    /// Single-character input.
-    Alpha,
-    /// Numeric.
-    Digits,
-    /// Numeric with sign + decimal.
-    Number,
-    /// Phone number.
-    Phone,
-    /// URL.
-    Url,
-    /// Email address.
-    Email,
-    /// Person's name.
-    Name,
-    /// Password.
-    Password,
-    /// PIN — numeric password.
-    Pin,
-    /// Date.
-    Date,
-    /// Time.
-    Time,
-    /// Date + time.
-    Datetime,
-    /// Terminal / shell command line.
-    Terminal,
-}
-
 /// IME event dispatched as part of [`crate::windowing::WindowEvent::Ime`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
