@@ -602,18 +602,29 @@ fn flatten_top_level(dir: &Path) -> Result<()> {
     let Some(top) = top else {
         return Ok(());
     };
+    let mut moved_all = true;
     for entry in fs::read_dir(&top)? {
         let entry = entry?;
         let from = entry.path();
         let to = dir.join(entry.file_name());
         if to.exists() {
+            // Collision with a pre-existing file in the vendor dir — leave
+            // the archive's copy in place (skip means keep, not discard).
+            // When anything is skipped, keep `top` so the skipped entries
+            // survive; remove_dir_all below would delete them.
+            eprintln!("xtask: flatten_top_level skipping {}", to.display());
+            moved_all = false;
             continue;
         }
         fs::rename(&from, &to).or_else(|_| {
             copy_dir_recursive(&from, &to).and_then(|_| Ok(fs::remove_dir_all(&from)?))
         })?;
     }
-    let _ = fs::remove_dir_all(&top);
+    // Only delete the archive dir when every entry moved out of it; if
+    // one was skipped, its copy is still inside and must survive.
+    if moved_all {
+        let _ = fs::remove_dir_all(&top);
+    }
     Ok(())
 }
 
@@ -2140,6 +2151,53 @@ fn stage_windows_payload(bin_dest: &Path, cef_dest: &Path, p: &WindowsPayload) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_skipped_entries_survive_without_deleting_the_top_dir() {
+        // The bug: when a destination already exists, the entry is left
+        // inside `top`, and the unconditional remove_dir_all(&top) then
+        // deleted it — a skipped entry was discarded, not kept.
+        let tmp = std::env::temp_dir().join(format!("buffr-flatten-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Pre-existing collision in the vendor dir.
+        let vendor = tmp.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("README.txt"), "stale").unwrap();
+        // The archive's top dir with one colliding and one fresh entry.
+        let top = vendor.join("cef_binary_99_linux64");
+        std::fs::create_dir_all(top.join("Release")).unwrap();
+        std::fs::write(top.join("README.txt"), "fresh").unwrap();
+        flatten_top_level(&vendor).expect("flatten completes");
+        // The stale file must have survived — the fix, not the bug.
+        assert_eq!(
+            std::fs::read_to_string(vendor.join("README.txt")).unwrap(),
+            "stale",
+            "pre-existing vendor file must win over the archive copy"
+        );
+        // Release moved out; the top dir stays (it still holds the
+        // skipped README.txt, and deleting it would destroy that file).
+        assert!(vendor.join("Release").is_dir());
+        assert!(top.is_dir(), "top dir survives when an entry was skipped");
+        assert!(
+            top.join("README.txt").exists(),
+            "skipped entry intact inside top"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn flatten_moving_everything_removes_the_top_dir() {
+        let tmp = std::env::temp_dir().join(format!("buffr-flatten-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let vendor = tmp.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let top = vendor.join("cef_binary_99_linux64");
+        std::fs::create_dir_all(top.join("Release")).unwrap();
+        flatten_top_level(&vendor).expect("flatten completes");
+        assert!(vendor.join("Release").is_dir());
+        assert!(!top.exists(), "top dir removed when every entry moved out");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     /// Spotify ships minimal builds at
     /// `<cdn>/cef_binary_<version>_<platform>_minimal.tar.bz2`. The full
