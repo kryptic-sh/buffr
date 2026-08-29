@@ -112,6 +112,21 @@ const CONSOLE_LOG_MAX_LEN: usize = 120;
 /// and logging them verbatim is the A-A1 unbounded-log vector.
 const CONSOLE_SENTINEL_LOG_MAX_LEN: usize = 512;
 
+/// Upper bound on UTF-16 code units a console line may carry before the
+/// browser process refuses to convert it to a Rust `String` (A-A2).
+///
+/// Our own sentinel payloads are bounded well below this — the edit value
+/// cap is 256 KB — so any line longer than this is page chatter that must
+/// not force a full allocation per `console.log` call.
+const CONSOLE_MAX_UTF16_UNITS: usize = 1024 * 1024;
+
+/// Does the raw UTF-16 console line start with the ASCII `prefix`?
+/// Zero-alloc: compares code units directly against the ASCII bytes.
+fn utf16_starts_with(line: &[u16], prefix: &str) -> bool {
+    let prefix = prefix.as_bytes();
+    line.len() >= prefix.len() && prefix.iter().enumerate().all(|(i, &b)| line[i] == b as u16)
+}
+
 /// Sentinel prefixes emitted by buffr's own injected scripts. These are
 /// protocol, not user content, so they get a larger logging budget.
 ///
@@ -1032,6 +1047,28 @@ wrap_display_handler! {
             // appropriate sink. Returning 0 lets CEF continue logging;
             // returning 1 would suppress the message from devtools.
             let Some(message) = message else { return 0; };
+
+            // A2: convert to a Rust String only when the line could be
+            // protocol — check the raw UTF-16 prefix for a sentinel first
+            // (zero-alloc), and skip lines longer than any legitimate
+            // sentinel payload. A page looping `console.log(bigString)`
+            // otherwise allocates the full UTF-16→UTF-8 copy per line in
+            // the browser process. The opt-in console mirror truncates
+            // non-sentinel lines to a short prefix, so it must still see
+            // the text when enabled.
+            let utf16 = message.as_slice();
+            let is_sentinel = utf16
+                .map(|s| CONSOLE_SENTINEL_PREFIXES.iter().any(|p| utf16_starts_with(s, p)))
+                .unwrap_or(false);
+            if !is_sentinel && !console_logging_enabled() {
+                return 0;
+            }
+            if utf16.is_some_and(|s| s.len() > CONSOLE_MAX_UTF16_UNITS) {
+                // Oversized — cannot be one of our bounded sentinel
+                // payloads (the edit value cap is 256 KB); skip the
+                // conversion entirely.
+                return 0;
+            }
             let text = message.to_string();
 
             // H5: CEF's `on_console_message` carries no frame argument, so
@@ -1910,6 +1947,31 @@ mod tests {
         assert!(redacted.is_char_boundary(redacted.len()));
         // And the truncated prefix must itself be valid UTF-8.
         std::str::from_utf8(redacted.as_bytes()).expect("redacted output is valid UTF-8");
+    }
+
+    #[test]
+    fn utf16_starts_with_matches_ascii_prefix() {
+        let line: Vec<u16> = "__buffr_edit__:abc".encode_utf16().collect();
+        assert!(utf16_starts_with(&line, "__buffr_edit__:"));
+        assert!(utf16_starts_with(&line, "__"));
+        assert!(!utf16_starts_with(&line, "__buffr_hint__:"));
+        assert!(!utf16_starts_with(&line, "__buffr_edit__:x"));
+        assert!(!utf16_starts_with(&line, "__buffr_edit__:abc extra"));
+        // Prefix longer than the line never matches.
+        assert!(!utf16_starts_with(&line, "__buffr_edit__:abcdefghij"));
+        // Empty line matches only an empty prefix.
+        assert!(!utf16_starts_with(&[], "__"));
+    }
+
+    #[test]
+    fn utf16_starts_with_handles_non_ascii_after_prefix() {
+        // Sentinel prefix is ASCII; the payload tail may be any UTF-16.
+        let line: Vec<u16> = "__buffr_media__:\u{1F600}".encode_utf16().collect();
+        assert!(utf16_starts_with(&line, "__buffr_media__:"));
+        // A non-ASCII byte at the same position must not be treated as an
+        // ASCII prefix match.
+        let emoji_first: Vec<u16> = "\u{1F600}x".encode_utf16().collect();
+        assert!(!utf16_starts_with(&emoji_first, "x"));
     }
 
     #[test]
