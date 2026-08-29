@@ -1008,13 +1008,6 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   fixed by 96f9b54 (`TaggedHintEvent`, hint.rs:432-449); `FindResultSink` never
   got the tagging. Fix: tag with browser_id and drop non-active-tab results at
   the drain (apps half).
-- **D-R1 LOW — `flatten_top_level` silently deletes extracted entries whose
-  destination already exists.** Where: `xtask/src/main.rs:608-616`.
-  `if to.exists() { continue }` leaves the entry inside `top`, which the
-  unconditional `fs::remove_dir_all(&top)` then deletes — skip means discard.
-  The early bail at :212-216 only checks `Release`/`libcef.so`, so a stale-file
-  vendor dir reaches this path. Fix: only `remove_dir_all` when the loop moved
-  everything.
 
 ### Audit findings (security)
 
