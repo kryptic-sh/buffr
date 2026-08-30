@@ -24,6 +24,187 @@ use crate::*;
 /// bounds the same flood before `on_after_created`.
 const MAX_LIVE_POPUPS: usize = 32;
 
+impl AppState {
+    /// Route a keyboard event through every key sink in priority order.
+    ///
+    /// Shared by the real `WindowEvent::Key` path and the e2e key-injection
+    /// hook (`BuffrUserEvent::InjectKey`), so tests drive exactly the same
+    /// code a physical keyboard does.
+    fn handle_key_event(&mut self, event: &crate::windowing::KeyEvent) {
+        // Sync `self.modifiers` from the event so downstream
+        // consumers that read the cached field (CEF VK
+        // forwarding, edit-mode chord routing, pointer paths
+        // between key events) see the modifiers that were
+        // live AT THE TIME of this key event. The bridge also
+        // emits ModifiersChanged for modifier-only transitions
+        // (see arm above) — both paths run, last writer wins.
+        self.modifiers = event.modifiers;
+        // Pinned-close confirmation takes precedence over
+        // everything else: `y` or `<Enter>` confirms, `n` /
+        // `<Esc>` dismisses. Other keys are swallowed so the
+        // page underneath can't receive stray input while a
+        // modal banner is up.
+        if self.confirm_close_pinned.is_some() && self.confirm_handle_key(event) {
+            return;
+        }
+        // Permissions prompt takes precedence over every other
+        // key sink. Pressing `a`/`d`/`A`/`D`/Esc resolves the
+        // request; nothing else is allowed through until the
+        // queue drains.
+        if self.permissions_handle_key(event) {
+            return;
+        }
+        // Context-menu overlay: Up/Down/Enter/Esc are consumed.
+        // Other keys dismiss the menu and fall through to normal
+        // key dispatch.
+        if self.context_menu_handle_key(event) {
+            return;
+        }
+        // Overlay open → all keys route to it.
+        if self.overlay_handle_key(event) {
+            return;
+        }
+        // Hint mode: route printable chars + Esc + BS straight
+        // to the host's hint-session API. The modal engine
+        // already sits in `Mode::Hint` (set by the action
+        // dispatch below), but the engine itself doesn't know
+        // about per-keystroke hint matching.
+        if self.hint_mode_handle_key(event) {
+            return;
+        }
+        // Edit-mode takes precedence over the page-mode FSM
+        // once a field is focused (Editing state). Esc is
+        // intercepted; all other keys forward directly to CEF.
+        //
+        // The engine can also sit in `PageMode::Insert` with
+        // NO field focused — `enter_insert_mode` is bindable
+        // user config, and a focused field can go away under
+        // us. There, `Engine::feed` answers every chord with
+        // `Step::EditModeActive` before consulting the trie,
+        // so no binding (Esc included) can fire and the
+        // keyboard is stranded until the user clicks an input
+        // or kills the window. Run the same handler in that
+        // state so its Esc branch still gets a look; it
+        // returns `false` for every other key, which falls
+        // through to the dispatch below exactly as before.
+        let insert_no_focus = !matches!(&self.edit_focus, EditFocus::Editing { .. })
+            && matches!(self.engine.lock().map(|e| e.mode()), Ok(PageMode::Insert));
+        if (matches!(&self.edit_focus, EditFocus::Editing { .. }) || insert_no_focus)
+            && self.edit_mode_handle_key(event)
+        {
+            return;
+        }
+        // Page-mode dispatch accepts auto-repeat events so
+        // holding e.g. `H` / `L` cycles tabs at OS repeat speed.
+        // Per-action filtering happens after resolution: see
+        // `PageAction::is_repeatable`.
+        let is_repeat = event.repeat;
+        let Some(chord) = key_event_to_chord_with_repeat(event) else {
+            return;
+        };
+        let now = self.startup.elapsed();
+        let (step, post_mode) = match self.engine.lock() {
+            Ok(mut e) => {
+                let s = e.feed(chord, now);
+                let m = e.mode();
+                (s, m)
+            }
+            Err(_) => return,
+        };
+        match step {
+            Step::Resolved(action) => {
+                // Drop auto-repeat events for actions that
+                // shouldn't stream (TabClose, OpenOmnibar, etc).
+                if is_repeat && !action.is_repeatable() {
+                    return;
+                }
+                // `EnterInsertMode` (`i`) flips the engine into
+                // PageMode::Insert. Entry into a specific field is
+                // handled via the JS focusin bridge; `i` alone
+                // without a focused input is a no-op at the page
+                // level — the engine mode flip is sufficient to
+                // unblock subsequent keys once a field is clicked.
+                if action == buffr_modal::PageAction::EnterInsertMode {
+                    self.refresh_title();
+                    return;
+                }
+                // OpenOmnibar / OpenCommandLine flip the
+                // engine into Mode::Command and ALSO open the
+                // matching overlay UI. The host's `dispatch`
+                // for these is a no-op log, so we handle the
+                // UI side here.
+                match &action {
+                    buffr_modal::PageAction::OpenOmnibar => {
+                        self.open_omnibar();
+                    }
+                    buffr_modal::PageAction::OpenCommandLine => {
+                        self.open_command_line();
+                    }
+                    buffr_modal::PageAction::Find { forward } => {
+                        self.open_find(*forward);
+                    }
+                    _ => {
+                        self.dispatch_action(&action);
+                    }
+                }
+            }
+            Step::Pending | Step::Ambiguous { .. } => {
+                // Phase 3 chrome will surface a count/pending
+                // buffer indicator in the status line. For
+                // now, silently accumulate.
+            }
+            Step::Reject => {
+                // Vim-style: only pass unbound keys to the page
+                // in modes where the page owns input (Edit /
+                // Command). In Normal, Visual, Hint, and Pending
+                // the modal layer owns the keyboard — silently
+                // swallow so typing `a`, `s`, etc. doesn't
+                // type into a focused field or trigger browser
+                // shortcuts.
+                let pass_through = matches!(post_mode, PageMode::Insert | PageMode::Command);
+                if pass_through {
+                    // A surrogate-pair character (emoji, rare CJK)
+                    // cannot travel as a CHAR key event — insert it
+                    // as text instead (§11-16).
+                    if let Some(text) = multi_unit_char_text(event.text.as_deref()) {
+                        self.insert_text_via_exec(text);
+                    } else if let Some(host) = self.active_engine_dyn() {
+                        let mods = mods_to_cef(&self.modifiers);
+                        // Reject path: in Insert/Command modes a
+                        // text input may or may not be focused.
+                        // Use `edit_focus` to set the flag.
+                        let editable = matches!(self.edit_focus, EditFocus::Editing { .. });
+                        tracing::warn!(
+                            state = ?event.state,
+                            key_code = ?event.key_code,
+                            post_mode = ?post_mode,
+                            edit_focus = ?self.edit_focus,
+                            editable,
+                            "page-mode Reject pass-through (key bypassed edit_mode_handle_key)"
+                        );
+                        for ev in key_to_neutral_events(event, mods, editable) {
+                            host.osr_key_event(ev);
+                        }
+                    }
+                } else {
+                    trace!(
+                        ?chord,
+                        ?post_mode,
+                        "key not bound — swallowed in modal mode"
+                    );
+                }
+            }
+            Step::EditModeActive => {
+                // Engine is already in PageMode::Insert; consume
+                // the key. If a field is focused, edit_mode_handle_key
+                // above already handled it; otherwise the key is
+                // silently dropped (no input is active).
+            }
+        }
+        self.refresh_title();
+    }
+}
+
 impl ApplicationHandler<BuffrUserEvent> for AppState {
     fn user_event(&mut self, event_loop: &mut EventLoop<BuffrUserEvent>, event: BuffrUserEvent) {
         // Heartbeat + shutdown check: fold the logic that was in new_events (winit)
@@ -44,6 +225,10 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.save_session_now();
                 self.mark_clean_shutdown();
                 event_loop.exit();
+            }
+            BuffrUserEvent::InjectKey(event) => {
+                // e2e-only synthetic key: same dispatch as a real key.
+                self.handle_key_event(&event);
             }
             BuffrUserEvent::OsrFrame => {
                 tracing::trace!("user_event: OsrFrame -> request_redraw");
@@ -1075,178 +1260,7 @@ impl ApplicationHandler<BuffrUserEvent> for AppState {
                 self.modifiers = modifiers;
             }
             WindowEvent::Key(event) => {
-                // Sync `self.modifiers` from the event so downstream
-                // consumers that read the cached field (CEF VK
-                // forwarding, edit-mode chord routing, pointer paths
-                // between key events) see the modifiers that were
-                // live AT THE TIME of this key event. The bridge also
-                // emits ModifiersChanged for modifier-only transitions
-                // (see arm above) — both paths run, last writer wins.
-                self.modifiers = event.modifiers;
-                // Pinned-close confirmation takes precedence over
-                // everything else: `y` or `<Enter>` confirms, `n` /
-                // `<Esc>` dismisses. Other keys are swallowed so the
-                // page underneath can't receive stray input while a
-                // modal banner is up.
-                if self.confirm_close_pinned.is_some() && self.confirm_handle_key(&event) {
-                    return;
-                }
-                // Permissions prompt takes precedence over every other
-                // key sink. Pressing `a`/`d`/`A`/`D`/Esc resolves the
-                // request; nothing else is allowed through until the
-                // queue drains.
-                if self.permissions_handle_key(&event) {
-                    return;
-                }
-                // Context-menu overlay: Up/Down/Enter/Esc are consumed.
-                // Other keys dismiss the menu and fall through to normal
-                // key dispatch.
-                if self.context_menu_handle_key(&event) {
-                    return;
-                }
-                // Overlay open → all keys route to it.
-                if self.overlay_handle_key(&event) {
-                    return;
-                }
-                // Hint mode: route printable chars + Esc + BS straight
-                // to the host's hint-session API. The modal engine
-                // already sits in `Mode::Hint` (set by the action
-                // dispatch below), but the engine itself doesn't know
-                // about per-keystroke hint matching.
-                if self.hint_mode_handle_key(&event) {
-                    return;
-                }
-                // Edit-mode takes precedence over the page-mode FSM
-                // once a field is focused (Editing state). Esc is
-                // intercepted; all other keys forward directly to CEF.
-                //
-                // The engine can also sit in `PageMode::Insert` with
-                // NO field focused — `enter_insert_mode` is bindable
-                // user config, and a focused field can go away under
-                // us. There, `Engine::feed` answers every chord with
-                // `Step::EditModeActive` before consulting the trie,
-                // so no binding (Esc included) can fire and the
-                // keyboard is stranded until the user clicks an input
-                // or kills the window. Run the same handler in that
-                // state so its Esc branch still gets a look; it
-                // returns `false` for every other key, which falls
-                // through to the dispatch below exactly as before.
-                let insert_no_focus = !matches!(&self.edit_focus, EditFocus::Editing { .. })
-                    && matches!(self.engine.lock().map(|e| e.mode()), Ok(PageMode::Insert));
-                if (matches!(&self.edit_focus, EditFocus::Editing { .. }) || insert_no_focus)
-                    && self.edit_mode_handle_key(&event)
-                {
-                    return;
-                }
-                // Page-mode dispatch accepts auto-repeat events so
-                // holding e.g. `H` / `L` cycles tabs at OS repeat speed.
-                // Per-action filtering happens after resolution: see
-                // `PageAction::is_repeatable`.
-                let is_repeat = event.repeat;
-                let Some(chord) = key_event_to_chord_with_repeat(&event) else {
-                    return;
-                };
-                let now = self.startup.elapsed();
-                let (step, post_mode) = match self.engine.lock() {
-                    Ok(mut e) => {
-                        let s = e.feed(chord, now);
-                        let m = e.mode();
-                        (s, m)
-                    }
-                    Err(_) => return,
-                };
-                match step {
-                    Step::Resolved(action) => {
-                        // Drop auto-repeat events for actions that
-                        // shouldn't stream (TabClose, OpenOmnibar, etc).
-                        if is_repeat && !action.is_repeatable() {
-                            return;
-                        }
-                        // `EnterInsertMode` (`i`) flips the engine into
-                        // PageMode::Insert. Entry into a specific field is
-                        // handled via the JS focusin bridge; `i` alone
-                        // without a focused input is a no-op at the page
-                        // level — the engine mode flip is sufficient to
-                        // unblock subsequent keys once a field is clicked.
-                        if action == buffr_modal::PageAction::EnterInsertMode {
-                            self.refresh_title();
-                            return;
-                        }
-                        // OpenOmnibar / OpenCommandLine flip the
-                        // engine into Mode::Command and ALSO open the
-                        // matching overlay UI. The host's `dispatch`
-                        // for these is a no-op log, so we handle the
-                        // UI side here.
-                        match &action {
-                            buffr_modal::PageAction::OpenOmnibar => {
-                                self.open_omnibar();
-                            }
-                            buffr_modal::PageAction::OpenCommandLine => {
-                                self.open_command_line();
-                            }
-                            buffr_modal::PageAction::Find { forward } => {
-                                self.open_find(*forward);
-                            }
-                            _ => {
-                                self.dispatch_action(&action);
-                            }
-                        }
-                    }
-                    Step::Pending | Step::Ambiguous { .. } => {
-                        // Phase 3 chrome will surface a count/pending
-                        // buffer indicator in the status line. For
-                        // now, silently accumulate.
-                    }
-                    Step::Reject => {
-                        // Vim-style: only pass unbound keys to the page
-                        // in modes where the page owns input (Edit /
-                        // Command). In Normal, Visual, Hint, and Pending
-                        // the modal layer owns the keyboard — silently
-                        // swallow so typing `a`, `s`, etc. doesn't
-                        // type into a focused field or trigger browser
-                        // shortcuts.
-                        let pass_through =
-                            matches!(post_mode, PageMode::Insert | PageMode::Command);
-                        if pass_through {
-                            // A surrogate-pair character (emoji, rare CJK)
-                            // cannot travel as a CHAR key event — insert it
-                            // as text instead (§11-16).
-                            if let Some(text) = multi_unit_char_text(event.text.as_deref()) {
-                                self.insert_text_via_exec(text);
-                            } else if let Some(host) = self.active_engine_dyn() {
-                                let mods = mods_to_cef(&self.modifiers);
-                                // Reject path: in Insert/Command modes a
-                                // text input may or may not be focused.
-                                // Use `edit_focus` to set the flag.
-                                let editable = matches!(self.edit_focus, EditFocus::Editing { .. });
-                                tracing::warn!(
-                                    state = ?event.state,
-                                    key_code = ?event.key_code,
-                                    post_mode = ?post_mode,
-                                    edit_focus = ?self.edit_focus,
-                                    editable,
-                                    "page-mode Reject pass-through (key bypassed edit_mode_handle_key)"
-                                );
-                                for ev in key_to_neutral_events(&event, mods, editable) {
-                                    host.osr_key_event(ev);
-                                }
-                            }
-                        } else {
-                            trace!(
-                                ?chord,
-                                ?post_mode,
-                                "key not bound — swallowed in modal mode"
-                            );
-                        }
-                    }
-                    Step::EditModeActive => {
-                        // Engine is already in PageMode::Insert; consume
-                        // the key. If a field is focused, edit_mode_handle_key
-                        // above already handled it; otherwise the key is
-                        // silently dropped (no input is active).
-                    }
-                }
-                self.refresh_title();
+                self.handle_key_event(&event);
             }
             // ── IME composition (#86) ─────────────────────────────────────────
             //

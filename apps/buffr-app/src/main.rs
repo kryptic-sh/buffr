@@ -242,6 +242,12 @@ enum BuffrUserEvent {
     /// deadline (probe interval, media probe) and the shutdown_flag
     /// poll wouldn't fire until the next reveal/probe.
     Shutdown,
+    /// e2e harness key injection. The headless CI seat has no input
+    /// devices, so the test suite cannot send real keystrokes; this
+    /// routes a synthetic key through the exact same dispatch path a
+    /// physical key takes (`AppState::handle_key_event`). Only ever
+    /// posted when `BUFFR_E2E_KEYS` is set — never in normal runs.
+    InjectKey(crate::windowing::KeyEvent),
 }
 
 /// Per-popup-window state. Owns the wayr Toplevel, wgpu renderer, and the
@@ -952,6 +958,12 @@ fn main() -> Result<()> {
     // thread and the Ctrl+C handler. The proxy is cheap to clone (internally an Arc).
     let event_proxy = event_loop.proxy();
 
+    // e2e key injection (BUFFR_E2E_KEYS). The headless CI seat has no input
+    // devices, so the e2e suite cannot send real keystrokes; a driver thread
+    // posts the scripted sequence through the same dispatch path a real key
+    // takes. Ignored entirely when the env var is absent.
+    spawn_e2e_key_driver(event_proxy.clone());
+
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     {
         let flag = Arc::clone(&shutdown_flag);
@@ -1230,6 +1242,86 @@ fn update_indicator_from(status: &buffr_core::UpdateStatus) -> Option<buffr_ui::
         buffr_core::UpdateStatus::Stale { .. } => Some(buffr_ui::UpdateIndicator::Stale),
         _ => None,
     }
+}
+
+/// Parse one `BUFFR_E2E_KEYS` token into a synthetic [`crate::windowing::KeyEvent`].
+///
+/// Token forms:
+/// - `char:<c>` — a printable character (text + Char code).
+/// - `named:<name>` — a named key (`Return`, `Escape`, `Tab`, `BackSpace`, …).
+fn parse_e2e_key(token: &str) -> Option<crate::windowing::KeyEvent> {
+    let (kind, value) = token.split_once(':')?;
+    let ev =
+        |code: crate::windowing::KeyCode, text: Option<String>| -> crate::windowing::KeyEvent {
+            crate::windowing::KeyEvent::new(
+                crate::windowing::ScanCode(0),
+                code,
+                crate::windowing::Modifiers::default(),
+                crate::windowing::KeyState::Pressed,
+                text,
+                false,
+            )
+        };
+    match kind {
+        "char" => {
+            let mut chars = value.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None; // multi-codepoint: not a single key
+            }
+            // xkbcommon keysym for a Unicode codepoint: 0x01000000 | cp.
+            // The chord translation keys off `text` anyway, but keep the
+            // code honest.
+            let sym = 0x0100_0000 | (c as u32);
+            Some(ev(crate::windowing::KeyCode::Sym(sym), Some(c.to_string())))
+        }
+        "named" => Some(ev(
+            crate::windowing::KeyCode::Named(value.to_string()),
+            None,
+        )),
+        _ => None,
+    }
+}
+
+/// e2e key-injection driver. When `BUFFR_E2E_KEYS` is set to a
+/// comma-separated sequence of [`parse_e2e_key`] tokens, a background
+/// thread waits for the first chrome frame (so the window exists), then
+/// posts each key through the event proxy with a small delay — exactly
+/// as if the user typed it. The headless CI seat has no input devices,
+/// so this is the only way the e2e suite can drive the key path.
+fn spawn_e2e_key_driver(proxy: EventLoopProxy<BuffrUserEvent>) {
+    let Ok(spec) = std::env::var("BUFFR_E2E_KEYS") else {
+        return;
+    };
+    if spec.trim().is_empty() {
+        return;
+    }
+    let keys: Vec<crate::windowing::KeyEvent> = spec.split(',').filter_map(parse_e2e_key).collect();
+    if keys.is_empty() {
+        warn!(spec = %spec, "BUFFR_E2E_KEYS: no parseable keys");
+        return;
+    }
+    std::thread::Builder::new()
+        .name("e2e-key-driver".into())
+        .spawn(move || {
+            // Wait for the first chrome frame (proves the window + engine
+            // exist) before typing. In a normal run the smoke flag is
+            // never set, so fall back to a fixed startup delay.
+            let mut waited = 0u32;
+            while !SMOKE_TEST_SAW_REDRAW.load(Ordering::SeqCst) && waited < 50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                waited += 1;
+            }
+            if waited >= 50 {
+                info!("e2e: no smoke flag — dispatching after {waited} polls anyway");
+            }
+            for key in keys {
+                let _ = proxy.send_event(BuffrUserEvent::InjectKey(key));
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            info!("e2e: key sequence dispatched");
+        })
+        .expect("spawn e2e key driver");
 }
 
 /// Restrict a profile directory to the owning user (0700). SQLite and
@@ -4221,8 +4313,11 @@ impl AppState {
         let mut bar = InputBar::with_prefix("> ");
         // Pre-populate with the current page URL so the user can edit
         // it in place — Vimium / qutebrowser convention. Internal
-        // buffr:// URLs (new-tab page, etc.) start empty so the user
-        // can type a fresh query immediately.
+        // buffr:// URLs (new-tab page, etc.) and placeholder pages
+        // (about:blank on a freshly-opened tab) start empty so the user
+        // can type a fresh query immediately — typing into a pre-filled
+        // placeholder produced a concatenated garbage URL like
+        // "about:blankhttps://…" and the navigation silently failed.
         //
         // Query the host directly — `statusline.url` is updated by a
         // 250ms-throttled poll, so it can lag a tab switch and pre-fill
@@ -4231,7 +4326,7 @@ impl AppState {
             .active_engine_dyn()
             .map(|e| e.active_tab_live_url())
             .unwrap_or_default();
-        if !url.starts_with("buffr:") {
+        if omnibar_prefill(&url) {
             bar.buffer = url;
             bar.cursor = bar.buffer.len();
         }
@@ -5819,6 +5914,18 @@ fn mode_label(mode: PageMode) -> String {
     mode.name().to_uppercase()
 }
 
+/// Should the omnibar pre-fill with the active tab's URL, or start empty?
+///
+/// Pre-fill is the Vimium/qutebrowser convention for a real page the
+/// user wants to edit. Placeholder pages — internal `buffr://` pages,
+/// `about:blank` on a freshly-opened tab, and the empty string — start
+/// empty so the user can type a fresh URL immediately. Pre-filling
+/// `about:blank` made typed input concatenate into a garbage URL
+/// ("about:blankhttps://…") that silently failed to navigate.
+fn omnibar_prefill(url: &str) -> bool {
+    !url.is_empty() && !url.starts_with("buffr:") && url != "about:blank"
+}
+
 impl AppState {
     /// Push the current splash frame's HTML into the new-tab page when
     /// the active tab is `buffr://new` and the splash tick has changed
@@ -5907,6 +6014,28 @@ mod tests {
     use super::*;
     use buffr_ui::TAB_STRIP_HEIGHT;
     use clap::CommandFactory;
+
+    // ---- omnibar pre-fill (bug: new-tab omnibar showed about:blank) ----
+
+    #[test]
+    fn omnibar_prefill_real_urls_only() {
+        // A real page URL pre-fills so the user can edit it in place.
+        assert!(omnibar_prefill("https://example.com/"));
+        assert!(omnibar_prefill("file:///tmp/plain.html"));
+        assert!(omnibar_prefill("http://localhost:8080"));
+    }
+
+    #[test]
+    fn omnibar_prefill_empty_for_placeholders() {
+        // New-tab / internal / blank pages start empty so the typed URL
+        // does not concatenate onto the placeholder (bug: typing into a
+        // pre-filled "about:blank" produced "about:blankhttps://…" and
+        // the navigation silently failed, leaving the omnibar up).
+        assert!(!omnibar_prefill("about:blank"));
+        assert!(!omnibar_prefill("buffr://new"));
+        assert!(!omnibar_prefill("buffr://home"));
+        assert!(!omnibar_prefill(""));
+    }
 
     // ---- OSR sleep policy tests --------------------------------------------
 
