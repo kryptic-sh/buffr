@@ -68,7 +68,7 @@ fn fetch_agent() -> ureq::Agent {
 /// wrapper it compiles must talk to the same API version the vendored
 /// libcef reports, or every binary aborts with "Request for unsupported CEF
 /// API version" at startup.
-const CEF_VERSION_PREFIX: &str = "148.";
+const CEF_VERSION_PREFIX: &str = "151.";
 
 /// Embedded `Info.plist` template for the main `Buffr.app` bundle.
 const MAIN_PLIST_TEMPLATE: &str = include_str!("../templates/main.plist");
