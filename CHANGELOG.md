@@ -8,6 +8,29 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.16] - 2026-08-30
+
+### Fixed
+
+- A new tab's omnibar now opens empty instead of pre-filled with `about:blank`:
+  the pre-fill was applied even when the new-tab URL was a placeholder, so `O`
+  showed `about:blank` in the address bar, and typing a URL on top of it and
+  pressing Enter loaded the page while the omnibar stayed open with the pre-fill
+  and the typed input merged in its buffer. Pre-fill now applies only to real
+  URLs (`o` on a tab whose URL is not `buffr:`/`about:blank`).
+- The previous tab list is now restored on reopen by default:
+  `startup.restore_session` defaults to `true` instead of `false`, so the
+  session saved to disk on every tab change is loaded back on the next launch
+  without a config edit.
+
+### Changed
+
+- ~60 transitive dependencies rolled forward to their current in-range versions
+  (rusqlite, wgpu, uuid, tree-sitter and others). The CEF 151 experiment was
+  reverted before shipping: 151 broke page loading on Linux Wayland
+  (GPU/renderer subprocesses never spawned), so the pinned CEF wrapper stays on
+  the 148 line.
+
 ## [0.14.15] - 2026-08-30
 
 ### Fixed
@@ -2438,7 +2461,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.15...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.16...HEAD
+[0.14.16]: https://github.com/kryptic-sh/buffr/compare/v0.14.15...v0.14.16
 [0.14.15]: https://github.com/kryptic-sh/buffr/compare/v0.14.14...v0.14.15
 [0.14.14]: https://github.com/kryptic-sh/buffr/compare/v0.14.13...v0.14.14
 [0.14.13]: https://github.com/kryptic-sh/buffr/compare/v0.14.12...v0.14.13
