@@ -477,7 +477,6 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
- "ureq",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
