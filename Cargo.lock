@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "buffr"
-version = "0.14.14"
+version = "0.14.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-app"
-version = "0.14.14"
+version = "0.14.15"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-core"
-version = "0.14.14"
+version = "0.14.15"
 dependencies = [
  "base64 0.23.1",
  "buffr-config",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.14.14"
+version = "0.14.15"
 dependencies = [
  "buffr-cef",
 ]
@@ -5133,7 +5133,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.14.14"
+version = "0.14.15"
 dependencies = [
  "anyhow",
  "bzip2",

@@ -8,6 +8,57 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.15] - 2026-08-30
+
+### Fixed
+
+- A popup whose window or renderer failed to build is now closed instead of
+  orphaned: the live CEF popup browser stayed registered, kept playing audio and
+  running JS, and leaked until shutdown.
+- Find results are now tagged with the emitting browser: a background tab's
+  in-flight find stream no longer overwrites the active tab's statusline counts.
+- The console-IPC path no longer converts every console line to a Rust String
+  before the sentinel check, and sentinel-prefixed lines are capped at a
+  512-byte log budget — a page looping `console.log(bigString)` can no longer
+  flood the log or force an allocation per line in the browser process.
+- The font glyph cache is bounded at 4096 entries; a page rewriting
+  `document.title` with fresh exotic characters can no longer grow it without
+  limit.
+- A 32-popup burst no longer mispairs frame/view/url: `on_before_popup` cancels
+  the new popup when the pending-alloc queue is full instead of evicting an
+  alloc a live popup is about to claim.
+- One errored audio stream no longer clears the whole browser's stream count.
+- The single-instance forwarder treats an `ERR`/EOF ack as failure instead of
+  accepting any ack as success; the server acks `ERR` when every forwarded URL
+  is rejected.
+- `flatten_top_level` no longer deletes skipped entries it could not move.
+- `--private --smoke-test` no longer leaks `$TMPDIR/buffr-private-<pid>-*`: the
+  tempdir is dropped before the smoke-test `_exit`.
+
+### Changed
+
+- The mode→label table now has one source (`PageMode::name()`); the four copies
+  that had drifted into UPPERCASE/lowercase variants are gone.
+- The JS-string and HTML escapers, the ureq agent config, the bookmark-import
+  statements and regexes, the atomic JSON write, the CLI store openers, the
+  xtask binary build, and the deadline-clamp idiom each deduplicated into a
+  single shared helper.
+- `buffr_core` gains `http::agent` (bounded timeouts, buffr UA, no redirects),
+  `html::escape` and `js::escape`; `buffr-modal` gains `PageMode::name()`.
+- `buffr-cef` no longer depends directly on `ureq`.
+- `fetch-cef` bounds network stalls with per-phase timeouts (15s connect, 30s
+  response, 60s body-read) instead of the timeout-less default agent.
+- The favicon BGRA→RGBA repack uses `as_chunks` in both crates (newer clippy).
+
+### Performance
+
+- Bookmark import reuses prepared statements instead of compiling each query per
+  row (~500k `sqlite3_prepare` calls on a 100k-bookmark export).
+- The context-menu panel size is cached at construction instead of re-measured
+  every label per dirty frame.
+- View-source caches grammar load failures so a broken artifact isn't re-
+  dlopened per request; the import regexes compile once per process.
+
 ## [0.14.14] - 2026-08-14
 
 ### Fixed
@@ -2387,7 +2438,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.14...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.15...HEAD
+[0.14.15]: https://github.com/kryptic-sh/buffr/compare/v0.14.14...v0.14.15
 [0.14.14]: https://github.com/kryptic-sh/buffr/compare/v0.14.13...v0.14.14
 [0.14.13]: https://github.com/kryptic-sh/buffr/compare/v0.14.12...v0.14.13
 [0.14.12]: https://github.com/kryptic-sh/buffr/compare/v0.14.11...v0.14.12
