@@ -1245,7 +1245,10 @@ wrap_download_image_callback! {
             let mut pixels: Vec<u32> = Vec::with_capacity(pixel_count);
             unsafe {
                 let bytes = std::slice::from_raw_parts(raw as *const u8, expected_bytes);
-                for chunk in bytes.chunks_exact(4) {
+                // `expected_bytes` is width*height*4, so the `as_chunks`
+                // remainder is always empty (newer clippy's
+                // `chunks_exact_to_as_chunks`).
+                for chunk in bytes.as_chunks::<4>().0 {
                     let b = chunk[0] as u32;
                     let g = chunk[1] as u32;
                     let r = chunk[2] as u32;
