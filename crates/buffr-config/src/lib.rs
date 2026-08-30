@@ -108,7 +108,7 @@ pub struct Startup {
 impl Default for Startup {
     fn default() -> Self {
         Self {
-            restore_session: false,
+            restore_session: true,
             new_tab_url: "about:blank".into(),
         }
     }
@@ -1019,6 +1019,15 @@ mod tests {
     }
 
     #[test]
+    fn session_restore_is_on_by_default() {
+        // Bug: tabs were saved to session.json but never restored on
+        // reopen, because restore_session defaulted to false — the
+        // feature the user expects (reopen restores the previous tab
+        // list) was silently off.
+        assert!(Config::default().startup.restore_session);
+    }
+
+    #[test]
     fn parse_error_carries_location() {
         let bad = "[general]\nhomepage = 12 = oops\n";
         let err = toml::from_str::<Config>(bad).unwrap_err();
@@ -1597,7 +1606,7 @@ leader = "\\"
 show_favicons = true
 
 [startup]
-restore_session = false
+restore_session = true
 new_tab_url = "about:blank"
 
 [search]
