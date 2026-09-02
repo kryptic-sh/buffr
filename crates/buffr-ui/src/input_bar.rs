@@ -368,17 +368,18 @@ impl InputBar {
         let chars_visible = chars_visible_for(inner_w, self.buffer.chars().map(font::char_width));
         let cursor_chars = self.buffer[..self.cursor].chars().count();
         let total_chars = self.buffer.chars().count();
-        let mut scroll_chars: usize = if cursor_chars >= chars_visible {
-            cursor_chars + 1 - chars_visible
-        } else {
-            0
-        };
-        // Don't scroll past the end — keep the trailing edge of the
-        // text within view when the buffer is shorter than scroll.
-        let max_scroll = total_chars.saturating_sub(chars_visible.saturating_sub(1));
-        if scroll_chars > max_scroll {
-            scroll_chars = max_scroll;
-        }
+        // Scroll only when the cursor is past the visible window: if
+        // `cursor_chars` (chars before the cursor) fits within
+        // `chars_visible`, nothing scrolls. Otherwise scroll so the
+        // cursor becomes the last visible position. The old
+        // `cursor_chars + 1 - chars_visible` over-scrolled by one and hid
+        // the first char of a one-char buffer — `chars_visible` is capped
+        // at the buffer length, so a single typed char always produced an
+        // empty visible slice (the "first typed char is missing" bug).
+        let scroll_chars = cursor_chars.saturating_sub(chars_visible);
+        // Don't scroll past the end — keep the trailing edge of the text
+        // in view when the cursor sits at the end of a long buffer.
+        let scroll_chars = scroll_chars.min(total_chars.saturating_sub(chars_visible));
         // Visible substring.
         let visible: String = self
             .buffer
@@ -657,54 +658,50 @@ mod tests {
 
     #[test]
     fn paint_renders_the_first_typed_char() {
-        // Bug: typing the first char into the omnibar showed nothing —
-        // the cursor bar was drawn but the glyph before it was missing,
-        // so the char looked "hidden". The glyph must be visible to the
-        // LEFT of the cursor, not just the cursor itself.
+        // Bug: the first character typed into the omnibar was invisible
+        // even in a wide bar. `scroll_chars` was computed as
+        // `cursor_chars + 1 - chars_visible`; `chars_visible` is capped
+        // by the number of chars in the buffer, so a one-char buffer has
+        // `chars_visible == 1` and `cursor_chars == 1`, giving
+        // `scroll_chars == 1` — the only char was scrolled off and an
+        // empty slice drawn, leaving just the cursor. The glyph must be
+        // rendered to the LEFT of the cursor.
+        //
+        // Cursor is disabled and the `> ` prefix is drawn in accent (not
+        // fg), so a correctly-drawn 'h' is the ONLY source of fg pixels.
         let w = 400;
         let h = 60;
         let mut buf = vec![0u32; w * h];
-        let mut b = InputBar::default();
+        let mut b = InputBar::with_prefix("> ");
         b.buffer = "h".into();
         b.cursor = 1;
-        b.cursor_visible = true;
+        b.cursor_visible = false;
         b.paint_at(&mut buf, w, h, 0, 0, w, h);
 
-        // Count fg pixels. The cursor bar alone is 2px wide x glyph_h
-        // tall (cursor_visible=true), so a rendered 'h' adds its own
-        // glyph pixels beyond that. If the first char were missing, fg
-        // would be only the cursor's ~2 * glyph_h pixels.
         let fg = b.palette.fg;
         let fg_px = buf.iter().filter(|&&p| p == fg).count();
-        let cursor_px = 2 * font::glyph_h();
         assert!(
-            fg_px > cursor_px,
-            "expected the 'h' glyph pixels before the cursor, got {fg_px} fg px (cursor alone is {cursor_px})"
+            fg_px > 0,
+            "first typed char 'h' rendered no glyph pixels — scrolled off (fg_px={fg_px})"
         );
     }
 
     #[test]
     fn paint_single_char_in_narrow_box_is_not_scrolled_away() {
-        // Bug: a narrow omnibar (1 char visible) with a single typed
-        // char hid it — the scroll math skipped the only char, leaving
-        // just the cursor. The char immediately before the cursor must
-        // stay visible.
-        let w = 40; // very narrow: exactly ~1 char fits
+        // Same scroll bug in the narrowest case: a one-char buffer with
+        // the box sized for ~1 char must still draw that char, not skip it.
+        let w = 40;
         let h = 60;
         let mut buf = vec![0u32; w * h];
         let mut b = InputBar::default();
         b.buffer = "h".into();
         b.cursor = 1;
-        b.cursor_visible = true;
+        b.cursor_visible = false;
         b.paint_at(&mut buf, w, h, 0, 0, w, h);
 
         let fg = b.palette.fg;
         let fg_px = buf.iter().filter(|&&p| p == fg).count();
-        let cursor_px = 2 * font::glyph_h();
-        assert!(
-            fg_px > cursor_px,
-            "narrow box hid the single char: {fg_px} fg px (cursor alone is {cursor_px})"
-        );
+        assert!(fg_px > 0, "narrow box hid the single char (fg_px={fg_px})");
     }
 
     #[test]
