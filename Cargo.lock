@@ -1732,9 +1732,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hjkl-bonsai"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "987f5dec6ed7c78c0d50142867e73f4d397fd21ca3bab0c9a86fb2c38dbe4f3a"
+checksum = "68d4fa969708dfbc1d41e49df4ff73fc5ec29cb2232a149b1515a58653bc88d5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1756,9 +1756,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-buffer"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90e1b58f8f1df988b893fab78bc6ed03e2f4f85439f75d5abdc24c91b25c9cb2"
+checksum = "e3d270f072a0b8a4c3360217e6034de6ccc9505370ed1c60901ffc9e6c3ad9b5"
 dependencies = [
  "regex",
  "ropey",
@@ -1768,9 +1768,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-clipboard"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e6657baea4adbc765d6125ebb51dea7cc596cfac0683520a6d538fef5f0cf99"
+checksum = "0a9c31b6069002326ef3f7d6dafd2040b43beb209799f4e51a567666ee508425"
 dependencies = [
  "async-trait",
  "bitflags 2.13.1",
@@ -1780,9 +1780,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-config"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb53e207b3f531ed1e7b618661ef83e1af649aaddbafacd034cbe7b2d8a1ae8c"
+checksum = "703967d0a4d68b89db7386a0d96db78c0af6732bc2c7f529d5ae1282049f237b"
 dependencies = [
  "hjkl-fs",
  "hjkl-xdg",
@@ -1794,9 +1794,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-engine"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "833a5b0569274656973c304027ee06e044081c14c8144ab1de09a42988090083"
+checksum = "61085c2eccacc48a00f65e468a739676a8306e4f280afe79af208ca8c0982b76"
 dependencies = [
  "bitflags 2.13.1",
  "hjkl-buffer",
@@ -1843,9 +1843,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-splash"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c70271cb7bec43f92c87b7dbe8bdc90f10179b4af2d48ca7565523a5a38db8"
+checksum = "d5f7757878b82b33ac53257c43be3c9faff548e0e51b2ad92c93da63c2e10f7d"
 
 [[package]]
 name = "hjkl-theme"
@@ -1860,9 +1860,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-vim"
-version = "0.41.3"
+version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffe16a083bef6ad7bec8996e6c878680c3c62383c77bd087739c084f7752eaa9"
+checksum = "05a770af77ae1c22b8bb9808b36252d9f5ba80197af77b696bed06f4e321ca41"
 dependencies = [
  "hjkl-buffer",
  "hjkl-engine",
@@ -2132,9 +2132,9 @@ dependencies = [
 
 [[package]]
 name = "interprocess"
-version = "2.4.3"
+version = "2.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "798de1433ba514cc6c04c4144c2469af81396e4906195218737c776d47769572"
+checksum = "6cb02ffbf25e8ef0f4a95bff054eef75f6d1bf16919474cf2caa63b21997478a"
 dependencies = [
  "doctest-file",
  "libc",
@@ -3990,9 +3990,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "toml"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -4104,13 +4104,12 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.26.12"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83c567a8e18ae93f20982c90370b16fd24023aeaf52f6052b96957ab253a0fec"
+checksum = "2038684e0058edba0d17302619f62eabce4a8e11c6ac59506996a8d79848851d"
 dependencies = [
  "cc",
  "regex",
- "regex-syntax",
  "serde_json",
  "streaming-iterator",
  "tree-sitter-language",
@@ -4118,9 +4117,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-language"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
 
 [[package]]
 name = "ttf-parser"
