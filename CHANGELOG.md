@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.14.17] - 2026-09-15
+
 ### Fixed
 
 - The first character typed into the omnibar / command line is drawn again: the
@@ -23,7 +25,7 @@ and this project adheres to
 ### Changed
 
 - In-range dependency updates via `cargo update` (wgpu 30.0.1, rustls 0.23.45,
-  uuid 1.26.1, the hjkl crates 0.41.6 and others), plus `dirs` 7 in
+  uuid 1.26.1, the hjkl crates 0.41.7 and others), plus `dirs` 7 in
   `buffr-config`.
 - CEF upgraded from 148 to 152 (`cef` 152.3.0, libcef 152.0.6), with the 152
   runtime staged by `fetch-cef`. On Linux, 152 as shipped never loaded a page:
@@ -2491,7 +2493,8 @@ keybindings, GPU-accelerated chrome compositor, and per-origin data layers
   layer. Buffr consumes only editor-level APIs, so this is a transparent pin
   bump — no source changes required.
 
-[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.16...HEAD
+[Unreleased]: https://github.com/kryptic-sh/buffr/compare/v0.14.17...HEAD
+[0.14.17]: https://github.com/kryptic-sh/buffr/compare/v0.14.16...v0.14.17
 [0.14.16]: https://github.com/kryptic-sh/buffr/compare/v0.14.15...v0.14.16
 [0.14.15]: https://github.com/kryptic-sh/buffr/compare/v0.14.14...v0.14.15
 [0.14.14]: https://github.com/kryptic-sh/buffr/compare/v0.14.13...v0.14.14

@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "buffr"
-version = "0.14.16"
+version = "0.14.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-app"
-version = "0.14.16"
+version = "0.14.17"
 dependencies = [
  "anyhow",
  "buffr-bookmarks",
@@ -484,7 +484,7 @@ name = "buffr-config"
 version = "0.4.2"
 dependencies = [
  "buffr-modal",
- "dirs 7.0.0",
+ "dirs",
  "hjkl-config",
  "notify",
  "serde",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-core"
-version = "0.14.16"
+version = "0.14.17"
 dependencies = [
  "base64",
  "buffr-config",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "buffr-helper"
-version = "0.14.16"
+version = "0.14.17"
 dependencies = [
  "buffr-cef",
 ]
@@ -1189,15 +1189,6 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs"
 version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
@@ -1737,12 +1728,13 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hjkl-bonsai"
-version = "0.41.6"
+version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d4fa969708dfbc1d41e49df4ff73fc5ec29cb2232a149b1515a58653bc88d5"
+checksum = "48b852cfa10e58a1628a3465f7a4f202bee233c87f3e8527ae1e83252f7ed6f0"
 dependencies = [
  "ahash",
  "anyhow",
+ "cc",
  "hjkl-fs",
  "hjkl-theme",
  "hjkl-xdg",
@@ -1761,9 +1753,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-buffer"
-version = "0.41.6"
+version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3d270f072a0b8a4c3360217e6034de6ccc9505370ed1c60901ffc9e6c3ad9b5"
+checksum = "fd5c0ffa73a41f110b14bc16f94695410c5b2dfcb55fbea513dfbd1f21fdd943"
 dependencies = [
  "regex",
  "ropey",
@@ -1815,9 +1807,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-fs"
-version = "0.41.6"
+version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "206ea7bc3661a3a9fe7bc2d5ece4132eabd0b0900ce9b6eecd835929f788297c"
+checksum = "4e0566baca36ff4a6ab540badd3cb6f18a05d403098886eceafa3ebd34d0f925"
 dependencies = [
  "hjkl-xdg",
  "ignore",
@@ -1854,9 +1846,9 @@ checksum = "d5f7757878b82b33ac53257c43be3c9faff548e0e51b2ad92c93da63c2e10f7d"
 
 [[package]]
 name = "hjkl-theme"
-version = "0.41.6"
+version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55a67b37ae48873317c3902b3bda16f2f8573496259a5399f8c14561b93ddcc3"
+checksum = "751af2f8f161c927c5834cc49aa8517dd155bf6271b7363e5d2489c7e3276494"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -1888,11 +1880,11 @@ dependencies = [
 
 [[package]]
 name = "hjkl-xdg"
-version = "0.41.6"
+version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c8f2bf97d114c10ffec47b90ad7bb1d49acd36082025a2e680e1d20abbe2aff"
+checksum = "0d92dc88d6ebc77d606de14a671b641a1e5787957cbc9a3d65adc947e1bd53f6"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "thiserror 2.0.20",
 ]
 
@@ -5139,7 +5131,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.14.16"
+version = "0.14.17"
 dependencies = [
  "anyhow",
  "bzip2",
