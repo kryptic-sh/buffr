@@ -71,8 +71,9 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
   - --own-name=org.mpris.MediaPlayer2.buffr.*
 
-# Skip stripping — CEF's libcef.so is already stripped upstream and
-# stripping it again breaks symbol lookups in some builds.
+# Skip flatpak-builder's own stripping: `xtask package-linux --release`
+# already strips debug info from libcef.so and its sibling libraries,
+# deliberately keeping their symbol tables for native backtraces.
 build-options:
   strip: false
   no-debuginfo: true

@@ -1109,7 +1109,10 @@ fn package_linux(args: Vec<String>) -> Result<()> {
     build_binaries(&workspace, parsed.release, None)?;
 
     let target_dir = cargo_target_dir(&workspace, profile, None);
-    let payload = collect_runtime_payload(&target_dir)?;
+    let mut payload = collect_runtime_payload(&target_dir)?;
+    if parsed.release {
+        strip_runtime_libs(&mut payload, &target_dir)?;
+    }
 
     // 2. Always (re)write the AUR PKGBUILD with the current version. It
     //    is cheap and keeps `pkg/aur/PKGBUILD` in lockstep with the
@@ -1254,6 +1257,43 @@ fn collect_runtime_payload(target_dir: &Path) -> Result<RuntimePayload> {
         blobs,
         locales,
     })
+}
+
+/// Strip DWARF debug info from the CEF shared libraries a release package
+/// ships, repointing `payload` at the stripped copies.
+///
+/// CEF's Linux distribution ships `libcef.so` and its sibling libraries
+/// unstripped: debug info is most of libcef's size, and on arm64 it pushed
+/// the file past 2 GiB, which snapcraft's bundled patchelf cannot read.
+/// `--strip-debug` keeps the symbol table, so native backtraces still name
+/// functions. The copies land in `target_dir/buffr-stripped/`; the build
+/// output itself is left untouched. buffr's own binaries are already
+/// stripped by the release profile.
+fn strip_runtime_libs(payload: &mut RuntimePayload, target_dir: &Path) -> Result<()> {
+    if !which("strip") {
+        bail!("`strip` (binutils) not on PATH; release packages must not ship CEF debug info");
+    }
+    let out_dir = target_dir.join("buffr-stripped");
+    fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    for lib in std::iter::once(&mut payload.libcef).chain(payload.runtime_libs.iter_mut()) {
+        let name = lib
+            .file_name()
+            .ok_or_else(|| anyhow!("runtime lib `{}` has no file name", lib.display()))?;
+        let stripped = out_dir.join(name);
+        eprintln!("xtask: strip --strip-debug {}", lib.display());
+        let status = Command::new("strip")
+            .arg("--strip-debug")
+            .arg("-o")
+            .arg(&stripped)
+            .arg(&*lib)
+            .status()
+            .context("spawning strip")?;
+        if !status.success() {
+            bail!("strip --strip-debug {} exited {status:?}", lib.display());
+        }
+        *lib = stripped;
+    }
+    Ok(())
 }
 
 /// Stage the runtime payload (binaries + CEF runtime tree) inside
@@ -2565,6 +2605,62 @@ mod tests {
         assert!(dest.join("icudtl.dat").exists());
         assert!(dest.join("v8_context_snapshot.bin").exists());
         assert!(dest.join("locales/en-US.pak").exists());
+    }
+
+    /// Uses this test binary as a stand-in `libcef.so`: a dev-profile build
+    /// carries DWARF, so a working strip must drop `.debug_info`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strip_runtime_libs_drops_debug_info() {
+        let tmp = tempdir();
+        let target = tmp.path().join("target-release");
+        fs::create_dir_all(&target).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let libcef = target.join("libcef.so");
+        let egl = target.join("libEGL.so");
+        fs::copy(&exe, &libcef).unwrap();
+        fs::copy(&exe, &egl).unwrap();
+        let mut payload = RuntimePayload {
+            buffr: target.join("buffr"),
+            buffr_app: target.join("buffr-app"),
+            helper: target.join("buffr-helper"),
+            libcef: libcef.clone(),
+            runtime_libs: vec![egl.clone()],
+            paks: Vec::new(),
+            blobs: Vec::new(),
+            jsons: Vec::new(),
+            locales: target.join("locales"),
+        };
+        // Section headers via binutils' readelf (a byte search would also
+        // match this function's own ".debug_info" literal in .rodata).
+        let has_debug_info = |p: &Path| {
+            let out = Command::new("readelf")
+                .arg("--section-headers")
+                .arg("--wide")
+                .arg(p)
+                .output()
+                .expect("spawning readelf");
+            assert!(out.status.success(), "readelf failed on {}", p.display());
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .any(|word| word == ".debug_info")
+        };
+        assert!(
+            has_debug_info(&libcef),
+            "fixture must start with debug info"
+        );
+
+        strip_runtime_libs(&mut payload, &target).unwrap();
+
+        let stripped_dir = target.join("buffr-stripped");
+        assert_eq!(payload.libcef, stripped_dir.join("libcef.so"));
+        assert_eq!(payload.runtime_libs, vec![stripped_dir.join("libEGL.so")]);
+        for lib in std::iter::once(&payload.libcef).chain(&payload.runtime_libs) {
+            assert!(!has_debug_info(lib), "{} kept .debug_info", lib.display());
+        }
+        // The build output is not modified in place.
+        assert!(has_debug_info(&libcef));
+        assert!(has_debug_info(&egl));
     }
 
     #[test]

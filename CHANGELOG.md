@@ -26,12 +26,17 @@ and this project adheres to
   uuid 1.26.1, the hjkl crates 0.41.6 and others), plus `dirs` 7 in
   `buffr-config`.
 - CEF upgraded from 148 to 152 (`cef` 152.3.0, libcef 152.0.6), with the 152
-  runtime staged by `fetch-cef`. On Linux, 152 as shipped never loaded a
-  page: Chromium's first-run flow shows a Linux EULA dialog that blocks CEF
+  runtime staged by `fetch-cef`. On Linux, 152 as shipped never loaded a page:
+  Chromium's first-run flow shows a Linux EULA dialog that blocks CEF
   initialization on any fresh profile (every `--private` launch, every new
   install). buffr now passes `--no-first-run` so Chromium skips it. (An earlier
   151 upgrade failed with the same symptom and was reverted; its cause was not
   confirmed.)
+- Linux release packages (`.deb`, `.rpm`, tarball, and the Flatpak / Snap / AUR
+  builds made from it) strip DWARF debug info from `libcef.so` and CEF's other
+  bundled libraries. CEF 152 ships them unstripped; amd64 `libcef.so` drops from
+  1.43 GB to 457 MB. Symbol tables are kept, so native backtraces still name
+  functions.
 
 ## [0.14.16] - 2026-08-30
 
