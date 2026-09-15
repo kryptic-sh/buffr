@@ -8,6 +8,18 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- The first character typed into the omnibar / command line is drawn again: the
+  input bar's scroll window over-scrolled by one, so the leading character of
+  every buffer that fit the box was scrolled out of view.
+- The omnibar no longer stays on screen after Enter or Esc. The chrome frame
+  that followed the popup closing re-uploaded only the tab-strip and statusline
+  bands, so the GPU texture kept the popup's pixels over the page until a tab
+  switch forced a full upload. A full-height upload now follows any frame that
+  painted into the page region (omnibar, prompts, context menu, loading
+  animation).
+
 ## [0.14.16] - 2026-08-30
 
 ### Fixed

@@ -1016,7 +1016,7 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   `file:`, so defence-in-depth.
 - Internal server: consider `Cross-Origin-Resource-Policy: same-origin`.
 - Theme colours never reach ConfirmPrompt/PermissionsPrompt/InputBar (fixed
-  COLOUR_* constants) — `theme.high_contrast` skips the prompts and omnibar;
+  COLOUR\_\* constants) — `theme.high_contrast` skips the prompts and omnibar;
   needs wiring when theme hot-apply lands (main.rs:802-825).
 - `pub` fields with documented-but-unenforced invariants: `InputBar:: cursor`
   (char boundary), `ContextMenuOverlay::selected` (bounds).
@@ -1040,10 +1040,38 @@ reason. Excluded per §15-2: `buffr-webkit`, `buffr-poc`.
   traced slices are covered by verified findings).
 - Area C (buffr-ui/-modal/-config + inhibit): all 24 files read end-to-end. Not
   reviewed: dependency sources (fontdue/notify/wayland read via docs, not
-  installed copies), tests/e2e/render_* beyond the commit diff.
+  installed copies), tests/e2e/render\_\* beyond the commit diff.
 - Area D (stores/xtask/fuzz/CI/packaging): all read end-to-end incl. all 2825
   xtask lines and all five fuzz targets. Not reviewed: pkg/homebrew + pkg/scoop
   manifests, docs-site, vendor/.
 - Platform-gated (never compiled locally or in CI): buffr-webkit (excluded
   §15-2), buffr-core/src/inhibit/{macos,windows}, all `#[cfg(windows)]` arms,
   buffr-app windowing `other` non-Linux paths. Static review only.
+
+---
+
+## 23. Omnibar review 2026-09-15 — not actioned
+
+Came out of fixing the "first typed char missing" and "omnibar stuck after
+Enter" bugs (both now covered by `tests/e2e/omnibar.sh`).
+
+### LOW — input-bar scroll window sizes itself from the start of the buffer
+
+**Where:** `crates/buffr-ui/src/input_bar.rs`, `InputBar::paint_at`
+(`chars_visible_for`).
+
+`chars_visible` counts how many chars fit starting from char 0 of the buffer,
+then that count is applied to the scrolled slice `skip(scroll_chars)`. With
+uniform advances the two agree. When the tail of a long buffer holds wider
+glyphs than its head (CJK typed after an ASCII URL), the visible slice is wider
+than the box and the text runs past the popup's right border. Static reading
+only — not reproduced. The fix is to count visible chars backwards from the
+cursor when scrolling.
+
+### Surprise — closing the overlay does not request a redraw itself
+
+`close_overlay` and `confirm_overlay` (`apps/buffr-app/src/main.rs`) bump
+`chrome_generation` (via `overlay_handle_key`) but never call `request_redraw`.
+The Esc case of `tests/e2e/omnibar.sh` still passes over a static page, so some
+other path repaints after the key; which one was not traced. If that path goes
+away, the popup would linger until the next unrelated redraw.

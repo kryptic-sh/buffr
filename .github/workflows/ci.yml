@@ -188,6 +188,12 @@ jobs:
       - name: run render e2e suite
         run: ./tests/e2e/render_suite.sh
 
+      - name: run omnibar e2e suite
+        # Unlike the edit-mode cases, this suite types: buffr's
+        # BUFFR_E2E_KEYS hook posts synthetic keys through the real key
+        # dispatch path, and the verdict comes from grim captures.
+        run: ./tests/e2e/omnibar.sh
+
   smoke:
     # Cross-platform event-loop smoke. Builds buffr-app + supervisor
     # for the target OS, then launches `buffr-app --smoke-test`. The

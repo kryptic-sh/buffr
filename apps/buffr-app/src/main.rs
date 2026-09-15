@@ -2009,6 +2009,14 @@ struct AppState {
     /// path (OSR buffer absent or wrong size). Cleared when the OSR path
     /// resumes. Used to emit the `debug!` transition log exactly once.
     loading_anim_active: bool,
+    /// True when the last chrome buffer that reached the GPU painted into
+    /// the browser region (loading animation, omnibar / prompt / context
+    /// menu). The next chrome upload must then cover the full height, even
+    /// if nothing paints there any more: a strip-bands-only upload leaves
+    /// the old pixels in the texture's middle rows, composited over the
+    /// page — the omnibar stayed on screen after Enter until a tab switch
+    /// happened to force a full upload.
+    chrome_middle_on_gpu: bool,
     /// When `Some(t)`, the event loop's `about_to_wait` sets
     /// `ControlFlow::WaitUntil(t)` to ensure the next animation frame
     /// fires at ~12 fps. Cleared as soon as `loading_anim_active`
@@ -2313,6 +2321,7 @@ impl AppState {
             last_splash_tick: None,
             splash_js_next_push: None,
             loading_anim_active: false,
+            chrome_middle_on_gpu: false,
             loading_anim_next_wake: None,
             resize_paint_watchdog: ResizePaintWatchdog::default(),
             surface_drifted: false,
@@ -3846,17 +3855,18 @@ impl AppState {
         // (statusline). The browser region between them is transparent and
         // skipped, turning the full-texture upload into two thin strips.
         // But when anything paints into the browser region this frame — the
-        // loading animation, a floating omnibar/prompt/context menu, or the
-        // animation→OSR transition that must clear the animation pixels —
-        // the whole buffer has to reach the GPU, so the top band covers the
-        // full logical height.
+        // loading animation or a floating omnibar/prompt/context menu — or
+        // the texture still holds such pixels from the last upload (a popup
+        // just closed, the animation just handed over to OSR) and they must
+        // be cleared, the whole buffer has to reach the GPU, so the top band
+        // covers the full logical height.
         let chrome_middle_painted = want_anim
-            || anim_just_deactivated
             || confirm_close_pinned.is_some()
             || permissions_prompt.is_some()
             || overlay_data.is_some()
             || context_menu_overlay.is_some();
-        let (chrome_top_band_h, chrome_bottom_band_h) = if chrome_middle_painted {
+        let chrome_full_upload = chrome_middle_painted || self.chrome_middle_on_gpu;
+        let (chrome_top_band_h, chrome_bottom_band_h) = if chrome_full_upload {
             (lheight, 0)
         } else {
             (TAB_STRIP_HEIGHT + DOWNLOAD_NOTICE_HEIGHT, STATUSLINE_HEIGHT)
@@ -4108,6 +4118,8 @@ impl AppState {
         let commit = decide_frame_commit(outcome, chrome_dirty_effective);
         if commit.advance_chrome_gen {
             self.last_painted_chrome_gen = self.chrome_generation;
+            // Only an uploaded chrome buffer changes what the texture holds.
+            self.chrome_middle_on_gpu = chrome_middle_painted;
         }
         if let Some(us) = commit.observe_us {
             self.observe_present_us(us, probe_pending);
