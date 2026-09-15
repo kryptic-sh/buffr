@@ -55,6 +55,17 @@ parts:
     organize:
       '*': usr/share/buffr/
 
+# The classic linter reads every ELF with snapcraft's bundled patchelf
+# (canonical/patchelf `0.9+snapcraft`), which loads the file in one
+# `read()`. Linux caps a single read just under 2 GiB, so libcef.so from
+# CEF 152's unstripped arm64 build fails with a bare "read" and aborts the
+# pack. The linter only checks rpath/interpreter, and libcef's `$ORIGIN`
+# rpath already matches this layout.
+lint:
+  ignore:
+    - classic:
+        - usr/share/buffr/libcef.so
+
 apps:
   buffr:
     command: usr/share/buffr/buffr

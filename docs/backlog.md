@@ -1080,3 +1080,20 @@ cursor when scrolling.
 The Esc case of `tests/e2e/omnibar.sh` still passes over a static page, so some
 other path repaints after the key; which one was not traced. If that path goes
 away, the popup would linger until the next unrelated redraw.
+
+## 24. CEF 152 packaging — decision needed
+
+### libcef.so ships with full debug info (arm64 build is 2.4 GB)
+
+CEF 152's minimal Linux distributions ship `libcef.so` unstripped ("with
+debug_info"): verified on the downloaded runtimes, amd64 1.36 GB and arm64 2.42
+GB. Every Linux package (tarball, Flatpak, Snap) carries it as-is. The arm64
+file broke the Snap pack: snapcraft's bundled patchelf reads files in one
+`read()`, which Linux caps just under 2 GiB. `snap/snapcraft.yaml` now skips the
+classic linter for `libcef.so` (reproduced locally by building
+`canonical/patchelf` `0.9+snapcraft`: "read", exit 1 on arm64, fine on amd64).
+
+Options: (a) keep shipping unstripped — no symbols lost, huge downloads; (b)
+`strip --strip-debug libcef.so` at packaging time — far smaller packages, but
+native crash backtraces lose symbol detail (buffr does not configure
+crashpad/breakpad today). Sizes after stripping not measured.
