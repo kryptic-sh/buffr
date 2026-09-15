@@ -91,7 +91,7 @@ timestamp is only millisecond-precise, so the counter (and an `O_EXCL`-style
 millisecond from overwriting each other's report.
 
 CEF's `BrowserProcessHandler` does **not** expose an `on_uncaught_exception`
-callback in the libcef buffr links (`147.0.14`, via the `cef` crate `148.x`) —
+callback in the libcef buffr links (`152.0.6`, via the `cef` crate `152.x`) —
 the only `on_uncaught_exception` is on the renderer- process
 `RenderProcessHandler` and only fires for V8 exceptions (JavaScript errors).
 Native CEF crashes are caught by Chromium's internal crashpad/ breakpad

@@ -278,17 +278,15 @@ methods instead of cutting a range. The natural groups:
   (`bec1f30`) and need a real rebase, not a cherry-pick.
   `archive/wl-subsurface-poc` is the subsurface work the removed native
   compositing trio referred to.
-- **`cef` stays on the 148 line.** Both 151 and 152 break page loading on Linux
-  Wayland, so a routine dependabot bump (crate only) cannot land; bumping means
-  moving the crate and `xtask` `CEF_VERSION_PREFIX` together, then passing the
-  runtime e2e jobs. Retried 2026-09-15 with `cef` 152.2.0+152.0.6 and the
-  matching 152.0.6 runtime: the edit-mode suite reports `no-page-load` for every
-  page, the log's last CEF line is "'--ozone-platform=wayland' is not compatible
-  with Vulkan". Adding `ozone-platform=headless` (OSR does not need the Wayland
-  backend) moves the failure: the GPU process then segfaults (exit 139) in a
-  restart loop. Not tried: `ozone-platform=headless` combined with the GPU
-  switches the 151 attempt tested (`use-vulkan`, `disable-gpu`, …). Dependabot
-  PR #222 was left open with this note.
+- **A CEF upgrade that "never loads a page" may be hanging in init, not the
+  GPU.** The 151 bump was reverted after GPU/Wayland switch experiments that
+  changed nothing. On 152 the same symptom turned out to be Chromium's Linux
+  first-run EULA dialog blocking inside `cef_initialize`, fixed with
+  `--no-first-run` (whether 151 had the same cause was not checked). Look for
+  buffr's `cef initialized` log line first, and get a backtrace by launching
+  `buffr-app` under `gdb` (`ptrace_scope=1` blocks attaching). The log line
+  "'--ozone-platform=wayland' is not compatible with Vulkan" is benign: working
+  148 builds print it too.
 
 ---
 

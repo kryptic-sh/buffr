@@ -24,9 +24,14 @@ and this project adheres to
 
 - In-range dependency updates via `cargo update` (wgpu 30.0.1, rustls 0.23.45,
   uuid 1.26.1, the hjkl crates 0.41.6 and others), plus `dirs` 7 in
-  `buffr-config`. The `cef` wrapper stays on 148: CEF 152 has the same Linux
-  Wayland failure as 151 (no page ever loads), so the dependabot bump to 152 is
-  not merged.
+  `buffr-config`.
+- CEF upgraded from 148 to 152 (`cef` 152.3.0, libcef 152.0.6), with the 152
+  runtime staged by `fetch-cef`. On Linux, 152 as shipped never loaded a
+  page: Chromium's first-run flow shows a Linux EULA dialog that blocks CEF
+  initialization on any fresh profile (every `--private` launch, every new
+  install). buffr now passes `--no-first-run` so Chromium skips it. (An earlier
+  151 upgrade failed with the same symptom and was reverted; its cause was not
+  confirmed.)
 
 ## [0.14.16] - 2026-08-30
 

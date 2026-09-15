@@ -45,7 +45,7 @@ cargo run --bin buffr
 - `--version <PREFIX>` — version prefix to match in the Spotify CDN
   (`index.json`). Defaults to `CEF_VERSION_PREFIX` in `xtask/src/main.rs`, which
   must match the libcef version the `cef` crate binds. That pairing is
-  load-bearing: `cef 148.x` wraps libcef `147.0.14`, so the prefix is `147.`.
+  load-bearing: `cef 152.x` wraps libcef `152.0.6`, so the prefix is `152.`.
 
 Override the CEF tree location with `CEF_PATH=...` (mirrors
 `tauri-apps/cef-rs`). When unset, `crates/buffr-cef/build.rs` falls back to

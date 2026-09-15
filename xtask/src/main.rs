@@ -60,15 +60,15 @@ fn fetch_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-/// CEF major version we pin against the `cef` crate (148.x).
+/// CEF major version we pin against the `cef` crate (152.x).
 ///
-/// Spotify CDN entries look like `cef_binary_148.0.10+gXXXXX+chromium-...`;
+/// Spotify CDN entries look like `cef_binary_152.0.6+gXXXXX+chromium-...`;
 /// we pick the newest entry whose version starts with this prefix. Keep the
 /// major line in lockstep with the `cef` crate resolved by Cargo.toml — the
 /// wrapper it compiles must talk to the same API version the vendored
 /// libcef reports, or every binary aborts with "Request for unsupported CEF
 /// API version" at startup.
-const CEF_VERSION_PREFIX: &str = "148.";
+const CEF_VERSION_PREFIX: &str = "152.";
 
 /// Embedded `Info.plist` template for the main `Buffr.app` bundle.
 const MAIN_PLIST_TEMPLATE: &str = include_str!("../templates/main.plist");

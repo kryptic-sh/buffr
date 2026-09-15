@@ -1,6 +1,6 @@
 //! CEF `App` impl + per-user profile path resolution.
 //!
-//! The `cef` crate (148.x, tauri-apps/cef-rs) exposes the `App` trait
+//! The `cef` crate (152.x, tauri-apps/cef-rs) exposes the `App` trait
 //! via its `wrap_app!` macro. We use it here to:
 //!
 //! - Override `on_before_command_line_processing` so we can inject our
@@ -150,6 +150,13 @@ wrap_app! {
                  AutofillAddressProfileSavePromptNicknameSupport",
             );
             append_switch(command_line, "disable-save-password-bubble");
+            // Skip Chromium's first-run flow. As of Chromium 152 it shows a
+            // Linux EULA dialog (`first_run::internal::ShowEulaDialog`) whose
+            // nested run loop blocks `cef_initialize` until someone clicks
+            // it. Every profile without the first-run sentinel reaches it —
+            // each `--private` launch, each new install — so `initialize`
+            // never returned and no page ever loaded.
+            append_switch(command_line, "no-first-run");
             // Force the basic (plaintext) password/cookie store. Linux
             // Chromium auto-detects org.freedesktop.Secret over D-Bus;
             // when an SS implementation is present but auth/unlock fails

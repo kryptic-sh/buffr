@@ -17,7 +17,7 @@ The default is `false` because building the tree is a non-trivial per-frame cost
 users without an AT don't need. Users who rely on a screen reader should enable
 it on first launch.
 
-The `cef` crate buffr pins (`148.x`, wrapping libcef `147.0.14`) does not expose
+The `cef` crate buffr pins (`152.x`, wrapping libcef `152.0.6`) does not expose
 a `Settings::accessibility_state` field; the command-line switch path is the
 supported wiring. (There is also a `SetAccessibilityState` method on the
 per-browser host that can be flipped later, but the command-line switch covers
