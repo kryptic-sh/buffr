@@ -20,6 +20,14 @@ and this project adheres to
   painted into the page region (omnibar, prompts, context menu, loading
   animation).
 
+### Changed
+
+- In-range dependency updates via `cargo update` (wgpu 30.0.1, rustls 0.23.45,
+  uuid 1.26.1, the hjkl crates 0.41.6 and others), plus `dirs` 7 in
+  `buffr-config`. The `cef` wrapper stays on 148: CEF 152 has the same Linux
+  Wayland failure as 151 (no page ever loads), so the dependabot bump to 152 is
+  not merged.
+
 ## [0.14.16] - 2026-08-30
 
 ### Fixed

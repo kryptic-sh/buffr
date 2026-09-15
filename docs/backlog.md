@@ -278,10 +278,17 @@ methods instead of cutting a range. The natural groups:
   (`bec1f30`) and need a real rebase, not a cherry-pick.
   `archive/wl-subsurface-poc` is the subsurface work the removed native
   compositing trio referred to.
-- **`cef` stays on the 148 line.** 151.3.0 is the latest release, but the
-  vendored libcef runtime and `xtask fetch-cef` pin 148.x and wrapper/runtime
-  must agree — bumping means a coordinated runtime upgrade, not a routine dep
-  bump. Revisit when the runtime is fetched at 151.
+- **`cef` stays on the 148 line.** Both 151 and 152 break page loading on Linux
+  Wayland, so a routine dependabot bump (crate only) cannot land; bumping means
+  moving the crate and `xtask` `CEF_VERSION_PREFIX` together, then passing the
+  runtime e2e jobs. Retried 2026-09-15 with `cef` 152.2.0+152.0.6 and the
+  matching 152.0.6 runtime: the edit-mode suite reports `no-page-load` for every
+  page, the log's last CEF line is "'--ozone-platform=wayland' is not compatible
+  with Vulkan". Adding `ozone-platform=headless` (OSR does not need the Wayland
+  backend) moves the failure: the GPU process then segfaults (exit 139) in a
+  restart loop. Not tried: `ozone-platform=headless` combined with the GPU
+  switches the 151 attempt tested (`use-vulkan`, `disable-gpu`, …). Dependabot
+  PR #222 was left open with this note.
 
 ---
 
