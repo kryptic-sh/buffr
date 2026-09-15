@@ -2607,19 +2607,31 @@ mod tests {
         assert!(dest.join("locales/en-US.pak").exists());
     }
 
-    /// Uses this test binary as a stand-in `libcef.so`: a dev-profile build
-    /// carries DWARF, so a working strip must drop `.debug_info`.
+    /// Uses this test binary as a stand-in `libcef.so`. binutils' objcopy
+    /// drops whatever debug info the build profile left and adds a known
+    /// `.debug_info` section, so the fixture is the same with or without
+    /// debug info in the test build (CI builds without it).
     #[cfg(target_os = "linux")]
     #[test]
     fn strip_runtime_libs_drops_debug_info() {
         let tmp = tempdir();
         let target = tmp.path().join("target-release");
         fs::create_dir_all(&target).unwrap();
+        let section = tmp.path().join("debug_info.bin");
+        fs::write(&section, b"fixture debug info").unwrap();
         let exe = std::env::current_exe().unwrap();
         let libcef = target.join("libcef.so");
         let egl = target.join("libEGL.so");
-        fs::copy(&exe, &libcef).unwrap();
-        fs::copy(&exe, &egl).unwrap();
+        for lib in [&libcef, &egl] {
+            let status = Command::new("objcopy")
+                .arg("--strip-debug")
+                .arg(format!("--add-section=.debug_info={}", section.display()))
+                .arg(&exe)
+                .arg(lib)
+                .status()
+                .expect("spawning objcopy");
+            assert!(status.success(), "objcopy failed for {}", lib.display());
+        }
         let mut payload = RuntimePayload {
             buffr: target.join("buffr"),
             buffr_app: target.join("buffr-app"),
