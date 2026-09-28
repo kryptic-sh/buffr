@@ -619,7 +619,7 @@ dependencies = [
 name = "buffr-view-source"
 version = "0.1.0"
 dependencies = [
- "hjkl-bonsai",
+ "hjkl-bonsai 0.42.1",
  "tracing",
 ]
 
@@ -1735,9 +1735,34 @@ dependencies = [
  "ahash",
  "anyhow",
  "cc",
- "hjkl-fs",
- "hjkl-theme",
- "hjkl-xdg",
+ "hjkl-fs 0.41.7",
+ "hjkl-theme 0.41.7",
+ "hjkl-xdg 0.41.7",
+ "libloading 0.9.0",
+ "libmimalloc-sys",
+ "memchr",
+ "regex",
+ "ropey",
+ "serde",
+ "thiserror 2.0.20",
+ "toml",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "hjkl-bonsai"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87d366b8ce2ffcdbf7aa220b83861375328953f2ab9badde9e74d6a599864c69"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "cc",
+ "hjkl-fs 0.42.1",
+ "hjkl-theme 0.42.1",
+ "hjkl-xdg 0.42.1",
  "libloading 0.9.0",
  "libmimalloc-sys",
  "memchr",
@@ -1781,8 +1806,8 @@ version = "0.41.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703967d0a4d68b89db7386a0d96db78c0af6732bc2c7f529d5ae1282049f237b"
 dependencies = [
- "hjkl-fs",
- "hjkl-xdg",
+ "hjkl-fs 0.41.7",
+ "hjkl-xdg 0.41.7",
  "serde",
  "thiserror 2.0.20",
  "toml",
@@ -1811,7 +1836,19 @@ version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e0566baca36ff4a6ab540badd3cb6f18a05d403098886eceafa3ebd34d0f925"
 dependencies = [
- "hjkl-xdg",
+ "hjkl-xdg 0.41.7",
+ "ignore",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hjkl-fs"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "305a93d927ccfdeffbfc9f5f6c9aafa22e2555013459b17f5ec4a40176e49c7c"
+dependencies = [
+ "hjkl-xdg 0.42.1",
  "ignore",
  "libc",
  "windows-sys 0.61.2",
@@ -1834,7 +1871,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "632a5ec5acdcac56ad81c9c335b75c69ba85441279bca96e6d96e0b25932a77c"
 dependencies = [
  "anyhow",
- "hjkl-bonsai",
+ "hjkl-bonsai 0.41.7",
  "tracing",
 ]
 
@@ -1849,6 +1886,17 @@ name = "hjkl-theme"
 version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "751af2f8f161c927c5834cc49aa8517dd155bf6271b7363e5d2489c7e3276494"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
+name = "hjkl-theme"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "015ac8b155357999bd3fe135363c556ce27b132d3716f317c2fa1608fbcc6d0a"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -1883,6 +1931,16 @@ name = "hjkl-xdg"
 version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d92dc88d6ebc77d606de14a671b641a1e5787957cbc9a3d65adc947e1bd53f6"
+dependencies = [
+ "dirs",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04c913524531eca43d00c4f150dfe15f79df74593c258f77e095866d8e8a0a97"
 dependencies = [
  "dirs",
  "thiserror 2.0.20",
