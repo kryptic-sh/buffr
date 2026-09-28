@@ -1735,9 +1735,9 @@ dependencies = [
  "ahash",
  "anyhow",
  "cc",
- "hjkl-fs",
+ "hjkl-fs 0.41.7",
  "hjkl-theme",
- "hjkl-xdg",
+ "hjkl-xdg 0.41.7",
  "libloading 0.9.0",
  "libmimalloc-sys",
  "memchr",
@@ -1777,12 +1777,12 @@ dependencies = [
 
 [[package]]
 name = "hjkl-config"
-version = "0.41.6"
+version = "0.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703967d0a4d68b89db7386a0d96db78c0af6732bc2c7f529d5ae1282049f237b"
+checksum = "d8f5287aa07b3e72d1634c1aba109aef99d71e597f4335df0b4691ef2dae17a7"
 dependencies = [
- "hjkl-fs",
- "hjkl-xdg",
+ "hjkl-fs 0.42.1",
+ "hjkl-xdg 0.42.1",
  "serde",
  "thiserror 2.0.20",
  "toml",
@@ -1811,7 +1811,19 @@ version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e0566baca36ff4a6ab540badd3cb6f18a05d403098886eceafa3ebd34d0f925"
 dependencies = [
- "hjkl-xdg",
+ "hjkl-xdg 0.41.7",
+ "ignore",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hjkl-fs"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "305a93d927ccfdeffbfc9f5f6c9aafa22e2555013459b17f5ec4a40176e49c7c"
+dependencies = [
+ "hjkl-xdg 0.42.1",
  "ignore",
  "libc",
  "windows-sys 0.61.2",
@@ -1883,6 +1895,16 @@ name = "hjkl-xdg"
 version = "0.41.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d92dc88d6ebc77d606de14a671b641a1e5787957cbc9a3d65adc947e1bd53f6"
+dependencies = [
+ "dirs",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04c913524531eca43d00c4f150dfe15f79df74593c258f77e095866d8e8a0a97"
 dependencies = [
  "dirs",
  "thiserror 2.0.20",
