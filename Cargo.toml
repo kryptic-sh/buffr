@@ -125,7 +125,7 @@ hjkl-buffer = "0.41"
 hjkl-clipboard = "0.41"
 hjkl-splash = "0.41"
 hjkl-config = "0.41"
-hjkl-bonsai = "0.41"
+hjkl-bonsai = "0.42"
 # The vim FSM (Editor::feed_input / vim_mode, formerly on hjkl-engine)
 # now lives in its own crate, released in the same lockstep train.
 hjkl-vim = "0.41"
