@@ -440,7 +440,7 @@ version = "0.2.0"
 dependencies = [
  "bitflags 2.13.2",
  "crossterm",
- "hjkl-buffer",
+ "hjkl-buffer 0.44.0",
  "hjkl-engine",
  "hjkl-vim",
  "serde",
@@ -1563,6 +1563,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hjkl-buffer"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ac3a1cfa3535ead56186c28f8774ae811ef390893de3a397989a2b293059c18"
+dependencies = [
+ "regex",
+ "ropey",
+ "serde",
+ "unicode-width",
+]
+
+[[package]]
 name = "hjkl-clipboard"
 version = "0.43.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1595,7 +1607,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07f0a751c94d18b2d4c73bf439cc2f52d58f24d9d11862c2b1b8043be0538e56"
 dependencies = [
  "bitflags 2.13.2",
- "hjkl-buffer",
+ "hjkl-buffer 0.43.4",
  "hjkl-lang",
  "hjkl-vim-types",
  "regex",
@@ -1660,7 +1672,7 @@ version = "0.43.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b218e189cac8e2b81ba482c481b8b11432bc0a082f990bb7be687af76a36255"
 dependencies = [
- "hjkl-buffer",
+ "hjkl-buffer 0.43.4",
  "hjkl-engine",
  "hjkl-keymap",
  "hjkl-vim-types",
