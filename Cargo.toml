@@ -128,7 +128,7 @@ hjkl-config = "0.43"
 hjkl-bonsai = "0.43"
 # The vim FSM (Editor::feed_input / vim_mode, formerly on hjkl-engine)
 # now lives in its own crate, released in the same lockstep train.
-hjkl-vim = "0.43"
+hjkl-vim = "0.44"
 
 [profile.release]
 lto = "thin"
