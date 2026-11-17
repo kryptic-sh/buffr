@@ -120,15 +120,15 @@ buffr-view-source = { path = "crates/buffr-view-source" }
 # Vim engine + rope buffer extracted into standalone repos. Caret-pinned
 # at their latest majors — patch bumps roll in automatically; major-bump
 # breakage is gated by the leading-zero version.
-hjkl-engine = "0.43"
-hjkl-buffer = "0.43"
-hjkl-clipboard = "0.43"
-hjkl-splash = "0.43"
-hjkl-config = "0.43"
-hjkl-bonsai = "0.43"
+hjkl-engine = "0.46"
+hjkl-buffer = "0.46"
+hjkl-clipboard = "0.46"
+hjkl-splash = "0.46"
+hjkl-config = "0.46"
+hjkl-bonsai = "0.46"
 # The vim FSM (Editor::feed_input / vim_mode, formerly on hjkl-engine)
 # now lives in its own crate, released in the same lockstep train.
-hjkl-vim = "0.43"
+hjkl-vim = "0.46"
 
 [profile.release]
 lto = "thin"

@@ -12,7 +12,7 @@ and this project adheres to
 
 - Updated the `hjkl-*` crates (`hjkl-engine`, `hjkl-buffer`, `hjkl-vim`,
   `hjkl-clipboard`, `hjkl-config`, `hjkl-splash` and `hjkl-bonsai`) from 0.41 to
-  0.43.4 together, which brings hjkl's vim-compatibility fixes (operators,
+  0.46.0 together, which brings hjkl's vim-compatibility fixes (operators,
   motions, text objects and folds; hjkl's changelog lists them) to edit mode.
 
 ### Fixed
