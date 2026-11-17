@@ -131,9 +131,10 @@ fn host_platform() -> &'static str {
 /// Copy CEF resources (`Resources/`, `*.pak`, `locales/`, shared lib)
 /// next to the final target binaries.
 ///
-/// `OUT_DIR` is `target/<profile>/build/<crate>-<hash>/out`. Walking
-/// `../../..` lands us at `target/<profile>/`, where Cargo deposits
-/// the binaries from `apps/buffr` and `apps/buffr-helper`.
+/// `OUT_DIR` sits under `target/<profile>/build/`: older Cargo uses
+/// `build/<crate>-<hash>/out`, Cargo 1.100+ `build/<crate>/<hash>/out`.
+/// The parent of that `build` directory is `target/<profile>/`, where
+/// Cargo deposits the binaries from `apps/buffr` and `apps/buffr-helper`.
 fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
     let out_dir = env::var_os("OUT_DIR").map(PathBuf::from);
     let Some(out_dir) = out_dir else {
@@ -141,8 +142,9 @@ fn stage_runtime(lib_dir: &Path, resources_dir: &Path) -> io::Result<()> {
     };
     let target_dir = out_dir
         .ancestors()
-        .nth(3)
-        .ok_or_else(|| io::Error::other("OUT_DIR has no grand-grand-parent"))?
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("OUT_DIR is not under a `build` directory"))?
         .to_path_buf();
 
     if !target_dir.exists() {

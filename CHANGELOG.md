@@ -17,6 +17,12 @@ and this project adheres to
 
 ### Fixed
 
+- **`cargo build` stages the CEF runtime next to the binaries again with Cargo
+  1.100 and later.** Cargo 1.100 nests build-script output one directory deeper,
+  so `buffr-cef`'s build script copied `libcef`, `chrome-sandbox` and the macOS
+  framework into `target/<profile>/build/` instead of `target/<profile>/`, and
+  `cargo run` could not find them.
+
 - **The Homebrew cask's `depends_on macos:` uses `:ventura`** instead of the
   `">= :ventura"` string form, which Homebrew 7 deprecates and warns about
   whenever the tap loads.
