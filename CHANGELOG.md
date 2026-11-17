@@ -29,6 +29,11 @@ and this project adheres to
 
 ### Security
 
+- Updated `rusqlite` to 0.42.0, whose `libsqlite3-sys` 0.40.0 bundles a SQLite
+  past RUSTSEC-2026-0459 (CVE-2026-119375): older bundled SQLite could return
+  uninitialized page-cache memory when opening a database next to a `-wal` file
+  with a different page size. buffr's history, bookmarks, downloads and other
+  profile stores use that bundled SQLite.
 - Updated `rustls-webpki` 0.103.15 → 0.103.16 for RUSTSEC-2026-0382 and
   `webpki-roots` 1.0.9 → 1.0.11 for RUSTSEC-2026-0381, which stop trusting
   certificate paths through distrusted emSign intermediates and drop the emSign

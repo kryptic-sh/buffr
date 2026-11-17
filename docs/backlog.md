@@ -108,6 +108,17 @@ has observed.
   exit handling, argument quoting, the environment block) and the rewritten
   `restart_on_crash_windows.rs`. Adding a Windows test job is the single
   highest-value CI change left.
+- **Five tests fail on a local Windows run (2026-11-17, Rust 1.100).** All of
+  `restart_on_crash_windows.rs` fails with the supervisor reporting "failed to
+  spawn child C:\WINDOWS\system32\cmd.exe: CreateProcessW failed: Access is
+  denied", inside and outside the agent sandbox.
+  `image_copy::tests::agent_does_not_follow_redirects` and
+  `view_source_scheme::tests::fetch_does_not_follow_redirects` fail too: the
+  first gets `ConnectionAborted` (os error 10053). The likely cause is the test
+  server writing its 302 and closing without reading the request, which Windows
+  answers with a reset; this is a guess, not checked. None of these run in CI
+  (Linux only), and they were not run on the commit before the hjkl 0.46 / Cargo
+  1.100 fixes, so whether they are new is unknown.
 - **`buffr-webkit` is still not built by CI.** It is excluded from the workspace
   and has no job, which is exactly how it bit-rotted into the W-series findings.
   It builds and passes clippy/tests locally now (needs `wpewebkit-2.0`), so a
