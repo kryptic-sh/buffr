@@ -14,6 +14,9 @@ and this project adheres to
   `hjkl-clipboard`, `hjkl-config`, `hjkl-splash` and `hjkl-bonsai`) from 0.41 to
   0.46.0 together, which brings hjkl's vim-compatibility fixes (operators,
   motions, text objects and folds; hjkl's changelog lists them) to edit mode.
+- Updated the embedded Chromium from CEF 152 to CEF 156: the `cef` crate moves
+  to 156.6.0, and `cargo xtask fetch-cef` vendors the matching libcef 156
+  runtime.
 
 ### Fixed
 

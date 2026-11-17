@@ -1,6 +1,6 @@
 //! CEF `App` impl + per-user profile path resolution.
 //!
-//! The `cef` crate (152.x, tauri-apps/cef-rs) exposes the `App` trait
+//! The `cef` crate (156.x, tauri-apps/cef-rs) exposes the `App` trait
 //! via its `wrap_app!` macro. We use it here to:
 //!
 //! - Override `on_before_command_line_processing` so we can inject our
