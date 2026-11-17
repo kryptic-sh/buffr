@@ -43,12 +43,13 @@ const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
 /// Per-phase timeouts for CEF downloads (hardening §22): the default
 /// ureq agent has no timeouts at all, so a hung CDN stalls CI until the
 /// runner timeout. Per-phase, not global: the archive is ~150 MB and a
-/// slow-but-alive connection must be allowed to finish. `recv_body`
-/// restarts per read, so it bounds "no bytes arrived" stalls, not total
-/// download time.
+/// slow-but-alive connection must be allowed to finish. ureq's
+/// `timeout_recv_body` is a total budget for the whole body, not a
+/// per-read stall timeout, so it has to cover the full archive download on
+/// a slow CDN link.
 const FETCH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const FETCH_RECV_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const FETCH_RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const FETCH_RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// ureq agent for CEF index + archive fetches with the timeouts above.
 fn fetch_agent() -> ureq::Agent {
