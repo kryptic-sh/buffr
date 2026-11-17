@@ -555,6 +555,16 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+      # The action falls back to `cargo install cargo-machete` when the
+      # GitHub API lookup of the latest release fails (rate-limited on
+      # shared runners). That builds the newest release, which may need a
+      # newer Rust than rust-toolchain.toml pins, so build with stable as
+      # the other jobs do.
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
       # Pinned to a full commit SHA, not `@main`: a moving ref would let a
       # compromise of that repo execute arbitrary code in this workflow on
       # the next push. Bump the SHA and the trailing comment together.
