@@ -42,14 +42,20 @@ const DEFAULT_CDN: &str = "https://cef-builds.spotifycdn.com";
 
 /// Per-phase timeouts for CEF downloads (hardening §22): the default
 /// ureq agent has no timeouts at all, so a hung CDN stalls CI until the
-/// runner timeout. Per-phase, not global: the archive is ~150 MB and a
-/// slow-but-alive connection must be allowed to finish. ureq's
-/// `timeout_recv_body` is a total budget for the whole body, not a
-/// per-read stall timeout, so it has to cover the full archive download on
-/// a slow CDN link.
+/// runner timeout. Per-phase, not global: the archive runs to hundreds of
+/// MiB and a slow-but-alive connection must be allowed to finish. ureq's
+/// `timeout_recv_body` is a total budget for the whole body, not a per-read
+/// stall timeout, so it has to cover the full archive download on a slow
+/// CDN link; `timeout_per_read` restarts on every read and catches a
+/// connection that stops sending well before that.
 const FETCH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const FETCH_RECV_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const FETCH_RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const FETCH_READ_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound for the CDN's `index.json`, which lists every CEF build for
+/// every platform and has outgrown ureq's 10 MiB `read_json` default.
+const CEF_INDEX_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// ureq agent for CEF index + archive fetches with the timeouts above.
 fn fetch_agent() -> ureq::Agent {
@@ -57,6 +63,7 @@ fn fetch_agent() -> ureq::Agent {
         .timeout_connect(Some(FETCH_CONNECT_TIMEOUT))
         .timeout_recv_response(Some(FETCH_RECV_RESPONSE_TIMEOUT))
         .timeout_recv_body(Some(FETCH_RECV_BODY_TIMEOUT))
+        .timeout_per_read(Some(FETCH_READ_STALL_TIMEOUT))
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -246,6 +253,8 @@ fn fetch_cef(args: Vec<String>) -> Result<()> {
         .call()
         .context("fetching CEF index.json")?
         .body_mut()
+        .with_config()
+        .limit(CEF_INDEX_MAX_BYTES)
         .read_json()
         .context("parsing CEF index.json")?;
 
