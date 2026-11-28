@@ -19,6 +19,25 @@ Grouped by what is actually blocking them.
   `cargo audit`, which fails only on vulnerabilities (unmaintained and yanked
   crates are warnings).
 
+## Dependencies
+
+- **Replace chrono with jiff.** (2026-11-28.) **Needs the owner's final decision
+  and discussion; nothing is changed until then.** RUSTSEC-2026-0543
+  (2026-09-14) marks every chrono version unmaintained, with no patched release.
+  Its maintainer soft-deprecated chrono and chrono-tz in chronotope/chrono#1768
+  and recommends jiff (1.0 since; the advisory waited for it); the advisory also
+  lists `time`. kryptic-sh/lyr is moving to jiff on the owner's call
+  (2026-11-28); kryptic-sh/infr dropped chrono for the C library's `strftime`
+  instead, since it used one function. Here chrono is a workspace dependency
+  (`serde`, `clock`) of buffr-bookmarks, buffr-core, buffr-downloads,
+  buffr-history and buffr-store (optional, `chrono` feature, for
+  `buffr_store::ts_to_dt`), used as `DateTime<Utc>` with `Utc::now` and
+  `chrono::Duration` arithmetic, in files across the app and the CEF and WebKit
+  crates. The jiff equivalent is `jiff::Timestamp` with `jiff::SignedDuration`.
+  Open before deciding: whether anything persisted or sent over IPC is chrono's
+  serde form of `DateTime<Utc>`, and whether jiff's `Timestamp` serde reads it
+  back (not checked).
+
 ## 1. Needs a product decision
 
 Each of these has a real defect behind it, but two or more defensible
